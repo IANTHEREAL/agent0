@@ -257,9 +257,13 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
                     "JSONB" => Ok(DataType::Jsonb),
                     "VECTOR" => {
                         // Extract dimension from type modifiers if available
-                        // For now, use default dimension of 1536 (OpenAI embedding dimension)
-                        // TODO: Parse dimension from modifiers when sqlparser supports it
-                        let dim = 1536;
+                        // sqlparser parses vector(3) as Custom type with Vec<String> modifiers
+                        let dim = if !modifiers.is_empty() {
+                            // Try to parse first modifier as dimension number
+                            modifiers[0].parse::<u32>().unwrap_or(1536)
+                        } else {
+                            1536 // Default dimension (OpenAI embedding size)
+                        };
                         Ok(DataType::Vector(dim))
                     }
                     _ => Ok(DataType::Text),
@@ -632,7 +636,6 @@ pub fn is_serial_type(sql_type: &SqlDataType) -> bool {
     }
 }
 
-/// Get the name of a SelectItem for column naming
 pub fn get_select_item_name(item: &sqlparser::ast::SelectItem) -> String {
     match item {
         sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
@@ -650,7 +653,15 @@ pub fn get_expr_name(expr: &Expr) -> String {
             .last()
             .map(|p| p.value.clone())
             .unwrap_or_else(|| "?column?".to_string()),
-        Expr::Function(f) => f.name.to_string().to_lowercase(),
+        Expr::Function(f) => {
+            // Get the last part of the function name (handles schema-qualified names)
+            if let Some(last_ident) = f.name.0.last() {
+                let func_name = last_ident.value.to_lowercase();
+                func_name
+            } else {
+                "?column?".to_string()
+            }
+        }
         _ => "?column?".to_string(),
     }
 }
@@ -693,9 +704,190 @@ pub fn eval_default_expr(expr_str: &str) -> Result<Value> {
     Ok(Value::Text(expr_str.to_string()))
 }
 
+pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
+    match expr {
+        Expr::Identifier(ident) => {
+            let col_name = normalize_ident(ident);
+            schema
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(&col_name))
+                .map(|c| c.data_type.clone())
+                .unwrap_or(DataType::Text)
+        }
+        Expr::CompoundIdentifier(parts) => {
+            if let Some(last) = parts.last() {
+                let col_name = normalize_ident(last);
+                schema
+                    .columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&col_name))
+                    .map(|c| c.data_type.clone())
+                    .unwrap_or(DataType::Text)
+            } else {
+                DataType::Text
+            }
+        }
+        Expr::Cast { data_type, .. } => sql_datatype_to_internal(data_type),
+        Expr::Function(f) => {
+            let func_name = f
+                .name
+                .0
+                .last()
+                .map(|n| n.value.to_uppercase())
+                .unwrap_or_default();
+            match func_name.as_str() {
+                "COUNT" => DataType::Int64,
+                "SUM" | "AVG" => DataType::Float64,
+                "MIN" | "MAX" => {
+                    if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
+                        f.args.first()
+                    {
+                        infer_expr_type(arg_expr, schema)
+                    } else {
+                        DataType::Text
+                    }
+                }
+                "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" => DataType::Int64,
+                "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
+                    if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
+                        f.args.first()
+                    {
+                        infer_expr_type(arg_expr, schema)
+                    } else {
+                        DataType::Text
+                    }
+                }
+                "NOW" | "CURRENT_TIMESTAMP" | "CURRENT_DATE" => DataType::Timestamp,
+                "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => DataType::Uuid,
+                "JSONB_BUILD_OBJECT" | "JSONB_AGG" | "TO_JSONB" => DataType::Jsonb,
+                "JSON_BUILD_OBJECT" | "JSON_AGG" | "TO_JSON" => DataType::Json,
+                "COALESCE" | "NULLIF" | "GREATEST" | "LEAST" => {
+                    if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
+                        f.args.first()
+                    {
+                        infer_expr_type(arg_expr, schema)
+                    } else {
+                        DataType::Text
+                    }
+                }
+                _ => DataType::Text,
+            }
+        }
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::Plus
+            | BinaryOperator::Minus
+            | BinaryOperator::Multiply
+            | BinaryOperator::Divide
+            | BinaryOperator::Modulo => {
+                let left_type = infer_expr_type(left, schema);
+                let right_type = infer_expr_type(right, schema);
+                if matches!(left_type, DataType::Float64) || matches!(right_type, DataType::Float64)
+                {
+                    DataType::Float64
+                } else if matches!(left_type, DataType::Int64)
+                    || matches!(right_type, DataType::Int64)
+                {
+                    DataType::Int64
+                } else {
+                    DataType::Int32
+                }
+            }
+            BinaryOperator::And
+            | BinaryOperator::Or
+            | BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::LtEq
+            | BinaryOperator::Gt
+            | BinaryOperator::GtEq => DataType::Boolean,
+            BinaryOperator::StringConcat => DataType::Text,
+            _ => DataType::Text,
+        },
+        Expr::UnaryOp { op, .. } => match op {
+            sqlparser::ast::UnaryOperator::Not => DataType::Boolean,
+            sqlparser::ast::UnaryOperator::Minus | sqlparser::ast::UnaryOperator::Plus => {
+                DataType::Float64
+            }
+            _ => DataType::Text,
+        },
+        Expr::Value(val) => match val {
+            SqlValue::Number(_, _) => DataType::Int64,
+            SqlValue::SingleQuotedString(_)
+            | SqlValue::DoubleQuotedString(_)
+            | SqlValue::EscapedStringLiteral(_) => DataType::Text,
+            SqlValue::Boolean(_) => DataType::Boolean,
+            SqlValue::Null => DataType::Text,
+            _ => DataType::Text,
+        },
+        Expr::Case { .. } => DataType::Text,
+        Expr::Nested(inner) => infer_expr_type(inner, schema),
+        _ => DataType::Text,
+    }
+}
+
+fn sql_datatype_to_internal(dt: &SqlDataType) -> DataType {
+    match dt {
+        SqlDataType::Boolean | SqlDataType::Bool => DataType::Boolean,
+        SqlDataType::SmallInt(_) | SqlDataType::Int2(_) => DataType::Int32,
+        SqlDataType::Int(_)
+        | SqlDataType::Integer(_)
+        | SqlDataType::Int4(_)
+        | SqlDataType::MediumInt(_) => DataType::Int32,
+        SqlDataType::BigInt(_) | SqlDataType::Int8(_) => DataType::Int64,
+        SqlDataType::Real | SqlDataType::Float4 => DataType::Float64,
+        SqlDataType::Double
+        | SqlDataType::DoublePrecision
+        | SqlDataType::Float8
+        | SqlDataType::Float(_)
+        | SqlDataType::Numeric(_)
+        | SqlDataType::Decimal(_) => DataType::Float64,
+        SqlDataType::Timestamp(_, _) => DataType::Timestamp,
+        SqlDataType::Interval => DataType::Interval,
+        SqlDataType::Uuid => DataType::Uuid,
+        SqlDataType::Bytea => DataType::Bytes,
+        SqlDataType::JSON => DataType::Jsonb,
+        SqlDataType::Custom(name, _) => {
+            if let Some(ident) = name.0.last() {
+                let type_name = ident.value.to_uppercase();
+                match type_name.as_str() {
+                    "JSONB" => DataType::Jsonb,
+                    "JSON" => DataType::Json,
+                    "TIMESTAMPTZ" => DataType::Timestamp,
+                    _ => DataType::Text,
+                }
+            } else {
+                DataType::Text
+            }
+        }
+        _ => DataType::Text,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    #[test]
+    fn test_version_function_name() {
+        let dialect = PostgreSqlDialect {};
+        let sql = "SELECT version()";
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+
+        if let sqlparser::ast::Statement::Query(query) = &statements[0] {
+            if let sqlparser::ast::SetExpr::Select(select) = &*query.body {
+                let item = &select.projection[0];
+                let name = get_select_item_name(item);
+                assert_eq!(
+                    name, "version",
+                    "Function name should be 'version', got '{}'",
+                    name
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_dedup_rows() {
@@ -846,10 +1038,8 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
             // Parse vector literal: [1.0, 2.0, 3.0]
             if unescaped.starts_with('[') && unescaped.ends_with(']') {
                 let inner = &unescaped[1..unescaped.len() - 1];
-                let elements: Result<Vec<f64>, _> = inner
-                    .split(',')
-                    .map(|s| s.trim().parse::<f64>())
-                    .collect();
+                let elements: Result<Vec<f64>, _> =
+                    inner.split(',').map(|s| s.trim().parse::<f64>()).collect();
                 if let Ok(vec) = elements {
                     Value::Vector(vec)
                 } else {

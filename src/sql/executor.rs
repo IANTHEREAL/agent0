@@ -7,7 +7,8 @@ use super::helpers::{
     collect_having_agg_funcs, cte_is_recursive, dedup_rows, distinct_on_rows,
     distinct_on_rows_join, eval_default_expr, eval_having_expr, eval_having_expr_join,
     fill_row_defaults, get_select_item_name, get_skip_reason, get_unsupported_reason,
-    infer_data_type, parse_value_for_copy, set_expr_references_table, value_to_sql_expr,
+    infer_data_type, infer_expr_type, parse_value_for_copy, set_expr_references_table,
+    value_to_sql_expr,
 };
 use super::planner::{self, ScanType};
 use super::query;
@@ -280,7 +281,8 @@ impl Executor {
             Statement::ShowTables { .. } => self.execute_show_tables(txn).await,
             Statement::SetVariable { .. }
             | Statement::SetTimeZone { .. }
-            | Statement::SetNames { .. } => Ok(ExecuteResult::Empty),
+            | Statement::SetNames { .. }
+            | Statement::SetTransaction { .. } => Ok(ExecuteResult::Empty),
             Statement::CreateType { .. } | Statement::CreateFunction { .. } => {
                 Ok(ExecuteResult::Empty)
             }
@@ -1065,8 +1067,21 @@ impl Executor {
         }
 
         if returning.is_some() {
+            let column_types = Some(
+                ret_cols
+                    .iter()
+                    .map(|col_name| {
+                        schema
+                            .columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                            .map(|c| c.data_type.clone())
+                            .unwrap_or(DataType::Text)
+                    })
+                    .collect(),
+            );
             Ok(ExecuteResult::Select {
-                column_types: None,
+                column_types,
                 columns: ret_cols,
                 rows: ret_rows,
             })
@@ -1120,8 +1135,21 @@ impl Executor {
         }
 
         if returning.is_some() {
+            let column_types = Some(
+                ret_cols
+                    .iter()
+                    .map(|col_name| {
+                        schema
+                            .columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                            .map(|c| c.data_type.clone())
+                            .unwrap_or(DataType::Text)
+                    })
+                    .collect(),
+            );
             Ok(ExecuteResult::Select {
-                column_types: None,
+                column_types,
                 columns: ret_cols,
                 rows: ret_rows,
             })
@@ -2021,16 +2049,20 @@ impl Executor {
             None => {}
         }
 
-        // Extract column types from schema if available
         let column_types = Some(
-            cols.iter()
-                .map(|col_name| {
-                    schema
+            select
+                .projection
+                .iter()
+                .flat_map(|item| match item {
+                    SelectItem::Wildcard(_) => schema
                         .columns
                         .iter()
-                        .find(|c| c.name.eq_ignore_ascii_case(col_name))
                         .map(|c| c.data_type.clone())
-                        .unwrap_or(DataType::Text)
+                        .collect::<Vec<_>>(),
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                        vec![infer_expr_type(expr, &schema)]
+                    }
+                    _ => vec![DataType::Text],
                 })
                 .collect(),
         );
@@ -2589,6 +2621,12 @@ impl Executor {
                 _ => return Err(anyhow!("Unsupported JOIN type")),
             };
             let _ = is_natural;
+
+            let join_condition = if let Some(cond) = join_condition {
+                Some(self.resolve_subqueries(txn, &cond).await?)
+            } else {
+                None
+            };
 
             let is_left_join = matches!(&join.join_operator, JoinOperator::LeftOuter(_));
             let is_right_join = matches!(&join.join_operator, JoinOperator::RightOuter(_));

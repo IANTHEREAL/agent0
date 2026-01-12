@@ -77,6 +77,36 @@ fn parse_tenant_username(username: &str) -> (Option<String>, String) {
     (None, username.to_string())
 }
 
+fn find_keyword_outside_strings(query: &str, keyword: &str) -> Option<usize> {
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut i = 0;
+    let chars: Vec<char> = query.chars().collect();
+    let keyword_chars: Vec<char> = keyword.chars().collect();
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        if c == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+        } else if c == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+        }
+
+        if !in_single_quote && !in_double_quote {
+            if i + keyword_chars.len() <= chars.len() {
+                let slice: String = chars[i..i + keyword_chars.len()].iter().collect();
+                if slice == keyword {
+                    return Some(i);
+                }
+            }
+        }
+
+        i += 1;
+    }
+    None
+}
+
 pub struct DynamicPgHandler {
     client_pool: Option<Arc<TikvClientPool>>,
     pd_endpoints: Vec<String>,
@@ -164,19 +194,20 @@ impl DynamicPgHandler {
             )];
         }
 
-        // For queries with RETURNING, parse the RETURNING clause and infer types from table schema
         if has_returning {
-            if let Some(returning_pos) = query_upper.find("RETURNING") {
-                // Extract table name from the query
+            if let Some(returning_pos) = find_keyword_outside_strings(&query_upper, "RETURNING") {
                 let table_name = if let Some(into_pos) = query_upper.find("INSERT INTO") {
                     let after_into = &query[into_pos + 11..].trim();
-                    after_into.split_whitespace().next()
+                    let first_token = after_into.split_whitespace().next().unwrap_or("");
+                    Some(first_token.split('(').next().unwrap_or(first_token))
                 } else if let Some(update_pos) = query_upper.find("UPDATE") {
                     let after_update = &query[update_pos + 6..].trim();
-                    after_update.split_whitespace().next()
+                    let first_token = after_update.split_whitespace().next().unwrap_or("");
+                    Some(first_token.split('(').next().unwrap_or(first_token))
                 } else if let Some(delete_pos) = query_upper.find("DELETE FROM") {
                     let after_from = &query[delete_pos + 11..].trim();
-                    after_from.split_whitespace().next()
+                    let first_token = after_from.split_whitespace().next().unwrap_or("");
+                    Some(first_token.split('(').next().unwrap_or(first_token))
                 } else {
                     None
                 };
@@ -202,33 +233,24 @@ impl DynamicPgHandler {
                     })
                     .collect();
 
-                // Try to get table schema for type inference
                 if let Some(tbl) = table_name {
                     let table_name_clean = tbl.trim_matches('"').trim_matches('\'').to_lowercase();
 
-                    // Try to get schema by creating a temporary transaction if needed
                     let store = executor.store();
                     let schema_opt = if let Some(session) = session_guard.as_mut() {
-                        // Check if we have an active transaction
                         match session.get_mut_txn() {
-                            Some(txn) => {
-                                // Use existing transaction
-                                store
-                                    .get_schema(txn, &table_name_clean)
-                                    .await
-                                    .ok()
-                                    .flatten()
-                            }
+                            Some(txn) => store
+                                .get_schema(txn, &table_name_clean)
+                                .await
+                                .ok()
+                                .flatten(),
                             None => {
-                                // Create temporary transaction for schema lookup
                                 if let Ok(mut temp_txn) = store.begin().await {
-                                    let schema = store
+                                    store
                                         .get_schema(&mut temp_txn, &table_name_clean)
                                         .await
                                         .ok()
-                                        .flatten();
-                                    // Don't commit or rollback - just let it drop
-                                    schema
+                                        .flatten()
                                 } else {
                                     None
                                 }
@@ -239,7 +261,6 @@ impl DynamicPgHandler {
                     };
 
                     if let Some(schema) = schema_opt {
-                        // Handle RETURNING * by expanding to all column names
                         let expanded_columns: Vec<String> =
                             if columns.len() == 1 && columns[0] == "*" {
                                 schema.columns.iter().map(|c| c.name.clone()).collect()
@@ -275,7 +296,6 @@ impl DynamicPgHandler {
                     }
                 }
 
-                // Fallback to TEXT if schema lookup failed
                 return columns
                     .iter()
                     .map(|name| {
@@ -299,7 +319,6 @@ impl DynamicPgHandler {
                 column_types,
                 rows,
             }) => {
-                // Use column_types if available, otherwise infer from first row
                 if let Some(types) = column_types {
                     columns
                         .iter()
@@ -1067,7 +1086,17 @@ fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
                 .parameter::<String>(i, &param_type)
                 .ok()
                 .flatten()
-                .map(|v| format!("'{}'", v.replace("'", "''")))
+                .map(|v| {
+                    // If the value looks like a number, don't quote it
+                    // This handles the case where the client sends all params as TEXT
+                    if v.parse::<i64>().is_ok() || v.parse::<f64>().is_ok() {
+                        v
+                    } else if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false") {
+                        v.to_lowercase()
+                    } else {
+                        format!("'{}'", v.replace("'", "''"))
+                    }
+                })
                 .unwrap_or_else(|| "NULL".to_string()),
         };
 
@@ -1217,7 +1246,6 @@ impl PgHandler {
                 column_types,
                 rows,
             }) => {
-                // Use column_types if available, otherwise infer from first row
                 if let Some(types) = column_types {
                     columns
                         .iter()
@@ -1697,58 +1725,45 @@ fn datatype_to_pgtype(dt: Option<&DataType>) -> Type {
 }
 
 fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> {
-    tracing::info!("==== result_to_response called ====");
     match result {
         ExecuteResult::Select {
             columns,
             column_types: _,
             rows,
         } => {
-            tracing::info!("==== ExecuteResult::Select branch ====");
             let inferred_types: Vec<Type> = if let Some(first_row) = rows.first() {
-                first_row
+                let types: Vec<Type> = first_row
                     .values
                     .iter()
-                    .map(|v| datatype_to_pgtype(v.data_type().as_ref()))
-                    .collect()
+                    .map(|v| {
+                        let dt = v.data_type();
+                        datatype_to_pgtype(dt.as_ref())
+                    })
+                    .collect();
+                types
             } else {
                 vec![Type::TEXT; columns.len()]
             };
 
-            // Fix column names for common functions that return ?column?
-            tracing::info!("result_to_response: columns = {:?}", columns);
             let fixed_columns: Vec<String> = if columns.len() == 1 && columns[0] == "?column?" {
-                tracing::info!("  Found ?column?, checking first row value");
-                // Try to infer from the actual value for single-column selects
                 if let Some(first_row) = rows.first() {
                     if let Some(first_val) = first_row.values.first() {
-                        tracing::info!("  First value: {:?}", first_val);
-                        // Check if this looks like a common function result
                         match first_val {
                             Value::Text(s) if s.starts_with("PostgreSQL") => {
-                                tracing::info!("  Detected PostgreSQL version string, setting column name to 'version'");
                                 vec!["version".to_string()]
                             }
                             Value::Text(s) if s == "postgres" || !s.contains(' ') => {
-                                tracing::info!("  Detected database name or similar");
-                                // Likely current_database() or similar
                                 vec!["?column?".to_string()]
                             }
-                            _ => {
-                                tracing::info!("  Other value type, keeping ?column?");
-                                columns
-                            }
+                            _ => columns,
                         }
                     } else {
-                        tracing::info!("  No first value");
                         columns
                     }
                 } else {
-                    tracing::info!("  No rows");
                     columns
                 }
             } else {
-                tracing::info!("  Not ?column? or multiple columns");
                 columns
             };
 
