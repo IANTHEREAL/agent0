@@ -20,6 +20,7 @@ test_*.sql
 
 # Test outputs (auto-generated)
 tests/*.out
+test-reports/
 
 # Python
 __pycache__/
