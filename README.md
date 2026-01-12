@@ -229,7 +229,7 @@ src/
     └── mod.rs           # Value, Row, Schema types
 
 tests/                   # SQL integration tests
-orm-tests/               # ORM compatibility tests (TypeORM, Prisma, etc.)
+orm-tests/               # ORM compatibility tests (pg, TypeORM, Prisma, Sequelize, Knex, Drizzle, Kysely)
 ```
 
 ## ORM Compatibility
@@ -238,13 +238,15 @@ pg-tikv is tested against popular TypeScript/JavaScript ORMs:
 
 | ORM | Tests | Status |
 |-----|-------|--------|
+| **pg** (node-postgres) | 60+ | ✅ All passing |
 | TypeORM | 147 | ✅ All passing |
 | Prisma | 89 | ✅ All passing |
 | Sequelize | 87 | ✅ All passing |
 | Knex.js | 97 | ✅ All passing |
 | Drizzle | 75 | ✅ All passing |
+| **Kysely** | 60+ | ✅ All passing |
 
-**Total: 498 ORM tests passing**
+**Total: 600+ ORM tests passing**
 
 Features tested include:
 - Connection pooling and error handling

@@ -1,2 +1,23 @@
 node_modules/
 test-results.json
+test-results.txt
+test-output.txt
+test-output-*.txt
+
+# Temporary debug files
+test-*.js
+test-*.mjs
+test-*.ts
+test_*.mjs
+test_*.js
+*-debug.*
+
+# Documentation snapshots
+FINAL-SESSION-SUMMARY.md
+ORM-VECTOR-TEST-PROGRESS-*.md
+README-TEST-PATTERNS.md
+
+# Build outputs
+dist/
+build/
+*.log

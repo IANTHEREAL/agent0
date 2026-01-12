@@ -48,11 +48,13 @@ PG_HOST=192.168.1.100 PG_PORT=5432 npm test
 
 | ORM | Version | Test Files |
 |-----|---------|------------|
+| **pg** (node-postgres) | ^8.11.0 | `pg-client/*.test.ts` |
 | TypeORM | ^0.3.17 | `typeorm/*.test.ts` |
 | Prisma | ^5.7.0 | `prisma/*.test.ts` |
 | Sequelize | ^6.35.0 | `sequelize/*.test.ts` |
 | Knex.js | ^3.1.0 | `knex/*.test.ts` |
 | Drizzle | ^0.29.0 | `drizzle/*.test.ts` |
+| **Kysely** | ^0.27.0 | `kysely/*.test.ts` |
 
 ## Test Categories
 
@@ -98,11 +100,13 @@ npm test
 ### Single ORM
 
 ```bash
+npm test -- pg-client/
 npm test -- typeorm/
 npm test -- prisma/
 npm test -- sequelize/
 npm test -- knex/
 npm test -- drizzle/
+npm test -- kysely/
 ```
 
 ### Specific Test File
@@ -159,7 +163,12 @@ Test results are automatically saved to `test-results.json` after each run.
 orm-tests/
 ├── shared/
 │   ├── config.ts           # Database connection config
-│   └── generate-report.ts  # Report generator
+│   ├── test-utils.ts       # Test utilities
+│   ├── generate-report.ts  # Report generator
+│   └── types.ts            # Shared types
+├── pg-client/
+│   ├── client.ts           # pg Pool setup
+│   └── basic.test.ts       # Basic PostgreSQL client tests
 ├── typeorm/
 │   ├── datasource.ts       # TypeORM DataSource setup
 │   ├── entities/           # Entity definitions
@@ -171,6 +180,7 @@ orm-tests/
 │   ├── schema.test.ts
 │   ├── error.test.ts
 │   ├── types.test.ts
+│   ├── vector.test.ts      # pgvector support
 │   └── advanced.test.ts    # Window functions, CTEs, etc.
 ├── prisma/
 │   ├── schema.prisma       # Prisma schema
@@ -179,6 +189,7 @@ orm-tests/
 │   ├── crud.test.ts
 │   ├── query.test.ts
 │   ├── transaction.test.ts
+│   ├── vector.test.ts      # pgvector support
 │   └── advanced.test.ts
 ├── sequelize/
 │   ├── connection.ts       # Sequelize setup
@@ -194,6 +205,7 @@ orm-tests/
 │   ├── crud.test.ts
 │   ├── query.test.ts
 │   ├── transaction.test.ts
+│   ├── vector.test.ts      # pgvector support
 │   └── advanced.test.ts
 ├── drizzle/
 │   ├── schema.ts           # Drizzle schema
@@ -201,7 +213,12 @@ orm-tests/
 │   ├── connection.test.ts
 │   ├── crud.test.ts
 │   ├── transaction.test.ts
+│   ├── vector.test.ts      # pgvector support
 │   └── advanced.test.ts
+├── kysely/
+│   ├── types.ts            # Kysely type definitions
+│   ├── client.ts           # Kysely client setup
+│   └── crud.test.ts        # CRUD and advanced tests
 ├── package.json
 ├── tsconfig.json
 ├── vitest.config.ts

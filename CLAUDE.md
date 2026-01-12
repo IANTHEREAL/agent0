@@ -198,7 +198,7 @@ Built-in functions are implemented in `expr.rs` in the `eval_function()` method:
 
 Integration test files (`tests/*.sql`) are plain SQL scripts that run sequentially. The test runner (`scripts/integration_test.py`) executes each file against a running server. Tests should be idempotent when possible (use IF EXISTS, DROP before CREATE).
 
-ORM tests (`orm-tests/`) verify compatibility with real-world TypeScript ORMs including TypeORM, Prisma, Sequelize, Knex, and Drizzle.
+ORM tests (`orm-tests/`) verify compatibility with real-world TypeScript ORMs including pg (node-postgres), TypeORM, Prisma, Sequelize, Knex, Drizzle, and Kysely.
 
 ## Important Notes
 
