@@ -1988,6 +1988,12 @@ impl Executor {
         // Only use fast-path if projection is exactly `*` with no other items
         let pure_wildcard = wildcard && select.projection.len() == 1;
 
+        // Apply DISTINCT ON before projection (rows still have all original columns)
+        let rows_for_projection = match &select.distinct {
+            Some(Distinct::On(on_exprs)) => distinct_on_rows(final_rows, on_exprs, Some(&schema)),
+            _ => final_rows,
+        };
+
         let mut cols = Vec::new();
         let mut result_rows = Vec::new();
 
@@ -1995,7 +2001,7 @@ impl Executor {
             for c in &schema.columns {
                 cols.push(c.name.clone());
             }
-            result_rows = final_rows;
+            result_rows = rows_for_projection;
         } else {
             for item in &select.projection {
                 match item {
@@ -2012,7 +2018,7 @@ impl Executor {
                 }
             }
 
-            for (row_idx, row) in final_rows.iter().enumerate() {
+            for (row_idx, row) in rows_for_projection.iter().enumerate() {
                 let mut row_values = Vec::new();
                 for (proj_idx, item) in resolved_projection.iter().enumerate() {
                     if let Some(wf_pos) = window_funcs.iter().position(|wf| wf.proj_idx == proj_idx)
@@ -2039,14 +2045,8 @@ impl Executor {
             }
         }
 
-        match &select.distinct {
-            Some(Distinct::On(on_exprs)) => {
-                result_rows = distinct_on_rows(result_rows, on_exprs, Some(&schema));
-            }
-            Some(Distinct::Distinct) => {
-                result_rows = dedup_rows(result_rows);
-            }
-            None => {}
+        if matches!(&select.distinct, Some(Distinct::Distinct)) {
+            result_rows = dedup_rows(result_rows);
         }
 
         let column_types = Some(
