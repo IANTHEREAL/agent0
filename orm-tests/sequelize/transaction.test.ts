@@ -34,6 +34,7 @@ describe('Sequelize Transactions & Isolation [pg-tikv]', () => {
     });
 
     it('should rollback transaction on error', async () => {
+      let errorThrown = false;
       try {
         await sequelize.transaction(async (t) => {
           await User.create(
@@ -42,8 +43,15 @@ describe('Sequelize Transactions & Isolation [pg-tikv]', () => {
           );
           throw new Error('Intentional error');
         });
-      } catch {
+      } catch (error) {
+        errorThrown = true;
+        // Verify the error was thrown
+        expect(error).toBeDefined();
+        expect((error as Error).message).toBe('Intentional error');
       }
+
+      // Verify error was actually thrown
+      expect(errorThrown).toBe(true);
 
       const user = await User.findOne({ where: { email: 'rollback@example.com' } });
       expect(user).toBeNull();
@@ -111,6 +119,7 @@ describe('Sequelize Transactions & Isolation [pg-tikv]', () => {
           { transaction: t1 }
         );
 
+        let innerErrorThrown = false;
         try {
           await sequelize.transaction({ transaction: t1 }, async (t2) => {
             await User.create(
@@ -119,8 +128,15 @@ describe('Sequelize Transactions & Isolation [pg-tikv]', () => {
             );
             throw new Error('Rollback inner');
           });
-        } catch {
+        } catch (error) {
+          innerErrorThrown = true;
+          // Verify inner transaction error was thrown
+          expect(error).toBeDefined();
+          expect((error as Error).message).toBe('Rollback inner');
         }
+
+        // Verify inner error was actually thrown
+        expect(innerErrorThrown).toBe(true);
       });
 
       const outer = await User.findOne({ where: { email: 'outer@example.com' } });

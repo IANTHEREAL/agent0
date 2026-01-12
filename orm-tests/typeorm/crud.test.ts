@@ -7,8 +7,57 @@ describe('TypeORM CRUD Semantics [pg-tikv]', () => {
   let dataSource: DataSource;
 
   beforeAll(async () => {
-    dataSource = createDataSource({ synchronize: true });
+    dataSource = createDataSource({ synchronize: false });
     await dataSource.initialize();
+
+    await dataSource.query('DROP TABLE IF EXISTS typeorm_post_tags CASCADE');
+    await dataSource.query('DROP TABLE IF EXISTS typeorm_posts CASCADE');
+    await dataSource.query('DROP TABLE IF EXISTS typeorm_tags CASCADE');
+    await dataSource.query('DROP TABLE IF EXISTS typeorm_users CASCADE');
+
+    await dataSource.query(`
+      CREATE TABLE typeorm_users (
+        id SERIAL PRIMARY KEY,
+        email VARCHAR(255) UNIQUE NOT NULL,
+        name VARCHAR(100) NOT NULL,
+        age INT DEFAULT 0,
+        "isActive" BOOLEAN DEFAULT true,
+        bio TEXT,
+        metadata JSONB,
+        "externalId" UUID,
+        "createdAt" TIMESTAMPTZ DEFAULT NOW(),
+        "updatedAt" TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    await dataSource.query(`
+      CREATE TABLE typeorm_tags (
+        id SERIAL PRIMARY KEY,
+        name VARCHAR(100) UNIQUE NOT NULL,
+        color VARCHAR(7) DEFAULT '#000000'
+      )
+    `);
+
+    await dataSource.query(`
+      CREATE TABLE typeorm_posts (
+        id SERIAL PRIMARY KEY,
+        title VARCHAR(500) NOT NULL,
+        content TEXT NOT NULL,
+        published BOOLEAN DEFAULT false,
+        "viewCount" INT DEFAULT 0,
+        settings JSONB,
+        "createdAt" TIMESTAMPTZ DEFAULT NOW(),
+        "authorId" INT NOT NULL REFERENCES typeorm_users(id) ON DELETE CASCADE
+      )
+    `);
+
+    await dataSource.query(`
+      CREATE TABLE typeorm_post_tags (
+        "postId" INT NOT NULL REFERENCES typeorm_posts(id) ON DELETE CASCADE,
+        "tagId" INT NOT NULL REFERENCES typeorm_tags(id) ON DELETE CASCADE,
+        PRIMARY KEY ("postId", "tagId")
+      )
+    `);
   });
 
   afterAll(async () => {

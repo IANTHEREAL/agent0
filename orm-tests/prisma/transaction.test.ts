@@ -52,6 +52,7 @@ describe('Prisma Transactions & Isolation [pg-tikv]', () => {
     });
 
     it('should rollback interactive transaction on error', async () => {
+      let errorThrown = false;
       try {
         await prisma.$transaction(async (tx) => {
           await tx.prismaUser.create({
@@ -63,8 +64,15 @@ describe('Prisma Transactions & Isolation [pg-tikv]', () => {
           });
           throw new Error('Intentional error');
         });
-      } catch {
+      } catch (error) {
+        errorThrown = true;
+        // Verify the error was thrown
+        expect(error).toBeDefined();
+        expect((error as Error).message).toBe('Intentional error');
       }
+
+      // Verify error was actually thrown
+      expect(errorThrown).toBe(true);
 
       const user = await prisma.prismaUser.findUnique({
         where: { email: 'rollback@example.com' },
@@ -120,6 +128,7 @@ describe('Prisma Transactions & Isolation [pg-tikv]', () => {
     });
 
     it('should rollback batch transaction on any failure', async () => {
+      let errorThrown = false;
       try {
         await prisma.$transaction([
           prisma.prismaUser.create({
@@ -129,8 +138,14 @@ describe('Prisma Transactions & Isolation [pg-tikv]', () => {
             data: { email: 'batchfail1@example.com', name: 'Duplicate', age: 30 },
           }),
         ]);
-      } catch {
+      } catch (error) {
+        errorThrown = true;
+        // Verify error for duplicate email was thrown
+        expect(error).toBeDefined();
       }
+
+      // Verify error was actually thrown
+      expect(errorThrown).toBe(true);
 
       const count = await prisma.prismaUser.count();
       expect(count).toBe(0);

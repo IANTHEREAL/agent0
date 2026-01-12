@@ -252,6 +252,19 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             let val = eval_expr_join(expr, ctx)?;
             let ts = match val {
                 Value::Timestamp(t) => t,
+                Value::Text(s) => {
+                    // Parse text timestamp
+                    use chrono::NaiveDateTime;
+                    let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S"))
+                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f"))
+                        .or_else(|_| {
+                            chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                                .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                        })
+                        .map_err(|e| anyhow!("Invalid timestamp format: {}", e))?;
+                    dt.and_utc().timestamp_millis()
+                }
                 _ => return Ok(Value::Null),
             };
             use chrono::{Datelike, TimeZone, Timelike, Utc};
@@ -527,6 +540,11 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
     match expr {
         Expr::Value(v) => eval_value(v),
         Expr::Identifier(ident) => {
+            // Handle DEFAULT keyword specially - return Null which signals to use default value
+            if ident.value.to_uppercase() == "DEFAULT" {
+                return Ok(Value::Null);
+            }
+
             if let (Some(row), Some(schema)) = (row, schema) {
                 let idx = schema
                     .column_index(&ident.value)
@@ -764,6 +782,19 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             let val = eval_expr(expr, row, schema)?;
             let ts = match val {
                 Value::Timestamp(t) => t,
+                Value::Text(s) => {
+                    // Parse text timestamp
+                    use chrono::NaiveDateTime;
+                    let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S"))
+                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f"))
+                        .or_else(|_| {
+                            chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                                .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                        })
+                        .map_err(|e| anyhow!("Invalid timestamp format: {}", e))?;
+                    dt.and_utc().timestamp_millis()
+                }
                 _ => return Ok(Value::Null),
             };
             use chrono::{Datelike, TimeZone, Timelike, Utc};
@@ -1079,6 +1110,21 @@ fn eval_function(
             Some(Value::Text(s)) => Ok(Value::Text(s.chars().rev().collect())),
             _ => Ok(Value::Null),
         },
+        "TRIM" | "BTRIM" => match args.into_iter().next() {
+            Some(Value::Text(s)) => Ok(Value::Text(s.trim().to_string())),
+            Some(Value::Null) => Ok(Value::Null),
+            _ => Err(anyhow!("trim requires text argument")),
+        },
+        "LTRIM" => match args.into_iter().next() {
+            Some(Value::Text(s)) => Ok(Value::Text(s.trim_start().to_string())),
+            Some(Value::Null) => Ok(Value::Null),
+            _ => Err(anyhow!("ltrim requires text argument")),
+        },
+        "RTRIM" => match args.into_iter().next() {
+            Some(Value::Text(s)) => Ok(Value::Text(s.trim_end().to_string())),
+            Some(Value::Null) => Ok(Value::Null),
+            _ => Err(anyhow!("rtrim requires text argument")),
+        },
         "REPEAT" => {
             let mut iter = args.into_iter();
             let s = match iter.next() {
@@ -1297,6 +1343,20 @@ fn eval_function(
             };
             let ts = match iter.next() {
                 Some(Value::Timestamp(t)) => t,
+                Some(Value::Text(s)) => {
+                    // Parse text timestamp
+                    use chrono::NaiveDateTime;
+                    let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S"))
+                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f"))
+                        .or_else(|_| {
+                            // Try date only, add time component
+                            chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                                .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                        })
+                        .map_err(|e| anyhow!("Invalid timestamp format: {}", e))?;
+                    dt.and_utc().timestamp_millis()
+                }
                 _ => return Ok(Value::Null),
             };
             use chrono::{Datelike, TimeZone, Timelike, Utc};
@@ -1405,7 +1465,9 @@ fn eval_function(
         "SET_CONFIG" => Ok(Value::Text(String::new())),
         "PG_IS_IN_RECOVERY" => Ok(Value::Boolean(false)),
         "PG_BACKEND_PID" => Ok(Value::Int32(std::process::id() as i32)),
-        "VERSION" => Ok(Value::Text("PostgreSQL 15.0 (pg-tikv)".to_string())),
+        "VERSION" => Ok(Value::Text(
+            "PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit".to_string(),
+        )),
         "CURRENT_DATABASE" => Ok(Value::Text("postgres".to_string())),
         "CURRENT_SCHEMA" => Ok(Value::Text("public".to_string())),
         "CURRENT_USER" | "SESSION_USER" | "USER" => Ok(Value::Text("postgres".to_string())),
@@ -2287,6 +2349,16 @@ fn eval_json_access(left: Value, operator: &JsonOperator, right: Value) -> Resul
         Value::Json(s) => s.clone(),
         Value::Jsonb(s) => s.clone(),
         Value::Null => return Ok(Value::Null),
+        Value::Vector(v) => {
+            // Treat vectors as JSON arrays for JSON operator compatibility
+            format!(
+                "[{}]",
+                v.iter()
+                    .map(|f| f.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        }
         _ => return Err(anyhow!("JSON operators require json/jsonb operand")),
     };
 
@@ -2352,7 +2424,11 @@ fn eval_json_access(left: Value, operator: &JsonOperator, right: Value) -> Resul
             match accessed {
                 None => Ok(Value::Null),
                 Some(val) => match operator {
-                    JsonOperator::Arrow => Ok(Value::Text(val.to_string())),
+                    JsonOperator::Arrow => {
+                        // -> operator returns JSONB type
+                        // Client drivers will parse the JSONB value and extract the actual value
+                        Ok(Value::Jsonb(val.to_string()))
+                    }
                     JsonOperator::LongArrow => match val {
                         serde_json::Value::Null => Ok(Value::Null),
                         serde_json::Value::Bool(b) => Ok(Value::Text(b.to_string())),
@@ -2510,7 +2586,26 @@ fn extract_vector(val: &Value) -> Result<Vec<f64>> {
                 })
                 .collect()
         }
-        _ => Err(anyhow!("Expected vector or array type")),
+        Value::Text(s) => {
+            // Parse text representation like "[1.0, 2.0, 3.0]"
+            let s = s.trim();
+            if !s.starts_with('[') || !s.ends_with(']') {
+                return Err(anyhow!("Invalid vector format: expected [...]"));
+            }
+            let inner = &s[1..s.len() - 1];
+            if inner.is_empty() {
+                return Ok(Vec::new());
+            }
+            inner
+                .split(',')
+                .map(|elem| {
+                    elem.trim()
+                        .parse::<f64>()
+                        .map_err(|_| anyhow!("Invalid vector element: {}", elem))
+                })
+                .collect()
+        }
+        _ => Err(anyhow!("Expected vector, array, or text type")),
     }
 }
 
@@ -3208,7 +3303,7 @@ mod tests {
                 None
             )
             .unwrap(),
-            Value::Text("\"Alice\"".to_string())
+            Value::Jsonb("\"Alice\"".to_string())
         );
     }
 
@@ -3229,11 +3324,11 @@ mod tests {
     fn test_json_arrow_array_index() {
         assert_eq!(
             eval_expr(&parse_expr(r#"'[1, 2, 3]' -> 0"#), None, None).unwrap(),
-            Value::Text("1".to_string())
+            Value::Jsonb("1".to_string())
         );
         assert_eq!(
             eval_expr(&parse_expr(r#"'["a", "b", "c"]' -> 1"#), None, None).unwrap(),
-            Value::Text("\"b\"".to_string())
+            Value::Jsonb("\"b\"".to_string())
         );
     }
 
@@ -3253,7 +3348,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(intermediate, Value::Text("{\"name\":\"Bob\"}".to_string()));
+        assert_eq!(intermediate, Value::Jsonb("{\"name\":\"Bob\"}".to_string()));
 
         assert_eq!(
             eval_expr(&parse_expr(r#"'{"name": "Bob"}' ->> 'name'"#), None, None).unwrap(),
@@ -3535,12 +3630,23 @@ mod tests {
         assert_eq!(extracted2, vec![1.0, 2.0, 3.0]);
 
         // Test with Int32 array
-        let arr_int = Value::Array(vec![
-            Value::Int32(1),
-            Value::Int32(2),
-            Value::Int32(3),
-        ]);
+        let arr_int = Value::Array(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)]);
         let extracted3 = extract_vector(&arr_int).unwrap();
         assert_eq!(extracted3, vec![1.0, 2.0, 3.0]);
+
+        // Test with Text value (NEW - for ORM compatibility)
+        let text_val = Value::Text("[1.5, 2.5, 3.5]".to_string());
+        let extracted4 = extract_vector(&text_val).unwrap();
+        assert_eq!(extracted4, vec![1.5, 2.5, 3.5]);
+
+        // Test with Text value with spaces
+        let text_val2 = Value::Text(" [ 1.0 , 2.0 , 3.0 ] ".to_string());
+        let extracted5 = extract_vector(&text_val2).unwrap();
+        assert_eq!(extracted5, vec![1.0, 2.0, 3.0]);
+
+        // Test with empty text vector
+        let text_empty = Value::Text("[]".to_string());
+        let extracted6 = extract_vector(&text_empty).unwrap();
+        assert_eq!(extracted6, Vec::<f64>::new());
     }
 }

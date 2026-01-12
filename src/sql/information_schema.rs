@@ -7,6 +7,7 @@ use tikv_client::Transaction;
 pub fn is_information_schema_table(table_name: &str) -> bool {
     let lower = table_name.to_lowercase();
     lower.starts_with("information_schema.")
+        || lower.starts_with("pg_catalog.")
         || matches!(
             lower.as_str(),
             "tables"
@@ -17,6 +18,14 @@ pub fn is_information_schema_table(table_name: &str) -> bool {
                 | "referential_constraints"
                 | "constraint_column_usage"
                 | "check_constraints"
+                | "pg_range"
+                | "pg_type"
+                | "pg_class"
+                | "pg_index"
+                | "pg_attribute"
+                | "pg_namespace"
+                | "pg_proc"
+                | "pg_description"
         )
 }
 
@@ -35,7 +44,30 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
             _ => return None,
         });
     }
-    None
+    if let Some(name) = lower.strip_prefix("pg_catalog.") {
+        return Some(match name {
+            "pg_range" => "pg_range",
+            "pg_type" => "pg_type",
+            "pg_class" => "pg_class",
+            "pg_index" => "pg_index",
+            "pg_attribute" => "pg_attribute",
+            "pg_namespace" => "pg_namespace",
+            "pg_proc" => "pg_proc",
+            "pg_description" => "pg_description",
+            _ => return None,
+        });
+    }
+
+    // Handle unqualified catalog table names
+    match lower.as_str() {
+        "pg_class" => Some("pg_class"),
+        "pg_index" => Some("pg_index"),
+        "pg_attribute" => Some("pg_attribute"),
+        "pg_namespace" => Some("pg_namespace"),
+        "pg_proc" => Some("pg_proc"),
+        "pg_description" => Some("pg_description"),
+        _ => None,
+    }
 }
 
 fn text_col(name: &str) -> ColumnDef {
@@ -276,9 +308,185 @@ fn check_constraints_schema() -> TableSchema {
     }
 }
 
+fn pg_range_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_range".to_string(),
+        columns: vec![
+            int_col("rngtypid"),
+            int_col("rngsubtype"),
+            int_col("rngcollation"),
+            int_col("rngsubopc"),
+            text_col("rngcanonical"),
+            text_col("rngsubdiff"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
+fn pg_type_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_type".to_string(),
+        columns: vec![
+            int_col("oid"),
+            text_col("typname"),
+            int_col("typnamespace"),
+            int_col("typowner"),
+            int_col("typlen"),
+            text_col("typbyval"),
+            text_col("typtype"),
+            text_col("typcategory"),
+            text_col("typispreferred"),
+            text_col("typisdefined"),
+            text_col("typdelim"),
+            int_col("typrelid"),
+            int_col("typelem"),
+            int_col("typarray"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
+fn pg_class_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_class".to_string(),
+        columns: vec![
+            int_col("oid"),
+            text_col("relname"),
+            int_col("relnamespace"),
+            text_col("relkind"),
+            int_col("relowner"),
+            int_col("relam"),
+            int_col("reltuples"),
+            int_col("relpages"),
+            text_col("relhasindex"),
+            text_col("relispopulated"),
+            text_col("relreplident"),
+            text_col("relispartition"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
+fn pg_index_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_index".to_string(),
+        columns: vec![
+            int_col("indexrelid"),
+            int_col("indrelid"),
+            int_col("indnatts"),
+            text_col("indisunique"),
+            text_col("indisprimary"),
+            text_col("indisexclusion"),
+            text_col("indimmediate"),
+            text_col("indisclustered"),
+            text_col("indisvalid"),
+            text_col("indkey"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
+fn pg_attribute_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_attribute".to_string(),
+        columns: vec![
+            int_col("attrelid"),
+            text_col("attname"),
+            int_col("atttypid"),
+            int_col("attnum"),
+            int_col("attlen"),
+            text_col("attnotnull"),
+            text_col("atthasdef"),
+            text_col("attisdropped"),
+            text_col("attislocal"),
+            int_col("atttypmod"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
+fn pg_namespace_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_namespace".to_string(),
+        columns: vec![int_col("oid"), text_col("nspname"), int_col("nspowner")],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
+fn pg_proc_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_proc".to_string(),
+        columns: vec![
+            int_col("oid"),
+            text_col("proname"),
+            int_col("pronamespace"),
+            int_col("proowner"),
+            int_col("prorettype"),
+            text_col("prokind"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
+fn pg_description_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_description".to_string(),
+        columns: vec![
+            int_col("objoid"),
+            int_col("classoid"),
+            int_col("objsubid"),
+            text_col("description"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
 pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
     let lower = table_name.to_lowercase();
-    let name = lower.strip_prefix("information_schema.").unwrap_or(&lower);
+    let name = lower
+        .strip_prefix("information_schema.")
+        .or_else(|| lower.strip_prefix("pg_catalog."))
+        .unwrap_or(&lower);
 
     match name {
         "tables" => Some(tables_schema()),
@@ -289,6 +497,14 @@ pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
         "referential_constraints" => Some(referential_constraints_schema()),
         "constraint_column_usage" => Some(constraint_column_usage_schema()),
         "check_constraints" => Some(check_constraints_schema()),
+        "pg_range" => Some(pg_range_schema()),
+        "pg_type" => Some(pg_type_schema()),
+        "pg_class" => Some(pg_class_schema()),
+        "pg_index" => Some(pg_index_schema()),
+        "pg_attribute" => Some(pg_attribute_schema()),
+        "pg_namespace" => Some(pg_namespace_schema()),
+        "pg_proc" => Some(pg_proc_schema()),
+        "pg_description" => Some(pg_description_schema()),
         _ => None,
     }
 }
@@ -334,7 +550,10 @@ pub async fn get_information_schema_data(
     table_name: &str,
 ) -> Result<(TableSchema, Vec<Row>)> {
     let lower = table_name.to_lowercase();
-    let name = lower.strip_prefix("information_schema.").unwrap_or(&lower);
+    let name = lower
+        .strip_prefix("information_schema.")
+        .or_else(|| lower.strip_prefix("pg_catalog."))
+        .unwrap_or(&lower);
 
     let schema =
         get_information_schema_schema(table_name).ok_or_else(|| anyhow!("Unknown table"))?;
@@ -354,6 +573,14 @@ pub async fn get_information_schema_data(
             get_constraint_column_usage_rows(store, txn, &user_tables).await?
         }
         "check_constraints" => get_check_constraints_rows(store, txn, &user_tables).await?,
+        "pg_range" => vec![], // No range types defined
+        "pg_type" => get_pg_type_rows(),
+        "pg_namespace" => get_pg_namespace_rows(),
+        "pg_class" => get_pg_class_rows(store, txn, &user_tables).await?,
+        "pg_index" => get_pg_index_rows(store, txn, &user_tables).await?,
+        "pg_attribute" => get_pg_attribute_rows(store, txn, &user_tables).await?,
+        "pg_proc" => get_pg_proc_rows(),
+        "pg_description" => get_pg_description_rows(),
         _ => vec![],
     };
 
@@ -808,4 +1035,261 @@ async fn get_check_constraints_rows(
     }
 
     Ok(rows)
+}
+
+fn get_pg_namespace_rows() -> Vec<Row> {
+    vec![
+        Row::new(vec![
+            int_val(11), // Standard OID for pg_catalog
+            text_val("pg_catalog"),
+            int_val(10), // System user
+        ]),
+        Row::new(vec![
+            int_val(2200), // Standard OID for public
+            text_val("public"),
+            int_val(10), // System user
+        ]),
+        Row::new(vec![
+            int_val(13222), // Standard OID for information_schema
+            text_val("information_schema"),
+            int_val(10), // System user
+        ]),
+    ]
+}
+
+async fn get_pg_class_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    user_tables: &[String],
+) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+    let mut oid_counter = 16384; // Start from standard PostgreSQL user object OID
+
+    for table_name in user_tables {
+        if let Some(schema) = store.get_schema(txn, table_name).await? {
+            let table_oid = oid_counter;
+            oid_counter += 1;
+
+            // Add the table itself
+            rows.push(Row::new(vec![
+                int_val(table_oid),
+                text_val(table_name),
+                int_val(2200), // public schema OID
+                text_val("r"), // r = ordinary table
+                int_val(10),   // owner
+                int_val(0),    // access method
+                int_val(0),    // tuples (unknown)
+                int_val(0),    // pages (unknown)
+                text_val("t"), // has index (true if any indexes)
+                text_val("t"), // is populated
+                text_val("d"), // replica identity (default)
+                text_val("f"), // is partition (false)
+            ]));
+
+            // Add indexes as separate entries
+            for idx in &schema.indexes {
+                let index_oid = oid_counter;
+                oid_counter += 1;
+                rows.push(Row::new(vec![
+                    int_val(index_oid),
+                    text_val(&idx.name),
+                    int_val(2200), // public schema OID
+                    text_val("i"), // i = index
+                    int_val(10),   // owner
+                    int_val(403),  // btree access method
+                    int_val(0),    // tuples
+                    int_val(0),    // pages
+                    text_val("f"), // has index (false)
+                    text_val("t"), // is populated
+                    text_val("d"), // replica identity
+                    text_val("f"), // is partition
+                ]));
+            }
+
+            // Add primary key index if exists
+            if !schema.pk_indices.is_empty() {
+                let pk_name = format!("{}_pkey", table_name);
+                let pk_oid = oid_counter;
+                oid_counter += 1;
+                rows.push(Row::new(vec![
+                    int_val(pk_oid),
+                    text_val(&pk_name),
+                    int_val(2200),
+                    text_val("i"),
+                    int_val(10),
+                    int_val(403),
+                    int_val(0),
+                    int_val(0),
+                    text_val("f"),
+                    text_val("t"),
+                    text_val("d"),
+                    text_val("f"),
+                ]));
+            }
+        }
+    }
+
+    Ok(rows)
+}
+
+async fn get_pg_index_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    user_tables: &[String],
+) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+    let mut table_oid = 16384;
+
+    for table_name in user_tables {
+        if let Some(schema) = store.get_schema(txn, table_name).await? {
+            let base_table_oid = table_oid;
+            table_oid += 1;
+
+            // Add primary key index
+            if !schema.pk_indices.is_empty() {
+                let pk_oid = table_oid;
+                table_oid += 1;
+
+                let indkey = schema
+                    .pk_indices
+                    .iter()
+                    .map(|idx| (idx + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                rows.push(Row::new(vec![
+                    int_val(pk_oid),
+                    int_val(base_table_oid),
+                    int_val(schema.pk_indices.len() as i64),
+                    text_val("t"), // is unique
+                    text_val("t"), // is primary
+                    text_val("f"), // is exclusion
+                    text_val("t"), // is immediate
+                    text_val("f"), // is clustered
+                    text_val("t"), // is valid
+                    text_val(&indkey),
+                ]));
+            }
+
+            // Add secondary indexes
+            for idx in &schema.indexes {
+                let index_oid = table_oid;
+                table_oid += 1;
+
+                // Map column names to column indices
+                let mut col_indices = Vec::new();
+                for col_name in &idx.columns {
+                    if let Some(pos) = schema.columns.iter().position(|c| &c.name == col_name) {
+                        col_indices.push((pos + 1).to_string());
+                    }
+                }
+                let indkey = col_indices.join(" ");
+
+                rows.push(Row::new(vec![
+                    int_val(index_oid),
+                    int_val(base_table_oid),
+                    int_val(idx.columns.len() as i64),
+                    text_val(if idx.unique { "t" } else { "f" }),
+                    text_val("f"), // is primary
+                    text_val("f"), // is exclusion
+                    text_val("t"), // is immediate
+                    text_val("f"), // is clustered
+                    text_val("t"), // is valid
+                    text_val(&indkey),
+                ]));
+            }
+        }
+    }
+
+    Ok(rows)
+}
+
+async fn get_pg_attribute_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    user_tables: &[String],
+) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+    let mut table_oid: i64 = 16384;
+
+    for table_name in user_tables {
+        if let Some(schema) = store.get_schema(txn, table_name).await? {
+            let base_table_oid = table_oid;
+
+            // Calculate how many OIDs this table uses (1 for table + indexes)
+            let num_indexes =
+                schema.indexes.len() + if !schema.pk_indices.is_empty() { 1 } else { 0 };
+            table_oid += 1 + num_indexes as i64;
+
+            for (i, col) in schema.columns.iter().enumerate() {
+                let type_oid = match col.data_type {
+                    DataType::Boolean => 16,
+                    DataType::Int32 => 23,
+                    DataType::Int64 => 20,
+                    DataType::Float64 => 701,
+                    DataType::Text => 25,
+                    DataType::Bytes => 17,
+                    DataType::Timestamp => 1114,
+                    DataType::Uuid => 2950,
+                    DataType::Json => 114,
+                    DataType::Jsonb => 3802,
+                    DataType::Vector(_) => 16385, // Custom OID for vector
+                    _ => 25,                      // Default to text
+                };
+
+                let attlen = match col.data_type {
+                    DataType::Boolean => 1,
+                    DataType::Int32 => 4,
+                    DataType::Int64 => 8,
+                    DataType::Float64 => 8,
+                    _ => -1, // Variable length
+                };
+
+                rows.push(Row::new(vec![
+                    int_val(base_table_oid),
+                    text_val(&col.name),
+                    int_val(type_oid),
+                    int_val((i + 1) as i64),
+                    int_val(attlen),
+                    text_val(if !col.nullable { "t" } else { "f" }),
+                    text_val(if col.default_expr.is_some() { "t" } else { "f" }),
+                    text_val("f"), // not dropped
+                    text_val("t"), // is local
+                    int_val(-1),   // type modifier
+                ]));
+            }
+        }
+    }
+
+    Ok(rows)
+}
+
+fn get_pg_type_rows() -> Vec<Row> {
+    // Return the vector type so ORMs can discover it
+    vec![Row::new(vec![
+        int_val(16385),     // oid: custom type OID for vector
+        text_val("vector"), // typname
+        int_val(11),        // typnamespace: pg_catalog (OID 11)
+        int_val(10),        // typowner: system user
+        int_val(-1),        // typlen: variable length
+        text_val("f"),      // typbyval: false (not passed by value)
+        text_val("b"),      // typtype: base type
+        text_val("A"),      // typcategory: Array type
+        text_val("f"),      // typispreferred: false
+        text_val("t"),      // typisdefined: true
+        text_val(","),      // typdelim: comma delimiter
+        int_val(0),         // typrelid: not a composite type
+        int_val(0),         // typelem: not an array
+        int_val(0),         // typarray: no array type
+    ])]
+}
+
+fn get_pg_proc_rows() -> Vec<Row> {
+    // Return empty for now - ORMs mostly just check if the table exists
+    vec![]
+}
+
+fn get_pg_description_rows() -> Vec<Row> {
+    // Return empty for now - ORMs mostly just check if the table exists
+    vec![]
 }

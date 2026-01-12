@@ -36,7 +36,11 @@ impl TikvClientPool {
 
         info!("Creating new TiKV client for keyspace: {}", key);
 
-        let actual_keyspace = if key == "default" { None } else { keyspace };
+        let actual_keyspace = if key == "default" {
+            Some("DEFAULT".to_string())
+        } else {
+            keyspace
+        };
 
         let result = TikvStore::new_with_keyspace(self.pd_endpoints.clone(), actual_keyspace).await;
 

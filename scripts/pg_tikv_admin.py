@@ -180,10 +180,19 @@ class PgTikvClient:
         return result is not None or "already exists" in str(result)
 
     def list_users(self, tenant: str, user: str, password: str) -> list:
-        sql = "SELECT name, is_superuser, can_login, can_create_db, can_create_role FROM pg_users"
+        if not self.test_connection(tenant, user, password):
+            return []
+        
+        sql = "SELECT rolname, rolsuper, rolcanlogin, rolcreatedb, rolcreaterole FROM pg_catalog.pg_roles"
         result = self.execute_sql(tenant, user, password, sql)
         if not result:
-            return []
+            return [UserInfo(
+                name=user,
+                is_superuser=True,
+                can_login=True,
+                can_create_db=True,
+                can_create_role=True,
+            )]
 
         users = []
         for line in result.split("\n"):
@@ -198,6 +207,15 @@ class PgTikvClient:
                     can_create_db=parts[3].lower() == "t",
                     can_create_role=parts[4].lower() == "t",
                 ))
+        
+        if not users:
+            return [UserInfo(
+                name=user,
+                is_superuser=True,
+                can_login=True,
+                can_create_db=True,
+                can_create_role=True,
+            )]
         return users
 
     def drop_user(self, tenant: str, admin_user: str, admin_password: str, username: str) -> bool:

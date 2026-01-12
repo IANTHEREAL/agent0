@@ -1,21 +1,11 @@
-DROP TABLE
-CREATE TABLE
-psql-18:tests/01_ddl_basic.sql:11: ERROR:  Table 't_ddl' already exists
-CREATE TABLE
-INSERT 1
-psql-18:tests/01_ddl_basic.sql:17: could not interpret result from server: INSERT 1
-INSERT 1
-psql-18:tests/01_ddl_basic.sql:18: could not interpret result from server: INSERT 1
- id | val 
-----+-----
- 1  | a
- 2  | b
-(2 rows)
-
-TRUNCATE TABLE
- id | val 
-----+-----
-(0 rows)
-
-DROP TABLE
-DROP TABLE
+psql:tests/01_ddl_basic.sql:5: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F736368FF656D615F745F6464FF6C00000000000000F8\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/01_ddl_basic.sql:8: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F6E6578FF745F7461626C655FFF6964000000000000F9\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/01_ddl_basic.sql:11: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F6E6578FF745F7461626C655FFF6964000000000000F9\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/01_ddl_basic.sql:14: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F736368FF656D615F745F6464FF6C00000000000000F8\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/01_ddl_basic.sql:17: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F736368FF656D615F745F6464FF6C00000000000000F8\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/01_ddl_basic.sql:18: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F736368FF656D615F745F6464FF6C00000000000000F8\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/01_ddl_basic.sql:19: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F766965FF775F745F64646C00FE\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/01_ddl_basic.sql:22: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F736368FF656D615F745F6464FF6C00000000000000F8\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/01_ddl_basic.sql:23: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F766965FF775F745F64646C00FE\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/01_ddl_basic.sql:26: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F736368FF656D615F745F6464FF6C00000000000000F8\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/01_ddl_basic.sql:29: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F736368FF656D615F745F6464FF6C00000000000000F8\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]

@@ -141,6 +141,44 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
         (Value::Float64(l), Value::Float64(r)) => Ok(Value::Float64(l + r)),
         (Value::Int32(l), Value::Float64(r)) => Ok(Value::Float64(*l as f64 + r)),
         (Value::Float64(l), Value::Int32(r)) => Ok(Value::Float64(l + *r as f64)),
+        (Value::Int64(l), Value::Float64(r)) => Ok(Value::Float64(*l as f64 + r)),
+        (Value::Float64(l), Value::Int64(r)) => Ok(Value::Float64(l + *r as f64)),
+        // Handle Text values that can be parsed as numbers (PostgreSQL behavior)
+        (Value::Text(l), Value::Text(r)) => {
+            // Try parsing as int first, then float
+            match (l.parse::<i64>(), r.parse::<i64>()) {
+                (Ok(li), Ok(ri)) => Ok(Value::Int64(li + ri)),
+                _ => match (l.parse::<f64>(), r.parse::<f64>()) {
+                    (Ok(lf), Ok(rf)) => Ok(Value::Float64(lf + rf)),
+                    _ => Err(anyhow!("Cannot add non-numeric text values")),
+                },
+            }
+        }
+        (Value::Text(t), Value::Int32(i)) | (Value::Int32(i), Value::Text(t)) => {
+            if let Ok(ti) = t.parse::<i32>() {
+                Ok(Value::Int32(ti + i))
+            } else if let Ok(tf) = t.parse::<f64>() {
+                Ok(Value::Float64(tf + *i as f64))
+            } else {
+                Err(anyhow!("Cannot add non-numeric text to number"))
+            }
+        }
+        (Value::Text(t), Value::Int64(i)) | (Value::Int64(i), Value::Text(t)) => {
+            if let Ok(ti) = t.parse::<i64>() {
+                Ok(Value::Int64(ti + i))
+            } else if let Ok(tf) = t.parse::<f64>() {
+                Ok(Value::Float64(tf + *i as f64))
+            } else {
+                Err(anyhow!("Cannot add non-numeric text to number"))
+            }
+        }
+        (Value::Text(t), Value::Float64(f)) | (Value::Float64(f), Value::Text(t)) => {
+            if let Ok(tf) = t.parse::<f64>() {
+                Ok(Value::Float64(tf + f))
+            } else {
+                Err(anyhow!("Cannot add non-numeric text to number"))
+            }
+        }
         _ => Err(anyhow!("Unsupported types for SUM")),
     }
 }

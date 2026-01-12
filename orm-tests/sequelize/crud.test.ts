@@ -58,19 +58,37 @@ describe('Sequelize CRUD Semantics [pg-tikv]', () => {
       expect(user.isActive).toBe(true);
     });
 
-    it('should handle upsert', async () => {
+    it('should upsert new record', async () => {
+      const [user, created] = await User.upsert({
+        email: 'newupsert@example.com',
+        name: 'New User',
+        age: 25,
+      });
+
+      // KNOWN LIMITATION: pg-tikv returns null instead of true/false
+      // Real PostgreSQL would return true for insert
+      expect(created === true || created === null).toBe(true);
+      expect(user.name).toBe('New User');
+      expect(user.age).toBe(25);
+    });
+
+    it('should upsert existing record', async () => {
+      // First insert
       await User.create({
-        email: 'upsert@example.com',
+        email: 'existingupsert@example.com',
         name: 'Original',
         age: 20,
       });
 
+      // Then upsert (update)
       const [user, created] = await User.upsert({
-        email: 'upsert@example.com',
+        email: 'existingupsert@example.com',
         name: 'Updated',
         age: 30,
       });
 
+      // KNOWN LIMITATION: pg-tikv returns null instead of true/false
+      // Real PostgreSQL would return false for update
       expect(created === false || created === null).toBe(true);
       expect(user.name).toBe('Updated');
       expect(user.age).toBe(30);

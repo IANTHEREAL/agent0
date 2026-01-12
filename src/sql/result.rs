@@ -1,6 +1,6 @@
 //! SQL execution result types
 
-use crate::types::{Row, TableSchema};
+use crate::types::{DataType, Row, TableSchema};
 
 /// Result of executing a SQL statement
 #[derive(Debug)]
@@ -8,6 +8,7 @@ pub enum ExecuteResult {
     /// SELECT result with rows
     Select {
         columns: Vec<String>,
+        column_types: Option<Vec<DataType>>,
         rows: Vec<Row>,
     },
     /// CREATE TABLE result

@@ -153,14 +153,21 @@ describe('TypeORM Error Semantics [pg-tikv]', () => {
         age: 25,
       });
 
+      let errorThrown = false;
       try {
         await userRepo.save({
           email: 'first@example.com',
           name: 'Duplicate',
           age: 30,
         });
-      } catch {
+      } catch (error) {
+        errorThrown = true;
+        // Verify error was thrown for duplicate email
+        expect(error).toBeDefined();
       }
+
+      // Verify error was actually thrown
+      expect(errorThrown).toBe(true);
 
       const user = await userRepo.save({
         email: 'second@example.com',

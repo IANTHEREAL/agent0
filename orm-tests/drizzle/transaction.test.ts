@@ -54,6 +54,7 @@ describe('Drizzle Transactions & Isolation [pg-tikv]', () => {
     });
 
     it('should rollback transaction on error', async () => {
+      let errorThrown = false;
       try {
         await db.transaction(async (tx) => {
           await tx.insert(drizzleUsers).values({
@@ -63,8 +64,15 @@ describe('Drizzle Transactions & Isolation [pg-tikv]', () => {
           });
           throw new Error('Intentional error');
         });
-      } catch {
+      } catch (error) {
+        errorThrown = true;
+        // Verify the error was thrown
+        expect(error).toBeDefined();
+        expect((error as Error).message).toBe('Intentional error');
       }
+
+      // Verify error was actually thrown
+      expect(errorThrown).toBe(true);
 
       const users = await db
         .select()
@@ -107,6 +115,7 @@ describe('Drizzle Transactions & Isolation [pg-tikv]', () => {
           age: 30,
         });
 
+        let nestedErrorThrown = false;
         try {
           await tx.transaction(async (nested) => {
             await nested.insert(drizzleUsers).values({
@@ -116,8 +125,15 @@ describe('Drizzle Transactions & Isolation [pg-tikv]', () => {
             });
             throw new Error('Rollback nested');
           });
-        } catch {
+        } catch (error) {
+          nestedErrorThrown = true;
+          // Verify nested transaction error was thrown
+          expect(error).toBeDefined();
+          expect((error as Error).message).toBe('Rollback nested');
         }
+
+        // Verify nested error was actually thrown
+        expect(nestedErrorThrown).toBe(true);
       });
 
       const outer = await db

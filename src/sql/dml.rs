@@ -17,6 +17,7 @@ fn eval_upsert_expr(
     existing_row: &Row,
     excluded_row: &Row,
     schema: &TableSchema,
+    target_column: Option<&ColumnDef>,
 ) -> Result<Value> {
     match expr {
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
@@ -35,17 +36,27 @@ fn eval_upsert_expr(
             }
         }
         Expr::Identifier(ident) => {
+            if ident.value.eq_ignore_ascii_case("DEFAULT") {
+                if let Some(col) = target_column {
+                    if let Some(default_expr) = &col.default_expr {
+                        return eval_default_expr(default_expr);
+                    }
+                }
+                return Ok(Value::Null);
+            }
             let idx = schema
                 .column_index(&ident.value)
                 .ok_or_else(|| anyhow!("Column '{}' not found", ident.value))?;
             Ok(existing_row.values[idx].clone())
         }
         Expr::BinaryOp { left, op, right } => {
-            let left_val = eval_upsert_expr(left, existing_row, excluded_row, schema)?;
-            let right_val = eval_upsert_expr(right, existing_row, excluded_row, schema)?;
+            let left_val = eval_upsert_expr(left, existing_row, excluded_row, schema, None)?;
+            let right_val = eval_upsert_expr(right, existing_row, excluded_row, schema, None)?;
             super::expr::eval_binary_op_public(left_val, op, right_val)
         }
-        Expr::Nested(inner) => eval_upsert_expr(inner, existing_row, excluded_row, schema),
+        Expr::Nested(inner) => {
+            eval_upsert_expr(inner, existing_row, excluded_row, schema, target_column)
+        }
         _ => eval_expr(expr, Some(existing_row), Some(schema)),
     }
 }
@@ -125,15 +136,141 @@ pub async fn execute_insert_row(
                     .await;
                 if let Err(e) = result {
                     if e.to_string().contains("Duplicate entry") {
-                        let cols = index.columns.join(", ");
-                        let vals: Vec<String> =
-                            idx_values.iter().map(|v| format!("{}", v)).collect();
-                        return Err(anyhow!(
-                            "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
-                            index.name,
-                            cols,
-                            vals.join(", ")
-                        ));
+                        // Check if ON CONFLICT is specified
+                        match on_conflict {
+                            Some(OnInsert::OnConflict(oc)) => {
+                                let pks = store
+                                    .scan_index(txn, schema.table_id, index.id, &idx_values, true)
+                                    .await?;
+                                if pks.is_empty() {
+                                    return Err(anyhow!(
+                                        "Failed to find conflicting row in unique index"
+                                    ));
+                                }
+                                let existing_pk = &pks[0];
+
+                                store.delete_by_pk(txn, table_name, &pk_values).await?;
+
+                                match &oc.action {
+                                    OnConflictAction::DoNothing => return Ok(None),
+                                    OnConflictAction::DoUpdate(do_update) => {
+                                        let existing_rows = store
+                                            .batch_get_rows(
+                                                txn,
+                                                schema.table_id,
+                                                vec![existing_pk.clone()],
+                                                schema,
+                                            )
+                                            .await?;
+                                        if existing_rows.is_empty() {
+                                            return Err(anyhow!(
+                                                "Failed to fetch existing row for upsert"
+                                            ));
+                                        }
+                                        let existing_row = &existing_rows[0];
+                                        let mut updated_vals = existing_row.values.clone();
+                                        for assignment in &do_update.assignments {
+                                            let col_name =
+                                                assignment.id.last().unwrap().value.clone();
+                                            let col_idx = schema
+                                                .column_index(&col_name)
+                                                .ok_or_else(|| {
+                                                    anyhow!(
+                                                        "Unknown column in DO UPDATE: {}",
+                                                        col_name
+                                                    )
+                                                })?;
+                                            updated_vals[col_idx] = eval_upsert_expr(
+                                                &assignment.value,
+                                                existing_row,
+                                                &row,
+                                                schema,
+                                                schema.columns.get(col_idx),
+                                            )?;
+                                        }
+                                        let updated_row = Row::new(updated_vals);
+                                        update_row_indexes(
+                                            store,
+                                            txn,
+                                            schema,
+                                            existing_row,
+                                            &updated_row,
+                                        )
+                                        .await?;
+                                        store.upsert(txn, table_name, updated_row.clone()).await?;
+                                        return Ok(Some(updated_row));
+                                    }
+                                }
+                            }
+                            Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
+                                let pks = store
+                                    .scan_index(txn, schema.table_id, index.id, &idx_values, true)
+                                    .await?;
+                                if pks.is_empty() {
+                                    return Err(anyhow!(
+                                        "Failed to find conflicting row in unique index"
+                                    ));
+                                }
+                                let existing_pk = &pks[0];
+
+                                store.delete_by_pk(txn, table_name, &pk_values).await?;
+
+                                let existing_rows = store
+                                    .batch_get_rows(
+                                        txn,
+                                        schema.table_id,
+                                        vec![existing_pk.clone()],
+                                        schema,
+                                    )
+                                    .await?;
+                                if existing_rows.is_empty() {
+                                    return Err(anyhow!("Failed to fetch existing row for upsert"));
+                                }
+                                let existing_row = &existing_rows[0];
+                                let mut updated_vals = existing_row.values.clone();
+                                for assignment in assignments {
+                                    let col_name = assignment.id.last().unwrap().value.clone();
+                                    let col_idx = schema
+                                        .column_index(&col_name)
+                                        .ok_or_else(|| anyhow!("Unknown column: {}", col_name))?;
+                                    updated_vals[col_idx] = eval_upsert_expr(
+                                        &assignment.value,
+                                        existing_row,
+                                        &row,
+                                        schema,
+                                        schema.columns.get(col_idx),
+                                    )?;
+                                }
+                                let updated_row = Row::new(updated_vals);
+                                update_row_indexes(store, txn, schema, existing_row, &updated_row)
+                                    .await?;
+                                store.upsert(txn, table_name, updated_row.clone()).await?;
+                                return Ok(Some(updated_row));
+                            }
+                            None => {
+                                // No ON CONFLICT specified, return error
+                                let cols = index.columns.join(", ");
+                                let vals: Vec<String> =
+                                    idx_values.iter().map(|v| format!("{}", v)).collect();
+                                return Err(anyhow!(
+                                    "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+                                    index.name,
+                                    cols,
+                                    vals.join(", ")
+                                ));
+                            }
+                            _ => {
+                                let cols = index.columns.join(", ");
+                                let vals: Vec<String> =
+                                    idx_values.iter().map(|v| format!("{}", v)).collect();
+                                return Err(anyhow!(
+                                    "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+                                    index.name,
+                                    cols,
+                                    vals.join(", ")
+                                ));
+                            }
+                        }
                     }
                     return Err(e);
                 }
@@ -157,8 +294,13 @@ pub async fn execute_insert_row(
                         let col_idx = schema
                             .column_index(&col_name)
                             .ok_or_else(|| anyhow!("Unknown column in DO UPDATE: {}", col_name))?;
-                        updated_vals[col_idx] =
-                            eval_upsert_expr(&assignment.value, existing_row, &row, schema)?;
+                        updated_vals[col_idx] = eval_upsert_expr(
+                            &assignment.value,
+                            existing_row,
+                            &row,
+                            schema,
+                            schema.columns.get(col_idx),
+                        )?;
                     }
                     let updated_row = Row::new(updated_vals);
                     update_row_indexes(store, txn, schema, existing_row, &updated_row).await?;
@@ -180,8 +322,13 @@ pub async fn execute_insert_row(
                     let col_idx = schema
                         .column_index(&col_name)
                         .ok_or_else(|| anyhow!("Unknown column: {}", col_name))?;
-                    updated_vals[col_idx] =
-                        eval_upsert_expr(&assignment.value, existing_row, &row, schema)?;
+                    updated_vals[col_idx] = eval_upsert_expr(
+                        &assignment.value,
+                        existing_row,
+                        &row,
+                        schema,
+                        schema.columns.get(col_idx),
+                    )?;
                 }
                 let updated_row = Row::new(updated_vals);
                 update_row_indexes(store, txn, schema, existing_row, &updated_row).await?;
@@ -595,8 +742,17 @@ pub fn prepare_insert_row(
             return Err(anyhow!("Column count mismatch"));
         }
         for (i, e) in exprs.iter().enumerate() {
-            row_vals[i] = eval_expr(e, None, None)?;
-            indices.push(i);
+            // Check if expression is DEFAULT keyword
+            let is_default =
+                matches!(e, Expr::Identifier(ident) if ident.value.to_uppercase() == "DEFAULT");
+
+            if is_default {
+                // Don't add to indices, leave as NULL, will be filled by fill_missing_columns
+                row_vals[i] = Value::Null;
+            } else {
+                row_vals[i] = eval_expr(e, None, None)?;
+                indices.push(i);
+            }
         }
     } else {
         if columns.len() != exprs.len() {
@@ -606,8 +762,17 @@ pub fn prepare_insert_row(
             let idx = schema
                 .column_index(&c.value)
                 .ok_or_else(|| anyhow!("Unknown col"))?;
-            row_vals[idx] = eval_expr(&exprs[i], None, None)?;
-            indices.push(idx);
+
+            // Check if expression is DEFAULT keyword
+            let is_default = matches!(&exprs[i], Expr::Identifier(ident) if ident.value.to_uppercase() == "DEFAULT");
+
+            if is_default {
+                // Don't add to indices, leave as NULL, will be filled by fill_missing_columns
+                row_vals[idx] = Value::Null;
+            } else {
+                row_vals[idx] = eval_expr(&exprs[i], None, None)?;
+                indices.push(idx);
+            }
         }
     }
 

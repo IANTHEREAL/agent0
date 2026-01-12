@@ -57,6 +57,7 @@ pub async fn execute_create_table(
         })
         .collect();
 
+    let mut foreign_keys: Vec<ForeignKeyConstraint> = Vec::new();
     let mut col_defs = Vec::new();
     for col in columns {
         let col_name = normalize_ident(&col.name);
@@ -96,6 +97,53 @@ pub async fn execute_create_table(
                     if matches!(generated_as, GeneratedAs::Always | GeneratedAs::ByDefault) {
                         is_serial = true;
                     }
+                }
+                ColumnOption::ForeignKey {
+                    foreign_table,
+                    referred_columns,
+                    on_delete,
+                    on_update,
+                    ..
+                } => {
+                    // Handle inline REFERENCES clause
+                    let ref_table = foreign_table
+                        .0
+                        .last()
+                        .map(normalize_ident)
+                        .unwrap_or_default();
+                    let ref_cols: Vec<String> =
+                        referred_columns.iter().map(normalize_ident).collect();
+                    let fk_name = format!("{}_{}_fkey", table_name, col_name);
+
+                    let parse_action =
+                        |action: &Option<sqlparser::ast::ReferentialAction>| -> ForeignKeyAction {
+                            match action {
+                                Some(sqlparser::ast::ReferentialAction::Cascade) => {
+                                    ForeignKeyAction::Cascade
+                                }
+                                Some(sqlparser::ast::ReferentialAction::SetNull) => {
+                                    ForeignKeyAction::SetNull
+                                }
+                                Some(sqlparser::ast::ReferentialAction::SetDefault) => {
+                                    ForeignKeyAction::SetDefault
+                                }
+                                Some(sqlparser::ast::ReferentialAction::Restrict) => {
+                                    ForeignKeyAction::Restrict
+                                }
+                                Some(sqlparser::ast::ReferentialAction::NoAction) | None => {
+                                    ForeignKeyAction::NoAction
+                                }
+                            }
+                        };
+
+                    foreign_keys.push(ForeignKeyConstraint {
+                        name: fk_name,
+                        columns: vec![col_name.clone()],
+                        ref_table,
+                        ref_columns: ref_cols,
+                        on_delete: parse_action(on_delete),
+                        on_update: parse_action(on_update),
+                    });
                 }
                 _ => {}
             }
@@ -151,8 +199,7 @@ pub async fn execute_create_table(
         }
     }
 
-    let mut foreign_keys = Vec::new();
-
+    // Process table-level constraints for foreign keys
     for constraint in constraints {
         match constraint {
             TableConstraint::Unique {
@@ -743,7 +790,60 @@ pub async fn execute_alter_table(
                 schema.version += 1;
                 store.update_schema(txn, schema).await?;
             }
-            TableConstraint::ForeignKey { .. } | TableConstraint::Check { .. } => {}
+            TableConstraint::ForeignKey {
+                name,
+                columns,
+                foreign_table,
+                referred_columns,
+                on_delete,
+                on_update,
+                ..
+            } => {
+                let fk_cols: Vec<String> = columns.iter().map(normalize_ident).collect();
+                let ref_table = foreign_table
+                    .0
+                    .last()
+                    .map(normalize_ident)
+                    .unwrap_or_default();
+                let ref_cols: Vec<String> = referred_columns.iter().map(normalize_ident).collect();
+                let fk_name = name
+                    .as_ref()
+                    .map(|n| n.value.clone())
+                    .unwrap_or_else(|| format!("{}_{}_fkey", t, fk_cols.join("_")));
+
+                let parse_action =
+                    |action: &Option<sqlparser::ast::ReferentialAction>| -> ForeignKeyAction {
+                        match action {
+                            Some(sqlparser::ast::ReferentialAction::Cascade) => {
+                                ForeignKeyAction::Cascade
+                            }
+                            Some(sqlparser::ast::ReferentialAction::SetNull) => {
+                                ForeignKeyAction::SetNull
+                            }
+                            Some(sqlparser::ast::ReferentialAction::SetDefault) => {
+                                ForeignKeyAction::SetDefault
+                            }
+                            Some(sqlparser::ast::ReferentialAction::Restrict) => {
+                                ForeignKeyAction::Restrict
+                            }
+                            Some(sqlparser::ast::ReferentialAction::NoAction) | None => {
+                                ForeignKeyAction::NoAction
+                            }
+                        }
+                    };
+
+                schema.foreign_keys.push(ForeignKeyConstraint {
+                    name: fk_name,
+                    columns: fk_cols,
+                    ref_table,
+                    ref_columns: ref_cols,
+                    on_delete: parse_action(on_delete),
+                    on_update: parse_action(on_update),
+                });
+                schema.version += 1;
+                store.update_schema(txn, schema).await?;
+            }
+            TableConstraint::Check { .. } => {}
             _ => {}
         },
         AlterTableOperation::DropConstraint { .. } => {}

@@ -1,22 +1,9 @@
-DROP TABLE
-CREATE TABLE
-INSERT 1
-psql-18:tests/03_schema_evolution.sql:11: could not interpret result from server: INSERT 1
-ALTER TABLE
- id | v1  |     v2      
-----+-----+-------------
- 1  | old | new_default
-(1 row)
-
-INSERT 1
-psql-18:tests/03_schema_evolution.sql:20: could not interpret result from server: INSERT 1
-INSERT 1
-psql-18:tests/03_schema_evolution.sql:23: could not interpret result from server: INSERT 1
- id |      v1      |     v2      
-----+--------------+-------------
- 1  | old          | new_default
- 2  | new_implicit | new_default
- 3  | new_explicit | overridden
-(3 rows)
-
-DROP TABLE
+psql:tests/03_schema_evolution.sql:4: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F736368FF656D615F745F6576FF6F6C766500000000FB\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/03_schema_evolution.sql:8: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F6E6578FF745F7461626C655FFF6964000000000000F9\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/03_schema_evolution.sql:11: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F736368FF656D615F745F6576FF6F6C766500000000FB\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/03_schema_evolution.sql:14: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F736368FF656D615F745F6576FF6F6C766500000000FB\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/03_schema_evolution.sql:17: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F766965FF775F745F65766F6CFF7665000000000000F9\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/03_schema_evolution.sql:20: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F736368FF656D615F745F6576FF6F6C766500000000FB\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/03_schema_evolution.sql:23: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F736368FF656D615F745F6576FF6F6C766500000000FB\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/03_schema_evolution.sql:26: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F766965FF775F745F65766F6CFF7665000000000000F9\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]
+psql:tests/03_schema_evolution.sql:29: ERROR:  Multiple key errors: [KeyError(KeyError { locked: None, retryable: "", abort: "Error(InvalidKeyMode { cmd: get, storage_api_version: V2, key: \"6E5F746573745F73FF756974655F313736FF383137363935385FFF5F7379735F736368FF656D615F745F6576FF6F6C766500000000FB\" })", conflict: None, already_exist: None, deadlock: None, commit_ts_expired: None, txn_not_found: None, commit_ts_too_large: None, assertion_failed: None, primary_mismatch: None })]

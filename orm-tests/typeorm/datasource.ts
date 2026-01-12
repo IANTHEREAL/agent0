@@ -1,7 +1,7 @@
 import 'reflect-metadata';
 import { DataSource, DataSourceOptions } from 'typeorm';
 import pg from 'pg';
-import { User, Post, Tag } from './entities/index.js';
+import { User, Post, Tag, Embedding } from './entities/index.js';
 import { defaultConfig } from '../shared/config.js';
 
 const { types } = pg;
@@ -23,7 +23,7 @@ export function createDataSourceOptions(
     username: defaultConfig.user,
     password: defaultConfig.password,
     ssl: defaultConfig.ssl ? { rejectUnauthorized: false } : false,
-    entities: [User, Post, Tag],
+    entities: [User, Post, Tag, Embedding],
     synchronize: false,
     logging: process.env.DEBUG === 'true' ? ['query', 'error'] : false,
     ...options,

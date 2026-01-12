@@ -120,6 +120,7 @@ describe('TypeORM Transactions & Isolation [pg-tikv]', () => {
     });
 
     it('should auto-rollback on error in transaction manager', async () => {
+      let errorThrown = false;
       try {
         await dataSource.transaction(async (manager) => {
           await manager.save(User, {
@@ -129,8 +130,15 @@ describe('TypeORM Transactions & Isolation [pg-tikv]', () => {
           });
           throw new Error('Intentional error');
         });
-      } catch {
+      } catch (error) {
+        errorThrown = true;
+        // Verify the error was thrown
+        expect(error).toBeDefined();
+        expect((error as Error).message).toBe('Intentional error');
       }
+
+      // Verify error was actually thrown
+      expect(errorThrown).toBe(true);
 
       const user = await dataSource.getRepository(User).findOneBy({ email: 'error@example.com' });
       expect(user).toBeNull();

@@ -38,6 +38,7 @@ describe('Knex Transactions & Isolation [pg-tikv]', () => {
     });
 
     it('should rollback transaction on error', async () => {
+      let errorThrown = false;
       try {
         await db.transaction(async (trx) => {
           await trx('knex_users').insert({
@@ -47,8 +48,15 @@ describe('Knex Transactions & Isolation [pg-tikv]', () => {
           });
           throw new Error('Intentional error');
         });
-      } catch {
+      } catch (error) {
+        errorThrown = true;
+        // Verify the error was thrown
+        expect(error).toBeDefined();
+        expect((error as Error).message).toBe('Intentional error');
       }
+
+      // Verify error was actually thrown
+      expect(errorThrown).toBe(true);
 
       const user = await db('knex_users').where({ email: 'rollback@example.com' }).first();
       expect(user).toBeUndefined();

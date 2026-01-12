@@ -14,7 +14,8 @@ RUN cargo build --release 2>/dev/null || true
 RUN rm -rf src target/release/pg-tikv target/release/deps/pg_tikv*
 
 COPY src ./src
-RUN touch src/main.rs && cargo build --release
+RUN rm -rf target/release/pg-tikv target/release/deps/pg_tikv* && \
+    cargo build --release
 
 FROM debian:bookworm-slim
 
