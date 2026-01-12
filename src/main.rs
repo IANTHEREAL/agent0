@@ -62,7 +62,6 @@ async fn main() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PG_PORT);
     let default_keyspace = env::var("PG_KEYSPACE").ok();
-    let password = env::var("PG_PASSWORD").ok();
 
     let tls_cert = env::var("PG_TLS_CERT").ok();
     let tls_key = env::var("PG_TLS_KEY").ok();
@@ -75,11 +74,7 @@ async fn main() -> Result<()> {
     } else {
         info!("Default keyspace: default");
     }
-    if password.is_some() {
-        info!("Password authentication: enabled");
-    } else {
-        info!("Password authentication: disabled");
-    }
+    info!("Password authentication: enabled (via AuthManager)");
 
     let pd_addrs: Vec<String> = pd_endpoints
         .split(',')
@@ -169,9 +164,8 @@ async fn main() -> Result<()> {
         let tls_acceptor = tls_acceptor.clone();
         let client_pool = client_pool.clone();
         let default_keyspace = default_keyspace.clone();
-        let password = password.clone();
 
-        let factory = DynamicHandlerFactory::new_with_pool(client_pool, default_keyspace, password);
+        let factory = DynamicHandlerFactory::new_with_pool(client_pool, default_keyspace);
 
         tokio::spawn(async move {
             if let Err(e) = process_socket(socket, tls_acceptor, factory).await {

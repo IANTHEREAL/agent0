@@ -111,7 +111,6 @@ pub struct DynamicPgHandler {
     client_pool: Option<Arc<TikvClientPool>>,
     pd_endpoints: Vec<String>,
     default_keyspace: Option<String>,
-    fallback_password: Option<String>,
     executor: OnceCell<Arc<Executor>>,
     session: Mutex<Option<Session>>,
     copy_context: Mutex<Option<CopyContext>>,
@@ -119,16 +118,11 @@ pub struct DynamicPgHandler {
 }
 
 impl DynamicPgHandler {
-    pub fn new(
-        pd_endpoints: Vec<String>,
-        default_keyspace: Option<String>,
-        fallback_password: Option<String>,
-    ) -> Self {
+    pub fn new(pd_endpoints: Vec<String>, default_keyspace: Option<String>) -> Self {
         Self {
             client_pool: None,
             pd_endpoints,
             default_keyspace,
-            fallback_password,
             executor: OnceCell::new(),
             session: Mutex::new(None),
             copy_context: Mutex::new(None),
@@ -139,13 +133,11 @@ impl DynamicPgHandler {
     pub fn new_with_pool(
         client_pool: Arc<TikvClientPool>,
         default_keyspace: Option<String>,
-        fallback_password: Option<String>,
     ) -> Self {
         Self {
             client_pool: Some(client_pool),
             pd_endpoints: Vec::new(),
             default_keyspace,
-            fallback_password,
             executor: OnceCell::new(),
             session: Mutex::new(None),
             copy_context: Mutex::new(None),
@@ -511,11 +503,6 @@ impl DynamicPgHandler {
             }
         };
 
-        if self.fallback_password.is_none() {
-            info!("No password configured, allowing connection without authentication");
-            return Ok((true, true));
-        }
-
         let auth_manager = AuthManager::new();
 
         // Try bootstrap with error handling for gRPC transport issues
@@ -553,11 +540,6 @@ impl DynamicPgHandler {
             }
             Ok(None) => {
                 txn.rollback().await.ok();
-                if let Some(fallback) = &self.fallback_password {
-                    if password == fallback {
-                        return Ok((true, true));
-                    }
-                }
                 Ok((false, false))
             }
             Err(e) => {
@@ -1126,30 +1108,20 @@ pub struct DynamicHandlerFactory {
 }
 
 impl DynamicHandlerFactory {
-    pub fn new(
-        pd_endpoints: Vec<String>,
-        default_keyspace: Option<String>,
-        expected_password: Option<String>,
-    ) -> Self {
+    pub fn new(pd_endpoints: Vec<String>, default_keyspace: Option<String>) -> Self {
         Self {
-            handler: Arc::new(DynamicPgHandler::new(
-                pd_endpoints,
-                default_keyspace,
-                expected_password,
-            )),
+            handler: Arc::new(DynamicPgHandler::new(pd_endpoints, default_keyspace)),
         }
     }
 
     pub fn new_with_pool(
         client_pool: Arc<TikvClientPool>,
         default_keyspace: Option<String>,
-        expected_password: Option<String>,
     ) -> Self {
         Self {
             handler: Arc::new(DynamicPgHandler::new_with_pool(
                 client_pool,
                 default_keyspace,
-                expected_password,
             )),
         }
     }
