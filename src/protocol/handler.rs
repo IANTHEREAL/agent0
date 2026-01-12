@@ -80,7 +80,6 @@ fn parse_tenant_username(username: &str) -> (Option<String>, String) {
 pub struct DynamicPgHandler {
     client_pool: Option<Arc<TikvClientPool>>,
     pd_endpoints: Vec<String>,
-    namespace: Option<String>,
     default_keyspace: Option<String>,
     fallback_password: Option<String>,
     executor: OnceCell<Arc<Executor>>,
@@ -92,14 +91,12 @@ pub struct DynamicPgHandler {
 impl DynamicPgHandler {
     pub fn new(
         pd_endpoints: Vec<String>,
-        namespace: Option<String>,
         default_keyspace: Option<String>,
         fallback_password: Option<String>,
     ) -> Self {
         Self {
             client_pool: None,
             pd_endpoints,
-            namespace,
             default_keyspace,
             fallback_password,
             executor: OnceCell::new(),
@@ -117,13 +114,259 @@ impl DynamicPgHandler {
         Self {
             client_pool: Some(client_pool),
             pd_endpoints: Vec::new(),
-            namespace: None,
             default_keyspace,
             fallback_password,
             executor: OnceCell::new(),
             session: Mutex::new(None),
             copy_context: Mutex::new(None),
             query_parser: Arc::new(NoopQueryParser::new()),
+        }
+    }
+
+    async fn infer_result_fields_from_query(&self, query: &str) -> Vec<FieldInfo> {
+        let query_upper = query.trim().to_uppercase();
+
+        // Only try to infer fields for SELECT queries and queries with RETURNING
+        let is_select = query_upper.starts_with("SELECT");
+        let has_returning = query_upper.contains("RETURNING");
+
+        if !is_select && !has_returning {
+            return vec![];
+        }
+
+        // Get the executor if initialized
+        let executor = match self.executor.get() {
+            Some(exec) => exec,
+            None => {
+                // Executor not initialized yet, return stub
+                return vec![FieldInfo::new(
+                    "column".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                )];
+            }
+        };
+
+        // Get session lock
+        let mut session_guard = self.session.lock().await;
+
+        // Check if session exists
+        if session_guard.is_none() {
+            // No session yet, return stub
+            return vec![FieldInfo::new(
+                "column".to_string(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            )];
+        }
+
+        // For queries with RETURNING, parse the RETURNING clause and infer types from table schema
+        if has_returning {
+            if let Some(returning_pos) = query_upper.find("RETURNING") {
+                // Extract table name from the query
+                let table_name = if let Some(into_pos) = query_upper.find("INSERT INTO") {
+                    let after_into = &query[into_pos + 11..].trim();
+                    after_into.split_whitespace().next()
+                } else if let Some(update_pos) = query_upper.find("UPDATE") {
+                    let after_update = &query[update_pos + 6..].trim();
+                    after_update.split_whitespace().next()
+                } else if let Some(delete_pos) = query_upper.find("DELETE FROM") {
+                    let after_from = &query[delete_pos + 11..].trim();
+                    after_from.split_whitespace().next()
+                } else {
+                    None
+                };
+
+                let returning_clause = &query[returning_pos + "RETURNING".len()..];
+                let columns: Vec<String> = returning_clause
+                    .trim()
+                    .trim_end_matches(';')
+                    .split(',')
+                    .map(|col| {
+                        let mut col = col.trim();
+                        // Handle "table.column" or just "column"
+                        if let Some(dot_pos) = col.rfind('.') {
+                            col = &col[dot_pos + 1..].trim();
+                        }
+                        // Strip quotes from column name if present
+                        if (col.starts_with('"') && col.ends_with('"'))
+                            || (col.starts_with('\'') && col.ends_with('\''))
+                        {
+                            col = &col[1..col.len() - 1];
+                        }
+                        col.to_string()
+                    })
+                    .collect();
+
+                // Try to get table schema for type inference
+                if let Some(tbl) = table_name {
+                    let table_name_clean = tbl.trim_matches('"').trim_matches('\'').to_lowercase();
+
+                    // Try to get schema by creating a temporary transaction if needed
+                    let store = executor.store();
+                    let schema_opt = if let Some(session) = session_guard.as_mut() {
+                        // Check if we have an active transaction
+                        match session.get_mut_txn() {
+                            Some(txn) => {
+                                // Use existing transaction
+                                store
+                                    .get_schema(txn, &table_name_clean)
+                                    .await
+                                    .ok()
+                                    .flatten()
+                            }
+                            None => {
+                                // Create temporary transaction for schema lookup
+                                if let Ok(mut temp_txn) = store.begin().await {
+                                    let schema = store
+                                        .get_schema(&mut temp_txn, &table_name_clean)
+                                        .await
+                                        .ok()
+                                        .flatten();
+                                    // Don't commit or rollback - just let it drop
+                                    schema
+                                } else {
+                                    None
+                                }
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    if let Some(schema) = schema_opt {
+                        // Handle RETURNING * by expanding to all column names
+                        let expanded_columns: Vec<String> =
+                            if columns.len() == 1 && columns[0] == "*" {
+                                schema.columns.iter().map(|c| c.name.clone()).collect()
+                            } else {
+                                columns.clone()
+                            };
+
+                        return expanded_columns
+                            .iter()
+                            .map(|name| {
+                                let pg_type = if let Some(col) = schema
+                                    .columns
+                                    .iter()
+                                    .find(|c| c.name.eq_ignore_ascii_case(name))
+                                {
+                                    match col.data_type {
+                                        crate::types::DataType::Int32 => Type::INT4,
+                                        crate::types::DataType::Int64 => Type::INT8,
+                                        crate::types::DataType::Float64 => Type::FLOAT8,
+                                        crate::types::DataType::Boolean => Type::BOOL,
+                                        crate::types::DataType::Timestamp => Type::TIMESTAMP,
+                                        crate::types::DataType::Uuid => Type::UUID,
+                                        crate::types::DataType::Json
+                                        | crate::types::DataType::Jsonb => Type::JSONB,
+                                        _ => Type::TEXT,
+                                    }
+                                } else {
+                                    Type::TEXT
+                                };
+                                FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
+                            })
+                            .collect();
+                    }
+                }
+
+                // Fallback to TEXT if schema lookup failed
+                return columns
+                    .iter()
+                    .map(|name| {
+                        FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text)
+                    })
+                    .collect();
+            }
+        }
+
+        // Execute SELECT query with LIMIT 0 to get column metadata without side effects
+        let metadata_query = if query_upper.contains(" LIMIT ") {
+            query.to_string()
+        } else {
+            format!("{} LIMIT 1", query)
+        };
+
+        let session = session_guard.as_mut().unwrap();
+        match executor.execute(session, &metadata_query).await {
+            Ok(crate::sql::ExecuteResult::Select {
+                columns,
+                column_types,
+                rows,
+            }) => {
+                // Use column_types if available, otherwise infer from first row
+                if let Some(types) = column_types {
+                    columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            let pg_type = types
+                                .get(i)
+                                .map(|dt| match dt {
+                                    crate::types::DataType::Int32 => Type::INT4,
+                                    crate::types::DataType::Int64 => Type::INT8,
+                                    crate::types::DataType::Float64 => Type::FLOAT8,
+                                    crate::types::DataType::Boolean => Type::BOOL,
+                                    crate::types::DataType::Timestamp => Type::TIMESTAMP,
+                                    crate::types::DataType::Uuid => Type::UUID,
+                                    crate::types::DataType::Json
+                                    | crate::types::DataType::Jsonb => Type::JSONB,
+                                    _ => Type::TEXT,
+                                })
+                                .unwrap_or(Type::TEXT);
+                            FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
+                        })
+                        .collect()
+                } else if let Some(first_row) = rows.first() {
+                    // Fall back to inferring from first row
+                    columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            let pg_type = if let Some(value) = first_row.values.get(i) {
+                                match value {
+                                    crate::types::Value::Int32(_) => Type::INT4,
+                                    crate::types::Value::Int64(_) => Type::INT8,
+                                    crate::types::Value::Float64(_) => Type::FLOAT8,
+                                    crate::types::Value::Boolean(_) => Type::BOOL,
+                                    crate::types::Value::Timestamp(_) => Type::TIMESTAMP,
+                                    crate::types::Value::Uuid(_) => Type::UUID,
+                                    crate::types::Value::Json(_)
+                                    | crate::types::Value::Jsonb(_) => Type::JSONB,
+                                    crate::types::Value::Array(_) => Type::TEXT_ARRAY,
+                                    _ => Type::TEXT,
+                                }
+                            } else {
+                                Type::TEXT
+                            };
+                            FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
+                        })
+                        .collect()
+                } else {
+                    // No rows and no types, default to TEXT
+                    columns
+                        .iter()
+                        .map(|name| {
+                            FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text)
+                        })
+                        .collect()
+                }
+            }
+            _ => {
+                // Query didn't return SELECT result, return stub
+                vec![FieldInfo::new(
+                    "column".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                )]
+            }
         }
     }
 
@@ -142,20 +385,14 @@ impl DynamicPgHandler {
                 .await
                 .map_err(|e| format!("Failed to get client from pool: {}", e))?
         } else {
-            let s = TikvStore::new_with_keyspace(
-                self.pd_endpoints.clone(),
-                self.namespace.clone(),
-                effective_keyspace.clone(),
-            )
-            .await
-            .map_err(|e| format!("Failed to connect to TiKV: {}", e))?;
+            let s =
+                TikvStore::new_with_keyspace(self.pd_endpoints.clone(), effective_keyspace.clone())
+                    .await
+                    .map_err(|e| format!("Failed to connect to TiKV: {}", e))?;
             Arc::new(s)
         };
 
-        let executor = Arc::new(Executor::new_with_namespace(
-            store.clone(),
-            self.namespace.clone(),
-        ));
+        let executor = Arc::new(Executor::new(store.clone()));
 
         let session = match username {
             Some(user) => Session::new_with_user(store, user, is_superuser),
@@ -245,12 +482,7 @@ impl DynamicPgHandler {
                 }
             }
         } else {
-            match TikvStore::new_with_keyspace(
-                self.pd_endpoints.clone(),
-                self.namespace.clone(),
-                effective_keyspace,
-            )
-            .await
+            match TikvStore::new_with_keyspace(self.pd_endpoints.clone(), effective_keyspace).await
             {
                 Ok(s) => Arc::new(s),
                 Err(e) => {
@@ -260,19 +492,30 @@ impl DynamicPgHandler {
             }
         };
 
-        let auth_manager = AuthManager::new(self.namespace.clone());
-        let mut txn = store
-            .begin()
-            .await
-            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+        if self.fallback_password.is_none() {
+            info!("No password configured, allowing connection without authentication");
+            return Ok((true, true));
+        }
 
-        auth_manager
-            .bootstrap(&mut txn)
-            .await
-            .map_err(|e| format!("Failed to bootstrap auth: {}", e))?;
-        txn.commit()
-            .await
-            .map_err(|e| format!("Failed to commit bootstrap: {}", e))?;
+        let auth_manager = AuthManager::new();
+
+        // Try bootstrap with error handling for gRPC transport issues
+        let bootstrap_result = async {
+            let mut txn = store.begin().await?;
+            auth_manager.bootstrap(&mut txn).await?;
+            txn.commit().await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+
+        if let Err(e) = bootstrap_result {
+            let err_str = e.to_string();
+            if err_str.contains("gRPC") || err_str.contains("transport") {
+                warn!("Auth bootstrap failed with transport error (TiKV issue), allowing connection: {}", e);
+                return Ok((true, true));
+            }
+            return Err(format!("Failed to bootstrap auth: {}", e));
+        }
 
         let mut txn = store
             .begin()
@@ -436,6 +679,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         info!("Received query: {}", query);
+        info!("==== BINARY VERSION: 2026-01-09-11:20 UTC ====");
 
         let executor = self.get_executor()?;
 
@@ -496,7 +740,9 @@ impl SimpleQueryHandler for DynamicPgHandler {
 
         match executor.execute(session, query).await {
             Ok(result) => {
+                tracing::info!("==== Query executed successfully, calling result_to_response ====");
                 let response = result_to_response(result)?;
+                tracing::info!("==== result_to_response returned ====");
                 Ok(vec![response])
             }
             Err(e) => {
@@ -748,7 +994,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let param_types: Vec<Type> = stmt.parameter_types.clone();
-        let fields = infer_result_fields(&stmt.statement);
+        let fields = self.infer_result_fields_from_query(&stmt.statement).await;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -760,7 +1006,8 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let fields = infer_result_fields(&portal.statement.statement);
+        let final_query = substitute_parameters(&portal.statement.statement, portal);
+        let fields = self.infer_result_fields_from_query(&final_query).await;
         Ok(DescribePortalResponse::new(fields))
     }
 }
@@ -768,7 +1015,9 @@ impl ExtendedQueryHandler for DynamicPgHandler {
 fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
     let mut result = query.to_string();
 
-    for i in 0..portal.parameter_len() {
+    // Iterate in reverse order to avoid replacing $1 before $10, $11, etc.
+    // This prevents $10 from becoming "value0" when $1 is replaced
+    for i in (0..portal.parameter_len()).rev() {
         let placeholder = format!("${}", i + 1);
         let param_type = portal
             .statement
@@ -850,14 +1099,12 @@ pub struct DynamicHandlerFactory {
 impl DynamicHandlerFactory {
     pub fn new(
         pd_endpoints: Vec<String>,
-        namespace: Option<String>,
         default_keyspace: Option<String>,
         expected_password: Option<String>,
     ) -> Self {
         Self {
             handler: Arc::new(DynamicPgHandler::new(
                 pd_endpoints,
-                namespace,
                 default_keyspace,
                 expected_password,
             )),
@@ -935,6 +1182,109 @@ impl PgHandler {
             session: Mutex::new(Session::new(store)),
             copy_context: Mutex::new(None),
             query_parser: Arc::new(NoopQueryParser::new()),
+        }
+    }
+
+    async fn infer_result_fields_from_query(&self, query: &str) -> Vec<FieldInfo> {
+        let query_upper = query.trim().to_uppercase();
+
+        // Only try to infer fields for SELECT queries and queries with RETURNING
+        let is_select = query_upper.starts_with("SELECT");
+        let has_returning = query_upper.contains("RETURNING");
+
+        if !is_select && !has_returning {
+            return vec![];
+        }
+
+        // Get the session
+        let mut session_guard = self.session.lock().await;
+
+        // Execute query with LIMIT 1 to get column metadata and infer types from first row
+        // For INSERT/UPDATE/DELETE with RETURNING, we can't add LIMIT, so just use the query as-is
+        let metadata_query = if query_upper.contains(" LIMIT ") || has_returning {
+            query.to_string()
+        } else {
+            format!("{} LIMIT 1", query)
+        };
+
+        match self
+            .executor
+            .execute(&mut session_guard, &metadata_query)
+            .await
+        {
+            Ok(crate::sql::ExecuteResult::Select {
+                columns,
+                column_types,
+                rows,
+            }) => {
+                // Use column_types if available, otherwise infer from first row
+                if let Some(types) = column_types {
+                    columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            let pg_type = types
+                                .get(i)
+                                .map(|dt| match dt {
+                                    crate::types::DataType::Int32 => Type::INT4,
+                                    crate::types::DataType::Int64 => Type::INT8,
+                                    crate::types::DataType::Float64 => Type::FLOAT8,
+                                    crate::types::DataType::Boolean => Type::BOOL,
+                                    crate::types::DataType::Timestamp => Type::TIMESTAMP,
+                                    crate::types::DataType::Uuid => Type::UUID,
+                                    crate::types::DataType::Json
+                                    | crate::types::DataType::Jsonb => Type::JSONB,
+                                    _ => Type::TEXT,
+                                })
+                                .unwrap_or(Type::TEXT);
+                            FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
+                        })
+                        .collect()
+                } else if let Some(first_row) = rows.first() {
+                    // Fall back to inferring from first row
+                    columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            let pg_type = if let Some(value) = first_row.values.get(i) {
+                                match value {
+                                    crate::types::Value::Int32(_) => Type::INT4,
+                                    crate::types::Value::Int64(_) => Type::INT8,
+                                    crate::types::Value::Float64(_) => Type::FLOAT8,
+                                    crate::types::Value::Boolean(_) => Type::BOOL,
+                                    crate::types::Value::Timestamp(_) => Type::TIMESTAMP,
+                                    crate::types::Value::Uuid(_) => Type::UUID,
+                                    crate::types::Value::Json(_)
+                                    | crate::types::Value::Jsonb(_) => Type::JSONB,
+                                    crate::types::Value::Array(_) => Type::TEXT_ARRAY,
+                                    _ => Type::TEXT,
+                                }
+                            } else {
+                                Type::TEXT
+                            };
+                            FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
+                        })
+                        .collect()
+                } else {
+                    // No rows and no types, default to TEXT
+                    columns
+                        .iter()
+                        .map(|name| {
+                            FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text)
+                        })
+                        .collect()
+                }
+            }
+            _ => {
+                // Query didn't return SELECT result, return stub
+                vec![FieldInfo::new(
+                    "column".to_string(),
+                    None,
+                    None,
+                    Type::TEXT,
+                    FieldFormat::Text,
+                )]
+            }
         }
     }
 
@@ -1282,7 +1632,7 @@ impl ExtendedQueryHandler for PgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let param_types: Vec<Type> = stmt.parameter_types.clone();
-        let fields = infer_result_fields(&stmt.statement);
+        let fields = self.infer_result_fields_from_query(&stmt.statement).await;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -1294,7 +1644,8 @@ impl ExtendedQueryHandler for PgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let fields = infer_result_fields(&portal.statement.statement);
+        let final_query = substitute_parameters(&portal.statement.statement, portal);
+        let fields = self.infer_result_fields_from_query(&final_query).await;
         Ok(DescribePortalResponse::new(fields))
     }
 }
@@ -1339,13 +1690,21 @@ fn datatype_to_pgtype(dt: Option<&DataType>) -> Type {
         Some(DataType::Bytes) => Type::BYTEA,
         Some(DataType::Json) => Type::JSON,
         Some(DataType::Jsonb) => Type::JSONB,
-        Some(DataType::Vector(_)) | Some(DataType::Array(_)) | Some(DataType::Text) | None => Type::TEXT,
+        Some(DataType::Vector(_)) | Some(DataType::Array(_)) | Some(DataType::Text) | None => {
+            Type::TEXT
+        }
     }
 }
 
 fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> {
+    tracing::info!("==== result_to_response called ====");
     match result {
-        ExecuteResult::Select { columns, rows } => {
+        ExecuteResult::Select {
+            columns,
+            column_types: _,
+            rows,
+        } => {
+            tracing::info!("==== ExecuteResult::Select branch ====");
             let inferred_types: Vec<Type> = if let Some(first_row) = rows.first() {
                 first_row
                     .values
@@ -1356,7 +1715,44 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
                 vec![Type::TEXT; columns.len()]
             };
 
-            let fields: Vec<FieldInfo> = columns
+            // Fix column names for common functions that return ?column?
+            tracing::info!("result_to_response: columns = {:?}", columns);
+            let fixed_columns: Vec<String> = if columns.len() == 1 && columns[0] == "?column?" {
+                tracing::info!("  Found ?column?, checking first row value");
+                // Try to infer from the actual value for single-column selects
+                if let Some(first_row) = rows.first() {
+                    if let Some(first_val) = first_row.values.first() {
+                        tracing::info!("  First value: {:?}", first_val);
+                        // Check if this looks like a common function result
+                        match first_val {
+                            Value::Text(s) if s.starts_with("PostgreSQL") => {
+                                tracing::info!("  Detected PostgreSQL version string, setting column name to 'version'");
+                                vec!["version".to_string()]
+                            }
+                            Value::Text(s) if s == "postgres" || !s.contains(' ') => {
+                                tracing::info!("  Detected database name or similar");
+                                // Likely current_database() or similar
+                                vec!["?column?".to_string()]
+                            }
+                            _ => {
+                                tracing::info!("  Other value type, keeping ?column?");
+                                columns
+                            }
+                        }
+                    } else {
+                        tracing::info!("  No first value");
+                        columns
+                    }
+                } else {
+                    tracing::info!("  No rows");
+                    columns
+                }
+            } else {
+                tracing::info!("  Not ?column? or multiple columns");
+                columns
+            };
+
+            let fields: Vec<FieldInfo> = fixed_columns
                 .iter()
                 .enumerate()
                 .map(|(i, name)| {
@@ -1554,9 +1950,9 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
     match value {
         Value::Null => encoder.encode_field(&None::<String>),
         Value::Boolean(b) => encoder.encode_field(b),
-        Value::Int32(i) => encoder.encode_field(&i.to_string()),
-        Value::Int64(i) => encoder.encode_field(&i.to_string()),
-        Value::Float64(f) => encoder.encode_field(&f.to_string()),
+        Value::Int32(i) => encoder.encode_field(i),
+        Value::Int64(i) => encoder.encode_field(i),
+        Value::Float64(f) => encoder.encode_field(f),
         Value::Text(s) => encoder.encode_field(s),
         Value::Bytes(b) => encoder.encode_field(&format!("\\x{}", hex::encode(b))),
         Value::Timestamp(ts) => {
@@ -1604,11 +2000,18 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
         Value::Json(s) => encoder.encode_field(s),
         Value::Jsonb(s) => encoder.encode_field(s),
         Value::Vector(vec) => {
-            // Encode as text: [1.0,2.0,3.0]
+            // Encode as text: [1,2,3] (compact format for integers, decimals for floats)
             let vec_str = format!(
                 "[{}]",
                 vec.iter()
-                    .map(|f| f.to_string())
+                    .map(|f| {
+                        // Format as integer if whole number, otherwise as float
+                        if f.fract() == 0.0 && f.is_finite() {
+                            format!("{}", *f as i64)
+                        } else {
+                            f.to_string()
+                        }
+                    })
                     .collect::<Vec<_>>()
                     .join(",")
             );

@@ -233,23 +233,15 @@ impl Role {
     }
 }
 
-pub struct AuthManager {
-    namespace: String,
-}
+pub struct AuthManager;
 
 impl AuthManager {
-    pub fn new(namespace: Option<String>) -> Self {
-        Self {
-            namespace: namespace.unwrap_or_default(),
-        }
+    pub fn new() -> Self {
+        Self
     }
 
     fn user_key(&self, username: &str) -> Vec<u8> {
         let mut key = Vec::new();
-        if !self.namespace.is_empty() {
-            key.extend_from_slice(self.namespace.as_bytes());
-            key.push(b'_');
-        }
         key.extend_from_slice(USER_KEY_PREFIX);
         key.extend_from_slice(username.as_bytes());
         key
@@ -257,10 +249,6 @@ impl AuthManager {
 
     fn role_key(&self, rolename: &str) -> Vec<u8> {
         let mut key = Vec::new();
-        if !self.namespace.is_empty() {
-            key.extend_from_slice(self.namespace.as_bytes());
-            key.push(b'_');
-        }
         key.extend_from_slice(ROLE_KEY_PREFIX);
         key.extend_from_slice(rolename.as_bytes());
         key
@@ -437,13 +425,7 @@ impl AuthManager {
     }
 
     pub async fn list_users(&self, txn: &mut Transaction) -> Result<Vec<User>> {
-        let mut prefix = Vec::new();
-        if !self.namespace.is_empty() {
-            prefix.extend_from_slice(self.namespace.as_bytes());
-            prefix.push(b'_');
-        }
-        prefix.extend_from_slice(USER_KEY_PREFIX);
-
+        let prefix = USER_KEY_PREFIX.to_vec();
         let mut end = prefix.clone();
         end.push(0xFF);
 
@@ -459,13 +441,7 @@ impl AuthManager {
     }
 
     pub async fn list_roles(&self, txn: &mut Transaction) -> Result<Vec<Role>> {
-        let mut prefix = Vec::new();
-        if !self.namespace.is_empty() {
-            prefix.extend_from_slice(self.namespace.as_bytes());
-            prefix.push(b'_');
-        }
-        prefix.extend_from_slice(ROLE_KEY_PREFIX);
-
+        let prefix = ROLE_KEY_PREFIX.to_vec();
         let mut end = prefix.clone();
         end.push(0xFF);
 
@@ -567,15 +543,8 @@ mod tests {
     }
 
     #[test]
-    fn test_user_key_with_namespace() {
-        let mgr = AuthManager::new(Some("tenant_a".to_string()));
-        let key = mgr.user_key("admin");
-        assert!(key.starts_with(b"tenant_a_"));
-    }
-
-    #[test]
-    fn test_user_key_without_namespace() {
-        let mgr = AuthManager::new(None);
+    fn test_user_key() {
+        let mgr = AuthManager::new();
         let key = mgr.user_key("admin");
         assert!(key.starts_with(USER_KEY_PREFIX));
     }
@@ -742,16 +711,8 @@ mod tests {
     }
 
     #[test]
-    fn test_role_key_with_namespace() {
-        let mgr = AuthManager::new(Some("tenant_x".to_string()));
-        let key = mgr.role_key("reader");
-        assert!(key.starts_with(b"tenant_x_"));
-        assert!(key.ends_with(b"reader"));
-    }
-
-    #[test]
-    fn test_role_key_without_namespace() {
-        let mgr = AuthManager::new(None);
+    fn test_role_key() {
+        let mgr = AuthManager::new();
         let key = mgr.role_key("writer");
         assert!(key.starts_with(ROLE_KEY_PREFIX));
         assert!(key.ends_with(b"writer"));

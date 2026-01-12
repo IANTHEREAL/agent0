@@ -19,33 +19,6 @@ const SYS_PROCEDURE_PREFIX: &[u8] = b"_sys_proc_";
 const TABLE_DATA_PREFIX: &[u8] = b"t_";
 const TABLE_INDEX_PREFIX: &[u8] = b"i_";
 
-/// Apply namespace prefix to a key
-/// Format: `n_{namespace}_{original_key}`
-pub fn apply_namespace(namespace: &str, key: &[u8]) -> Vec<u8> {
-    if namespace.is_empty() {
-        return key.to_vec();
-    }
-    let mut namespaced = Vec::with_capacity(2 + namespace.len() + 1 + key.len());
-    namespaced.extend_from_slice(b"n_");
-    namespaced.extend_from_slice(namespace.as_bytes());
-    namespaced.push(b'_');
-    namespaced.extend_from_slice(key);
-    namespaced
-}
-
-/// Strip namespace prefix from a key (if present)
-pub fn strip_namespace<'a>(namespace: &str, key: &'a [u8]) -> &'a [u8] {
-    if namespace.is_empty() {
-        return key;
-    }
-    let prefix_len = 2 + namespace.len() + 1; // "n_" + namespace + "_"
-    if key.len() >= prefix_len && &key[0..2] == b"n_" {
-        &key[prefix_len..]
-    } else {
-        key
-    }
-}
-
 /// Encode the system key for next table ID
 pub fn encode_next_table_id_key() -> Vec<u8> {
     SYS_NEXT_TABLE_ID.to_vec()
@@ -180,34 +153,6 @@ mod tests {
     use crate::types::{ColumnDef, DataType};
 
     #[test]
-    fn test_apply_namespace_empty() {
-        let key = b"test_key";
-        let result = apply_namespace("", key);
-        assert_eq!(result, key.to_vec());
-    }
-
-    #[test]
-    fn test_apply_namespace_with_value() {
-        let key = b"test_key";
-        let result = apply_namespace("myns", key);
-        assert_eq!(result, b"n_myns_test_key".to_vec());
-    }
-
-    #[test]
-    fn test_strip_namespace_empty() {
-        let key = b"test_key";
-        let result = strip_namespace("", key);
-        assert_eq!(result, key);
-    }
-
-    #[test]
-    fn test_strip_namespace_with_value() {
-        let key = b"n_myns_test_key";
-        let result = strip_namespace("myns", key);
-        assert_eq!(result, b"test_key");
-    }
-
-    #[test]
     fn test_encode_schema_key() {
         let key = encode_schema_key("users");
         assert_eq!(key, b"_sys_schema_users".to_vec());
@@ -309,14 +254,5 @@ mod tests {
         let key = encode_index_key(1, 2, &values, Some(&pk));
         assert!(key.starts_with(b"i_"));
         assert!(key.len() > encode_index_key(1, 2, &values, None).len());
-    }
-
-    #[test]
-    fn test_namespace_roundtrip() {
-        let original = b"my_key_data";
-        let ns = "test_namespace";
-        let namespaced = apply_namespace(ns, original);
-        let stripped = strip_namespace(ns, &namespaced);
-        assert_eq!(stripped, original);
     }
 }

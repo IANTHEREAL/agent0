@@ -7,15 +7,13 @@ use tracing::info;
 
 pub struct TikvClientPool {
     pd_endpoints: Vec<String>,
-    namespace: Option<String>,
     clients: RwLock<HashMap<String, Arc<TikvStore>>>,
 }
 
 impl TikvClientPool {
-    pub fn new(pd_endpoints: Vec<String>, namespace: Option<String>) -> Self {
+    pub fn new(pd_endpoints: Vec<String>) -> Self {
         Self {
             pd_endpoints,
-            namespace,
             clients: RwLock::new(HashMap::new()),
         }
     }
@@ -38,12 +36,9 @@ impl TikvClientPool {
 
         info!("Creating new TiKV client for keyspace: {}", key);
 
-        let result = TikvStore::new_with_keyspace(
-            self.pd_endpoints.clone(),
-            self.namespace.clone(),
-            keyspace.clone(),
-        )
-        .await;
+        let actual_keyspace = if key == "default" { None } else { keyspace };
+
+        let result = TikvStore::new_with_keyspace(self.pd_endpoints.clone(), actual_keyspace).await;
 
         let store = match result {
             Ok(s) => s,
@@ -72,7 +67,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pool_creation() {
-        let pool = TikvClientPool::new(vec!["127.0.0.1:2379".to_string()], None);
+        let pool = TikvClientPool::new(vec!["127.0.0.1:2379".to_string()]);
         assert_eq!(pool.client_count().await, 0);
     }
 }

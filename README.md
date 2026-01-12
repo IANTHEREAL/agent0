@@ -153,7 +153,10 @@ pg_restore -h 127.0.0.1 -p 5433 -d postgres --no-owner --no-privileges ./backup/
 |---------------------|---------|-------------|
 | `PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD endpoints |
 | `PG_PORT` | `5433` | PostgreSQL protocol port |
-| `PG_NAMESPACE` | (empty) | Multi-tenant namespace prefix |
+| `PG_KEYSPACE` | `default` | Default TiKV keyspace for multi-tenancy |
+| `PG_PASSWORD` | (empty) | Enable password authentication |
+
+Multi-tenancy: Use `tenant.user` or `tenant:user` format to specify keyspace per connection.
 
 ## Constraints
 

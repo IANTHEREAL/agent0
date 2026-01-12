@@ -9,17 +9,15 @@ use tracing::{debug, info};
 
 pub struct TikvStore {
     client: Arc<TransactionClient>,
-    namespace: String,
 }
 
 impl TikvStore {
-    pub async fn new(pd_endpoints: Vec<String>, namespace: Option<String>) -> Result<Self> {
-        Self::new_with_keyspace(pd_endpoints, namespace, None).await
+    pub async fn new(pd_endpoints: Vec<String>) -> Result<Self> {
+        Self::new_with_keyspace(pd_endpoints, None).await
     }
 
     pub async fn new_with_keyspace(
         pd_endpoints: Vec<String>,
-        namespace: Option<String>,
         keyspace: Option<String>,
     ) -> Result<Self> {
         info!("Connecting to TiKV at {:?}", pd_endpoints);
@@ -33,19 +31,14 @@ impl TikvStore {
         let client = TransactionClient::new_with_config(pd_endpoints, config)
             .await
             .context("Failed to connect to TiKV")?;
-        info!(
-            "Connected to TiKV. Namespace: {:?}, Keyspace: {:?}",
-            namespace, keyspace
-        );
+        info!("Connected to TiKV. Keyspace: {:?}", keyspace);
         Ok(Self {
             client: Arc::new(client),
-            namespace: namespace.unwrap_or_default(),
         })
     }
 
-    /// Helper to wrap key with namespace
     fn key(&self, key: &[u8]) -> Vec<u8> {
-        apply_namespace(&self.namespace, key)
+        key.to_vec()
     }
 
     pub async fn begin(&self) -> Result<Transaction> {
@@ -280,21 +273,17 @@ impl TikvStore {
         }
     }
 
-    /// List all tables
     pub async fn list_tables(&self, txn: &mut Transaction) -> Result<Vec<String>> {
-        let raw_start = encode_schema_prefix();
-        let mut raw_end = raw_start.clone();
-        raw_end.push(0xFF);
-        let start = self.key(&raw_start);
-        let end = self.key(&raw_end);
-        let range: BoundRange = (start..end).into();
+        let prefix = encode_schema_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
         let pairs = txn.scan(range, u32::MAX).await?;
         let mut tables = Vec::new();
         for pair in pairs {
-            let full_key: &[u8] = pair.key().as_ref().into();
-            let raw_key = strip_namespace(&self.namespace, full_key);
-            if raw_key.starts_with(&raw_start) {
-                let name = String::from_utf8_lossy(&raw_key[raw_start.len()..]).to_string();
+            let key: &[u8] = pair.key().as_ref().into();
+            if key.starts_with(&prefix) {
+                let name = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
                 tables.push(name);
             }
         }
@@ -470,19 +459,16 @@ impl TikvStore {
     }
 
     pub async fn list_views(&self, txn: &mut Transaction) -> Result<Vec<String>> {
-        let raw_start = encode_view_prefix();
-        let mut raw_end = raw_start.clone();
-        raw_end.push(0xFF);
-        let start = self.key(&raw_start);
-        let end = self.key(&raw_end);
-        let range: BoundRange = (start..end).into();
+        let prefix = encode_view_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
         let pairs = txn.scan(range, u32::MAX).await?;
         let mut views = Vec::new();
         for pair in pairs {
-            let full_key: &[u8] = pair.key().as_ref().into();
-            let raw_key = strip_namespace(&self.namespace, full_key);
-            if raw_key.starts_with(&raw_start) {
-                let name = String::from_utf8_lossy(&raw_key[raw_start.len()..]).to_string();
+            let key: &[u8] = pair.key().as_ref().into();
+            if key.starts_with(&prefix) {
+                let name = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
                 views.push(name);
             }
         }
@@ -528,19 +514,16 @@ impl TikvStore {
     }
 
     pub async fn list_materialized_views(&self, txn: &mut Transaction) -> Result<Vec<String>> {
-        let raw_start = encode_matview_prefix();
-        let mut raw_end = raw_start.clone();
-        raw_end.push(0xFF);
-        let start = self.key(&raw_start);
-        let end = self.key(&raw_end);
-        let range: BoundRange = (start..end).into();
+        let prefix = encode_matview_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
         let pairs = txn.scan(range, u32::MAX).await?;
         let mut matviews = Vec::new();
         for pair in pairs {
-            let full_key: &[u8] = pair.key().as_ref().into();
-            let raw_key = strip_namespace(&self.namespace, full_key);
-            if raw_key.starts_with(&raw_start) {
-                let name = String::from_utf8_lossy(&raw_key[raw_start.len()..]).to_string();
+            let key: &[u8] = pair.key().as_ref().into();
+            if key.starts_with(&prefix) {
+                let name = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
                 matviews.push(name);
             }
         }

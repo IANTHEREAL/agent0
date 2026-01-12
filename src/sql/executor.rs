@@ -55,14 +55,7 @@ impl Executor {
     pub fn new(store: Arc<TikvStore>) -> Self {
         Self {
             store,
-            auth_manager: AuthManager::new(None),
-        }
-    }
-
-    pub fn new_with_namespace(store: Arc<TikvStore>, namespace: Option<String>) -> Self {
-        Self {
-            store,
-            auth_manager: AuthManager::new(namespace),
+            auth_manager: AuthManager::new(),
         }
     }
 
@@ -409,6 +402,7 @@ impl Executor {
             ExecuteResult::Select {
                 columns: cols,
                 rows,
+                ..
             } => (cols, rows),
             _ => return Err(anyhow!("CREATE TABLE AS requires a SELECT query")),
         };
@@ -442,6 +436,7 @@ impl Executor {
             ExecuteResult::Select {
                 columns: cols,
                 rows,
+                ..
             } => (cols, rows),
             _ => return Err(anyhow!("SELECT INTO requires a SELECT query")),
         };
@@ -490,7 +485,11 @@ impl Executor {
             .execute_query_with_ctes(txn, query, &HashMap::new())
             .await?;
         let (columns, rows) = match result {
-            ExecuteResult::Select { columns, rows } => (columns, rows),
+            ExecuteResult::Select {
+                columns,
+                column_types: _,
+                rows,
+            } => (columns, rows),
             _ => return Err(anyhow!("Materialized view must be a SELECT query")),
         };
 
@@ -1067,6 +1066,7 @@ impl Executor {
 
         if returning.is_some() {
             Ok(ExecuteResult::Select {
+                column_types: None,
                 columns: ret_cols,
                 rows: ret_rows,
             })
@@ -1121,6 +1121,7 @@ impl Executor {
 
         if returning.is_some() {
             Ok(ExecuteResult::Select {
+                column_types: None,
                 columns: ret_cols,
                 rows: ret_rows,
             })
@@ -1271,7 +1272,23 @@ impl Executor {
         }
 
         if returning.is_some() {
+            // Extract column types from schema for RETURNING clause
+            let column_types = Some(
+                ret_cols
+                    .iter()
+                    .map(|col_name| {
+                        schema
+                            .columns
+                            .iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                            .map(|c| c.data_type.clone())
+                            .unwrap_or(DataType::Text)
+                    })
+                    .collect(),
+            );
+
             Ok(ExecuteResult::Select {
+                column_types,
                 columns: ret_cols,
                 rows: ret_rows,
             })
@@ -1309,7 +1326,11 @@ impl Executor {
                 } else {
                     let cte_result = self.execute_query_with_ctes(txn, &cte.query, &ctes).await?;
                     match cte_result {
-                        ExecuteResult::Select { columns, rows } => {
+                        ExecuteResult::Select {
+                            columns,
+                            column_types: _,
+                            rows,
+                        } => {
                             let col_names: Vec<String> = if cte.alias.columns.is_empty() {
                                 columns
                             } else {
@@ -1386,7 +1407,11 @@ impl Executor {
             .execute_query_with_ctes(txn, &base_query, existing_ctes)
             .await?;
         let (columns, mut all_rows) = match base_result {
-            ExecuteResult::Select { columns, rows } => (columns, rows),
+            ExecuteResult::Select {
+                columns,
+                column_types: _,
+                rows,
+            } => (columns, rows),
             _ => return Err(anyhow!("Recursive CTE base must be SELECT")),
         };
 
@@ -1806,6 +1831,7 @@ impl Executor {
             }
 
             let result = ExecuteResult::Select {
+                column_types: None,
                 columns: col_names,
                 rows: final_rows,
             };
@@ -1831,10 +1857,30 @@ impl Executor {
             let mut indexed: Vec<(usize, Row)> = filtered_rows.into_iter().enumerate().collect();
             indexed.sort_by(|(_, a), (_, b)| {
                 for order_expr in &query.order_by {
+                    // Resolve ORDER BY expression: if it's an alias, use the SELECT list expression
+                    let actual_expr = if let Expr::Identifier(ref ident) = order_expr.expr {
+                        // Check if this identifier matches a SELECT list alias
+                        let mut found_expr = None;
+                        for item in &resolved_projection {
+                            match item {
+                                SelectItem::ExprWithAlias { expr, alias } => {
+                                    if alias.value.eq_ignore_ascii_case(&ident.value) {
+                                        found_expr = Some(expr);
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        found_expr.unwrap_or(&order_expr.expr)
+                    } else {
+                        &order_expr.expr
+                    };
+
                     let val_a =
-                        eval_expr(&order_expr.expr, Some(a), Some(&schema)).unwrap_or(Value::Null);
+                        eval_expr(actual_expr, Some(a), Some(&schema)).unwrap_or(Value::Null);
                     let val_b =
-                        eval_expr(&order_expr.expr, Some(b), Some(&schema)).unwrap_or(Value::Null);
+                        eval_expr(actual_expr, Some(b), Some(&schema)).unwrap_or(Value::Null);
                     let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
                     if cmp != 0 {
                         let asc = order_expr.asc.unwrap_or(true);
@@ -1930,7 +1976,11 @@ impl Executor {
                             cols.push(c.name.clone());
                         }
                     }
-                    _ => cols.push(get_select_item_name(item)),
+                    _ => {
+                        let col_name = get_select_item_name(item);
+                        tracing::info!("Column name for SELECT item: '{}'", col_name);
+                        cols.push(col_name);
+                    }
                 }
             }
 
@@ -1971,7 +2021,22 @@ impl Executor {
             None => {}
         }
 
+        // Extract column types from schema if available
+        let column_types = Some(
+            cols.iter()
+                .map(|col_name| {
+                    schema
+                        .columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                        .map(|c| c.data_type.clone())
+                        .unwrap_or(DataType::Text)
+                })
+                .collect(),
+        );
+
         let result = ExecuteResult::Select {
+            column_types,
             columns: cols,
             rows: result_rows,
         };
@@ -2010,6 +2075,7 @@ impl Executor {
         }
 
         Ok(ExecuteResult::Select {
+            column_types: None,
             columns: cols,
             rows: vec![Row::new(values)],
         })
@@ -2030,11 +2096,19 @@ impl Executor {
             let right_result = self.execute_set_expr(txn, right, ctes).await?;
 
             let (left_cols, left_rows) = match left_result {
-                ExecuteResult::Select { columns, rows } => (columns, rows),
+                ExecuteResult::Select {
+                    columns,
+                    column_types: _,
+                    rows,
+                } => (columns, rows),
                 _ => return Err(anyhow!("Left side of set operation must be SELECT")),
             };
             let (right_cols, right_rows) = match right_result {
-                ExecuteResult::Select { columns, rows } => (columns, rows),
+                ExecuteResult::Select {
+                    columns,
+                    column_types: _,
+                    rows,
+                } => (columns, rows),
                 _ => return Err(anyhow!("Right side of set operation must be SELECT")),
             };
 
@@ -2050,6 +2124,7 @@ impl Executor {
             };
 
             Ok(ExecuteResult::Select {
+                column_types: None,
                 columns: left_cols,
                 rows,
             })
@@ -2110,6 +2185,44 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<(TableSchema, Vec<Row>)> {
         let t_lower = table_name.to_lowercase();
+
+        // Check if this is a known scalar function (with or without parentheses)
+        let t_upper = table_name.trim_end_matches("()").to_uppercase();
+        if matches!(
+            t_upper.as_str(),
+            "CURRENT_SCHEMA" | "CURRENT_DATABASE" | "CURRENT_USER" | "SESSION_USER" | "USER"
+        ) {
+            let result = match t_upper.as_str() {
+                "CURRENT_SCHEMA" => Value::Text("public".to_string()),
+                "CURRENT_DATABASE" => Value::Text("postgres".to_string()),
+                "CURRENT_USER" | "SESSION_USER" | "USER" => Value::Text("postgres".to_string()),
+                _ => unreachable!(),
+            };
+
+            // Create a single-column, single-row result
+            let col_name = t_upper.to_lowercase();
+            let schema = TableSchema {
+                table_id: 0,
+                name: table_name.to_string(),
+                columns: vec![ColumnDef {
+                    name: col_name.clone(),
+                    data_type: result.data_type().unwrap_or(DataType::Text),
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                }],
+                pk_indices: vec![],
+                indexes: vec![],
+                version: 1,
+                check_constraints: vec![],
+                foreign_keys: vec![],
+            };
+            let rows = vec![Row::new(vec![result])];
+            return Ok((schema, rows));
+        }
+
         if let Some((schema, rows)) = ctes.get(&t_lower) {
             return Ok((schema.clone(), rows.clone()));
         }
@@ -2126,7 +2239,11 @@ impl Executor {
         if let Some(view_query) = self.store.get_view(txn, &t_lower).await? {
             let result = self.execute_view_query(txn, &view_query, ctes).await?;
             return match result {
-                ExecuteResult::Select { columns, rows } => {
+                ExecuteResult::Select {
+                    columns,
+                    column_types: _,
+                    rows,
+                } => {
                     let schema = TableSchema {
                         table_id: 0,
                         name: t_lower,
@@ -2152,6 +2269,41 @@ impl Executor {
                 }
                 _ => Err(anyhow!("View must return SELECT result")),
             };
+        }
+
+        // Handle function calls in FROM clause (e.g., SELECT * FROM current_schema())
+        if table_name.ends_with("()") || table_name.contains("(") && table_name.contains(")") {
+            // Parse as a function call
+            let func_name = table_name.trim_end_matches("()").to_uppercase();
+            let result = match func_name.as_str() {
+                "CURRENT_SCHEMA" => Value::Text("public".to_string()),
+                "CURRENT_DATABASE" => Value::Text("postgres".to_string()),
+                "CURRENT_USER" | "SESSION_USER" | "USER" => Value::Text("postgres".to_string()),
+                _ => return Err(anyhow!("Function '{}' not found", func_name)),
+            };
+
+            // Create a single-column, single-row result
+            let col_name = func_name.to_lowercase();
+            let schema = TableSchema {
+                table_id: 0,
+                name: table_name.to_string(),
+                columns: vec![ColumnDef {
+                    name: col_name.clone(),
+                    data_type: result.data_type().unwrap_or(DataType::Text),
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                }],
+                pk_indices: vec![],
+                indexes: vec![],
+                version: 1,
+                check_constraints: vec![],
+                foreign_keys: vec![],
+            };
+            let rows = vec![Row::new(vec![result])];
+            return Ok((schema, rows));
         }
 
         let schema = self
@@ -2192,7 +2344,11 @@ impl Executor {
         Box::pin(async move {
             let result = self.execute_query_with_ctes(txn, subquery, ctes).await?;
             match result {
-                ExecuteResult::Select { columns, rows } => {
+                ExecuteResult::Select {
+                    columns,
+                    column_types: _,
+                    rows,
+                } => {
                     let schema = TableSchema {
                         table_id: 0,
                         name: alias.to_string(),
@@ -2229,13 +2385,33 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
         let (base_alias, base_schema, base_rows) = match &select.from[0].relation {
-            TableFactor::Table { name, alias, .. } => {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
                 let tbl = name.0.last().unwrap().value.clone();
                 let als = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| tbl.clone());
-                let (schema, rows) = self.get_table_data(txn, &tbl, ctes).await?;
+
+                // Check if this is a known scalar function that can be used as a table
+                let tbl_upper = tbl.to_uppercase();
+                let is_scalar_function = matches!(
+                    tbl_upper.as_str(),
+                    "CURRENT_SCHEMA"
+                        | "CURRENT_DATABASE"
+                        | "CURRENT_USER"
+                        | "SESSION_USER"
+                        | "USER"
+                ) || args.is_some();
+
+                let table_name = if is_scalar_function {
+                    format!("{}()", tbl) // Add parentheses for function detection in get_table_data
+                } else {
+                    tbl.clone()
+                };
+
+                let (schema, rows) = self.get_table_data(txn, &table_name, ctes).await?;
                 (als, schema, rows)
             }
             TableFactor::Derived {
@@ -2705,6 +2881,7 @@ impl Executor {
             }
 
             return Ok(ExecuteResult::Select {
+                column_types: None,
                 columns: col_names,
                 rows: final_rows,
             });
@@ -2726,6 +2903,26 @@ impl Executor {
             let mut indexed: Vec<(usize, Row)> = filtered_rows.into_iter().enumerate().collect();
             indexed.sort_by(|(_, a), (_, b)| {
                 for order_expr in &query.order_by {
+                    // Resolve ORDER BY expression: if it's an alias, use the SELECT list expression
+                    let actual_expr = if let Expr::Identifier(ref ident) = order_expr.expr {
+                        // Check if this identifier matches a SELECT list alias
+                        let mut found_expr = None;
+                        for item in &resolved_projection {
+                            match item {
+                                SelectItem::ExprWithAlias { expr, alias } => {
+                                    if alias.value.eq_ignore_ascii_case(&ident.value) {
+                                        found_expr = Some(expr);
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        found_expr.unwrap_or(&order_expr.expr)
+                    } else {
+                        &order_expr.expr
+                    };
+
                     let ctx_a = JoinContext {
                         tables: HashMap::new(),
                         column_offsets: final_column_offsets.clone(),
@@ -2738,8 +2935,8 @@ impl Executor {
                         combined_row: b,
                         combined_schema: &final_schema,
                     };
-                    let val_a = eval_expr_join(&order_expr.expr, &ctx_a).unwrap_or(Value::Null);
-                    let val_b = eval_expr_join(&order_expr.expr, &ctx_b).unwrap_or(Value::Null);
+                    let val_a = eval_expr_join(actual_expr, &ctx_a).unwrap_or(Value::Null);
+                    let val_b = eval_expr_join(actual_expr, &ctx_b).unwrap_or(Value::Null);
                     let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
                     if cmp != 0 {
                         let asc = order_expr.asc.unwrap_or(true);
@@ -2917,6 +3114,7 @@ impl Executor {
         }
 
         Ok(ExecuteResult::Select {
+            column_types: None,
             columns: cols,
             rows: result_rows,
         })
@@ -2956,6 +3154,7 @@ impl Executor {
             .collect();
 
         Ok(ExecuteResult::Select {
+            column_types: None,
             columns: vec!["QUERY PLAN".to_string()],
             rows: lines,
         })

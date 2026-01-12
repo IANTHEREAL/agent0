@@ -61,7 +61,6 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PG_PORT);
-    let namespace = env::var("PG_NAMESPACE").ok();
     let default_keyspace = env::var("PG_KEYSPACE").ok();
     let password = env::var("PG_PASSWORD").ok();
 
@@ -71,11 +70,6 @@ async fn main() -> Result<()> {
     info!("pg-tikv starting up...");
     info!("PD endpoints: {}", pd_endpoints);
     info!("PostgreSQL port: {}", pg_port);
-    if let Some(ns) = &namespace {
-        info!("Namespace: {}", ns);
-    } else {
-        info!("Namespace: (default/global)");
-    }
     if let Some(ks) = &default_keyspace {
         info!("Default keyspace: {}", ks);
     } else {
@@ -113,7 +107,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let client_pool = Arc::new(TikvClientPool::new(pd_addrs.clone(), namespace.clone()));
+    let client_pool = Arc::new(TikvClientPool::new(pd_addrs.clone()));
 
     let startup_keyspace = default_keyspace
         .clone()
