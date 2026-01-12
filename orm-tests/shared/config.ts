@@ -7,14 +7,33 @@ export interface DatabaseConfig {
   ssl: boolean;
 }
 
-export const defaultConfig: DatabaseConfig = {
-  host: process.env.PG_HOST ?? '127.0.0.1',
-  port: parseInt(process.env.PG_PORT ?? '5433', 10),
-  database: process.env.PG_DATABASE ?? 'postgres',
-  user: process.env.PG_USER ?? 'postgres',
-  password: process.env.PG_PASSWORD ?? 'postgres',
-  ssl: process.env.PG_SSL === 'true',
-};
+function parseDsn(dsn: string): DatabaseConfig {
+  const url = new URL(dsn);
+  return {
+    host: url.hostname || '127.0.0.1',
+    port: parseInt(url.port || '5433', 10),
+    database: url.pathname.slice(1) || 'postgres',
+    user: url.username || 'admin',
+    password: url.password || 'admin',
+    ssl: url.searchParams.get('sslmode') === 'require',
+  };
+}
+
+function buildConfig(): DatabaseConfig {
+  if (process.env.PG_DSN) {
+    return parseDsn(process.env.PG_DSN);
+  }
+  return {
+    host: process.env.PG_HOST ?? '127.0.0.1',
+    port: parseInt(process.env.PG_PORT ?? '5433', 10),
+    database: process.env.PG_DATABASE ?? 'postgres',
+    user: process.env.PG_USER ?? 'admin',
+    password: process.env.PG_PASSWORD ?? 'admin',
+    ssl: process.env.PG_SSL === 'true',
+  };
+}
+
+export const defaultConfig: DatabaseConfig = buildConfig();
 
 export function getConnectionString(config: DatabaseConfig = defaultConfig): string {
   const { host, port, database, user, password, ssl } = config;

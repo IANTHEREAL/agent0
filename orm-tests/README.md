@@ -28,17 +28,21 @@ npm test
 
 ## Test Configuration
 
-Default connection settings in `shared/config.ts`:
+Use `PG_DSN` environment variable (recommended):
+
+```bash
+PG_DSN=postgres://admin:admin@127.0.0.1:5433/postgres npm test
+```
+
+Or use individual environment variables (fallback):
 
 | Setting | Default | Environment Variable |
 |---------|---------|---------------------|
 | Host | `127.0.0.1` | `PG_HOST` |
 | Port | `5433` | `PG_PORT` |
 | Database | `postgres` | `PG_DATABASE` |
-| User | `postgres` | `PG_USER` |
-| Password | `postgres` | `PG_PASSWORD` |
-
-Override using environment variables:
+| User | `admin` | `PG_USER` |
+| Password | `admin` | `PG_PASSWORD` |
 
 ```bash
 PG_HOST=192.168.1.100 PG_PORT=5432 npm test

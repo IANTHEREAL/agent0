@@ -1,0 +1,15 @@
+FROM rust:1.75-bookworm
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    cmake \
+    protobuf-compiler \
+    libssl-dev \
+    pkg-config \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Keep container running for development
+CMD ["sleep", "infinity"]

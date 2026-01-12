@@ -1,49 +1,36 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# ///
 """
 pg-tikv Integration Test Runner
 
 Usage:
-    python3 scripts/integration_test.py                    # Run built-in tests
-    python3 scripts/integration_test.py tests/basic.sql   # Run single SQL file
-    python3 scripts/integration_test.py tests/            # Run all .sql files in directory
-    python3 scripts/integration_test.py --help            # Show help
+    integration_test.py --dsn postgres://user:pass@host:port/db
+    integration_test.py --dsn postgres://... tests/basic.sql
+    integration_test.py --dsn postgres://... tests/
 
-Options:
-    --user USER         PostgreSQL user (default: postgres)
-    --password PASS     PostgreSQL password (default: postgres)
-    --port PORT         pg-tikv port (default: 5433)
-    --host HOST         pg-tikv host (default: 127.0.0.1)
-    --docker            Use Docker for TiKV/pg-tikv (default)
-    --tiup              Use tiup playground instead of Docker
-    --no-setup          Skip TiKV/pg-tikv setup (use existing)
-    --no-cleanup        Don't cleanup after tests
-    --verbose           Show SQL output
-    --stop-on-error     Stop on first error
+Environment:
+    PG_DSN=postgres://admin:admin@127.0.0.1:5433/postgres
 """
 
 import subprocess
 import sys
 import os
 import time
-import signal
-import re
-import socket
-import atexit
 import argparse
+import re
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Optional, List, Tuple
 from enum import Enum
+from urllib.parse import urlparse
 
 PROJECT_DIR = Path(__file__).parent.parent
-DOCKER_DIR = PROJECT_DIR / "docker"
-LOG_DIR = Path("/tmp/pg-tikv-test")
-DEFAULT_PORT = 5433
 
 GREEN = "\033[0;32m"
 YELLOW = "\033[1;33m"
 RED = "\033[0;31m"
-BLUE = "\033[0;34m"
 NC = "\033[0m"
 
 
@@ -54,28 +41,32 @@ class TestResult(Enum):
     ERROR = "ERROR"
 
 
-class SetupMode(Enum):
-    DOCKER = "docker"
-    TIUP = "tiup"
-    NONE = "none"
-
-
 @dataclass
-class ProcessManager:
-    playground_proc: Optional[subprocess.Popen] = None
-    pgtikv_proc: Optional[subprocess.Popen] = None
-    pd_port: Optional[int] = None
-    docker_compose_file: Optional[Path] = None
+class DbConfig:
+    host: str = "127.0.0.1"
+    port: int = 5433
+    user: str = "admin"
+    password: str = "admin"
+    database: str = "postgres"
+
+    @classmethod
+    def from_dsn(cls, dsn: str) -> "DbConfig":
+        parsed = urlparse(dsn)
+        return cls(
+            host=parsed.hostname or "127.0.0.1",
+            port=parsed.port or 5433,
+            user=parsed.username or "admin",
+            password=parsed.password or "admin",
+            database=parsed.path.lstrip("/") or "postgres",
+        )
+
+    def to_dsn(self) -> str:
+        return f"postgres://{self.user}:{self.password}@{self.host}:{self.port}/{self.database}"
 
 
 @dataclass
 class TestConfig:
-    user: str = "postgres"
-    password: str = "postgres"
-    port: int = DEFAULT_PORT
-    host: str = "127.0.0.1"
-    setup_mode: SetupMode = SetupMode.DOCKER
-    no_cleanup: bool = False
+    db: DbConfig = field(default_factory=DbConfig)
     verbose: bool = False
     stop_on_error: bool = False
     test_files: List[Path] = field(default_factory=list)
@@ -103,7 +94,6 @@ class TestStats:
             self.errors += 1
 
 
-pm = ProcessManager()
 config = TestConfig()
 
 
@@ -130,273 +120,36 @@ def log_test(name: str, result: TestResult, details: str = ""):
     print(f"{color}[{result.value}]{NC} {name}{suffix}")
 
 
-def cleanup():
-    if config.no_cleanup:
-        log_info("Skipping cleanup (--no-cleanup)")
-        return
-
-    print(f"{YELLOW}Cleaning up...{NC}")
-
-    if config.setup_mode == SetupMode.DOCKER:
-        cleanup_docker()
-    elif config.setup_mode == SetupMode.TIUP:
-        cleanup_tiup()
-
-    print("Cleanup complete")
+def psql_args() -> List[str]:
+    db = config.db
+    return ["psql", "-h", db.host, "-p", str(db.port), "-U", db.user, "-d", db.database]
 
 
-def cleanup_docker():
-    log_info("Stopping Docker containers...")
-    compose_file = DOCKER_DIR / "docker-compose.test.yml"
-    subprocess.run(
-        ["docker", "compose", "-f", str(compose_file), "down", "-v"],
-        capture_output=True,
-        cwd=DOCKER_DIR,
-    )
+def psql_env() -> dict:
+    env = os.environ.copy()
+    env["PGPASSWORD"] = config.db.password
+    return env
 
 
-def cleanup_tiup():
-    if pm.pgtikv_proc and pm.pgtikv_proc.poll() is None:
-        print(f"Stopping pg-tikv (PID: {pm.pgtikv_proc.pid})")
-        pm.pgtikv_proc.terminate()
-        try:
-            pm.pgtikv_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pm.pgtikv_proc.kill()
-
-    if pm.playground_proc and pm.playground_proc.poll() is None:
-        print(f"Stopping tiup playground (PID: {pm.playground_proc.pid})")
-        pm.playground_proc.terminate()
-        try:
-            pm.playground_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pm.playground_proc.kill()
-
-    for pattern in ["tiup playground", "tikv-server", "pd-server"]:
-        subprocess.run(["pkill", "-f", pattern], capture_output=True)
-
-
-def wait_for_port(host: str, port: int, timeout: int = 30) -> bool:
-    for _ in range(timeout):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(1)
-            if sock.connect_ex((host, port)) == 0:
-                return True
-        time.sleep(1)
-    return False
-
-
-def check_docker() -> bool:
-    result = subprocess.run(["docker", "info"], capture_output=True)
-    if result.returncode != 0:
-        log_error("Docker is not running. Please start Docker first.")
-        return False
-    
-    result = subprocess.run(["docker", "compose", "version"], capture_output=True)
-    if result.returncode != 0:
-        log_error("Docker Compose is not available. Please install Docker Compose.")
-        return False
-    
-    return True
-
-
-def setup_docker():
-    log_info("Setting up TiKV cluster with Docker...")
-
-    compose_file = DOCKER_DIR / "docker-compose.test.yml"
-    if not compose_file.exists():
-        log_error(f"Docker compose file not found: {compose_file}")
-        sys.exit(1)
-
-    log_info("Starting Docker containers (PD, TiKV, pg-tikv)...")
-    log_info("This may take a few minutes on first run...")
-
+def check_connection() -> bool:
     result = subprocess.run(
-        ["docker", "compose", "-f", str(compose_file), "up", "-d", "--build", 
-         "pd", "tikv", "pg-tikv"],
-        cwd=DOCKER_DIR,
+        psql_args() + ["-c", "SELECT 1"],
         capture_output=True,
         text=True,
+        env=psql_env(),
+        timeout=10,
     )
-
-    if result.returncode != 0:
-        log_error("Failed to start Docker containers:")
-        print(result.stderr)
-        sys.exit(1)
-
-    log_info("Waiting for pg-tikv to be ready...")
-    
-    if not wait_for_port(config.host, config.port, timeout=120):
-        log_error(f"pg-tikv not accessible on {config.host}:{config.port}")
-        log_error("Container logs:")
-        subprocess.run(
-            ["docker", "compose", "-f", str(compose_file), "logs", "pg-tikv"],
-            cwd=DOCKER_DIR,
-        )
-        sys.exit(1)
-
-    log_info(f"pg-tikv is ready on port {config.port}")
-    time.sleep(2)
+    return result.returncode == 0
 
 
-def extract_pd_port(log_file: Path, timeout: int = 120) -> Optional[int]:
-    pattern = re.compile(r"(?:PD Endpoints:|PD client).*?127\.0\.0\.1:(\d+)")
-
-    for elapsed in range(timeout):
-        if log_file.exists():
-            content = log_file.read_text()
-            match = pattern.search(content)
-            if match:
-                return int(match.group(1))
-
-        if elapsed > 0 and elapsed % 10 == 0:
-            log_info(f"Still waiting for PD to start... ({elapsed}s/{timeout}s)")
-        time.sleep(1)
-
-    return None
-
-
-def detect_tiup_ctl_version() -> str:
-    tiup_home = Path.home() / ".tiup" / "components" / "ctl"
-    if tiup_home.exists():
-        versions = [d.name for d in tiup_home.iterdir() if d.is_dir() and d.name.startswith("v")]
-        if versions:
-            return sorted(versions, reverse=True)[0]
-    return "nightly"
-
-
-def check_tiup_dependencies() -> bool:
-    deps = {
-        "tiup": "curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh",
-        "psql": "brew install postgresql   (macOS)\n  apt install postgresql-client   (Ubuntu/Debian)",
-        "cargo": "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
-    }
-
-    missing = False
-    for cmd, install_hint in deps.items():
-        if subprocess.run(["which", cmd], capture_output=True).returncode != 0:
-            log_error(f"{cmd} is not installed. Install with:")
-            log_error(f"  {install_hint}")
-            missing = True
-
-    return not missing
-
-
-def setup_tiup():
-    log_info("Setting up TiKV cluster with tiup...")
-
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-    tikv_config = LOG_DIR / "tikv.toml"
-    tikv_config.write_text("""\
-[storage]
-api-version = 2
-enable-ttl = true
-""")
-
-    log_info("Starting tiup playground (this may take a while on first run)...")
-
-    log_file = LOG_DIR / "playground.log"
-    with open(log_file, "w") as f:
-        pm.playground_proc = subprocess.Popen(
-            ["tiup", "playground", "--mode", "tikv-slim", "--kv.config", str(tikv_config)],
-            stdout=f,
-            stderr=subprocess.STDOUT,
-        )
-
-    log_info(f"Waiting for PD to start (PID: {pm.playground_proc.pid})...")
-
-    pm.pd_port = extract_pd_port(log_file)
-    if not pm.pd_port:
-        log_error("Failed to extract PD port from logs after 120 seconds")
-        log_error("Log file contents:")
-        print(log_file.read_text())
-        sys.exit(1)
-
-    log_info(f"PD is running on port {pm.pd_port}")
-
-    if not wait_for_port("127.0.0.1", pm.pd_port, 60):
-        log_error(f"PD port {pm.pd_port} is not accessible")
-        sys.exit(1)
-
-    time.sleep(3)
-    build_pgtikv()
-    start_pgtikv_tiup()
-
-
-def build_pgtikv():
-    log_info("Building pg-tikv...")
-    result = subprocess.run(
-        ["cargo", "build", "--release"],
-        cwd=PROJECT_DIR,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        log_error("Build failed:")
-        print(result.stderr)
-        sys.exit(1)
-
-
-def start_pgtikv_tiup():
-    log_info(f"Starting pg-tikv on port {config.port} with PD at 127.0.0.1:{pm.pd_port}...")
-
-    log_file = LOG_DIR / "pgtikv.log"
-    env = os.environ.copy()
-    env.update({
-        "PD_ENDPOINTS": f"127.0.0.1:{pm.pd_port}",
-        "PG_PORT": str(config.port),
-        "PG_PASSWORD": config.password,
-    })
-
-    with open(log_file, "w") as f:
-        pm.pgtikv_proc = subprocess.Popen(
-            [str(PROJECT_DIR / "target" / "release" / "pg-tikv")],
-            stdout=f,
-            stderr=subprocess.STDOUT,
-            env=env,
-        )
-
-    log_info(f"pg-tikv started (PID: {pm.pgtikv_proc.pid})")
-
-    if not wait_for_port("127.0.0.1", config.port, 30):
-        log_error(f"pg-tikv port {config.port} is not accessible")
-        print(log_file.read_text())
-        sys.exit(1)
-
-    time.sleep(2)
-
-
-def check_cluster_health() -> bool:
-    if config.setup_mode == SetupMode.TIUP:
-        if pm.playground_proc and pm.playground_proc.poll() is not None:
-            log_error(f"tiup playground died (exit code: {pm.playground_proc.returncode})")
-            return False
-        if pm.pgtikv_proc and pm.pgtikv_proc.poll() is not None:
-            log_error(f"pg-tikv died (exit code: {pm.pgtikv_proc.returncode})")
-            log_error("pg-tikv log:")
-            print((LOG_DIR / "pgtikv.log").read_text()[-2000:])
-            return False
-    return True
-
-
-def run_sql(sql: str, user: Optional[str] = None, password: Optional[str] = None, retries: int = 2) -> Tuple[str, int]:
-    actual_user = user if user else config.user
-    actual_password = password if password else config.password
-
-    env = os.environ.copy()
-    env["PGPASSWORD"] = actual_password
+def run_sql(sql: str, retries: int = 2) -> Tuple[str, int]:
     output = ""
-
     for attempt in range(retries + 1):
-        if config.setup_mode != SetupMode.NONE and not check_cluster_health():
-            return "ERROR: Cluster unhealthy", 1
-
         result = subprocess.run(
-            ["psql", "-h", config.host, "-p", str(config.port), "-U", actual_user, "-d", "postgres", "-c", sql],
+            psql_args() + ["-c", sql],
             capture_output=True,
             text=True,
-            env=env,
+            env=psql_env(),
         )
         output = result.stdout + result.stderr
 
@@ -410,18 +163,12 @@ def run_sql(sql: str, user: Optional[str] = None, password: Optional[str] = None
     return output, 1
 
 
-def run_sql_file(sql_file: Path, user: Optional[str] = None, password: Optional[str] = None) -> Tuple[str, int]:
-    actual_user = user if user else config.user
-    actual_password = password if password else config.password
-
-    env = os.environ.copy()
-    env["PGPASSWORD"] = actual_password
-
+def run_sql_file(sql_file: Path) -> Tuple[str, int]:
     result = subprocess.run(
-        ["psql", "-h", config.host, "-p", str(config.port), "-U", actual_user, "-d", "postgres", "-f", str(sql_file)],
+        psql_args() + ["-f", str(sql_file)],
         capture_output=True,
         text=True,
-        env=env,
+        env=psql_env(),
     )
     return result.stdout + result.stderr, result.returncode
 
@@ -437,26 +184,26 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
 
     if setup_file.exists():
         log_info(f"  Running setup: {setup_file.name}")
-        setup_output, setup_rc = run_sql_file(setup_file)
+        setup_output, _ = run_sql_file(setup_file)
         if "ERROR:" in setup_output or "FATAL:" in setup_output:
-            log_test(sql_file.name, TestResult.FAILED, f"setup failed")
+            log_test(sql_file.name, TestResult.FAILED, "setup failed")
             print(f"  {RED}Setup error: {setup_output[:200]}{NC}")
             return TestResult.FAILED
 
     if load_script.exists():
         log_info(f"  Running load script: {load_script.name}")
+        db = config.db
         result = subprocess.run(
-            ["python3", str(load_script), "--port", str(config.port), "--user", config.user, "--password", config.password],
+            ["python3", str(load_script), "--port", str(db.port), "--user", db.user, "--password", db.password],
             capture_output=True,
             text=True,
         )
         if result.returncode != 0:
-            log_test(sql_file.name, TestResult.FAILED, f"load script failed")
+            log_test(sql_file.name, TestResult.FAILED, "load script failed")
             print(f"  {RED}Load error: {result.stdout[:200]}{result.stderr[:200]}{NC}")
             return TestResult.FAILED
 
-    output, returncode = run_sql_file(sql_file)
-
+    output, _ = run_sql_file(sql_file)
     out_file.write_text(output)
 
     if config.verbose:
@@ -478,33 +225,30 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
                 print(f"--- Actual ({out_file}):")
                 print(output[:500])
             return TestResult.FAILED
-    else:
-        if has_error:
-            if errors_file.exists():
-                expected_errors = [line.strip() for line in errors_file.read_text().strip().split("\n") if line.strip()]
-                actual_errors = [line for line in output.split("\n") if any(p in line for p in error_patterns)]
-                unexpected_errors = []
-                for actual in actual_errors:
-                    if not any(exp in actual for exp in expected_errors):
-                        unexpected_errors.append(actual)
-                if unexpected_errors:
-                    log_test(sql_file.name, TestResult.FAILED, "unexpected SQL errors")
-                    for line in unexpected_errors[:3]:
-                        print(f"  {RED}{line}{NC}")
-                    return TestResult.FAILED
-                else:
-                    log_test(sql_file.name, TestResult.PASSED, "all errors were expected")
-                    return TestResult.PASSED
-            else:
-                log_test(sql_file.name, TestResult.FAILED, "SQL errors detected")
-                for line in output.split("\n"):
-                    if any(p in line for p in error_patterns):
-                        print(f"  {RED}{line}{NC}")
-                        break
+
+    if has_error:
+        if errors_file.exists():
+            expected_errors = [line.strip() for line in errors_file.read_text().strip().split("\n") if line.strip()]
+            actual_errors = [line for line in output.split("\n") if any(p in line for p in error_patterns)]
+            unexpected_errors = [actual for actual in actual_errors if not any(exp in actual for exp in expected_errors)]
+            if unexpected_errors:
+                log_test(sql_file.name, TestResult.FAILED, "unexpected SQL errors")
+                for line in unexpected_errors[:3]:
+                    print(f"  {RED}{line}{NC}")
                 return TestResult.FAILED
+            else:
+                log_test(sql_file.name, TestResult.PASSED, "all errors were expected")
+                return TestResult.PASSED
         else:
-            log_test(sql_file.name, TestResult.PASSED, "no .expected file, checked for errors only")
-            return TestResult.PASSED
+            log_test(sql_file.name, TestResult.FAILED, "SQL errors detected")
+            for line in output.split("\n"):
+                if any(p in line for p in error_patterns):
+                    print(f"  {RED}{line}{NC}")
+                    break
+            return TestResult.FAILED
+
+    log_test(sql_file.name, TestResult.PASSED, "no .expected file, checked for errors only")
+    return TestResult.PASSED
 
 
 def run_external_tests(test_paths: List[Path]) -> TestStats:
@@ -597,21 +341,21 @@ def test_dml_operations() -> bool:
 
     result, _ = run_sql("SELECT SUM(value) FROM test_dml")
     if "60" not in result:
-        log_error(f"INSERT + SELECT: FAILED (expected 60)")
+        log_error("INSERT + SELECT: FAILED (expected 60)")
         return False
     log_info("INSERT + SELECT: PASSED")
 
     run_sql("UPDATE test_dml SET value = value * 2 WHERE value > 15")
     result, _ = run_sql("SELECT SUM(value) FROM test_dml")
     if "110" not in result:
-        log_error(f"UPDATE: FAILED (expected 110)")
+        log_error("UPDATE: FAILED (expected 110)")
         return False
     log_info("UPDATE: PASSED")
 
     run_sql("DELETE FROM test_dml WHERE value > 50")
     result, _ = run_sql("SELECT COUNT(*) FROM test_dml")
     if "1" not in result:
-        log_error(f"DELETE: FAILED (expected 1 row)")
+        log_error("DELETE: FAILED (expected 1 row)")
         return False
     log_info("DELETE: PASSED")
 
@@ -630,14 +374,14 @@ def test_transactions() -> bool:
     run_sql("BEGIN; UPDATE test_txn SET value = 200 WHERE id = 1; ROLLBACK")
     result, _ = run_sql("SELECT value FROM test_txn WHERE id = 1")
     if "100" not in result:
-        log_error(f"ROLLBACK: FAILED (expected 100)")
+        log_error("ROLLBACK: FAILED (expected 100)")
         return False
     log_info("ROLLBACK: PASSED")
 
     run_sql("UPDATE test_txn SET value = 300 WHERE id = 1")
     result, _ = run_sql("SELECT value FROM test_txn WHERE id = 1")
     if "300" not in result:
-        log_error(f"UPDATE (auto-commit): FAILED (expected 300)")
+        log_error("UPDATE (auto-commit): FAILED (expected 300)")
         return False
     log_info("UPDATE (auto-commit): PASSED")
 
@@ -693,7 +437,7 @@ def test_query_features() -> bool:
         GROUP BY c.id, c.name
     """)
     if "Alice" not in result or "300" not in result:
-        log_error(f"JOIN + GROUP BY: FAILED")
+        log_error("JOIN + GROUP BY: FAILED")
         return False
     log_info("JOIN + GROUP BY: PASSED")
 
@@ -702,7 +446,7 @@ def test_query_features() -> bool:
         WHERE id IN (SELECT customer_id FROM orders_test WHERE amount > 100)
     """)
     if "Alice" not in result:
-        log_error(f"Subquery: FAILED")
+        log_error("Subquery: FAILED")
         return False
     log_info("Subquery: PASSED")
 
@@ -739,52 +483,31 @@ def run_builtin_tests() -> TestStats:
 
 
 def parse_args() -> TestConfig:
+    default_dsn = os.environ.get("PG_DSN", "postgres://admin:admin@127.0.0.1:5433/postgres")
+
     parser = argparse.ArgumentParser(
         description="pg-tikv Integration Test Runner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                           Run built-in tests with Docker
-  %(prog)s --tiup                    Run built-in tests with tiup
-  %(prog)s tests/basic.sql           Run single SQL file
-  %(prog)s tests/                    Run all .sql files in directory
-  %(prog)s --no-setup tests/*.sql    Run tests against existing pg-tikv
-  %(prog)s --verbose tests/my.sql    Show SQL output
+  %(prog)s --dsn postgres://admin:admin@127.0.0.1:5433/postgres
+  %(prog)s --dsn postgres://... tests/basic.sql
+  %(prog)s --dsn postgres://... tests/
         """,
     )
     parser.add_argument("tests", nargs="*", help="SQL test files or directories")
-    parser.add_argument("--user", default="postgres", help="PostgreSQL user (default: postgres)")
-    parser.add_argument("--password", default="postgres", help="PostgreSQL password (default: postgres)")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"pg-tikv port (default: {DEFAULT_PORT})")
-    parser.add_argument("--host", default="127.0.0.1", help="pg-tikv host (default: 127.0.0.1)")
-    parser.add_argument("--docker", action="store_true", default=True, help="Use Docker for TiKV (default)")
-    parser.add_argument("--tiup", action="store_true", help="Use tiup playground instead of Docker")
-    parser.add_argument("--no-setup", action="store_true", help="Skip TiKV/pg-tikv setup")
-    parser.add_argument("--no-cleanup", action="store_true", help="Don't cleanup after tests")
+    parser.add_argument("--dsn", default=default_dsn, help="PostgreSQL connection DSN")
     parser.add_argument("--verbose", "-v", action="store_true", help="Show SQL output")
     parser.add_argument("--stop-on-error", "-x", action="store_true", help="Stop on first error")
 
     args = parser.parse_args()
 
-    if args.no_setup:
-        setup_mode = SetupMode.NONE
-    elif args.tiup:
-        setup_mode = SetupMode.TIUP
-    else:
-        setup_mode = SetupMode.DOCKER
-
-    cfg = TestConfig(
-        user=args.user,
-        password=args.password,
-        port=args.port,
-        host=args.host,
-        setup_mode=setup_mode,
-        no_cleanup=args.no_cleanup,
+    return TestConfig(
+        db=DbConfig.from_dsn(args.dsn),
         verbose=args.verbose,
         stop_on_error=args.stop_on_error,
         test_files=[Path(t) for t in args.tests] if args.tests else [],
     )
-    return cfg
 
 
 def main():
@@ -793,28 +516,20 @@ def main():
 
     log_info("pg-tikv Integration Test Runner")
     log_info("================================")
+    log_info(f"DSN: {config.db.to_dsn()}")
 
-    if not config.no_cleanup:
-        atexit.register(cleanup)
-    signal.signal(signal.SIGINT, lambda s, f: sys.exit(1))
-    signal.signal(signal.SIGTERM, lambda s, f: sys.exit(1))
+    try:
+        if not check_connection():
+            log_error(f"Cannot connect to pg-tikv at {config.db.host}:{config.db.port}")
+            log_error("Make sure pg-tikv is running:")
+            log_error("  1. uv run scripts/tikv_admin.py start --persistent")
+            log_error("  2. PD_ENDPOINTS=127.0.0.1:<pd_port> cargo run --release")
+            sys.exit(1)
+    except subprocess.TimeoutExpired:
+        log_error(f"Connection timeout to {config.db.host}:{config.db.port}")
+        sys.exit(1)
 
-    if config.setup_mode == SetupMode.DOCKER:
-        if not check_docker():
-            sys.exit(1)
-        setup_docker()
-    elif config.setup_mode == SetupMode.TIUP:
-        if not check_tiup_dependencies():
-            sys.exit(1)
-        for pattern in ["pg-tikv", "tiup playground", "tikv-server", "pd-server"]:
-            subprocess.run(["pkill", "-f", pattern], capture_output=True)
-        time.sleep(1)
-        setup_tiup()
-    else:
-        log_info("Skipping setup (--no-setup), using existing pg-tikv")
-        if not wait_for_port(config.host, config.port, 5):
-            log_error(f"pg-tikv not accessible on {config.host}:{config.port}")
-            sys.exit(1)
+    log_info("Connection verified")
 
     if config.test_files:
         stats = run_external_tests(config.test_files)

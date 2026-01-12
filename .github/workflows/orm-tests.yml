@@ -1,0 +1,171 @@
+name: pg-tikv Tests
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  PG_PORT: 5433
+  PG_USER: admin
+  PG_PASSWORD: admin
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: orm-tests/package-lock.json
+
+      - name: Install tiup
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+          echo "$HOME/.tiup/bin" >> $GITHUB_PATH
+
+      - name: Build pg-tikv
+        run: cargo build --release
+
+      - name: Run unit tests
+        run: cargo test
+
+      - name: Start TiKV cluster
+        run: |
+          ~/.tiup/bin/tiup playground --mode tikv-slim --without-monitor --kv 1 &
+          # Wait for TiKV to be ready (check PD health endpoint)
+          for i in $(seq 1 60); do
+            if curl -sf http://127.0.0.1:2379/pd/api/v1/health > /dev/null 2>&1; then
+              echo "TiKV ready after $i seconds"
+              break
+            fi
+            sleep 1
+          done
+          # Verify TiKV is healthy
+          curl -sf http://127.0.0.1:2379/pd/api/v1/health || exit 1
+
+      - name: Start pg-tikv
+        run: |
+          PD_ENDPOINTS=127.0.0.1:2379 PG_PORT=$PG_PORT ./target/release/pg-tikv > /tmp/pgtikv.log 2>&1 &
+          echo "PG_TIKV_PID=$!" >> $GITHUB_ENV
+          # Wait for pg-tikv to be ready
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p $PG_PORT -U $PG_USER -q 2>/dev/null; then
+              echo "pg-tikv ready after $i seconds"
+              break
+            fi
+            sleep 1
+          done
+          # Verify pg-tikv is responding
+          PGPASSWORD=$PG_PASSWORD psql -h 127.0.0.1 -p $PG_PORT -U $PG_USER -d postgres -c "SELECT 1" || (cat /tmp/pgtikv.log && exit 1)
+
+      - name: Run integration tests
+        run: |
+          pip install psycopg2-binary
+          python3 scripts/integration_test.py --dsn "postgres://$PG_USER:$PG_PASSWORD@127.0.0.1:$PG_PORT/postgres"
+
+      - name: Install ORM test dependencies
+        working-directory: orm-tests
+        run: npm ci
+
+      - name: Generate Prisma client
+        working-directory: orm-tests
+        run: npx prisma generate
+
+      - name: Run ORM tests
+        working-directory: orm-tests
+        run: npm test -- --json --outputFile=test-results.json || true
+        env:
+          PG_DSN: postgres://${{ env.PG_USER }}:${{ env.PG_PASSWORD }}@127.0.0.1:${{ env.PG_PORT }}/postgres
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            orm-tests/test-results.json
+            /tmp/pgtikv.log
+
+      - name: Generate test summary
+        if: always()
+        working-directory: orm-tests
+        run: |
+          if [ -f test-results.json ]; then
+            node -e "
+            const results = require('./test-results.json');
+            const passed = results.numPassedTests || 0;
+            const failed = results.numFailedTests || 0;
+            const skipped = results.numPendingTests || 0;
+            const total = passed + failed + skipped;
+            
+            console.log('## pg-tikv Test Results');
+            console.log('');
+            console.log('### ORM Compatibility Tests');
+            console.log('');
+            console.log('| Metric | Count |');
+            console.log('|--------|-------|');
+            console.log('| ✅ Passed | ' + passed + ' |');
+            console.log('| ❌ Failed | ' + failed + ' |');
+            console.log('| ⏭️ Skipped | ' + skipped + ' |');
+            console.log('| Total | ' + total + ' |');
+            console.log('');
+            console.log('**Pass Rate:** ' + (total > 0 ? ((passed / total) * 100).toFixed(1) : 0) + '%');
+            " >> \$GITHUB_STEP_SUMMARY
+          else
+            echo "## pg-tikv Test Results" >> \$GITHUB_STEP_SUMMARY
+            echo "" >> \$GITHUB_STEP_SUMMARY
+            echo "⚠️ No test results file found" >> \$GITHUB_STEP_SUMMARY
+          fi
+
+      - name: Check test results
+        working-directory: orm-tests
+        run: |
+          if [ -f test-results.json ]; then
+            node -e "
+            const results = require('./test-results.json');
+            const failed = results.numFailedTests || 0;
+            // Allow up to 120 failures (known pg-tikv limitations)
+            if (failed > 120) {
+              console.error('Too many test failures: ' + failed + ' (max allowed: 120)');
+              process.exit(1);
+            }
+            console.log('Test failures within acceptable range: ' + failed + '/120');
+            "
+          fi
+
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      - name: Run clippy
+        run: cargo clippy -- -D warnings

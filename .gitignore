@@ -18,6 +18,16 @@ Thumbs.db
 test_*.sql
 !tests/*.sql
 
+# Test outputs (auto-generated)
+tests/*.out
+
+# Python
+__pycache__/
+*.pyc
+
+# Session artifacts
+.sisyphus/
+
 # Environment
 .env
 .env.local

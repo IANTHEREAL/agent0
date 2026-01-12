@@ -5,10 +5,12 @@ PostgreSQL-compatible SQL layer on TiKV. Rust + async/await + pgwire + sqlparser
 ## Quick Reference
 
 ```bash
-cargo build                    # Debug build
-cargo test                     # Unit tests (184 tests)
-cargo clippy -- -D warnings    # Lint
-python3 scripts/integration_test.py  # Integration tests (14 tests, requires TiKV)
+cargo build                           # Debug build
+cargo test                            # Unit tests (Rust, ~184 tests)
+cargo clippy -- -D warnings           # Lint
+python3 scripts/integration_test.py   # Integration tests (SQL, auto setup)
+python3 scripts/integration_test.py tests/  # Run all SQL files
+cd orm-tests && npm test              # ORM compatibility tests
 ```
 
 ## Structure
@@ -74,9 +76,35 @@ if is_autocommit {
 ```
 
 ### Testing
-- Unit tests: `#[cfg(test)] mod tests` in same file
-- Integration: `tests/*.sql` files
-- Name: `test_<feature>_<scenario>`
+
+See [HOW_TO_TEST.md](HOW_TO_TEST.md) for detailed testing documentation.
+
+**Quick commands:**
+```bash
+# Full automated test suite (starts TiKV, runs all tests)
+./run_tests.sh
+
+# Manual workflow
+uv run scripts/tikv_admin.py start --name dev --persistent   # Start TiKV
+PD_ENDPOINTS=127.0.0.1:<pd_port> cargo run --release         # Start pg-tikv
+python3 scripts/integration_test.py --dsn postgres://admin:admin@127.0.0.1:5433/postgres
+cd orm-tests && npm test
+```
+
+**Test types:**
+- Unit tests: `cargo test` (~184 tests, no dependencies)
+- Integration tests: `scripts/integration_test.py` + `tests/*.sql` (6 built-in + 30+ SQL files)
+- ORM tests: `orm-tests/` (600+ tests across 7 ORMs via Vitest)
+
+**Test file conventions:**
+- SQL tests: `tests/<number>_<name>.sql`
+- Expected output (optional): `tests/<name>.expected`
+- Expected errors (optional): `tests/<name>.errors`
+- Output: `tests/<name>.out` (auto-generated)
+
+### Coverage (not wired by default)
+- Rust: prefer `cargo llvm-cov` for line/branch coverage; `cargo tarpaulin` or `grcov` are alternatives
+- ORM tests: run `npm test -- --coverage` to emit `coverage/` reports (configured in `orm-tests/vitest.config.ts`)
 
 ## Anti-Patterns
 
