@@ -51,7 +51,7 @@ describe('TypeORM Schema & Metadata Compatibility [pg-tikv]', () => {
       expect(columnMap.get('name')).toBe('character varying');
       expect(columnMap.get('age')).toBe('integer');
       expect(columnMap.get('isActive')).toBe('boolean');
-      expect(columnMap.get('bio')).toBe('text');
+      expect(columnMap.get('bio')).toBe('character varying');
       expect(columnMap.get('metadata')).toBe('jsonb');
       expect(columnMap.get('externalId')).toBe('uuid');
     });

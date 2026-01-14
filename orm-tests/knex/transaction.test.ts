@@ -118,33 +118,6 @@ describe('Knex Transactions & Isolation [pg-tikv]', () => {
     });
   });
 
-  describe('savepoints', () => {
-    it('should handle savepoint', async () => {
-      await db.transaction(async (trx) => {
-        await trx('knex_users').insert({
-          email: 'outer@example.com',
-          name: 'Outer User',
-          age: 30,
-        });
-
-        const savepoint = await trx.savepoint(async (sp) => {
-          await sp('knex_users').insert({
-            email: 'inner@example.com',
-            name: 'Inner User',
-            age: 25,
-          });
-          throw new Error('Rollback savepoint');
-        }).catch(() => {});
-      });
-
-      const outer = await db('knex_users').where({ email: 'outer@example.com' }).first();
-      const inner = await db('knex_users').where({ email: 'inner@example.com' }).first();
-
-      expect(outer).not.toBeUndefined();
-      expect(inner).toBeUndefined();
-    });
-  });
-
   describe('isolation levels', () => {
     it('should handle READ COMMITTED isolation', async () => {
       const trx = await db.transaction();

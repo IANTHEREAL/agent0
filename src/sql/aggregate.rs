@@ -18,6 +18,9 @@ pub enum Aggregator {
         values: Vec<String>,
         delimiter: String,
     },
+    ArrayAgg {
+        values: Vec<Value>,
+    },
 }
 
 impl Aggregator {
@@ -32,6 +35,7 @@ impl Aggregator {
                 values: Vec::new(),
                 delimiter: ",".to_string(),
             }),
+            "ARRAY_AGG" => Ok(Aggregator::ArrayAgg { values: Vec::new() }),
             _ => Err(anyhow!("Unsupported aggregate function: {}", kind)),
         }
     }
@@ -41,6 +45,10 @@ impl Aggregator {
             values: Vec::new(),
             delimiter,
         }
+    }
+
+    pub fn new_array_agg() -> Self {
+        Aggregator::ArrayAgg { values: Vec::new() }
     }
 
     pub fn update(&mut self, val: &Value) -> Result<()> {
@@ -104,6 +112,10 @@ impl Aggregator {
                     values.push(s);
                 }
             }
+            Aggregator::ArrayAgg { values } => {
+                // array_agg includes NULL values (unlike most aggregates)
+                values.push(val.clone());
+            }
         }
         Ok(())
     }
@@ -126,6 +138,13 @@ impl Aggregator {
                     Value::Null
                 } else {
                     Value::Text(values.join(delimiter))
+                }
+            }
+            Aggregator::ArrayAgg { values } => {
+                if values.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Array(values.clone())
                 }
             }
         }
@@ -336,6 +355,36 @@ mod tests {
     #[test]
     fn test_string_agg_empty() {
         let agg = Aggregator::new_string_agg(",".to_string());
+        assert_eq!(agg.result(), Value::Null);
+    }
+
+    #[test]
+    fn test_array_agg() {
+        let mut agg = Aggregator::new_array_agg();
+        agg.update(&Value::Int32(1)).unwrap();
+        agg.update(&Value::Int32(2)).unwrap();
+        agg.update(&Value::Int32(3)).unwrap();
+        assert_eq!(
+            agg.result(),
+            Value::Array(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)])
+        );
+    }
+
+    #[test]
+    fn test_array_agg_with_null() {
+        let mut agg = Aggregator::new_array_agg();
+        agg.update(&Value::Int32(1)).unwrap();
+        agg.update(&Value::Null).unwrap();
+        agg.update(&Value::Int32(2)).unwrap();
+        assert_eq!(
+            agg.result(),
+            Value::Array(vec![Value::Int32(1), Value::Null, Value::Int32(2)])
+        );
+    }
+
+    #[test]
+    fn test_array_agg_empty() {
+        let agg = Aggregator::new_array_agg();
         assert_eq!(agg.result(), Value::Null);
     }
 }

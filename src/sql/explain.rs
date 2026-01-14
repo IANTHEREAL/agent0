@@ -457,6 +457,13 @@ fn format_value(value: &crate::types::Value) -> String {
             let elems: Vec<String> = vec.iter().map(|f| f.to_string()).collect();
             format!("'[{}]'", elems.join(","))
         }
+        crate::types::Value::Time(micros) => {
+            let total_secs = micros / 1_000_000;
+            let hours = total_secs / 3600;
+            let mins = (total_secs % 3600) / 60;
+            let secs = total_secs % 60;
+            format!("'{:02}:{:02}:{:02}'", hours, mins, secs)
+        }
     }
 }
 

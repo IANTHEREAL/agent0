@@ -77,6 +77,46 @@ fn parse_tenant_username(username: &str) -> (Option<String>, String) {
     (None, username.to_string())
 }
 
+/// Count the number of parameter placeholders ($1, $2, ...) in a SQL query.
+/// Returns the maximum placeholder number found, which indicates how many parameters are expected.
+fn count_sql_parameters(sql: &str) -> usize {
+    let mut max_param = 0;
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let chars: Vec<char> = sql.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let c = chars[i];
+
+        // Track string state
+        if c == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+        } else if c == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+        }
+
+        // Look for $ followed by digits, but only outside strings
+        if !in_single_quote && !in_double_quote && c == '$' && i + 1 < chars.len() {
+            let mut num_str = String::new();
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                num_str.push(chars[j]);
+                j += 1;
+            }
+            if !num_str.is_empty() {
+                if let Ok(num) = num_str.parse::<usize>() {
+                    if num > max_param {
+                        max_param = num;
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    max_param
+}
+
 fn find_keyword_outside_strings(query: &str, keyword: &str) -> Option<usize> {
     let mut in_single_quote = false;
     let mut in_double_quote = false;
@@ -146,7 +186,8 @@ impl DynamicPgHandler {
     }
 
     async fn infer_result_fields_from_query(&self, query: &str) -> Vec<FieldInfo> {
-        let query_upper = query.trim().to_uppercase();
+        let query_trimmed = query.trim();
+        let query_upper = query_trimmed.to_uppercase();
 
         // Only try to infer fields for SELECT queries and queries with RETURNING
         let is_select = query_upper.starts_with("SELECT");
@@ -189,22 +230,22 @@ impl DynamicPgHandler {
         if has_returning {
             if let Some(returning_pos) = find_keyword_outside_strings(&query_upper, "RETURNING") {
                 let table_name = if let Some(into_pos) = query_upper.find("INSERT INTO") {
-                    let after_into = &query[into_pos + 11..].trim();
+                    let after_into = &query_trimmed[into_pos + 11..].trim();
                     let first_token = after_into.split_whitespace().next().unwrap_or("");
                     Some(first_token.split('(').next().unwrap_or(first_token))
                 } else if let Some(update_pos) = query_upper.find("UPDATE") {
-                    let after_update = &query[update_pos + 6..].trim();
+                    let after_update = &query_trimmed[update_pos + 6..].trim();
                     let first_token = after_update.split_whitespace().next().unwrap_or("");
                     Some(first_token.split('(').next().unwrap_or(first_token))
                 } else if let Some(delete_pos) = query_upper.find("DELETE FROM") {
-                    let after_from = &query[delete_pos + 11..].trim();
+                    let after_from = &query_trimmed[delete_pos + 11..].trim();
                     let first_token = after_from.split_whitespace().next().unwrap_or("");
                     Some(first_token.split('(').next().unwrap_or(first_token))
                 } else {
                     None
                 };
 
-                let returning_clause = &query[returning_pos + "RETURNING".len()..];
+                let returning_clause = &query_trimmed[returning_pos + "RETURNING".len()..];
                 let columns: Vec<String> = returning_clause
                     .trim()
                     .trim_end_matches(';')
@@ -959,10 +1000,10 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     {
         let executor = self.get_executor()?;
         let query = &portal.statement.statement;
-        debug!("Extended query: {}", query);
+        info!("Extended query: {}", query);
 
         let final_query = substitute_parameters(query, portal);
-        debug!("Final query after substitution: {}", final_query);
+        info!("Final query after substitution: {}", final_query);
 
         let mut session_guard = self.session.lock().await;
         let session = session_guard.as_mut().ok_or_else(|| {
@@ -994,7 +1035,13 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let param_types: Vec<Type> = stmt.parameter_types.clone();
+        let param_count = count_sql_parameters(&stmt.statement);
+        let mut param_types: Vec<Type> = stmt.parameter_types.clone();
+
+        if param_types.len() < param_count {
+            param_types.resize(param_count, Type::UNKNOWN);
+        }
+
         let fields = self.infer_result_fields_from_query(&stmt.statement).await;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
@@ -1016,8 +1063,6 @@ impl ExtendedQueryHandler for DynamicPgHandler {
 fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
     let mut result = query.to_string();
 
-    // Iterate in reverse order to avoid replacing $1 before $10, $11, etc.
-    // This prevents $10 from becoming "value0" when $1 is replaced
     for i in (0..portal.parameter_len()).rev() {
         let placeholder = format!("${}", i + 1);
         let param_type = portal
@@ -1025,7 +1070,7 @@ fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
             .parameter_types
             .get(i)
             .cloned()
-            .unwrap_or(Type::TEXT);
+            .unwrap_or(Type::UNKNOWN);
 
         let value_str = match &param_type {
             t if *t == Type::BOOL => portal
@@ -1064,13 +1109,49 @@ fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
                 .flatten()
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "NULL".to_string()),
+            t if *t == Type::UNKNOWN => {
+                // Type::UNKNOWN - check format and try appropriate decoding
+                if portal.parameter_format.is_binary(i) {
+                    // Binary format - try to decode as common types
+                    // Try i32 first (most common for integers)
+                    if let Ok(Some(v)) = portal.parameter::<i32>(i, &Type::INT4) {
+                        v.to_string()
+                    } else if let Ok(Some(v)) = portal.parameter::<i64>(i, &Type::INT8) {
+                        v.to_string()
+                    } else if let Ok(Some(v)) = portal.parameter::<bool>(i, &Type::BOOL) {
+                        if v { "true" } else { "false" }.to_string()
+                    } else if let Ok(Some(v)) = portal.parameter::<f64>(i, &Type::FLOAT8) {
+                        v.to_string()
+                    } else if let Ok(Some(v)) = portal.parameter::<String>(i, &Type::TEXT) {
+                        format!("'{}'", v.replace("'", "''"))
+                    } else {
+                        "NULL".to_string()
+                    }
+                } else {
+                    // Text format - read as string and auto-detect
+                    portal
+                        .parameter::<String>(i, &Type::TEXT)
+                        .ok()
+                        .flatten()
+                        .map(|v| {
+                            if v.parse::<i64>().is_ok() || v.parse::<f64>().is_ok() {
+                                v
+                            } else if v.eq_ignore_ascii_case("true")
+                                || v.eq_ignore_ascii_case("false")
+                            {
+                                v.to_lowercase()
+                            } else {
+                                format!("'{}'", v.replace("'", "''"))
+                            }
+                        })
+                        .unwrap_or_else(|| "NULL".to_string())
+                }
+            }
             _ => portal
                 .parameter::<String>(i, &param_type)
                 .ok()
                 .flatten()
                 .map(|v| {
-                    // If the value looks like a number, don't quote it
-                    // This handles the case where the client sends all params as TEXT
                     if v.parse::<i64>().is_ok() || v.parse::<f64>().is_ok() {
                         v
                     } else if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false") {
@@ -1631,7 +1712,13 @@ impl ExtendedQueryHandler for PgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let param_types: Vec<Type> = stmt.parameter_types.clone();
+        let param_count = count_sql_parameters(&stmt.statement);
+        let mut param_types: Vec<Type> = stmt.parameter_types.clone();
+
+        if param_types.len() < param_count {
+            param_types.resize(param_count, Type::UNKNOWN);
+        }
+
         let fields = self.infer_result_fields_from_query(&stmt.statement).await;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
@@ -1690,6 +1777,7 @@ fn datatype_to_pgtype(dt: Option<&DataType>) -> Type {
         Some(DataType::Bytes) => Type::BYTEA,
         Some(DataType::Json) => Type::JSON,
         Some(DataType::Jsonb) => Type::JSONB,
+        Some(DataType::Time) => Type::TIME,
         Some(DataType::Vector(_)) | Some(DataType::Array(_)) | Some(DataType::Text) | None => {
             Type::TEXT
         }
@@ -2003,6 +2091,18 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
                     .join(",")
             );
             encoder.encode_field(&vec_str)
+        }
+        Value::Time(micros) => {
+            let total_secs = micros / 1_000_000;
+            let hours = total_secs / 3600;
+            let mins = (total_secs % 3600) / 60;
+            let secs = total_secs % 60;
+            let frac = micros % 1_000_000;
+            if frac > 0 {
+                encoder.encode_field(&format!("{:02}:{:02}:{:02}.{:06}", hours, mins, secs, frac))
+            } else {
+                encoder.encode_field(&format!("{:02}:{:02}:{:02}", hours, mins, secs))
+            }
         }
     }
 }

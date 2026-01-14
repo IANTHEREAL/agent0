@@ -21,6 +21,7 @@ pub enum DataType {
     // with existing serialized schemas. Do not reorder!
     Json,
     Jsonb,
+    Time, // Time of day (microseconds since midnight)
 }
 
 impl DataType {
@@ -36,9 +37,10 @@ impl DataType {
             DataType::Interval => 8,
             DataType::Uuid => 16,
             DataType::Array(_) => 64,
-            DataType::Vector(dim) => (*dim as usize) * 8, // 8 bytes per f64
+            DataType::Vector(dim) => (*dim as usize) * 8,
             DataType::Json => 64,
             DataType::Jsonb => 64,
+            DataType::Time => 8,
         }
     }
 }
@@ -59,6 +61,7 @@ impl fmt::Display for DataType {
             DataType::Vector(dim) => write!(f, "vector({})", dim),
             DataType::Json => write!(f, "JSON"),
             DataType::Jsonb => write!(f, "JSONB"),
+            DataType::Time => write!(f, "TIME"),
         }
     }
 }
@@ -77,9 +80,10 @@ pub enum Value {
     Interval(i64),
     Uuid([u8; 16]),
     Array(Vec<Value>),
-    Vector(Vec<f64>), // embedding as f64 array
+    Vector(Vec<f64>),
     Json(String),
     Jsonb(String),
+    Time(i64),
 }
 
 impl Value {
@@ -104,6 +108,7 @@ impl Value {
             Value::Vector(vec) => Some(DataType::Vector(vec.len() as u32)),
             Value::Json(_) => Some(DataType::Json),
             Value::Jsonb(_) => Some(DataType::Jsonb),
+            Value::Time(_) => Some(DataType::Time),
         }
     }
 }
@@ -126,6 +131,18 @@ impl fmt::Display for Value {
                 let secs = (*ms % (1000 * 60)) / 1000;
                 if days > 0 {
                     write!(f, "{} days {:02}:{:02}:{:02}", days, hours, mins, secs)
+                } else {
+                    write!(f, "{:02}:{:02}:{:02}", hours, mins, secs)
+                }
+            }
+            Value::Time(micros) => {
+                let total_secs = *micros / 1_000_000;
+                let hours = total_secs / 3600;
+                let mins = (total_secs % 3600) / 60;
+                let secs = total_secs % 60;
+                let frac = *micros % 1_000_000;
+                if frac > 0 {
+                    write!(f, "{:02}:{:02}:{:02}.{:06}", hours, mins, secs, frac)
                 } else {
                     write!(f, "{:02}:{:02}:{:02}", hours, mins, secs)
                 }

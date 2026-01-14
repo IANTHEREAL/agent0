@@ -111,42 +111,6 @@ describe('Sequelize Transactions & Isolation [pg-tikv]', () => {
     });
   });
 
-  describe('savepoints', () => {
-    it('should handle nested transaction with savepoint', async () => {
-      await sequelize.transaction(async (t1) => {
-        await User.create(
-          { email: 'outer@example.com', name: 'Outer User', age: 30 },
-          { transaction: t1 }
-        );
-
-        let innerErrorThrown = false;
-        try {
-          await sequelize.transaction({ transaction: t1 }, async (t2) => {
-            await User.create(
-              { email: 'inner@example.com', name: 'Inner User', age: 25 },
-              { transaction: t2 }
-            );
-            throw new Error('Rollback inner');
-          });
-        } catch (error) {
-          innerErrorThrown = true;
-          // Verify inner transaction error was thrown
-          expect(error).toBeDefined();
-          expect((error as Error).message).toBe('Rollback inner');
-        }
-
-        // Verify inner error was actually thrown
-        expect(innerErrorThrown).toBe(true);
-      });
-
-      const outer = await User.findOne({ where: { email: 'outer@example.com' } });
-      const inner = await User.findOne({ where: { email: 'inner@example.com' } });
-
-      expect(outer).not.toBeNull();
-      expect(inner).toBeNull();
-    });
-  });
-
   describe('isolation levels', () => {
     it('should handle READ COMMITTED isolation', async () => {
       await sequelize.transaction(

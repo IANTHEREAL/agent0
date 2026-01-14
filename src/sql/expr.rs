@@ -304,6 +304,48 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             let arr_val = eval_expr_join(obj, ctx)?;
             eval_array_index_join(arr_val, indexes, ctx)
         }
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => {
+            let left_val = eval_expr_join(left, ctx)?;
+            let right_val = eval_expr_join(right, ctx)?;
+            let arr = match right_val {
+                Value::Array(arr) => arr,
+                _ => return Err(anyhow!("ANY requires an array operand")),
+            };
+            for elem in arr {
+                let cmp = eval_binary_op(left_val.clone(), compare_op, elem)?;
+                if matches!(cmp, Value::Boolean(true)) {
+                    return Ok(Value::Boolean(true));
+                }
+            }
+            Ok(Value::Boolean(false))
+        }
+        Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => {
+            let left_val = eval_expr_join(left, ctx)?;
+            let right_val = eval_expr_join(right, ctx)?;
+            let arr = match right_val {
+                Value::Array(arr) => arr,
+                _ => return Err(anyhow!("ALL requires an array operand")),
+            };
+            if arr.is_empty() {
+                return Ok(Value::Boolean(true));
+            }
+            for elem in arr {
+                let cmp = eval_binary_op(left_val.clone(), compare_op, elem)?;
+                if !matches!(cmp, Value::Boolean(true)) {
+                    return Ok(Value::Boolean(false));
+                }
+            }
+            Ok(Value::Boolean(true))
+        }
         _ => Err(anyhow!(
             "Unsupported expression in JOIN context: {:?}",
             expr
@@ -531,6 +573,18 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
         | "JSONB_PRETTY"
         | "TO_JSON"
         | "TO_JSONB" => eval_function(func, None, None),
+        "PG_GET_INDEXDEF" => {
+            for (col_key, &offset) in &ctx.column_offsets {
+                if col_key.ends_with(".indexdef") || col_key == "indexdef" {
+                    if let Some(val) = ctx.combined_row.values.get(offset) {
+                        if !matches!(val, Value::Null) {
+                            return Ok(val.clone());
+                        }
+                    }
+                }
+            }
+            Ok(Value::Text("CREATE INDEX".to_string()))
+        }
         _ => Err(anyhow!("Unsupported function in JOIN: {}", func_name)),
     }
 }
@@ -865,6 +919,48 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
         Expr::ArrayIndex { obj, indexes } => {
             let arr_val = eval_expr(obj, row, schema)?;
             eval_array_index(arr_val, indexes, row, schema)
+        }
+        Expr::AnyOp {
+            left,
+            compare_op,
+            right,
+            ..
+        } => {
+            let left_val = eval_expr(left, row, schema)?;
+            let right_val = eval_expr(right, row, schema)?;
+            let arr = match right_val {
+                Value::Array(arr) => arr,
+                _ => return Err(anyhow!("ANY requires an array operand")),
+            };
+            for elem in arr {
+                let cmp = eval_binary_op(left_val.clone(), compare_op, elem)?;
+                if matches!(cmp, Value::Boolean(true)) {
+                    return Ok(Value::Boolean(true));
+                }
+            }
+            Ok(Value::Boolean(false))
+        }
+        Expr::AllOp {
+            left,
+            compare_op,
+            right,
+        } => {
+            let left_val = eval_expr(left, row, schema)?;
+            let right_val = eval_expr(right, row, schema)?;
+            let arr = match right_val {
+                Value::Array(arr) => arr,
+                _ => return Err(anyhow!("ALL requires an array operand")),
+            };
+            if arr.is_empty() {
+                return Ok(Value::Boolean(true));
+            }
+            for elem in arr {
+                let cmp = eval_binary_op(left_val.clone(), compare_op, elem)?;
+                if !matches!(cmp, Value::Boolean(true)) {
+                    return Ok(Value::Boolean(false));
+                }
+            }
+            Ok(Value::Boolean(true))
         }
         _ => Err(anyhow!("Unsupported expression: {:?}", expr)),
     }
@@ -1836,6 +1932,13 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
         (Value::Text(s), SqlType::Interval) => parse_interval_string(&s),
         (Value::Text(s), SqlType::Timestamp(_, _)) => parse_timestamp_string(&s),
         (Value::Timestamp(ts), SqlType::Timestamp(_, _)) => Ok(Value::Timestamp(ts)),
+        (Value::Text(s), SqlType::Time(_, _)) => {
+            use crate::sql::helpers::parse_time_string;
+            parse_time_string(&s)
+                .map(Value::Time)
+                .ok_or_else(|| anyhow!("Invalid time format: {}", s))
+        }
+        (Value::Time(micros), SqlType::Time(_, _)) => Ok(Value::Time(micros)),
         (Value::Text(s), SqlType::Uuid) => {
             let uuid =
                 uuid::Uuid::parse_str(s.trim()).map_err(|e| anyhow!("Invalid UUID: {}", e))?;
@@ -2344,13 +2447,56 @@ fn collect_json_ops<'a>(
 }
 
 fn eval_json_access(left: Value, operator: &JsonOperator, right: Value) -> Result<Value> {
+    if let Value::Array(left_arr) = &left {
+        match operator {
+            JsonOperator::AtArrow => {
+                let right_arr = match &right {
+                    Value::Array(arr) => arr,
+                    _ => return Err(anyhow!("@> on arrays requires array operand on right")),
+                };
+                for r in right_arr {
+                    let mut found = false;
+                    for l in left_arr {
+                        if compare_values(l, r).unwrap_or(1) == 0 {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        return Ok(Value::Boolean(false));
+                    }
+                }
+                return Ok(Value::Boolean(true));
+            }
+            JsonOperator::ArrowAt => {
+                let right_arr = match &right {
+                    Value::Array(arr) => arr,
+                    _ => return Err(anyhow!("<@ on arrays requires array operand on right")),
+                };
+                for l in left_arr {
+                    let mut found = false;
+                    for r in right_arr {
+                        if compare_values(l, r).unwrap_or(1) == 0 {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
+                        return Ok(Value::Boolean(false));
+                    }
+                }
+                return Ok(Value::Boolean(true));
+            }
+            _ => return Err(anyhow!("Unsupported operator for arrays: {:?}", operator)),
+        }
+    }
+
     let json_str = match &left {
         Value::Text(s) => s.clone(),
         Value::Json(s) => s.clone(),
         Value::Jsonb(s) => s.clone(),
         Value::Null => return Ok(Value::Null),
         Value::Vector(v) => {
-            // Treat vectors as JSON arrays for JSON operator compatibility
             format!(
                 "[{}]",
                 v.iter()
@@ -2487,6 +2633,7 @@ fn value_to_json(val: &Value) -> serde_json::Value {
                 .map(serde_json::Value::Number)
                 .collect(),
         ),
+        Value::Time(micros) => serde_json::Value::Number(serde_json::Number::from(*micros)),
     }
 }
 

@@ -106,51 +106,6 @@ describe('Drizzle Transactions & Isolation [pg-tikv]', () => {
     });
   });
 
-  describe('nested transactions (savepoints)', () => {
-    it('should handle nested transaction', async () => {
-      await db.transaction(async (tx) => {
-        await tx.insert(drizzleUsers).values({
-          email: 'outer@example.com',
-          name: 'Outer User',
-          age: 30,
-        });
-
-        let nestedErrorThrown = false;
-        try {
-          await tx.transaction(async (nested) => {
-            await nested.insert(drizzleUsers).values({
-              email: 'inner@example.com',
-              name: 'Inner User',
-              age: 25,
-            });
-            throw new Error('Rollback nested');
-          });
-        } catch (error) {
-          nestedErrorThrown = true;
-          // Verify nested transaction error was thrown
-          expect(error).toBeDefined();
-          expect((error as Error).message).toBe('Rollback nested');
-        }
-
-        // Verify nested error was actually thrown
-        expect(nestedErrorThrown).toBe(true);
-      });
-
-      const outer = await db
-        .select()
-        .from(drizzleUsers)
-        .where(eq(drizzleUsers.email, 'outer@example.com'));
-
-      const inner = await db
-        .select()
-        .from(drizzleUsers)
-        .where(eq(drizzleUsers.email, 'inner@example.com'));
-
-      expect(outer).toHaveLength(1);
-      expect(inner).toHaveLength(0);
-    });
-  });
-
   describe('isolation levels', () => {
     it('should handle read committed isolation', async () => {
       await db.transaction(

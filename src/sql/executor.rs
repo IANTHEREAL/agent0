@@ -7,8 +7,8 @@ use super::helpers::{
     collect_having_agg_funcs, cte_is_recursive, dedup_rows, distinct_on_rows,
     distinct_on_rows_join, eval_default_expr, eval_having_expr, eval_having_expr_join,
     fill_row_defaults, get_select_item_name, get_skip_reason, get_unsupported_reason,
-    infer_data_type, infer_expr_type, parse_value_for_copy, set_expr_references_table,
-    value_to_sql_expr,
+    infer_data_type, infer_expr_type, parse_value_for_copy, query_has_outer_reference,
+    set_expr_references_table, substitute_outer_values_in_query, value_to_sql_expr, AggExpr,
 };
 use super::planner::{self, ScanType};
 use super::query;
@@ -30,6 +30,7 @@ use sqlparser::ast::{
     ObjectName, OnInsert, OrderByExpr, Query, SelectItem, SetExpr, SetOperator, SetQuantifier,
     Statement, TableFactor, Value as SqlValue, Values,
 };
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use tikv_client::Transaction;
@@ -1578,8 +1579,8 @@ impl Executor {
             return Ok(result);
         }
 
-        let (t, schema, all_rows_base, is_virtual) = match &select.from[0].relation {
-            TableFactor::Table { name, .. } => {
+        let (t, outer_alias, schema, all_rows_base, is_virtual) = match &select.from[0].relation {
+            TableFactor::Table { name, alias, .. } => {
                 let full_name = get_full_table_name(name);
                 let simple_name = get_simple_table_name(name);
                 let lookup_name =
@@ -1595,7 +1596,11 @@ impl Executor {
                 let is_virtual = ctes.contains_key(&t_lower)
                     || super::information_schema::get_information_schema_schema(&t_lower).is_some()
                     || self.store.get_view(txn, &t_lower).await?.is_some();
-                (simple_name, schema, rows, is_virtual)
+                let alias_str = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| simple_name.clone());
+                (simple_name, alias_str, schema, rows, is_virtual)
             }
             TableFactor::Derived {
                 subquery, alias, ..
@@ -1607,19 +1612,29 @@ impl Executor {
                 let (schema, rows) = self
                     .execute_derived_table(txn, subquery, &alias_name, ctes)
                     .await?;
-                (alias_name, schema, rows, true)
+                (alias_name.clone(), alias_name, schema, rows, true)
             }
             _ => return Err(anyhow!("Unsupported table")),
         };
 
+        let has_correlated_exists = select
+            .selection
+            .as_ref()
+            .map(|sel| self.expr_has_correlated_exists(sel, &outer_alias))
+            .unwrap_or(false);
+
         let resolved_selection = if let Some(sel) = &select.selection {
-            Some(self.resolve_subqueries(txn, sel).await?)
+            if has_correlated_exists {
+                Some(sel.clone())
+            } else {
+                Some(self.resolve_subqueries(txn, sel).await?)
+            }
         } else {
             None
         };
 
         let resolved_projection = self
-            .resolve_projection_subqueries(txn, &select.projection)
+            .resolve_projection_subqueries_with_outer_context(txn, &select.projection, &outer_alias)
             .await?;
 
         let all_rows = if is_virtual {
@@ -1705,12 +1720,23 @@ impl Executor {
 
         let filtered_rows = if let Some(ref sel) = resolved_selection {
             let mut v = Vec::new();
-            for r in all_rows {
-                if matches!(
-                    eval_expr(sel, Some(&r), Some(&schema))?,
-                    Value::Boolean(true)
-                ) {
-                    v.push(r);
+            if has_correlated_exists {
+                for r in all_rows {
+                    let result = self
+                        .eval_selection_with_correlated_exists(txn, sel, &outer_alias, &schema, &r)
+                        .await?;
+                    if matches!(result, Value::Boolean(true)) {
+                        v.push(r);
+                    }
+                }
+            } else {
+                for r in all_rows {
+                    if matches!(
+                        eval_expr(sel, Some(&r), Some(&schema))?,
+                        Value::Boolean(true)
+                    ) {
+                        v.push(r);
+                    }
                 }
             }
             v
@@ -1733,7 +1759,7 @@ impl Executor {
 
         let window_funcs = extract_window_functions(&select.projection);
 
-        let mut agg_funcs = Vec::new();
+        let mut agg_funcs: Vec<(usize, AggExpr)> = Vec::new();
         for (i, item) in select.projection.iter().enumerate() {
             match item {
                 SelectItem::UnnamedExpr(Expr::Function(f))
@@ -1750,11 +1776,18 @@ impl Executor {
                             .unwrap_or_default();
                         if matches!(
                             func_name.as_str(),
-                            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"
+                            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "ARRAY_AGG"
                         ) {
-                            agg_funcs.push((i, f.clone()));
+                            agg_funcs.push((i, AggExpr::Function(f.clone())));
                         }
                     }
+                }
+                SelectItem::UnnamedExpr(Expr::ArrayAgg(arr))
+                | SelectItem::ExprWithAlias {
+                    expr: Expr::ArrayAgg(arr),
+                    ..
+                } => {
+                    agg_funcs.push((i, AggExpr::ArrayAgg(arr.clone())));
                 }
                 _ => {}
             }
@@ -1780,25 +1813,32 @@ impl Executor {
 
                 if !groups.contains_key(&key_bytes) {
                     let mut aggs = Vec::new();
-                    for (_, f) in &agg_funcs {
-                        let name = f.name.0.last().unwrap().value.to_uppercase();
-                        if name == "STRING_AGG" {
-                            let delimiter = if f.args.len() >= 2 {
-                                match &f.args[1] {
-                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                                        match eval_expr(e, Some(&row), Some(&schema))? {
-                                            Value::Text(s) => s,
+                    for (_, agg_expr) in &agg_funcs {
+                        match agg_expr {
+                            AggExpr::Function(f) => {
+                                let name = f.name.0.last().unwrap().value.to_uppercase();
+                                if name == "STRING_AGG" {
+                                    let delimiter = if f.args.len() >= 2 {
+                                        match &f.args[1] {
+                                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                                match eval_expr(e, Some(&row), Some(&schema))? {
+                                                    Value::Text(s) => s,
+                                                    _ => ",".to_string(),
+                                                }
+                                            }
                                             _ => ",".to_string(),
                                         }
-                                    }
-                                    _ => ",".to_string(),
+                                    } else {
+                                        ",".to_string()
+                                    };
+                                    aggs.push(Aggregator::new_string_agg(delimiter));
+                                } else {
+                                    aggs.push(Aggregator::new(&name)?);
                                 }
-                            } else {
-                                ",".to_string()
-                            };
-                            aggs.push(Aggregator::new_string_agg(delimiter));
-                        } else {
-                            aggs.push(Aggregator::new(&name)?);
+                            }
+                            AggExpr::ArrayAgg(_) => {
+                                aggs.push(Aggregator::new_array_agg());
+                            }
                         }
                     }
                     groups.insert(key_bytes.clone(), aggs);
@@ -1806,16 +1846,30 @@ impl Executor {
                 }
 
                 let aggs = groups.get_mut(&key_bytes).unwrap();
-                for (agg_idx, (_, f)) in agg_funcs.iter().enumerate() {
-                    let arg_expr = if f.args.is_empty() {
-                        None
-                    } else {
-                        match &f.args[0] {
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => None,
-                            _ => return Err(anyhow!("Unsupported arg")),
+                for (agg_idx, (_, agg_expr)) in agg_funcs.iter().enumerate() {
+                    let (filter_expr, arg_expr) = match agg_expr {
+                        AggExpr::Function(f) => {
+                            let filter = f.filter.as_ref().map(|e| e.as_ref());
+                            let arg = if f.args.is_empty() {
+                                None
+                            } else {
+                                match &f.args[0] {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => None,
+                                    _ => return Err(anyhow!("Unsupported arg")),
+                                }
+                            };
+                            (filter, arg)
                         }
+                        AggExpr::ArrayAgg(arr) => (None, Some(arr.expr.as_ref())),
                     };
+
+                    if let Some(filter) = filter_expr {
+                        let filter_val = eval_expr(filter, Some(&row), Some(&schema))?;
+                        if !matches!(filter_val, Value::Boolean(true)) {
+                            continue;
+                        }
+                    }
 
                     let val = if let Some(e) = arg_expr {
                         eval_expr(e, Some(&row), Some(&schema))?
@@ -1829,6 +1883,34 @@ impl Executor {
             let mut final_rows = Vec::new();
             let col_names: Vec<String> =
                 select.projection.iter().map(get_select_item_name).collect();
+
+            if groups.is_empty() && group_keys_exprs.is_empty() && !agg_funcs.is_empty() {
+                let mut default_aggs = Vec::new();
+                for (_, agg_expr) in &agg_funcs {
+                    match agg_expr {
+                        AggExpr::Function(f) => {
+                            let name = f.name.0.last().unwrap().value.to_uppercase();
+                            if name == "STRING_AGG" {
+                                default_aggs.push(Aggregator::new_string_agg(",".to_string()));
+                            } else {
+                                default_aggs.push(Aggregator::new(&name)?);
+                            }
+                        }
+                        AggExpr::ArrayAgg(_) => {
+                            default_aggs.push(Aggregator::new_array_agg());
+                        }
+                    }
+                }
+                let mut row_values = Vec::new();
+                for (i, _item) in resolved_projection.iter().enumerate() {
+                    if let Some(agg_pos) = agg_funcs.iter().position(|(idx, _)| *idx == i) {
+                        row_values.push(default_aggs[agg_pos].result());
+                    } else {
+                        row_values.push(Value::Null);
+                    }
+                }
+                final_rows.push(Row::new(row_values));
+            }
 
             for (key_bytes, aggs) in groups {
                 let representative = &group_rows[&key_bytes];
@@ -1881,13 +1963,28 @@ impl Executor {
             None
         };
 
-        let (filtered_rows, window_results) = if !query.order_by.is_empty() {
+        let order_by_references_correlated_subquery = query.order_by.iter().any(|order_expr| {
+            if let Expr::Identifier(ref ident) = order_expr.expr {
+                for item in &resolved_projection {
+                    if let SelectItem::ExprWithAlias { expr, alias } = item {
+                        if alias.value.eq_ignore_ascii_case(&ident.value) {
+                            if let Expr::Subquery(_) = expr {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        });
+
+        let (filtered_rows, window_results) = if !query.order_by.is_empty()
+            && !order_by_references_correlated_subquery
+        {
             let mut indexed: Vec<(usize, Row)> = filtered_rows.into_iter().enumerate().collect();
             indexed.sort_by(|(_, a), (_, b)| {
                 for order_expr in &query.order_by {
-                    // Resolve ORDER BY expression: if it's an alias, use the SELECT list expression
                     let actual_expr = if let Expr::Identifier(ref ident) = order_expr.expr {
-                        // Check if this identifier matches a SELECT list alias
                         let mut found_expr = None;
                         for item in &resolved_projection {
                             match item {
@@ -2038,11 +2135,53 @@ impl Executor {
                             }
                             _ => return Err(anyhow!("Unsupported select item")),
                         };
-                        row_values.push(eval_expr(expr, Some(row), Some(&schema))?);
+                        let value = if let Expr::Subquery(subquery) = expr {
+                            self.eval_correlated_subquery(txn, subquery, &outer_alias, &schema, row)
+                                .await?
+                        } else {
+                            eval_expr(expr, Some(row), Some(&schema))?
+                        };
+                        row_values.push(value);
                     }
                 }
                 result_rows.push(Row::new(row_values));
             }
+        }
+
+        if order_by_references_correlated_subquery && !query.order_by.is_empty() {
+            result_rows.sort_by(|a, b| {
+                for order_expr in &query.order_by {
+                    let col_idx = if let Expr::Identifier(ref ident) = order_expr.expr {
+                        cols.iter()
+                            .position(|c| c.eq_ignore_ascii_case(&ident.value))
+                    } else if let Expr::Value(SqlValue::Number(n, _)) = &order_expr.expr {
+                        n.parse::<usize>().ok().map(|i| i.saturating_sub(1))
+                    } else {
+                        None
+                    };
+
+                    if let Some(idx) = col_idx {
+                        let val_a = a.values.get(idx).cloned().unwrap_or(Value::Null);
+                        let val_b = b.values.get(idx).cloned().unwrap_or(Value::Null);
+                        let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                        if cmp != 0 {
+                            let asc = order_expr.asc.unwrap_or(true);
+                            return if asc {
+                                if cmp > 0 {
+                                    std::cmp::Ordering::Greater
+                                } else {
+                                    std::cmp::Ordering::Less
+                                }
+                            } else if cmp > 0 {
+                                std::cmp::Ordering::Less
+                            } else {
+                                std::cmp::Ordering::Greater
+                            };
+                        }
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
         }
 
         if matches!(&select.distinct, Some(Distinct::Distinct)) {
@@ -2409,6 +2548,192 @@ impl Executor {
         })
     }
 
+    fn resolve_table_factor<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        factor: &'a TableFactor,
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(String, TableSchema, Vec<Row>)>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            match factor {
+                TableFactor::Table {
+                    name, alias, args, ..
+                } => {
+                    let tbl = name.0.last().unwrap().value.clone();
+                    let als = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| tbl.clone());
+                    let tbl_upper = tbl.to_uppercase();
+                    let is_scalar_function = matches!(
+                        tbl_upper.as_str(),
+                        "CURRENT_SCHEMA"
+                            | "CURRENT_DATABASE"
+                            | "CURRENT_USER"
+                            | "SESSION_USER"
+                            | "USER"
+                    ) || args.is_some();
+                    let table_name = if is_scalar_function {
+                        format!("{}()", tbl)
+                    } else {
+                        tbl
+                    };
+                    let (schema, rows) = self.get_table_data(txn, &table_name, ctes).await?;
+                    Ok((als, schema, rows))
+                }
+                TableFactor::Derived {
+                    subquery, alias, ..
+                } => {
+                    let alias_name = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| "subquery".to_string());
+                    let (schema, rows) = self
+                        .execute_derived_table(txn, subquery, &alias_name, ctes)
+                        .await?;
+                    Ok((alias_name, schema, rows))
+                }
+                TableFactor::NestedJoin {
+                    table_with_joins,
+                    alias,
+                } => {
+                    let (mut base_alias, mut combined_schema, mut combined_rows) = self
+                        .resolve_table_factor(txn, &table_with_joins.relation, ctes)
+                        .await?;
+
+                    for join in &table_with_joins.joins {
+                        let (join_alias, join_schema, join_rows) =
+                            self.resolve_table_factor(txn, &join.relation, ctes).await?;
+
+                        let join_condition = match &join.join_operator {
+                            JoinOperator::Inner(JoinConstraint::On(expr)) => Some(expr.clone()),
+                            JoinOperator::LeftOuter(JoinConstraint::On(expr)) => Some(expr.clone()),
+                            JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
+                                Some(expr.clone())
+                            }
+                            JoinOperator::FullOuter(JoinConstraint::On(expr)) => Some(expr.clone()),
+                            JoinOperator::CrossJoin => None,
+                            JoinOperator::Inner(JoinConstraint::None) => None,
+                            _ => None,
+                        };
+
+                        let is_left_join = matches!(
+                            join.join_operator,
+                            JoinOperator::LeftOuter(_) | JoinOperator::FullOuter(_)
+                        );
+                        let is_right_join = matches!(
+                            join.join_operator,
+                            JoinOperator::RightOuter(_) | JoinOperator::FullOuter(_)
+                        );
+
+                        let mut column_offsets: HashMap<String, usize> = HashMap::new();
+                        let mut offset = 0;
+                        for col in &combined_schema.columns {
+                            column_offsets.insert(format!("{}.{}", base_alias, col.name), offset);
+                            if !column_offsets.contains_key(&col.name) {
+                                column_offsets.insert(col.name.clone(), offset);
+                            }
+                            offset += 1;
+                        }
+                        for col in &join_schema.columns {
+                            column_offsets.insert(format!("{}.{}", join_alias, col.name), offset);
+                            if !column_offsets.contains_key(&col.name) {
+                                column_offsets.insert(col.name.clone(), offset);
+                            }
+                            offset += 1;
+                        }
+
+                        let mut temp_columns = combined_schema.columns.clone();
+                        temp_columns.extend(join_schema.columns.clone());
+                        let temp_combined_schema = TableSchema {
+                            table_id: 0,
+                            name: "nested_join".to_string(),
+                            columns: temp_columns,
+                            pk_indices: vec![],
+                            indexes: vec![],
+                            version: 1,
+                            check_constraints: vec![],
+                            foreign_keys: vec![],
+                        };
+
+                        let mut new_rows = Vec::new();
+                        let mut right_matched_flags = vec![false; join_rows.len()];
+                        let right_cols = join_schema.columns.len();
+
+                        for left_row in &combined_rows {
+                            let mut matched_any = false;
+                            for (right_idx, right_row) in join_rows.iter().enumerate() {
+                                let mut combined_values = left_row.values.clone();
+                                combined_values.extend(right_row.values.clone());
+                                let combined_row = Row::new(combined_values);
+
+                                let matches = if let Some(cond) = &join_condition {
+                                    let ctx = JoinContext {
+                                        tables: HashMap::new(),
+                                        column_offsets: column_offsets.clone(),
+                                        combined_row: &combined_row,
+                                        combined_schema: &temp_combined_schema,
+                                    };
+                                    matches!(eval_expr_join(cond, &ctx), Ok(Value::Boolean(true)))
+                                } else {
+                                    true
+                                };
+
+                                if matches {
+                                    new_rows.push(combined_row);
+                                    matched_any = true;
+                                    right_matched_flags[right_idx] = true;
+                                }
+                            }
+
+                            if !matched_any && is_left_join {
+                                let mut combined_values = left_row.values.clone();
+                                combined_values.extend(vec![Value::Null; right_cols]);
+                                new_rows.push(Row::new(combined_values));
+                            }
+                        }
+
+                        if is_right_join {
+                            let left_cols = combined_schema.columns.len();
+                            for (right_idx, right_row) in join_rows.iter().enumerate() {
+                                if !right_matched_flags[right_idx] {
+                                    let mut combined_values = vec![Value::Null; left_cols];
+                                    combined_values.extend(right_row.values.clone());
+                                    new_rows.push(Row::new(combined_values));
+                                }
+                            }
+                        }
+
+                        let mut new_columns = combined_schema.columns.clone();
+                        new_columns.extend(join_schema.columns.clone());
+                        combined_schema = TableSchema {
+                            table_id: 0,
+                            name: format!("{}_{}", base_alias, join_alias),
+                            columns: new_columns,
+                            pk_indices: vec![],
+                            indexes: vec![],
+                            version: 1,
+                            check_constraints: vec![],
+                            foreign_keys: vec![],
+                        };
+                        combined_rows = new_rows;
+                        base_alias = format!("{}_{}", base_alias, join_alias);
+                    }
+
+                    let final_alias = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or(base_alias);
+
+                    Ok((final_alias, combined_schema, combined_rows))
+                }
+                _ => Err(anyhow!("Unsupported table factor")),
+            }
+        })
+    }
+
     async fn execute_join_query_with_ctes(
         &self,
         txn: &mut Transaction,
@@ -2458,6 +2783,10 @@ impl Executor {
                     .await?;
                 (alias_name, schema, rows)
             }
+            TableFactor::NestedJoin { .. } => {
+                self.resolve_table_factor(txn, &select.from[0].relation, ctes)
+                    .await?
+            }
             _ => return Err(anyhow!("Unsupported base table")),
         };
 
@@ -2489,6 +2818,10 @@ impl Executor {
                         .execute_derived_table(txn, subquery, &alias_name, ctes)
                         .await?;
                     (alias_name, schema, rows)
+                }
+                TableFactor::NestedJoin { .. } => {
+                    self.resolve_table_factor(txn, &from_item.relation, ctes)
+                        .await?
                 }
                 _ => return Err(anyhow!("Unsupported table factor in FROM")),
             };
@@ -2526,6 +2859,10 @@ impl Executor {
                             .execute_derived_table(txn, subquery, &alias_name, ctes)
                             .await?;
                         (alias_name, schema, rows)
+                    }
+                    TableFactor::NestedJoin { .. } => {
+                        self.resolve_table_factor(txn, &extra_join.relation, ctes)
+                            .await?
                     }
                     _ => return Err(anyhow!("Unsupported join table factor")),
                 };
@@ -2565,6 +2902,9 @@ impl Executor {
                         .execute_derived_table(txn, subquery, &alias_name, ctes)
                         .await?;
                     (alias_name, schema, rows)
+                }
+                TableFactor::NestedJoin { .. } => {
+                    self.resolve_table_factor(txn, &join.relation, ctes).await?
                 }
                 _ => return Err(anyhow!("Unsupported join table")),
             };
@@ -2622,8 +2962,18 @@ impl Executor {
             };
             let _ = is_natural;
 
+            let has_correlated_subquery = join_condition.as_ref().map_or(false, |cond| {
+                combined_schemas.iter().any(|(alias, _)| {
+                    super::helpers::query_has_outer_reference_in_expr(cond, alias)
+                })
+            });
+
             let join_condition = if let Some(cond) = join_condition {
-                Some(self.resolve_subqueries(txn, &cond).await?)
+                if has_correlated_subquery {
+                    Some(cond)
+                } else {
+                    Some(self.resolve_subqueries(txn, &cond).await?)
+                }
             } else {
                 None
             };
@@ -2675,12 +3025,38 @@ impl Executor {
 
             for left_row in &combined_rows {
                 let mut matched = false;
+
+                let resolved_condition = if has_correlated_subquery {
+                    if let Some(ref cond) = join_condition {
+                        let mut substituted = cond.clone();
+                        let mut value_offset = 0;
+                        for (alias, schema) in &combined_schemas {
+                            let row_values: Vec<Value> = left_row.values
+                                [value_offset..value_offset + schema.columns.len()]
+                                .to_vec();
+                            let outer_row = Row::new(row_values);
+                            substituted = super::helpers::substitute_outer_values(
+                                &substituted,
+                                alias,
+                                schema,
+                                &outer_row,
+                            );
+                            value_offset += schema.columns.len();
+                        }
+                        Some(self.resolve_subqueries(txn, &substituted).await?)
+                    } else {
+                        None
+                    }
+                } else {
+                    join_condition.clone()
+                };
+
                 for (right_idx, right_row) in join_rows.iter().enumerate() {
                     let mut combined_values = left_row.values.clone();
                     combined_values.extend(right_row.values.clone());
                     let combined_row = Row::new(combined_values);
 
-                    let matches = if let Some(ref cond) = join_condition {
+                    let matches = if let Some(ref cond) = resolved_condition {
                         let ctx = JoinContext {
                             tables: HashMap::new(),
                             column_offsets: column_offsets.clone(),
@@ -2782,7 +3158,7 @@ impl Executor {
             GroupByExpr::All => return Err(anyhow!("GROUP BY ALL not supported")),
         };
 
-        let mut agg_funcs = Vec::new();
+        let mut agg_funcs: Vec<(usize, AggExpr)> = Vec::new();
         for (i, item) in select.projection.iter().enumerate() {
             match item {
                 SelectItem::UnnamedExpr(Expr::Function(f))
@@ -2801,10 +3177,17 @@ impl Executor {
                         .unwrap_or_default();
                     if matches!(
                         func_name.as_str(),
-                        "COUNT" | "SUM" | "AVG" | "MAX" | "MIN" | "STRING_AGG"
+                        "COUNT" | "SUM" | "AVG" | "MAX" | "MIN" | "STRING_AGG" | "ARRAY_AGG"
                     ) {
-                        agg_funcs.push((i, f.clone()));
+                        agg_funcs.push((i, AggExpr::Function(f.clone())));
                     }
+                }
+                SelectItem::UnnamedExpr(Expr::ArrayAgg(arr))
+                | SelectItem::ExprWithAlias {
+                    expr: Expr::ArrayAgg(arr),
+                    ..
+                } => {
+                    agg_funcs.push((i, AggExpr::ArrayAgg(arr.clone())));
                 }
                 _ => {}
             }
@@ -2837,25 +3220,32 @@ impl Executor {
 
                 if !groups.contains_key(&key_bytes) {
                     let mut aggs = Vec::new();
-                    for (_, f) in &agg_funcs {
-                        let name = f.name.0.last().unwrap().value.to_uppercase();
-                        if name == "STRING_AGG" {
-                            let delimiter = if f.args.len() >= 2 {
-                                match &f.args[1] {
-                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                                        match eval_expr_join(e, &ctx)? {
-                                            Value::Text(s) => s,
+                    for (_, agg_expr) in &agg_funcs {
+                        match agg_expr {
+                            AggExpr::Function(f) => {
+                                let name = f.name.0.last().unwrap().value.to_uppercase();
+                                if name == "STRING_AGG" {
+                                    let delimiter = if f.args.len() >= 2 {
+                                        match &f.args[1] {
+                                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                                match eval_expr_join(e, &ctx)? {
+                                                    Value::Text(s) => s,
+                                                    _ => ",".to_string(),
+                                                }
+                                            }
                                             _ => ",".to_string(),
                                         }
-                                    }
-                                    _ => ",".to_string(),
+                                    } else {
+                                        ",".to_string()
+                                    };
+                                    aggs.push(Aggregator::new_string_agg(delimiter));
+                                } else {
+                                    aggs.push(Aggregator::new(&name)?);
                                 }
-                            } else {
-                                ",".to_string()
-                            };
-                            aggs.push(Aggregator::new_string_agg(delimiter));
-                        } else {
-                            aggs.push(Aggregator::new(&name)?);
+                            }
+                            AggExpr::ArrayAgg(_) => {
+                                aggs.push(Aggregator::new_array_agg());
+                            }
                         }
                     }
                     groups.insert(key_bytes.clone(), aggs);
@@ -2863,16 +3253,31 @@ impl Executor {
                 }
 
                 let aggs = groups.get_mut(&key_bytes).unwrap();
-                for (agg_idx, (_, f)) in agg_funcs.iter().enumerate() {
-                    let arg_expr = if f.args.is_empty() {
-                        None
-                    } else {
-                        match &f.args[0] {
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                            FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => None,
-                            _ => None,
+                for (agg_idx, (_, agg_expr)) in agg_funcs.iter().enumerate() {
+                    let (filter_expr, arg_expr) = match agg_expr {
+                        AggExpr::Function(f) => {
+                            let filter = f.filter.as_ref().map(|e| e.as_ref());
+                            let arg = if f.args.is_empty() {
+                                None
+                            } else {
+                                match &f.args[0] {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => None,
+                                    _ => return Err(anyhow!("Unsupported arg")),
+                                }
+                            };
+                            (filter, arg)
                         }
+                        AggExpr::ArrayAgg(arr) => (None, Some(arr.expr.as_ref())),
                     };
+
+                    if let Some(filter) = filter_expr {
+                        let filter_val = eval_expr_join(filter, &ctx)?;
+                        if !matches!(filter_val, Value::Boolean(true)) {
+                            continue;
+                        }
+                    }
+
                     let val = if let Some(e) = arg_expr {
                         eval_expr_join(e, &ctx)?
                     } else {
@@ -3353,6 +3758,208 @@ impl Executor {
             resolved.push(resolved_item);
         }
         Ok(resolved)
+    }
+
+    async fn resolve_projection_subqueries_with_outer_context(
+        &self,
+        txn: &mut Transaction,
+        projection: &[SelectItem],
+        outer_alias: &str,
+    ) -> Result<Vec<SelectItem>> {
+        let mut resolved = Vec::with_capacity(projection.len());
+        for item in projection {
+            let resolved_item = match item {
+                SelectItem::UnnamedExpr(e) => {
+                    if self.expr_is_correlated_subquery(e, outer_alias) {
+                        SelectItem::UnnamedExpr(e.clone())
+                    } else {
+                        SelectItem::UnnamedExpr(self.resolve_subqueries(txn, e).await?)
+                    }
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    if self.expr_is_correlated_subquery(expr, outer_alias) {
+                        SelectItem::ExprWithAlias {
+                            expr: expr.clone(),
+                            alias: alias.clone(),
+                        }
+                    } else {
+                        SelectItem::ExprWithAlias {
+                            expr: self.resolve_subqueries(txn, expr).await?,
+                            alias: alias.clone(),
+                        }
+                    }
+                }
+                other => other.clone(),
+            };
+            resolved.push(resolved_item);
+        }
+        Ok(resolved)
+    }
+
+    fn expr_is_correlated_subquery(&self, expr: &Expr, outer_alias: &str) -> bool {
+        match expr {
+            Expr::Subquery(q) => query_has_outer_reference(q, outer_alias),
+            _ => false,
+        }
+    }
+
+    fn expr_has_correlated_exists(&self, expr: &Expr, outer_alias: &str) -> bool {
+        match expr {
+            Expr::Exists { subquery, .. } => query_has_outer_reference(subquery, outer_alias),
+            Expr::BinaryOp { left, right, .. } => {
+                self.expr_has_correlated_exists(left, outer_alias)
+                    || self.expr_has_correlated_exists(right, outer_alias)
+            }
+            Expr::UnaryOp { expr: inner, .. } => {
+                self.expr_has_correlated_exists(inner, outer_alias)
+            }
+            Expr::Nested(inner) => self.expr_has_correlated_exists(inner, outer_alias),
+            _ => false,
+        }
+    }
+
+    fn eval_correlated_exists<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        subquery: &'a Query,
+        negated: bool,
+        outer_alias: &'a str,
+        outer_schema: &'a TableSchema,
+        outer_row: &'a Row,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let substituted_query =
+                substitute_outer_values_in_query(subquery, outer_alias, outer_schema, outer_row);
+            let result = self.execute_query(txn, &substituted_query).await?;
+            let exists = match result {
+                ExecuteResult::Select { rows, .. } => !rows.is_empty(),
+                _ => false,
+            };
+            let result_bool = if negated { !exists } else { exists };
+            Ok(Value::Boolean(result_bool))
+        })
+    }
+
+    fn eval_selection_with_correlated_exists<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        expr: &'a Expr,
+        outer_alias: &'a str,
+        outer_schema: &'a TableSchema,
+        outer_row: &'a Row,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move {
+            match expr {
+                Expr::Exists { subquery, negated } => {
+                    if query_has_outer_reference(subquery, outer_alias) {
+                        self.eval_correlated_exists(
+                            txn,
+                            subquery,
+                            *negated,
+                            outer_alias,
+                            outer_schema,
+                            outer_row,
+                        )
+                        .await
+                    } else {
+                        let result = self.execute_query(txn, subquery).await?;
+                        let exists = match result {
+                            ExecuteResult::Select { rows, .. } => !rows.is_empty(),
+                            _ => false,
+                        };
+                        let result_bool = if *negated { !exists } else { exists };
+                        Ok(Value::Boolean(result_bool))
+                    }
+                }
+                Expr::BinaryOp { left, op, right } => {
+                    let left_val = self
+                        .eval_selection_with_correlated_exists(
+                            txn,
+                            left,
+                            outer_alias,
+                            outer_schema,
+                            outer_row,
+                        )
+                        .await?;
+                    let right_val = self
+                        .eval_selection_with_correlated_exists(
+                            txn,
+                            right,
+                            outer_alias,
+                            outer_schema,
+                            outer_row,
+                        )
+                        .await?;
+                    match op {
+                        BinaryOperator::And => {
+                            let left_bool = matches!(left_val, Value::Boolean(true));
+                            let right_bool = matches!(right_val, Value::Boolean(true));
+                            Ok(Value::Boolean(left_bool && right_bool))
+                        }
+                        BinaryOperator::Or => {
+                            let left_bool = matches!(left_val, Value::Boolean(true));
+                            let right_bool = matches!(right_val, Value::Boolean(true));
+                            Ok(Value::Boolean(left_bool || right_bool))
+                        }
+                        _ => eval_expr(expr, Some(outer_row), Some(outer_schema)),
+                    }
+                }
+                Expr::UnaryOp {
+                    op: sqlparser::ast::UnaryOperator::Not,
+                    expr: inner,
+                } => {
+                    let inner_val = self
+                        .eval_selection_with_correlated_exists(
+                            txn,
+                            inner,
+                            outer_alias,
+                            outer_schema,
+                            outer_row,
+                        )
+                        .await?;
+                    let inner_bool = matches!(inner_val, Value::Boolean(true));
+                    Ok(Value::Boolean(!inner_bool))
+                }
+                Expr::Nested(inner) => {
+                    self.eval_selection_with_correlated_exists(
+                        txn,
+                        inner,
+                        outer_alias,
+                        outer_schema,
+                        outer_row,
+                    )
+                    .await
+                }
+                _ => eval_expr(expr, Some(outer_row), Some(outer_schema)),
+            }
+        })
+    }
+
+    fn eval_correlated_subquery<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        subquery: &'a Query,
+        outer_alias: &'a str,
+        outer_schema: &'a TableSchema,
+        outer_row: &'a Row,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let substituted_query =
+                substitute_outer_values_in_query(subquery, outer_alias, outer_schema, outer_row);
+            let result = self.execute_query(txn, &substituted_query).await?;
+            match result {
+                ExecuteResult::Select { rows, .. } => {
+                    if rows.is_empty() {
+                        Ok(Value::Null)
+                    } else if rows.len() == 1 {
+                        Ok(rows[0].values.first().cloned().unwrap_or(Value::Null))
+                    } else {
+                        Err(anyhow!("Scalar subquery returned more than one row"))
+                    }
+                }
+                _ => Err(anyhow!("Subquery must return a SELECT result")),
+            }
+        })
     }
 
     async fn scan_and_fill(

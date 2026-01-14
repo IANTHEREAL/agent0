@@ -70,6 +70,14 @@ pub fn build_returning_columns(
         for item in items {
             match item {
                 SelectItem::UnnamedExpr(Expr::Identifier(id)) => ret_cols.push(id.value.clone()),
+                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                    ret_cols.push(
+                        parts
+                            .last()
+                            .map(|p| p.value.clone())
+                            .unwrap_or_else(|| "col".to_string()),
+                    );
+                }
                 SelectItem::ExprWithAlias { alias, .. } => ret_cols.push(alias.value.clone()),
                 SelectItem::Wildcard(_) => {
                     for c in &schema.columns {
@@ -149,10 +157,11 @@ pub async fn execute_insert_row(
                                 }
                                 let existing_pk = &pks[0];
 
-                                store.delete_by_pk(txn, table_name, &pk_values).await?;
-
                                 match &oc.action {
-                                    OnConflictAction::DoNothing => return Ok(None),
+                                    OnConflictAction::DoNothing => {
+                                        store.delete_by_pk(txn, table_name, &pk_values).await?;
+                                        return Ok(None);
+                                    }
                                     OnConflictAction::DoUpdate(do_update) => {
                                         let existing_rows = store
                                             .batch_get_rows(
@@ -189,6 +198,10 @@ pub async fn execute_insert_row(
                                             )?;
                                         }
                                         let updated_row = Row::new(updated_vals);
+
+                                        store.delete_by_pk(txn, table_name, &pk_values).await?;
+                                        store.delete_by_pk(txn, table_name, existing_pk).await?;
+
                                         update_row_indexes(
                                             store,
                                             txn,
@@ -212,8 +225,6 @@ pub async fn execute_insert_row(
                                     ));
                                 }
                                 let existing_pk = &pks[0];
-
-                                store.delete_by_pk(txn, table_name, &pk_values).await?;
 
                                 let existing_rows = store
                                     .batch_get_rows(
@@ -242,6 +253,10 @@ pub async fn execute_insert_row(
                                     )?;
                                 }
                                 let updated_row = Row::new(updated_vals);
+
+                                store.delete_by_pk(txn, table_name, &pk_values).await?;
+                                store.delete_by_pk(txn, table_name, existing_pk).await?;
+
                                 update_row_indexes(store, txn, schema, existing_row, &updated_row)
                                     .await?;
                                 store.upsert(txn, table_name, updated_row.clone()).await?;

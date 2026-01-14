@@ -7,9 +7,15 @@ use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    BinaryOperator, DataType as SqlDataType, Expr, FunctionArg, FunctionArgExpr, Ident, Query,
-    SetExpr, TableFactor, Value as SqlValue,
+    ArrayAgg, BinaryOperator, DataType as SqlDataType, Expr, Function, FunctionArg,
+    FunctionArgExpr, Ident, Query, SetExpr, TableFactor, Value as SqlValue,
 };
+
+#[derive(Debug, Clone)]
+pub enum AggExpr {
+    Function(Function),
+    ArrayAgg(ArrayAgg),
+}
 
 pub fn normalize_ident(ident: &Ident) -> String {
     if ident.quote_style.is_some() {
@@ -149,6 +155,16 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
         }
         Value::Json(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
         Value::Jsonb(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
+        Value::Time(micros) => {
+            let total_secs = micros / 1_000_000;
+            let hours = total_secs / 3600;
+            let mins = (total_secs % 3600) / 60;
+            let secs = total_secs % 60;
+            Expr::Value(SqlValue::SingleQuotedString(format!(
+                "{:02}:{:02}:{:02}",
+                hours, mins, secs
+            )))
+        }
     }
 }
 
@@ -245,6 +261,7 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
         SqlDataType::Bytea => Ok(DataType::Bytes),
         SqlDataType::Timestamp(_, _) => Ok(DataType::Timestamp),
         SqlDataType::Date => Ok(DataType::Timestamp),
+        SqlDataType::Time(_, _) => Ok(DataType::Time),
         SqlDataType::Uuid => Ok(DataType::Uuid),
         SqlDataType::JSON => Ok(DataType::Jsonb),
         SqlDataType::Custom(name, modifiers) => {
@@ -333,10 +350,9 @@ fn extract_conditions_recursive(
 /// Collect aggregate functions from HAVING clause that aren't already in projection
 pub fn collect_having_agg_funcs(
     expr: &Expr,
-    agg_funcs: &mut Vec<(usize, sqlparser::ast::Function)>,
+    agg_funcs: &mut Vec<(usize, AggExpr)>,
     extra_start: usize,
 ) {
-    tracing::debug!("collect_having_agg_funcs called with expr: {:?}", expr);
     match expr {
         Expr::Function(f) if f.over.is_none() => {
             let func_name = f
@@ -345,25 +361,23 @@ pub fn collect_having_agg_funcs(
                 .last()
                 .map(|i| i.value.to_uppercase())
                 .unwrap_or_default();
-            tracing::debug!("Found function in HAVING: {}", func_name);
             if matches!(
                 func_name.as_str(),
-                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "ARRAY_AGG"
             ) {
                 let already_exists = agg_funcs.iter().any(|(_, existing)| {
-                    let existing_name = existing
-                        .name
-                        .0
-                        .last()
-                        .map(|n| n.value.to_uppercase())
-                        .unwrap_or_default();
-                    existing_name == func_name && args_match(f, existing)
+                    if let AggExpr::Function(existing_f) = existing {
+                        let existing_name = existing_f
+                            .name
+                            .0
+                            .last()
+                            .map(|n| n.value.to_uppercase())
+                            .unwrap_or_default();
+                        existing_name == func_name && args_match(f, existing_f)
+                    } else {
+                        false
+                    }
                 });
-                tracing::debug!(
-                    "Already exists: {}, agg_funcs len: {}",
-                    already_exists,
-                    agg_funcs.len()
-                );
                 if !already_exists {
                     let new_idx = extra_start
                         + (agg_funcs.len()
@@ -371,9 +385,22 @@ pub fn collect_having_agg_funcs(
                                 .iter()
                                 .filter(|(idx, _)| *idx < extra_start)
                                 .count());
-                    tracing::debug!("Adding new agg func at index {}", new_idx);
-                    agg_funcs.push((new_idx, f.clone()));
+                    agg_funcs.push((new_idx, AggExpr::Function(f.clone())));
                 }
+            }
+        }
+        Expr::ArrayAgg(arr) => {
+            let already_exists = agg_funcs
+                .iter()
+                .any(|(_, existing)| matches!(existing, AggExpr::ArrayAgg(_)));
+            if !already_exists {
+                let new_idx = extra_start
+                    + (agg_funcs.len()
+                        - agg_funcs
+                            .iter()
+                            .filter(|(idx, _)| *idx < extra_start)
+                            .count());
+                agg_funcs.push((new_idx, AggExpr::ArrayAgg(arr.clone())));
             }
         }
         Expr::BinaryOp { left, right, .. } => {
@@ -381,9 +408,7 @@ pub fn collect_having_agg_funcs(
             collect_having_agg_funcs(right, agg_funcs, extra_start);
         }
         Expr::Nested(e) => collect_having_agg_funcs(e, agg_funcs, extra_start),
-        _ => {
-            tracing::debug!("Other expr type in HAVING: {:?}", expr);
-        }
+        _ => {}
     }
 }
 
@@ -392,7 +417,7 @@ pub fn eval_having_expr(
     expr: &Expr,
     row: &Row,
     schema: &TableSchema,
-    agg_funcs: &[(usize, sqlparser::ast::Function)],
+    agg_funcs: &[(usize, AggExpr)],
     aggs: &[Aggregator],
 ) -> Result<Value> {
     match expr {
@@ -408,20 +433,22 @@ pub fn eval_having_expr(
                 .last()
                 .map(|i| i.value.to_uppercase())
                 .unwrap_or_default();
-            for (i, (_, agg_f)) in agg_funcs.iter().enumerate() {
-                let agg_name = agg_f
-                    .name
-                    .0
-                    .last()
-                    .map(|n| n.value.to_uppercase())
-                    .unwrap_or_default();
-                if agg_name == func_name && args_match(f, agg_f) {
-                    return Ok(aggs[i].result());
+            for (i, (_, agg_expr)) in agg_funcs.iter().enumerate() {
+                if let AggExpr::Function(agg_f) = agg_expr {
+                    let agg_name = agg_f
+                        .name
+                        .0
+                        .last()
+                        .map(|n| n.value.to_uppercase())
+                        .unwrap_or_default();
+                    if agg_name == func_name && args_match(f, agg_f) {
+                        return Ok(aggs[i].result());
+                    }
                 }
             }
             if matches!(
                 func_name.as_str(),
-                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "ARRAY_AGG"
             ) {
                 let mut temp_agg = Aggregator::new(&func_name)?;
                 let arg_expr = if f.args.is_empty() {
@@ -443,6 +470,17 @@ pub fn eval_having_expr(
                 eval_expr(expr, Some(row), Some(schema))
             }
         }
+        Expr::ArrayAgg(arr) => {
+            for (i, (_, agg_expr)) in agg_funcs.iter().enumerate() {
+                if matches!(agg_expr, AggExpr::ArrayAgg(_)) {
+                    return Ok(aggs[i].result());
+                }
+            }
+            let mut temp_agg = Aggregator::new_array_agg();
+            let val = eval_expr(&arr.expr, Some(row), Some(schema))?;
+            temp_agg.update(&val)?;
+            Ok(temp_agg.result())
+        }
         Expr::Nested(e) => eval_having_expr(e, row, schema, agg_funcs, aggs),
         Expr::Value(v) => super::expr::eval_value_public(v),
         _ => eval_expr(expr, Some(row), Some(schema)),
@@ -453,7 +491,7 @@ pub fn eval_having_expr(
 pub fn eval_having_expr_join(
     expr: &Expr,
     ctx: &JoinContext,
-    agg_funcs: &[(usize, sqlparser::ast::Function)],
+    agg_funcs: &[(usize, AggExpr)],
     aggs: &[Aggregator],
 ) -> Result<Value> {
     match expr {
@@ -469,20 +507,22 @@ pub fn eval_having_expr_join(
                 .last()
                 .map(|i| i.value.to_uppercase())
                 .unwrap_or_default();
-            for (i, (_, agg_f)) in agg_funcs.iter().enumerate() {
-                let agg_name = agg_f
-                    .name
-                    .0
-                    .last()
-                    .map(|n| n.value.to_uppercase())
-                    .unwrap_or_default();
-                if agg_name == func_name && args_match(f, agg_f) {
-                    return Ok(aggs[i].result());
+            for (i, (_, agg_expr)) in agg_funcs.iter().enumerate() {
+                if let AggExpr::Function(agg_f) = agg_expr {
+                    let agg_name = agg_f
+                        .name
+                        .0
+                        .last()
+                        .map(|n| n.value.to_uppercase())
+                        .unwrap_or_default();
+                    if agg_name == func_name && args_match(f, agg_f) {
+                        return Ok(aggs[i].result());
+                    }
                 }
             }
             if matches!(
                 func_name.as_str(),
-                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG"
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "ARRAY_AGG"
             ) {
                 let mut temp_agg = Aggregator::new(&func_name)?;
                 let arg_expr = if f.args.is_empty() {
@@ -503,6 +543,17 @@ pub fn eval_having_expr_join(
             } else {
                 eval_expr_join(expr, ctx)
             }
+        }
+        Expr::ArrayAgg(arr) => {
+            for (i, (_, agg_expr)) in agg_funcs.iter().enumerate() {
+                if matches!(agg_expr, AggExpr::ArrayAgg(_)) {
+                    return Ok(aggs[i].result());
+                }
+            }
+            let mut temp_agg = Aggregator::new_array_agg();
+            let val = eval_expr_join(&arr.expr, ctx)?;
+            temp_agg.update(&val)?;
+            Ok(temp_agg.result())
         }
         Expr::Nested(e) => eval_having_expr_join(e, ctx, agg_funcs, aggs),
         Expr::Value(v) => super::expr::eval_value_public(v),
@@ -546,6 +597,7 @@ pub fn infer_data_type(value: &Value) -> DataType {
         Value::Bytes(_) => DataType::Bytes,
         Value::Timestamp(_) => DataType::Timestamp,
         Value::Interval { .. } => DataType::Interval,
+        Value::Time(_) => DataType::Time,
         Value::Uuid(_) => DataType::Uuid,
         Value::Vector(vec) => DataType::Vector(vec.len() as u32),
         Value::Json(_) => DataType::Json,
@@ -843,6 +895,7 @@ fn sql_datatype_to_internal(dt: &SqlDataType) -> DataType {
         | SqlDataType::Numeric(_)
         | SqlDataType::Decimal(_) => DataType::Float64,
         SqlDataType::Timestamp(_, _) => DataType::Timestamp,
+        SqlDataType::Time(_, _) => DataType::Time,
         SqlDataType::Interval => DataType::Interval,
         SqlDataType::Uuid => DataType::Uuid,
         SqlDataType::Bytea => DataType::Bytes,
@@ -1012,6 +1065,13 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
                 Value::Bytes(unescaped.into_bytes())
             }
         }
+        DataType::Time => {
+            if let Some(micros) = parse_time_string(&unescaped) {
+                Value::Time(micros)
+            } else {
+                Value::Text(unescaped)
+            }
+        }
         DataType::Text | DataType::Interval => Value::Text(unescaped),
         DataType::Array(_) => {
             if let Ok(arr) = parse_pg_array(&unescaped) {
@@ -1050,6 +1110,37 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
             }
         }
     }
+}
+
+pub fn parse_time_string(s: &str) -> Option<i64> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+
+    let hours: i64 = parts[0].parse().ok()?;
+    let minutes: i64 = parts[1].parse().ok()?;
+
+    let (seconds, micros) = if parts.len() == 3 {
+        if let Some(dot_pos) = parts[2].find('.') {
+            let secs: i64 = parts[2][..dot_pos].parse().ok()?;
+            let frac_str = &parts[2][dot_pos + 1..];
+            let padded = format!("{:0<6}", frac_str);
+            let micros: i64 = padded[..6].parse().ok()?;
+            (secs, micros)
+        } else {
+            let secs: i64 = parts[2].parse().ok()?;
+            (secs, 0)
+        }
+    } else {
+        (0, 0)
+    };
+
+    if hours < 0 || hours > 23 || minutes < 0 || minutes > 59 || seconds < 0 || seconds > 59 {
+        return None;
+    }
+
+    Some(hours * 3_600_000_000 + minutes * 60_000_000 + seconds * 1_000_000 + micros)
 }
 
 pub fn cte_is_recursive(query: &Query, cte_name: &str) -> bool {
@@ -1093,5 +1184,479 @@ pub fn table_factor_references(factor: &TableFactor, table_name: &str) -> bool {
             set_expr_references_table(&subquery.body, table_name)
         }
         _ => false,
+    }
+}
+
+/// Check if an expression contains references to an outer table alias
+/// Used to detect correlated subqueries
+pub fn expr_has_outer_reference(expr: &Expr, outer_alias: &str) -> bool {
+    match expr {
+        Expr::CompoundIdentifier(parts) => {
+            if parts.len() >= 2 {
+                let table_part = normalize_ident(&parts[0]);
+                table_part.eq_ignore_ascii_case(outer_alias)
+            } else {
+                false
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            expr_has_outer_reference(left, outer_alias)
+                || expr_has_outer_reference(right, outer_alias)
+        }
+        Expr::UnaryOp { expr: inner, .. } => expr_has_outer_reference(inner, outer_alias),
+        Expr::Nested(inner) => expr_has_outer_reference(inner, outer_alias),
+        Expr::Function(f) => {
+            for arg in &f.args {
+                if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                    if expr_has_outer_reference(e, outer_alias) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                if expr_has_outer_reference(op, outer_alias) {
+                    return true;
+                }
+            }
+            for cond in conditions {
+                if expr_has_outer_reference(cond, outer_alias) {
+                    return true;
+                }
+            }
+            for res in results {
+                if expr_has_outer_reference(res, outer_alias) {
+                    return true;
+                }
+            }
+            if let Some(else_expr) = else_result {
+                if expr_has_outer_reference(else_expr, outer_alias) {
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::InList {
+            expr: inner, list, ..
+        } => {
+            if expr_has_outer_reference(inner, outer_alias) {
+                return true;
+            }
+            for item in list {
+                if expr_has_outer_reference(item, outer_alias) {
+                    return true;
+                }
+            }
+            false
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            expr_has_outer_reference(expr, outer_alias)
+                || expr_has_outer_reference(low, outer_alias)
+                || expr_has_outer_reference(high, outer_alias)
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            expr_has_outer_reference(inner, outer_alias)
+        }
+        Expr::Subquery(q)
+        | Expr::InSubquery { subquery: q, .. }
+        | Expr::Exists { subquery: q, .. } => query_has_outer_reference(q, outer_alias),
+        _ => false,
+    }
+}
+
+pub fn query_has_outer_reference_in_expr(expr: &Expr, outer_alias: &str) -> bool {
+    match expr {
+        Expr::Subquery(q) => query_has_outer_reference(q, outer_alias),
+        Expr::InSubquery { subquery: q, .. } => query_has_outer_reference(q, outer_alias),
+        Expr::Exists { subquery: q, .. } => query_has_outer_reference(q, outer_alias),
+        Expr::BinaryOp { left, right, .. } => {
+            query_has_outer_reference_in_expr(left, outer_alias)
+                || query_has_outer_reference_in_expr(right, outer_alias)
+        }
+        Expr::UnaryOp { expr: inner, .. } => query_has_outer_reference_in_expr(inner, outer_alias),
+        Expr::Nested(inner) => query_has_outer_reference_in_expr(inner, outer_alias),
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => {
+            query_has_outer_reference_in_expr(inner, outer_alias)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            query_has_outer_reference_in_expr(expr, outer_alias)
+                || query_has_outer_reference_in_expr(low, outer_alias)
+                || query_has_outer_reference_in_expr(high, outer_alias)
+        }
+        Expr::InList { expr, list, .. } => {
+            query_has_outer_reference_in_expr(expr, outer_alias)
+                || list
+                    .iter()
+                    .any(|e| query_has_outer_reference_in_expr(e, outer_alias))
+        }
+        _ => false,
+    }
+}
+
+/// Check if a query contains references to an outer table alias
+pub fn query_has_outer_reference(query: &Query, outer_alias: &str) -> bool {
+    match &*query.body {
+        SetExpr::Select(select) => {
+            // Check selection (WHERE clause)
+            if let Some(selection) = &select.selection {
+                if expr_has_outer_reference(selection, outer_alias) {
+                    return true;
+                }
+            }
+            // Check projection
+            for item in &select.projection {
+                match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(e)
+                    | sqlparser::ast::SelectItem::ExprWithAlias { expr: e, .. } => {
+                        if expr_has_outer_reference(e, outer_alias) {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // Check HAVING
+            if let Some(having) = &select.having {
+                if expr_has_outer_reference(having, outer_alias) {
+                    return true;
+                }
+            }
+            false
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            let left_query = Query {
+                with: None,
+                body: left.clone(),
+                order_by: vec![],
+                limit: None,
+                offset: None,
+                fetch: None,
+                locks: vec![],
+                limit_by: vec![],
+                for_clause: None,
+            };
+            let right_query = Query {
+                with: None,
+                body: right.clone(),
+                order_by: vec![],
+                limit: None,
+                offset: None,
+                fetch: None,
+                locks: vec![],
+                limit_by: vec![],
+                for_clause: None,
+            };
+            query_has_outer_reference(&left_query, outer_alias)
+                || query_has_outer_reference(&right_query, outer_alias)
+        }
+        _ => false,
+    }
+}
+
+/// Substitute outer table column references with literal values from the current row
+pub fn substitute_outer_values(
+    expr: &Expr,
+    outer_alias: &str,
+    outer_schema: &TableSchema,
+    outer_row: &Row,
+) -> Expr {
+    match expr {
+        Expr::CompoundIdentifier(parts) => {
+            if parts.len() >= 2 {
+                let table_part = normalize_ident(&parts[0]);
+                if table_part.eq_ignore_ascii_case(outer_alias) {
+                    let col_name = normalize_ident(&parts[1]);
+                    // Find column index in outer schema
+                    if let Some(col_idx) = outer_schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(&col_name))
+                    {
+                        if let Some(value) = outer_row.values.get(col_idx) {
+                            return value_to_sql_expr(value);
+                        }
+                    }
+                }
+            }
+            expr.clone()
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(substitute_outer_values(
+                left,
+                outer_alias,
+                outer_schema,
+                outer_row,
+            )),
+            op: op.clone(),
+            right: Box::new(substitute_outer_values(
+                right,
+                outer_alias,
+                outer_schema,
+                outer_row,
+            )),
+        },
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(substitute_outer_values(
+                inner,
+                outer_alias,
+                outer_schema,
+                outer_row,
+            )),
+        },
+        Expr::Nested(inner) => Expr::Nested(Box::new(substitute_outer_values(
+            inner,
+            outer_alias,
+            outer_schema,
+            outer_row,
+        ))),
+        Expr::Function(f) => {
+            let mut new_args = Vec::new();
+            for arg in &f.args {
+                let new_arg = match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(substitute_outer_values(
+                            e,
+                            outer_alias,
+                            outer_schema,
+                            outer_row,
+                        )))
+                    }
+                    other => other.clone(),
+                };
+                new_args.push(new_arg);
+            }
+            Expr::Function(sqlparser::ast::Function {
+                name: f.name.clone(),
+                args: new_args,
+                filter: f.filter.clone(),
+                null_treatment: f.null_treatment.clone(),
+                over: f.over.clone(),
+                distinct: f.distinct,
+                special: f.special,
+                order_by: f.order_by.clone(),
+            })
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            let new_operand = operand.as_ref().map(|op| {
+                Box::new(substitute_outer_values(
+                    op,
+                    outer_alias,
+                    outer_schema,
+                    outer_row,
+                ))
+            });
+            let new_conditions: Vec<Expr> = conditions
+                .iter()
+                .map(|c| substitute_outer_values(c, outer_alias, outer_schema, outer_row))
+                .collect();
+            let new_results: Vec<Expr> = results
+                .iter()
+                .map(|r| substitute_outer_values(r, outer_alias, outer_schema, outer_row))
+                .collect();
+            let new_else = else_result.as_ref().map(|e| {
+                Box::new(substitute_outer_values(
+                    e,
+                    outer_alias,
+                    outer_schema,
+                    outer_row,
+                ))
+            });
+            Expr::Case {
+                operand: new_operand,
+                conditions: new_conditions,
+                results: new_results,
+                else_result: new_else,
+            }
+        }
+        Expr::InList {
+            expr: inner,
+            list,
+            negated,
+        } => {
+            let new_inner = Box::new(substitute_outer_values(
+                inner,
+                outer_alias,
+                outer_schema,
+                outer_row,
+            ));
+            let new_list: Vec<Expr> = list
+                .iter()
+                .map(|item| substitute_outer_values(item, outer_alias, outer_schema, outer_row))
+                .collect();
+            Expr::InList {
+                expr: new_inner,
+                list: new_list,
+                negated: *negated,
+            }
+        }
+        Expr::Between {
+            expr: inner,
+            negated,
+            low,
+            high,
+        } => Expr::Between {
+            expr: Box::new(substitute_outer_values(
+                inner,
+                outer_alias,
+                outer_schema,
+                outer_row,
+            )),
+            negated: *negated,
+            low: Box::new(substitute_outer_values(
+                low,
+                outer_alias,
+                outer_schema,
+                outer_row,
+            )),
+            high: Box::new(substitute_outer_values(
+                high,
+                outer_alias,
+                outer_schema,
+                outer_row,
+            )),
+        },
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(substitute_outer_values(
+            inner,
+            outer_alias,
+            outer_schema,
+            outer_row,
+        ))),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(substitute_outer_values(
+            inner,
+            outer_alias,
+            outer_schema,
+            outer_row,
+        ))),
+        Expr::Subquery(q) => Expr::Subquery(Box::new(substitute_outer_values_in_query(
+            q,
+            outer_alias,
+            outer_schema,
+            outer_row,
+        ))),
+        Expr::InSubquery {
+            expr: inner,
+            subquery,
+            negated,
+        } => Expr::InSubquery {
+            expr: Box::new(substitute_outer_values(
+                inner,
+                outer_alias,
+                outer_schema,
+                outer_row,
+            )),
+            subquery: Box::new(substitute_outer_values_in_query(
+                subquery,
+                outer_alias,
+                outer_schema,
+                outer_row,
+            )),
+            negated: *negated,
+        },
+        Expr::Exists { subquery, negated } => Expr::Exists {
+            subquery: Box::new(substitute_outer_values_in_query(
+                subquery,
+                outer_alias,
+                outer_schema,
+                outer_row,
+            )),
+            negated: *negated,
+        },
+        _ => expr.clone(),
+    }
+}
+
+/// Substitute outer values in a query
+pub fn substitute_outer_values_in_query(
+    query: &Query,
+    outer_alias: &str,
+    outer_schema: &TableSchema,
+    outer_row: &Row,
+) -> Query {
+    let new_body = match &*query.body {
+        SetExpr::Select(select) => {
+            let new_selection = select
+                .selection
+                .as_ref()
+                .map(|sel| substitute_outer_values(sel, outer_alias, outer_schema, outer_row));
+
+            let new_projection: Vec<sqlparser::ast::SelectItem> = select
+                .projection
+                .iter()
+                .map(|item| match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(e) => {
+                        sqlparser::ast::SelectItem::UnnamedExpr(substitute_outer_values(
+                            e,
+                            outer_alias,
+                            outer_schema,
+                            outer_row,
+                        ))
+                    }
+                    sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
+                        sqlparser::ast::SelectItem::ExprWithAlias {
+                            expr: substitute_outer_values(
+                                expr,
+                                outer_alias,
+                                outer_schema,
+                                outer_row,
+                            ),
+                            alias: alias.clone(),
+                        }
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+
+            let new_having = select
+                .having
+                .as_ref()
+                .map(|h| substitute_outer_values(h, outer_alias, outer_schema, outer_row));
+
+            Box::new(SetExpr::Select(Box::new(sqlparser::ast::Select {
+                distinct: select.distinct.clone(),
+                top: select.top.clone(),
+                projection: new_projection,
+                into: select.into.clone(),
+                from: select.from.clone(),
+                lateral_views: select.lateral_views.clone(),
+                selection: new_selection,
+                group_by: select.group_by.clone(),
+                cluster_by: select.cluster_by.clone(),
+                distribute_by: select.distribute_by.clone(),
+                sort_by: select.sort_by.clone(),
+                having: new_having,
+                named_window: select.named_window.clone(),
+                qualify: select.qualify.clone(),
+            })))
+        }
+        _ => query.body.clone(),
+    };
+
+    Query {
+        with: query.with.clone(),
+        body: new_body,
+        order_by: query.order_by.clone(),
+        limit: query.limit.clone(),
+        offset: query.offset.clone(),
+        fetch: query.fetch.clone(),
+        locks: query.locks.clone(),
+        limit_by: query.limit_by.clone(),
+        for_clause: query.for_clause.clone(),
     }
 }

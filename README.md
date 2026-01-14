@@ -229,7 +229,7 @@ src/
     └── mod.rs           # Value, Row, Schema types
 
 tests/                   # SQL integration tests
-orm-tests/               # ORM compatibility tests (pg, TypeORM, Prisma, Sequelize, Knex, Drizzle, Kysely)
+orm-tests/               # ORM compatibility tests (pg, TypeORM, Sequelize, Knex, Drizzle, Kysely)
 ```
 
 ## ORM Compatibility

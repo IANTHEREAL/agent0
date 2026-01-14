@@ -26,6 +26,7 @@ pub fn is_information_schema_table(table_name: &str) -> bool {
                 | "pg_namespace"
                 | "pg_proc"
                 | "pg_description"
+                | "pg_indexes"
         )
 }
 
@@ -54,6 +55,7 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
             "pg_namespace" => "pg_namespace",
             "pg_proc" => "pg_proc",
             "pg_description" => "pg_description",
+            "pg_indexes" => "pg_indexes",
             _ => return None,
         });
     }
@@ -66,6 +68,7 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
         "pg_namespace" => Some("pg_namespace"),
         "pg_proc" => Some("pg_proc"),
         "pg_description" => Some("pg_description"),
+        "pg_indexes" => Some("pg_indexes"),
         _ => None,
     }
 }
@@ -397,6 +400,7 @@ fn pg_index_schema() -> TableSchema {
             text_col("indisclustered"),
             text_col("indisvalid"),
             text_col("indkey"),
+            text_col("indexdef"), // Pre-computed index definition for pg_get_indexdef()
         ],
         version: 1,
         pk_indices: vec![],
@@ -481,6 +485,25 @@ fn pg_description_schema() -> TableSchema {
     }
 }
 
+fn pg_indexes_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_indexes".to_string(),
+        columns: vec![
+            text_col("schemaname"),
+            text_col("tablename"),
+            text_col("indexname"),
+            text_col("tablespace"),
+            text_col("indexdef"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
 pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
     let lower = table_name.to_lowercase();
     let name = lower
@@ -505,6 +528,7 @@ pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
         "pg_namespace" => Some(pg_namespace_schema()),
         "pg_proc" => Some(pg_proc_schema()),
         "pg_description" => Some(pg_description_schema()),
+        "pg_indexes" => Some(pg_indexes_schema()),
         _ => None,
     }
 }
@@ -515,7 +539,7 @@ fn data_type_to_pg_type(dt: &DataType) -> &'static str {
         DataType::Int32 => "integer",
         DataType::Int64 => "bigint",
         DataType::Float64 => "double precision",
-        DataType::Text => "text",
+        DataType::Text => "character varying",
         DataType::Bytes => "bytea",
         DataType::Timestamp => "timestamp without time zone",
         DataType::Interval => "interval",
@@ -523,12 +547,13 @@ fn data_type_to_pg_type(dt: &DataType) -> &'static str {
         DataType::Array(inner) => match inner.as_ref() {
             DataType::Int32 => "integer[]",
             DataType::Int64 => "bigint[]",
-            DataType::Text => "text[]",
+            DataType::Text => "character varying[]",
             _ => "anyarray",
         },
         DataType::Json => "json",
         DataType::Jsonb => "jsonb",
         DataType::Vector(_) => "vector",
+        DataType::Time => "time without time zone",
     }
 }
 
@@ -581,6 +606,7 @@ pub async fn get_information_schema_data(
         "pg_attribute" => get_pg_attribute_rows(store, txn, &user_tables).await?,
         "pg_proc" => get_pg_proc_rows(),
         "pg_description" => get_pg_description_rows(),
+        "pg_indexes" => get_pg_indexes_rows(store, txn, &user_tables).await?,
         _ => vec![],
     };
 
@@ -1138,45 +1164,17 @@ async fn get_pg_index_rows(
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
-    let mut table_oid = 16384;
+    let mut oid_counter = 16384;
 
     for table_name in user_tables {
         if let Some(schema) = store.get_schema(txn, table_name).await? {
-            let base_table_oid = table_oid;
-            table_oid += 1;
+            let base_table_oid = oid_counter;
+            oid_counter += 1;
 
-            // Add primary key index
-            if !schema.pk_indices.is_empty() {
-                let pk_oid = table_oid;
-                table_oid += 1;
-
-                let indkey = schema
-                    .pk_indices
-                    .iter()
-                    .map(|idx| (idx + 1).to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ");
-
-                rows.push(Row::new(vec![
-                    int_val(pk_oid),
-                    int_val(base_table_oid),
-                    int_val(schema.pk_indices.len() as i64),
-                    text_val("t"), // is unique
-                    text_val("t"), // is primary
-                    text_val("f"), // is exclusion
-                    text_val("t"), // is immediate
-                    text_val("f"), // is clustered
-                    text_val("t"), // is valid
-                    text_val(&indkey),
-                ]));
-            }
-
-            // Add secondary indexes
             for idx in &schema.indexes {
-                let index_oid = table_oid;
-                table_oid += 1;
+                let index_oid = oid_counter;
+                oid_counter += 1;
 
-                // Map column names to column indices
                 let mut col_indices = Vec::new();
                 for col_name in &idx.columns {
                     if let Some(pos) = schema.columns.iter().position(|c| &c.name == col_name) {
@@ -1185,17 +1183,116 @@ async fn get_pg_index_rows(
                 }
                 let indkey = col_indices.join(" ");
 
+                let indexdef = format!(
+                    "CREATE {}INDEX {} ON public.{} USING btree ({})",
+                    if idx.unique { "UNIQUE " } else { "" },
+                    idx.name,
+                    table_name,
+                    idx.columns.join(", ")
+                );
+
                 rows.push(Row::new(vec![
                     int_val(index_oid),
                     int_val(base_table_oid),
                     int_val(idx.columns.len() as i64),
                     text_val(if idx.unique { "t" } else { "f" }),
-                    text_val("f"), // is primary
-                    text_val("f"), // is exclusion
-                    text_val("t"), // is immediate
-                    text_val("f"), // is clustered
-                    text_val("t"), // is valid
+                    text_val("f"),
+                    text_val("f"),
+                    text_val("t"),
+                    text_val("f"),
+                    text_val("t"),
                     text_val(&indkey),
+                    text_val(&indexdef),
+                ]));
+            }
+
+            if !schema.pk_indices.is_empty() {
+                let pk_oid = oid_counter;
+                oid_counter += 1;
+
+                let indkey = schema
+                    .pk_indices
+                    .iter()
+                    .map(|idx| (idx + 1).to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+
+                let pk_cols: Vec<String> = schema
+                    .pk_indices
+                    .iter()
+                    .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
+                    .collect();
+                let indexdef = format!(
+                    "CREATE UNIQUE INDEX {}_pkey ON public.{} USING btree ({})",
+                    table_name,
+                    table_name,
+                    pk_cols.join(", ")
+                );
+
+                rows.push(Row::new(vec![
+                    int_val(pk_oid),
+                    int_val(base_table_oid),
+                    int_val(schema.pk_indices.len() as i64),
+                    text_val("t"),
+                    text_val("t"),
+                    text_val("f"),
+                    text_val("t"),
+                    text_val("f"),
+                    text_val("t"),
+                    text_val(&indkey),
+                    text_val(&indexdef),
+                ]));
+            }
+        }
+    }
+
+    Ok(rows)
+}
+
+async fn get_pg_indexes_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    user_tables: &[String],
+) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+
+    for table_name in user_tables {
+        if let Some(schema) = store.get_schema(txn, table_name).await? {
+            if !schema.pk_indices.is_empty() {
+                let pk_cols: Vec<String> = schema
+                    .pk_indices
+                    .iter()
+                    .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
+                    .collect();
+                let indexdef = format!(
+                    "CREATE UNIQUE INDEX {}_pkey ON public.{} USING btree ({})",
+                    table_name,
+                    table_name,
+                    pk_cols.join(", ")
+                );
+                rows.push(Row::new(vec![
+                    text_val("public"),
+                    text_val(table_name),
+                    text_val(&format!("{}_pkey", table_name)),
+                    null_val(),
+                    text_val(&indexdef),
+                ]));
+            }
+
+            for idx in &schema.indexes {
+                let indexdef = format!(
+                    "CREATE {}INDEX {} ON public.{} USING btree ({})",
+                    if idx.unique { "UNIQUE " } else { "" },
+                    idx.name,
+                    table_name,
+                    idx.columns.join(", ")
+                );
+                rows.push(Row::new(vec![
+                    text_val("public"),
+                    text_val(table_name),
+                    text_val(&idx.name),
+                    null_val(),
+                    text_val(&indexdef),
                 ]));
             }
         }
