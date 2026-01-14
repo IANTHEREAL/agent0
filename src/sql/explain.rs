@@ -36,6 +36,7 @@ pub enum PlanNode {
         child: Box<PlanNode>,
     },
     Limit {
+        #[allow(dead_code)]
         count: usize,
         cost: PlanCost,
         child: Box<PlanNode>,

@@ -13,7 +13,9 @@ pub enum TransactionState {
 pub struct Session {
     store: Arc<TikvStore>,
     state: TransactionState,
+    #[allow(dead_code)]
     current_user: Option<String>,
+    #[allow(dead_code)]
     is_superuser: bool,
 }
 
@@ -36,18 +38,22 @@ impl Session {
         }
     }
 
+    #[allow(dead_code)]
     pub fn store(&self) -> Arc<TikvStore> {
         self.store.clone()
     }
 
+    #[allow(dead_code)]
     pub fn current_user(&self) -> Option<&str> {
         self.current_user.as_deref()
     }
 
+    #[allow(dead_code)]
     pub fn is_superuser(&self) -> bool {
         self.is_superuser
     }
 
+    #[allow(dead_code)]
     pub fn set_user(&mut self, username: String, is_superuser: bool) {
         self.current_user = Some(username);
         self.is_superuser = is_superuser;

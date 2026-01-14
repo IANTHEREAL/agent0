@@ -251,6 +251,7 @@ pub struct TableSchema {
 }
 
 impl TableSchema {
+    #[allow(dead_code)]
     pub fn new(
         name: String,
         table_id: u64,

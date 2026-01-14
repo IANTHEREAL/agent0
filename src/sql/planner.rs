@@ -43,6 +43,7 @@ pub struct PredicateInfo {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum PredicateOp {
     Eq,
     Ne,
@@ -243,6 +244,7 @@ fn estimate_selectivity(index: &IndexDef, matched_cols: usize, full_match: bool)
     base_selectivity.max(0.0001)
 }
 
+#[allow(dead_code)]
 pub fn extract_index_values(
     predicates: &[PredicateInfo],
     index_columns: &[String],
@@ -260,12 +262,14 @@ pub fn extract_index_values(
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct JoinTableInfo {
     pub name: String,
     pub alias: String,
     pub estimated_rows: usize,
 }
 
+#[allow(dead_code)]
 pub fn optimize_join_order(tables: &[JoinTableInfo]) -> Vec<usize> {
     if tables.len() <= 1 {
         return (0..tables.len()).collect();
@@ -276,6 +280,7 @@ pub fn optimize_join_order(tables: &[JoinTableInfo]) -> Vec<usize> {
     indices
 }
 
+#[allow(dead_code)]
 pub fn estimate_join_cost(left_rows: usize, right_rows: usize, selectivity: f64) -> f64 {
     let scan_cost = (left_rows + right_rows) as f64;
     let join_cost = (left_rows * right_rows) as f64 * selectivity;
@@ -283,11 +288,13 @@ pub fn estimate_join_cost(left_rows: usize, right_rows: usize, selectivity: f64)
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct PushdownResult {
     pub table_predicates: HashMap<String, Vec<PredicateInfo>>,
     pub remaining_predicates: Vec<PredicateInfo>,
 }
 
+#[allow(dead_code)]
 pub fn pushdown_predicates(
     predicates: &[PredicateInfo],
     table_columns: &HashMap<String, Vec<String>>,
@@ -318,6 +325,7 @@ pub fn pushdown_predicates(
     }
 }
 
+#[allow(dead_code)]
 pub fn extract_table_predicates(
     predicates: &[PredicateInfo],
     table_alias: &str,

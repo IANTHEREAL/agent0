@@ -65,6 +65,7 @@ impl Executor {
         self.store.clone()
     }
 
+    #[allow(dead_code)]
     pub fn auth_manager(&self) -> &AuthManager {
         &self.auth_manager
     }
@@ -2339,6 +2340,7 @@ impl Executor {
         })
     }
 
+    #[allow(dead_code)]
     async fn execute_join_query(
         &self,
         txn: &mut Transaction,

@@ -303,6 +303,7 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
 }
 
 /// Extract equality conditions from a WHERE clause for index lookup
+#[allow(dead_code)]
 pub fn extract_eq_conditions(expr: &Expr, index_cols: &[String]) -> Option<Vec<Value>> {
     let mut values = vec![None; index_cols.len()];
     extract_conditions_recursive(expr, index_cols, &mut values);
@@ -314,6 +315,7 @@ pub fn extract_eq_conditions(expr: &Expr, index_cols: &[String]) -> Option<Vec<V
     }
 }
 
+#[allow(dead_code)]
 fn extract_conditions_recursive(
     expr: &Expr,
     index_cols: &[String],

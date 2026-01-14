@@ -158,6 +158,7 @@ pub struct DynamicPgHandler {
 }
 
 impl DynamicPgHandler {
+    #[allow(dead_code)]
     pub fn new(pd_endpoints: Vec<String>, default_keyspace: Option<String>) -> Self {
         Self {
             client_pool: None,
@@ -1169,6 +1170,7 @@ fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
     result
 }
 
+#[allow(dead_code)]
 fn infer_result_fields(query: &str) -> Vec<FieldInfo> {
     let query_upper = query.to_uppercase();
     if query_upper.starts_with("SELECT") {
@@ -1189,6 +1191,7 @@ pub struct DynamicHandlerFactory {
 }
 
 impl DynamicHandlerFactory {
+    #[allow(dead_code)]
     pub fn new(pd_endpoints: Vec<String>, default_keyspace: Option<String>) -> Self {
         Self {
             handler: Arc::new(DynamicPgHandler::new(pd_endpoints, default_keyspace)),
@@ -1237,11 +1240,13 @@ impl PgWireServerHandlers for DynamicHandlerFactory {
 }
 
 // Keep the old HandlerFactory for backward compatibility (static executor)
+#[allow(dead_code)]
 pub struct HandlerFactory {
     handler: Arc<PgHandler>,
 }
 
 impl HandlerFactory {
+    #[allow(dead_code)]
     pub fn new(executor: Arc<Executor>) -> Self {
         Self {
             handler: Arc::new(PgHandler::new(executor)),
@@ -1249,6 +1254,7 @@ impl HandlerFactory {
     }
 }
 
+#[allow(dead_code)]
 pub struct PgHandler {
     executor: Arc<Executor>,
     session: Mutex<Session>,
@@ -1257,6 +1263,7 @@ pub struct PgHandler {
 }
 
 impl PgHandler {
+    #[allow(dead_code)]
     pub fn new(executor: Arc<Executor>) -> Self {
         let store = executor.store();
         Self {
@@ -1267,6 +1274,7 @@ impl PgHandler {
         }
     }
 
+    #[allow(dead_code)]
     async fn infer_result_fields_from_query(&self, query: &str) -> Vec<FieldInfo> {
         let query_upper = query.trim().to_uppercase();
 
@@ -1369,6 +1377,7 @@ impl PgHandler {
         }
     }
 
+    #[allow(dead_code)]
     fn parse_copy_command(query: &str) -> Option<(String, Vec<String>)> {
         let query_upper = query.to_uppercase();
         if !query_upper.contains("COPY")
@@ -2031,11 +2040,10 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
         Value::Text(s) => encoder.encode_field(s),
         Value::Bytes(b) => encoder.encode_field(&format!("\\x{}", hex::encode(b))),
         Value::Timestamp(ts) => {
-            use chrono::{DateTime, NaiveDateTime, Utc};
+            use chrono::DateTime;
             let seconds = ts / 1000;
             let nanos = (ts % 1000) * 1_000_000;
-            if let Some(naive) = NaiveDateTime::from_timestamp_opt(seconds, nanos as u32) {
-                let dt = DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc);
+            if let Some(dt) = DateTime::from_timestamp(seconds, nanos as u32) {
                 encoder.encode_field(&dt.to_rfc3339())
             } else {
                 encoder.encode_field(&ts.to_string())

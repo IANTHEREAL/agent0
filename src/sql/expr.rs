@@ -6,9 +6,11 @@ use sqlparser::ast::{BinaryOperator, Expr, JsonOperator, Value as SqlValue};
 use std::collections::HashMap;
 
 pub struct JoinContext<'a> {
+    #[allow(dead_code)]
     pub tables: HashMap<String, (&'a TableSchema, &'a Row)>,
     pub column_offsets: HashMap<String, usize>,
     pub combined_row: &'a Row,
+    #[allow(dead_code)]
     pub combined_schema: &'a TableSchema,
 }
 

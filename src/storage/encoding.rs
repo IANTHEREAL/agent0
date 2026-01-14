@@ -48,6 +48,7 @@ pub fn encode_matview_key(matview_name: &str) -> Vec<u8> {
     key
 }
 
+#[allow(dead_code)]
 pub fn encode_matview_prefix() -> Vec<u8> {
     SYS_MATVIEW_PREFIX.to_vec()
 }
@@ -58,6 +59,7 @@ pub fn encode_procedure_key(proc_name: &str) -> Vec<u8> {
     key
 }
 
+#[allow(dead_code)]
 pub fn encode_procedure_prefix() -> Vec<u8> {
     SYS_PROCEDURE_PREFIX.to_vec()
 }
@@ -99,6 +101,7 @@ pub fn encode_index_key(
 /// This is hard because we don't know length of {values}.
 /// BUT for TPC-C, we only use this for scanning.
 /// If we scan with prefix `i_..._{values}_`, the remaining part IS `{pk}`.
+#[allow(dead_code)]
 pub fn decode_index_pk_from_key(full_key: &[u8], prefix_len: usize) -> Result<Vec<Value>> {
     let pk_bytes = &full_key[prefix_len..];
     bincode::deserialize(pk_bytes).context("Failed to deserialize PK from index key")

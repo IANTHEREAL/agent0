@@ -7,6 +7,7 @@ const USER_KEY_PREFIX: &[u8] = b"_sys_user_";
 const ROLE_KEY_PREFIX: &[u8] = b"_sys_role_";
 const DEFAULT_ADMIN_USER: &str = "admin";
 const DEFAULT_ADMIN_PASSWORD: &str = "admin";
+const SCAN_LIMIT: u32 = i32::MAX as u32;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Privilege {
@@ -30,6 +31,7 @@ pub enum Privilege {
 }
 
 impl Privilege {
+    #[allow(dead_code)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "ALL" | "ALL PRIVILEGES" => Some(Privilege::All),
@@ -52,6 +54,7 @@ impl Privilege {
         }
     }
 
+    #[allow(dead_code)]
     pub fn expand_all() -> HashSet<Privilege> {
         let mut set = HashSet::new();
         set.insert(Privilege::Select);
@@ -84,10 +87,12 @@ impl PrivilegeObject {
         }
     }
 
+    #[allow(dead_code)]
     pub fn all_tables() -> Self {
         PrivilegeObject::AllTablesInSchema("public".to_string())
     }
 
+    #[allow(dead_code)]
     pub fn database(name: &str) -> Self {
         PrivilegeObject::Database(name.to_string())
     }
@@ -171,6 +176,7 @@ impl User {
             .retain(|p| !(&p.privilege == privilege && &p.object == object));
     }
 
+    #[allow(dead_code)]
     pub fn has_privilege(&self, privilege: &Privilege, object: &PrivilegeObject) -> bool {
         if self.is_superuser {
             return true;
@@ -186,6 +192,7 @@ impl User {
         false
     }
 
+    #[allow(dead_code)]
     fn privilege_matches(granted: &Privilege, required: &Privilege) -> bool {
         if granted == &Privilege::All {
             return true;
@@ -193,6 +200,7 @@ impl User {
         granted == required
     }
 
+    #[allow(dead_code)]
     fn object_matches(granted: &PrivilegeObject, required: &PrivilegeObject) -> bool {
         if granted == &PrivilegeObject::Global {
             return true;
@@ -221,6 +229,7 @@ pub struct Role {
 }
 
 impl Role {
+    #[allow(dead_code)]
     pub fn new(name: &str) -> Self {
         Self {
             name: name.to_string(),
@@ -318,6 +327,7 @@ impl AuthManager {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn create_role(&self, txn: &mut Transaction, role: Role) -> Result<()> {
         let key = self.role_key(&role.name);
         if txn.get(key.clone()).await?.is_some() {
@@ -386,6 +396,7 @@ impl AuthManager {
         self.update_user(txn, user).await
     }
 
+    #[allow(dead_code)]
     pub async fn check_privilege(
         &self,
         txn: &mut Transaction,
@@ -424,13 +435,14 @@ impl AuthManager {
         Ok(false)
     }
 
+    #[allow(dead_code)]
     pub async fn list_users(&self, txn: &mut Transaction) -> Result<Vec<User>> {
         let prefix = USER_KEY_PREFIX.to_vec();
         let mut end = prefix.clone();
         end.push(0xFF);
 
         let range: tikv_client::BoundRange = (prefix..end).into();
-        let pairs = txn.scan(range, u32::MAX).await?;
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
 
         let mut users = Vec::new();
         for pair in pairs {
@@ -440,13 +452,14 @@ impl AuthManager {
         Ok(users)
     }
 
+    #[allow(dead_code)]
     pub async fn list_roles(&self, txn: &mut Transaction) -> Result<Vec<Role>> {
         let prefix = ROLE_KEY_PREFIX.to_vec();
         let mut end = prefix.clone();
         end.push(0xFF);
 
         let range: tikv_client::BoundRange = (prefix..end).into();
-        let pairs = txn.scan(range, u32::MAX).await?;
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
 
         let mut roles = Vec::new();
         for pair in pairs {

@@ -4,6 +4,7 @@ use crate::types::{DataType, Row, TableSchema};
 
 /// Result of executing a SQL statement
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum ExecuteResult {
     /// SELECT result with rows
     Select {
@@ -91,6 +92,7 @@ pub enum ExecuteResult {
 }
 
 impl ExecuteResult {
+    #[allow(dead_code)]
     pub fn affected_rows(&self) -> u64 {
         match self {
             ExecuteResult::Insert { affected_rows } => *affected_rows,
@@ -100,6 +102,7 @@ impl ExecuteResult {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_query(&self) -> bool {
         matches!(
             self,

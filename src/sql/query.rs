@@ -83,6 +83,7 @@ use sqlparser::ast::{Expr, OrderByExpr};
 use super::expr::compare_values;
 use crate::types::Value;
 
+#[allow(dead_code)]
 pub fn sort_rows_by_order<F>(rows: Vec<Row>, order_by: &[OrderByExpr], eval_fn: F) -> Vec<Row>
 where
     F: Fn(&Expr, &Row) -> Value,
@@ -115,6 +116,7 @@ where
     indexed.into_iter().map(|(_, r)| r).collect()
 }
 
+#[allow(dead_code)]
 pub fn sort_rows_with_index<F>(
     rows: Vec<Row>,
     order_by: &[OrderByExpr],
@@ -153,14 +155,17 @@ where
     (rows, indices)
 }
 
+#[allow(dead_code)]
 pub fn apply_offset(rows: Vec<Row>, offset: usize) -> Vec<Row> {
     rows.into_iter().skip(offset).collect()
 }
 
+#[allow(dead_code)]
 pub fn apply_limit(rows: Vec<Row>, limit: usize) -> Vec<Row> {
     rows.into_iter().take(limit).collect()
 }
 
+#[allow(dead_code)]
 pub fn reorder_by_indices<T: Clone>(data: &[T], indices: &[usize]) -> Vec<T> {
     indices.iter().map(|&idx| data[idx].clone()).collect()
 }

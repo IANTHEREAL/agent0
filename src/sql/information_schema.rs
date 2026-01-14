@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tikv_client::Transaction;
 
+#[allow(dead_code)]
 pub fn is_information_schema_table(table_name: &str) -> bool {
     let lower = table_name.to_lowercase();
     lower.starts_with("information_schema.")
@@ -30,6 +31,7 @@ pub fn is_information_schema_table(table_name: &str) -> bool {
         )
 }
 
+#[allow(dead_code)]
 pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
     let lower = table_name.to_lowercase();
     if let Some(name) = lower.strip_prefix("information_schema.") {

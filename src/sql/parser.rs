@@ -77,7 +77,6 @@ mod tests {
 #[cfg(test)]
 mod parser_tests {
     use super::*;
-    use sqlparser::ast::{Expr, SetExpr, Statement};
 
     #[test]
     fn test_default_in_on_conflict() {

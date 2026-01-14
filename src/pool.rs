@@ -60,6 +60,7 @@ impl TikvClientPool {
         Ok(store)
     }
 
+    #[allow(dead_code)]
     pub async fn client_count(&self) -> usize {
         self.clients.read().await.len()
     }

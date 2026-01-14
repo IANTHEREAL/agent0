@@ -7,11 +7,17 @@ use tikv_client::{
 };
 use tracing::{debug, info};
 
+/// Maximum scan limit - use a large but safe value to avoid overflow in TiKV client buffer
+/// when it adds headroom for deleted entries. u32::MAX causes overflow when combined with
+/// the count of deleted entries in the transaction buffer.
+const SCAN_LIMIT: u32 = i32::MAX as u32;
+
 pub struct TikvStore {
     client: Arc<TransactionClient>,
 }
 
 impl TikvStore {
+    #[allow(dead_code)]
     pub async fn new(pd_endpoints: Vec<String>) -> Result<Self> {
         Self::new_with_keyspace(pd_endpoints, None).await
     }
@@ -49,6 +55,7 @@ impl TikvStore {
             .map_err(|e| anyhow!(e))
     }
 
+    #[allow(dead_code)]
     pub async fn begin_optimistic(&self) -> Result<Transaction> {
         let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
         self.client
@@ -165,7 +172,7 @@ impl TikvStore {
             let start = self.key(&raw_start);
             let end = self.key(&raw_end);
             let range: BoundRange = (start..end).into();
-            let pairs = txn.scan(range, u32::MAX).await?;
+            let pairs = txn.scan(range, SCAN_LIMIT).await?;
             for pair in pairs {
                 txn.delete(pair.key().clone()).await?;
             }
@@ -223,7 +230,7 @@ impl TikvStore {
         let start = self.key(&raw_start);
         let end = self.key(&raw_end);
         let range: BoundRange = (start..end).into();
-        let pairs: Vec<_> = txn.scan(range, u32::MAX).await?.collect();
+        let pairs: Vec<_> = txn.scan(range, SCAN_LIMIT).await?.collect();
         let mut rows = Vec::new();
         for pair in pairs {
             let row = deserialize_row(&pair.value())?;
@@ -255,6 +262,7 @@ impl TikvStore {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn get_by_pk(
         &self,
         txn: &mut Transaction,
@@ -298,7 +306,7 @@ impl TikvStore {
             let start = self.key(&raw_start);
             let end = self.key(&raw_end);
             let range: BoundRange = (start..end).into();
-            let pairs = txn.scan(range, u32::MAX).await?;
+            let pairs = txn.scan(range, SCAN_LIMIT).await?;
             for pair in pairs {
                 txn.delete(pair.key().clone()).await?;
             }
@@ -396,7 +404,7 @@ impl TikvStore {
             end_key.push(0xFF);
 
             let range: BoundRange = (prefix_key.clone()..end_key).into();
-            let pairs = txn.scan(range, u32::MAX).await?;
+            let pairs = txn.scan(range, SCAN_LIMIT).await?;
 
             let mut pks = Vec::new();
             for pair in pairs {
@@ -513,6 +521,7 @@ impl TikvStore {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn list_materialized_views(&self, txn: &mut Transaction) -> Result<Vec<String>> {
         let prefix = encode_matview_prefix();
         let mut end = prefix.clone();
@@ -564,6 +573,7 @@ impl TikvStore {
         }
     }
 
+    #[allow(dead_code)]
     pub async fn replace_procedure(
         &self,
         txn: &mut Transaction,
