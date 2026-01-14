@@ -8,6 +8,7 @@ mod executor_ddl_ops;
 mod executor_dml_ops;
 mod executor_join;
 mod executor_procedure;
+mod executor_select;
 mod executor_subquery;
 mod explain;
 mod expr;
