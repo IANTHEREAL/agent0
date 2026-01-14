@@ -3,8 +3,10 @@
 mod ddl;
 mod dml;
 mod executor;
+mod executor_cte;
 mod executor_join;
 mod executor_procedure;
+mod executor_subquery;
 mod explain;
 mod expr;
 mod helpers;
