@@ -31,13 +31,13 @@ i_{table_id}_{idx_id}_{vals}    → pk (unique) or empty (non-unique)
 | Add TiKV operation | `tikv_store.rs` |
 | Fix scan issues | `tikv_store.rs` - check SCAN_LIMIT |
 
-## Critical: SCAN_LIMIT
+## SCAN_LIMIT
 
 ```rust
-const SCAN_LIMIT: u32 = i32::MAX as u32;  // NOT u32::MAX!
+const SCAN_LIMIT: u32 = u32::MAX;
 ```
 
-**Why**: TiKV client adds deleted entry count to limit. `u32::MAX + N` overflows.
+Uses `u32::MAX` for unbounded scans. Fixed in tikv/client-rust#515 (saturating_add).
 
 ## Key Functions
 

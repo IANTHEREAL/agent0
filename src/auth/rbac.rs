@@ -7,7 +7,7 @@ const USER_KEY_PREFIX: &[u8] = b"_sys_user_";
 const ROLE_KEY_PREFIX: &[u8] = b"_sys_role_";
 const DEFAULT_ADMIN_USER: &str = "admin";
 const DEFAULT_ADMIN_PASSWORD: &str = "admin";
-const SCAN_LIMIT: u32 = i32::MAX as u32;
+const SCAN_LIMIT: u32 = u32::MAX;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub enum Privilege {

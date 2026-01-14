@@ -7,10 +7,8 @@ use tikv_client::{
 };
 use tracing::{debug, info};
 
-/// Maximum scan limit - use a large but safe value to avoid overflow in TiKV client buffer
-/// when it adds headroom for deleted entries. u32::MAX causes overflow when combined with
-/// the count of deleted entries in the transaction buffer.
-const SCAN_LIMIT: u32 = i32::MAX as u32;
+/// Maximum scan limit for TiKV operations.
+const SCAN_LIMIT: u32 = u32::MAX;
 
 pub struct TikvStore {
     client: Arc<TransactionClient>,

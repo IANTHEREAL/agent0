@@ -56,13 +56,11 @@ cd orm-tests && npm test                  # ORM compatibility
 
 ## Anti-Patterns
 
-- **NEVER** use `u32::MAX` for TiKV scan limit → causes overflow (use `SCAN_LIMIT` constant)
 - **NEVER** suppress type errors with `as any`, `@ts-ignore`
 - **AVOID** `eval_expr` vs `eval_expr_join` confusion (single table vs JOIN context)
 
 ## Known Issues
 
-- tikv/client-rust#514: scan overflow when buffer has deletes (workaround in place)
 - executor.rs and expr.rs are large (~3500 lines each)
 - Window functions sort entire result set (not streaming)
 
