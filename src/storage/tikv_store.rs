@@ -1,5 +1,5 @@
 use super::encoding::*;
-use crate::types::{Row, TableSchema, Value};
+use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
 use tikv_client::{
@@ -387,30 +387,42 @@ impl TikvStore {
         index_id: u64,
         values: &[Value],
         unique: bool,
+        pk_types: &[DataType],
     ) -> Result<Vec<Vec<Value>>> {
+        if pk_types.is_empty() {
+            return Err(anyhow!("PK types required for index scan"));
+        }
+
         if unique {
             let idx_key = self.key(&encode_index_key(table_id, index_id, values, None));
             if let Some(val) = txn.get(idx_key).await? {
-                let pk: Vec<Value> = bincode::deserialize(&val)?;
+                let pk = decode_pk_from_index_suffix(&val, pk_types)?;
                 Ok(vec![pk])
             } else {
                 Ok(vec![])
             }
         } else {
-            let mut prefix = encode_index_key(table_id, index_id, values, None);
-            prefix.push(b'_');
-            let prefix_key = self.key(&prefix);
-            let mut end_key = prefix_key.clone();
-            end_key.push(0xFF);
+            let prefix = encode_index_key(table_id, index_id, values, None);
 
-            let range: BoundRange = (prefix_key.clone()..end_key).into();
+            let mut start_raw = prefix.clone();
+            start_raw.push(0x01);
+            let start_key = self.key(&start_raw);
+
+            let mut end_raw = prefix;
+            end_raw.push(0x02);
+            let end_key = self.key(&end_raw);
+
+            let range: BoundRange = (start_key.clone()..end_key).into();
             let pairs = txn.scan(range, SCAN_LIMIT).await?;
 
             let mut pks = Vec::new();
             for pair in pairs {
                 let full_key: &[u8] = pair.key().as_ref().into();
-                let pk_bytes = &full_key[prefix_key.len()..];
-                let pk: Vec<Value> = bincode::deserialize(pk_bytes)?;
+                if full_key.len() <= start_key.len() {
+                    continue;
+                }
+                let pk_bytes = &full_key[start_key.len()..];
+                let pk = decode_pk_from_index_suffix(pk_bytes, pk_types)?;
                 pks.push(pk);
             }
             Ok(pks)

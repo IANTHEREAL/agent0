@@ -1,14 +1,15 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from 'vitest';
 import pg from 'pg';
 const { Pool } = pg;
-import { createPool, uniqueTableName, dropTableIfExists } from '../src/utils.js';
+import { createPgPool, dropTableIfExists } from './client.js';
+import { generateTableName } from '../shared/test-utils.js';
 
 describe('pg client - Basic Operations', () => {
   let pool: pg.Pool;
   let tableName: string;
 
   beforeAll(async () => {
-    pool = createPool();
+    pool = createPgPool();
   });
 
   afterAll(async () => {
@@ -16,7 +17,7 @@ describe('pg client - Basic Operations', () => {
   });
 
   beforeEach(async () => {
-    tableName = uniqueTableName('pg_basic');
+    tableName = generateTableName('pg_basic');
   });
 
   afterEach(async () => {
@@ -267,7 +268,7 @@ describe('pg client - Transactions', () => {
   let tableName: string;
 
   beforeAll(async () => {
-    pool = createPool();
+    pool = createPgPool();
   });
 
   afterAll(async () => {
@@ -275,7 +276,7 @@ describe('pg client - Transactions', () => {
   });
 
   beforeEach(async () => {
-    tableName = uniqueTableName('pg_txn');
+    tableName = generateTableName('pg_txn');
     await pool.query(`
       CREATE TABLE ${tableName} (
         id SERIAL PRIMARY KEY,
@@ -369,7 +370,7 @@ describe('pg client - Joins', () => {
   let ordersTable: string;
 
   beforeAll(async () => {
-    pool = createPool();
+    pool = createPgPool();
   });
 
   afterAll(async () => {
@@ -377,8 +378,8 @@ describe('pg client - Joins', () => {
   });
 
   beforeEach(async () => {
-    usersTable = uniqueTableName('users');
-    ordersTable = uniqueTableName('orders');
+    usersTable = generateTableName('users');
+    ordersTable = generateTableName('orders');
 
     await pool.query(`
       CREATE TABLE ${usersTable} (
@@ -460,7 +461,7 @@ describe('pg client - Subqueries', () => {
   let tableName: string;
 
   beforeAll(async () => {
-    pool = createPool();
+    pool = createPgPool();
   });
 
   afterAll(async () => {
@@ -468,7 +469,7 @@ describe('pg client - Subqueries', () => {
   });
 
   beforeEach(async () => {
-    tableName = uniqueTableName('employees');
+    tableName = generateTableName('employees');
     await pool.query(`
       CREATE TABLE ${tableName} (
         id SERIAL PRIMARY KEY,
@@ -516,7 +517,7 @@ describe('pg client - Subqueries', () => {
   });
 
   it('should support EXISTS subquery', async () => {
-    const highEarners = uniqueTableName('high_earners');
+    const highEarners = generateTableName('high_earners');
     await pool.query(`CREATE TABLE ${highEarners} (employee_id INTEGER)`);
     await pool.query(`INSERT INTO ${highEarners} (employee_id) VALUES (1)`);
 
@@ -550,7 +551,7 @@ describe('pg client - Window Functions', () => {
   let tableName: string;
 
   beforeAll(async () => {
-    pool = createPool();
+    pool = createPgPool();
   });
 
   afterAll(async () => {
@@ -558,7 +559,7 @@ describe('pg client - Window Functions', () => {
   });
 
   beforeEach(async () => {
-    tableName = uniqueTableName('sales');
+    tableName = generateTableName('sales');
     await pool.query(`
       CREATE TABLE ${tableName} (
         id SERIAL PRIMARY KEY,
@@ -635,7 +636,7 @@ describe('pg client - CTEs', () => {
   let tableName: string;
 
   beforeAll(async () => {
-    pool = createPool();
+    pool = createPgPool();
   });
 
   afterAll(async () => {
@@ -643,7 +644,7 @@ describe('pg client - CTEs', () => {
   });
 
   beforeEach(async () => {
-    tableName = uniqueTableName('employees');
+    tableName = generateTableName('employees');
     await pool.query(`
       CREATE TABLE ${tableName} (
         id SERIAL PRIMARY KEY,
@@ -721,7 +722,7 @@ describe('pg client - Data Types', () => {
   let tableName: string;
 
   beforeAll(async () => {
-    pool = createPool();
+    pool = createPgPool();
   });
 
   afterAll(async () => {
@@ -729,7 +730,7 @@ describe('pg client - Data Types', () => {
   });
 
   beforeEach(async () => {
-    tableName = uniqueTableName('types_test');
+    tableName = generateTableName('types_test');
   });
 
   afterEach(async () => {
@@ -860,7 +861,7 @@ describe('pg client - Constraints', () => {
   let tableName: string;
 
   beforeAll(async () => {
-    pool = createPool();
+    pool = createPgPool();
   });
 
   afterAll(async () => {
@@ -868,7 +869,7 @@ describe('pg client - Constraints', () => {
   });
 
   beforeEach(async () => {
-    tableName = uniqueTableName('constraints_test');
+    tableName = generateTableName('constraints_test');
   });
 
   afterEach(async () => {
@@ -939,7 +940,7 @@ describe('pg client - Prepared Statements', () => {
   let tableName: string;
 
   beforeAll(async () => {
-    pool = createPool();
+    pool = createPgPool();
   });
 
   afterAll(async () => {
@@ -947,7 +948,7 @@ describe('pg client - Prepared Statements', () => {
   });
 
   beforeEach(async () => {
-    tableName = uniqueTableName('prepared_test');
+    tableName = generateTableName('prepared_test');
     await pool.query(`
       CREATE TABLE ${tableName} (
         id SERIAL PRIMARY KEY,

@@ -42,37 +42,59 @@ pub fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
     result
 }
 
+#[allow(dead_code)]
 pub fn distinct_on_rows(
     rows: Vec<Row>,
     on_exprs: &[Expr],
     row_context: Option<&TableSchema>,
 ) -> Vec<Row> {
+    distinct_on_rows_with_indices(rows, on_exprs, row_context).0
+}
+
+pub fn distinct_on_rows_with_indices(
+    rows: Vec<Row>,
+    on_exprs: &[Expr],
+    row_context: Option<&TableSchema>,
+) -> (Vec<Row>, Vec<usize>) {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut result = Vec::new();
+    let mut indices = Vec::new();
 
-    for row in rows {
+    for (idx, row) in rows.into_iter().enumerate() {
         let key_values: Vec<Value> = on_exprs
             .iter()
             .filter_map(|expr| eval_expr(expr, Some(&row), row_context).ok())
             .collect();
         let key = bincode::serialize(&key_values).unwrap_or_default();
         if seen.insert(key) {
+            indices.push(idx);
             result.push(row);
         }
     }
-    result
+    (result, indices)
 }
 
+#[allow(dead_code)]
 pub fn distinct_on_rows_join(
     rows: Vec<Row>,
     on_exprs: &[Expr],
     column_offsets: &std::collections::HashMap<String, usize>,
     combined_schema: &TableSchema,
 ) -> Vec<Row> {
+    distinct_on_rows_join_with_indices(rows, on_exprs, column_offsets, combined_schema).0
+}
+
+pub fn distinct_on_rows_join_with_indices(
+    rows: Vec<Row>,
+    on_exprs: &[Expr],
+    column_offsets: &std::collections::HashMap<String, usize>,
+    combined_schema: &TableSchema,
+) -> (Vec<Row>, Vec<usize>) {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut result = Vec::new();
+    let mut indices = Vec::new();
 
-    for row in rows {
+    for (idx, row) in rows.into_iter().enumerate() {
         let ctx = JoinContext {
             tables: std::collections::HashMap::new(),
             column_offsets: column_offsets.clone(),
@@ -85,16 +107,94 @@ pub fn distinct_on_rows_join(
             .collect();
         let key = bincode::serialize(&key_values).unwrap_or_default();
         if seen.insert(key) {
+            indices.push(idx);
             result.push(row);
         }
     }
-    result
+    (result, indices)
+}
+
+pub fn apply_offset_limit_fetch(mut rows: Vec<Row>, query: &Query) -> Vec<Row> {
+    if let Some(offset) = &query.offset {
+        if let Ok(v) = eval_expr(&offset.value, None, None) {
+            let n = match v {
+                Value::Int64(n) => n as usize,
+                Value::Int32(n) => n as usize,
+                _ => 0,
+            };
+            rows = rows.into_iter().skip(n).collect();
+        }
+    }
+    if let Some(limit) = &query.limit {
+        if let Ok(v) = eval_expr(limit, None, None) {
+            let n = match v {
+                Value::Int64(n) => n as usize,
+                Value::Int32(n) => n as usize,
+                _ => usize::MAX,
+            };
+            rows = rows.into_iter().take(n).collect();
+        }
+    }
+
+    if let Some(fetch) = &query.fetch {
+        if let Some(quantity) = &fetch.quantity {
+            if let Ok(v) = eval_expr(quantity, None, None) {
+                let n = match v {
+                    Value::Int64(n) => n as usize,
+                    Value::Int32(n) => n as usize,
+                    _ => 1,
+                };
+                rows = rows.into_iter().take(n).collect();
+            }
+        } else {
+            rows = rows.into_iter().take(1).collect();
+        }
+    }
+    rows
 }
 
 /// Coerce a value to match the expected column type
 pub fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Value> {
     match (&val, &col.data_type) {
         (Value::Null, _) => Ok(Value::Null),
+        (Value::Text(s), DataType::Int32) => s
+            .trim()
+            .parse::<i32>()
+            .map(Value::Int32)
+            .map_err(|_| anyhow!("invalid input syntax for type integer: \"{}\"", s)),
+        (Value::Int64(n), DataType::Int32) => i32::try_from(*n)
+            .map(Value::Int32)
+            .map_err(|_| anyhow!("integer out of range: {}", n)),
+        (Value::Float64(f), DataType::Int32) => {
+            if f.fract() != 0.0 {
+                return Err(anyhow!("invalid input syntax for type integer: \"{}\"", f));
+            }
+            let n = *f as i64;
+            i32::try_from(n)
+                .map(Value::Int32)
+                .map_err(|_| anyhow!("integer out of range: {}", n))
+        }
+        (Value::Text(s), DataType::Int64) => s
+            .trim()
+            .parse::<i64>()
+            .map(Value::Int64)
+            .map_err(|_| anyhow!("invalid input syntax for type bigint: \"{}\"", s)),
+        (Value::Int32(n), DataType::Int64) => Ok(Value::Int64(*n as i64)),
+        (Value::Text(s), DataType::Float64) => s
+            .trim()
+            .parse::<f64>()
+            .map(Value::Float64)
+            .map_err(|_| anyhow!("invalid input syntax for type double precision: \"{}\"", s)),
+        (Value::Int32(n), DataType::Float64) => Ok(Value::Float64(*n as f64)),
+        (Value::Int64(n), DataType::Float64) => Ok(Value::Float64(*n as f64)),
+        (Value::Text(s), DataType::Boolean) => match s.trim().to_lowercase().as_str() {
+            "true" | "t" | "yes" | "y" | "1" => Ok(Value::Boolean(true)),
+            "false" | "f" | "no" | "n" | "0" => Ok(Value::Boolean(false)),
+            _ => Err(anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
+        },
+        (Value::Text(s), DataType::Uuid) => uuid::Uuid::parse_str(s.trim())
+            .map(|u| Value::Uuid(*u.as_bytes()))
+            .map_err(|_| anyhow!("invalid input syntax for type uuid: \"{}\"", s)),
         (Value::Text(s), DataType::Json) => {
             serde_json::from_str::<serde_json::Value>(s)
                 .map_err(|e| anyhow!("invalid input syntax for type json: {}", e))?;
@@ -389,6 +489,15 @@ pub fn collect_having_agg_funcs(
                                 .count());
                     agg_funcs.push((new_idx, AggExpr::Function(f.clone())));
                 }
+            } else {
+                for arg in f.args.iter() {
+                    if let sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(arg_expr),
+                    ) = arg
+                    {
+                        collect_having_agg_funcs(arg_expr, agg_funcs, extra_start);
+                    }
+                }
             }
         }
         Expr::ArrayAgg(arr) => {
@@ -469,7 +578,37 @@ pub fn eval_having_expr(
                 }
                 Ok(temp_agg.result())
             } else {
-                eval_expr(expr, Some(row), Some(schema))
+                let args: Vec<Value> = f
+                    .args
+                    .iter()
+                    .filter_map(|arg| {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                            eval_having_expr(e, row, schema, agg_funcs, aggs).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                match func_name.as_str() {
+                    "COALESCE" => {
+                        for val in args {
+                            if !matches!(val, Value::Null) {
+                                return Ok(val);
+                            }
+                        }
+                        Ok(Value::Null)
+                    }
+                    "NULLIF" => {
+                        if args.len() >= 2
+                            && super::expr::compare_values(&args[0], &args[1]).unwrap_or(1) == 0
+                        {
+                            Ok(Value::Null)
+                        } else {
+                            Ok(args.into_iter().next().unwrap_or(Value::Null))
+                        }
+                    }
+                    _ => eval_expr(expr, Some(row), Some(schema)),
+                }
             }
         }
         Expr::ArrayAgg(arr) => {
@@ -543,7 +682,37 @@ pub fn eval_having_expr_join(
                 }
                 Ok(temp_agg.result())
             } else {
-                eval_expr_join(expr, ctx)
+                let args: Vec<Value> = f
+                    .args
+                    .iter()
+                    .filter_map(|arg| {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                            eval_having_expr_join(e, ctx, agg_funcs, aggs).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                match func_name.as_str() {
+                    "COALESCE" => {
+                        for val in args {
+                            if !matches!(val, Value::Null) {
+                                return Ok(val);
+                            }
+                        }
+                        Ok(Value::Null)
+                    }
+                    "NULLIF" => {
+                        if args.len() >= 2
+                            && super::expr::compare_values(&args[0], &args[1]).unwrap_or(1) == 0
+                        {
+                            Ok(Value::Null)
+                        } else {
+                            Ok(args.into_iter().next().unwrap_or(Value::Null))
+                        }
+                    }
+                    _ => eval_expr_join(expr, ctx),
+                }
             }
         }
         Expr::ArrayAgg(arr) => {
@@ -803,6 +972,7 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                     }
                 }
                 "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" => DataType::Int64,
+                "VECTOR_DIMS" => DataType::Int32,
                 "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
                     if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
                         f.args.first()
@@ -924,6 +1094,7 @@ mod tests {
     use super::*;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
+    use std::collections::HashMap;
 
     #[test]
     fn test_version_function_name() {
@@ -1008,6 +1179,103 @@ mod tests {
         assert!(get_unsupported_reason("CREATE TRIGGER foo").is_some());
         assert!(get_unsupported_reason("CREATE DOMAIN foo").is_some());
         assert!(get_unsupported_reason("SELECT * FROM foo").is_none());
+    }
+
+    #[test]
+    fn test_distinct_on_rows_with_indices() {
+        let schema = TableSchema::new(
+            "t".to_string(),
+            1,
+            vec![
+                ColumnDef {
+                    name: "a".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "b".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            vec![],
+        );
+        let rows = vec![
+            Row::new(vec![Value::Int32(1), Value::Text("x".to_string())]),
+            Row::new(vec![Value::Int32(1), Value::Text("y".to_string())]),
+            Row::new(vec![Value::Int32(2), Value::Text("z".to_string())]),
+        ];
+
+        let on_exprs = vec![sqlparser::ast::Expr::Identifier(
+            sqlparser::ast::Ident::new("a"),
+        )];
+        let (result, indices) = distinct_on_rows_with_indices(rows, &on_exprs, Some(&schema));
+        assert_eq!(indices, vec![0, 2]);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].values[1], Value::Text("x".to_string()));
+        assert_eq!(result[1].values[1], Value::Text("z".to_string()));
+    }
+
+    #[test]
+    fn test_distinct_on_rows_join_with_indices() {
+        let schema = TableSchema::new(
+            "t".to_string(),
+            1,
+            vec![ColumnDef {
+                name: "a".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            vec![],
+        );
+        let mut offsets = HashMap::new();
+        offsets.insert("a".to_string(), 0);
+
+        let rows = vec![
+            Row::new(vec![Value::Int32(1)]),
+            Row::new(vec![Value::Int32(1)]),
+            Row::new(vec![Value::Int32(2)]),
+        ];
+        let on_exprs = vec![sqlparser::ast::Expr::Identifier(
+            sqlparser::ast::Ident::new("a"),
+        )];
+        let (result, indices) =
+            distinct_on_rows_join_with_indices(rows, &on_exprs, &offsets, &schema);
+        assert_eq!(indices, vec![0, 2]);
+        assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_apply_offset_limit_fetch() {
+        let dialect = PostgreSqlDialect {};
+        let sql = "SELECT 1 LIMIT 2 OFFSET 1";
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+        let query = match &statements[0] {
+            sqlparser::ast::Statement::Query(q) => q.as_ref(),
+            _ => panic!("expected query"),
+        };
+
+        let rows = vec![
+            Row::new(vec![Value::Int32(10)]),
+            Row::new(vec![Value::Int32(11)]),
+            Row::new(vec![Value::Int32(12)]),
+        ];
+        let result = apply_offset_limit_fetch(rows, query);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].values[0], Value::Int32(11));
+        assert_eq!(result[1].values[0], Value::Int32(12));
     }
 }
 

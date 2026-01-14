@@ -122,6 +122,15 @@ pub async fn execute_insert_row(
     on_conflict: &Option<OnInsert>,
 ) -> Result<Option<Row>> {
     let pk_values = schema.get_pk_values(&row);
+    let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
+        vec![DataType::Uuid]
+    } else {
+        schema
+            .pk_indices
+            .iter()
+            .map(|&idx| schema.columns[idx].data_type.clone())
+            .collect()
+    };
 
     if !schema.foreign_keys.is_empty() {
         validate_foreign_keys(store, txn, schema, &row).await?;
@@ -148,7 +157,14 @@ pub async fn execute_insert_row(
                         match on_conflict {
                             Some(OnInsert::OnConflict(oc)) => {
                                 let pks = store
-                                    .scan_index(txn, schema.table_id, index.id, &idx_values, true)
+                                    .scan_index(
+                                        txn,
+                                        schema.table_id,
+                                        index.id,
+                                        &idx_values,
+                                        true,
+                                        &pk_types,
+                                    )
                                     .await?;
                                 if pks.is_empty() {
                                     return Err(anyhow!(
@@ -217,7 +233,14 @@ pub async fn execute_insert_row(
                             }
                             Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
                                 let pks = store
-                                    .scan_index(txn, schema.table_id, index.id, &idx_values, true)
+                                    .scan_index(
+                                        txn,
+                                        schema.table_id,
+                                        index.id,
+                                        &idx_values,
+                                        true,
+                                        &pk_types,
+                                    )
                                     .await?;
                                 if pks.is_empty() {
                                     return Err(anyhow!(

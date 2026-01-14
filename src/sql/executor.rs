@@ -3,7 +3,7 @@
 use super::ddl;
 use super::explain;
 use super::helpers::{
-    eval_default_expr, fill_row_defaults, get_skip_reason, get_unsupported_reason,
+    eval_default_expr, fill_row_defaults, get_expr_name, get_skip_reason, get_unsupported_reason,
     parse_value_for_copy,
 };
 use super::query;
@@ -379,7 +379,7 @@ impl Executor {
         for item in &resolved_projection {
             match item {
                 SelectItem::UnnamedExpr(expr) => {
-                    cols.push("?column?".to_string());
+                    cols.push(get_expr_name(expr));
                     values.push(eval_expr(expr, None, None)?);
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {

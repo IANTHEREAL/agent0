@@ -39,6 +39,28 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
                         return Ok(ctx.combined_row.values[offset].clone());
                     }
                 }
+                // For Sequelize-style aliases with '->' (e.g., "tags->sequelize_post_tags"),
+                // try to find a column that ends with ".table_alias.col_name"
+                if table_alias.contains("->") {
+                    let suffix = format!(".{}.{}", table_alias, col_name);
+                    let suffix_lower = suffix.to_lowercase();
+                    for (k, &offset) in &ctx.column_offsets {
+                        if k.to_lowercase().ends_with(&suffix_lower) {
+                            return Ok(ctx.combined_row.values[offset].clone());
+                        }
+                    }
+                    // Also try matching just "table_alias.col_name" at the end
+                    let direct_suffix = format!("{}.{}", table_alias, col_name);
+                    let direct_suffix_lower = direct_suffix.to_lowercase();
+                    for (k, &offset) in &ctx.column_offsets {
+                        if k.to_lowercase() == direct_suffix_lower
+                            || k.to_lowercase()
+                                .ends_with(&format!(".{}", direct_suffix_lower))
+                        {
+                            return Ok(ctx.combined_row.values[offset].clone());
+                        }
+                    }
+                }
                 Err(anyhow!("Column '{}.{}' not found", table_alias, col_name))
             } else {
                 Err(anyhow!("Unsupported compound identifier"))
@@ -575,6 +597,51 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
         | "JSONB_PRETTY"
         | "TO_JSON"
         | "TO_JSONB" => eval_function(func, None, None),
+        "COL_DESCRIPTION" => Ok(Value::Null),
+        "FORMAT_TYPE" => {
+            let mut iter = args.into_iter();
+            let oid = match iter.next().unwrap_or(Value::Null) {
+                Value::Int32(n) => n as i64,
+                Value::Int64(n) => n,
+                Value::Text(s) => s.trim().parse::<i64>().unwrap_or(0),
+                Value::Null => return Ok(Value::Null),
+                _ => 0,
+            };
+            let type_name = match oid {
+                16 => "bool",
+                20 => "int8",
+                23 => "int4",
+                701 => "float8",
+                25 => "text",
+                17 => "bytea",
+                1114 => "timestamp",
+                1184 => "timestamptz",
+                2950 => "uuid",
+                114 => "json",
+                3802 => "jsonb",
+                16385 => "vector",
+                _ => "text",
+            };
+            Ok(Value::Text(type_name.to_string()))
+        }
+        "PG_GET_CONSTRAINTDEF" => {
+            for (col_key, &offset) in &ctx.column_offsets {
+                if col_key.ends_with(".constraintdef") || col_key == "constraintdef" {
+                    if let Some(val) = ctx.combined_row.values.get(offset) {
+                        if !matches!(val, Value::Null) {
+                            return Ok(val.clone());
+                        }
+                    }
+                }
+            }
+            Ok(Value::Text(String::new()))
+        }
+        "PG_GET_EXPR" => Ok(Value::Null),
+        "UNNEST" => match args.into_iter().next() {
+            Some(Value::Array(arr)) => Ok(arr.into_iter().next().unwrap_or(Value::Null)),
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(v) => Ok(v),
+        },
         "PG_GET_INDEXDEF" => {
             for (col_key, &offset) in &ctx.column_offsets {
                 if col_key.ends_with(".indexdef") || col_key == "indexdef" {
@@ -1573,8 +1640,41 @@ fn eval_function(
         "HAS_SCHEMA_PRIVILEGE" | "HAS_TABLE_PRIVILEGE" | "HAS_DATABASE_PRIVILEGE" => {
             Ok(Value::Boolean(true))
         }
+        "PG_GET_CONSTRAINTDEF" => Ok(Value::Text(String::new())),
+        "PG_GET_EXPR" => Ok(Value::Null),
+        "FORMAT_TYPE" => {
+            let mut iter = args.into_iter();
+            let oid = match iter.next().unwrap_or(Value::Null) {
+                Value::Int32(n) => n as i64,
+                Value::Int64(n) => n,
+                Value::Text(s) => s.trim().parse::<i64>().unwrap_or(0),
+                Value::Null => return Ok(Value::Null),
+                _ => 0,
+            };
+            let type_name = match oid {
+                16 => "bool",
+                20 => "int8",
+                23 => "int4",
+                701 => "float8",
+                25 => "text",
+                17 => "bytea",
+                1114 => "timestamp",
+                1184 => "timestamptz",
+                2950 => "uuid",
+                114 => "json",
+                3802 => "jsonb",
+                16385 => "vector",
+                _ => "text",
+            };
+            Ok(Value::Text(type_name.to_string()))
+        }
         "OBJ_DESCRIPTION" | "COL_DESCRIPTION" | "SHOBJ_DESCRIPTION" => Ok(Value::Null),
         "PG_CATALOG.SET_CONFIG" => Ok(Value::Text(String::new())),
+        "UNNEST" => match args.into_iter().next() {
+            Some(Value::Array(arr)) => Ok(arr.into_iter().next().unwrap_or(Value::Null)),
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(v) => Ok(v),
+        },
         "ARRAY_LENGTH" => {
             let mut iter = args.into_iter();
             let arr = match iter.next() {
@@ -1978,6 +2078,15 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                         Value::Vector(_) => Ok(v),
                         _ => Err(anyhow!("Cannot cast {} to vector", v)),
                     },
+                    "REGTYPE" => {
+                        let s = match &v {
+                            Value::Text(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        let s = s.replace('"', "");
+                        let type_name = s.rsplit('.').next().unwrap_or_else(|| s.as_str()).trim();
+                        Ok(Value::Text(type_name.to_string()))
+                    }
                     _ => Ok(v),
                 }
             } else {
@@ -2024,6 +2133,10 @@ fn parse_interval_string(s: &str) -> Result<Value> {
 }
 
 fn parse_timestamp_string(s: &str) -> Result<Value> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s.trim()) {
+        return Ok(Value::Timestamp(dt.timestamp_millis()));
+    }
+
     use chrono::{NaiveDateTime, TimeZone, Utc};
     let formats = [
         "%Y-%m-%d %H:%M:%S%.f",
@@ -2258,6 +2371,14 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         (Value::Text(l), Value::Text(r)) => Ok(l.cmp(r) as i8),
         (Value::Boolean(l), Value::Boolean(r)) => Ok(l.cmp(r) as i8),
         (Value::Timestamp(l), Value::Timestamp(r)) => Ok(l.cmp(r) as i8),
+        (Value::Timestamp(l), Value::Text(r)) => match parse_timestamp_string(r)? {
+            Value::Timestamp(r_ts) => Ok(l.cmp(&r_ts) as i8),
+            _ => Err(anyhow!("Cannot compare")),
+        },
+        (Value::Text(l), Value::Timestamp(r)) => match parse_timestamp_string(l)? {
+            Value::Timestamp(l_ts) => Ok(l_ts.cmp(r) as i8),
+            _ => Err(anyhow!("Cannot compare")),
+        },
         (Value::Uuid(l), Value::Uuid(r)) => Ok(l.cmp(r) as i8),
         (Value::Null, Value::Null) => Ok(0),
         (Value::Null, _) => Ok(-1),

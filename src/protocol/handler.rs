@@ -191,7 +191,7 @@ impl DynamicPgHandler {
         let query_upper = query_trimmed.to_uppercase();
 
         // Only try to infer fields for SELECT queries and queries with RETURNING
-        let is_select = query_upper.starts_with("SELECT");
+        let is_select = query_upper.starts_with("SELECT") || query_upper.starts_with("WITH");
         let has_returning = query_upper.contains("RETURNING");
 
         if !is_select && !has_returning {
@@ -339,11 +339,13 @@ impl DynamicPgHandler {
             }
         }
 
-        // Execute SELECT query with LIMIT 0 to get column metadata without side effects
+        // Execute SELECT query with LIMIT 1 to get column metadata without side effects
+        // Replace any parameter placeholders ($1, $2, etc.) with defaults for type inference
+        let query_with_defaults = replace_placeholders_for_inference(query);
         let metadata_query = if query_upper.contains(" LIMIT ") {
-            query.to_string()
+            query_with_defaults
         } else {
-            format!("{} LIMIT 1", query)
+            format!("{} LIMIT 1", query_with_defaults)
         };
 
         let session = session_guard.as_mut().unwrap();
@@ -1061,6 +1063,88 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     }
 }
 
+fn replace_placeholders_for_inference(query: &str) -> String {
+    let mut result = String::with_capacity(query.len());
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut dollar_delim: Option<Vec<char>> = None;
+    let chars: Vec<char> = query.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        if let Some(ref delim) = dollar_delim {
+            if i + delim.len() <= chars.len() && chars[i..i + delim.len()] == delim[..] {
+                result.extend(delim);
+                i += delim.len();
+                dollar_delim = None;
+            } else {
+                result.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        let c = chars[i];
+
+        if c == '\'' && !in_double_quote {
+            if in_single_quote && i + 1 < chars.len() && chars[i + 1] == '\'' {
+                result.push('\'');
+                result.push('\'');
+                i += 2;
+                continue;
+            }
+            in_single_quote = !in_single_quote;
+            result.push(c);
+            i += 1;
+            continue;
+        } else if c == '"' && !in_single_quote {
+            if in_double_quote && i + 1 < chars.len() && chars[i + 1] == '"' {
+                result.push('"');
+                result.push('"');
+                i += 2;
+                continue;
+            }
+            in_double_quote = !in_double_quote;
+            result.push(c);
+            i += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote && c == '$' {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 {
+                result.push('1');
+                i = j;
+                continue;
+            }
+
+            // Handle PostgreSQL dollar-quoted strings ($tag$ ... $tag$ or $$ ... $$)
+            let mut j = i + 1;
+            while j < chars.len() && chars[j] != '$' {
+                if !(chars[j].is_ascii_alphanumeric() || chars[j] == '_') {
+                    break;
+                }
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == '$' {
+                let delim: Vec<char> = chars[i..=j].to_vec();
+                result.extend(&delim);
+                dollar_delim = Some(delim);
+                i = j + 1;
+                continue;
+            }
+        }
+
+        result.push(c);
+        i += 1;
+    }
+
+    result
+}
+
 fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
     let mut result = query.to_string();
 
@@ -1279,7 +1363,7 @@ impl PgHandler {
         let query_upper = query.trim().to_uppercase();
 
         // Only try to infer fields for SELECT queries and queries with RETURNING
-        let is_select = query_upper.starts_with("SELECT");
+        let is_select = query_upper.starts_with("SELECT") || query_upper.starts_with("WITH");
         let has_returning = query_upper.contains("RETURNING");
 
         if !is_select && !has_returning {
@@ -1289,12 +1373,12 @@ impl PgHandler {
         // Get the session
         let mut session_guard = self.session.lock().await;
 
-        // Execute query with LIMIT 1 to get column metadata and infer types from first row
         // For INSERT/UPDATE/DELETE with RETURNING, we can't add LIMIT, so just use the query as-is
+        let query_with_defaults = replace_placeholders_for_inference(query);
         let metadata_query = if query_upper.contains(" LIMIT ") || has_returning {
-            query.to_string()
+            query_with_defaults
         } else {
-            format!("{} LIMIT 1", query)
+            format!("{} LIMIT 1", query_with_defaults)
         };
 
         match self
@@ -2321,6 +2405,74 @@ mod tests {
                     "created_at".to_string()
                 ]
             ))
+        );
+    }
+
+    #[test]
+    fn test_replace_placeholders_basic() {
+        assert_eq!(
+            replace_placeholders_for_inference("SELECT * FROM users WHERE id = $1"),
+            "SELECT * FROM users WHERE id = 1"
+        );
+        assert_eq!(
+            replace_placeholders_for_inference("SELECT * FROM users WHERE id = $1 AND name = $2"),
+            "SELECT * FROM users WHERE id = 1 AND name = 1"
+        );
+    }
+
+    #[test]
+    fn test_replace_placeholders_preserves_string_literals() {
+        assert_eq!(
+            replace_placeholders_for_inference(
+                "SELECT * FROM users WHERE email = '$100bill@example.com'"
+            ),
+            "SELECT * FROM users WHERE email = '$100bill@example.com'"
+        );
+        assert_eq!(
+            replace_placeholders_for_inference("SELECT '${10}' AS template"),
+            "SELECT '${10}' AS template"
+        );
+        assert_eq!(
+            replace_placeholders_for_inference(
+                "SELECT * FROM t WHERE a = $1 AND b = 'contains $2 inside'"
+            ),
+            "SELECT * FROM t WHERE a = 1 AND b = 'contains $2 inside'"
+        );
+    }
+
+    #[test]
+    fn test_replace_placeholders_preserves_double_quoted_identifiers() {
+        assert_eq!(
+            replace_placeholders_for_inference(r#"SELECT * FROM "table$1" WHERE id = $1"#),
+            r#"SELECT * FROM "table$1" WHERE id = 1"#
+        );
+    }
+
+    #[test]
+    fn test_replace_placeholders_handles_escaped_single_quotes() {
+        assert_eq!(
+            replace_placeholders_for_inference("SELECT 'it''s $1' AS msg, $1 AS v"),
+            "SELECT 'it''s $1' AS msg, 1 AS v"
+        );
+    }
+
+    #[test]
+    fn test_replace_placeholders_preserves_dollar_quoted_strings() {
+        assert_eq!(
+            replace_placeholders_for_inference("SELECT $$ $1 $$ AS body, $1 AS v"),
+            "SELECT $$ $1 $$ AS body, 1 AS v"
+        );
+        assert_eq!(
+            replace_placeholders_for_inference("SELECT $tag$ $1 $tag$ AS body, $1 AS v"),
+            "SELECT $tag$ $1 $tag$ AS body, 1 AS v"
+        );
+    }
+
+    #[test]
+    fn test_replace_placeholders_high_numbers() {
+        assert_eq!(
+            replace_placeholders_for_inference("SELECT $1, $10, $100, $999"),
+            "SELECT 1, 1, 1, 1"
         );
     }
 }

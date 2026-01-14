@@ -2,12 +2,12 @@
 
 use super::executor::Executor;
 use super::helpers::{
-    collect_having_agg_funcs, dedup_rows, distinct_on_rows_join, eval_having_expr_join,
-    get_select_item_name, AggExpr,
+    apply_offset_limit_fetch, collect_having_agg_funcs, dedup_rows,
+    distinct_on_rows_join_with_indices, eval_having_expr_join, get_select_item_name, AggExpr,
 };
 use super::window::{compute_window_functions_join, extract_window_functions};
 use super::{
-    expr::{eval_expr, eval_expr_join, JoinContext},
+    expr::{eval_expr_join, JoinContext},
     parse_sql, Aggregator, ExecuteResult,
 };
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
@@ -281,9 +281,14 @@ impl Executor {
                     table_with_joins,
                     alias,
                 } => {
-                    let (mut base_alias, mut combined_schema, mut combined_rows) = self
+                    let (base_alias, base_schema, mut combined_rows) = self
                         .resolve_table_factor(txn, &table_with_joins.relation, ctes)
                         .await?;
+
+                    let mut all_table_aliases: Vec<(String, Vec<ColumnDef>)> =
+                        vec![(base_alias.clone(), base_schema.columns.clone())];
+
+                    let mut combined_schema = base_schema;
 
                     for join in &table_with_joins.joins {
                         let (join_alias, join_schema, join_rows) =
@@ -312,12 +317,15 @@ impl Executor {
 
                         let mut column_offsets: HashMap<String, usize> = HashMap::new();
                         let mut offset = 0;
-                        for col in &combined_schema.columns {
-                            column_offsets.insert(format!("{}.{}", base_alias, col.name), offset);
-                            if !column_offsets.contains_key(&col.name) {
-                                column_offsets.insert(col.name.clone(), offset);
+                        for (tbl_alias, cols) in &all_table_aliases {
+                            for col in cols {
+                                column_offsets
+                                    .insert(format!("{}.{}", tbl_alias, col.name), offset);
+                                if !column_offsets.contains_key(&col.name) {
+                                    column_offsets.insert(col.name.clone(), offset);
+                                }
+                                offset += 1;
                             }
-                            offset += 1;
                         }
                         for col in &join_schema.columns {
                             column_offsets.insert(format!("{}.{}", join_alias, col.name), offset);
@@ -388,11 +396,13 @@ impl Executor {
                             }
                         }
 
+                        all_table_aliases.push((join_alias.clone(), join_schema.columns.clone()));
+
                         let mut new_columns = combined_schema.columns.clone();
                         new_columns.extend(join_schema.columns.clone());
                         combined_schema = TableSchema {
                             table_id: 0,
-                            name: format!("{}_{}", base_alias, join_alias),
+                            name: "nested_join".to_string(),
                             columns: new_columns,
                             pk_indices: vec![],
                             indexes: vec![],
@@ -401,15 +411,40 @@ impl Executor {
                             foreign_keys: vec![],
                         };
                         combined_rows = new_rows;
-                        base_alias = format!("{}_{}", base_alias, join_alias);
                     }
 
-                    let final_alias = alias
-                        .as_ref()
-                        .map(|a| a.name.value.clone())
-                        .unwrap_or(base_alias);
+                    let final_alias =
+                        alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| {
+                                all_table_aliases
+                                    .first()
+                                    .map(|(a, _)| a.clone())
+                                    .unwrap_or_default()
+                            });
 
-                    Ok((final_alias, combined_schema, combined_rows))
+                    let mut prefixed_columns: Vec<ColumnDef> = Vec::new();
+                    for (tbl_alias, cols) in &all_table_aliases {
+                        for col in cols {
+                            let mut new_col = col.clone();
+                            new_col.name = format!("{}.{}", tbl_alias, col.name);
+                            prefixed_columns.push(new_col);
+                        }
+                    }
+
+                    let final_schema = TableSchema {
+                        table_id: 0,
+                        name: final_alias.clone(),
+                        columns: prefixed_columns,
+                        pk_indices: vec![],
+                        indexes: vec![],
+                        version: 1,
+                        check_constraints: vec![],
+                        foreign_keys: vec![],
+                    };
+
+                    Ok((final_alias, final_schema, combined_rows))
                 }
                 _ => Err(anyhow!("Unsupported table factor")),
             }
@@ -683,6 +718,9 @@ impl Executor {
                 if !column_offsets.contains_key(&col.name) {
                     column_offsets.insert(col.name.clone(), offset);
                 }
+                if col.name.contains('.') {
+                    column_offsets.insert(col.name.clone(), offset);
+                }
                 offset += 1;
             }
 
@@ -791,6 +829,9 @@ impl Executor {
                 if !final_column_offsets.contains_key(&col.name) {
                     final_column_offsets.insert(col.name.clone(), offset);
                 }
+                if col.name.contains('.') {
+                    final_column_offsets.insert(col.name.clone(), offset);
+                }
                 final_columns.push(col.clone());
                 offset += 1;
             }
@@ -841,6 +882,7 @@ impl Executor {
         };
 
         let mut agg_funcs: Vec<(usize, AggExpr)> = Vec::new();
+        let extra_start = select.projection.len();
         for (i, item) in select.projection.iter().enumerate() {
             match item {
                 SelectItem::UnnamedExpr(Expr::Function(f))
@@ -862,6 +904,12 @@ impl Executor {
                         "COUNT" | "SUM" | "AVG" | "MAX" | "MIN" | "STRING_AGG" | "ARRAY_AGG"
                     ) {
                         agg_funcs.push((i, AggExpr::Function(f.clone())));
+                    } else {
+                        collect_having_agg_funcs(
+                            &Expr::Function(f.clone()),
+                            &mut agg_funcs,
+                            extra_start,
+                        );
                     }
                 }
                 SelectItem::UnnamedExpr(Expr::ArrayAgg(arr))
@@ -876,7 +924,6 @@ impl Executor {
         }
 
         if let Some(having_expr) = &select.having {
-            let extra_start = select.projection.len();
             collect_having_agg_funcs(having_expr, &mut agg_funcs, extra_start);
         }
 
@@ -999,11 +1046,56 @@ impl Executor {
                             | SelectItem::ExprWithAlias { expr: e, .. } => e,
                             _ => return Err(anyhow!("Unsupported projection item")),
                         };
-                        row_values.push(eval_expr_join(expr, &ctx)?);
+                        row_values.push(eval_having_expr_join(expr, &ctx, &agg_funcs, &aggs)?);
                     }
                 }
                 final_rows.push(Row::new(row_values));
             }
+
+            let final_rows = if !query.order_by.is_empty() {
+                let mut indexed: Vec<(usize, Row)> = final_rows.into_iter().enumerate().collect();
+                indexed.sort_by(|(_, a), (_, b)| {
+                    for order_expr in &query.order_by {
+                        let col_idx = if let Expr::Identifier(ref ident) = order_expr.expr {
+                            col_names
+                                .iter()
+                                .position(|n| n.eq_ignore_ascii_case(&ident.value))
+                        } else {
+                            None
+                        };
+
+                        let (val_a, val_b) = if let Some(idx) = col_idx {
+                            (a.values.get(idx).cloned(), b.values.get(idx).cloned())
+                        } else {
+                            (None, None)
+                        };
+
+                        let val_a = val_a.unwrap_or(Value::Null);
+                        let val_b = val_b.unwrap_or(Value::Null);
+                        let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                        if cmp != 0 {
+                            let asc = order_expr.asc.unwrap_or(true);
+                            return if asc {
+                                if cmp > 0 {
+                                    std::cmp::Ordering::Greater
+                                } else {
+                                    std::cmp::Ordering::Less
+                                }
+                            } else if cmp > 0 {
+                                std::cmp::Ordering::Less
+                            } else {
+                                std::cmp::Ordering::Greater
+                            };
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                indexed.into_iter().map(|(_, r)| r).collect()
+            } else {
+                final_rows
+            };
+
+            let final_rows = apply_offset_limit_fetch(final_rows, query);
 
             return Ok(ExecuteResult::Select {
                 column_types: None,
@@ -1094,36 +1186,33 @@ impl Executor {
             (filtered_rows, window_results)
         };
 
-        let mut final_rows = filtered_rows;
-        if let Some(offset) = &query.offset {
-            if let Ok(v) = eval_expr(&offset.value, None, None) {
-                let n = match v {
-                    Value::Int64(n) => n as usize,
-                    Value::Int32(n) => n as usize,
-                    _ => 0,
-                };
-                final_rows = final_rows.into_iter().skip(n).collect();
+        let (rows_to_project, window_results) = match &select.distinct {
+            Some(Distinct::On(on_exprs)) => {
+                let (rows, indices) = distinct_on_rows_join_with_indices(
+                    filtered_rows,
+                    on_exprs,
+                    &final_column_offsets,
+                    &final_schema,
+                );
+                let window_results =
+                    window_results.map(|wr| super::query::reorder_by_indices(&wr, &indices));
+                (rows, window_results)
             }
-        }
-        if let Some(limit) = &query.limit {
-            if let Ok(v) = eval_expr(limit, None, None) {
-                let n = match v {
-                    Value::Int64(n) => n as usize,
-                    Value::Int32(n) => n as usize,
-                    _ => usize::MAX,
-                };
-                final_rows = final_rows.into_iter().take(n).collect();
-            }
-        }
+            _ => (filtered_rows, window_results),
+        };
 
         let mut cols = Vec::new();
         let mut result_rows = Vec::new();
 
-        let wildcard = select
+        let has_wildcard = select
             .projection
             .iter()
             .any(|p| matches!(p, SelectItem::Wildcard(_)));
-        if wildcard {
+        let has_qualified_wildcard = select
+            .projection
+            .iter()
+            .any(|p| matches!(p, SelectItem::QualifiedWildcard(..)));
+        if has_wildcard {
             if has_natural_join && !natural_join_common_cols.is_empty() {
                 let mut col_indices_to_keep: Vec<usize> = Vec::new();
                 let mut seen_common_cols: std::collections::HashSet<String> =
@@ -1149,7 +1238,7 @@ impl Executor {
                     }
                 }
 
-                result_rows = final_rows
+                result_rows = rows_to_project
                     .into_iter()
                     .map(|row| {
                         let vals: Vec<Value> = col_indices_to_keep
@@ -1165,7 +1254,123 @@ impl Executor {
                         cols.push(format!("{}.{}", alias, col.name));
                     }
                 }
-                result_rows = final_rows;
+                result_rows = rows_to_project;
+            }
+        } else if has_qualified_wildcard {
+            let mut expanded_items: Vec<(String, Option<(String, usize)>)> = Vec::new();
+
+            let mut schema_offsets: HashMap<String, usize> = HashMap::new();
+            let mut offset = 0;
+            for (alias, schema) in &combined_schemas {
+                schema_offsets.insert(alias.clone(), offset);
+                offset += schema.columns.len();
+            }
+
+            for item in &select.projection {
+                match item {
+                    SelectItem::QualifiedWildcard(prefix, _) => {
+                        let table_alias =
+                            prefix.0.last().map(|i| i.value.clone()).unwrap_or_default();
+                        if let Some((alias, schema)) = combined_schemas
+                            .iter()
+                            .find(|(a, _)| a.eq_ignore_ascii_case(&table_alias))
+                        {
+                            if let Some(&start_offset) = schema_offsets.get(alias) {
+                                for (col_idx, col) in schema.columns.iter().enumerate() {
+                                    expanded_items.push((
+                                        col.name.clone(),
+                                        Some((alias.clone(), start_offset + col_idx)),
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    SelectItem::UnnamedExpr(Expr::Identifier(id)) => {
+                        expanded_items.push((id.value.clone(), None));
+                    }
+                    SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                        expanded_items.push((
+                            parts
+                                .last()
+                                .map(|p| p.value.clone())
+                                .unwrap_or_else(|| "col".to_string()),
+                            None,
+                        ));
+                    }
+                    SelectItem::ExprWithAlias { alias, .. } => {
+                        expanded_items.push((alias.value.clone(), None));
+                    }
+                    SelectItem::UnnamedExpr(Expr::Function(f)) => {
+                        expanded_items.push((
+                            f.name
+                                .0
+                                .last()
+                                .map(|i| i.value.clone())
+                                .unwrap_or("func".to_string()),
+                            None,
+                        ));
+                    }
+                    _ => {
+                        expanded_items.push(("col".to_string(), None));
+                    }
+                }
+            }
+
+            for (name, _) in &expanded_items {
+                cols.push(name.clone());
+            }
+
+            let has_window_funcs = !window_funcs.is_empty();
+            for (row_idx, row) in rows_to_project.iter().enumerate() {
+                let ctx = JoinContext {
+                    tables: HashMap::new(),
+                    column_offsets: final_column_offsets.clone(),
+                    combined_row: row,
+                    combined_schema: &final_schema,
+                };
+                let mut vals = Vec::new();
+                let mut proj_idx = 0;
+
+                for item in resolved_projection.iter() {
+                    match item {
+                        SelectItem::QualifiedWildcard(prefix, _) => {
+                            let table_alias =
+                                prefix.0.last().map(|i| i.value.clone()).unwrap_or_default();
+                            if let Some((alias, schema)) = combined_schemas
+                                .iter()
+                                .find(|(a, _)| a.eq_ignore_ascii_case(&table_alias))
+                            {
+                                if let Some(&start_offset) = schema_offsets.get(alias) {
+                                    for col_idx in 0..schema.columns.len() {
+                                        let value = row
+                                            .values
+                                            .get(start_offset + col_idx)
+                                            .cloned()
+                                            .unwrap_or(Value::Null);
+                                        vals.push(value);
+                                    }
+                                }
+                            }
+                        }
+                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                            if has_window_funcs {
+                                if let Some(wf_idx) =
+                                    window_funcs.iter().position(|wf| wf.proj_idx == proj_idx)
+                                {
+                                    if let Some(ref wr) = window_results {
+                                        vals.push(wr[row_idx][wf_idx].clone());
+                                        proj_idx += 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                            vals.push(eval_expr_join(e, &ctx)?);
+                        }
+                        SelectItem::Wildcard(_) => {}
+                    }
+                    proj_idx += 1;
+                }
+                result_rows.push(Row::new(vals));
             }
         } else {
             for item in &select.projection {
@@ -1192,16 +1397,6 @@ impl Executor {
                     _ => cols.push("col".to_string()),
                 }
             }
-
-            let rows_to_project = match &select.distinct {
-                Some(Distinct::On(on_exprs)) => distinct_on_rows_join(
-                    final_rows,
-                    on_exprs,
-                    &final_column_offsets,
-                    &final_schema,
-                ),
-                _ => final_rows,
-            };
 
             let has_window_funcs = !window_funcs.is_empty();
             for (row_idx, row) in rows_to_project.iter().enumerate() {
@@ -1237,6 +1432,8 @@ impl Executor {
         if matches!(&select.distinct, Some(Distinct::Distinct)) {
             result_rows = dedup_rows(result_rows);
         }
+
+        result_rows = apply_offset_limit_fetch(result_rows, query);
 
         Ok(ExecuteResult::Select {
             column_types: None,

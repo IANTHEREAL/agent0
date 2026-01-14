@@ -492,7 +492,14 @@ pub async fn execute_create_index(
         }
     }
 
-    let index_id = store.next_table_id(txn).await?;
+    let index_id = schema
+        .indexes
+        .iter()
+        .map(|i| i.id)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("Index id overflow"))?;
     let new_index = IndexDef {
         name: idx_name_str.clone(),
         id: index_id,
@@ -744,7 +751,7 @@ pub async fn execute_alter_table(
                     _ => {}
                 }
             }
-            if !nullable && default_expr.is_none() {
+            if !nullable && default_expr.is_none() && !rows.is_empty() {
                 return Err(anyhow!("Cannot add NOT NULL column without DEFAULT"));
             }
             schema.columns.push(ColumnDef {
@@ -780,13 +787,59 @@ pub async fn execute_alter_table(
                 schema.version += 1;
                 store.update_schema(txn, schema).await?;
             }
-            TableConstraint::Unique { columns, .. } => {
-                for col in columns {
-                    let col_name = normalize_ident(col);
-                    if let Some(idx) = schema.columns.iter().position(|c| c.name == col_name) {
-                        schema.columns[idx].unique = true;
+            TableConstraint::Unique { columns, name, .. } => {
+                let col_names: Vec<String> = columns.iter().map(normalize_ident).collect();
+
+                for col_name in &col_names {
+                    if schema.column_index(col_name).is_none() {
+                        return Err(anyhow!("Column '{}' does not exist", col_name));
                     }
                 }
+
+                if col_names.len() == 1 {
+                    let idx = schema.column_index(&col_names[0]).expect("validated above");
+                    schema.columns[idx].unique = true;
+                }
+
+                let index_name = name
+                    .as_ref()
+                    .map(normalize_ident)
+                    .unwrap_or_else(|| format!("{}_{}_key", t, col_names.join("_")));
+
+                if schema.indexes.iter().any(|i| i.name == index_name) {
+                    return Err(anyhow!("Index exists"));
+                }
+
+                let new_index = crate::types::IndexDef {
+                    id: schema
+                        .indexes
+                        .iter()
+                        .map(|i| i.id)
+                        .max()
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow!("Index id overflow"))?,
+                    name: index_name,
+                    columns: col_names,
+                    unique: true,
+                };
+
+                for row in &rows {
+                    let idx_values = schema.get_index_values(&new_index, row);
+                    let pk_values = schema.get_pk_values(row);
+                    store
+                        .create_index_entry(
+                            txn,
+                            schema.table_id,
+                            new_index.id,
+                            &idx_values,
+                            &pk_values,
+                            true,
+                        )
+                        .await?;
+                }
+
+                schema.indexes.push(new_index);
                 schema.version += 1;
                 store.update_schema(txn, schema).await?;
             }

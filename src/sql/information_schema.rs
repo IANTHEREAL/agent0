@@ -1,6 +1,7 @@
 use crate::storage::TikvStore;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::types::{ColumnDef, DataType, ForeignKeyAction, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tikv_client::Transaction;
 
@@ -27,6 +28,8 @@ pub fn is_information_schema_table(table_name: &str) -> bool {
                 | "pg_namespace"
                 | "pg_proc"
                 | "pg_description"
+                | "pg_constraint"
+                | "pg_am"
                 | "pg_indexes"
         )
 }
@@ -57,6 +60,8 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
             "pg_namespace" => "pg_namespace",
             "pg_proc" => "pg_proc",
             "pg_description" => "pg_description",
+            "pg_constraint" => "pg_constraint",
+            "pg_am" => "pg_am",
             "pg_indexes" => "pg_indexes",
             _ => return None,
         });
@@ -70,6 +75,8 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
         "pg_namespace" => Some("pg_namespace"),
         "pg_proc" => Some("pg_proc"),
         "pg_description" => Some("pg_description"),
+        "pg_constraint" => Some("pg_constraint"),
+        "pg_am" => Some("pg_am"),
         "pg_indexes" => Some("pg_indexes"),
         _ => None,
     }
@@ -91,6 +98,30 @@ fn int_col(name: &str) -> ColumnDef {
     ColumnDef {
         name: name.to_string(),
         data_type: DataType::Int64,
+        nullable: true,
+        primary_key: false,
+        unique: false,
+        is_serial: false,
+        default_expr: None,
+    }
+}
+
+fn bool_col(name: &str) -> ColumnDef {
+    ColumnDef {
+        name: name.to_string(),
+        data_type: DataType::Boolean,
+        nullable: true,
+        primary_key: false,
+        unique: false,
+        is_serial: false,
+        default_expr: None,
+    }
+}
+
+fn int_array_col(name: &str) -> ColumnDef {
+    ColumnDef {
+        name: name.to_string(),
+        data_type: DataType::Array(Box::new(DataType::Int64)),
         nullable: true,
         primary_key: false,
         unique: false,
@@ -401,7 +432,8 @@ fn pg_index_schema() -> TableSchema {
             text_col("indimmediate"),
             text_col("indisclustered"),
             text_col("indisvalid"),
-            text_col("indkey"),
+            int_array_col("indkey"),
+            text_col("indpred"),
             text_col("indexdef"), // Pre-computed index definition for pg_get_indexdef()
         ],
         version: 1,
@@ -461,6 +493,46 @@ fn pg_proc_schema() -> TableSchema {
             int_col("prorettype"),
             text_col("prokind"),
         ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
+fn pg_constraint_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_constraint".to_string(),
+        columns: vec![
+            int_col("oid"),
+            text_col("conname"),
+            int_col("connamespace"),
+            text_col("contype"),
+            int_col("conrelid"),
+            int_col("confrelid"),
+            int_array_col("conkey"),
+            int_array_col("confkey"),
+            text_col("confdeltype"),
+            text_col("confupdtype"),
+            bool_col("condeferrable"),
+            bool_col("condeferred"),
+            text_col("constraintdef"), // Pre-computed definition for pg_get_constraintdef()
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
+fn pg_am_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_am".to_string(),
+        columns: vec![int_col("oid"), text_col("amname")],
         version: 1,
         pk_indices: vec![],
         indexes: vec![],
@@ -530,6 +602,8 @@ pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
         "pg_namespace" => Some(pg_namespace_schema()),
         "pg_proc" => Some(pg_proc_schema()),
         "pg_description" => Some(pg_description_schema()),
+        "pg_constraint" => Some(pg_constraint_schema()),
+        "pg_am" => Some(pg_am_schema()),
         "pg_indexes" => Some(pg_indexes_schema()),
         _ => None,
     }
@@ -608,6 +682,8 @@ pub async fn get_information_schema_data(
         "pg_attribute" => get_pg_attribute_rows(store, txn, &user_tables).await?,
         "pg_proc" => get_pg_proc_rows(),
         "pg_description" => get_pg_description_rows(),
+        "pg_constraint" => get_pg_constraint_rows(store, txn, &user_tables).await?,
+        "pg_am" => get_pg_am_rows(),
         "pg_indexes" => get_pg_indexes_rows(store, txn, &user_tables).await?,
         _ => vec![],
     };
@@ -714,16 +790,25 @@ async fn get_columns_rows(
                     _ => (null_val(), null_val(), null_val()),
                 };
 
+                let column_default = if col.is_serial {
+                    text_val(&format!(
+                        "nextval('{}_{}_seq'::regclass)",
+                        table_name, col.name
+                    ))
+                } else {
+                    col.default_expr
+                        .as_ref()
+                        .map(|s| text_val(s))
+                        .unwrap_or(null_val())
+                };
+
                 rows.push(Row::new(vec![
                     text_val("postgres"),
                     text_val("public"),
                     text_val(table_name),
                     text_val(&col.name),
                     int_val(ordinal),
-                    col.default_expr
-                        .as_ref()
-                        .map(|s| text_val(s))
-                        .unwrap_or(null_val()),
+                    column_default,
                     text_val(is_nullable),
                     text_val(pg_type),
                     char_max_len,
@@ -1180,10 +1265,10 @@ async fn get_pg_index_rows(
                 let mut col_indices = Vec::new();
                 for col_name in &idx.columns {
                     if let Some(pos) = schema.columns.iter().position(|c| &c.name == col_name) {
-                        col_indices.push((pos + 1).to_string());
+                        col_indices.push(Value::Int64((pos + 1) as i64));
                     }
                 }
-                let indkey = col_indices.join(" ");
+                let indkey = Value::Array(col_indices);
 
                 let indexdef = format!(
                     "CREATE {}INDEX {} ON public.{} USING btree ({})",
@@ -1203,7 +1288,8 @@ async fn get_pg_index_rows(
                     text_val("t"),
                     text_val("f"),
                     text_val("t"),
-                    text_val(&indkey),
+                    indkey,
+                    null_val(),
                     text_val(&indexdef),
                 ]));
             }
@@ -1215,9 +1301,8 @@ async fn get_pg_index_rows(
                 let indkey = schema
                     .pk_indices
                     .iter()
-                    .map(|idx| (idx + 1).to_string())
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                    .map(|idx| Value::Int64((idx + 1) as i64))
+                    .collect::<Vec<_>>();
 
                 let pk_cols: Vec<String> = schema
                     .pk_indices
@@ -1241,7 +1326,8 @@ async fn get_pg_index_rows(
                     text_val("t"),
                     text_val("f"),
                     text_val("t"),
-                    text_val(&indkey),
+                    Value::Array(indkey),
+                    null_val(),
                     text_val(&indexdef),
                 ]));
             }
@@ -1351,12 +1437,227 @@ async fn get_pg_attribute_rows(
                     int_val((i + 1) as i64),
                     int_val(attlen),
                     text_val(if !col.nullable { "t" } else { "f" }),
-                    text_val(if col.default_expr.is_some() { "t" } else { "f" }),
+                    text_val(if col.is_serial || col.default_expr.is_some() {
+                        "t"
+                    } else {
+                        "f"
+                    }),
                     text_val("f"), // not dropped
                     text_val("t"), // is local
                     int_val(-1),   // type modifier
                 ]));
             }
+        }
+    }
+
+    Ok(rows)
+}
+
+fn get_pg_am_rows() -> Vec<Row> {
+    vec![Row::new(vec![int_val(403), text_val("btree")])]
+}
+
+async fn get_pg_constraint_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    user_tables: &[String],
+) -> Result<Vec<Row>> {
+    fn fk_action_code(action: &ForeignKeyAction) -> &'static str {
+        match action {
+            ForeignKeyAction::NoAction => "a",
+            ForeignKeyAction::Restrict => "r",
+            ForeignKeyAction::Cascade => "c",
+            ForeignKeyAction::SetNull => "n",
+            ForeignKeyAction::SetDefault => "d",
+        }
+    }
+
+    fn fk_action_sql(action: &ForeignKeyAction) -> Option<&'static str> {
+        match action {
+            ForeignKeyAction::NoAction => None,
+            ForeignKeyAction::Restrict => Some("RESTRICT"),
+            ForeignKeyAction::Cascade => Some("CASCADE"),
+            ForeignKeyAction::SetNull => Some("SET NULL"),
+            ForeignKeyAction::SetDefault => Some("SET DEFAULT"),
+        }
+    }
+
+    let mut table_oids: HashMap<String, i64> = HashMap::new();
+    let mut table_schemas: HashMap<String, TableSchema> = HashMap::new();
+
+    let mut table_oid: i64 = 16384;
+    for table_name in user_tables {
+        if let Some(schema) = store.get_schema(txn, table_name).await? {
+            let base_table_oid = table_oid;
+            let num_indexes =
+                schema.indexes.len() + if !schema.pk_indices.is_empty() { 1 } else { 0 };
+            table_oid += 1 + num_indexes as i64;
+
+            table_oids.insert(table_name.to_string(), base_table_oid);
+            table_schemas.insert(table_name.to_string(), schema);
+        }
+    }
+
+    let mut rows = Vec::new();
+    let mut constraint_oid: i64 = 50000;
+
+    for table_name in user_tables {
+        let Some(schema) = table_schemas.get(table_name) else {
+            continue;
+        };
+        let Some(&conrelid) = table_oids.get(table_name) else {
+            continue;
+        };
+
+        if !schema.pk_indices.is_empty() {
+            let conname = format!("{}_pkey", table_name);
+            let conkey: Vec<Value> = schema
+                .pk_indices
+                .iter()
+                .map(|idx| Value::Int64((idx + 1) as i64))
+                .collect();
+            let pk_cols: Vec<String> = schema
+                .pk_indices
+                .iter()
+                .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
+                .collect();
+            let constraintdef = format!("PRIMARY KEY ({})", pk_cols.join(", "));
+            let conindid = conrelid + 1 + schema.indexes.len() as i64;
+
+            rows.push(Row::new(vec![
+                int_val(constraint_oid),
+                text_val(&conname),
+                int_val(2200), // public schema OID
+                text_val("p"),
+                int_val(conrelid),
+                int_val(0), // confrelid
+                Value::Array(conkey),
+                Value::Array(vec![]),
+                null_val(),
+                null_val(),
+                Value::Boolean(false),
+                Value::Boolean(false),
+                text_val(&constraintdef),
+            ]));
+            constraint_oid += 1;
+
+            // Keep primary key index discoverable via conindid in case ORMs query it.
+            let _ = conindid;
+        }
+
+        for (idx_pos, idx) in schema.indexes.iter().enumerate() {
+            if !idx.unique {
+                continue;
+            }
+            let mut conkey = Vec::new();
+            for col_name in &idx.columns {
+                if let Some(pos) = schema.columns.iter().position(|c| &c.name == col_name) {
+                    conkey.push(Value::Int64((pos + 1) as i64));
+                }
+            }
+            let constraintdef = format!("UNIQUE ({})", idx.columns.join(", "));
+            let _conindid = conrelid + 1 + idx_pos as i64;
+
+            rows.push(Row::new(vec![
+                int_val(constraint_oid),
+                text_val(&idx.name),
+                int_val(2200),
+                text_val("u"),
+                int_val(conrelid),
+                int_val(0),
+                Value::Array(conkey),
+                Value::Array(vec![]),
+                null_val(),
+                null_val(),
+                Value::Boolean(false),
+                Value::Boolean(false),
+                text_val(&constraintdef),
+            ]));
+            constraint_oid += 1;
+        }
+
+        for (i, check) in schema.check_constraints.iter().enumerate() {
+            let name = check
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("{}_check{}", table_name, i + 1));
+            let constraintdef = if check.expr.trim().starts_with('(') {
+                format!("CHECK {}", check.expr.trim())
+            } else {
+                format!("CHECK ({})", check.expr.trim())
+            };
+
+            rows.push(Row::new(vec![
+                int_val(constraint_oid),
+                text_val(&name),
+                int_val(2200),
+                text_val("c"),
+                int_val(conrelid),
+                int_val(0),
+                Value::Array(vec![]),
+                Value::Array(vec![]),
+                null_val(),
+                null_val(),
+                Value::Boolean(false),
+                Value::Boolean(false),
+                text_val(&constraintdef),
+            ]));
+            constraint_oid += 1;
+        }
+
+        for fk in &schema.foreign_keys {
+            let ref_table = fk.ref_table.to_lowercase();
+            let (confrelid, ref_schema) =
+                match (table_oids.get(&ref_table), table_schemas.get(&ref_table)) {
+                    (Some(&oid), Some(schema)) => (oid, schema),
+                    _ => (0, schema),
+                };
+
+            let mut conkey = Vec::new();
+            for col_name in &fk.columns {
+                if let Some(pos) = schema.columns.iter().position(|c| &c.name == col_name) {
+                    conkey.push(Value::Int64((pos + 1) as i64));
+                }
+            }
+
+            let mut confkey = Vec::new();
+            if confrelid != 0 {
+                for col_name in &fk.ref_columns {
+                    if let Some(pos) = ref_schema.columns.iter().position(|c| &c.name == col_name) {
+                        confkey.push(Value::Int64((pos + 1) as i64));
+                    }
+                }
+            }
+
+            let mut constraintdef = format!(
+                "FOREIGN KEY ({}) REFERENCES {} ({})",
+                fk.columns.join(", "),
+                ref_table,
+                fk.ref_columns.join(", ")
+            );
+            if let Some(action) = fk_action_sql(&fk.on_delete) {
+                constraintdef.push_str(&format!(" ON DELETE {}", action));
+            }
+            if let Some(action) = fk_action_sql(&fk.on_update) {
+                constraintdef.push_str(&format!(" ON UPDATE {}", action));
+            }
+
+            rows.push(Row::new(vec![
+                int_val(constraint_oid),
+                text_val(&fk.name),
+                int_val(2200),
+                text_val("f"),
+                int_val(conrelid),
+                int_val(confrelid),
+                Value::Array(conkey),
+                Value::Array(confkey),
+                text_val(fk_action_code(&fk.on_delete)),
+                text_val(fk_action_code(&fk.on_update)),
+                Value::Boolean(false),
+                Value::Boolean(false),
+                text_val(&constraintdef),
+            ]));
+            constraint_oid += 1;
         }
     }
 
