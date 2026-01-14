@@ -1201,6 +1201,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f52b00d39961fc5b2736ea853c9cc86238e165017a493d1d5c8eac6bdc4cc273"
 
 [[package]]
+name = "memcomparable"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "376101dbd964fc502d5902216e180f92b3d003b5cc3d2e40e044eb5470fca677"
+dependencies = [
+ "bytes",
+ "serde",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1342,6 +1353,7 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
+ "memcomparable",
  "pgwire",
  "rand 0.8.5",
  "regex",

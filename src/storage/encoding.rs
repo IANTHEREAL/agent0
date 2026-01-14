@@ -6,9 +6,12 @@
 //! - `t_{table_id}_{row_key}` -> Row (serialized)
 //! - `i_{table_id}_{index_id}_{index_values}` -> PK (Unique Index)
 //! - `i_{table_id}_{index_id}_{index_values}_{pk}` -> Empty (Non-Unique Index)
+//!
+//! Index keys use memcomparable encoding to preserve lexicographic sort order.
 
-use crate::types::{Row, TableSchema, Value};
+use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{Context, Result};
+use memcomparable::Deserializer;
 
 /// System key prefixes
 const SYS_NEXT_TABLE_ID: &[u8] = b"_sys_next_table_id";
@@ -73,7 +76,7 @@ pub fn encode_data_key(table_id: u64, row_key: &[u8]) -> Vec<u8> {
     key
 }
 
-/// Encode an index key
+/// Encode an index key using memcomparable format for correct sort order.
 /// If pk is None, it's a unique index key (Value -> PK)
 /// If pk is Some, it's a non-unique index key (Value+PK -> Empty)
 pub fn encode_index_key(
@@ -87,24 +90,176 @@ pub fn encode_index_key(
     key.push(b'_');
     key.extend_from_slice(&index_id.to_be_bytes());
     key.push(b'_');
-    key.extend_from_slice(&bincode::serialize(values).unwrap_or_default());
+
+    for value in values {
+        encode_value_memcomparable(value, &mut key);
+    }
 
     if let Some(pk_values) = pk {
-        key.push(b'_');
-        key.extend_from_slice(&bincode::serialize(pk_values).unwrap_or_default());
+        key.push(0x01); // Separator byte (not '_' to avoid collision with encoded data)
+        for value in pk_values {
+            encode_value_memcomparable(value, &mut key);
+        }
     }
     key
 }
 
-/// Decode PK from a non-unique index key
-/// Key: prefix ... {values} _ {pk}
-/// This is hard because we don't know length of {values}.
-/// BUT for TPC-C, we only use this for scanning.
-/// If we scan with prefix `i_..._{values}_`, the remaining part IS `{pk}`.
+const NULL_TAG: u8 = 0x00;
+const NOT_NULL_TAG: u8 = 0x01;
+
+fn encode_value_memcomparable(value: &Value, buf: &mut Vec<u8>) {
+    match value {
+        Value::Null => {
+            buf.push(NULL_TAG);
+        }
+        Value::Boolean(v) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(v).unwrap());
+        }
+        Value::Int32(v) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(v).unwrap());
+        }
+        Value::Int64(v) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(v).unwrap());
+        }
+        Value::Float64(v) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(v).unwrap());
+        }
+        Value::Text(s) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(s).unwrap());
+        }
+        Value::Bytes(b) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(b).unwrap());
+        }
+        Value::Timestamp(ts) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(ts).unwrap());
+        }
+        Value::Interval(i) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(i).unwrap());
+        }
+        Value::Time(t) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(t).unwrap());
+        }
+        Value::Uuid(bytes) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(&bytes.to_vec()).unwrap());
+        }
+        Value::Array(arr) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(&(arr.len() as u32)).unwrap());
+            for elem in arr {
+                encode_value_memcomparable(elem, buf);
+            }
+        }
+        Value::Vector(vec) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(&(vec.len() as u32)).unwrap());
+            for f in vec {
+                buf.extend(memcomparable::to_vec(f).unwrap());
+            }
+        }
+        Value::Json(s) | Value::Jsonb(s) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(s).unwrap());
+        }
+    }
+}
+
+pub fn decode_value_memcomparable(data: &[u8], data_type: &DataType) -> Result<(Value, usize)> {
+    if data.is_empty() {
+        anyhow::bail!("Empty data for memcomparable decode");
+    }
+
+    if data[0] == NULL_TAG {
+        return Ok((Value::Null, 1));
+    }
+
+    let payload = &data[1..];
+    let mut deserializer = Deserializer::new(payload);
+
+    let (value, consumed) = match data_type {
+        DataType::Boolean => {
+            let v: bool = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Boolean(v), deserializer.position())
+        }
+        DataType::Int32 => {
+            let v: i32 = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Int32(v), deserializer.position())
+        }
+        DataType::Int64 => {
+            let v: i64 = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Int64(v), deserializer.position())
+        }
+        DataType::Float64 => {
+            let v: f64 = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Float64(v), deserializer.position())
+        }
+        DataType::Text => {
+            let v: String = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Text(v), deserializer.position())
+        }
+        DataType::Bytes => {
+            let v: Vec<u8> = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Bytes(v), deserializer.position())
+        }
+        DataType::Timestamp => {
+            let v: i64 = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Timestamp(v), deserializer.position())
+        }
+        DataType::Interval => {
+            let v: i64 = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Interval(v), deserializer.position())
+        }
+        DataType::Time => {
+            let v: i64 = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Time(v), deserializer.position())
+        }
+        DataType::Uuid => {
+            let v: Vec<u8> = serde::Deserialize::deserialize(&mut deserializer)?;
+            if v.len() < 16 {
+                anyhow::bail!("UUID decode: expected 16 bytes, got {}", v.len());
+            }
+            let mut bytes = [0u8; 16];
+            bytes.copy_from_slice(&v[..16]);
+            (Value::Uuid(bytes), deserializer.position())
+        }
+        DataType::Json => {
+            let v: String = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Json(v), deserializer.position())
+        }
+        DataType::Jsonb => {
+            let v: String = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Jsonb(v), deserializer.position())
+        }
+        DataType::Array(_) | DataType::Vector(_) => {
+            anyhow::bail!("Array/Vector decoding not supported in index keys");
+        }
+    };
+
+    Ok((value, 1 + consumed))
+}
+
+/// Decode PK values from a non-unique index key suffix.
+/// `pk_bytes` should be the portion after the separator byte (0x01).
+/// `pk_types` describes the data types of each PK column.
 #[allow(dead_code)]
-pub fn decode_index_pk_from_key(full_key: &[u8], prefix_len: usize) -> Result<Vec<Value>> {
-    let pk_bytes = &full_key[prefix_len..];
-    bincode::deserialize(pk_bytes).context("Failed to deserialize PK from index key")
+pub fn decode_pk_from_index_suffix(pk_bytes: &[u8], pk_types: &[DataType]) -> Result<Vec<Value>> {
+    let mut values = Vec::with_capacity(pk_types.len());
+    let mut offset = 0;
+    for data_type in pk_types {
+        let (value, consumed) = decode_value_memcomparable(&pk_bytes[offset..], data_type)?;
+        values.push(value);
+        offset += consumed;
+    }
+    Ok(values)
 }
 
 /// Get the key range for scanning all rows of a table
@@ -124,10 +279,13 @@ pub fn encode_schema_prefix() -> Vec<u8> {
     SYS_SCHEMA_PREFIX.to_vec()
 }
 
-/// Encode primary key values (composite) to bytes
+/// Encode primary key values using memcomparable format for correct sort order.
 pub fn encode_pk_values(values: &[Value]) -> Vec<u8> {
-    // Serialize the whole vector of values
-    bincode::serialize(values).unwrap_or_default()
+    let mut buf = Vec::new();
+    for value in values {
+        encode_value_memcomparable(value, &mut buf);
+    }
+    buf
 }
 
 /// Serialize a table schema
@@ -180,16 +338,28 @@ mod tests {
     fn test_encode_pk_values_single() {
         let values = vec![Value::Int32(42)];
         let encoded = encode_pk_values(&values);
-        let decoded: Vec<Value> = bincode::deserialize(&encoded).unwrap();
-        assert_eq!(decoded, values);
+        let types = vec![DataType::Int32];
+        let mut offset = 0;
+        let (decoded, consumed) =
+            decode_value_memcomparable(&encoded[offset..], &types[0]).unwrap();
+        offset += consumed;
+        assert_eq!(offset, encoded.len());
+        assert_eq!(decoded, values[0]);
     }
 
     #[test]
     fn test_encode_pk_values_composite() {
         let values = vec![Value::Int32(1), Value::Text("test".to_string())];
         let encoded = encode_pk_values(&values);
-        let decoded: Vec<Value> = bincode::deserialize(&encoded).unwrap();
-        assert_eq!(decoded, values);
+        let types = vec![DataType::Int32, DataType::Text];
+        let mut offset = 0;
+        let (v1, c1) = decode_value_memcomparable(&encoded[offset..], &types[0]).unwrap();
+        offset += c1;
+        let (v2, c2) = decode_value_memcomparable(&encoded[offset..], &types[1]).unwrap();
+        offset += c2;
+        assert_eq!(offset, encoded.len());
+        assert_eq!(v1, values[0]);
+        assert_eq!(v2, values[1]);
     }
 
     #[test]
@@ -257,5 +427,66 @@ mod tests {
         let key = encode_index_key(1, 2, &values, Some(&pk));
         assert!(key.starts_with(b"i_"));
         assert!(key.len() > encode_index_key(1, 2, &values, None).len());
+    }
+
+    #[test]
+    fn test_memcomparable_int32_ordering() {
+        let key_neg = encode_pk_values(&[Value::Int32(-100)]);
+        let key_zero = encode_pk_values(&[Value::Int32(0)]);
+        let key_pos = encode_pk_values(&[Value::Int32(100)]);
+        assert!(key_neg < key_zero, "negative should be less than zero");
+        assert!(key_zero < key_pos, "zero should be less than positive");
+    }
+
+    #[test]
+    fn test_memcomparable_int64_ordering() {
+        let key_neg = encode_pk_values(&[Value::Int64(-1000)]);
+        let key_zero = encode_pk_values(&[Value::Int64(0)]);
+        let key_pos = encode_pk_values(&[Value::Int64(1000)]);
+        assert!(key_neg < key_zero);
+        assert!(key_zero < key_pos);
+    }
+
+    #[test]
+    fn test_memcomparable_text_ordering() {
+        let key_a = encode_pk_values(&[Value::Text("apple".to_string())]);
+        let key_b = encode_pk_values(&[Value::Text("banana".to_string())]);
+        let key_c = encode_pk_values(&[Value::Text("cherry".to_string())]);
+        assert!(key_a < key_b);
+        assert!(key_b < key_c);
+    }
+
+    #[test]
+    fn test_memcomparable_null_ordering() {
+        let key_null = encode_pk_values(&[Value::Null]);
+        let key_value = encode_pk_values(&[Value::Int32(0)]);
+        assert!(key_null < key_value, "NULL should sort before any value");
+    }
+
+    #[test]
+    fn test_memcomparable_float64_ordering() {
+        let key_neg = encode_pk_values(&[Value::Float64(-1.5)]);
+        let key_zero = encode_pk_values(&[Value::Float64(0.0)]);
+        let key_pos = encode_pk_values(&[Value::Float64(1.5)]);
+        assert!(key_neg < key_zero);
+        assert!(key_zero < key_pos);
+    }
+
+    #[test]
+    fn test_index_key_ordering() {
+        let key1 = encode_index_key(1, 1, &[Value::Int32(-5)], None);
+        let key2 = encode_index_key(1, 1, &[Value::Int32(0)], None);
+        let key3 = encode_index_key(1, 1, &[Value::Int32(5)], None);
+        assert!(key1 < key2);
+        assert!(key2 < key3);
+    }
+
+    #[test]
+    fn test_composite_key_ordering() {
+        let key1 = encode_pk_values(&[Value::Int32(1), Value::Text("a".to_string())]);
+        let key2 = encode_pk_values(&[Value::Int32(1), Value::Text("b".to_string())]);
+        let key3 = encode_pk_values(&[Value::Int32(2), Value::Text("a".to_string())]);
+        assert!(key1 < key2, "same first col, second col determines order");
+        assert!(key2 < key3, "first col determines order");
     }
 }
