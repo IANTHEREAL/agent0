@@ -3,6 +3,7 @@
 mod ddl;
 mod dml;
 mod executor;
+mod executor_join;
 mod executor_procedure;
 mod explain;
 mod expr;
