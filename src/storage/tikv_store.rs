@@ -286,7 +286,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, u32::MAX).await?;
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
         let mut tables = Vec::new();
         for pair in pairs {
             let key: &[u8] = pair.key().as_ref().into();
@@ -471,7 +471,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, u32::MAX).await?;
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
         let mut views = Vec::new();
         for pair in pairs {
             let key: &[u8] = pair.key().as_ref().into();
@@ -527,7 +527,7 @@ impl TikvStore {
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
-        let pairs = txn.scan(range, u32::MAX).await?;
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
         let mut matviews = Vec::new();
         for pair in pairs {
             let key: &[u8] = pair.key().as_ref().into();
