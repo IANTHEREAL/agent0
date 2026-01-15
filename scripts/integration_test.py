@@ -332,6 +332,298 @@ def test_ddl_operations() -> bool:
     return True
 
 
+def test_alter_table_migration() -> bool:
+    log_info("Testing ALTER TABLE migration features...")
+
+    # Cleanup from prior runs
+    run_sql("DROP TABLE IF EXISTS atm_posts")
+    run_sql("DROP TABLE IF EXISTS atm_users")
+    run_sql("DROP TABLE IF EXISTS atm_pk_shift")
+
+    out, code = run_sql(
+        """CREATE TABLE atm_users (
+            id INT PRIMARY KEY,
+            email TEXT,
+            age INT,
+            nickname TEXT,
+            CONSTRAINT atm_users_email_key UNIQUE (email),
+            CONSTRAINT atm_users_age_chk CHECK (age > 0)
+        )"""
+    )
+    if code != 0:
+        log_error("CREATE TABLE (atm_users): FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        "INSERT INTO atm_users (id, email, age) VALUES (1, 'a@example.com', 10)"
+    )
+    if code != 0:
+        log_error("INSERT (atm_users): FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        """CREATE TABLE atm_posts (
+            id INT PRIMARY KEY,
+            user_id INT,
+            CONSTRAINT atm_posts_user_fk FOREIGN KEY (user_id) REFERENCES atm_users (id)
+        )"""
+    )
+    if code != 0:
+        log_error("CREATE TABLE (atm_posts): FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql("INSERT INTO atm_posts (id, user_id) VALUES (1, 1)")
+    if code != 0:
+        log_error("INSERT (atm_posts): FAILED")
+        print(out[:200])
+        return False
+
+    # Rename FK column and ensure FK still enforced.
+    out, code = run_sql("ALTER TABLE atm_posts RENAME COLUMN user_id TO author_id")
+    if code != 0:
+        log_error("RENAME COLUMN (FK column): FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql("INSERT INTO atm_posts (id, author_id) VALUES (2, 999)")
+    if code == 0 or "violates foreign key constraint" not in out.lower():
+        log_error("FK enforcement after RENAME COLUMN: FAILED")
+        print(out[:200])
+        return False
+
+    # Rename column used by CHECK and ensure CHECK expression is rewritten.
+    out, code = run_sql("ALTER TABLE atm_users RENAME COLUMN age TO years")
+    if code != 0:
+        log_error("RENAME COLUMN (CHECK column): FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        "INSERT INTO atm_users (id, email, years) VALUES (2, 'b@example.com', -1)"
+    )
+    if code == 0 or "violates check constraint" not in out.lower() or "atm_users_age_chk" not in out:
+        log_error("CHECK enforcement after RENAME COLUMN: FAILED")
+        print(out[:200])
+        return False
+
+    # RENAME CONSTRAINT should update metadata and error messages.
+    out, code = run_sql(
+        "ALTER TABLE atm_users RENAME CONSTRAINT atm_users_age_chk TO atm_users_years_chk"
+    )
+    if code != 0:
+        log_error("RENAME CONSTRAINT (CHECK): FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        "INSERT INTO atm_users (id, email, years) VALUES (2, 'b@example.com', -1)"
+    )
+    if code == 0 or "atm_users_years_chk" not in out:
+        log_error("CHECK error message after RENAME CONSTRAINT: FAILED")
+        print(out[:200])
+        return False
+
+    # DROP CONSTRAINT should stop enforcing CHECK.
+    out, code = run_sql("ALTER TABLE atm_users DROP CONSTRAINT atm_users_years_chk")
+    if code != 0:
+        log_error("DROP CONSTRAINT (CHECK): FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        "INSERT INTO atm_users (id, email, years) VALUES (2, 'b@example.com', -1)"
+    )
+    if code != 0:
+        log_error("INSERT after DROP CONSTRAINT (CHECK): FAILED")
+        print(out[:200])
+        return False
+
+    # UNIQUE constraint should be enforced, then removable via DROP CONSTRAINT.
+    out, code = run_sql(
+        "INSERT INTO atm_users (id, email, years) VALUES (3, 'b@example.com', 1)"
+    )
+    if code == 0 or "violates unique constraint" not in out.lower() or "atm_users_email_key" not in out:
+        log_error("UNIQUE enforcement: FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql("ALTER TABLE atm_users DROP CONSTRAINT atm_users_email_key")
+    if code != 0:
+        log_error("DROP CONSTRAINT (UNIQUE): FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        "INSERT INTO atm_users (id, email, years) VALUES (3, 'b@example.com', 1)"
+    )
+    if code != 0:
+        log_error("INSERT after DROP CONSTRAINT (UNIQUE): FAILED")
+        print(out[:200])
+        return False
+
+    # DROP CONSTRAINT should stop enforcing FK.
+    out, code = run_sql("ALTER TABLE atm_posts DROP CONSTRAINT atm_posts_user_fk")
+    if code != 0:
+        log_error("DROP CONSTRAINT (FK): FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql("INSERT INTO atm_posts (id, author_id) VALUES (2, 999)")
+    if code != 0:
+        log_error("INSERT after DROP CONSTRAINT (FK): FAILED")
+        print(out[:200])
+        return False
+
+    # ALTER COLUMN DEFAULT should affect missing-column inserts.
+    out, code = run_sql("ALTER TABLE atm_users ALTER COLUMN nickname SET DEFAULT 'anon'")
+    if code != 0:
+        log_error("ALTER COLUMN SET DEFAULT: FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        "INSERT INTO atm_users (id, email, years) VALUES (4, 'd@example.com', 40)"
+    )
+    if code != 0:
+        log_error("INSERT with DEFAULT: FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql("SELECT nickname FROM atm_users WHERE id = 4")
+    if code != 0 or "anon" not in out:
+        log_error("DEFAULT value not applied: FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql("ALTER TABLE atm_users ALTER COLUMN nickname DROP DEFAULT")
+    if code != 0:
+        log_error("ALTER COLUMN DROP DEFAULT: FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        "INSERT INTO atm_users (id, email, years) VALUES (5, 'e@example.com', 50)"
+    )
+    if code != 0:
+        log_error("INSERT after DROP DEFAULT: FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        "SELECT COALESCE(nickname, 'NULL') FROM atm_users WHERE id = 5"
+    )
+    if code != 0 or "NULL" not in out:
+        log_error("DROP DEFAULT not reflected: FAILED")
+        print(out[:200])
+        return False
+
+    # ALTER COLUMN SET NOT NULL should validate existing rows.
+    out, code = run_sql("ALTER TABLE atm_users ALTER COLUMN nickname SET NOT NULL")
+    if code == 0:
+        log_error("ALTER COLUMN SET NOT NULL should fail on existing NULLs: FAILED")
+        return False
+
+    out, code = run_sql("UPDATE atm_users SET nickname = 'x' WHERE nickname IS NULL")
+    if code != 0:
+        log_error("UPDATE to satisfy NOT NULL: FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql("ALTER TABLE atm_users ALTER COLUMN nickname SET NOT NULL")
+    if code != 0:
+        log_error("ALTER COLUMN SET NOT NULL: FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        "INSERT INTO atm_users (id, email, years) VALUES (6, 'f@example.com', 60)"
+    )
+    if code == 0 or "cannot be null" not in out.lower():
+        log_error("NOT NULL enforcement on INSERT: FAILED")
+        print(out[:200])
+        return False
+
+    # ALTER COLUMN TYPE should rewrite and keep UNIQUE indexes consistent.
+    out, code = run_sql("UPDATE atm_users SET years = id * 10")
+    if code != 0:
+        log_error("UPDATE years for UNIQUE test: FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        "ALTER TABLE atm_users ADD CONSTRAINT atm_users_years_key UNIQUE (years)"
+    )
+    if code != 0:
+        log_error("ADD CONSTRAINT (UNIQUE): FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        "INSERT INTO atm_users (id, email, years, nickname) VALUES (6, 'g@example.com', 10, 'x')"
+    )
+    if code == 0 or "violates unique constraint" not in out.lower():
+        log_error("UNIQUE enforcement before TYPE change: FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql("ALTER TABLE atm_users ALTER COLUMN years TYPE BIGINT")
+    if code != 0:
+        log_error("ALTER COLUMN TYPE: FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        "INSERT INTO atm_users (id, email, years, nickname) VALUES (6, 'g@example.com', 10, 'x')"
+    )
+    if code == 0 or "violates unique constraint" not in out.lower():
+        log_error("UNIQUE enforcement after TYPE change: FAILED")
+        print(out[:200])
+        return False
+
+    out, code = run_sql(
+        "INSERT INTO atm_users (id, email, years, nickname) VALUES (6, 'g@example.com', 2147483648, 'x')"
+    )
+    if code != 0:
+        log_error("INSERT BIGINT after TYPE change: FAILED")
+        print(out[:200])
+        return False
+
+    # DROP COLUMN should not corrupt composite PK key encoding.
+    out, code = run_sql(
+        "CREATE TABLE atm_pk_shift (a INT, b INT, c INT, PRIMARY KEY (b, c))"
+    )
+    if code != 0:
+        log_error("CREATE TABLE (atm_pk_shift): FAILED")
+        print(out[:200])
+        return False
+    run_sql("INSERT INTO atm_pk_shift (a, b, c) VALUES (1, 10, 20)")
+    out, code = run_sql("ALTER TABLE atm_pk_shift DROP COLUMN a")
+    if code != 0:
+        log_error("DROP COLUMN (atm_pk_shift): FAILED")
+        print(out[:200])
+        return False
+    out, code = run_sql("DELETE FROM atm_pk_shift WHERE b = 10 AND c = 20")
+    if code != 0:
+        log_error("DELETE after DROP COLUMN (atm_pk_shift): FAILED")
+        print(out[:200])
+        return False
+    out, code = run_sql("SELECT COUNT(*) FROM atm_pk_shift")
+    if code != 0 or re.search(r"\b0\b", out) is None:
+        log_error("Row not deleted after DROP COLUMN (PK shift): FAILED")
+        print(out[:200])
+        return False
+
+    run_sql("DROP TABLE atm_pk_shift")
+    run_sql("DROP TABLE atm_posts")
+    run_sql("DROP TABLE atm_users")
+
+    log_info("ALTER TABLE migration features: PASSED")
+    return True
+
+
 def test_dml_operations() -> bool:
     log_info("Testing DML operations...")
 
@@ -572,6 +864,7 @@ def run_builtin_tests() -> TestStats:
     tests = [
         ("Basic Connection", test_basic_connection),
         ("DDL Operations", test_ddl_operations),
+        ("ALTER TABLE Migration", test_alter_table_migration),
         ("DML Operations", test_dml_operations),
         ("Transactions", test_transactions),
         ("Savepoints", test_savepoints),

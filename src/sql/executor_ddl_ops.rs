@@ -161,13 +161,6 @@ impl Executor {
         name: &ObjectName,
         operation: &AlterTableOperation,
     ) -> Result<ExecuteResult> {
-        let t = name.0.last().unwrap().value.clone();
-        let schema = self
-            .store()
-            .get_schema(txn, &t)
-            .await?
-            .ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
-        let rows = self.scan_and_fill(txn, &t, &schema).await?;
-        ddl::execute_alter_table(&self.store(), txn, name, operation, rows).await
+        ddl::execute_alter_table(&self.store(), txn, name, operation).await
     }
 }

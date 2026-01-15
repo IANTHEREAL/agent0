@@ -326,6 +326,47 @@ impl TikvStore {
         Ok(())
     }
 
+    /// Rename a table by moving its schema metadata key.
+    ///
+    /// This operation does **not** rewrite row or index keys because those are
+    /// keyed by `table_id`, not by table name.
+    ///
+    /// Callers are responsible for updating cross-table references (e.g.
+    /// `foreign_keys[*].ref_table`) if needed.
+    pub async fn rename_table_schema(
+        &self,
+        txn: &mut Transaction,
+        old_table: &str,
+        new_table: &str,
+    ) -> Result<()> {
+        if old_table == new_table {
+            return Ok(());
+        }
+
+        let old_key = self.key(&encode_schema_key(old_table));
+        let new_key = self.key(&encode_schema_key(new_table));
+
+        if txn.get(new_key.clone()).await?.is_some() {
+            return Err(anyhow!("Table '{}' already exists", new_table));
+        }
+
+        let schema_bytes = txn
+            .get(old_key.clone())
+            .await?
+            .ok_or_else(|| anyhow!("Table '{}' does not exist", old_table))?;
+
+        let mut schema = deserialize_schema(&schema_bytes)?;
+        schema.name = new_table.to_string();
+        schema.version = schema
+            .version
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("Schema version overflow"))?;
+
+        txn_put(txn, new_key, serialize_schema(&schema)?).await?;
+        txn_delete(txn, old_key).await?;
+        Ok(())
+    }
+
     /// Create an index entry
     pub async fn create_index_entry(
         &self,
