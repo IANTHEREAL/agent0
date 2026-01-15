@@ -4,14 +4,12 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption, Expr,
-    GeneratedAs, ObjectName, OrderByExpr, Query, TableConstraint,
+    DataType as SqlDataType, GeneratedAs, ObjectName, OrderByExpr, Query, TableConstraint,
 };
 use tikv_client::Transaction;
 
-use super::helpers::{
-    coerce_value_for_column, convert_data_type, fill_row_defaults, infer_data_type, is_serial_type,
-    normalize_ident,
-};
+use super::helpers::{coerce_value_for_column, convert_data_type, fill_row_defaults, infer_data_type, normalize_ident};
+use super::udt;
 use super::{expr::eval_expr, ExecuteResult};
 use crate::storage::TikvStore;
 use crate::types::{
@@ -21,6 +19,45 @@ use crate::types::{
 use crate::txn::{txn_delete, txn_put};
 
 const DDL_SCAN_BATCH_SIZE: u32 = 1024;
+
+async fn resolve_column_data_type(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    sql_type: &SqlDataType,
+) -> Result<(DataType, bool)> {
+    match sql_type {
+        SqlDataType::Custom(name, _) => {
+            let type_ident = name
+                .0
+                .last()
+                .ok_or_else(|| anyhow!("Invalid type name"))?;
+            let type_name = type_ident.value.to_uppercase();
+
+            match type_name.as_str() {
+                "SERIAL" => Ok((DataType::Int32, true)),
+                "BIGSERIAL" => Ok((DataType::Int64, true)),
+                // VECTOR/JSON/JSONB are handled by existing conversion.
+                "VECTOR" | "JSON" | "JSONB" => Ok((convert_data_type(sql_type)?, false)),
+                _ => {
+                    let (_, _, full_name) = udt::resolve_type_name(name)?;
+                    match store.get_type(txn, &full_name).await? {
+                        Some(def) => match def.kind {
+                            crate::types::UserTypeKind::Enum { .. } => {
+                                Ok((DataType::UserDefined(full_name), false))
+                            }
+                            crate::types::UserTypeKind::Composite { .. } => Err(anyhow!(
+                                "composite type '{}' cannot be used as a column type",
+                                full_name
+                            )),
+                        },
+                        None => Ok((convert_data_type(sql_type)?, false)),
+                    }
+                }
+            }
+        }
+        _ => Ok((convert_data_type(sql_type)?, false)),
+    }
+}
 
 struct KvScanBatches {
     next_start: Option<Vec<u8>>,
@@ -334,11 +371,7 @@ pub async fn execute_create_table(
     let mut col_defs = Vec::new();
     for col in columns {
         let col_name = normalize_ident(&col.name);
-        let (data_type, mut is_serial) = if is_serial_type(&col.data_type) {
-            (DataType::Int32, true)
-        } else {
-            (convert_data_type(&col.data_type)?, false)
-        };
+        let (data_type, mut is_serial) = resolve_column_data_type(store, txn, &col.data_type).await?;
 
         let mut is_pk = pk_columns.contains(&col_name);
         let mut nullable = true;
@@ -1029,7 +1062,8 @@ pub async fn execute_alter_table(
             if schema.column_index(&col_name).is_some() {
                 return Err(anyhow!("Column exists"));
             }
-            let data_type = convert_data_type(&column_def.data_type)?;
+            let (data_type, is_serial) =
+                resolve_column_data_type(store, txn, &column_def.data_type).await?;
             let mut nullable = true;
             let mut default_expr = None;
             for opt in &column_def.options {
@@ -1053,7 +1087,7 @@ pub async fn execute_alter_table(
                 nullable,
                 primary_key: false,
                 unique: false,
-                is_serial: false,
+                is_serial,
                 default_expr,
             });
             schema.version += 1;
@@ -1673,7 +1707,7 @@ pub async fn execute_alter_table(
                         ));
                     }
 
-                    let new_type = convert_data_type(data_type)?;
+                    let (new_type, _) = resolve_column_data_type(store, txn, data_type).await?;
                     if schema.columns[col_idx].data_type == new_type {
                         return Ok(ExecuteResult::AlterTable {
                             table_name: result_table_name,

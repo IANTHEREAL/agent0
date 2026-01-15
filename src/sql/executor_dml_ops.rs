@@ -28,6 +28,7 @@ impl Executor {
             .get_schema(txn, &t)
             .await?
             .ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
+        let enum_cache = dml::build_enum_label_cache(&self.store(), txn, &schema).await?;
         let source = source
             .as_ref()
             .ok_or_else(|| anyhow!("INSERT requires VALUES"))?;
@@ -48,7 +49,7 @@ impl Executor {
             dml::validate_check_constraints(&schema, &row)?;
 
             let result =
-                dml::execute_insert_row(&self.store(), txn, &t, &schema, row, on_conflict).await?;
+                dml::execute_insert_row(&self.store(), txn, &t, &schema, row, on_conflict, &enum_cache).await?;
             if let Some(final_row) = result {
                 affected += 1;
                 if let Some(ret_row) = dml::eval_returning_row(returning, &final_row, &schema)? {
@@ -174,6 +175,7 @@ impl Executor {
             .get_schema(txn, &t)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
+        let enum_cache = dml::build_enum_label_cache(&self.store(), txn, &schema).await?;
         if schema.pk_indices.is_empty() {
             return Err(anyhow!("No PK"));
         }
@@ -282,7 +284,7 @@ impl Executor {
             let new_row = Row::new(new_vals);
             dml::validate_check_constraints(&schema, &new_row)?;
             let updated_row =
-                dml::execute_update_row(&self.store(), txn, &t, &schema, r, new_row).await?;
+                dml::execute_update_row(&self.store(), txn, &t, &schema, r, new_row, &enum_cache).await?;
 
             if let Some(ret_row) = dml::eval_returning_row(returning, &updated_row, &schema)? {
                 ret_rows.push(ret_row);

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -11,6 +11,90 @@ use super::expr::eval_expr;
 use super::helpers::{coerce_value_for_column, eval_default_expr};
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+
+pub type EnumLabelCache = HashMap<String, HashSet<String>>;
+
+pub async fn build_enum_label_cache(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    schema: &TableSchema,
+) -> Result<EnumLabelCache> {
+    let mut required_types: HashSet<&str> = HashSet::new();
+    for col in &schema.columns {
+        if let DataType::UserDefined(udt_name) = &col.data_type {
+            required_types.insert(udt_name.as_str());
+        }
+    }
+    if required_types.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut cache: EnumLabelCache = HashMap::new();
+    for udt_name in required_types {
+        let def = store
+            .get_type(txn, udt_name)
+            .await?
+            .ok_or_else(|| anyhow!("Type '{}' does not exist", udt_name))?;
+        match def.kind {
+            crate::types::UserTypeKind::Enum { labels } => {
+                cache.insert(udt_name.to_string(), labels.into_iter().collect());
+            }
+            crate::types::UserTypeKind::Composite { .. } => {
+                return Err(anyhow!(
+                    "composite type '{}' cannot be used as a column type",
+                    udt_name
+                ));
+            }
+        }
+    }
+
+    Ok(cache)
+}
+
+fn validate_enum_values(schema: &TableSchema, row: &Row, cache: &EnumLabelCache) -> Result<()> {
+    if cache.is_empty() {
+        return Ok(());
+    }
+
+    for (idx, col) in schema.columns.iter().enumerate() {
+        let DataType::UserDefined(udt_name) = &col.data_type else {
+            continue;
+        };
+
+        let value = row
+            .values
+            .get(idx)
+            .ok_or_else(|| anyhow!("Row value missing for column '{}'", col.name))?;
+        if matches!(value, Value::Null) {
+            continue;
+        }
+
+        let labels = cache
+            .get(udt_name)
+            .ok_or_else(|| anyhow!("Type '{}' does not exist", udt_name))?;
+
+        match value {
+            Value::Text(s) => {
+                if !labels.contains(s) {
+                    return Err(anyhow!(
+                        "invalid input value for enum {}: \"{}\"",
+                        udt_name,
+                        s
+                    ));
+                }
+            }
+            other => {
+                return Err(anyhow!(
+                    "invalid input value for enum {}: {}",
+                    udt_name,
+                    other
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
 
 fn eval_upsert_expr(
     expr: &Expr,
@@ -120,7 +204,10 @@ pub async fn execute_insert_row(
     schema: &TableSchema,
     row: Row,
     on_conflict: &Option<OnInsert>,
+    enum_cache: &EnumLabelCache,
 ) -> Result<Option<Row>> {
+    validate_enum_values(schema, &row, enum_cache)?;
+
     let pk_values = schema.get_pk_values(&row);
     let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
         vec![DataType::Uuid]
@@ -214,6 +301,7 @@ pub async fn execute_insert_row(
                                             )?;
                                         }
                                         let updated_row = Row::new(updated_vals);
+                                        validate_enum_values(schema, &updated_row, enum_cache)?;
 
                                         store.delete_by_pk(txn, table_name, &pk_values).await?;
                                         store.delete_by_pk(txn, table_name, existing_pk).await?;
@@ -276,6 +364,7 @@ pub async fn execute_insert_row(
                                     )?;
                                 }
                                 let updated_row = Row::new(updated_vals);
+                                validate_enum_values(schema, &updated_row, enum_cache)?;
 
                                 store.delete_by_pk(txn, table_name, &pk_values).await?;
                                 store.delete_by_pk(txn, table_name, existing_pk).await?;
@@ -341,6 +430,7 @@ pub async fn execute_insert_row(
                         )?;
                     }
                     let updated_row = Row::new(updated_vals);
+                    validate_enum_values(schema, &updated_row, enum_cache)?;
                     update_row_indexes(store, txn, schema, existing_row, &updated_row).await?;
                     store.upsert(txn, table_name, updated_row.clone()).await?;
                     Ok(Some(updated_row))
@@ -369,6 +459,7 @@ pub async fn execute_insert_row(
                     )?;
                 }
                 let updated_row = Row::new(updated_vals);
+                validate_enum_values(schema, &updated_row, enum_cache)?;
                 update_row_indexes(store, txn, schema, existing_row, &updated_row).await?;
                 store.upsert(txn, table_name, updated_row.clone()).await?;
                 Ok(Some(updated_row))
@@ -573,9 +664,18 @@ async fn cascade_delete_recursive(
                 store.delete_by_pk(txn, other_table, &del_pk).await?;
             }
 
+            let enum_cache = build_enum_label_cache(store, txn, other_schema).await?;
             for (old_row, new_row) in rows_to_update {
-                execute_update_row(store, txn, other_table, other_schema, &old_row, new_row)
-                    .await?;
+                execute_update_row(
+                    store,
+                    txn,
+                    other_table,
+                    other_schema,
+                    &old_row,
+                    new_row,
+                    &enum_cache,
+                )
+                .await?;
             }
         }
     }
@@ -693,6 +793,7 @@ pub async fn handle_foreign_key_on_update(
                 }
             }
 
+            let enum_cache = build_enum_label_cache(store, txn, &other_schema).await?;
             for (old_child_row, new_child_row) in rows_to_update {
                 Box::pin(execute_update_row(
                     store,
@@ -701,6 +802,7 @@ pub async fn handle_foreign_key_on_update(
                     &other_schema,
                     &old_child_row,
                     new_child_row,
+                    &enum_cache,
                 ))
                 .await?;
             }
@@ -743,7 +845,10 @@ pub async fn execute_update_row(
     schema: &TableSchema,
     old_row: &Row,
     new_row: Row,
+    enum_cache: &EnumLabelCache,
 ) -> Result<Row> {
+    validate_enum_values(schema, &new_row, enum_cache)?;
+
     if !schema.foreign_keys.is_empty() {
         validate_foreign_keys(store, txn, schema, &new_row).await?;
     }
@@ -1026,4 +1131,80 @@ pub fn build_update_join_context<'a>(
     let combined_row = Row::new(combined_values);
 
     (combined_schema, combined_row, column_offsets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn enum_schema() -> TableSchema {
+        TableSchema {
+            name: "t".to_string(),
+            table_id: 1,
+            columns: vec![ColumnDef {
+                name: "r".to_string(),
+                data_type: DataType::UserDefined("public.role".to_string()),
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+        }
+    }
+
+    fn enum_cache() -> EnumLabelCache {
+        let mut cache: EnumLabelCache = HashMap::new();
+        cache.insert(
+            "public.role".to_string(),
+            ["USER", "ADMIN"].into_iter().map(|s| s.to_string()).collect(),
+        );
+        cache
+    }
+
+    #[test]
+    fn enum_validation_allows_null() {
+        let schema = enum_schema();
+        let cache = enum_cache();
+        let row = Row::new(vec![Value::Null]);
+        validate_enum_values(&schema, &row, &cache).unwrap();
+    }
+
+    #[test]
+    fn enum_validation_rejects_unknown_label() {
+        let schema = enum_schema();
+        let cache = enum_cache();
+        let row = Row::new(vec![Value::Text("INVALID".to_string())]);
+        let err = validate_enum_values(&schema, &row, &cache).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid input value for enum public.role"));
+    }
+
+    #[test]
+    fn enum_validation_is_case_sensitive() {
+        let schema = enum_schema();
+        let cache = enum_cache();
+        let row = Row::new(vec![Value::Text("user".to_string())]);
+        let err = validate_enum_values(&schema, &row, &cache).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid input value for enum public.role"));
+    }
+
+    #[test]
+    fn enum_validation_requires_text() {
+        let schema = enum_schema();
+        let cache = enum_cache();
+        let row = Row::new(vec![Value::Int32(1)]);
+        let err = validate_enum_values(&schema, &row, &cache).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid input value for enum public.role"));
+    }
 }

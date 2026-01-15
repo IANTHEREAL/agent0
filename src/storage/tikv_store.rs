@@ -1,5 +1,5 @@
 use super::encoding::*;
-use crate::types::{DataType, Row, TableSchema, Value};
+use crate::types::{DataType, Row, TableSchema, UserTypeDef, Value};
 use crate::txn::{txn_delete, txn_put};
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
@@ -95,6 +95,26 @@ impl TikvStore {
     pub async fn next_table_id(&self, txn: &mut Transaction) -> Result<u64> {
         self.increment_sys_key(txn, encode_next_table_id_key())
             .await
+    }
+
+    pub async fn next_type_oid(&self, txn: &mut Transaction) -> Result<u32> {
+        const FIRST_USER_TYPE_OID: u32 = 20000;
+
+        let key = self.key(&encode_next_type_oid_key());
+        let current = txn.get(key.clone()).await?;
+        let next_val = match current {
+            Some(data) => {
+                let oid = u32::from_be_bytes(
+                    data.try_into()
+                        .map_err(|_| anyhow!("Invalid type OID format"))?,
+                );
+                oid.checked_add(1)
+                    .ok_or_else(|| anyhow!("Type OID overflow"))?
+            }
+            None => FIRST_USER_TYPE_OID,
+        };
+        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
+        Ok(next_val)
     }
 
     pub async fn next_sequence_value(&self, txn: &mut Transaction, table_id: u64) -> Result<i32> {
@@ -233,7 +253,7 @@ impl TikvStore {
         let pairs: Vec<_> = txn.scan(range, SCAN_LIMIT).await?.collect();
         let mut rows = Vec::new();
         for pair in pairs {
-            let row = deserialize_row(&pair.value())?;
+            let row = deserialize_row(pair.value())?;
             rows.push(row);
         }
         debug!("Scanned {} rows from '{}'", rows.len(), table_name);
@@ -296,6 +316,57 @@ impl TikvStore {
             }
         }
         Ok(tables)
+    }
+
+    pub async fn create_type(&self, txn: &mut Transaction, def: UserTypeDef) -> Result<()> {
+        let full_name = format!("{}.{}", def.schema, def.name);
+        let key = self.key(&encode_type_key(&full_name));
+        if txn.get(key.clone()).await?.is_some() {
+            return Err(anyhow!("Type '{}' already exists", full_name));
+        }
+        let data = bincode::serialize(&def).context("Failed to serialize type definition")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
+    pub async fn get_type(
+        &self,
+        txn: &mut Transaction,
+        full_name: &str,
+    ) -> Result<Option<UserTypeDef>> {
+        let key = self.key(&encode_type_key(full_name));
+        match txn.get(key).await? {
+            Some(data) => Ok(Some(
+                bincode::deserialize(&data).context("Failed to deserialize type definition")?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_types(&self, txn: &mut Transaction) -> Result<Vec<UserTypeDef>> {
+        let prefix = encode_type_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut types = Vec::new();
+        for pair in pairs {
+            let def: UserTypeDef =
+                bincode::deserialize(pair.value()).context("Failed to deserialize type")?;
+            types.push(def);
+        }
+        Ok(types)
+    }
+
+    pub async fn drop_type(&self, txn: &mut Transaction, full_name: &str) -> Result<bool> {
+        let key = self.key(&encode_type_key(full_name));
+        if txn.get(key.clone()).await?.is_some() {
+            txn_delete(txn, key).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// Truncate a table

@@ -133,12 +133,10 @@ fn find_keyword_outside_strings(query: &str, keyword: &str) -> Option<usize> {
             in_double_quote = !in_double_quote;
         }
 
-        if !in_single_quote && !in_double_quote {
-            if i + keyword_chars.len() <= chars.len() {
-                let slice: String = chars[i..i + keyword_chars.len()].iter().collect();
-                if slice == keyword {
-                    return Some(i);
-                }
+        if !in_single_quote && !in_double_quote && i + keyword_chars.len() <= chars.len() {
+            let slice: String = chars[i..i + keyword_chars.len()].iter().collect();
+            if slice == keyword {
+                return Some(i);
             }
         }
 
@@ -255,7 +253,7 @@ impl DynamicPgHandler {
                         let mut col = col.trim();
                         // Handle "table.column" or just "column"
                         if let Some(dot_pos) = col.rfind('.') {
-                            col = &col[dot_pos + 1..].trim();
+                            col = col[dot_pos + 1..].trim();
                         }
                         // Strip quotes from column name if present
                         if (col.starts_with('"') && col.ends_with('"'))
@@ -1871,9 +1869,11 @@ fn datatype_to_pgtype(dt: Option<&DataType>) -> Type {
         Some(DataType::Json) => Type::JSON,
         Some(DataType::Jsonb) => Type::JSONB,
         Some(DataType::Time) => Type::TIME,
-        Some(DataType::Vector(_)) | Some(DataType::Array(_)) | Some(DataType::Text) | None => {
-            Type::TEXT
-        }
+        Some(DataType::Vector(_))
+        | Some(DataType::Array(_))
+        | Some(DataType::Text)
+        | Some(DataType::UserDefined(_))
+        | None => Type::TEXT,
     }
 }
 

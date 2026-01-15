@@ -8,6 +8,7 @@ use super::helpers::{
 };
 use super::query;
 use super::rbac;
+use super::udt;
 use super::{expr::eval_expr, parse_sql, ExecuteResult, Session};
 use crate::auth::AuthManager;
 use crate::storage::TikvStore;
@@ -72,6 +73,25 @@ impl Executor {
 
             if sql_upper.starts_with("CREATE PROCEDURE") {
                 return self.execute_create_procedure_cmd(session, sql).await;
+            }
+
+            if sql_upper.starts_with("CREATE TYPE") {
+                let mut prev = "";
+                let mut is_enum = false;
+                for token in sql_upper.split_whitespace() {
+                    if prev == "AS" && token.starts_with("ENUM") {
+                        is_enum = true;
+                        break;
+                    }
+                    prev = token;
+                }
+                if is_enum {
+                    return self.execute_create_type_enum_cmd(session, sql).await;
+                }
+            }
+
+            if sql_upper.starts_with("DROP TYPE") {
+                return self.execute_drop_type_cmd(session, sql).await;
             }
 
             let statements = match parse_sql(sql) {
@@ -278,9 +298,10 @@ impl Executor {
             | Statement::SetTimeZone { .. }
             | Statement::SetNames { .. }
             | Statement::SetTransaction { .. } => Ok(ExecuteResult::Empty),
-            Statement::CreateType { .. } | Statement::CreateFunction { .. } => {
-                Ok(ExecuteResult::Empty)
+            Statement::CreateType { name, representation } => {
+                udt::execute_create_type(&self.store, txn, name, representation).await
             }
+            Statement::CreateFunction { .. } => Ok(ExecuteResult::Empty),
             Statement::CreateProcedure {
                 name, params, body, ..
             } => {

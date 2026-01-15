@@ -827,12 +827,6 @@ pub fn get_unsupported_reason(sql_upper: &str) -> Option<String> {
     if sql_upper.starts_with("ALTER TABLE") && sql_upper.contains("OWNER TO") {
         return Some("ALTER TABLE OWNER TO not supported".into());
     }
-    if sql_upper.starts_with("CREATE TYPE") && sql_upper.contains("AS ENUM") {
-        return Some("CREATE TYPE AS ENUM not supported".into());
-    }
-    if sql_upper.starts_with("CREATE TYPE") && sql_upper.contains("AS (") {
-        return Some("CREATE TYPE AS composite not supported".into());
-    }
     if sql_upper.contains("$_$") || sql_upper.contains("$$") {
         return Some("Dollar-quoted strings not supported".into());
     }
@@ -843,20 +837,6 @@ pub fn get_unsupported_reason(sql_upper: &str) -> Option<String> {
         return Some("GIST index not supported".into());
     }
     None
-}
-
-/// Check if a SQL data type is a SERIAL type
-pub fn is_serial_type(sql_type: &SqlDataType) -> bool {
-    match sql_type {
-        SqlDataType::Custom(name, _) => {
-            if let Some(ident) = name.0.last() {
-                ident.value.eq_ignore_ascii_case("SERIAL")
-            } else {
-                false
-            }
-        }
-        _ => false,
-    }
 }
 
 pub fn get_select_item_name(item: &sqlparser::ast::SelectItem) -> String {
@@ -1342,7 +1322,7 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
                 Value::Text(unescaped)
             }
         }
-        DataType::Text | DataType::Interval => Value::Text(unescaped),
+        DataType::Text | DataType::Interval | DataType::UserDefined(_) => Value::Text(unescaped),
         DataType::Array(_) => {
             if let Ok(arr) = parse_pg_array(&unescaped) {
                 Value::Array(arr)

@@ -17,11 +17,11 @@ pub enum DataType {
     Uuid,
     Array(Box<DataType>),
     Vector(u32), // dimension count
-    // NOTE: Json and Jsonb MUST remain at end of enum to preserve bincode compatibility
-    // with existing serialized schemas. Do not reorder!
+    // NOTE: Do not reorder variants; append only to preserve bincode compatibility.
     Json,
     Jsonb,
     Time, // Time of day (microseconds since midnight)
+    UserDefined(String),
 }
 
 impl DataType {
@@ -41,6 +41,7 @@ impl DataType {
             DataType::Json => 64,
             DataType::Jsonb => 64,
             DataType::Time => 8,
+            DataType::UserDefined(_) => 32,
         }
     }
 }
@@ -62,6 +63,7 @@ impl fmt::Display for DataType {
             DataType::Json => write!(f, "JSON"),
             DataType::Jsonb => write!(f, "JSONB"),
             DataType::Time => write!(f, "TIME"),
+            DataType::UserDefined(name) => write!(f, "{name}"),
         }
     }
 }
@@ -288,7 +290,7 @@ impl TableSchema {
     }
 
     // Helper to get Index values
-    pub fn get_index_values<'a>(&self, index: &IndexDef, row: &'a Row) -> Vec<Value> {
+    pub fn get_index_values(&self, index: &IndexDef, row: &Row) -> Vec<Value> {
         let mut values = Vec::new();
         for col_name in &index.columns {
             if let Some(idx) = self.column_index(col_name) {
@@ -312,4 +314,19 @@ impl Row {
     pub fn new(values: Vec<Value>) -> Self {
         Self { values }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum UserTypeKind {
+    Enum { labels: Vec<String> },
+    Composite { fields: Vec<(String, DataType)> },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserTypeDef {
+    pub oid: u32,
+    pub schema: String,
+    pub name: String,
+    pub kind: UserTypeKind,
+    pub owner: String,
 }

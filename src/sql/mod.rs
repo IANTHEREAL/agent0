@@ -10,6 +10,7 @@ mod executor_join;
 mod executor_procedure;
 mod executor_select;
 mod executor_subquery;
+mod executor_udt_cmd;
 mod explain;
 mod expr;
 mod helpers;
@@ -19,6 +20,7 @@ mod planner;
 mod query;
 mod rbac;
 mod result;
+mod udt;
 mod window;
 
 pub use executor::*;

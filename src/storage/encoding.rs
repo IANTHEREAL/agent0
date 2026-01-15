@@ -15,10 +15,12 @@ use memcomparable::Deserializer;
 
 /// System key prefixes
 const SYS_NEXT_TABLE_ID: &[u8] = b"_sys_next_table_id";
+const SYS_NEXT_TYPE_OID: &[u8] = b"_sys_next_type_oid";
 const SYS_SCHEMA_PREFIX: &[u8] = b"_sys_schema_";
 const SYS_VIEW_PREFIX: &[u8] = b"_sys_view_";
 const SYS_MATVIEW_PREFIX: &[u8] = b"_sys_matview_";
 const SYS_PROCEDURE_PREFIX: &[u8] = b"_sys_proc_";
+const SYS_TYPE_PREFIX: &[u8] = b"_sys_type_";
 const TABLE_DATA_PREFIX: &[u8] = b"t_";
 const TABLE_INDEX_PREFIX: &[u8] = b"i_";
 
@@ -27,11 +29,29 @@ pub fn encode_next_table_id_key() -> Vec<u8> {
     SYS_NEXT_TABLE_ID.to_vec()
 }
 
+/// Encode the system key for next type OID (user-defined types)
+pub fn encode_next_type_oid_key() -> Vec<u8> {
+    SYS_NEXT_TYPE_OID.to_vec()
+}
+
 /// Encode the schema key for a table
 pub fn encode_schema_key(table_name: &str) -> Vec<u8> {
     let mut key = SYS_SCHEMA_PREFIX.to_vec();
     key.extend_from_slice(table_name.as_bytes());
     key
+}
+
+/// Encode the key for a user-defined type definition.
+///
+/// `full_name` should be `schema.name` (e.g. `public.role`).
+pub fn encode_type_key(full_name: &str) -> Vec<u8> {
+    let mut key = SYS_TYPE_PREFIX.to_vec();
+    key.extend_from_slice(full_name.as_bytes());
+    key
+}
+
+pub fn encode_type_prefix() -> Vec<u8> {
+    SYS_TYPE_PREFIX.to_vec()
 }
 
 pub fn encode_view_key(view_name: &str) -> Vec<u8> {
@@ -202,7 +222,7 @@ pub fn decode_value_memcomparable(data: &[u8], data_type: &DataType) -> Result<(
             let v: f64 = serde::Deserialize::deserialize(&mut deserializer)?;
             (Value::Float64(v), deserializer.position())
         }
-        DataType::Text => {
+        DataType::Text | DataType::UserDefined(_) => {
             let v: String = serde::Deserialize::deserialize(&mut deserializer)?;
             (Value::Text(v), deserializer.position())
         }

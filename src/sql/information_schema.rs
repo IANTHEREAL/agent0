@@ -22,6 +22,7 @@ pub fn is_information_schema_table(table_name: &str) -> bool {
                 | "check_constraints"
                 | "pg_range"
                 | "pg_type"
+                | "pg_enum"
                 | "pg_class"
                 | "pg_index"
                 | "pg_attribute"
@@ -54,6 +55,7 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
         return Some(match name {
             "pg_range" => "pg_range",
             "pg_type" => "pg_type",
+            "pg_enum" => "pg_enum",
             "pg_class" => "pg_class",
             "pg_index" => "pg_index",
             "pg_attribute" => "pg_attribute",
@@ -78,6 +80,7 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
         "pg_constraint" => Some("pg_constraint"),
         "pg_am" => Some("pg_am"),
         "pg_indexes" => Some("pg_indexes"),
+        "pg_enum" => Some("pg_enum"),
         _ => None,
     }
 }
@@ -98,6 +101,18 @@ fn int_col(name: &str) -> ColumnDef {
     ColumnDef {
         name: name.to_string(),
         data_type: DataType::Int64,
+        nullable: true,
+        primary_key: false,
+        unique: false,
+        is_serial: false,
+        default_expr: None,
+    }
+}
+
+fn float_col(name: &str) -> ColumnDef {
+    ColumnDef {
+        name: name.to_string(),
+        data_type: DataType::Float64,
         nullable: true,
         primary_key: false,
         unique: false,
@@ -392,6 +407,24 @@ fn pg_type_schema() -> TableSchema {
     }
 }
 
+fn pg_enum_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_enum".to_string(),
+        columns: vec![
+            int_col("oid"),
+            int_col("enumtypid"),
+            float_col("enumsortorder"),
+            text_col("enumlabel"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
 fn pg_class_schema() -> TableSchema {
     TableSchema {
         table_id: 0,
@@ -596,6 +629,7 @@ pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
         "check_constraints" => Some(check_constraints_schema()),
         "pg_range" => Some(pg_range_schema()),
         "pg_type" => Some(pg_type_schema()),
+        "pg_enum" => Some(pg_enum_schema()),
         "pg_class" => Some(pg_class_schema()),
         "pg_index" => Some(pg_index_schema()),
         "pg_attribute" => Some(pg_attribute_schema()),
@@ -630,6 +664,7 @@ fn data_type_to_pg_type(dt: &DataType) -> &'static str {
         DataType::Jsonb => "jsonb",
         DataType::Vector(_) => "vector",
         DataType::Time => "time without time zone",
+        DataType::UserDefined(_) => "character varying",
     }
 }
 
@@ -643,6 +678,10 @@ fn null_val() -> Value {
 
 fn int_val(i: i64) -> Value {
     Value::Int64(i)
+}
+
+fn float_val(f: f64) -> Value {
+    Value::Float64(f)
 }
 
 pub async fn get_information_schema_data(
@@ -675,7 +714,8 @@ pub async fn get_information_schema_data(
         }
         "check_constraints" => get_check_constraints_rows(store, txn, &user_tables).await?,
         "pg_range" => vec![], // No range types defined
-        "pg_type" => get_pg_type_rows(),
+        "pg_type" => get_pg_type_rows(store, txn).await?,
+        "pg_enum" => get_pg_enum_rows(store, txn).await?,
         "pg_namespace" => get_pg_namespace_rows(),
         "pg_class" => get_pg_class_rows(store, txn, &user_tables).await?,
         "pg_index" => get_pg_index_rows(store, txn, &user_tables).await?,
@@ -778,7 +818,17 @@ async fn get_columns_rows(
     for table_name in user_tables {
         if let Some(schema) = store.get_schema(txn, table_name).await? {
             for (i, col) in schema.columns.iter().enumerate() {
-                let pg_type = data_type_to_pg_type(&col.data_type);
+                let (data_type_str, udt_schema, udt_name) = match &col.data_type {
+                    DataType::UserDefined(full_udt) => {
+                        let (schema_name, type_name) =
+                            full_udt.rsplit_once('.').unwrap_or(("public", full_udt.as_str()));
+                        ("USER-DEFINED", schema_name, type_name)
+                    }
+                    _ => {
+                        let pg_type = data_type_to_pg_type(&col.data_type);
+                        (pg_type, "pg_catalog", pg_type)
+                    }
+                };
                 let is_nullable = if col.nullable { "YES" } else { "NO" };
                 let ordinal = (i + 1) as i64;
 
@@ -810,7 +860,7 @@ async fn get_columns_rows(
                     int_val(ordinal),
                     column_default,
                     text_val(is_nullable),
-                    text_val(pg_type),
+                    text_val(data_type_str),
                     char_max_len,
                     null_val(),
                     num_precision,
@@ -829,8 +879,8 @@ async fn get_columns_rows(
                     null_val(),
                     null_val(),
                     text_val("postgres"),
-                    text_val("pg_catalog"),
-                    text_val(pg_type),
+                    text_val(udt_schema),
+                    text_val(udt_name),
                     null_val(),
                     null_val(),
                     null_val(),
@@ -1407,27 +1457,37 @@ async fn get_pg_attribute_rows(
             table_oid += 1 + num_indexes as i64;
 
             for (i, col) in schema.columns.iter().enumerate() {
-                let type_oid = match col.data_type {
-                    DataType::Boolean => 16,
-                    DataType::Int32 => 23,
-                    DataType::Int64 => 20,
-                    DataType::Float64 => 701,
-                    DataType::Text => 25,
-                    DataType::Bytes => 17,
-                    DataType::Timestamp => 1114,
-                    DataType::Uuid => 2950,
-                    DataType::Json => 114,
-                    DataType::Jsonb => 3802,
-                    DataType::Vector(_) => 16385, // Custom OID for vector
-                    _ => 25,                      // Default to text
-                };
+                let (type_oid, attlen) = if let DataType::UserDefined(udt_name) = &col.data_type {
+                    let oid = store
+                        .get_type(txn, udt_name)
+                        .await?
+                        .map(|t| t.oid as i64)
+                        .unwrap_or(25);
+                    (oid, 4)
+                } else {
+                    let oid = match col.data_type {
+                        DataType::Boolean => 16,
+                        DataType::Int32 => 23,
+                        DataType::Int64 => 20,
+                        DataType::Float64 => 701,
+                        DataType::Text => 25,
+                        DataType::Bytes => 17,
+                        DataType::Timestamp => 1114,
+                        DataType::Uuid => 2950,
+                        DataType::Json => 114,
+                        DataType::Jsonb => 3802,
+                        DataType::Vector(_) => 16385, // Custom OID for vector
+                        _ => 25,                      // Default to text
+                    };
 
-                let attlen = match col.data_type {
-                    DataType::Boolean => 1,
-                    DataType::Int32 => 4,
-                    DataType::Int64 => 8,
-                    DataType::Float64 => 8,
-                    _ => -1, // Variable length
+                    let len = match col.data_type {
+                        DataType::Boolean => 1,
+                        DataType::Int32 => 4,
+                        DataType::Int64 => 8,
+                        DataType::Float64 => 8,
+                        _ => -1, // Variable length
+                    };
+                    (oid, len)
                 };
 
                 rows.push(Row::new(vec![
@@ -1664,9 +1724,20 @@ async fn get_pg_constraint_rows(
     Ok(rows)
 }
 
-fn get_pg_type_rows() -> Vec<Row> {
+fn schema_oid(schema: &str) -> i64 {
+    match schema {
+        "pg_catalog" => 11,
+        "public" => 2200,
+        "information_schema" => 13222,
+        _ => 2200,
+    }
+}
+
+async fn get_pg_type_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+
     // Return the vector type so ORMs can discover it
-    vec![Row::new(vec![
+    rows.push(Row::new(vec![
         int_val(16385),     // oid: custom type OID for vector
         text_val("vector"), // typname
         int_val(11),        // typnamespace: pg_catalog (OID 11)
@@ -1681,7 +1752,64 @@ fn get_pg_type_rows() -> Vec<Row> {
         int_val(0),         // typrelid: not a composite type
         int_val(0),         // typelem: not an array
         int_val(0),         // typarray: no array type
-    ])]
+    ]));
+
+    let mut user_types = store.list_types(txn).await?;
+    user_types.sort_by_key(|t| t.oid);
+    for def in user_types {
+        let (typlen, typbyval, typtype, typcategory) = match def.kind {
+            crate::types::UserTypeKind::Enum { .. } => (4, "t", "e", "E"),
+            crate::types::UserTypeKind::Composite { .. } => (-1, "f", "c", "C"),
+        };
+
+        rows.push(Row::new(vec![
+            int_val(def.oid as i64),
+            text_val(&def.name),
+            int_val(schema_oid(&def.schema)),
+            int_val(10),
+            int_val(typlen),
+            text_val(typbyval),
+            text_val(typtype),
+            text_val(typcategory),
+            text_val("f"),
+            text_val("t"),
+            text_val(","),
+            int_val(0),
+            int_val(0),
+            int_val(0),
+        ]));
+    }
+
+    Ok(rows)
+}
+
+async fn get_pg_enum_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+
+    let mut user_types = store.list_types(txn).await?;
+    user_types.sort_by_key(|t| t.oid);
+
+    for def in user_types {
+        let crate::types::UserTypeKind::Enum { labels } = def.kind else {
+            continue;
+        };
+
+        for (i, label) in labels.iter().enumerate() {
+            let enum_oid = (def.oid as i64)
+                .checked_mul(1_000_000)
+                .and_then(|v| v.checked_add(i as i64 + 1))
+                .ok_or_else(|| anyhow!("pg_enum oid overflow"))?;
+
+            rows.push(Row::new(vec![
+                int_val(enum_oid),
+                int_val(def.oid as i64),
+                float_val((i + 1) as f64),
+                text_val(label),
+            ]));
+        }
+    }
+
+    Ok(rows)
 }
 
 fn get_pg_proc_rows() -> Vec<Row> {
