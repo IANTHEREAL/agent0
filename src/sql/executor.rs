@@ -4,7 +4,7 @@ use super::ddl;
 use super::explain;
 use super::helpers::{
     eval_default_expr, fill_row_defaults, get_expr_name, get_skip_reason, get_unsupported_reason,
-    parse_value_for_copy,
+    normalize_ident, parse_value_for_copy,
 };
 use super::query;
 use super::rbac;
@@ -45,95 +45,116 @@ impl Executor {
     /// Execute a SQL statement string using the provided session
     /// Supports multiple statements separated by semicolons (e.g., "BEGIN; UPDATE...; COMMIT;")
     pub async fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecuteResult> {
-        let sql_upper = sql.trim().to_uppercase();
-        if let Some(reason) = get_skip_reason(&sql_upper) {
-            return Ok(ExecuteResult::Skipped { message: reason });
-        }
-
-        if sql_upper.starts_with("REFRESH MATERIALIZED VIEW") {
-            return self
-                .execute_refresh_materialized_view_cmd(session, sql)
-                .await;
-        }
-
-        if sql_upper.starts_with("DROP MATERIALIZED VIEW") {
-            return self.execute_drop_materialized_view_cmd(session, sql).await;
-        }
-
-        if sql_upper.starts_with("CALL ") {
-            return self.execute_call_cmd(session, sql).await;
-        }
-
-        if sql_upper.starts_with("DROP PROCEDURE") {
-            return self.execute_drop_procedure_cmd(session, sql).await;
-        }
-
-        if sql_upper.starts_with("CREATE PROCEDURE") {
-            return self.execute_create_procedure_cmd(session, sql).await;
-        }
-
-        let statements = match parse_sql(sql) {
-            Ok(stmts) => stmts,
-            Err(e) => {
-                if let Some(reason) = get_unsupported_reason(&sql_upper) {
-                    return Ok(ExecuteResult::Skipped { message: reason });
-                }
-                return Err(e);
+        let savepoints = session.savepoints();
+        crate::txn::with_savepoints(savepoints, async {
+            let sql_upper = sql.trim().to_uppercase();
+            if let Some(reason) = get_skip_reason(&sql_upper) {
+                return Ok(ExecuteResult::Skipped { message: reason });
             }
-        };
 
-        if statements.is_empty() {
-            return Ok(ExecuteResult::Empty);
-        }
-
-        // Execute all statements in order, returning the result of the last one
-        let mut last_result = ExecuteResult::Empty;
-
-        for stmt in &statements {
-            debug!("Executing statement: {:?}", stmt);
-
-            last_result = match stmt {
-                // Transaction Control
-                Statement::StartTransaction { .. } => {
-                    session.begin().await?;
-                    ExecuteResult::Empty
-                }
-                Statement::Commit { .. } => {
-                    session.commit().await?;
-                    ExecuteResult::Empty
-                }
-                Statement::Rollback { .. } => {
-                    session.rollback().await?;
-                    ExecuteResult::Empty
-                }
-                // DDL/DML - delegated to session transaction management
-                _ => {
-                    let is_autocommit = !session.is_in_transaction();
-
-                    if is_autocommit {
-                        session.begin().await?;
-                    }
-
-                    let res = async {
-                        let txn = session.get_mut_txn().expect("Transaction must be active");
-                        self.execute_statement_on_txn(txn, stmt).await
-                    }
+            if sql_upper.starts_with("REFRESH MATERIALIZED VIEW") {
+                return self
+                    .execute_refresh_materialized_view_cmd(session, sql)
                     .await;
+            }
 
-                    if is_autocommit {
-                        if res.is_ok() {
-                            session.commit().await?;
-                        } else {
-                            session.rollback().await?;
-                        }
+            if sql_upper.starts_with("DROP MATERIALIZED VIEW") {
+                return self.execute_drop_materialized_view_cmd(session, sql).await;
+            }
+
+            if sql_upper.starts_with("CALL ") {
+                return self.execute_call_cmd(session, sql).await;
+            }
+
+            if sql_upper.starts_with("DROP PROCEDURE") {
+                return self.execute_drop_procedure_cmd(session, sql).await;
+            }
+
+            if sql_upper.starts_with("CREATE PROCEDURE") {
+                return self.execute_create_procedure_cmd(session, sql).await;
+            }
+
+            let statements = match parse_sql(sql) {
+                Ok(stmts) => stmts,
+                Err(e) => {
+                    if let Some(reason) = get_unsupported_reason(&sql_upper) {
+                        return Ok(ExecuteResult::Skipped { message: reason });
                     }
-
-                    res?
+                    return Err(e);
                 }
             };
-        }
 
-        Ok(last_result)
+            if statements.is_empty() {
+                return Ok(ExecuteResult::Empty);
+            }
+
+            // Execute all statements in order, returning the result of the last one
+            let mut last_result = ExecuteResult::Empty;
+
+            for stmt in &statements {
+                debug!("Executing statement: {:?}", stmt);
+
+                last_result = match stmt {
+                    // Transaction Control
+                    Statement::StartTransaction { .. } => {
+                        session.begin().await?;
+                        ExecuteResult::Empty
+                    }
+                    Statement::Commit { .. } => {
+                        session.commit().await?;
+                        ExecuteResult::Empty
+                    }
+                    Statement::Savepoint { name } => {
+                        session.create_savepoint(normalize_ident(name))?;
+                        ExecuteResult::Empty
+                    }
+                    Statement::ReleaseSavepoint { name } => {
+                        let sp = normalize_ident(name);
+                        session.release_savepoint(&sp)?;
+                        ExecuteResult::Empty
+                    }
+                    Statement::Rollback {
+                        savepoint: Some(name),
+                        ..
+                    } => {
+                        let sp = normalize_ident(name);
+                        session.rollback_to_savepoint(&sp).await?;
+                        ExecuteResult::Empty
+                    }
+                    Statement::Rollback { savepoint: None, .. } => {
+                        session.rollback().await?;
+                        ExecuteResult::Empty
+                    }
+                    // DDL/DML - delegated to session transaction management
+                    _ => {
+                        let is_autocommit = !session.is_in_transaction();
+
+                        if is_autocommit {
+                            session.begin().await?;
+                        }
+
+                        let res = async {
+                            let txn = session.get_mut_txn().expect("Transaction must be active");
+                            self.execute_statement_on_txn(txn, stmt).await
+                        }
+                        .await;
+
+                        if is_autocommit {
+                            if res.is_ok() {
+                                session.commit().await?;
+                            } else {
+                                session.rollback().await?;
+                            }
+                        }
+
+                        res?
+                    }
+                };
+            }
+
+            Ok(last_result)
+        })
+        .await
     }
 
     /// Execute a parsed SQL statement on a given transaction

@@ -390,6 +390,111 @@ def test_transactions() -> bool:
     return True
 
 
+def test_savepoints() -> bool:
+    log_info("Testing savepoints...")
+
+    run_sql("DROP TABLE IF EXISTS test_savepoints")
+    run_sql("CREATE TABLE test_savepoints (id INTEGER PRIMARY KEY, value INTEGER)")
+    run_sql("INSERT INTO test_savepoints VALUES (1, 100)")
+
+    # NOTE: pg-tikv currently returns only the result of the last statement in
+    # a multi-statement simple query, so we validate savepoint semantics by
+    # checking the final persisted state after COMMIT.
+
+    # ROLLBACK TO SAVEPOINT should revert changes.
+    out, code = run_sql(
+        "BEGIN; SAVEPOINT a; UPDATE test_savepoints SET value = 200 WHERE id = 1; ROLLBACK TO a; COMMIT;"
+    )
+    if code != 0:
+        log_error("ROLLBACK TO SAVEPOINT: FAILED")
+        print(out[:200])
+        return False
+    result, _ = run_sql("SELECT value FROM test_savepoints WHERE id = 1")
+    if "100" not in result:
+        log_error("ROLLBACK TO SAVEPOINT: FAILED (expected 100)")
+        print(result[:200])
+        return False
+    log_info("ROLLBACK TO SAVEPOINT: PASSED")
+
+    # ROLLBACK TO should re-establish the savepoint (can rollback twice).
+    run_sql("UPDATE test_savepoints SET value = 100 WHERE id = 1")
+    out, code = run_sql(
+        "BEGIN; SAVEPOINT a; UPDATE test_savepoints SET value = 200 WHERE id = 1; ROLLBACK TO a; "
+        "UPDATE test_savepoints SET value = 300 WHERE id = 1; ROLLBACK TO a; COMMIT;"
+    )
+    if code != 0:
+        log_error("ROLLBACK TO re-establish: FAILED")
+        print(out[:200])
+        return False
+    result, _ = run_sql("SELECT value FROM test_savepoints WHERE id = 1")
+    if "100" not in result:
+        log_error("ROLLBACK TO re-establish: FAILED (expected 100)")
+        print(result[:200])
+        return False
+    log_info("ROLLBACK TO re-establish: PASSED")
+
+    # RELEASE should keep changes.
+    run_sql("UPDATE test_savepoints SET value = 100 WHERE id = 1")
+    out, code = run_sql(
+        "BEGIN; SAVEPOINT a; UPDATE test_savepoints SET value = 200 WHERE id = 1; RELEASE SAVEPOINT a; COMMIT;"
+    )
+    if code != 0:
+        log_error("RELEASE SAVEPOINT: FAILED")
+        print(out[:200])
+        return False
+    result, _ = run_sql("SELECT value FROM test_savepoints WHERE id = 1")
+    if "200" not in result:
+        log_error("RELEASE SAVEPOINT: FAILED (expected 200)")
+        print(result[:200])
+        return False
+    log_info("RELEASE SAVEPOINT: PASSED")
+
+    # RELEASE must not prevent outer savepoint rollback.
+    run_sql("UPDATE test_savepoints SET value = 100 WHERE id = 1")
+    out, code = run_sql(
+        "BEGIN; SAVEPOINT outer; SAVEPOINT inner; UPDATE test_savepoints SET value = 500 WHERE id = 1; "
+        "RELEASE SAVEPOINT inner; ROLLBACK TO SAVEPOINT outer; COMMIT;"
+    )
+    if code != 0:
+        log_error("Nested savepoint rollback after RELEASE: FAILED")
+        print(out[:200])
+        return False
+    result, _ = run_sql("SELECT value FROM test_savepoints WHERE id = 1")
+    if "100" not in result:
+        log_error("Nested savepoint rollback after RELEASE: FAILED (expected 100)")
+        print(result[:200])
+        return False
+    log_info("Nested savepoint rollback after RELEASE: PASSED")
+
+    # SAVEPOINT outside a transaction should error.
+    out, code = run_sql("SAVEPOINT should_fail")
+    if code == 0 or "SAVEPOINT can only be used in transaction blocks" not in out:
+        log_error("SAVEPOINT outside transaction: FAILED (expected error)")
+        print(out[:200])
+        return False
+    log_info("SAVEPOINT outside transaction: PASSED")
+
+    # RELEASE SAVEPOINT outside a transaction should error.
+    out, code = run_sql("RELEASE SAVEPOINT should_fail")
+    if code == 0 or "RELEASE SAVEPOINT can only be used in transaction blocks" not in out:
+        log_error("RELEASE SAVEPOINT outside transaction: FAILED (expected error)")
+        print(out[:200])
+        return False
+    log_info("RELEASE SAVEPOINT outside transaction: PASSED")
+
+    # ROLLBACK TO SAVEPOINT outside a transaction should error.
+    out, code = run_sql("ROLLBACK TO SAVEPOINT should_fail")
+    if code == 0 or "ROLLBACK TO SAVEPOINT can only be used in transaction blocks" not in out:
+        log_error("ROLLBACK TO SAVEPOINT outside transaction: FAILED (expected error)")
+        print(out[:200])
+        return False
+    log_info("ROLLBACK TO SAVEPOINT outside transaction: PASSED")
+
+    run_sql("DROP TABLE test_savepoints")
+    log_info("Savepoint tests: PASSED")
+    return True
+
+
 def test_json_operations() -> bool:
     log_info("Testing JSON operations...")
 
@@ -469,6 +574,7 @@ def run_builtin_tests() -> TestStats:
         ("DDL Operations", test_ddl_operations),
         ("DML Operations", test_dml_operations),
         ("Transactions", test_transactions),
+        ("Savepoints", test_savepoints),
         ("JSON Operations", test_json_operations),
         ("Query Features", test_query_features),
     ]

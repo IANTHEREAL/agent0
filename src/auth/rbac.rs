@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use crate::txn::{txn_delete, txn_put};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use tikv_client::Transaction;
@@ -278,7 +279,7 @@ impl AuthManager {
             return Err(anyhow!("User '{}' already exists", user.name));
         }
         let data = bincode::serialize(&user)?;
-        txn.put(key, data).await?;
+        txn_put(txn, key, data).await?;
         Ok(())
     }
 
@@ -293,7 +294,7 @@ impl AuthManager {
     pub async fn update_user(&self, txn: &mut Transaction, user: User) -> Result<()> {
         let key = self.user_key(&user.name);
         let data = bincode::serialize(&user)?;
-        txn.put(key, data).await?;
+        txn_put(txn, key, data).await?;
         Ok(())
     }
 
@@ -302,7 +303,7 @@ impl AuthManager {
         if txn.get(key.clone()).await?.is_none() {
             return Ok(false);
         }
-        txn.delete(key).await?;
+        txn_delete(txn, key).await?;
         Ok(true)
     }
 
@@ -334,7 +335,7 @@ impl AuthManager {
             return Err(anyhow!("Role '{}' already exists", role.name));
         }
         let data = bincode::serialize(&role)?;
-        txn.put(key, data).await?;
+        txn_put(txn, key, data).await?;
         Ok(())
     }
 
@@ -349,7 +350,7 @@ impl AuthManager {
     pub async fn update_role(&self, txn: &mut Transaction, role: Role) -> Result<()> {
         let key = self.role_key(&role.name);
         let data = bincode::serialize(&role)?;
-        txn.put(key, data).await?;
+        txn_put(txn, key, data).await?;
         Ok(())
     }
 
@@ -358,7 +359,7 @@ impl AuthManager {
         if txn.get(key.clone()).await?.is_none() {
             return Ok(false);
         }
-        txn.delete(key).await?;
+        txn_delete(txn, key).await?;
         Ok(true)
     }
 

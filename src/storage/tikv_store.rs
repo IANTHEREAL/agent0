@@ -1,5 +1,6 @@
 use super::encoding::*;
 use crate::types::{DataType, Row, TableSchema, Value};
+use crate::txn::{txn_delete, txn_put};
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
 use tikv_client::{
@@ -112,7 +113,7 @@ impl TikvStore {
         let mut raw_key = b"_sys_seq_".to_vec();
         raw_key.extend_from_slice(&table_id.to_be_bytes());
         let key = self.key(&raw_key);
-        txn.put(key, value.to_be_bytes().to_vec()).await?;
+        txn_put(txn, key, value.to_be_bytes().to_vec()).await?;
         Ok(())
     }
 
@@ -127,7 +128,7 @@ impl TikvStore {
             }
             None => 1,
         };
-        txn.put(key, next_val.to_be_bytes().to_vec()).await?;
+        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
         Ok(next_val)
     }
 
@@ -138,7 +139,7 @@ impl TikvStore {
             return Err(anyhow!("Table '{}' already exists", schema.name));
         }
         let schema_data = serialize_schema(&schema)?;
-        txn.put(schema_key, schema_data).await?;
+        txn_put(txn, schema_key, schema_data).await?;
         info!(
             "Created table '{}' with ID {}",
             schema.name, schema.table_id
@@ -165,14 +166,15 @@ impl TikvStore {
         let schema_opt = self.get_schema(txn, table_name).await?;
         if let Some(schema) = schema_opt {
             let schema_key = self.key(&encode_schema_key(table_name));
-            txn.delete(schema_key).await?;
+            txn_delete(txn, schema_key).await?;
             let (raw_start, raw_end) = encode_table_data_range(schema.table_id);
             let start = self.key(&raw_start);
             let end = self.key(&raw_end);
             let range: BoundRange = (start..end).into();
             let pairs = txn.scan(range, SCAN_LIMIT).await?;
             for pair in pairs {
-                txn.delete(pair.key().clone()).await?;
+                let key: Vec<u8> = pair.into_key().into();
+                txn_delete(txn, key).await?;
             }
 
             info!("Dropped table '{}'", table_name);
@@ -198,7 +200,7 @@ impl TikvStore {
         if txn.get(data_key.clone()).await?.is_some() {
             return Err(anyhow!("Duplicate primary key: {:?}", pk_values));
         }
-        txn.put(data_key, row_data).await?;
+        txn_put(txn, data_key, row_data).await?;
         debug!("Inserted row into '{}'", table_name);
         Ok(())
     }
@@ -213,7 +215,7 @@ impl TikvStore {
         let row_key = encode_pk_values(&pk_values);
         let data_key = self.key(&encode_data_key(schema.table_id, &row_key));
         let row_data = serialize_row(&row)?;
-        txn.put(data_key, row_data).await?;
+        txn_put(txn, data_key, row_data).await?;
         debug!("Upserted row into '{}'", table_name);
         Ok(())
     }
@@ -253,7 +255,7 @@ impl TikvStore {
         let data_key = self.key(&encode_data_key(schema.table_id, &row_key));
         let existed = txn.get(data_key.clone()).await?.is_some();
         if existed {
-            txn.delete(data_key).await?;
+            txn_delete(txn, data_key).await?;
             Ok(1)
         } else {
             Ok(0)
@@ -306,7 +308,8 @@ impl TikvStore {
             let range: BoundRange = (start..end).into();
             let pairs = txn.scan(range, SCAN_LIMIT).await?;
             for pair in pairs {
-                txn.delete(pair.key().clone()).await?;
+                let key: Vec<u8> = pair.into_key().into();
+                txn_delete(txn, key).await?;
             }
             info!("Truncated table '{}'", table_name);
             Ok(true)
@@ -319,7 +322,7 @@ impl TikvStore {
     pub async fn update_schema(&self, txn: &mut Transaction, schema: TableSchema) -> Result<()> {
         let schema_key = self.key(&encode_schema_key(&schema.name));
         let schema_data = serialize_schema(&schema)?;
-        txn.put(schema_key, schema_data).await?;
+        txn_put(txn, schema_key, schema_data).await?;
         Ok(())
     }
 
@@ -339,7 +342,7 @@ impl TikvStore {
                 return Err(anyhow!("Duplicate entry for unique index"));
             }
             let idx_val = encode_pk_values(pk_values);
-            txn.put(idx_key, idx_val).await?;
+            txn_put(txn, idx_key, idx_val).await?;
         } else {
             let idx_key = self.key(&encode_index_key(
                 table_id,
@@ -347,7 +350,7 @@ impl TikvStore {
                 values,
                 Some(pk_values),
             ));
-            txn.put(idx_key, vec![]).await?;
+            txn_put(txn, idx_key, vec![]).await?;
         }
         Ok(())
     }
@@ -364,7 +367,7 @@ impl TikvStore {
     ) -> Result<()> {
         if unique {
             let idx_key = self.key(&encode_index_key(table_id, index_id, values, None));
-            txn.delete(idx_key).await?;
+            txn_delete(txn, idx_key).await?;
         } else {
             let idx_key = self.key(&encode_index_key(
                 table_id,
@@ -372,7 +375,7 @@ impl TikvStore {
                 values,
                 Some(pk_values),
             ));
-            txn.delete(idx_key).await?;
+            txn_delete(txn, idx_key).await?;
         }
         Ok(())
     }
@@ -452,7 +455,7 @@ impl TikvStore {
         if txn.get(key.clone()).await?.is_some() {
             return Err(anyhow!("View '{}' already exists", name));
         }
-        txn.put(key, query.as_bytes().to_vec()).await?;
+        txn_put(txn, key, query.as_bytes().to_vec()).await?;
         info!("Created view '{}'", name);
         Ok(())
     }
@@ -468,7 +471,7 @@ impl TikvStore {
     pub async fn drop_view(&self, txn: &mut Transaction, name: &str) -> Result<bool> {
         let key = self.key(&encode_view_key(name));
         if txn.get(key.clone()).await?.is_some() {
-            txn.delete(key).await?;
+            txn_delete(txn, key).await?;
             info!("Dropped view '{}'", name);
             Ok(true)
         } else {
@@ -503,7 +506,7 @@ impl TikvStore {
         if txn.get(key.clone()).await?.is_some() {
             return Err(anyhow!("Materialized view '{}' already exists", name));
         }
-        txn.put(key, query.as_bytes().to_vec()).await?;
+        txn_put(txn, key, query.as_bytes().to_vec()).await?;
         info!("Created materialized view '{}'", name);
         Ok(())
     }
@@ -523,7 +526,7 @@ impl TikvStore {
     pub async fn drop_materialized_view(&self, txn: &mut Transaction, name: &str) -> Result<bool> {
         let key = self.key(&encode_matview_key(name));
         if txn.get(key.clone()).await?.is_some() {
-            txn.delete(key).await?;
+            txn_delete(txn, key).await?;
             info!("Dropped materialized view '{}'", name);
             Ok(true)
         } else {
@@ -559,7 +562,7 @@ impl TikvStore {
         if txn.get(key.clone()).await?.is_some() {
             return Err(anyhow!("Procedure '{}' already exists", name));
         }
-        txn.put(key, definition.as_bytes().to_vec()).await?;
+        txn_put(txn, key, definition.as_bytes().to_vec()).await?;
         info!("Created procedure '{}'", name);
         Ok(())
     }
@@ -575,7 +578,7 @@ impl TikvStore {
     pub async fn drop_procedure(&self, txn: &mut Transaction, name: &str) -> Result<bool> {
         let key = self.key(&encode_procedure_key(name));
         if txn.get(key.clone()).await?.is_some() {
-            txn.delete(key).await?;
+            txn_delete(txn, key).await?;
             info!("Dropped procedure '{}'", name);
             Ok(true)
         } else {
@@ -591,7 +594,7 @@ impl TikvStore {
         definition: &str,
     ) -> Result<()> {
         let key = self.key(&encode_procedure_key(name));
-        txn.put(key, definition.as_bytes().to_vec()).await?;
+        txn_put(txn, key, definition.as_bytes().to_vec()).await?;
         info!("Replaced procedure '{}'", name);
         Ok(())
     }

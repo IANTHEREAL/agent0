@@ -1,6 +1,7 @@
 //! Session management for transactions
 
 use crate::storage::TikvStore;
+use crate::txn::SavepointState;
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tikv_client::Transaction;
@@ -13,6 +14,7 @@ pub enum TransactionState {
 pub struct Session {
     store: Arc<TikvStore>,
     state: TransactionState,
+    savepoints: Arc<SavepointState>,
     #[allow(dead_code)]
     current_user: Option<String>,
     #[allow(dead_code)]
@@ -24,6 +26,7 @@ impl Session {
         Self {
             store,
             state: TransactionState::Idle,
+            savepoints: Arc::new(SavepointState::new()),
             current_user: None,
             is_superuser: false,
         }
@@ -33,6 +36,7 @@ impl Session {
         Self {
             store,
             state: TransactionState::Idle,
+            savepoints: Arc::new(SavepointState::new()),
             current_user: Some(username),
             is_superuser,
         }
@@ -64,6 +68,10 @@ impl Session {
         matches!(self.state, TransactionState::Active(_))
     }
 
+    pub(crate) fn savepoints(&self) -> Arc<SavepointState> {
+        self.savepoints.clone()
+    }
+
     /// Get mutable reference to active transaction
     pub fn get_mut_txn(&mut self) -> Option<&mut Transaction> {
         match &mut self.state {
@@ -72,11 +80,67 @@ impl Session {
         }
     }
 
+    pub fn create_savepoint(&mut self, name: String) -> Result<()> {
+        if !self.is_in_transaction() {
+            return Err(anyhow!("SAVEPOINT can only be used in transaction blocks"));
+        }
+        self.savepoints.create(name)
+    }
+
+    pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
+        if !self.is_in_transaction() {
+            return Err(anyhow!("RELEASE SAVEPOINT can only be used in transaction blocks"));
+        }
+        self.savepoints.release(name)
+    }
+
+    pub async fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
+        if !self.is_in_transaction() {
+            return Err(anyhow!("ROLLBACK TO SAVEPOINT can only be used in transaction blocks"));
+        }
+
+        let mut prepared = self.savepoints.prepare_rollback_to(name)?;
+        let res = {
+            let txn = self.get_mut_txn().expect("transaction must be active");
+
+            // Undo nested savepoints first, then the target savepoint itself.
+            for sp in prepared.popped.iter_mut().rev() {
+                let mut entries = Vec::with_capacity(sp.undo.len());
+                entries.extend(sp.undo.drain());
+                entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+                for (key, prev) in entries {
+                    match prev {
+                        Some(val) => txn.put(key, val).await.map_err(|e| anyhow!(e))?,
+                        None => txn.delete(key).await.map_err(|e| anyhow!(e))?,
+                    }
+                }
+            }
+
+            prepared.target_undo.sort_by(|a, b| a.key.cmp(&b.key));
+            for rec in prepared.target_undo.drain(..) {
+                match rec.prev {
+                    Some(val) => txn.put(rec.key, val).await.map_err(|e| anyhow!(e))?,
+                    None => txn.delete(rec.key).await.map_err(|e| anyhow!(e))?,
+                }
+            }
+
+            Ok::<(), anyhow::Error>(())
+        };
+
+        if let Err(e) = res {
+            // If undo fails, the transaction is likely in an unknown state. Abort it.
+            let _ = self.rollback().await;
+            return Err(e);
+        }
+        Ok(())
+    }
+
     /// Start a transaction block (BEGIN)
     pub async fn begin(&mut self) -> Result<()> {
         match self.state {
             TransactionState::Idle => {
                 let txn = self.store.begin().await?;
+                self.savepoints.reset()?;
                 self.state = TransactionState::Active(txn);
                 Ok(())
             }
@@ -92,6 +156,7 @@ impl Session {
         // Move txn out of state to take ownership
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
+                self.savepoints.reset()?;
                 txn.commit().await.map(|_| ()).map_err(|e| anyhow!(e))
             }
             TransactionState::Idle => {
@@ -103,7 +168,10 @@ impl Session {
     /// Rollback a transaction block (ROLLBACK)
     pub async fn rollback(&mut self) -> Result<()> {
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
-            TransactionState::Active(mut txn) => txn.rollback().await.map_err(|e| anyhow!(e)),
+            TransactionState::Active(mut txn) => {
+                self.savepoints.reset()?;
+                txn.rollback().await.map_err(|e| anyhow!(e))
+            }
             TransactionState::Idle => {
                 Ok(()) // No-op
             }
