@@ -330,3 +330,36 @@ pub struct UserTypeDef {
     pub kind: UserTypeKind,
     pub owner: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SequenceState {
+    pub last_value: i64,
+    pub is_called: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum SequenceBacking {
+    /// Bridge to the existing per-table autoincrement key (`_sys_seq_ + table_id`).
+    TableId(u64),
+    /// A standalone sequence whose state is stored in `SequenceState`.
+    Standalone(SequenceState),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SequenceDef {
+    pub schema: String,
+    pub name: String,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub is_cycled: bool,
+    pub owned_by: Option<(String, String)>,
+    pub owner: String,
+    pub backing: SequenceBacking,
+}
+
+impl SequenceDef {
+    pub fn full_name(&self) -> String {
+        format!("{}.{}", self.schema, self.name)
+    }
+}

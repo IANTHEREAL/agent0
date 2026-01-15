@@ -1626,7 +1626,10 @@ fn eval_function(
             let uuid = uuid::Uuid::new_v4();
             Ok(Value::Uuid(*uuid.as_bytes()))
         }
-        "NEXTVAL" | "CURRVAL" | "SETVAL" => Ok(Value::Int64(1)),
+        "NEXTVAL" | "CURRVAL" | "SETVAL" => Err(anyhow!(
+            "{} is a sequence function and must be evaluated during execution",
+            func_name
+        )),
         "SET_CONFIG" => Ok(Value::Text(String::new())),
         "PG_IS_IN_RECOVERY" => Ok(Value::Boolean(false)),
         "PG_BACKEND_PID" => Ok(Value::Int32(std::process::id() as i32)),

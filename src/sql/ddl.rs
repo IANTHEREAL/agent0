@@ -9,6 +9,7 @@ use sqlparser::ast::{
 use tikv_client::Transaction;
 
 use super::helpers::{coerce_value_for_column, convert_data_type, fill_row_defaults, infer_data_type, normalize_ident};
+use super::sequences;
 use super::udt;
 use super::{expr::eval_expr, ExecuteResult};
 use crate::storage::TikvStore;
@@ -57,6 +58,41 @@ async fn resolve_column_data_type(
         }
         _ => Ok((convert_data_type(sql_type)?, false)),
     }
+}
+
+async fn create_implicit_sequences_for_schema(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    schema: &TableSchema,
+) -> Result<()> {
+    for col in &schema.columns {
+        if col.is_serial {
+            store
+                .create_sequence(
+                    txn,
+                    sequences::build_implicit_sequence_def(&schema.name, &col.name, schema.table_id),
+                )
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn drop_owned_sequences_for_table(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    table_name: &str,
+) -> Result<()> {
+    let seqs = store.list_sequences(txn).await?;
+    for def in seqs {
+        let Some((owned_table, _)) = &def.owned_by else {
+            continue;
+        };
+        if owned_table == table_name {
+            store.drop_sequence(txn, &def.full_name()).await?;
+        }
+    }
+    Ok(())
 }
 
 struct KvScanBatches {
@@ -602,7 +638,8 @@ pub async fn execute_create_table(
         check_constraints,
         foreign_keys,
     };
-    store.create_table(txn, schema).await?;
+    store.create_table(txn, schema.clone()).await?;
+    create_implicit_sequences_for_schema(store, txn, &schema).await?;
 
     Ok(ExecuteResult::CreateTable { table_name })
 }
@@ -677,6 +714,7 @@ pub async fn create_table_from_query_result(
         foreign_keys: vec![],
     };
     store.create_table(txn, schema.clone()).await?;
+    create_implicit_sequences_for_schema(store, txn, &schema).await?;
 
     let row_count = result_rows.len();
     for (i, row) in result_rows.into_iter().enumerate() {
@@ -747,6 +785,7 @@ pub async fn create_table_from_select_into(
         foreign_keys: vec![],
     };
     store.create_table(txn, schema.clone()).await?;
+    create_implicit_sequences_for_schema(store, txn, &schema).await?;
 
     let row_count = result_rows.len();
     for (i, row) in result_rows.into_iter().enumerate() {
@@ -986,9 +1025,14 @@ pub async fn execute_drop_table(
     let mut last = String::new();
     for name in names {
         let t = name.0.last().map(normalize_ident).unwrap();
-        if !store.drop_table(txn, &t).await? && !if_exists {
-            return Err(anyhow!("Table '{}' does not exist", t));
+        if store.get_schema(txn, &t).await?.is_none() {
+            if !if_exists {
+                return Err(anyhow!("Table '{}' does not exist", t));
+            }
+            continue;
         }
+        drop_owned_sequences_for_table(store, txn, &t).await?;
+        store.drop_table(txn, &t).await?;
         last = t;
     }
     Ok(ExecuteResult::DropTable { table_name: last })
@@ -1062,7 +1106,7 @@ pub async fn execute_alter_table(
             if schema.column_index(&col_name).is_some() {
                 return Err(anyhow!("Column exists"));
             }
-            let (data_type, is_serial) =
+            let (data_type, mut is_serial) =
                 resolve_column_data_type(store, txn, &column_def.data_type).await?;
             let mut nullable = true;
             let mut default_expr = None;
@@ -1070,8 +1114,20 @@ pub async fn execute_alter_table(
                 match &opt.option {
                     ColumnOption::NotNull => nullable = false,
                     ColumnOption::Default(expr) => default_expr = Some(expr.to_string()),
+                    ColumnOption::Generated {
+                        generated_as,
+                        generation_expr: None,
+                        ..
+                    } => {
+                        if matches!(generated_as, GeneratedAs::Always | GeneratedAs::ByDefault) {
+                            is_serial = true;
+                        }
+                    }
                     _ => {}
                 }
+            }
+            if is_serial {
+                nullable = false;
             }
             if !nullable && default_expr.is_none() {
                 let (start, end) = crate::storage::encode_table_data_range(schema.table_id);
@@ -1090,6 +1146,18 @@ pub async fn execute_alter_table(
                 is_serial,
                 default_expr,
             });
+            if is_serial {
+                store
+                    .create_sequence(
+                        txn,
+                        sequences::build_implicit_sequence_def(
+                            &schema.name,
+                            schema.columns.last().expect("column just pushed").name.as_str(),
+                            schema.table_id,
+                        ),
+                    )
+                    .await?;
+            }
             schema.version += 1;
             store.update_schema(txn, schema).await?;
         }

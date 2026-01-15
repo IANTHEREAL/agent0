@@ -3,6 +3,7 @@
 use crate::storage::TikvStore;
 use crate::txn::SavepointState;
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tikv_client::Transaction;
 
@@ -15,6 +16,7 @@ pub struct Session {
     store: Arc<TikvStore>,
     state: TransactionState,
     savepoints: Arc<SavepointState>,
+    last_sequence_values: HashMap<String, i64>,
     #[allow(dead_code)]
     current_user: Option<String>,
     #[allow(dead_code)]
@@ -27,6 +29,7 @@ impl Session {
             store,
             state: TransactionState::Idle,
             savepoints: Arc::new(SavepointState::new()),
+            last_sequence_values: HashMap::new(),
             current_user: None,
             is_superuser: false,
         }
@@ -37,6 +40,7 @@ impl Session {
             store,
             state: TransactionState::Idle,
             savepoints: Arc::new(SavepointState::new()),
+            last_sequence_values: HashMap::new(),
             current_user: Some(username),
             is_superuser,
         }
@@ -76,6 +80,15 @@ impl Session {
     pub fn get_mut_txn(&mut self) -> Option<&mut Transaction> {
         match &mut self.state {
             TransactionState::Active(txn) => Some(txn),
+            _ => None,
+        }
+    }
+
+    pub fn get_mut_txn_and_sequence_values(
+        &mut self,
+    ) -> Option<(&mut Transaction, &mut HashMap<String, i64>)> {
+        match &mut self.state {
+            TransactionState::Active(txn) => Some((txn, &mut self.last_sequence_values)),
             _ => None,
         }
     }

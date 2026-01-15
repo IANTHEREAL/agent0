@@ -21,6 +21,7 @@ const SYS_VIEW_PREFIX: &[u8] = b"_sys_view_";
 const SYS_MATVIEW_PREFIX: &[u8] = b"_sys_matview_";
 const SYS_PROCEDURE_PREFIX: &[u8] = b"_sys_proc_";
 const SYS_TYPE_PREFIX: &[u8] = b"_sys_type_";
+const SYS_SEQUENCE_PREFIX: &[u8] = b"_sys_seqdef_";
 const TABLE_DATA_PREFIX: &[u8] = b"t_";
 const TABLE_INDEX_PREFIX: &[u8] = b"i_";
 
@@ -52,6 +53,19 @@ pub fn encode_type_key(full_name: &str) -> Vec<u8> {
 
 pub fn encode_type_prefix() -> Vec<u8> {
     SYS_TYPE_PREFIX.to_vec()
+}
+
+/// Encode the key for a sequence definition.
+///
+/// `full_name` should be `schema.name` (e.g. `public.my_seq`).
+pub fn encode_sequence_key(full_name: &str) -> Vec<u8> {
+    let mut key = SYS_SEQUENCE_PREFIX.to_vec();
+    key.extend_from_slice(full_name.as_bytes());
+    key
+}
+
+pub fn encode_sequence_prefix() -> Vec<u8> {
+    SYS_SEQUENCE_PREFIX.to_vec()
 }
 
 pub fn encode_view_key(view_name: &str) -> Vec<u8> {

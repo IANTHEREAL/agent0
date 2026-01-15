@@ -9,6 +9,7 @@ use tikv_client::Transaction;
 
 use super::expr::eval_expr;
 use super::helpers::{coerce_value_for_column, eval_default_expr};
+use super::sequences;
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
@@ -175,7 +176,10 @@ pub fn build_returning_columns(
     Ok(ret_cols)
 }
 
-pub fn eval_returning_row(
+pub async fn eval_returning_row(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    sequence_values: &mut HashMap<String, i64>,
     returning: &Option<Vec<SelectItem>>,
     row: &Row,
     schema: &TableSchema,
@@ -185,7 +189,19 @@ pub fn eval_returning_row(
         for item in items {
             match item {
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                    vals.push(eval_expr(e, Some(row), Some(schema))?);
+                    vals.push(if sequences::expr_uses_sequence_functions(e) {
+                        sequences::eval_expr_with_sequences(
+                            store,
+                            txn,
+                            sequence_values,
+                            e,
+                            Some(row),
+                            Some(schema),
+                        )
+                        .await?
+                    } else {
+                        eval_expr(e, Some(row), Some(schema))?
+                    });
                 }
                 SelectItem::Wildcard(_) => vals.extend(row.values.clone()),
                 _ => {}
@@ -872,7 +888,10 @@ pub async fn execute_update_row(
     Ok(new_row)
 }
 
-pub fn prepare_insert_row(
+pub async fn prepare_insert_row(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    sequence_values: &mut HashMap<String, i64>,
     schema: &TableSchema,
     columns: &[Ident],
     exprs: &[Expr],
@@ -893,7 +912,12 @@ pub fn prepare_insert_row(
                 // Don't add to indices, leave as NULL, will be filled by fill_missing_columns
                 row_vals[i] = Value::Null;
             } else {
-                row_vals[i] = eval_expr(e, None, None)?;
+                row_vals[i] = if sequences::expr_uses_sequence_functions(e) {
+                    sequences::eval_expr_with_sequences(store, txn, sequence_values, e, None, None)
+                        .await?
+                } else {
+                    eval_expr(e, None, None)?
+                };
                 indices.push(i);
             }
         }
@@ -913,7 +937,19 @@ pub fn prepare_insert_row(
                 // Don't add to indices, leave as NULL, will be filled by fill_missing_columns
                 row_vals[idx] = Value::Null;
             } else {
-                row_vals[idx] = eval_expr(&exprs[i], None, None)?;
+                row_vals[idx] = if sequences::expr_uses_sequence_functions(&exprs[i]) {
+                    sequences::eval_expr_with_sequences(
+                        store,
+                        txn,
+                        sequence_values,
+                        &exprs[i],
+                        None,
+                        None,
+                    )
+                    .await?
+                } else {
+                    eval_expr(&exprs[i], None, None)?
+                };
                 indices.push(idx);
             }
         }
@@ -922,9 +958,45 @@ pub fn prepare_insert_row(
     Ok((row_vals, indices))
 }
 
+async fn eval_default_expr_maybe_sequence(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    sequence_values: &mut HashMap<String, i64>,
+    expr_str: &str,
+) -> Result<Value> {
+    let sql = format!("SELECT {}", expr_str);
+    let dialect = PostgreSqlDialect {};
+    let ast = Parser::parse_sql(&dialect, &sql)
+        .map_err(|e| anyhow!("Failed to parse default expr: {}", e))?;
+
+    if let Some(sqlparser::ast::Statement::Query(q)) = ast.into_iter().next() {
+        if let sqlparser::ast::SetExpr::Select(s) = *q.body {
+            if let Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) = s.projection.into_iter().next()
+            {
+                return if sequences::expr_uses_sequence_functions(&e) {
+                    sequences::eval_expr_with_sequences(
+                        store,
+                        txn,
+                        sequence_values,
+                        &e,
+                        None,
+                        None,
+                    )
+                    .await
+                } else {
+                    eval_expr(&e, None, None)
+                };
+            }
+        }
+    }
+
+    Ok(Value::Text(expr_str.to_string()))
+}
+
 pub async fn fill_missing_columns(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    sequence_values: &mut HashMap<String, i64>,
     schema: &TableSchema,
     row_vals: &mut Vec<Value>,
     indices: &[usize],
@@ -938,7 +1010,8 @@ pub async fn fill_missing_columns(
                     _ => Value::Int32(seq_val),
                 };
             } else if let Some(def) = &c.default_expr {
-                row_vals[i] = eval_default_expr(def)?;
+                row_vals[i] = eval_default_expr_maybe_sequence(store, txn, sequence_values, def)
+                    .await?;
             } else if !c.nullable {
                 return Err(anyhow!("Column '{}' cannot be null", c.name));
             }
@@ -1067,7 +1140,10 @@ pub fn validate_update_columns(
     Ok(indices)
 }
 
-pub fn compute_update_values(
+pub async fn compute_update_values(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    sequence_values: &mut HashMap<String, i64>,
     schema: &TableSchema,
     old_row: &Row,
     assignments: &[Assignment],
@@ -1076,10 +1152,24 @@ pub fn compute_update_values(
 ) -> Result<Vec<Value>> {
     let mut vals = old_row.values.clone();
     for (i, a) in assignments.iter().enumerate() {
-        let raw_val = if let Some((combined_row, combined_schema)) = eval_row {
-            eval_expr(&a.value, Some(combined_row), Some(combined_schema))?
+        let (eval_row, eval_schema) = if let Some((combined_row, combined_schema)) = eval_row {
+            (combined_row, combined_schema)
         } else {
-            eval_expr(&a.value, Some(old_row), Some(schema))?
+            (old_row, schema)
+        };
+
+        let raw_val = if sequences::expr_uses_sequence_functions(&a.value) {
+            sequences::eval_expr_with_sequences(
+                store,
+                txn,
+                sequence_values,
+                &a.value,
+                Some(eval_row),
+                Some(eval_schema),
+            )
+            .await?
+        } else {
+            eval_expr(&a.value, Some(eval_row), Some(eval_schema))?
         };
         let col = &schema.columns[indices[i]];
         let coerced = coerce_value_for_column(raw_val, col)?;

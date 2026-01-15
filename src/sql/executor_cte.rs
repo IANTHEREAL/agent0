@@ -13,6 +13,7 @@ impl Executor {
     pub(crate) async fn build_cte_context(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         query: &Query,
     ) -> Result<HashMap<String, (TableSchema, Vec<Row>)>> {
         let mut ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
@@ -24,6 +25,7 @@ impl Executor {
                     let (schema, rows) = self
                         .execute_recursive_cte(
                             txn,
+                            sequence_values,
                             &cte_name,
                             &cte.query,
                             &cte.alias.columns,
@@ -32,7 +34,9 @@ impl Executor {
                         .await?;
                     ctes.insert(cte_name, (schema, rows));
                 } else {
-                    let cte_result = self.execute_query_with_ctes(txn, &cte.query, &ctes).await?;
+                    let cte_result = self
+                        .execute_query_with_ctes(txn, sequence_values, &cte.query, &ctes)
+                        .await?;
                     match cte_result {
                         ExecuteResult::Select {
                             columns,
@@ -78,6 +82,7 @@ impl Executor {
     pub(crate) async fn execute_recursive_cte(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         cte_name: &str,
         query: &Query,
         alias_columns: &[Ident],
@@ -112,7 +117,7 @@ impl Executor {
             for_clause: None,
         };
         let base_result = self
-            .execute_query_with_ctes(txn, &base_query, existing_ctes)
+            .execute_query_with_ctes(txn, sequence_values, &base_query, existing_ctes)
             .await?;
         let (columns, mut all_rows) = match base_result {
             ExecuteResult::Select {
@@ -175,7 +180,7 @@ impl Executor {
                 for_clause: None,
             };
             let recursive_result = self
-                .execute_query_with_ctes(txn, &recursive_query, &temp_ctes)
+                .execute_query_with_ctes(txn, sequence_values, &recursive_query, &temp_ctes)
                 .await?;
 
             let new_rows = match recursive_result {

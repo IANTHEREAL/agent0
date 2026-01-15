@@ -7,12 +7,14 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     AlterTableOperation, ColumnDef as SqlColumnDef, ObjectName, OrderByExpr, Query,
 };
+use std::collections::HashMap;
 use tikv_client::Transaction;
 
 impl Executor {
     pub(crate) async fn execute_create_table_as(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         name: &ObjectName,
         query: &Query,
         columns: &[SqlColumnDef],
@@ -26,8 +28,10 @@ impl Executor {
             .value
             .clone();
 
-        let ctes = self.build_cte_context(txn, query).await?;
-        let result = self.execute_query_with_ctes(txn, query, &ctes).await?;
+        let ctes = self.build_cte_context(txn, sequence_values, query).await?;
+        let result = self
+            .execute_query_with_ctes(txn, sequence_values, query, &ctes)
+            .await?;
 
         let (result_cols, result_rows) = match result {
             ExecuteResult::Select {

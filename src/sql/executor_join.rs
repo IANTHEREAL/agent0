@@ -5,6 +5,7 @@ use super::helpers::{
     apply_offset_limit_fetch, collect_having_agg_funcs, dedup_rows,
     distinct_on_rows_join_with_indices, eval_having_expr_join, get_select_item_name, AggExpr,
 };
+use super::sequences;
 use super::window::{compute_window_functions_join, extract_window_functions};
 use super::{
     expr::{eval_expr_join, JoinContext},
@@ -24,16 +25,18 @@ impl Executor {
     pub(crate) async fn execute_join_query(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         query: &Query,
         select: &sqlparser::ast::Select,
     ) -> Result<ExecuteResult> {
-        self.execute_join_query_with_ctes(txn, query, select, &HashMap::new())
+        self.execute_join_query_with_ctes(txn, sequence_values, query, select, &HashMap::new())
             .await
     }
 
     pub(crate) async fn get_table_data(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         table_name: &str,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<(TableSchema, Vec<Row>)> {
@@ -90,7 +93,9 @@ impl Executor {
         }
 
         if let Some(view_query) = self.store().get_view(txn, &t_lower).await? {
-            let result = self.execute_view_query(txn, &view_query, ctes).await?;
+            let result = self
+                .execute_view_query(txn, sequence_values, &view_query, ctes)
+                .await?;
             return match result {
                 ExecuteResult::Select {
                     columns,
@@ -171,6 +176,7 @@ impl Executor {
     pub(crate) fn execute_view_query<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        sequence_values: &'a mut HashMap<String, i64>,
         view_query: &'a str,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecuteResult>> + Send + 'a>>
@@ -178,7 +184,7 @@ impl Executor {
         Box::pin(async move {
             let ast = parse_sql(view_query)?;
             if let Some(Statement::Query(q)) = ast.into_iter().next() {
-                self.execute_query_with_ctes(txn, &q, ctes).await
+                self.execute_query_with_ctes(txn, sequence_values, &q, ctes).await
             } else {
                 Err(anyhow!("Invalid view query"))
             }
@@ -188,6 +194,7 @@ impl Executor {
     pub(crate) fn execute_derived_table<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        sequence_values: &'a mut HashMap<String, i64>,
         subquery: &'a Query,
         alias: &'a str,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
@@ -195,7 +202,9 @@ impl Executor {
         Box<dyn std::future::Future<Output = Result<(TableSchema, Vec<Row>)>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let result = self.execute_query_with_ctes(txn, subquery, ctes).await?;
+            let result = self
+                .execute_query_with_ctes(txn, sequence_values, subquery, ctes)
+                .await?;
             match result {
                 ExecuteResult::Select {
                     columns,
@@ -233,6 +242,7 @@ impl Executor {
     pub(crate) fn resolve_table_factor<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        sequence_values: &'a mut HashMap<String, i64>,
         factor: &'a TableFactor,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> std::pin::Pin<
@@ -262,7 +272,9 @@ impl Executor {
                     } else {
                         tbl
                     };
-                    let (schema, rows) = self.get_table_data(txn, &table_name, ctes).await?;
+                    let (schema, rows) = self
+                        .get_table_data(txn, sequence_values, &table_name, ctes)
+                        .await?;
                     Ok((als, schema, rows))
                 }
                 TableFactor::Derived {
@@ -273,7 +285,7 @@ impl Executor {
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| "subquery".to_string());
                     let (schema, rows) = self
-                        .execute_derived_table(txn, subquery, &alias_name, ctes)
+                        .execute_derived_table(txn, sequence_values, subquery, &alias_name, ctes)
                         .await?;
                     Ok((alias_name, schema, rows))
                 }
@@ -282,7 +294,7 @@ impl Executor {
                     alias,
                 } => {
                     let (base_alias, base_schema, mut combined_rows) = self
-                        .resolve_table_factor(txn, &table_with_joins.relation, ctes)
+                        .resolve_table_factor(txn, sequence_values, &table_with_joins.relation, ctes)
                         .await?;
 
                     let mut all_table_aliases: Vec<(String, Vec<ColumnDef>)> =
@@ -292,7 +304,7 @@ impl Executor {
 
                     for join in &table_with_joins.joins {
                         let (join_alias, join_schema, join_rows) =
-                            self.resolve_table_factor(txn, &join.relation, ctes).await?;
+                            self.resolve_table_factor(txn, sequence_values, &join.relation, ctes).await?;
 
                         let join_condition = match &join.join_operator {
                             JoinOperator::Inner(JoinConstraint::On(expr)) => Some(expr.clone()),
@@ -366,7 +378,16 @@ impl Executor {
                                         combined_row: &combined_row,
                                         combined_schema: &temp_combined_schema,
                                     };
-                                    matches!(eval_expr_join(cond, &ctx), Ok(Value::Boolean(true)))
+                                    matches!(
+                                        self.eval_expr_join_maybe_sequence(
+                                            txn,
+                                            sequence_values,
+                                            cond,
+                                            &ctx
+                                        )
+                                        .await?,
+                                        Value::Boolean(true)
+                                    )
                                 } else {
                                     true
                                 };
@@ -454,6 +475,7 @@ impl Executor {
     pub(crate) async fn execute_join_query_with_ctes(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         query: &Query,
         select: &sqlparser::ast::Select,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
@@ -485,7 +507,9 @@ impl Executor {
                     tbl.clone()
                 };
 
-                let (schema, rows) = self.get_table_data(txn, &table_name, ctes).await?;
+                let (schema, rows) = self
+                    .get_table_data(txn, sequence_values, &table_name, ctes)
+                    .await?;
                 (als, schema, rows)
             }
             TableFactor::Derived {
@@ -496,12 +520,12 @@ impl Executor {
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "subquery".to_string());
                 let (schema, rows) = self
-                    .execute_derived_table(txn, subquery, &alias_name, ctes)
+                    .execute_derived_table(txn, sequence_values, subquery, &alias_name, ctes)
                     .await?;
                 (alias_name, schema, rows)
             }
             TableFactor::NestedJoin { .. } => {
-                self.resolve_table_factor(txn, &select.from[0].relation, ctes)
+                self.resolve_table_factor(txn, sequence_values, &select.from[0].relation, ctes)
                     .await?
             }
             _ => return Err(anyhow!("Unsupported base table")),
@@ -521,7 +545,7 @@ impl Executor {
                         .as_ref()
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| tbl.clone());
-                    let (schema, rows) = self.get_table_data(txn, &tbl, ctes).await?;
+                    let (schema, rows) = self.get_table_data(txn, sequence_values, &tbl, ctes).await?;
                     (als, schema, rows)
                 }
                 TableFactor::Derived {
@@ -532,12 +556,12 @@ impl Executor {
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| "subquery".to_string());
                     let (schema, rows) = self
-                        .execute_derived_table(txn, subquery, &alias_name, ctes)
+                        .execute_derived_table(txn, sequence_values, subquery, &alias_name, ctes)
                         .await?;
                     (alias_name, schema, rows)
                 }
                 TableFactor::NestedJoin { .. } => {
-                    self.resolve_table_factor(txn, &from_item.relation, ctes)
+                    self.resolve_table_factor(txn, sequence_values, &from_item.relation, ctes)
                         .await?
                 }
                 _ => return Err(anyhow!("Unsupported table factor in FROM")),
@@ -562,7 +586,8 @@ impl Executor {
                             .as_ref()
                             .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| tbl.clone());
-                        let (schema, rows) = self.get_table_data(txn, &tbl, ctes).await?;
+                        let (schema, rows) =
+                            self.get_table_data(txn, sequence_values, &tbl, ctes).await?;
                         (als, schema, rows)
                     }
                     TableFactor::Derived {
@@ -573,12 +598,12 @@ impl Executor {
                             .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| "subquery".to_string());
                         let (schema, rows) = self
-                            .execute_derived_table(txn, subquery, &alias_name, ctes)
+                            .execute_derived_table(txn, sequence_values, subquery, &alias_name, ctes)
                             .await?;
                         (alias_name, schema, rows)
                     }
                     TableFactor::NestedJoin { .. } => {
-                        self.resolve_table_factor(txn, &extra_join.relation, ctes)
+                        self.resolve_table_factor(txn, sequence_values, &extra_join.relation, ctes)
                             .await?
                     }
                     _ => return Err(anyhow!("Unsupported join table factor")),
@@ -605,7 +630,7 @@ impl Executor {
                         .as_ref()
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| tbl.clone());
-                    let (schema, rows) = self.get_table_data(txn, &tbl, ctes).await?;
+                    let (schema, rows) = self.get_table_data(txn, sequence_values, &tbl, ctes).await?;
                     (als, schema, rows)
                 }
                 TableFactor::Derived {
@@ -616,12 +641,13 @@ impl Executor {
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| "subquery".to_string());
                     let (schema, rows) = self
-                        .execute_derived_table(txn, subquery, &alias_name, ctes)
+                        .execute_derived_table(txn, sequence_values, subquery, &alias_name, ctes)
                         .await?;
                     (alias_name, schema, rows)
                 }
                 TableFactor::NestedJoin { .. } => {
-                    self.resolve_table_factor(txn, &join.relation, ctes).await?
+                    self.resolve_table_factor(txn, sequence_values, &join.relation, ctes)
+                        .await?
                 }
                 _ => return Err(anyhow!("Unsupported join table")),
             };
@@ -689,7 +715,7 @@ impl Executor {
                 if has_correlated_subquery {
                     Some(cond)
                 } else {
-                    Some(self.resolve_subqueries(txn, &cond).await?)
+                    Some(self.resolve_subqueries(txn, sequence_values, &cond).await?)
                 }
             } else {
                 None
@@ -763,7 +789,7 @@ impl Executor {
                             );
                             value_offset += schema.columns.len();
                         }
-                        Some(self.resolve_subqueries(txn, &substituted).await?)
+                        Some(self.resolve_subqueries(txn, sequence_values, &substituted).await?)
                     } else {
                         None
                     }
@@ -783,7 +809,16 @@ impl Executor {
                             combined_row: &combined_row,
                             combined_schema: &temp_combined_schema,
                         };
-                        matches!(eval_expr_join(cond, &ctx)?, Value::Boolean(true))
+                        matches!(
+                            self.eval_expr_join_maybe_sequence(
+                                txn,
+                                sequence_values,
+                                cond,
+                                &ctx
+                            )
+                            .await?,
+                            Value::Boolean(true)
+                        )
                     } else {
                         true
                     };
@@ -849,7 +884,7 @@ impl Executor {
 
         // Resolve subqueries (EXISTS, IN (SELECT ...), scalar subqueries) in WHERE clause
         let resolved_selection = if let Some(sel) = &select.selection {
-            Some(self.resolve_subqueries(txn, sel).await?)
+            Some(self.resolve_subqueries(txn, sequence_values, sel).await?)
         } else {
             None
         };
@@ -863,7 +898,11 @@ impl Executor {
                     combined_row: &row,
                     combined_schema: &final_schema,
                 };
-                if matches!(eval_expr_join(sel, &ctx)?, Value::Boolean(true)) {
+                if matches!(
+                    self.eval_expr_join_maybe_sequence(txn, sequence_values, sel, &ctx)
+                        .await?,
+                    Value::Boolean(true)
+                ) {
                     v.push(row);
                 }
             }
@@ -873,7 +912,7 @@ impl Executor {
         };
 
         let resolved_projection = self
-            .resolve_projection_subqueries(txn, &select.projection)
+            .resolve_projection_subqueries(txn, sequence_values, &select.projection)
             .await?;
 
         let group_keys_exprs = match &select.group_by {
@@ -943,7 +982,10 @@ impl Executor {
 
                 let mut key = Vec::new();
                 for expr in group_keys_exprs {
-                    key.push(eval_expr_join(expr, &ctx)?);
+                    key.push(
+                        self.eval_expr_join_maybe_sequence(txn, sequence_values, expr, &ctx)
+                            .await?,
+                    );
                 }
                 let key_bytes = bincode::serialize(&key).unwrap();
 
@@ -957,7 +999,15 @@ impl Executor {
                                     let delimiter = if f.args.len() >= 2 {
                                         match &f.args[1] {
                                             FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                                                match eval_expr_join(e, &ctx)? {
+                                                match self
+                                                    .eval_expr_join_maybe_sequence(
+                                                        txn,
+                                                        sequence_values,
+                                                        e,
+                                                        &ctx,
+                                                    )
+                                                    .await?
+                                                {
                                                     Value::Text(s) => s,
                                                     _ => ",".to_string(),
                                                 }
@@ -1001,14 +1051,22 @@ impl Executor {
                     };
 
                     if let Some(filter) = filter_expr {
-                        let filter_val = eval_expr_join(filter, &ctx)?;
+                        let filter_val = self
+                            .eval_expr_join_maybe_sequence(
+                                txn,
+                                sequence_values,
+                                filter,
+                                &ctx,
+                            )
+                            .await?;
                         if !matches!(filter_val, Value::Boolean(true)) {
                             continue;
                         }
                     }
 
                     let val = if let Some(e) = arg_expr {
-                        eval_expr_join(e, &ctx)?
+                        self.eval_expr_join_maybe_sequence(txn, sequence_values, e, &ctx)
+                            .await?
                     } else {
                         Value::Int32(1)
                     };
@@ -1030,7 +1088,19 @@ impl Executor {
                 };
 
                 if let Some(having_expr) = &select.having {
-                    let having_val = eval_having_expr_join(having_expr, &ctx, &agg_funcs, &aggs)?;
+                    let having_expr = if sequences::expr_uses_sequence_functions(having_expr) {
+                        sequences::replace_sequence_functions_join(
+                            &self.store(),
+                            txn,
+                            sequence_values,
+                            having_expr,
+                            &ctx,
+                        )
+                        .await?
+                    } else {
+                        having_expr.clone()
+                    };
+                    let having_val = eval_having_expr_join(&having_expr, &ctx, &agg_funcs, &aggs)?;
                     if !matches!(having_val, Value::Boolean(true)) {
                         continue;
                     }
@@ -1046,7 +1116,19 @@ impl Executor {
                             | SelectItem::ExprWithAlias { expr: e, .. } => e,
                             _ => return Err(anyhow!("Unsupported projection item")),
                         };
-                        row_values.push(eval_having_expr_join(expr, &ctx, &agg_funcs, &aggs)?);
+                        let expr = if sequences::expr_uses_sequence_functions(expr) {
+                            sequences::replace_sequence_functions_join(
+                                &self.store(),
+                                txn,
+                                sequence_values,
+                                expr,
+                                &ctx,
+                            )
+                            .await?
+                        } else {
+                            expr.clone()
+                        };
+                        row_values.push(eval_having_expr_join(&expr, &ctx, &agg_funcs, &aggs)?);
                     }
                 }
                 final_rows.push(Row::new(row_values));
@@ -1117,71 +1199,131 @@ impl Executor {
         };
 
         let (filtered_rows, window_results) = if !query.order_by.is_empty() {
-            let mut indexed: Vec<(usize, Row)> = filtered_rows.into_iter().enumerate().collect();
-            indexed.sort_by(|(_, a), (_, b)| {
-                for order_expr in &query.order_by {
-                    // Resolve ORDER BY expression: if it's an alias, use the SELECT list expression
-                    let actual_expr = if let Expr::Identifier(ref ident) = order_expr.expr {
-                        // Check if this identifier matches a SELECT list alias
-                        let mut found_expr = None;
+            let resolved_order_exprs: Vec<Expr> = query
+                .order_by
+                .iter()
+                .map(|order_expr| {
+                    if let Expr::Identifier(ref ident) = order_expr.expr {
                         for item in &resolved_projection {
-                            match item {
-                                SelectItem::ExprWithAlias { expr, alias } => {
-                                    if alias.value.eq_ignore_ascii_case(&ident.value) {
-                                        found_expr = Some(expr);
-                                        break;
-                                    }
+                            if let SelectItem::ExprWithAlias { expr, alias } = item {
+                                if alias.value.eq_ignore_ascii_case(&ident.value) {
+                                    return expr.clone();
                                 }
-                                _ => {}
                             }
                         }
-                        found_expr.unwrap_or(&order_expr.expr)
-                    } else {
-                        &order_expr.expr
+                    }
+                    order_expr.expr.clone()
+                })
+                .collect();
+
+            let order_by_uses_sequences = resolved_order_exprs
+                .iter()
+                .any(sequences::expr_uses_sequence_functions);
+
+            if order_by_uses_sequences {
+                let mut rows_with_keys: Vec<(usize, Row, Vec<Value>)> =
+                    Vec::with_capacity(filtered_rows.len());
+
+                for (orig_idx, row) in filtered_rows.into_iter().enumerate() {
+                    let ctx = JoinContext {
+                        tables: HashMap::new(),
+                        column_offsets: final_column_offsets.clone(),
+                        combined_row: &row,
+                        combined_schema: &final_schema,
                     };
 
-                    let ctx_a = JoinContext {
-                        tables: HashMap::new(),
-                        column_offsets: final_column_offsets.clone(),
-                        combined_row: a,
-                        combined_schema: &final_schema,
-                    };
-                    let ctx_b = JoinContext {
-                        tables: HashMap::new(),
-                        column_offsets: final_column_offsets.clone(),
-                        combined_row: b,
-                        combined_schema: &final_schema,
-                    };
-                    let val_a = eval_expr_join(actual_expr, &ctx_a).unwrap_or(Value::Null);
-                    let val_b = eval_expr_join(actual_expr, &ctx_b).unwrap_or(Value::Null);
-                    let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
-                    if cmp != 0 {
-                        let asc = order_expr.asc.unwrap_or(true);
-                        return if asc {
-                            if cmp > 0 {
-                                std::cmp::Ordering::Greater
-                            } else {
-                                std::cmp::Ordering::Less
-                            }
+                    let mut keys = Vec::with_capacity(resolved_order_exprs.len());
+                    for expr in &resolved_order_exprs {
+                        let val = if sequences::expr_uses_sequence_functions(expr) {
+                            self.eval_expr_join_maybe_sequence(txn, sequence_values, expr, &ctx)
+                                .await?
                         } else {
-                            if cmp > 0 {
+                            eval_expr_join(expr, &ctx).unwrap_or(Value::Null)
+                        };
+                        keys.push(val);
+                    }
+                    rows_with_keys.push((orig_idx, row, keys));
+                }
+
+                rows_with_keys.sort_by(|(_, _, a_keys), (_, _, b_keys)| {
+                    for (idx, order_expr) in query.order_by.iter().enumerate() {
+                        let val_a = a_keys.get(idx).cloned().unwrap_or(Value::Null);
+                        let val_b = b_keys.get(idx).cloned().unwrap_or(Value::Null);
+                        let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                        if cmp != 0 {
+                            let asc = order_expr.asc.unwrap_or(true);
+                            return if asc {
+                                if cmp > 0 {
+                                    std::cmp::Ordering::Greater
+                                } else {
+                                    std::cmp::Ordering::Less
+                                }
+                            } else if cmp > 0 {
                                 std::cmp::Ordering::Less
                             } else {
                                 std::cmp::Ordering::Greater
-                            }
-                        };
+                            };
+                        }
                     }
-                }
-                std::cmp::Ordering::Equal
-            });
-            let reordered_wr = window_results.map(|wr| {
-                indexed
-                    .iter()
-                    .map(|(orig_idx, _)| wr[*orig_idx].clone())
-                    .collect()
-            });
-            let reordered_rows: Vec<Row> = indexed.into_iter().map(|(_, r)| r).collect();
-            (reordered_rows, reordered_wr)
+                    std::cmp::Ordering::Equal
+                });
+
+                let reordered_wr = window_results.map(|wr| {
+                    rows_with_keys
+                        .iter()
+                        .map(|(orig_idx, _, _)| wr[*orig_idx].clone())
+                        .collect()
+                });
+                let reordered_rows: Vec<Row> =
+                    rows_with_keys.into_iter().map(|(_, r, _)| r).collect();
+                (reordered_rows, reordered_wr)
+            } else {
+                let mut indexed: Vec<(usize, Row)> =
+                    filtered_rows.into_iter().enumerate().collect();
+                indexed.sort_by(|(_, a), (_, b)| {
+                    for (idx, order_expr) in query.order_by.iter().enumerate() {
+                        let expr = &resolved_order_exprs[idx];
+                        let ctx_a = JoinContext {
+                            tables: HashMap::new(),
+                            column_offsets: final_column_offsets.clone(),
+                            combined_row: a,
+                            combined_schema: &final_schema,
+                        };
+                        let ctx_b = JoinContext {
+                            tables: HashMap::new(),
+                            column_offsets: final_column_offsets.clone(),
+                            combined_row: b,
+                            combined_schema: &final_schema,
+                        };
+                        let val_a = eval_expr_join(expr, &ctx_a).unwrap_or(Value::Null);
+                        let val_b = eval_expr_join(expr, &ctx_b).unwrap_or(Value::Null);
+                        let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                        if cmp != 0 {
+                            let asc = order_expr.asc.unwrap_or(true);
+                            return if asc {
+                                if cmp > 0 {
+                                    std::cmp::Ordering::Greater
+                                } else {
+                                    std::cmp::Ordering::Less
+                                }
+                            } else if cmp > 0 {
+                                std::cmp::Ordering::Less
+                            } else {
+                                std::cmp::Ordering::Greater
+                            };
+                        }
+                    }
+                    std::cmp::Ordering::Equal
+                });
+                let reordered_wr = window_results.map(|wr| {
+                    indexed
+                        .iter()
+                        .map(|(orig_idx, _)| wr[*orig_idx].clone())
+                        .collect()
+                });
+                let reordered_rows: Vec<Row> = indexed.into_iter().map(|(_, r)| r).collect();
+                (reordered_rows, reordered_wr)
+            }
         } else {
             (filtered_rows, window_results)
         };
@@ -1364,7 +1506,10 @@ impl Executor {
                                     }
                                 }
                             }
-                            vals.push(eval_expr_join(e, &ctx)?);
+                            vals.push(
+                                self.eval_expr_join_maybe_sequence(txn, sequence_values, e, &ctx)
+                                    .await?,
+                            );
                         }
                         SelectItem::Wildcard(_) => {}
                     }
@@ -1423,7 +1568,10 @@ impl Executor {
                         SelectItem::Wildcard(_) => continue,
                         _ => return Err(anyhow!("Unsupported select item")),
                     };
-                    vals.push(eval_expr_join(expr, &ctx)?);
+                    vals.push(
+                        self.eval_expr_join_maybe_sequence(txn, sequence_values, expr, &ctx)
+                            .await?,
+                    );
                 }
                 result_rows.push(Row::new(vals));
             }

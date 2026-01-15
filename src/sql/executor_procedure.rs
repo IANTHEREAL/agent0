@@ -12,12 +12,13 @@ impl Executor {
     pub(crate) async fn execute_create_materialized_view(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         name: &ObjectName,
         query: &Query,
         or_replace: bool,
     ) -> Result<ExecuteResult> {
         let result = self
-            .execute_query_with_ctes(txn, query, &HashMap::new())
+            .execute_query_with_ctes(txn, sequence_values, query, &HashMap::new())
             .await?;
         let (columns, rows) = match result {
             ExecuteResult::Select {
@@ -119,7 +120,9 @@ impl Executor {
         }
 
         let result = async {
-            let txn = session.get_mut_txn().expect("Transaction must be active");
+            let (txn, sequence_values) = session
+                .get_mut_txn_and_sequence_values()
+                .expect("Transaction must be active");
 
             let query_str: String = self
                 .store()
@@ -134,7 +137,7 @@ impl Executor {
             };
 
             let result = self
-                .execute_query_with_ctes(txn, &query, &HashMap::new())
+                .execute_query_with_ctes(txn, sequence_values, &query, &HashMap::new())
                 .await?;
             let rows = match result {
                 ExecuteResult::Select { rows, .. } => rows,
@@ -198,7 +201,9 @@ impl Executor {
         }
 
         let result = async {
-            let txn = session.get_mut_txn().expect("Transaction must be active");
+            let (txn, _sequence_values) = session
+                .get_mut_txn_and_sequence_values()
+                .expect("Transaction must be active");
             let name = ObjectName(vec![sqlparser::ast::Ident::new(view_name)]);
             ddl::execute_drop_materialized_view(&self.store(), txn, &[name], if_exists).await
         }
@@ -280,7 +285,9 @@ impl Executor {
         }
 
         let result = async {
-            let txn = session.get_mut_txn().expect("Transaction must be active");
+            let (txn, sequence_values) = session
+                .get_mut_txn_and_sequence_values()
+                .expect("Transaction must be active");
 
             let definition: String = self
                 .store()
@@ -362,7 +369,8 @@ impl Executor {
 
                 let stmts = parse_sql(&expanded_stmt)?;
                 for stmt in stmts {
-                    self.execute_statement_on_txn(txn, &stmt).await?;
+                    self.execute_statement_on_txn(txn, sequence_values, &stmt)
+                        .await?;
                 }
             }
 

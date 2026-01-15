@@ -8,13 +8,14 @@ use super::helpers::{
 };
 use super::query;
 use super::rbac;
+use super::sequences;
 use super::udt;
-use super::{expr::eval_expr, parse_sql, ExecuteResult, Session};
+use super::{parse_sql, ExecuteResult, Session};
 use crate::auth::AuthManager;
 use crate::storage::TikvStore;
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{Query, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement};
+use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -154,8 +155,10 @@ impl Executor {
                         }
 
                         let res = async {
-                            let txn = session.get_mut_txn().expect("Transaction must be active");
-                            self.execute_statement_on_txn(txn, stmt).await
+                            let (txn, sequence_values) = session
+                                .get_mut_txn_and_sequence_values()
+                                .expect("Transaction must be active");
+                            self.execute_statement_on_txn(txn, sequence_values, stmt).await
                         }
                         .await;
 
@@ -181,6 +184,7 @@ impl Executor {
     pub(crate) async fn execute_statement_on_txn(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         stmt: &Statement,
     ) -> Result<ExecuteResult> {
         match stmt {
@@ -194,8 +198,16 @@ impl Executor {
                 ..
             } => {
                 if let Some(q) = query {
-                    self.execute_create_table_as(txn, name, q, columns, *if_not_exists, *temporary)
-                        .await
+                    self.execute_create_table_as(
+                        txn,
+                        sequence_values,
+                        name,
+                        q,
+                        columns,
+                        *if_not_exists,
+                        *temporary,
+                    )
+                    .await
                 } else {
                     ddl::execute_create_table(
                         &self.store,
@@ -248,7 +260,9 @@ impl Executor {
                     ObjectType::Role => {
                         rbac::execute_drop_role(&self.auth_manager, txn, names, *if_exists).await
                     }
-                    ObjectType::Sequence => Ok(ExecuteResult::Empty),
+                    ObjectType::Sequence => {
+                        sequences::execute_drop_sequence(&self.store, txn, names, *if_exists).await
+                    }
                     _ => Ok(ExecuteResult::Empty),
                 }
             }
@@ -272,7 +286,7 @@ impl Executor {
                 on,
                 ..
             } => {
-                self.execute_insert(txn, table_name, columns, source, returning, on)
+                self.execute_insert(txn, sequence_values, table_name, columns, source, returning, on)
                     .await
             }
             Statement::Delete {
@@ -280,7 +294,9 @@ impl Executor {
                 selection,
                 returning,
                 ..
-            } => self.execute_delete(txn, from, selection, returning).await,
+            } => self
+                .execute_delete(txn, sequence_values, from, selection, returning)
+                .await,
             Statement::Update {
                 table,
                 assignments,
@@ -289,10 +305,10 @@ impl Executor {
                 returning,
                 ..
             } => {
-                self.execute_update(txn, table, assignments, from, selection, returning)
+                self.execute_update(txn, sequence_values, table, assignments, from, selection, returning)
                     .await
             }
-            Statement::Query(query) => self.execute_query(txn, query).await,
+            Statement::Query(query) => self.execute_query(txn, sequence_values, query).await,
             Statement::ShowTables { .. } => self.execute_show_tables(txn).await,
             Statement::SetVariable { .. }
             | Statement::SetTimeZone { .. }
@@ -308,7 +324,21 @@ impl Executor {
                 self.execute_create_procedure(txn, name, params.as_deref(), body)
                     .await
             }
-            Statement::CreateSequence { .. } => Ok(ExecuteResult::Empty),
+            Statement::CreateSequence {
+                name,
+                if_not_exists,
+                sequence_options,
+                ..
+            } => {
+                sequences::execute_create_sequence(
+                    &self.store,
+                    txn,
+                    name,
+                    *if_not_exists,
+                    sequence_options,
+                )
+                .await
+            }
             Statement::CreateView {
                 name,
                 query,
@@ -317,7 +347,7 @@ impl Executor {
                 ..
             } => {
                 if *materialized {
-                    self.execute_create_materialized_view(txn, name, query, *or_replace)
+                    self.execute_create_materialized_view(txn, sequence_values, name, query, *or_replace)
                         .await
                 } else {
                     ddl::execute_create_view(&self.store, txn, name, query, *or_replace).await
@@ -397,22 +427,56 @@ impl Executor {
         }
     }
 
+    pub(crate) async fn eval_expr_maybe_sequence(
+        &self,
+        txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
+        expr: &Expr,
+        row: Option<&Row>,
+        schema: Option<&TableSchema>,
+    ) -> Result<Value> {
+        if sequences::expr_uses_sequence_functions(expr) {
+            sequences::eval_expr_with_sequences(&self.store, txn, sequence_values, expr, row, schema)
+                .await
+        } else {
+            super::expr::eval_expr(expr, row, schema)
+        }
+    }
+
+    pub(crate) async fn eval_expr_join_maybe_sequence(
+        &self,
+        txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
+        expr: &Expr,
+        join_ctx: &super::expr::JoinContext<'_>,
+    ) -> Result<Value> {
+        if sequences::expr_uses_sequence_functions(expr) {
+            sequences::eval_expr_join_with_sequences(&self.store, txn, sequence_values, expr, join_ctx)
+                .await
+        } else {
+            super::expr::eval_expr_join(expr, join_ctx)
+        }
+    }
+
     pub(crate) async fn execute_query(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         query: &Query,
     ) -> Result<ExecuteResult> {
-        let ctes = self.build_cte_context(txn, query).await?;
-        self.execute_query_with_ctes(txn, query, &ctes).await
+        let ctes = self.build_cte_context(txn, sequence_values, query).await?;
+        self.execute_query_with_ctes(txn, sequence_values, query, &ctes)
+            .await
     }
 
     pub(crate) async fn execute_tableless_query(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         select: &sqlparser::ast::Select,
     ) -> Result<ExecuteResult> {
         let resolved_projection = self
-            .resolve_projection_subqueries(txn, &select.projection)
+            .resolve_projection_subqueries(txn, sequence_values, &select.projection)
             .await?;
 
         let mut cols = Vec::new();
@@ -422,11 +486,31 @@ impl Executor {
             match item {
                 SelectItem::UnnamedExpr(expr) => {
                     cols.push(get_expr_name(expr));
-                    values.push(eval_expr(expr, None, None)?);
+                    values.push(
+                        sequences::eval_expr_with_sequences(
+                            &self.store,
+                            txn,
+                            sequence_values,
+                            expr,
+                            None,
+                            None,
+                        )
+                        .await?,
+                    );
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     cols.push(alias.value.clone());
-                    values.push(eval_expr(expr, None, None)?);
+                    values.push(
+                        sequences::eval_expr_with_sequences(
+                            &self.store,
+                            txn,
+                            sequence_values,
+                            expr,
+                            None,
+                            None,
+                        )
+                        .await?,
+                    );
                 }
                 _ => return Err(anyhow!("Unsupported select item in tableless query")),
             }
@@ -442,6 +526,7 @@ impl Executor {
     pub(crate) fn execute_set_operation<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        sequence_values: &'a mut HashMap<String, i64>,
         op: &'a SetOperator,
         quantifier: &'a SetQuantifier,
         left: &'a SetExpr,
@@ -450,8 +535,12 @@ impl Executor {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecuteResult>> + Send + 'a>>
     {
         Box::pin(async move {
-            let left_result = self.execute_set_expr(txn, left, ctes).await?;
-            let right_result = self.execute_set_expr(txn, right, ctes).await?;
+            let left_result = self
+                .execute_set_expr(txn, sequence_values, left, ctes)
+                .await?;
+            let right_result = self
+                .execute_set_expr(txn, sequence_values, right, ctes)
+                .await?;
 
             let (left_cols, left_rows) = match left_result {
                 ExecuteResult::Select {
@@ -492,6 +581,7 @@ impl Executor {
     fn execute_set_expr<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        sequence_values: &'a mut HashMap<String, i64>,
         expr: &'a SetExpr,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecuteResult>> + Send + 'a>>
@@ -510,7 +600,8 @@ impl Executor {
                         limit_by: vec![],
                         for_clause: None,
                     };
-                    self.execute_query_with_ctes(txn, &query, ctes).await
+                    self.execute_query_with_ctes(txn, sequence_values, &query, ctes)
+                        .await
                 }
                 SetExpr::SetOperation {
                     op,
@@ -518,8 +609,16 @@ impl Executor {
                     left,
                     right,
                 } => {
-                    self.execute_set_operation(txn, op, set_quantifier, left, right, ctes)
-                        .await
+                    self.execute_set_operation(
+                        txn,
+                        sequence_values,
+                        op,
+                        set_quantifier,
+                        left,
+                        right,
+                        ctes,
+                    )
+                    .await
                 }
                 _ => Err(anyhow!("Unsupported set expression")),
             }

@@ -20,6 +20,7 @@ mod planner;
 mod query;
 mod rbac;
 mod result;
+mod sequences;
 mod udt;
 mod window;
 

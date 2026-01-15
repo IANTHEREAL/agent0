@@ -5,6 +5,7 @@ use super::helpers::{
     eval_having_expr, fill_row_defaults, get_select_item_name, infer_expr_type, AggExpr,
 };
 use super::planner::{self, ScanType};
+use super::sequences;
 use super::window::{compute_window_functions, extract_window_functions, WindowFuncInfo};
 use super::{expr::eval_expr, Aggregator, ExecuteResult, Executor};
 use crate::types::{DataType, Row, TableSchema, Value};
@@ -33,6 +34,7 @@ impl Executor {
     pub(crate) async fn execute_query_with_ctes(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         query: &Query,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
@@ -44,7 +46,7 @@ impl Executor {
         } = &*query.body
         {
             return self
-                .execute_set_operation(txn, op, set_quantifier, left, right, ctes)
+                .execute_set_operation(txn, sequence_values, op, set_quantifier, left, right, ctes)
                 .await;
         }
 
@@ -59,7 +61,7 @@ impl Executor {
             .map(|into| (into.name.clone(), into.temporary));
 
         if select.from.is_empty() {
-            let result = self.execute_tableless_query(txn, select).await?;
+            let result = self.execute_tableless_query(txn, sequence_values, select).await?;
             if let Some((target_name, _temp)) = select_into_target {
                 return self
                     .create_table_from_result(txn, &target_name, result)
@@ -72,7 +74,7 @@ impl Executor {
 
         if has_joins {
             let result = self
-                .execute_join_query_with_ctes(txn, query, select, ctes)
+                .execute_join_query_with_ctes(txn, sequence_values, query, select, ctes)
                 .await?;
             if let Some((target_name, _temp)) = select_into_target {
                 return self
@@ -95,7 +97,9 @@ impl Executor {
                         simple_name.clone()
                     };
                 let t_lower = lookup_name.to_lowercase();
-                let (schema, rows) = self.get_table_data(txn, &lookup_name, ctes).await?;
+                let (schema, rows) = self
+                    .get_table_data(txn, sequence_values, &lookup_name, ctes)
+                    .await?;
                 let is_virtual = ctes.contains_key(&t_lower)
                     || super::information_schema::get_information_schema_schema(&t_lower).is_some()
                     || self.store().get_view(txn, &t_lower).await?.is_some();
@@ -113,7 +117,7 @@ impl Executor {
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "subquery".to_string());
                 let (schema, rows) = self
-                    .execute_derived_table(txn, subquery, &alias_name, ctes)
+                    .execute_derived_table(txn, sequence_values, subquery, &alias_name, ctes)
                     .await?;
                 (alias_name.clone(), alias_name, schema, rows, true)
             }
@@ -130,14 +134,19 @@ impl Executor {
             if has_correlated_exists {
                 Some(sel.clone())
             } else {
-                Some(self.resolve_subqueries(txn, sel).await?)
+                Some(self.resolve_subqueries(txn, sequence_values, sel).await?)
             }
         } else {
             None
         };
 
         let resolved_projection = self
-            .resolve_projection_subqueries_with_outer_context(txn, &select.projection, &outer_alias)
+            .resolve_projection_subqueries_with_outer_context(
+                txn,
+                sequence_values,
+                &select.projection,
+                &outer_alias,
+            )
             .await?;
 
         let all_rows = if is_virtual {
@@ -250,7 +259,14 @@ impl Executor {
             if has_correlated_exists {
                 for r in all_rows {
                     let result = self
-                        .eval_selection_with_correlated_exists(txn, sel, &outer_alias, &schema, &r)
+                        .eval_selection_with_correlated_exists(
+                            txn,
+                            sequence_values,
+                            sel,
+                            &outer_alias,
+                            &schema,
+                            &r,
+                        )
                         .await?;
                     if matches!(result, Value::Boolean(true)) {
                         v.push(r);
@@ -259,7 +275,14 @@ impl Executor {
             } else {
                 for r in all_rows {
                     if matches!(
-                        eval_expr(sel, Some(&r), Some(&schema))?,
+                        self.eval_expr_maybe_sequence(
+                            txn,
+                            sequence_values,
+                            sel,
+                            Some(&r),
+                            Some(&schema),
+                        )
+                        .await?,
                         Value::Boolean(true)
                     ) {
                         v.push(r);
@@ -337,6 +360,7 @@ impl Executor {
             return self
                 .execute_aggregate_query(
                     txn,
+                    sequence_values,
                     query,
                     select,
                     &schema,
@@ -377,12 +401,15 @@ impl Executor {
         let (filtered_rows, window_results) =
             if !query.order_by.is_empty() && !order_by_references_correlated_subquery {
                 self.apply_order_by(
+                    txn,
+                    sequence_values,
                     filtered_rows,
                     window_results,
                     &query.order_by,
                     &resolved_projection,
                     &schema,
                 )
+                .await?
             } else {
                 (filtered_rows, window_results)
             };
@@ -411,6 +438,7 @@ impl Executor {
         } else {
             self.project_rows(
                 txn,
+                sequence_values,
                 select,
                 &schema,
                 &outer_alias,
@@ -467,6 +495,7 @@ impl Executor {
     async fn execute_aggregate_query(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         query: &Query,
         select: &sqlparser::ast::Select,
         schema: &TableSchema,
@@ -482,7 +511,10 @@ impl Executor {
         for row in filtered_rows {
             let mut key = Vec::new();
             for expr in group_keys_exprs {
-                key.push(eval_expr(expr, Some(&row), Some(schema))?);
+                key.push(
+                    self.eval_expr_maybe_sequence(txn, sequence_values, expr, Some(&row), Some(schema))
+                        .await?,
+                );
             }
             let key_bytes = bincode::serialize(&key).unwrap();
 
@@ -496,7 +528,16 @@ impl Executor {
                                 let delimiter = if f.args.len() >= 2 {
                                     match &f.args[1] {
                                         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                                            match eval_expr(e, Some(&row), Some(schema))? {
+                                            match self
+                                                .eval_expr_maybe_sequence(
+                                                    txn,
+                                                    sequence_values,
+                                                    e,
+                                                    Some(&row),
+                                                    Some(schema),
+                                                )
+                                                .await?
+                                            {
                                                 Value::Text(s) => s,
                                                 _ => ",".to_string(),
                                             }
@@ -540,14 +581,23 @@ impl Executor {
                 };
 
                 if let Some(filter) = filter_expr {
-                    let filter_val = eval_expr(filter, Some(&row), Some(schema))?;
+                    let filter_val = self
+                        .eval_expr_maybe_sequence(
+                            txn,
+                            sequence_values,
+                            filter,
+                            Some(&row),
+                            Some(schema),
+                        )
+                        .await?;
                     if !matches!(filter_val, Value::Boolean(true)) {
                         continue;
                     }
                 }
 
                 let val = if let Some(e) = arg_expr {
-                    eval_expr(e, Some(&row), Some(schema))?
+                    self.eval_expr_maybe_sequence(txn, sequence_values, e, Some(&row), Some(schema))
+                        .await?
                 } else {
                     Value::Int32(1)
                 };
@@ -590,8 +640,21 @@ impl Executor {
             let representative = &group_rows[&key_bytes];
 
             if let Some(having_expr) = &select.having {
+                let having_expr = if sequences::expr_uses_sequence_functions(having_expr) {
+                    sequences::replace_sequence_functions(
+                        &self.store(),
+                        txn,
+                        sequence_values,
+                        having_expr,
+                        Some(representative),
+                        Some(schema),
+                    )
+                    .await?
+                } else {
+                    having_expr.clone()
+                };
                 let having_val =
-                    eval_having_expr(having_expr, representative, schema, &agg_funcs, &aggs)?;
+                    eval_having_expr(&having_expr, representative, schema, &agg_funcs, &aggs)?;
                 if !matches!(having_val, Value::Boolean(true)) {
                     continue;
                 }
@@ -607,8 +670,21 @@ impl Executor {
                         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
                         _ => return Err(anyhow!("Unsupported item")),
                     };
+                    let expr = if sequences::expr_uses_sequence_functions(expr) {
+                        sequences::replace_sequence_functions(
+                            &self.store(),
+                            txn,
+                            sequence_values,
+                            expr,
+                            Some(representative),
+                            Some(schema),
+                        )
+                        .await?
+                    } else {
+                        expr.clone()
+                    };
                     row_values.push(super::helpers::eval_having_expr(
-                        expr,
+                        &expr,
                         representative,
                         schema,
                         &agg_funcs,
@@ -686,65 +762,130 @@ impl Executor {
         indexed.into_iter().map(|(_, r)| r).collect()
     }
 
-    fn apply_order_by(
+    async fn apply_order_by(
         &self,
+        txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         filtered_rows: Vec<Row>,
         window_results: Option<Vec<Vec<Value>>>,
         order_by: &[sqlparser::ast::OrderByExpr],
         resolved_projection: &[SelectItem],
         schema: &TableSchema,
-    ) -> (Vec<Row>, Option<Vec<Vec<Value>>>) {
-        let mut indexed: Vec<(usize, Row)> = filtered_rows.into_iter().enumerate().collect();
-        indexed.sort_by(|(_, a), (_, b)| {
-            for order_expr in order_by {
-                let actual_expr = if let Expr::Identifier(ref ident) = order_expr.expr {
-                    let mut found_expr = None;
+    ) -> Result<(Vec<Row>, Option<Vec<Vec<Value>>>)> {
+        let resolved_order_exprs: Vec<Expr> = order_by
+            .iter()
+            .map(|order_expr| {
+                if let Expr::Identifier(ref ident) = order_expr.expr {
                     for item in resolved_projection {
                         if let SelectItem::ExprWithAlias { expr, alias } = item {
                             if alias.value.eq_ignore_ascii_case(&ident.value) {
-                                found_expr = Some(expr);
-                                break;
+                                return expr.clone();
                             }
                         }
                     }
-                    found_expr.unwrap_or(&order_expr.expr)
-                } else {
-                    &order_expr.expr
-                };
-
-                let val_a = eval_expr(actual_expr, Some(a), Some(schema)).unwrap_or(Value::Null);
-                let val_b = eval_expr(actual_expr, Some(b), Some(schema)).unwrap_or(Value::Null);
-                let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
-                if cmp != 0 {
-                    let asc = order_expr.asc.unwrap_or(true);
-                    return if asc {
-                        if cmp > 0 {
-                            std::cmp::Ordering::Greater
-                        } else {
-                            std::cmp::Ordering::Less
-                        }
-                    } else if cmp > 0 {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Greater
-                    };
                 }
+                order_expr.expr.clone()
+            })
+            .collect();
+
+        let order_by_uses_sequences = resolved_order_exprs
+            .iter()
+            .any(sequences::expr_uses_sequence_functions);
+
+        if order_by_uses_sequences {
+            let mut rows_with_keys: Vec<(usize, Row, Vec<Value>)> =
+                Vec::with_capacity(filtered_rows.len());
+            for (orig_idx, row) in filtered_rows.into_iter().enumerate() {
+                let mut keys = Vec::with_capacity(order_by.len());
+                for actual_expr in &resolved_order_exprs {
+                    let val = if sequences::expr_uses_sequence_functions(actual_expr) {
+                        self.eval_expr_maybe_sequence(
+                            txn,
+                            sequence_values,
+                            actual_expr,
+                            Some(&row),
+                            Some(schema),
+                        )
+                        .await?
+                    } else {
+                        eval_expr(actual_expr, Some(&row), Some(schema)).unwrap_or(Value::Null)
+                    };
+                    keys.push(val);
+                }
+                rows_with_keys.push((orig_idx, row, keys));
             }
-            std::cmp::Ordering::Equal
-        });
-        let reordered_wr = window_results.map(|wr| {
-            indexed
-                .iter()
-                .map(|(orig_idx, _)| wr[*orig_idx].clone())
-                .collect()
-        });
-        let reordered_rows: Vec<Row> = indexed.into_iter().map(|(_, r)| r).collect();
-        (reordered_rows, reordered_wr)
+
+            rows_with_keys.sort_by(|(_, _, a_keys), (_, _, b_keys)| {
+                for (idx, order_expr) in order_by.iter().enumerate() {
+                    let val_a = a_keys.get(idx).cloned().unwrap_or(Value::Null);
+                    let val_b = b_keys.get(idx).cloned().unwrap_or(Value::Null);
+                    let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                    if cmp != 0 {
+                        let asc = order_expr.asc.unwrap_or(true);
+                        return if asc {
+                            if cmp > 0 {
+                                std::cmp::Ordering::Greater
+                            } else {
+                                std::cmp::Ordering::Less
+                            }
+                        } else if cmp > 0 {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Greater
+                        };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+
+            let reordered_wr = window_results.map(|wr| {
+                rows_with_keys
+                    .iter()
+                    .map(|(orig_idx, _, _)| wr[*orig_idx].clone())
+                    .collect()
+            });
+            let reordered_rows: Vec<Row> = rows_with_keys.into_iter().map(|(_, r, _)| r).collect();
+            Ok((reordered_rows, reordered_wr))
+        } else {
+            let mut indexed: Vec<(usize, Row)> = filtered_rows.into_iter().enumerate().collect();
+            indexed.sort_by(|(_, a), (_, b)| {
+                for (idx, order_expr) in order_by.iter().enumerate() {
+                    let actual_expr = &resolved_order_exprs[idx];
+                    let val_a = eval_expr(actual_expr, Some(a), Some(schema)).unwrap_or(Value::Null);
+                    let val_b = eval_expr(actual_expr, Some(b), Some(schema)).unwrap_or(Value::Null);
+                    let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                    if cmp != 0 {
+                        let asc = order_expr.asc.unwrap_or(true);
+                        return if asc {
+                            if cmp > 0 {
+                                std::cmp::Ordering::Greater
+                            } else {
+                                std::cmp::Ordering::Less
+                            }
+                        } else if cmp > 0 {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Greater
+                        };
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            let reordered_wr = window_results.map(|wr| {
+                indexed
+                    .iter()
+                    .map(|(orig_idx, _)| wr[*orig_idx].clone())
+                    .collect()
+            });
+            let reordered_rows: Vec<Row> = indexed.into_iter().map(|(_, r)| r).collect();
+            Ok((reordered_rows, reordered_wr))
+        }
     }
 
     async fn project_rows(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         select: &sqlparser::ast::Select,
         schema: &TableSchema,
         outer_alias: &str,
@@ -825,10 +966,24 @@ impl Executor {
                         }
                     };
                     let value = if let Expr::Subquery(subquery) = expr {
-                        self.eval_correlated_subquery(txn, subquery, outer_alias, schema, row)
+                        self.eval_correlated_subquery(
+                            txn,
+                            sequence_values,
+                            subquery,
+                            outer_alias,
+                            schema,
+                            row,
+                        )
                             .await?
                     } else {
-                        eval_expr(expr, Some(row), Some(schema))?
+                        self.eval_expr_maybe_sequence(
+                            txn,
+                            sequence_values,
+                            expr,
+                            Some(row),
+                            Some(schema),
+                        )
+                        .await?
                     };
                     row_values.push(value);
                 }

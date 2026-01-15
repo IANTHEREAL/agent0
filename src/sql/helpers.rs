@@ -963,6 +963,7 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                     }
                 }
                 "NOW" | "CURRENT_TIMESTAMP" | "CURRENT_DATE" => DataType::Timestamp,
+                "NEXTVAL" | "CURRVAL" | "SETVAL" => DataType::Int64,
                 "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => DataType::Uuid,
                 "JSONB_BUILD_OBJECT" | "JSONB_AGG" | "TO_JSONB" => DataType::Jsonb,
                 "JSON_BUILD_OBJECT" | "JSON_AGG" | "TO_JSON" => DataType::Json,

@@ -1,7 +1,6 @@
 //! Subquery resolution for the SQL executor
 
 use super::executor::Executor;
-use super::expr::eval_expr;
 use super::helpers::{
     query_has_outer_reference, substitute_outer_values_in_query, value_to_sql_expr,
 };
@@ -9,12 +8,14 @@ use super::ExecuteResult;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{BinaryOperator, Expr, Query, SelectItem, Value as SqlValue};
+use std::collections::HashMap;
 use tikv_client::Transaction;
 
 impl Executor {
     pub(crate) fn resolve_subqueries<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        sequence_values: &'a mut HashMap<String, i64>,
         expr: &'a Expr,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Expr>> + Send + 'a>> {
         Box::pin(async move {
@@ -24,7 +25,7 @@ impl Executor {
                     subquery,
                     negated,
                 } => {
-                    let result = self.execute_query(txn, subquery).await?;
+                    let result = self.execute_query(txn, sequence_values, subquery).await?;
                     let values = match result {
                         ExecuteResult::Select { rows, .. } => rows
                             .iter()
@@ -33,7 +34,10 @@ impl Executor {
                             .collect::<Vec<_>>(),
                         _ => return Err(anyhow!("Subquery must return a SELECT result")),
                     };
-                    let resolved_inner = Box::new(self.resolve_subqueries(txn, inner_expr).await?);
+                    let resolved_inner = Box::new(
+                        self.resolve_subqueries(txn, sequence_values, inner_expr)
+                            .await?,
+                    );
                     Ok(Expr::InList {
                         expr: resolved_inner,
                         list: values,
@@ -41,8 +45,12 @@ impl Executor {
                     })
                 }
                 Expr::BinaryOp { left, op, right } => {
-                    let resolved_left = Box::new(self.resolve_subqueries(txn, left).await?);
-                    let resolved_right = Box::new(self.resolve_subqueries(txn, right).await?);
+                    let resolved_left = Box::new(
+                        self.resolve_subqueries(txn, sequence_values, left).await?,
+                    );
+                    let resolved_right = Box::new(
+                        self.resolve_subqueries(txn, sequence_values, right).await?,
+                    );
                     Ok(Expr::BinaryOp {
                         left: resolved_left,
                         op: op.clone(),
@@ -50,18 +58,24 @@ impl Executor {
                     })
                 }
                 Expr::UnaryOp { op, expr: inner } => {
-                    let resolved = Box::new(self.resolve_subqueries(txn, inner).await?);
+                    let resolved = Box::new(
+                        self.resolve_subqueries(txn, sequence_values, inner)
+                            .await?,
+                    );
                     Ok(Expr::UnaryOp {
                         op: op.clone(),
                         expr: resolved,
                     })
                 }
                 Expr::Nested(inner) => {
-                    let resolved = Box::new(self.resolve_subqueries(txn, inner).await?);
+                    let resolved = Box::new(
+                        self.resolve_subqueries(txn, sequence_values, inner)
+                            .await?,
+                    );
                     Ok(Expr::Nested(resolved))
                 }
                 Expr::Subquery(subquery) => {
-                    let result = self.execute_query(txn, subquery).await?;
+                    let result = self.execute_query(txn, sequence_values, subquery).await?;
                     match result {
                         ExecuteResult::Select { rows, .. } => {
                             if rows.is_empty() {
@@ -77,7 +91,7 @@ impl Executor {
                     }
                 }
                 Expr::Exists { subquery, negated } => {
-                    let result = self.execute_query(txn, subquery).await?;
+                    let result = self.execute_query(txn, sequence_values, subquery).await?;
                     let exists = match result {
                         ExecuteResult::Select { rows, .. } => !rows.is_empty(),
                         _ => false,
@@ -92,20 +106,29 @@ impl Executor {
                     else_result,
                 } => {
                     let resolved_operand = if let Some(op) = operand {
-                        Some(Box::new(self.resolve_subqueries(txn, op).await?))
+                        Some(Box::new(
+                            self.resolve_subqueries(txn, sequence_values, op).await?,
+                        ))
                     } else {
                         None
                     };
                     let mut resolved_conditions = Vec::with_capacity(conditions.len());
                     for cond in conditions {
-                        resolved_conditions.push(self.resolve_subqueries(txn, cond).await?);
+                        resolved_conditions.push(
+                            self.resolve_subqueries(txn, sequence_values, cond).await?,
+                        );
                     }
                     let mut resolved_results = Vec::with_capacity(results.len());
                     for res in results {
-                        resolved_results.push(self.resolve_subqueries(txn, res).await?);
+                        resolved_results.push(
+                            self.resolve_subqueries(txn, sequence_values, res).await?,
+                        );
                     }
                     let resolved_else = if let Some(else_expr) = else_result {
-                        Some(Box::new(self.resolve_subqueries(txn, else_expr).await?))
+                        Some(Box::new(
+                            self.resolve_subqueries(txn, sequence_values, else_expr)
+                                .await?,
+                        ))
                     } else {
                         None
                     };
@@ -124,7 +147,7 @@ impl Executor {
                                 sqlparser::ast::FunctionArgExpr::Expr(e),
                             ) => sqlparser::ast::FunctionArg::Unnamed(
                                 sqlparser::ast::FunctionArgExpr::Expr(
-                                    self.resolve_subqueries(txn, e).await?,
+                                    self.resolve_subqueries(txn, sequence_values, e).await?,
                                 ),
                             ),
                             other => other.clone(),
@@ -150,16 +173,17 @@ impl Executor {
     pub(crate) async fn resolve_projection_subqueries(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         projection: &[SelectItem],
     ) -> Result<Vec<SelectItem>> {
         let mut resolved = Vec::with_capacity(projection.len());
         for item in projection {
             let resolved_item = match item {
                 SelectItem::UnnamedExpr(e) => {
-                    SelectItem::UnnamedExpr(self.resolve_subqueries(txn, e).await?)
+                    SelectItem::UnnamedExpr(self.resolve_subqueries(txn, sequence_values, e).await?)
                 }
                 SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias {
-                    expr: self.resolve_subqueries(txn, expr).await?,
+                    expr: self.resolve_subqueries(txn, sequence_values, expr).await?,
                     alias: alias.clone(),
                 },
                 other => other.clone(),
@@ -173,6 +197,7 @@ impl Executor {
     pub(crate) async fn resolve_projection_subqueries_with_outer_context(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         projection: &[SelectItem],
         outer_alias: &str,
     ) -> Result<Vec<SelectItem>> {
@@ -183,7 +208,7 @@ impl Executor {
                     if self.expr_is_correlated_subquery(e, outer_alias) {
                         SelectItem::UnnamedExpr(e.clone())
                     } else {
-                        SelectItem::UnnamedExpr(self.resolve_subqueries(txn, e).await?)
+                        SelectItem::UnnamedExpr(self.resolve_subqueries(txn, sequence_values, e).await?)
                     }
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
@@ -194,7 +219,7 @@ impl Executor {
                         }
                     } else {
                         SelectItem::ExprWithAlias {
-                            expr: self.resolve_subqueries(txn, expr).await?,
+                            expr: self.resolve_subqueries(txn, sequence_values, expr).await?,
                             alias: alias.clone(),
                         }
                     }
@@ -233,6 +258,7 @@ impl Executor {
     pub(crate) fn eval_correlated_exists<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        sequence_values: &'a mut HashMap<String, i64>,
         subquery: &'a Query,
         negated: bool,
         outer_alias: &'a str,
@@ -242,7 +268,9 @@ impl Executor {
         Box::pin(async move {
             let substituted_query =
                 substitute_outer_values_in_query(subquery, outer_alias, outer_schema, outer_row);
-            let result = self.execute_query(txn, &substituted_query).await?;
+            let result = self
+                .execute_query(txn, sequence_values, &substituted_query)
+                .await?;
             let exists = match result {
                 ExecuteResult::Select { rows, .. } => !rows.is_empty(),
                 _ => false,
@@ -256,6 +284,7 @@ impl Executor {
     pub(crate) fn eval_selection_with_correlated_exists<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        sequence_values: &'a mut HashMap<String, i64>,
         expr: &'a Expr,
         outer_alias: &'a str,
         outer_schema: &'a TableSchema,
@@ -267,6 +296,7 @@ impl Executor {
                     if query_has_outer_reference(subquery, outer_alias) {
                         self.eval_correlated_exists(
                             txn,
+                            sequence_values,
                             subquery,
                             *negated,
                             outer_alias,
@@ -275,7 +305,7 @@ impl Executor {
                         )
                         .await
                     } else {
-                        let result = self.execute_query(txn, subquery).await?;
+                        let result = self.execute_query(txn, sequence_values, subquery).await?;
                         let exists = match result {
                             ExecuteResult::Select { rows, .. } => !rows.is_empty(),
                             _ => false,
@@ -288,6 +318,7 @@ impl Executor {
                     let left_val = self
                         .eval_selection_with_correlated_exists(
                             txn,
+                            sequence_values,
                             left,
                             outer_alias,
                             outer_schema,
@@ -297,6 +328,7 @@ impl Executor {
                     let right_val = self
                         .eval_selection_with_correlated_exists(
                             txn,
+                            sequence_values,
                             right,
                             outer_alias,
                             outer_schema,
@@ -314,7 +346,16 @@ impl Executor {
                             let right_bool = matches!(right_val, Value::Boolean(true));
                             Ok(Value::Boolean(left_bool || right_bool))
                         }
-                        _ => eval_expr(expr, Some(outer_row), Some(outer_schema)),
+                        _ => {
+                            self.eval_expr_maybe_sequence(
+                                txn,
+                                sequence_values,
+                                expr,
+                                Some(outer_row),
+                                Some(outer_schema),
+                            )
+                            .await
+                        }
                     }
                 }
                 Expr::UnaryOp {
@@ -324,6 +365,7 @@ impl Executor {
                     let inner_val = self
                         .eval_selection_with_correlated_exists(
                             txn,
+                            sequence_values,
                             inner,
                             outer_alias,
                             outer_schema,
@@ -336,6 +378,7 @@ impl Executor {
                 Expr::Nested(inner) => {
                     self.eval_selection_with_correlated_exists(
                         txn,
+                        sequence_values,
                         inner,
                         outer_alias,
                         outer_schema,
@@ -343,7 +386,16 @@ impl Executor {
                     )
                     .await
                 }
-                _ => eval_expr(expr, Some(outer_row), Some(outer_schema)),
+                _ => {
+                    self.eval_expr_maybe_sequence(
+                        txn,
+                        sequence_values,
+                        expr,
+                        Some(outer_row),
+                        Some(outer_schema),
+                    )
+                    .await
+                }
             }
         })
     }
@@ -352,6 +404,7 @@ impl Executor {
     pub(crate) fn eval_correlated_subquery<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        sequence_values: &'a mut HashMap<String, i64>,
         subquery: &'a Query,
         outer_alias: &'a str,
         outer_schema: &'a TableSchema,
@@ -360,7 +413,9 @@ impl Executor {
         Box::pin(async move {
             let substituted_query =
                 substitute_outer_values_in_query(subquery, outer_alias, outer_schema, outer_row);
-            let result = self.execute_query(txn, &substituted_query).await?;
+            let result = self
+                .execute_query(txn, sequence_values, &substituted_query)
+                .await?;
             match result {
                 ExecuteResult::Select { rows, .. } => {
                     if rows.is_empty() {

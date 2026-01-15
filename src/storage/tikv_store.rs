@@ -1,5 +1,7 @@
 use super::encoding::*;
-use crate::types::{DataType, Row, TableSchema, UserTypeDef, Value};
+use crate::types::{
+    DataType, Row, SequenceBacking, SequenceDef, SequenceState, TableSchema, UserTypeDef, Value,
+};
 use crate::txn::{txn_delete, txn_put};
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
@@ -10,6 +12,77 @@ use tracing::{debug, info};
 
 /// Maximum scan limit for TiKV operations.
 const SCAN_LIMIT: u32 = u32::MAX;
+
+fn nextval_standalone(
+    full_name: &str,
+    increment: i64,
+    min_value: i64,
+    max_value: i64,
+    is_cycled: bool,
+    state: &mut SequenceState,
+) -> Result<i64> {
+    if increment == 0 {
+        return Err(anyhow!("Sequence '{}' has invalid INCREMENT 0", full_name));
+    }
+
+    if !state.is_called {
+        state.is_called = true;
+        return Ok(state.last_value);
+    }
+
+    let candidate = state
+        .last_value
+        .checked_add(increment)
+        .ok_or_else(|| anyhow!("Sequence '{}' overflow", full_name))?;
+
+    let wrapped = if candidate > max_value {
+        if is_cycled {
+            min_value
+        } else {
+            return Err(anyhow!(
+                "nextval: reached maximum value of sequence \"{}\" ({})",
+                full_name,
+                max_value
+            ));
+        }
+    } else if candidate < min_value {
+        if is_cycled {
+            max_value
+        } else {
+            return Err(anyhow!(
+                "nextval: reached minimum value of sequence \"{}\" ({})",
+                full_name,
+                min_value
+            ));
+        }
+    } else {
+        candidate
+    };
+
+    state.last_value = wrapped;
+    Ok(wrapped)
+}
+
+fn setval_standalone(
+    full_name: &str,
+    min_value: i64,
+    max_value: i64,
+    state: &mut SequenceState,
+    value: i64,
+    is_called: bool,
+) -> Result<i64> {
+    if value < min_value || value > max_value {
+        return Err(anyhow!(
+            "setval: value {} is out of bounds for sequence \"{}\"",
+            value,
+            full_name
+        ));
+    }
+
+    state.last_value = value;
+    state.is_called = is_called;
+    Ok(value)
+}
 
 pub struct TikvStore {
     client: Arc<TransactionClient>,
@@ -369,6 +442,132 @@ impl TikvStore {
         }
     }
 
+    pub async fn create_sequence(&self, txn: &mut Transaction, def: SequenceDef) -> Result<()> {
+        let full_name = def.full_name();
+        let key = self.key(&encode_sequence_key(&full_name));
+        if txn.get(key.clone()).await?.is_some() {
+            return Err(anyhow!("Sequence '{}' already exists", full_name));
+        }
+        let data = bincode::serialize(&def).context("Failed to serialize sequence definition")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
+    pub async fn get_sequence(
+        &self,
+        txn: &mut Transaction,
+        full_name: &str,
+    ) -> Result<Option<SequenceDef>> {
+        let key = self.key(&encode_sequence_key(full_name));
+        match txn.get(key).await? {
+            Some(data) => Ok(Some(
+                bincode::deserialize(&data).context("Failed to deserialize sequence definition")?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_sequences(&self, txn: &mut Transaction) -> Result<Vec<SequenceDef>> {
+        let prefix = encode_sequence_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut sequences = Vec::new();
+        for pair in pairs {
+            let def: SequenceDef =
+                bincode::deserialize(pair.value()).context("Failed to deserialize sequence")?;
+            sequences.push(def);
+        }
+        Ok(sequences)
+    }
+
+    pub async fn drop_sequence(&self, txn: &mut Transaction, full_name: &str) -> Result<bool> {
+        let key = self.key(&encode_sequence_key(full_name));
+        if txn.get(key.clone()).await?.is_some() {
+            txn_delete(txn, key).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn nextval_sequence(&self, txn: &mut Transaction, full_name: &str) -> Result<i64> {
+        let mut def = self
+            .get_sequence(txn, full_name)
+            .await?
+            .ok_or_else(|| anyhow!("Sequence '{}' does not exist", full_name))?;
+
+        match &mut def.backing {
+            SequenceBacking::TableId(table_id) => {
+                Ok(self.next_sequence_value(txn, *table_id).await? as i64)
+            }
+            SequenceBacking::Standalone(state) => {
+                let next = nextval_standalone(
+                    full_name,
+                    def.increment,
+                    def.min_value,
+                    def.max_value,
+                    def.is_cycled,
+                    state,
+                )?;
+
+                let key = self.key(&encode_sequence_key(full_name));
+                let data =
+                    bincode::serialize(&def).context("Failed to serialize sequence definition")?;
+                txn_put(txn, key, data).await?;
+                Ok(next)
+            }
+        }
+    }
+
+    pub async fn setval_sequence(
+        &self,
+        txn: &mut Transaction,
+        full_name: &str,
+        value: i64,
+        is_called: bool,
+    ) -> Result<i64> {
+        let mut def = self
+            .get_sequence(txn, full_name)
+            .await?
+            .ok_or_else(|| anyhow!("Sequence '{}' does not exist", full_name))?;
+
+        match &mut def.backing {
+            SequenceBacking::TableId(table_id) => {
+                if value < 1 {
+                    return Err(anyhow!(
+                        "setval: value {} is out of bounds for sequence \"{}\"",
+                        value,
+                        full_name
+                    ));
+                }
+                let value_u64: u64 = value
+                    .try_into()
+                    .map_err(|_| anyhow!("setval: value {} is too large for sequence \"{}\"", value, full_name))?;
+                let stored = if is_called {
+                    value_u64
+                } else {
+                    value_u64
+                        .checked_sub(1)
+                        .ok_or_else(|| anyhow!("setval: value {} is out of bounds for sequence \"{}\"", value, full_name))?
+                };
+                self.set_sequence_value(txn, *table_id, stored).await?;
+                Ok(value)
+            }
+            SequenceBacking::Standalone(state) => {
+                setval_standalone(full_name, def.min_value, def.max_value, state, value, is_called)?;
+
+                let key = self.key(&encode_sequence_key(full_name));
+                let data =
+                    bincode::serialize(&def).context("Failed to serialize sequence definition")?;
+                txn_put(txn, key, data).await?;
+                Ok(value)
+            }
+        }
+    }
+
     /// Truncate a table
     pub async fn truncate_table(&self, txn: &mut Transaction, table_name: &str) -> Result<bool> {
         let schema_opt = self.get_schema(txn, table_name).await?;
@@ -709,5 +908,74 @@ impl TikvStore {
         txn_put(txn, key, definition.as_bytes().to_vec()).await?;
         info!("Replaced procedure '{}'", name);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sequence_tests {
+    use super::*;
+
+    #[test]
+    fn test_standalone_nextval_is_called_semantics() {
+        let mut state = SequenceState {
+            last_value: 1,
+            is_called: false,
+        };
+
+        let first = nextval_standalone("public.s", 1, 1, i64::MAX, false, &mut state).unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(state.last_value, 1);
+        assert!(state.is_called);
+
+        let second = nextval_standalone("public.s", 1, 1, i64::MAX, false, &mut state).unwrap();
+        assert_eq!(second, 2);
+        assert_eq!(state.last_value, 2);
+        assert!(state.is_called);
+    }
+
+    #[test]
+    fn test_standalone_setval_is_called_false_behavior() {
+        let mut state = SequenceState {
+            last_value: 1,
+            is_called: true,
+        };
+
+        setval_standalone("public.s", 1, i64::MAX, &mut state, 20, false).unwrap();
+        assert_eq!(state.last_value, 20);
+        assert!(!state.is_called);
+
+        let first = nextval_standalone("public.s", 1, 1, i64::MAX, false, &mut state).unwrap();
+        assert_eq!(first, 20);
+        assert_eq!(state.last_value, 20);
+        assert!(state.is_called);
+
+        let second = nextval_standalone("public.s", 1, 1, i64::MAX, false, &mut state).unwrap();
+        assert_eq!(second, 21);
+        assert_eq!(state.last_value, 21);
+    }
+
+    #[test]
+    fn test_standalone_cycle_wraps() {
+        let mut state = SequenceState {
+            last_value: 2,
+            is_called: true,
+        };
+
+        let wrapped = nextval_standalone("public.s", 1, 1, 2, true, &mut state).unwrap();
+        assert_eq!(wrapped, 1);
+        assert_eq!(state.last_value, 1);
+    }
+
+    #[test]
+    fn test_standalone_non_cycle_errors_on_bound() {
+        let mut state = SequenceState {
+            last_value: 2,
+            is_called: true,
+        };
+
+        let err = nextval_standalone("public.s", 1, 1, 2, false, &mut state)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("reached maximum value"));
     }
 }

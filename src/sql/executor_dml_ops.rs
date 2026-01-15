@@ -2,7 +2,7 @@
 
 use super::dml;
 use super::executor::Executor;
-use super::expr::{eval_expr, eval_expr_join, JoinContext};
+use super::expr::JoinContext;
 use super::ExecuteResult;
 use crate::types::{DataType, Row, Value};
 use anyhow::{anyhow, Result};
@@ -16,6 +16,7 @@ impl Executor {
     pub(crate) async fn execute_insert(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         table_name: &ObjectName,
         columns: &[Ident],
         source: &Option<Box<Query>>,
@@ -42,8 +43,10 @@ impl Executor {
         let ret_cols = dml::build_returning_columns(returning, &schema)?;
 
         for exprs in values {
-            let (mut row_vals, indices) = dml::prepare_insert_row(&schema, columns, exprs)?;
-            dml::fill_missing_columns(&self.store(), txn, &schema, &mut row_vals, &indices).await?;
+            let (mut row_vals, indices) =
+                dml::prepare_insert_row(&self.store(), txn, sequence_values, &schema, columns, exprs)
+                    .await?;
+            dml::fill_missing_columns(&self.store(), txn, sequence_values, &schema, &mut row_vals, &indices).await?;
             dml::coerce_row_values(&schema, &mut row_vals)?;
             let row = Row::new(row_vals);
             dml::validate_check_constraints(&schema, &row)?;
@@ -52,7 +55,10 @@ impl Executor {
                 dml::execute_insert_row(&self.store(), txn, &t, &schema, row, on_conflict, &enum_cache).await?;
             if let Some(final_row) = result {
                 affected += 1;
-                if let Some(ret_row) = dml::eval_returning_row(returning, &final_row, &schema)? {
+                if let Some(ret_row) =
+                    dml::eval_returning_row(&self.store(), txn, sequence_values, returning, &final_row, &schema)
+                        .await?
+                {
                     ret_rows.push(ret_row);
                 }
             }
@@ -87,6 +93,7 @@ impl Executor {
     pub(crate) async fn execute_delete(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         from: &[sqlparser::ast::TableWithJoins],
         selection: &Option<Expr>,
         returning: &Option<Vec<SelectItem>>,
@@ -104,7 +111,7 @@ impl Executor {
             return Err(anyhow!("No PK"));
         }
         let resolved_selection = if let Some(sel) = selection {
-            Some(self.resolve_subqueries(txn, sel).await?)
+            Some(self.resolve_subqueries(txn, sequence_values, sel).await?)
         } else {
             None
         };
@@ -115,11 +122,18 @@ impl Executor {
 
         for r in rows {
             if let Some(ref e) = resolved_selection {
-                if !matches!(eval_expr(e, Some(&r), Some(&schema))?, Value::Boolean(true)) {
+                if !matches!(
+                    self.eval_expr_maybe_sequence(txn, sequence_values, e, Some(&r), Some(&schema))
+                        .await?,
+                    Value::Boolean(true)
+                ) {
                     continue;
                 }
             }
-            if let Some(ret_row) = dml::eval_returning_row(returning, &r, &schema)? {
+            if let Some(ret_row) =
+                dml::eval_returning_row(&self.store(), txn, sequence_values, returning, &r, &schema)
+                    .await?
+            {
                 ret_rows.push(ret_row);
             }
             dml::execute_delete_row(&self.store(), txn, &t, &schema, &r).await?;
@@ -153,6 +167,7 @@ impl Executor {
     pub(crate) async fn execute_update(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
         table: &sqlparser::ast::TableWithJoins,
         assignments: &[Assignment],
         from: &Option<sqlparser::ast::TableWithJoins>,
@@ -180,7 +195,7 @@ impl Executor {
             return Err(anyhow!("No PK"));
         }
         let resolved_selection = if let Some(sel) = selection {
-            Some(self.resolve_subqueries(txn, sel).await?)
+            Some(self.resolve_subqueries(txn, sequence_values, sel).await?)
         } else {
             None
         };
@@ -223,29 +238,41 @@ impl Executor {
                 let (combined_schema, _, column_offsets) =
                     dml::build_update_join_context(&schema, &table_alias, fs, fa, r, &fr[0]);
 
-                fr.iter()
-                    .filter(|from_row| {
-                        if let Some(ref sel) = resolved_selection {
-                            let mut combined_values = r.values.clone();
-                            combined_values.extend(from_row.values.clone());
-                            let combined_row = Row::new(combined_values);
-                            let ctx = JoinContext {
-                                tables: HashMap::new(),
-                                column_offsets: column_offsets.clone(),
-                                combined_row: &combined_row,
-                                combined_schema: &combined_schema,
-                            };
-                            matches!(eval_expr_join(sel, &ctx), Ok(Value::Boolean(true)))
-                        } else {
-                            true
+                let mut matches = Vec::new();
+                for from_row in fr {
+                    if let Some(ref sel) = resolved_selection {
+                        let mut combined_values = r.values.clone();
+                        combined_values.extend(from_row.values.clone());
+                        let combined_row = Row::new(combined_values);
+                        let ctx = JoinContext {
+                            tables: HashMap::new(),
+                            column_offsets: column_offsets.clone(),
+                            combined_row: &combined_row,
+                            combined_schema: &combined_schema,
+                        };
+                        if matches!(
+                            self.eval_expr_join_maybe_sequence(
+                                txn,
+                                sequence_values,
+                                sel,
+                                &ctx
+                            )
+                            .await?,
+                            Value::Boolean(true)
+                        ) {
+                            matches.push(from_row);
                         }
-                    })
-                    .collect()
+                    } else {
+                        matches.push(from_row);
+                    }
+                }
+                matches
             } else {
                 if let Some(ref e) = resolved_selection {
                     if !matches!(
-                        eval_expr(e, Some(r), Some(&schema)),
-                        Ok(Value::Boolean(true))
+                        self.eval_expr_maybe_sequence(txn, sequence_values, e, Some(r), Some(&schema))
+                            .await?,
+                        Value::Boolean(true)
                     ) {
                         continue;
                     }
@@ -268,17 +295,41 @@ impl Executor {
                         first_from,
                     );
                     dml::compute_update_values(
+                        &self.store(),
+                        txn,
+                        sequence_values,
                         &schema,
                         r,
                         assignments,
                         &indices,
                         Some((&combined_row, &combined_schema)),
-                    )?
+                    )
+                    .await?
                 } else {
-                    dml::compute_update_values(&schema, r, assignments, &indices, None)?
+                    dml::compute_update_values(
+                        &self.store(),
+                        txn,
+                        sequence_values,
+                        &schema,
+                        r,
+                        assignments,
+                        &indices,
+                        None,
+                    )
+                    .await?
                 }
             } else {
-                dml::compute_update_values(&schema, r, assignments, &indices, None)?
+                dml::compute_update_values(
+                    &self.store(),
+                    txn,
+                    sequence_values,
+                    &schema,
+                    r,
+                    assignments,
+                    &indices,
+                    None,
+                )
+                .await?
             };
 
             let new_row = Row::new(new_vals);
@@ -286,7 +337,10 @@ impl Executor {
             let updated_row =
                 dml::execute_update_row(&self.store(), txn, &t, &schema, r, new_row, &enum_cache).await?;
 
-            if let Some(ret_row) = dml::eval_returning_row(returning, &updated_row, &schema)? {
+            if let Some(ret_row) =
+                dml::eval_returning_row(&self.store(), txn, sequence_values, returning, &updated_row, &schema)
+                    .await?
+            {
                 ret_rows.push(ret_row);
             }
             cnt += 1;

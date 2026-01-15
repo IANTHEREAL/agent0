@@ -1292,6 +1292,31 @@ async fn get_pg_class_rows(
         }
     }
 
+    let sequences = store.list_sequences(txn).await?;
+    for seq in sequences {
+        let seq_oid = oid_counter;
+        oid_counter += 1;
+        let namespace_oid = match seq.schema.as_str() {
+            "pg_catalog" => 11,
+            "information_schema" => 13222,
+            _ => 2200,
+        };
+        rows.push(Row::new(vec![
+            int_val(seq_oid),
+            text_val(&seq.name),
+            int_val(namespace_oid),
+            text_val("S"), // S = sequence
+            int_val(10),   // owner
+            int_val(0),    // access method
+            int_val(0),    // tuples (unknown)
+            int_val(0),    // pages (unknown)
+            text_val("f"), // has index
+            text_val("t"), // is populated
+            text_val("d"), // replica identity
+            text_val("f"), // is partition
+        ]));
+    }
+
     Ok(rows)
 }
 
