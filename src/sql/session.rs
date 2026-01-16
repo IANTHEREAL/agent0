@@ -17,6 +17,7 @@ pub struct Session {
     state: TransactionState,
     savepoints: Arc<SavepointState>,
     last_sequence_values: HashMap<String, i64>,
+    search_path: Vec<String>,
     #[allow(dead_code)]
     current_user: Option<String>,
     #[allow(dead_code)]
@@ -30,6 +31,7 @@ impl Session {
             state: TransactionState::Idle,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
+            search_path: vec!["public".to_string()],
             current_user: None,
             is_superuser: false,
         }
@@ -41,6 +43,7 @@ impl Session {
             state: TransactionState::Idle,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
+            search_path: vec!["public".to_string()],
             current_user: Some(username),
             is_superuser,
         }
@@ -84,13 +87,22 @@ impl Session {
         }
     }
 
-    pub fn get_mut_txn_and_sequence_values(
+    pub fn get_mut_txn_sequence_values_and_search_path(
         &mut self,
-    ) -> Option<(&mut Transaction, &mut HashMap<String, i64>)> {
+    ) -> Option<(&mut Transaction, &mut HashMap<String, i64>, &[String])> {
         match &mut self.state {
-            TransactionState::Active(txn) => Some((txn, &mut self.last_sequence_values)),
+            TransactionState::Active(txn) => Some((txn, &mut self.last_sequence_values, &self.search_path)),
             _ => None,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn search_path(&self) -> &[String] {
+        &self.search_path
+    }
+
+    pub fn set_search_path(&mut self, search_path: Vec<String>) {
+        self.search_path = search_path;
     }
 
     pub fn create_savepoint(&mut self, name: String) -> Result<()> {

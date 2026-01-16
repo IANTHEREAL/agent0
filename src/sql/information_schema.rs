@@ -1,6 +1,7 @@
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, ForeignKeyAction, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
+use super::{names, sequences};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tikv_client::Transaction;
@@ -684,6 +685,37 @@ fn float_val(f: f64) -> Value {
     Value::Float64(f)
 }
 
+fn split_schema_and_name(full: &str) -> (String, String) {
+    match names::parse_full_name(full) {
+        Ok((schema, name)) => (schema, name),
+        Err(_) => ("public".to_string(), full.to_string()),
+    }
+}
+
+fn build_schema_oid_map(schemas: &[String]) -> HashMap<String, i64> {
+    let mut map: HashMap<String, i64> = HashMap::new();
+    map.insert("pg_catalog".to_string(), 11);
+    map.insert("public".to_string(), 2200);
+    map.insert("information_schema".to_string(), 13222);
+
+    let mut next_oid: i64 = 20000;
+    let mut schemas_sorted = schemas.to_vec();
+    schemas_sorted.sort();
+    schemas_sorted.dedup();
+    for schema in schemas_sorted {
+        if map.contains_key(&schema) {
+            continue;
+        }
+        map.insert(schema, next_oid);
+        next_oid += 1;
+    }
+    map
+}
+
+fn schema_oid(schema_oids: &HashMap<String, i64>, schema: &str) -> i64 {
+    schema_oids.get(schema).copied().unwrap_or(2200)
+}
+
 pub async fn get_information_schema_data(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -699,9 +731,11 @@ pub async fn get_information_schema_data(
         get_information_schema_schema(table_name).ok_or_else(|| anyhow!("Unknown table"))?;
 
     let user_tables = store.list_tables(txn).await?;
+    let schemas = store.list_schemas(txn).await?;
+    let schema_oids = build_schema_oid_map(&schemas);
 
     let rows = match name {
-        "schemata" => get_schemata_rows(),
+        "schemata" => get_schemata_rows(&schemas),
         "tables" => get_tables_rows(store, txn, &user_tables).await?,
         "columns" => get_columns_rows(store, txn, &user_tables).await?,
         "table_constraints" => get_table_constraints_rows(store, txn, &user_tables).await?,
@@ -714,15 +748,15 @@ pub async fn get_information_schema_data(
         }
         "check_constraints" => get_check_constraints_rows(store, txn, &user_tables).await?,
         "pg_range" => vec![], // No range types defined
-        "pg_type" => get_pg_type_rows(store, txn).await?,
+        "pg_type" => get_pg_type_rows(store, txn, &schema_oids).await?,
         "pg_enum" => get_pg_enum_rows(store, txn).await?,
-        "pg_namespace" => get_pg_namespace_rows(),
-        "pg_class" => get_pg_class_rows(store, txn, &user_tables).await?,
-        "pg_index" => get_pg_index_rows(store, txn, &user_tables).await?,
+        "pg_namespace" => get_pg_namespace_rows(&schemas, &schema_oids),
+        "pg_class" => get_pg_class_rows(store, txn, &user_tables, &schema_oids).await?,
+        "pg_index" => get_pg_index_rows(store, txn, &user_tables, &schema_oids).await?,
         "pg_attribute" => get_pg_attribute_rows(store, txn, &user_tables).await?,
         "pg_proc" => get_pg_proc_rows(),
         "pg_description" => get_pg_description_rows(),
-        "pg_constraint" => get_pg_constraint_rows(store, txn, &user_tables).await?,
+        "pg_constraint" => get_pg_constraint_rows(store, txn, &user_tables, &schema_oids).await?,
         "pg_am" => get_pg_am_rows(),
         "pg_indexes" => get_pg_indexes_rows(store, txn, &user_tables).await?,
         _ => vec![],
@@ -731,36 +765,21 @@ pub async fn get_information_schema_data(
     Ok((schema, rows))
 }
 
-fn get_schemata_rows() -> Vec<Row> {
-    vec![
-        Row::new(vec![
-            text_val("postgres"),
-            text_val("public"),
-            text_val("postgres"),
-            null_val(),
-            null_val(),
-            null_val(),
-            null_val(),
-        ]),
-        Row::new(vec![
-            text_val("postgres"),
-            text_val("information_schema"),
-            text_val("postgres"),
-            null_val(),
-            null_val(),
-            null_val(),
-            null_val(),
-        ]),
-        Row::new(vec![
-            text_val("postgres"),
-            text_val("pg_catalog"),
-            text_val("postgres"),
-            null_val(),
-            null_val(),
-            null_val(),
-            null_val(),
-        ]),
-    ]
+fn get_schemata_rows(schemas: &[String]) -> Vec<Row> {
+    schemas
+        .iter()
+        .map(|schema| {
+            Row::new(vec![
+                text_val("postgres"),
+                text_val(schema),
+                text_val("postgres"),
+                null_val(),
+                null_val(),
+                null_val(),
+                null_val(),
+            ])
+        })
+        .collect()
 }
 
 async fn get_tables_rows(
@@ -770,11 +789,12 @@ async fn get_tables_rows(
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
-    for table_name in user_tables {
+    for full_table_name in user_tables {
+        let (table_schema, table_name) = split_schema_and_name(full_table_name);
         rows.push(Row::new(vec![
             text_val("postgres"),
-            text_val("public"),
-            text_val(table_name),
+            text_val(&table_schema),
+            text_val(&table_name),
             text_val("BASE TABLE"),
             null_val(),
             null_val(),
@@ -788,10 +808,11 @@ async fn get_tables_rows(
     }
 
     let views = store.list_views(txn).await.unwrap_or_default();
-    for view_name in views {
+    for full_view_name in views {
+        let (view_schema, view_name) = split_schema_and_name(&full_view_name);
         rows.push(Row::new(vec![
             text_val("postgres"),
-            text_val("public"),
+            text_val(&view_schema),
             text_val(&view_name),
             text_val("VIEW"),
             null_val(),
@@ -815,8 +836,9 @@ async fn get_columns_rows(
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
-    for table_name in user_tables {
-        if let Some(schema) = store.get_schema(txn, table_name).await? {
+    for full_table_name in user_tables {
+        let (table_schema, table_name) = split_schema_and_name(full_table_name);
+        if let Some(schema) = store.get_schema(txn, full_table_name).await? {
             for (i, col) in schema.columns.iter().enumerate() {
                 let (data_type_str, udt_schema, udt_name) = match &col.data_type {
                     DataType::UserDefined(full_udt) => {
@@ -841,9 +863,14 @@ async fn get_columns_rows(
                 };
 
                 let column_default = if col.is_serial {
+                    let seq_full_name = format!(
+                        "{}.{}",
+                        table_schema,
+                        sequences::implicit_sequence_name(&table_name, &col.name)
+                    );
                     text_val(&format!(
-                        "nextval('{}_{}_seq'::regclass)",
-                        table_name, col.name
+                        "nextval('{}'::regclass)",
+                        seq_full_name
                     ))
                 } else {
                     col.default_expr
@@ -854,8 +881,8 @@ async fn get_columns_rows(
 
                 rows.push(Row::new(vec![
                     text_val("postgres"),
-                    text_val("public"),
-                    text_val(table_name),
+                    text_val(&table_schema),
+                    text_val(&table_name),
                     text_val(&col.name),
                     int_val(ordinal),
                     column_default,
@@ -912,17 +939,18 @@ async fn get_table_constraints_rows(
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
-    for table_name in user_tables {
-        if let Some(schema) = store.get_schema(txn, table_name).await? {
-            if !schema.pk_indices.is_empty() {
+    for full_table_name in user_tables {
+        let (table_schema, table_name) = split_schema_and_name(full_table_name);
+        if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
+            if !table_def.pk_indices.is_empty() {
                 let pk_name = format!("{}_pkey", table_name);
                 rows.push(Row::new(vec![
                     text_val("postgres"),
-                    text_val("public"),
+                    text_val(&table_schema),
                     text_val(&pk_name),
                     text_val("postgres"),
-                    text_val("public"),
-                    text_val(table_name),
+                    text_val(&table_schema),
+                    text_val(&table_name),
                     text_val("PRIMARY KEY"),
                     text_val("NO"),
                     text_val("NO"),
@@ -930,15 +958,15 @@ async fn get_table_constraints_rows(
                 ]));
             }
 
-            for idx in &schema.indexes {
+            for idx in &table_def.indexes {
                 if idx.unique {
                     rows.push(Row::new(vec![
                         text_val("postgres"),
-                        text_val("public"),
+                        text_val(&table_schema),
                         text_val(&idx.name),
                         text_val("postgres"),
-                        text_val("public"),
-                        text_val(table_name),
+                        text_val(&table_schema),
+                        text_val(&table_name),
                         text_val("UNIQUE"),
                         text_val("NO"),
                         text_val("NO"),
@@ -947,16 +975,16 @@ async fn get_table_constraints_rows(
                 }
             }
 
-            for col in &schema.columns {
+            for col in &table_def.columns {
                 if col.unique && !col.primary_key {
                     let constraint_name = format!("{}_{}_key", table_name, col.name);
                     rows.push(Row::new(vec![
                         text_val("postgres"),
-                        text_val("public"),
+                        text_val(&table_schema),
                         text_val(&constraint_name),
                         text_val("postgres"),
-                        text_val("public"),
-                        text_val(table_name),
+                        text_val(&table_schema),
+                        text_val(&table_name),
                         text_val("UNIQUE"),
                         text_val("NO"),
                         text_val("NO"),
@@ -965,14 +993,14 @@ async fn get_table_constraints_rows(
                 }
             }
 
-            for fk in &schema.foreign_keys {
+            for fk in &table_def.foreign_keys {
                 rows.push(Row::new(vec![
                     text_val("postgres"),
-                    text_val("public"),
+                    text_val(&table_schema),
                     text_val(&fk.name),
                     text_val("postgres"),
-                    text_val("public"),
-                    text_val(table_name),
+                    text_val(&table_schema),
+                    text_val(&table_name),
                     text_val("FOREIGN KEY"),
                     text_val("NO"),
                     text_val("NO"),
@@ -980,18 +1008,18 @@ async fn get_table_constraints_rows(
                 ]));
             }
 
-            for (i, check) in schema.check_constraints.iter().enumerate() {
+            for (i, check) in table_def.check_constraints.iter().enumerate() {
                 let name = check
                     .name
                     .clone()
                     .unwrap_or_else(|| format!("{}_check{}", table_name, i + 1));
                 rows.push(Row::new(vec![
                     text_val("postgres"),
-                    text_val("public"),
+                    text_val(&table_schema),
                     text_val(&name),
                     text_val("postgres"),
-                    text_val("public"),
-                    text_val(table_name),
+                    text_val(&table_schema),
+                    text_val(&table_name),
                     text_val("CHECK"),
                     text_val("NO"),
                     text_val("NO"),
@@ -1011,19 +1039,20 @@ async fn get_key_column_usage_rows(
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
-    for table_name in user_tables {
-        if let Some(schema) = store.get_schema(txn, table_name).await? {
-            if !schema.pk_indices.is_empty() {
+    for full_table_name in user_tables {
+        let (table_schema, table_name) = split_schema_and_name(full_table_name);
+        if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
+            if !table_def.pk_indices.is_empty() {
                 let pk_name = format!("{}_pkey", table_name);
-                for (i, &col_idx) in schema.pk_indices.iter().enumerate() {
-                    let col_name = &schema.columns[col_idx].name;
+                for (i, &col_idx) in table_def.pk_indices.iter().enumerate() {
+                    let col_name = &table_def.columns[col_idx].name;
                     rows.push(Row::new(vec![
                         text_val("postgres"),
-                        text_val("public"),
+                        text_val(&table_schema),
                         text_val(&pk_name),
                         text_val("postgres"),
-                        text_val("public"),
-                        text_val(table_name),
+                        text_val(&table_schema),
+                        text_val(&table_name),
                         text_val(col_name),
                         int_val((i + 1) as i64),
                         null_val(),
@@ -1031,16 +1060,16 @@ async fn get_key_column_usage_rows(
                 }
             }
 
-            for idx in &schema.indexes {
+            for idx in &table_def.indexes {
                 if idx.unique {
                     for (i, col_name) in idx.columns.iter().enumerate() {
                         rows.push(Row::new(vec![
                             text_val("postgres"),
-                            text_val("public"),
+                            text_val(&table_schema),
                             text_val(&idx.name),
                             text_val("postgres"),
-                            text_val("public"),
-                            text_val(table_name),
+                            text_val(&table_schema),
+                            text_val(&table_name),
                             text_val(col_name),
                             int_val((i + 1) as i64),
                             null_val(),
@@ -1049,15 +1078,15 @@ async fn get_key_column_usage_rows(
                 }
             }
 
-            for fk in &schema.foreign_keys {
+            for fk in &table_def.foreign_keys {
                 for (i, col_name) in fk.columns.iter().enumerate() {
                     rows.push(Row::new(vec![
                         text_val("postgres"),
-                        text_val("public"),
+                        text_val(&table_schema),
                         text_val(&fk.name),
                         text_val("postgres"),
-                        text_val("public"),
-                        text_val(table_name),
+                        text_val(&table_schema),
+                        text_val(&table_name),
                         text_val(col_name),
                         int_val((i + 1) as i64),
                         int_val((i + 1) as i64),
@@ -1077,10 +1106,12 @@ async fn get_referential_constraints_rows(
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
-    for table_name in user_tables {
-        if let Some(schema) = store.get_schema(txn, table_name).await? {
-            for fk in &schema.foreign_keys {
-                let ref_pk_name = format!("{}_pkey", fk.ref_table);
+    for full_table_name in user_tables {
+        let (table_schema, _) = split_schema_and_name(full_table_name);
+        if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
+            for fk in &table_def.foreign_keys {
+                let (ref_schema, ref_table_name) = split_schema_and_name(&fk.ref_table);
+                let ref_pk_name = format!("{}_pkey", ref_table_name);
                 let update_rule = match fk.on_update {
                     crate::types::ForeignKeyAction::Cascade => "CASCADE",
                     crate::types::ForeignKeyAction::SetNull => "SET NULL",
@@ -1097,10 +1128,10 @@ async fn get_referential_constraints_rows(
                 };
                 rows.push(Row::new(vec![
                     text_val("postgres"),
-                    text_val("public"),
+                    text_val(&table_schema),
                     text_val(&fk.name),
                     text_val("postgres"),
-                    text_val("public"),
+                    text_val(&ref_schema),
                     text_val(&ref_pk_name),
                     text_val("NONE"),
                     text_val(update_rule),
@@ -1120,49 +1151,51 @@ async fn get_constraint_column_usage_rows(
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
-    for table_name in user_tables {
-        if let Some(schema) = store.get_schema(txn, table_name).await? {
-            if !schema.pk_indices.is_empty() {
+    for full_table_name in user_tables {
+        let (table_schema, table_name) = split_schema_and_name(full_table_name);
+        if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
+            if !table_def.pk_indices.is_empty() {
                 let pk_name = format!("{}_pkey", table_name);
-                for &col_idx in &schema.pk_indices {
-                    let col_name = &schema.columns[col_idx].name;
+                for &col_idx in &table_def.pk_indices {
+                    let col_name = &table_def.columns[col_idx].name;
                     rows.push(Row::new(vec![
                         text_val("postgres"),
-                        text_val("public"),
-                        text_val(table_name),
+                        text_val(&table_schema),
+                        text_val(&table_name),
                         text_val(col_name),
                         text_val("postgres"),
-                        text_val("public"),
+                        text_val(&table_schema),
                         text_val(&pk_name),
                     ]));
                 }
             }
 
-            for idx in &schema.indexes {
+            for idx in &table_def.indexes {
                 if idx.unique {
                     for col_name in &idx.columns {
                         rows.push(Row::new(vec![
                             text_val("postgres"),
-                            text_val("public"),
-                            text_val(table_name),
+                            text_val(&table_schema),
+                            text_val(&table_name),
                             text_val(col_name),
                             text_val("postgres"),
-                            text_val("public"),
+                            text_val(&table_schema),
                             text_val(&idx.name),
                         ]));
                     }
                 }
             }
 
-            for fk in &schema.foreign_keys {
+            for fk in &table_def.foreign_keys {
+                let (ref_schema, ref_table_name) = split_schema_and_name(&fk.ref_table);
                 for col_name in &fk.ref_columns {
                     rows.push(Row::new(vec![
                         text_val("postgres"),
-                        text_val("public"),
-                        text_val(&fk.ref_table),
+                        text_val(&ref_schema),
+                        text_val(&ref_table_name),
                         text_val(col_name),
                         text_val("postgres"),
-                        text_val("public"),
+                        text_val(&table_schema),
                         text_val(&fk.name),
                     ]));
                 }
@@ -1180,16 +1213,17 @@ async fn get_check_constraints_rows(
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
-    for table_name in user_tables {
-        if let Some(schema) = store.get_schema(txn, table_name).await? {
-            for (i, check) in schema.check_constraints.iter().enumerate() {
+    for full_table_name in user_tables {
+        let (table_schema, table_name) = split_schema_and_name(full_table_name);
+        if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
+            for (i, check) in table_def.check_constraints.iter().enumerate() {
                 let name = check
                     .name
                     .clone()
                     .unwrap_or_else(|| format!("{}_check{}", table_name, i + 1));
                 rows.push(Row::new(vec![
                     text_val("postgres"),
-                    text_val("public"),
+                    text_val(&table_schema),
                     text_val(&name),
                     text_val(&check.expr),
                 ]));
@@ -1200,44 +1234,40 @@ async fn get_check_constraints_rows(
     Ok(rows)
 }
 
-fn get_pg_namespace_rows() -> Vec<Row> {
-    vec![
-        Row::new(vec![
-            int_val(11), // Standard OID for pg_catalog
-            text_val("pg_catalog"),
-            int_val(10), // System user
-        ]),
-        Row::new(vec![
-            int_val(2200), // Standard OID for public
-            text_val("public"),
-            int_val(10), // System user
-        ]),
-        Row::new(vec![
-            int_val(13222), // Standard OID for information_schema
-            text_val("information_schema"),
-            int_val(10), // System user
-        ]),
-    ]
+fn get_pg_namespace_rows(schemas: &[String], schema_oids: &HashMap<String, i64>) -> Vec<Row> {
+    schemas
+        .iter()
+        .map(|schema| {
+            Row::new(vec![
+                int_val(schema_oid(schema_oids, schema)),
+                text_val(schema),
+                int_val(10),
+            ])
+        })
+        .collect()
 }
 
 async fn get_pg_class_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     user_tables: &[String],
+    schema_oids: &HashMap<String, i64>,
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
     let mut oid_counter = 16384; // Start from standard PostgreSQL user object OID
 
-    for table_name in user_tables {
-        if let Some(schema) = store.get_schema(txn, table_name).await? {
+    for full_table_name in user_tables {
+        let (table_schema, table_name) = split_schema_and_name(full_table_name);
+        let namespace_oid = schema_oid(schema_oids, &table_schema);
+        if let Some(schema) = store.get_schema(txn, full_table_name).await? {
             let table_oid = oid_counter;
             oid_counter += 1;
 
             // Add the table itself
             rows.push(Row::new(vec![
                 int_val(table_oid),
-                text_val(table_name),
-                int_val(2200), // public schema OID
+                text_val(&table_name),
+                int_val(namespace_oid),
                 text_val("r"), // r = ordinary table
                 int_val(10),   // owner
                 int_val(0),    // access method
@@ -1256,7 +1286,7 @@ async fn get_pg_class_rows(
                 rows.push(Row::new(vec![
                     int_val(index_oid),
                     text_val(&idx.name),
-                    int_val(2200), // public schema OID
+                    int_val(namespace_oid),
                     text_val("i"), // i = index
                     int_val(10),   // owner
                     int_val(403),  // btree access method
@@ -1277,7 +1307,7 @@ async fn get_pg_class_rows(
                 rows.push(Row::new(vec![
                     int_val(pk_oid),
                     text_val(&pk_name),
-                    int_val(2200),
+                    int_val(namespace_oid),
                     text_val("i"),
                     int_val(10),
                     int_val(403),
@@ -1296,11 +1326,7 @@ async fn get_pg_class_rows(
     for seq in sequences {
         let seq_oid = oid_counter;
         oid_counter += 1;
-        let namespace_oid = match seq.schema.as_str() {
-            "pg_catalog" => 11,
-            "information_schema" => 13222,
-            _ => 2200,
-        };
+        let namespace_oid = schema_oid(schema_oids, &seq.schema);
         rows.push(Row::new(vec![
             int_val(seq_oid),
             text_val(&seq.name),
@@ -1324,12 +1350,14 @@ async fn get_pg_index_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     user_tables: &[String],
+    _schema_oids: &HashMap<String, i64>,
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
     let mut oid_counter = 16384;
 
-    for table_name in user_tables {
-        if let Some(schema) = store.get_schema(txn, table_name).await? {
+    for full_table_name in user_tables {
+        let (table_schema, table_name) = split_schema_and_name(full_table_name);
+        if let Some(schema) = store.get_schema(txn, full_table_name).await? {
             let base_table_oid = oid_counter;
             oid_counter += 1;
 
@@ -1346,9 +1374,10 @@ async fn get_pg_index_rows(
                 let indkey = Value::Array(col_indices);
 
                 let indexdef = format!(
-                    "CREATE {}INDEX {} ON public.{} USING btree ({})",
+                    "CREATE {}INDEX {} ON {}.{} USING btree ({})",
                     if idx.unique { "UNIQUE " } else { "" },
                     idx.name,
+                    table_schema,
                     table_name,
                     idx.columns.join(", ")
                 );
@@ -1385,8 +1414,9 @@ async fn get_pg_index_rows(
                     .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
                     .collect();
                 let indexdef = format!(
-                    "CREATE UNIQUE INDEX {}_pkey ON public.{} USING btree ({})",
+                    "CREATE UNIQUE INDEX {}_pkey ON {}.{} USING btree ({})",
                     table_name,
+                    table_schema,
                     table_name,
                     pk_cols.join(", ")
                 );
@@ -1419,8 +1449,9 @@ async fn get_pg_indexes_rows(
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
-    for table_name in user_tables {
-        if let Some(schema) = store.get_schema(txn, table_name).await? {
+    for full_table_name in user_tables {
+        let (table_schema, table_name) = split_schema_and_name(full_table_name);
+        if let Some(schema) = store.get_schema(txn, full_table_name).await? {
             if !schema.pk_indices.is_empty() {
                 let pk_cols: Vec<String> = schema
                     .pk_indices
@@ -1428,14 +1459,15 @@ async fn get_pg_indexes_rows(
                     .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
                     .collect();
                 let indexdef = format!(
-                    "CREATE UNIQUE INDEX {}_pkey ON public.{} USING btree ({})",
+                    "CREATE UNIQUE INDEX {}_pkey ON {}.{} USING btree ({})",
                     table_name,
+                    table_schema,
                     table_name,
                     pk_cols.join(", ")
                 );
                 rows.push(Row::new(vec![
-                    text_val("public"),
-                    text_val(table_name),
+                    text_val(&table_schema),
+                    text_val(&table_name),
                     text_val(&format!("{}_pkey", table_name)),
                     null_val(),
                     text_val(&indexdef),
@@ -1444,15 +1476,16 @@ async fn get_pg_indexes_rows(
 
             for idx in &schema.indexes {
                 let indexdef = format!(
-                    "CREATE {}INDEX {} ON public.{} USING btree ({})",
+                    "CREATE {}INDEX {} ON {}.{} USING btree ({})",
                     if idx.unique { "UNIQUE " } else { "" },
                     idx.name,
+                    table_schema,
                     table_name,
                     idx.columns.join(", ")
                 );
                 rows.push(Row::new(vec![
-                    text_val("public"),
-                    text_val(table_name),
+                    text_val(&table_schema),
+                    text_val(&table_name),
                     text_val(&idx.name),
                     null_val(),
                     text_val(&indexdef),
@@ -1546,6 +1579,7 @@ async fn get_pg_constraint_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     user_tables: &[String],
+    schema_oids: &HashMap<String, i64>,
 ) -> Result<Vec<Row>> {
     fn fk_action_code(action: &ForeignKeyAction) -> &'static str {
         match action {
@@ -1587,6 +1621,8 @@ async fn get_pg_constraint_rows(
     let mut constraint_oid: i64 = 50000;
 
     for table_name in user_tables {
+        let (table_schema, table_short_name) = split_schema_and_name(table_name);
+        let connamespace_oid = schema_oid(schema_oids, &table_schema);
         let Some(schema) = table_schemas.get(table_name) else {
             continue;
         };
@@ -1595,7 +1631,7 @@ async fn get_pg_constraint_rows(
         };
 
         if !schema.pk_indices.is_empty() {
-            let conname = format!("{}_pkey", table_name);
+            let conname = format!("{}_pkey", table_short_name);
             let conkey: Vec<Value> = schema
                 .pk_indices
                 .iter()
@@ -1612,7 +1648,7 @@ async fn get_pg_constraint_rows(
             rows.push(Row::new(vec![
                 int_val(constraint_oid),
                 text_val(&conname),
-                int_val(2200), // public schema OID
+                int_val(connamespace_oid),
                 text_val("p"),
                 int_val(conrelid),
                 int_val(0), // confrelid
@@ -1646,7 +1682,7 @@ async fn get_pg_constraint_rows(
             rows.push(Row::new(vec![
                 int_val(constraint_oid),
                 text_val(&idx.name),
-                int_val(2200),
+                int_val(connamespace_oid),
                 text_val("u"),
                 int_val(conrelid),
                 int_val(0),
@@ -1665,7 +1701,7 @@ async fn get_pg_constraint_rows(
             let name = check
                 .name
                 .clone()
-                .unwrap_or_else(|| format!("{}_check{}", table_name, i + 1));
+                .unwrap_or_else(|| format!("{}_check{}", table_short_name, i + 1));
             let constraintdef = if check.expr.trim().starts_with('(') {
                 format!("CHECK {}", check.expr.trim())
             } else {
@@ -1675,7 +1711,7 @@ async fn get_pg_constraint_rows(
             rows.push(Row::new(vec![
                 int_val(constraint_oid),
                 text_val(&name),
-                int_val(2200),
+                int_val(connamespace_oid),
                 text_val("c"),
                 int_val(conrelid),
                 int_val(0),
@@ -1691,7 +1727,7 @@ async fn get_pg_constraint_rows(
         }
 
         for fk in &schema.foreign_keys {
-            let ref_table = fk.ref_table.to_lowercase();
+            let ref_table = fk.ref_table.clone();
             let (confrelid, ref_schema) =
                 match (table_oids.get(&ref_table), table_schemas.get(&ref_table)) {
                     (Some(&oid), Some(schema)) => (oid, schema),
@@ -1730,7 +1766,7 @@ async fn get_pg_constraint_rows(
             rows.push(Row::new(vec![
                 int_val(constraint_oid),
                 text_val(&fk.name),
-                int_val(2200),
+                int_val(connamespace_oid),
                 text_val("f"),
                 int_val(conrelid),
                 int_val(confrelid),
@@ -1749,23 +1785,18 @@ async fn get_pg_constraint_rows(
     Ok(rows)
 }
 
-fn schema_oid(schema: &str) -> i64 {
-    match schema {
-        "pg_catalog" => 11,
-        "public" => 2200,
-        "information_schema" => 13222,
-        _ => 2200,
-    }
-}
-
-async fn get_pg_type_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
+async fn get_pg_type_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    schema_oids: &HashMap<String, i64>,
+) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
     // Return the vector type so ORMs can discover it
     rows.push(Row::new(vec![
         int_val(16385),     // oid: custom type OID for vector
         text_val("vector"), // typname
-        int_val(11),        // typnamespace: pg_catalog (OID 11)
+        int_val(schema_oid(schema_oids, "pg_catalog")),
         int_val(10),        // typowner: system user
         int_val(-1),        // typlen: variable length
         text_val("f"),      // typbyval: false (not passed by value)
@@ -1790,7 +1821,7 @@ async fn get_pg_type_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Resu
         rows.push(Row::new(vec![
             int_val(def.oid as i64),
             text_val(&def.name),
-            int_val(schema_oid(&def.schema)),
+            int_val(schema_oid(schema_oids, &def.schema)),
             int_val(10),
             int_val(typlen),
             text_val(typbyval),

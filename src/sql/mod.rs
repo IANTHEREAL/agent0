@@ -15,6 +15,7 @@ mod explain;
 mod expr;
 mod helpers;
 mod information_schema;
+mod names;
 mod parser;
 mod planner;
 mod query;

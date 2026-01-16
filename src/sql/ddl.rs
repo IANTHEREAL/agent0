@@ -8,9 +8,11 @@ use sqlparser::ast::{
 };
 use tikv_client::Transaction;
 
-use super::helpers::{coerce_value_for_column, convert_data_type, fill_row_defaults, infer_data_type, normalize_ident};
+use super::helpers::{
+    coerce_value_for_column, convert_data_type, fill_row_defaults, infer_data_type, normalize_ident,
+};
+use super::names;
 use super::sequences;
-use super::udt;
 use super::{expr::eval_expr, ExecuteResult};
 use crate::storage::TikvStore;
 use crate::types::{
@@ -24,6 +26,7 @@ const DDL_SCAN_BATCH_SIZE: u32 = 1024;
 async fn resolve_column_data_type(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    search_path: &[String],
     sql_type: &SqlDataType,
 ) -> Result<(DataType, bool)> {
     match sql_type {
@@ -40,7 +43,13 @@ async fn resolve_column_data_type(
                 // VECTOR/JSON/JSONB are handled by existing conversion.
                 "VECTOR" | "JSON" | "JSONB" => Ok((convert_data_type(sql_type)?, false)),
                 _ => {
-                    let (_, _, full_name) = udt::resolve_type_name(name)?;
+                    let resolved_type =
+                        names::resolve_existing_type_name(store.as_ref(), txn, name, search_path)
+                            .await?;
+                    let Some(resolved_type) = resolved_type else {
+                        return Ok((convert_data_type(sql_type)?, false));
+                    };
+                    let full_name = resolved_type.full;
                     match store.get_type(txn, &full_name).await? {
                         Some(def) => match def.kind {
                             crate::types::UserTypeKind::Enum { .. } => {
@@ -364,19 +373,25 @@ fn coerce_value_for_type_change(val: Value, target_col: &ColumnDef) -> Result<Va
 pub async fn execute_create_table(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    search_path: &[String],
     name: &ObjectName,
     columns: &[SqlColumnDef],
     constraints: &[TableConstraint],
     if_not_exists: bool,
 ) -> Result<ExecuteResult> {
-    let table_name = name
-        .0
-        .last()
-        .map(normalize_ident)
-        .ok_or_else(|| anyhow!("Invalid table name"))?;
+    let names::ResolvedName {
+        schema: table_schema_name,
+        name: table_object_name,
+        full: table_full_name,
+    } = names::resolve_ddl_object_name(name, search_path)?;
+    if !store.schema_exists(txn, &table_schema_name).await? {
+        return Err(anyhow!("schema '{}' does not exist", table_schema_name));
+    }
 
-    if if_not_exists && store.table_exists(txn, &table_name).await? {
-        return Ok(ExecuteResult::CreateTable { table_name });
+    if if_not_exists && store.table_exists(txn, &table_full_name).await? {
+        return Ok(ExecuteResult::CreateTable {
+            table_name: table_full_name,
+        });
     }
 
     let pk_columns: Vec<String> = constraints
@@ -407,7 +422,8 @@ pub async fn execute_create_table(
     let mut col_defs = Vec::new();
     for col in columns {
         let col_name = normalize_ident(&col.name);
-        let (data_type, mut is_serial) = resolve_column_data_type(store, txn, &col.data_type).await?;
+        let (data_type, mut is_serial) =
+            resolve_column_data_type(store, txn, search_path, &col.data_type).await?;
 
         let mut is_pk = pk_columns.contains(&col_name);
         let mut nullable = true;
@@ -448,14 +464,28 @@ pub async fn execute_create_table(
                     ..
                 } => {
                     // Handle inline REFERENCES clause
-                    let ref_table = foreign_table
-                        .0
-                        .last()
-                        .map(normalize_ident)
-                        .unwrap_or_default();
+                    let (ref_schema_opt, ref_table_name) = names::split_object_name(foreign_table)?;
+                    let ref_table = if ref_table_name == table_object_name
+                        && ref_schema_opt
+                            .as_deref()
+                            .map(|s| s == table_schema_name)
+                            .unwrap_or(true)
+                    {
+                        table_full_name.clone()
+                    } else {
+                        names::resolve_existing_table_name(
+                            store.as_ref(),
+                            txn,
+                            foreign_table,
+                            search_path,
+                        )
+                        .await?
+                        .ok_or_else(|| anyhow!("Referenced table '{}' does not exist", foreign_table))?
+                        .full
+                    };
                     let ref_cols: Vec<String> =
                         referred_columns.iter().map(normalize_ident).collect();
-                    let fk_name = format!("{}_{}_fkey", table_name, col_name);
+                    let fk_name = format!("{}_{}_fkey", table_object_name, col_name);
 
                     let parse_action =
                         |action: &Option<sqlparser::ast::ReferentialAction>| -> ForeignKeyAction {
@@ -532,7 +562,7 @@ pub async fn execute_create_table(
     for col in col_defs.iter() {
         if col.unique && !col.primary_key {
             indexes.push(IndexDef {
-                name: format!("{}_{}_key", table_name, col.name),
+                name: format!("{}_{}_key", table_object_name, col.name),
                 id: next_index_id,
                 columns: vec![col.name.clone()],
                 unique: true,
@@ -555,7 +585,7 @@ pub async fn execute_create_table(
                     let idx_name = name
                         .as_ref()
                         .map(|n| n.value.clone())
-                        .unwrap_or_else(|| format!("{}_{}_key", table_name, col_names.join("_")));
+                        .unwrap_or_else(|| format!("{}_{}_key", table_object_name, col_names.join("_")));
                     indexes.push(IndexDef {
                         name: idx_name,
                         id: next_index_id,
@@ -575,16 +605,30 @@ pub async fn execute_create_table(
                 ..
             } => {
                 let fk_cols: Vec<String> = columns.iter().map(normalize_ident).collect();
-                let ref_table = foreign_table
-                    .0
-                    .last()
-                    .map(normalize_ident)
-                    .unwrap_or_default();
+                let (ref_schema_opt, ref_table_name) = names::split_object_name(foreign_table)?;
+                let ref_table = if ref_table_name == table_object_name
+                    && ref_schema_opt
+                        .as_deref()
+                        .map(|s| s == table_schema_name)
+                        .unwrap_or(true)
+                {
+                    table_full_name.clone()
+                } else {
+                    names::resolve_existing_table_name(
+                        store.as_ref(),
+                        txn,
+                        foreign_table,
+                        search_path,
+                    )
+                    .await?
+                    .ok_or_else(|| anyhow!("Referenced table '{}' does not exist", foreign_table))?
+                    .full
+                };
                 let ref_cols: Vec<String> = referred_columns.iter().map(normalize_ident).collect();
                 let fk_name = name
                     .as_ref()
                     .map(|n| n.value.clone())
-                    .unwrap_or_else(|| format!("{}_{}_fkey", table_name, fk_cols.join("_")));
+                    .unwrap_or_else(|| format!("{}_{}_fkey", table_object_name, fk_cols.join("_")));
 
                 let parse_action =
                     |action: &Option<sqlparser::ast::ReferentialAction>| -> ForeignKeyAction {
@@ -621,7 +665,7 @@ pub async fn execute_create_table(
     }
 
     assign_generated_check_constraint_names(
-        &table_name,
+        &table_object_name,
         !pk_indices.is_empty(),
         &indexes,
         &foreign_keys,
@@ -629,7 +673,7 @@ pub async fn execute_create_table(
     );
 
     let schema = TableSchema {
-        name: table_name.clone(),
+        name: table_full_name.clone(),
         table_id,
         columns: col_defs,
         version: 1,
@@ -641,7 +685,9 @@ pub async fn execute_create_table(
     store.create_table(txn, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, &schema).await?;
 
-    Ok(ExecuteResult::CreateTable { table_name })
+    Ok(ExecuteResult::CreateTable {
+        table_name: table_full_name,
+    })
 }
 
 pub async fn create_table_from_query_result(
@@ -809,17 +855,17 @@ pub async fn execute_create_index(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     idx_name: &str,
-    table_name: &ObjectName,
+    table_name: &str,
     columns: &[OrderByExpr],
     unique: bool,
     if_not_exists: bool,
     rows: Vec<Row>,
 ) -> Result<ExecuteResult> {
     let idx_name_str = idx_name.to_lowercase();
-    let tbl_name = table_name.0.last().map(normalize_ident).unwrap();
+    let tbl_name = table_name;
 
     let mut schema = store
-        .get_schema(txn, &tbl_name)
+        .get_schema(txn, tbl_name)
         .await?
         .ok_or_else(|| anyhow!("Table not found"))?;
 
@@ -886,15 +932,16 @@ pub async fn execute_create_index(
 pub async fn execute_create_view(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    search_path: &[String],
     name: &ObjectName,
     query: &Query,
     or_replace: bool,
 ) -> Result<ExecuteResult> {
-    let view_name = name
-        .0
-        .last()
-        .map(normalize_ident)
-        .ok_or_else(|| anyhow!("Invalid view name"))?;
+    let resolved = names::resolve_ddl_object_name(name, search_path)?;
+    if !store.schema_exists(txn, &resolved.schema).await? {
+        return Err(anyhow!("schema '{}' does not exist", resolved.schema));
+    }
+    let view_name = resolved.full;
 
     if store.get_view(txn, &view_name).await?.is_some() {
         if or_replace {
@@ -913,16 +960,26 @@ pub async fn execute_create_view(
 pub async fn execute_drop_view(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    search_path: &[String],
     names: &[ObjectName],
     if_exists: bool,
 ) -> Result<ExecuteResult> {
     let mut last = String::new();
     for name in names {
-        let v = name.0.last().map(normalize_ident).unwrap();
-        if !store.drop_view(txn, &v).await? && !if_exists {
-            return Err(anyhow!("View '{}' does not exist", v));
+        let resolved =
+            match names::resolve_existing_view_name(store.as_ref(), txn, name, search_path).await? {
+                Some(resolved) => resolved,
+                None => {
+                    if !if_exists {
+                        return Err(anyhow!("View '{}' does not exist", name));
+                    }
+                    continue;
+                }
+            };
+        if !store.drop_view(txn, &resolved.full).await? && !if_exists {
+            return Err(anyhow!("View '{}' does not exist", resolved.full));
         }
-        last = v;
+        last = resolved.full;
     }
     Ok(ExecuteResult::DropView { view_name: last })
 }
@@ -930,17 +987,19 @@ pub async fn execute_drop_view(
 pub async fn execute_create_materialized_view(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    search_path: &[String],
     name: &ObjectName,
     query: &Query,
     or_replace: bool,
-    schema: TableSchema,
+    mut schema: TableSchema,
     rows: Vec<Row>,
 ) -> Result<ExecuteResult> {
-    let view_name = name
-        .0
-        .last()
-        .map(normalize_ident)
-        .ok_or_else(|| anyhow!("Invalid materialized view name"))?;
+    let resolved = names::resolve_ddl_object_name(name, search_path)?;
+    if !store.schema_exists(txn, &resolved.schema).await? {
+        return Err(anyhow!("schema '{}' does not exist", resolved.schema));
+    }
+    let view_name = resolved.full;
+    schema.name = view_name.clone();
 
     if store
         .get_materialized_view(txn, &view_name)
@@ -948,6 +1007,7 @@ pub async fn execute_create_materialized_view(
         .is_some()
     {
         if or_replace {
+            drop_owned_sequences_for_table(store, txn, &view_name).await?;
             store.drop_materialized_view(txn, &view_name).await?;
             store.drop_table(txn, &view_name).await?;
         } else {
@@ -960,33 +1020,61 @@ pub async fn execute_create_materialized_view(
         .create_materialized_view(txn, &view_name, &query_str)
         .await?;
 
-    store.create_table(txn, schema).await?;
+    let row_count = rows.len();
+    store.create_table(txn, schema.clone()).await?;
+    create_implicit_sequences_for_schema(store, txn, &schema).await?;
     for row in rows {
         store.insert(txn, &view_name, row).await?;
     }
+    if row_count > 0 {
+        store
+            .set_sequence_value(txn, schema.table_id, row_count as u64)
+            .await?;
+    }
 
     Ok(ExecuteResult::CreateMaterializedView {
-        view_name: view_name.clone(),
+        view_name,
     })
 }
 
 pub async fn execute_drop_materialized_view(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    search_path: &[String],
     names: &[ObjectName],
     if_exists: bool,
 ) -> Result<ExecuteResult> {
     let mut last = String::new();
     for name in names {
-        let v = name.0.last().map(normalize_ident).unwrap();
-        let exists = store.drop_materialized_view(txn, &v).await?;
+        let resolved = match names::resolve_existing_materialized_view_name(
+            store.as_ref(),
+            txn,
+            name,
+            search_path,
+        )
+        .await?
+        {
+            Some(resolved) => resolved,
+            None => {
+                if !if_exists {
+                    return Err(anyhow!("Materialized view '{}' does not exist", name));
+                }
+                continue;
+            }
+        };
+
+        let exists = store.drop_materialized_view(txn, &resolved.full).await?;
         if !exists && !if_exists {
-            return Err(anyhow!("Materialized view '{}' does not exist", v));
+            return Err(anyhow!(
+                "Materialized view '{}' does not exist",
+                resolved.full
+            ));
         }
         if exists {
-            store.drop_table(txn, &v).await?;
+            drop_owned_sequences_for_table(store, txn, &resolved.full).await?;
+            store.drop_table(txn, &resolved.full).await?;
         }
-        last = v;
+        last = resolved.full;
     }
     Ok(ExecuteResult::DropMaterializedView { view_name: last })
 }
@@ -997,43 +1085,58 @@ pub async fn execute_refresh_materialized_view(
     name: &str,
     rows: Vec<Row>,
 ) -> Result<ExecuteResult> {
-    let name_lower = name.to_lowercase();
     if store
-        .get_materialized_view(txn, &name_lower)
+        .get_materialized_view(txn, name)
         .await?
         .is_none()
     {
         return Err(anyhow!("Materialized view '{}' does not exist", name));
     }
 
-    store.truncate_table(txn, &name_lower).await?;
+    let schema = store
+        .get_schema(txn, name)
+        .await?
+        .ok_or_else(|| anyhow!("Materialized view '{}' does not exist", name))?;
+
+    if !store.truncate_table(txn, name).await? {
+        return Err(anyhow!("Materialized view '{}' does not exist", name));
+    }
+    let row_count = rows.len();
     for row in rows {
-        store.insert(txn, &name_lower, row).await?;
+        store.insert(txn, name, row).await?;
+    }
+    if row_count > 0 {
+        store
+            .set_sequence_value(txn, schema.table_id, row_count as u64)
+            .await?;
     }
 
     Ok(ExecuteResult::RefreshMaterializedView {
-        view_name: name_lower,
+        view_name: name.to_string(),
     })
 }
 
 pub async fn execute_drop_table(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    search_path: &[String],
     names: &[ObjectName],
     if_exists: bool,
 ) -> Result<ExecuteResult> {
     let mut last = String::new();
     for name in names {
-        let t = name.0.last().map(normalize_ident).unwrap();
-        if store.get_schema(txn, &t).await?.is_none() {
-            if !if_exists {
-                return Err(anyhow!("Table '{}' does not exist", t));
+        let resolved = match names::resolve_existing_table_name(store.as_ref(), txn, name, search_path).await? {
+            Some(resolved) => resolved,
+            None => {
+                if !if_exists {
+                    return Err(anyhow!("Table '{}' does not exist", name));
+                }
+                continue;
             }
-            continue;
-        }
-        drop_owned_sequences_for_table(store, txn, &t).await?;
-        store.drop_table(txn, &t).await?;
-        last = t;
+        };
+        drop_owned_sequences_for_table(store, txn, &resolved.full).await?;
+        store.drop_table(txn, &resolved.full).await?;
+        last = resolved.full;
     }
     Ok(ExecuteResult::DropTable { table_name: last })
 }
@@ -1041,9 +1144,13 @@ pub async fn execute_drop_table(
 pub async fn execute_truncate(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    search_path: &[String],
     table_name: &ObjectName,
 ) -> Result<ExecuteResult> {
-    let t = table_name.0.last().map(normalize_ident).unwrap();
+    let resolved = names::resolve_existing_table_name(store.as_ref(), txn, table_name, search_path)
+        .await?
+        .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
+    let t = resolved.full;
     if !store.truncate_table(txn, &t).await? {
         return Err(anyhow!("Table '{}' does not exist", t));
     }
@@ -1083,17 +1190,22 @@ pub async fn execute_drop_index(
 pub async fn execute_alter_table(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    search_path: &[String],
     name: &ObjectName,
     operation: &AlterTableOperation,
 ) -> Result<ExecuteResult> {
-    let t = name.0.last().map(normalize_ident).unwrap();
+    let resolved = names::resolve_existing_table_name(store.as_ref(), txn, name, search_path)
+        .await?
+        .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?;
+    let table_object_name = resolved.name.clone();
+    let t = resolved.full;
     let mut result_table_name = t.clone();
     let mut schema = store
         .get_schema(txn, &t)
         .await?
         .ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
     assign_generated_check_constraint_names(
-        &t,
+        &table_object_name,
         !schema.pk_indices.is_empty(),
         &schema.indexes,
         &schema.foreign_keys,
@@ -1107,7 +1219,7 @@ pub async fn execute_alter_table(
                 return Err(anyhow!("Column exists"));
             }
             let (data_type, mut is_serial) =
-                resolve_column_data_type(store, txn, &column_def.data_type).await?;
+                resolve_column_data_type(store, txn, search_path, &column_def.data_type).await?;
             let mut nullable = true;
             let mut default_expr = None;
             for opt in &column_def.options {
@@ -1199,7 +1311,7 @@ pub async fn execute_alter_table(
                 let index_name = name
                     .as_ref()
                     .map(normalize_ident)
-                    .unwrap_or_else(|| format!("{}_{}_key", t, col_names.join("_")));
+                    .unwrap_or_else(|| format!("{}_{}_key", table_object_name, col_names.join("_")));
 
                 if schema.indexes.iter().any(|i| i.name == index_name) {
                     return Err(anyhow!("Index exists"));
@@ -1261,24 +1373,25 @@ pub async fn execute_alter_table(
                     }
                 }
 
-                let ref_table = foreign_table
-                    .0
-                    .last()
-                    .map(normalize_ident)
-                    .unwrap_or_default();
+                let ref_table = names::resolve_existing_table_name(
+                    store.as_ref(),
+                    txn,
+                    foreign_table,
+                    search_path,
+                )
+                .await?
+                .ok_or_else(|| anyhow!("Referenced table '{}' does not exist", foreign_table))?
+                .full;
                 let ref_schema = store.get_schema(txn, &ref_table).await?.ok_or_else(|| {
-                    anyhow!(
-                        "Referenced table '{}' not found for foreign key",
-                        ref_table
-                    )
+                    anyhow!("Referenced table '{}' not found for foreign key", ref_table)
                 })?;
                 let ref_cols: Vec<String> = referred_columns.iter().map(normalize_ident).collect();
                 let fk_name = name
                     .as_ref()
                     .map(normalize_ident)
-                    .unwrap_or_else(|| format!("{}_{}_fkey", t, fk_cols.join("_")));
+                    .unwrap_or_else(|| format!("{}_{}_fkey", table_object_name, fk_cols.join("_")));
 
-                if constraint_name_exists(&schema, &t, &fk_name) {
+                if constraint_name_exists(&schema, &table_object_name, &fk_name) {
                     return Err(anyhow!("Constraint '{}' already exists", fk_name));
                 }
 
@@ -1384,15 +1497,15 @@ pub async fn execute_alter_table(
                 } else {
                     let mut suffix = 1usize;
                     loop {
-                        let candidate = format!("{}_check{}", t, suffix);
-                        if !constraint_name_exists(&schema, &t, &candidate) {
+                        let candidate = format!("{}_check{}", table_object_name, suffix);
+                        if !constraint_name_exists(&schema, &table_object_name, &candidate) {
                             break candidate;
                         }
                         suffix += 1;
                     }
                 };
 
-                if constraint_name_exists(&schema, &t, &check_name) {
+                if constraint_name_exists(&schema, &table_object_name, &check_name) {
                     return Err(anyhow!("Constraint '{}' already exists", check_name));
                 }
 
@@ -1446,7 +1559,7 @@ pub async fn execute_alter_table(
             }
 
             let constraint_name = normalize_ident(name);
-            let pk_name = format!("{}_pkey", t);
+            let pk_name = format!("{}_pkey", table_object_name);
             if !schema.pk_indices.is_empty() && constraint_name == pk_name {
                 return Err(anyhow!(
                     "Cannot drop primary key constraint '{}'",
@@ -1467,7 +1580,9 @@ pub async fn execute_alter_table(
                 });
             }
 
-            if let Some(pos) = find_check_constraint_index(&schema, &t, &constraint_name) {
+            if let Some(pos) =
+                find_check_constraint_index(&schema, &table_object_name, &constraint_name)
+            {
                 schema.check_constraints.remove(pos);
                 schema.version += 1;
                 store.update_schema(txn, schema).await?;
@@ -1640,10 +1755,12 @@ pub async fn execute_alter_table(
                 .map(normalize_ident)
                 .ok_or_else(|| anyhow!("Invalid table name"))?;
 
+            let (schema_name, _) = names::parse_full_name(&t)?;
+            let new_full = format!("{}.{}", schema_name, new_table);
             store
-                .rename_table_schema(txn, &t, &new_table)
+                .rename_table_schema(txn, &t, &new_full)
                 .await?;
-            result_table_name = new_table.clone();
+            result_table_name = new_full.clone();
 
             // Update referencing-side metadata (FKs store ref_table as a string).
             let tables = store.list_tables(txn).await?;
@@ -1655,7 +1772,7 @@ pub async fn execute_alter_table(
                 let mut changed = false;
                 for fk in &mut s.foreign_keys {
                     if fk.ref_table == t {
-                        fk.ref_table = new_table.clone();
+                        fk.ref_table = new_full.clone();
                         changed = true;
                     }
                 }
@@ -1669,11 +1786,11 @@ pub async fn execute_alter_table(
             let old = normalize_ident(old_name);
             let new = normalize_ident(new_name);
 
-            if constraint_name_exists(&schema, &t, &new) {
+            if constraint_name_exists(&schema, &table_object_name, &new) {
                 return Err(anyhow!("Constraint '{}' already exists", new));
             }
 
-            let pk_name = format!("{}_pkey", t);
+            let pk_name = format!("{}_pkey", table_object_name);
             if !schema.pk_indices.is_empty() && old == pk_name {
                 return Err(anyhow!("Cannot rename primary key constraint '{}'", old));
             }
@@ -1687,7 +1804,7 @@ pub async fn execute_alter_table(
                 });
             }
 
-            if let Some(pos) = find_check_constraint_index(&schema, &t, &old) {
+            if let Some(pos) = find_check_constraint_index(&schema, &table_object_name, &old) {
                 schema.check_constraints[pos].name = Some(new);
                 schema.version += 1;
                 store.update_schema(txn, schema).await?;
@@ -1775,7 +1892,8 @@ pub async fn execute_alter_table(
                         ));
                     }
 
-                    let (new_type, _) = resolve_column_data_type(store, txn, data_type).await?;
+                    let (new_type, _) =
+                        resolve_column_data_type(store, txn, search_path, data_type).await?;
                     if schema.columns[col_idx].data_type == new_type {
                         return Ok(ExecuteResult::AlterTable {
                             table_name: result_table_name,

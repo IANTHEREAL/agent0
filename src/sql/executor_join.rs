@@ -5,6 +5,7 @@ use super::helpers::{
     apply_offset_limit_fetch, collect_having_agg_funcs, dedup_rows,
     distinct_on_rows_join_with_indices, eval_having_expr_join, get_select_item_name, AggExpr,
 };
+use super::names;
 use super::sequences;
 use super::window::{compute_window_functions_join, extract_window_functions};
 use super::{
@@ -26,17 +27,26 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
         query: &Query,
         select: &sqlparser::ast::Select,
     ) -> Result<ExecuteResult> {
-        self.execute_join_query_with_ctes(txn, sequence_values, query, select, &HashMap::new())
-            .await
+        self.execute_join_query_with_ctes(
+            txn,
+            sequence_values,
+            search_path,
+            query,
+            select,
+            &HashMap::new(),
+        )
+        .await
     }
 
     pub(crate) async fn get_table_data(
         &self,
         txn: &mut Transaction,
         sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
         table_name: &str,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<(TableSchema, Vec<Row>)> {
@@ -49,7 +59,7 @@ impl Executor {
             "CURRENT_SCHEMA" | "CURRENT_DATABASE" | "CURRENT_USER" | "SESSION_USER" | "USER"
         ) {
             let result = match t_upper.as_str() {
-                "CURRENT_SCHEMA" => Value::Text("public".to_string()),
+                "CURRENT_SCHEMA" => Value::Text(names::default_schema(search_path).to_string()),
                 "CURRENT_DATABASE" => Value::Text("postgres".to_string()),
                 "CURRENT_USER" | "SESSION_USER" | "USER" => Value::Text("postgres".to_string()),
                 _ => unreachable!(),
@@ -92,41 +102,59 @@ impl Executor {
             .await;
         }
 
-        if let Some(view_query) = self.store().get_view(txn, &t_lower).await? {
-            let result = self
-                .execute_view_query(txn, sequence_values, &view_query, ctes)
-                .await?;
-            return match result {
-                ExecuteResult::Select {
-                    columns,
-                    column_types: _,
-                    rows,
-                } => {
-                    let schema = TableSchema {
-                        table_id: 0,
-                        name: t_lower,
-                        columns: columns
-                            .iter()
-                            .map(|n| ColumnDef {
-                                name: n.clone(),
-                                data_type: DataType::Text,
-                                nullable: true,
-                                primary_key: false,
-                                unique: false,
-                                is_serial: false,
-                                default_expr: None,
-                            })
-                            .collect(),
-                        pk_indices: vec![],
-                        indexes: vec![],
-                        version: 1,
-                        check_constraints: vec![],
-                        foreign_keys: vec![],
-                    };
-                    Ok((schema, rows))
-                }
-                _ => Err(anyhow!("View must return SELECT result")),
-            };
+        let candidates: Vec<String> = if table_name.contains('.') {
+            vec![table_name.to_string()]
+        } else if search_path.is_empty() {
+            vec![format!("public.{}", table_name)]
+        } else {
+            search_path
+                .iter()
+                .map(|schema| format!("{}.{}", schema, table_name))
+                .collect()
+        };
+
+        for candidate in &candidates {
+            if let Some(view_query) = self.store().get_view(txn, candidate).await? {
+                let result = self
+                    .execute_view_query(txn, sequence_values, search_path, &view_query, ctes)
+                    .await?;
+                return match result {
+                    ExecuteResult::Select {
+                        columns,
+                        column_types: _,
+                        rows,
+                    } => {
+                        let schema = TableSchema {
+                            table_id: 0,
+                            name: candidate.clone(),
+                            columns: columns
+                                .iter()
+                                .map(|n| ColumnDef {
+                                    name: n.clone(),
+                                    data_type: DataType::Text,
+                                    nullable: true,
+                                    primary_key: false,
+                                    unique: false,
+                                    is_serial: false,
+                                    default_expr: None,
+                                })
+                                .collect(),
+                            pk_indices: vec![],
+                            indexes: vec![],
+                            version: 1,
+                            check_constraints: vec![],
+                            foreign_keys: vec![],
+                        };
+                        Ok((schema, rows))
+                    }
+                    _ => Err(anyhow!("View must return SELECT result")),
+                };
+            }
+
+            if let Some(schema) = self.store().get_schema(txn, candidate).await? {
+                let rows = self.scan_and_fill(txn, candidate, &schema).await?;
+                return Ok((schema, rows));
+            }
         }
 
         // Handle function calls in FROM clause (e.g., SELECT * FROM current_schema())
@@ -134,7 +162,7 @@ impl Executor {
             // Parse as a function call
             let func_name = table_name.trim_end_matches("()").to_uppercase();
             let result = match func_name.as_str() {
-                "CURRENT_SCHEMA" => Value::Text("public".to_string()),
+                "CURRENT_SCHEMA" => Value::Text(names::default_schema(search_path).to_string()),
                 "CURRENT_DATABASE" => Value::Text("postgres".to_string()),
                 "CURRENT_USER" | "SESSION_USER" | "USER" => Value::Text("postgres".to_string()),
                 _ => return Err(anyhow!("Function '{}' not found", func_name)),
@@ -163,20 +191,14 @@ impl Executor {
             let rows = vec![Row::new(vec![result])];
             return Ok((schema, rows));
         }
-
-        let schema = self
-            .store()
-            .get_schema(txn, table_name)
-            .await?
-            .ok_or_else(|| anyhow!("Table '{}' not found", table_name))?;
-        let rows = self.scan_and_fill(txn, table_name, &schema).await?;
-        Ok((schema, rows))
+        Err(anyhow!("Table '{}' not found", table_name))
     }
 
     pub(crate) fn execute_view_query<'a>(
         &'a self,
         txn: &'a mut Transaction,
         sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
         view_query: &'a str,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecuteResult>> + Send + 'a>>
@@ -184,7 +206,8 @@ impl Executor {
         Box::pin(async move {
             let ast = parse_sql(view_query)?;
             if let Some(Statement::Query(q)) = ast.into_iter().next() {
-                self.execute_query_with_ctes(txn, sequence_values, &q, ctes).await
+                self.execute_query_with_ctes(txn, sequence_values, search_path, &q, ctes)
+                    .await
             } else {
                 Err(anyhow!("Invalid view query"))
             }
@@ -195,6 +218,7 @@ impl Executor {
         &'a self,
         txn: &'a mut Transaction,
         sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
         subquery: &'a Query,
         alias: &'a str,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
@@ -203,7 +227,7 @@ impl Executor {
     > {
         Box::pin(async move {
             let result = self
-                .execute_query_with_ctes(txn, sequence_values, subquery, ctes)
+                .execute_query_with_ctes(txn, sequence_values, search_path, subquery, ctes)
                 .await?;
             match result {
                 ExecuteResult::Select {
@@ -243,6 +267,7 @@ impl Executor {
         &'a self,
         txn: &'a mut Transaction,
         sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
         factor: &'a TableFactor,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> std::pin::Pin<
@@ -253,12 +278,12 @@ impl Executor {
                 TableFactor::Table {
                     name, alias, args, ..
                 } => {
-                    let tbl = name.0.last().unwrap().value.clone();
+                    let (schema_opt, obj_name) = names::split_object_name(name)?;
                     let als = alias
                         .as_ref()
                         .map(|a| a.name.value.clone())
-                        .unwrap_or_else(|| tbl.clone());
-                    let tbl_upper = tbl.to_uppercase();
+                        .unwrap_or_else(|| obj_name.clone());
+                    let tbl_upper = obj_name.to_uppercase();
                     let is_scalar_function = matches!(
                         tbl_upper.as_str(),
                         "CURRENT_SCHEMA"
@@ -268,12 +293,15 @@ impl Executor {
                             | "USER"
                     ) || args.is_some();
                     let table_name = if is_scalar_function {
-                        format!("{}()", tbl)
+                        format!("{}()", obj_name)
                     } else {
-                        tbl
+                        match schema_opt {
+                            Some(schema) => format!("{}.{}", schema, obj_name),
+                            None => obj_name,
+                        }
                     };
                     let (schema, rows) = self
-                        .get_table_data(txn, sequence_values, &table_name, ctes)
+                        .get_table_data(txn, sequence_values, search_path, &table_name, ctes)
                         .await?;
                     Ok((als, schema, rows))
                 }
@@ -285,7 +313,14 @@ impl Executor {
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| "subquery".to_string());
                     let (schema, rows) = self
-                        .execute_derived_table(txn, sequence_values, subquery, &alias_name, ctes)
+                        .execute_derived_table(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            subquery,
+                            &alias_name,
+                            ctes,
+                        )
                         .await?;
                     Ok((alias_name, schema, rows))
                 }
@@ -294,7 +329,13 @@ impl Executor {
                     alias,
                 } => {
                     let (base_alias, base_schema, mut combined_rows) = self
-                        .resolve_table_factor(txn, sequence_values, &table_with_joins.relation, ctes)
+                        .resolve_table_factor(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            &table_with_joins.relation,
+                            ctes,
+                        )
                         .await?;
 
                     let mut all_table_aliases: Vec<(String, Vec<ColumnDef>)> =
@@ -304,7 +345,14 @@ impl Executor {
 
                     for join in &table_with_joins.joins {
                         let (join_alias, join_schema, join_rows) =
-                            self.resolve_table_factor(txn, sequence_values, &join.relation, ctes).await?;
+                            self.resolve_table_factor(
+                                txn,
+                                sequence_values,
+                                search_path,
+                                &join.relation,
+                                ctes,
+                            )
+                            .await?;
 
                         let join_condition = match &join.join_operator {
                             JoinOperator::Inner(JoinConstraint::On(expr)) => Some(expr.clone()),
@@ -382,6 +430,7 @@ impl Executor {
                                         self.eval_expr_join_maybe_sequence(
                                             txn,
                                             sequence_values,
+                                            search_path,
                                             cond,
                                             &ctx
                                         )
@@ -476,6 +525,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
         query: &Query,
         select: &sqlparser::ast::Select,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
@@ -484,14 +534,14 @@ impl Executor {
             TableFactor::Table {
                 name, alias, args, ..
             } => {
-                let tbl = name.0.last().unwrap().value.clone();
+                let (schema_opt, obj_name) = names::split_object_name(name)?;
                 let als = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
-                    .unwrap_or_else(|| tbl.clone());
+                    .unwrap_or_else(|| obj_name.clone());
 
                 // Check if this is a known scalar function that can be used as a table
-                let tbl_upper = tbl.to_uppercase();
+                let tbl_upper = obj_name.to_uppercase();
                 let is_scalar_function = matches!(
                     tbl_upper.as_str(),
                     "CURRENT_SCHEMA"
@@ -502,13 +552,16 @@ impl Executor {
                 ) || args.is_some();
 
                 let table_name = if is_scalar_function {
-                    format!("{}()", tbl) // Add parentheses for function detection in get_table_data
+                    format!("{}()", obj_name) // Add parentheses for function detection in get_table_data
                 } else {
-                    tbl.clone()
+                    match schema_opt {
+                        Some(schema) => format!("{}.{}", schema, obj_name),
+                        None => obj_name,
+                    }
                 };
 
                 let (schema, rows) = self
-                    .get_table_data(txn, sequence_values, &table_name, ctes)
+                    .get_table_data(txn, sequence_values, search_path, &table_name, ctes)
                     .await?;
                 (als, schema, rows)
             }
@@ -520,13 +573,26 @@ impl Executor {
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "subquery".to_string());
                 let (schema, rows) = self
-                    .execute_derived_table(txn, sequence_values, subquery, &alias_name, ctes)
+                    .execute_derived_table(
+                        txn,
+                        sequence_values,
+                        search_path,
+                        subquery,
+                        &alias_name,
+                        ctes,
+                    )
                     .await?;
                 (alias_name, schema, rows)
             }
             TableFactor::NestedJoin { .. } => {
-                self.resolve_table_factor(txn, sequence_values, &select.from[0].relation, ctes)
-                    .await?
+                self.resolve_table_factor(
+                    txn,
+                    sequence_values,
+                    search_path,
+                    &select.from[0].relation,
+                    ctes,
+                )
+                .await?
             }
             _ => return Err(anyhow!("Unsupported base table")),
         };
@@ -540,12 +606,18 @@ impl Executor {
         for from_item in select.from.iter().skip(1) {
             let (extra_alias, extra_schema, extra_rows) = match &from_item.relation {
                 TableFactor::Table { name, alias, .. } => {
-                    let tbl = name.0.last().unwrap().value.clone();
+                    let (schema_opt, obj_name) = names::split_object_name(name)?;
+                    let tbl = match schema_opt {
+                        Some(schema) => format!("{}.{}", schema, obj_name),
+                        None => obj_name.clone(),
+                    };
                     let als = alias
                         .as_ref()
                         .map(|a| a.name.value.clone())
-                        .unwrap_or_else(|| tbl.clone());
-                    let (schema, rows) = self.get_table_data(txn, sequence_values, &tbl, ctes).await?;
+                        .unwrap_or_else(|| obj_name.clone());
+                    let (schema, rows) =
+                        self.get_table_data(txn, sequence_values, search_path, &tbl, ctes)
+                            .await?;
                     (als, schema, rows)
                 }
                 TableFactor::Derived {
@@ -556,13 +628,26 @@ impl Executor {
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| "subquery".to_string());
                     let (schema, rows) = self
-                        .execute_derived_table(txn, sequence_values, subquery, &alias_name, ctes)
+                        .execute_derived_table(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            subquery,
+                            &alias_name,
+                            ctes,
+                        )
                         .await?;
                     (alias_name, schema, rows)
                 }
                 TableFactor::NestedJoin { .. } => {
-                    self.resolve_table_factor(txn, sequence_values, &from_item.relation, ctes)
-                        .await?
+                    self.resolve_table_factor(
+                        txn,
+                        sequence_values,
+                        search_path,
+                        &from_item.relation,
+                        ctes,
+                    )
+                    .await?
                 }
                 _ => return Err(anyhow!("Unsupported table factor in FROM")),
             };
@@ -581,13 +666,18 @@ impl Executor {
             for extra_join in &from_item.joins {
                 let (join_alias, join_schema, join_rows) = match &extra_join.relation {
                     TableFactor::Table { name, alias, .. } => {
-                        let tbl = name.0.last().unwrap().value.clone();
+                        let (schema_opt, obj_name) = names::split_object_name(name)?;
+                        let tbl = match schema_opt {
+                            Some(schema) => format!("{}.{}", schema, obj_name),
+                            None => obj_name.clone(),
+                        };
                         let als = alias
                             .as_ref()
                             .map(|a| a.name.value.clone())
-                            .unwrap_or_else(|| tbl.clone());
+                            .unwrap_or_else(|| obj_name.clone());
                         let (schema, rows) =
-                            self.get_table_data(txn, sequence_values, &tbl, ctes).await?;
+                            self.get_table_data(txn, sequence_values, search_path, &tbl, ctes)
+                                .await?;
                         (als, schema, rows)
                     }
                     TableFactor::Derived {
@@ -598,13 +688,26 @@ impl Executor {
                             .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| "subquery".to_string());
                         let (schema, rows) = self
-                            .execute_derived_table(txn, sequence_values, subquery, &alias_name, ctes)
+                            .execute_derived_table(
+                                txn,
+                                sequence_values,
+                                search_path,
+                                subquery,
+                                &alias_name,
+                                ctes,
+                            )
                             .await?;
                         (alias_name, schema, rows)
                     }
                     TableFactor::NestedJoin { .. } => {
-                        self.resolve_table_factor(txn, sequence_values, &extra_join.relation, ctes)
-                            .await?
+                        self.resolve_table_factor(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            &extra_join.relation,
+                            ctes,
+                        )
+                        .await?
                     }
                     _ => return Err(anyhow!("Unsupported join table factor")),
                 };
@@ -625,12 +728,18 @@ impl Executor {
         for join in &select.from[0].joins {
             let (join_alias, join_schema, join_rows) = match &join.relation {
                 TableFactor::Table { name, alias, .. } => {
-                    let tbl = name.0.last().unwrap().value.clone();
+                    let (schema_opt, obj_name) = names::split_object_name(name)?;
+                    let tbl = match schema_opt {
+                        Some(schema) => format!("{}.{}", schema, obj_name),
+                        None => obj_name.clone(),
+                    };
                     let als = alias
                         .as_ref()
                         .map(|a| a.name.value.clone())
-                        .unwrap_or_else(|| tbl.clone());
-                    let (schema, rows) = self.get_table_data(txn, sequence_values, &tbl, ctes).await?;
+                        .unwrap_or_else(|| obj_name.clone());
+                    let (schema, rows) =
+                        self.get_table_data(txn, sequence_values, search_path, &tbl, ctes)
+                            .await?;
                     (als, schema, rows)
                 }
                 TableFactor::Derived {
@@ -641,12 +750,19 @@ impl Executor {
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| "subquery".to_string());
                     let (schema, rows) = self
-                        .execute_derived_table(txn, sequence_values, subquery, &alias_name, ctes)
+                        .execute_derived_table(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            subquery,
+                            &alias_name,
+                            ctes,
+                        )
                         .await?;
                     (alias_name, schema, rows)
                 }
                 TableFactor::NestedJoin { .. } => {
-                    self.resolve_table_factor(txn, sequence_values, &join.relation, ctes)
+                    self.resolve_table_factor(txn, sequence_values, search_path, &join.relation, ctes)
                         .await?
                 }
                 _ => return Err(anyhow!("Unsupported join table")),
@@ -715,7 +831,10 @@ impl Executor {
                 if has_correlated_subquery {
                     Some(cond)
                 } else {
-                    Some(self.resolve_subqueries(txn, sequence_values, &cond).await?)
+                    Some(
+                        self.resolve_subqueries(txn, sequence_values, search_path, &cond)
+                            .await?,
+                    )
                 }
             } else {
                 None
@@ -789,7 +908,10 @@ impl Executor {
                             );
                             value_offset += schema.columns.len();
                         }
-                        Some(self.resolve_subqueries(txn, sequence_values, &substituted).await?)
+                        Some(
+                            self.resolve_subqueries(txn, sequence_values, search_path, &substituted)
+                                .await?,
+                        )
                     } else {
                         None
                     }
@@ -813,6 +935,7 @@ impl Executor {
                             self.eval_expr_join_maybe_sequence(
                                 txn,
                                 sequence_values,
+                                search_path,
                                 cond,
                                 &ctx
                             )
@@ -884,7 +1007,10 @@ impl Executor {
 
         // Resolve subqueries (EXISTS, IN (SELECT ...), scalar subqueries) in WHERE clause
         let resolved_selection = if let Some(sel) = &select.selection {
-            Some(self.resolve_subqueries(txn, sequence_values, sel).await?)
+            Some(
+                self.resolve_subqueries(txn, sequence_values, search_path, sel)
+                    .await?,
+            )
         } else {
             None
         };
@@ -899,7 +1025,7 @@ impl Executor {
                     combined_schema: &final_schema,
                 };
                 if matches!(
-                    self.eval_expr_join_maybe_sequence(txn, sequence_values, sel, &ctx)
+                    self.eval_expr_join_maybe_sequence(txn, sequence_values, search_path, sel, &ctx)
                         .await?,
                     Value::Boolean(true)
                 ) {
@@ -912,7 +1038,7 @@ impl Executor {
         };
 
         let resolved_projection = self
-            .resolve_projection_subqueries(txn, sequence_values, &select.projection)
+            .resolve_projection_subqueries(txn, sequence_values, search_path, &select.projection)
             .await?;
 
         let group_keys_exprs = match &select.group_by {
@@ -983,7 +1109,7 @@ impl Executor {
                 let mut key = Vec::new();
                 for expr in group_keys_exprs {
                     key.push(
-                        self.eval_expr_join_maybe_sequence(txn, sequence_values, expr, &ctx)
+                        self.eval_expr_join_maybe_sequence(txn, sequence_values, search_path, expr, &ctx)
                             .await?,
                     );
                 }
@@ -1003,6 +1129,7 @@ impl Executor {
                                                     .eval_expr_join_maybe_sequence(
                                                         txn,
                                                         sequence_values,
+                                                        search_path,
                                                         e,
                                                         &ctx,
                                                     )
@@ -1055,6 +1182,7 @@ impl Executor {
                             .eval_expr_join_maybe_sequence(
                                 txn,
                                 sequence_values,
+                                search_path,
                                 filter,
                                 &ctx,
                             )
@@ -1065,7 +1193,7 @@ impl Executor {
                     }
 
                     let val = if let Some(e) = arg_expr {
-                        self.eval_expr_join_maybe_sequence(txn, sequence_values, e, &ctx)
+                        self.eval_expr_join_maybe_sequence(txn, sequence_values, search_path, e, &ctx)
                             .await?
                     } else {
                         Value::Int32(1)
@@ -1088,11 +1216,14 @@ impl Executor {
                 };
 
                 if let Some(having_expr) = &select.having {
-                    let having_expr = if sequences::expr_uses_sequence_functions(having_expr) {
+                    let having_expr = if sequences::expr_uses_sequence_functions(having_expr)
+                        || sequences::expr_uses_current_schema(having_expr)
+                    {
                         sequences::replace_sequence_functions_join(
                             &self.store(),
                             txn,
                             sequence_values,
+                            search_path,
                             having_expr,
                             &ctx,
                         )
@@ -1116,11 +1247,14 @@ impl Executor {
                             | SelectItem::ExprWithAlias { expr: e, .. } => e,
                             _ => return Err(anyhow!("Unsupported projection item")),
                         };
-                        let expr = if sequences::expr_uses_sequence_functions(expr) {
+                        let expr = if sequences::expr_uses_sequence_functions(expr)
+                            || sequences::expr_uses_current_schema(expr)
+                        {
                             sequences::replace_sequence_functions_join(
                                 &self.store(),
                                 txn,
                                 sequence_values,
+                                search_path,
                                 expr,
                                 &ctx,
                             )
@@ -1216,9 +1350,9 @@ impl Executor {
                 })
                 .collect();
 
-            let order_by_uses_sequences = resolved_order_exprs
-                .iter()
-                .any(sequences::expr_uses_sequence_functions);
+            let order_by_uses_sequences = resolved_order_exprs.iter().any(|e| {
+                sequences::expr_uses_sequence_functions(e) || sequences::expr_uses_current_schema(e)
+            });
 
             if order_by_uses_sequences {
                 let mut rows_with_keys: Vec<(usize, Row, Vec<Value>)> =
@@ -1234,9 +1368,17 @@ impl Executor {
 
                     let mut keys = Vec::with_capacity(resolved_order_exprs.len());
                     for expr in &resolved_order_exprs {
-                        let val = if sequences::expr_uses_sequence_functions(expr) {
-                            self.eval_expr_join_maybe_sequence(txn, sequence_values, expr, &ctx)
-                                .await?
+                        let val = if sequences::expr_uses_sequence_functions(expr)
+                            || sequences::expr_uses_current_schema(expr)
+                        {
+                            self.eval_expr_join_maybe_sequence(
+                                txn,
+                                sequence_values,
+                                search_path,
+                                expr,
+                                &ctx,
+                            )
+                            .await?
                         } else {
                             eval_expr_join(expr, &ctx).unwrap_or(Value::Null)
                         };
@@ -1507,7 +1649,13 @@ impl Executor {
                                 }
                             }
                             vals.push(
-                                self.eval_expr_join_maybe_sequence(txn, sequence_values, e, &ctx)
+                                self.eval_expr_join_maybe_sequence(
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    e,
+                                    &ctx,
+                                )
                                     .await?,
                             );
                         }
@@ -1569,7 +1717,13 @@ impl Executor {
                         _ => return Err(anyhow!("Unsupported select item")),
                     };
                     vals.push(
-                        self.eval_expr_join_maybe_sequence(txn, sequence_values, expr, &ctx)
+                        self.eval_expr_join_maybe_sequence(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            expr,
+                            &ctx,
+                        )
                             .await?,
                     );
                 }

@@ -5,33 +5,30 @@ use sqlparser::ast::{ObjectName, UserDefinedTypeRepresentation};
 use tikv_client::Transaction;
 
 use super::helpers::{convert_data_type, normalize_ident};
+use super::names;
 use super::ExecuteResult;
 use crate::storage::TikvStore;
 use crate::types::{UserTypeDef, UserTypeKind};
 
-pub(crate) fn resolve_type_name(name: &ObjectName) -> Result<(String, String, String)> {
-    if name.0.is_empty() {
-        return Err(anyhow!("Invalid type name"));
-    }
-
-    let type_name = normalize_ident(name.0.last().unwrap());
-    let schema = if name.0.len() >= 2 {
-        normalize_ident(&name.0[name.0.len() - 2])
-    } else {
-        "public".to_string()
-    };
-
-    let full_name = format!("{}.{}", schema, type_name);
-    Ok((schema, type_name, full_name))
+pub(crate) fn resolve_type_name(
+    name: &ObjectName,
+    search_path: &[String],
+) -> Result<(String, String, String)> {
+    let resolved = names::resolve_ddl_object_name(name, search_path)?;
+    Ok((resolved.schema, resolved.name, resolved.full))
 }
 
 pub async fn execute_create_type(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    search_path: &[String],
     name: &ObjectName,
     representation: &UserDefinedTypeRepresentation,
 ) -> Result<ExecuteResult> {
-    let (schema, type_name, full_name) = resolve_type_name(name)?;
+    let (schema, type_name, full_name) = resolve_type_name(name, search_path)?;
+    if !store.schema_exists(txn, &schema).await? {
+        return Err(anyhow!("schema '{}' does not exist", schema));
+    }
 
     let kind = match representation {
         UserDefinedTypeRepresentation::Composite { attributes } => {

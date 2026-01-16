@@ -12,6 +12,7 @@ use tikv_client::Transaction;
 
 use super::expr::{eval_expr, eval_expr_join, JoinContext};
 use super::helpers::{normalize_ident, value_to_sql_expr};
+use super::names;
 use super::ExecuteResult;
 
 pub(crate) fn expr_uses_sequence_functions(expr: &Expr) -> bool {
@@ -37,19 +38,42 @@ pub(crate) fn expr_uses_sequence_functions(expr: &Expr) -> bool {
     found
 }
 
-pub(crate) fn normalize_sequence_name(name: &ObjectName) -> Result<(String, String, String)> {
+pub(crate) fn expr_uses_current_schema(expr: &Expr) -> bool {
+    use core::ops::ControlFlow;
+    use sqlparser::ast::visit_expressions;
+
+    let mut found = false;
+    let _ = visit_expressions(expr, |e| {
+        if found {
+            return ControlFlow::Break(());
+        }
+
+        if let Expr::Function(func) = e {
+            let name = function_name_upper(func);
+            if name == "CURRENT_SCHEMA" {
+                found = true;
+                return ControlFlow::Break(());
+            }
+        }
+
+        ControlFlow::<()>::Continue(())
+    });
+    found
+}
+
+pub(crate) fn normalize_sequence_name(
+    name: &ObjectName,
+    search_path: &[String],
+) -> Result<(String, String, String)> {
     let parts: Vec<String> = name.0.iter().map(normalize_ident).collect();
     if parts.is_empty() {
         return Err(anyhow!("Invalid sequence name"));
     }
 
-    let (schema, seq_name) = if parts.len() >= 2 {
-        (
-            parts[parts.len() - 2].clone(),
-            parts[parts.len() - 1].clone(),
-        )
-    } else {
-        ("public".to_string(), parts[0].clone())
+    let (schema, seq_name) = match parts.as_slice() {
+        [seq_name] => (names::default_schema(search_path).to_string(), seq_name.clone()),
+        [schema, seq_name] => (schema.clone(), seq_name.clone()),
+        _ => return Err(anyhow!("Invalid sequence name")),
     };
 
     Ok((schema.clone(), seq_name.clone(), format!("{}.{}", schema, seq_name)))
@@ -60,18 +84,24 @@ pub(crate) fn implicit_sequence_name(table_name: &str, column_name: &str) -> Str
 }
 
 pub(crate) fn build_implicit_sequence_def(
-    table_name: &str,
+    table_full_name: &str,
     column_name: &str,
     table_id: u64,
 ) -> SequenceDef {
+    let (schema, table_name) = match table_full_name.split_once('.') {
+        Some((schema, table)) if !schema.is_empty() && !table.is_empty() => {
+            (schema.to_string(), table.to_string())
+        }
+        _ => ("public".to_string(), table_full_name.to_string()),
+    };
     SequenceDef {
-        schema: "public".to_string(),
-        name: implicit_sequence_name(table_name, column_name),
+        schema,
+        name: implicit_sequence_name(&table_name, column_name),
         increment: 1,
         min_value: 1,
         max_value: i64::MAX,
         is_cycled: false,
-        owned_by: Some((table_name.to_string(), column_name.to_string())),
+        owned_by: Some((table_full_name.to_string(), column_name.to_string())),
         owner: "postgres".to_string(),
         backing: SequenceBacking::TableId(table_id),
     }
@@ -90,7 +120,7 @@ fn eval_i64(expr: &Expr) -> Result<i64> {
     }
 }
 
-fn parse_qualified_name_token(token: &str) -> Result<(String, String, String)> {
+fn parse_sequence_name_token(token: &str) -> Result<(Option<String>, String)> {
     fn push_part(parts: &mut Vec<String>, raw: &str, quoted: bool) -> Result<()> {
         let trimmed = if quoted { raw } else { raw.trim() };
         if trimmed.is_empty() {
@@ -139,16 +169,14 @@ fn parse_qualified_name_token(token: &str) -> Result<(String, String, String)> {
     }
     push_part(&mut parts, &buf, part_quoted)?;
 
-    let (schema, name) = if parts.len() >= 2 {
-        (
-            parts[parts.len() - 2].clone(),
+    if parts.len() >= 2 {
+        Ok((
+            Some(parts[parts.len() - 2].clone()),
             parts[parts.len() - 1].clone(),
-        )
+        ))
     } else {
-        ("public".to_string(), parts[0].clone())
-    };
-
-    Ok((schema.clone(), name.clone(), format!("{}.{}", schema, name)))
+        Ok((None, parts[0].clone()))
+    }
 }
 
 fn parse_minmax(value: &MinMaxValue) -> Result<Option<i64>> {
@@ -162,11 +190,15 @@ fn parse_minmax(value: &MinMaxValue) -> Result<Option<i64>> {
 pub(crate) async fn execute_create_sequence(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    search_path: &[String],
     name: &ObjectName,
     if_not_exists: bool,
     sequence_options: &[SequenceOptions],
 ) -> Result<ExecuteResult> {
-    let (schema, seq_name, full_name) = normalize_sequence_name(name)?;
+    let (schema, seq_name, full_name) = normalize_sequence_name(name, search_path)?;
+    if !store.schema_exists(txn, &schema).await? {
+        return Err(anyhow!("schema '{}' does not exist", schema));
+    }
 
     if if_not_exists && store.get_sequence(txn, &full_name).await?.is_some() {
         return Ok(ExecuteResult::Empty);
@@ -242,14 +274,22 @@ pub(crate) async fn execute_create_sequence(
 pub(crate) async fn execute_drop_sequence(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    search_path: &[String],
     names: &[ObjectName],
     if_exists: bool,
 ) -> Result<ExecuteResult> {
     for name in names {
-        let (_, _, full_name) = normalize_sequence_name(name)?;
-        let existed = store.drop_sequence(txn, &full_name).await?;
+        let resolved =
+            names::resolve_existing_sequence_name(store.as_ref(), txn, name, search_path).await?;
+        let Some(resolved) = resolved else {
+            if !if_exists {
+                return Err(anyhow!("Sequence '{}' does not exist", name));
+            }
+            continue;
+        };
+        let existed = store.drop_sequence(txn, &resolved.full).await?;
         if !existed && !if_exists {
-            return Err(anyhow!("Sequence '{}' does not exist", full_name));
+            return Err(anyhow!("Sequence '{}' does not exist", resolved.full));
         }
     }
     Ok(ExecuteResult::Empty)
@@ -271,24 +311,57 @@ fn extract_arg_expr<'a>(args: &'a [FunctionArg], idx: usize) -> Result<&'a Expr>
     }
 }
 
-fn parse_sequence_full_name_from_value(v: crate::types::Value) -> Result<String> {
+async fn resolve_sequence_full_name_from_value(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    search_path: &[String],
+    v: crate::types::Value,
+) -> Result<String> {
     let crate::types::Value::Text(s) = v else {
         return Err(anyhow!("Sequence name must be text/regclass"));
     };
-    let (_, _, full_name) = parse_qualified_name_token(&s)?;
-    Ok(full_name)
+
+    let (schema_opt, seq_name) = parse_sequence_name_token(&s)?;
+    if let Some(schema) = schema_opt {
+        return Ok(names::ResolvedName::new(schema, seq_name)?.full);
+    }
+
+    let candidates: Vec<&str> = if search_path.is_empty() {
+        vec!["public"]
+    } else {
+        search_path.iter().map(|s| s.as_str()).collect()
+    };
+    for schema in candidates {
+        let resolved = names::ResolvedName::new(schema.to_string(), seq_name.clone())?;
+        if store.get_sequence(txn, &resolved.full).await?.is_some() {
+            return Ok(resolved.full);
+        }
+    }
+
+    Ok(
+        names::ResolvedName::new(names::default_schema(search_path).to_string(), seq_name)?.full,
+    )
 }
 
 pub(crate) async fn eval_expr_with_sequences(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     last_sequence_values: &mut HashMap<String, i64>,
+    search_path: &[String],
     expr: &Expr,
     row: Option<&crate::types::Row>,
     schema: Option<&crate::types::TableSchema>,
 ) -> Result<crate::types::Value> {
-    let rewritten =
-        replace_sequence_functions(store, txn, last_sequence_values, expr, row, schema).await?;
+    let rewritten = replace_sequence_functions(
+        store,
+        txn,
+        last_sequence_values,
+        search_path,
+        expr,
+        row,
+        schema,
+    )
+    .await?;
     eval_expr(&rewritten, row, schema)
 }
 
@@ -296,11 +369,19 @@ pub(crate) async fn eval_expr_join_with_sequences(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     last_sequence_values: &mut HashMap<String, i64>,
+    search_path: &[String],
     expr: &Expr,
     join_ctx: &JoinContext<'_>,
 ) -> Result<crate::types::Value> {
-    let rewritten =
-        replace_sequence_functions_join(store, txn, last_sequence_values, expr, join_ctx).await?;
+    let rewritten = replace_sequence_functions_join(
+        store,
+        txn,
+        last_sequence_values,
+        search_path,
+        expr,
+        join_ctx,
+    )
+    .await?;
     eval_expr_join(&rewritten, join_ctx)
 }
 
@@ -308,6 +389,7 @@ pub(crate) fn replace_sequence_functions<'a>(
     store: &'a Arc<TikvStore>,
     txn: &'a mut Transaction,
     last_sequence_values: &'a mut HashMap<String, i64>,
+    search_path: &'a [String],
     expr: &'a Expr,
     row: Option<&'a crate::types::Row>,
     schema: Option<&'a crate::types::TableSchema>,
@@ -317,16 +399,34 @@ pub(crate) fn replace_sequence_functions<'a>(
         Expr::Function(func) => {
             let name = function_name_upper(func);
             match name.as_str() {
+                "CURRENT_SCHEMA" => Ok(value_to_sql_expr(&crate::types::Value::Text(
+                    names::default_schema(search_path).to_string(),
+                ))),
                 "NEXTVAL" => {
                     let arg0 = extract_arg_expr(&func.args, 0)?;
-                    let full_name = parse_sequence_full_name_from_value(eval_expr(arg0, row, schema)?)?;
+                    let full_name = resolve_sequence_full_name_from_value(
+                        store,
+                        txn,
+                        search_path,
+                        eval_expr(arg0, row, schema)?,
+                    )
+                    .await?;
                     let val = store.nextval_sequence(txn, &full_name).await?;
                     last_sequence_values.insert(full_name, val);
                     Ok(value_to_sql_expr(&crate::types::Value::Int64(val)))
                 }
                 "CURRVAL" => {
                     let arg0 = extract_arg_expr(&func.args, 0)?;
-                    let full_name = parse_sequence_full_name_from_value(eval_expr(arg0, row, schema)?)?;
+                    let full_name = resolve_sequence_full_name_from_value(
+                        store,
+                        txn,
+                        search_path,
+                        eval_expr(arg0, row, schema)?,
+                    )
+                    .await?;
+                    if store.get_sequence(txn, &full_name).await?.is_none() {
+                        return Err(anyhow!("Sequence '{}' does not exist", full_name));
+                    }
                     let val = last_sequence_values.get(&full_name).copied().ok_or_else(|| {
                         anyhow!(
                             "currval of sequence \"{}\" is not yet defined in this session",
@@ -338,7 +438,13 @@ pub(crate) fn replace_sequence_functions<'a>(
                 "SETVAL" => {
                     let arg0 = extract_arg_expr(&func.args, 0)?;
                     let arg1 = extract_arg_expr(&func.args, 1)?;
-                    let full_name = parse_sequence_full_name_from_value(eval_expr(arg0, row, schema)?)?;
+                    let full_name = resolve_sequence_full_name_from_value(
+                        store,
+                        txn,
+                        search_path,
+                        eval_expr(arg0, row, schema)?,
+                    )
+                    .await?;
                     let val = eval_expr(arg1, row, schema)?;
                     let value_i64 = match val {
                         crate::types::Value::Int32(n) => n as i64,
@@ -377,6 +483,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                                         store,
                                         txn,
                                         last_sequence_values,
+                                        search_path,
                                         e,
                                         row,
                                         schema,
@@ -394,6 +501,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                                 store,
                                 txn,
                                 last_sequence_values,
+                                search_path,
                                 filter,
                                 row,
                                 schema,
@@ -410,6 +518,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                             store,
                             txn,
                             last_sequence_values,
+                            search_path,
                             &ob.expr,
                             row,
                             schema,
@@ -432,43 +541,82 @@ pub(crate) fn replace_sequence_functions<'a>(
         }
         Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
             left: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, left, row, schema)
+                replace_sequence_functions(
+                    store,
+                    txn,
+                    last_sequence_values,
+                    search_path,
+                    left,
+                    row,
+                    schema,
+                )
                     .await?,
             ),
             op: op.clone(),
             right: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, right, row, schema)
+                replace_sequence_functions(
+                    store,
+                    txn,
+                    last_sequence_values,
+                    search_path,
+                    right,
+                    row,
+                    schema,
+                )
                     .await?,
             ),
         }),
         Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
             op: op.clone(),
             expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, expr, row, schema)
+                replace_sequence_functions(
+                    store,
+                    txn,
+                    last_sequence_values,
+                    search_path,
+                    expr,
+                    row,
+                    schema,
+                )
                     .await?,
             ),
         }),
         Expr::Nested(inner) => Ok(Expr::Nested(Box::new(
-            replace_sequence_functions(store, txn, last_sequence_values, inner, row, schema).await?,
+            replace_sequence_functions(store, txn, last_sequence_values, search_path, inner, row, schema).await?,
         ))),
         Expr::IsNull(inner) => Ok(Expr::IsNull(Box::new(
-            replace_sequence_functions(store, txn, last_sequence_values, inner, row, schema).await?,
+            replace_sequence_functions(store, txn, last_sequence_values, search_path, inner, row, schema).await?,
         ))),
         Expr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(
-            replace_sequence_functions(store, txn, last_sequence_values, inner, row, schema).await?,
+            replace_sequence_functions(store, txn, last_sequence_values, search_path, inner, row, schema).await?,
         ))),
         Expr::InList {
             expr,
             list,
             negated,
         } => {
-            let resolved_expr =
-                replace_sequence_functions(store, txn, last_sequence_values, expr, row, schema)
-                    .await?;
+            let resolved_expr = replace_sequence_functions(
+                store,
+                txn,
+                last_sequence_values,
+                search_path,
+                expr,
+                row,
+                schema,
+            )
+            .await?;
             let mut resolved_list = Vec::with_capacity(list.len());
             for item in list {
                 resolved_list.push(
-                    replace_sequence_functions(store, txn, last_sequence_values, item, row, schema)
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        item,
+                        row,
+                        schema,
+                    )
                         .await?,
                 );
             }
@@ -485,16 +633,40 @@ pub(crate) fn replace_sequence_functions<'a>(
             high,
         } => Ok(Expr::Between {
             expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, expr, row, schema)
+                replace_sequence_functions(
+                    store,
+                    txn,
+                    last_sequence_values,
+                    search_path,
+                    expr,
+                    row,
+                    schema,
+                )
                     .await?,
             ),
             negated: *negated,
             low: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, low, row, schema)
+                replace_sequence_functions(
+                    store,
+                    txn,
+                    last_sequence_values,
+                    search_path,
+                    low,
+                    row,
+                    schema,
+                )
                     .await?,
             ),
             high: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, high, row, schema)
+                replace_sequence_functions(
+                    store,
+                    txn,
+                    last_sequence_values,
+                    search_path,
+                    high,
+                    row,
+                    schema,
+                )
                     .await?,
             ),
         }),
@@ -506,7 +678,15 @@ pub(crate) fn replace_sequence_functions<'a>(
         } => {
             let resolved_operand = if let Some(op) = operand {
                 Some(Box::new(
-                    replace_sequence_functions(store, txn, last_sequence_values, op, row, schema)
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        op,
+                        row,
+                        schema,
+                    )
                         .await?,
                 ))
             } else {
@@ -515,14 +695,30 @@ pub(crate) fn replace_sequence_functions<'a>(
             let mut resolved_conditions = Vec::with_capacity(conditions.len());
             for cond in conditions {
                 resolved_conditions.push(
-                    replace_sequence_functions(store, txn, last_sequence_values, cond, row, schema)
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        cond,
+                        row,
+                        schema,
+                    )
                         .await?,
                 );
             }
             let mut resolved_results = Vec::with_capacity(results.len());
             for res in results {
                 resolved_results.push(
-                    replace_sequence_functions(store, txn, last_sequence_values, res, row, schema)
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        res,
+                        row,
+                        schema,
+                    )
                         .await?,
                 );
             }
@@ -532,6 +728,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         else_expr,
                         row,
                         schema,
@@ -550,7 +747,7 @@ pub(crate) fn replace_sequence_functions<'a>(
         }
         Expr::Cast { expr, data_type, format } => Ok(Expr::Cast {
             expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, expr, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
                     .await?,
             ),
             data_type: data_type.clone(),
@@ -563,19 +760,19 @@ pub(crate) fn replace_sequence_functions<'a>(
             special,
         } => Ok(Expr::Substring {
             expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, expr, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
                     .await?,
             ),
             substring_from: match substring_from {
                 Some(e) => Some(Box::new(
-                    replace_sequence_functions(store, txn, last_sequence_values, e, row, schema)
+                    replace_sequence_functions(store, txn, last_sequence_values, search_path, e, row, schema)
                         .await?,
                 )),
                 None => None,
             },
             substring_for: match substring_for {
                 Some(e) => Some(Box::new(
-                    replace_sequence_functions(store, txn, last_sequence_values, e, row, schema)
+                    replace_sequence_functions(store, txn, last_sequence_values, search_path, e, row, schema)
                         .await?,
                 )),
                 None => None,
@@ -589,13 +786,13 @@ pub(crate) fn replace_sequence_functions<'a>(
             trim_characters,
         } => Ok(Expr::Trim {
             expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, expr, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
                     .await?,
             ),
             trim_where: trim_where.clone(),
             trim_what: match trim_what {
                 Some(e) => Some(Box::new(
-                    replace_sequence_functions(store, txn, last_sequence_values, e, row, schema)
+                    replace_sequence_functions(store, txn, last_sequence_values, search_path, e, row, schema)
                         .await?,
                 )),
                 None => None,
@@ -604,31 +801,31 @@ pub(crate) fn replace_sequence_functions<'a>(
         }),
         Expr::Position { expr, r#in } => Ok(Expr::Position {
             expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, expr, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
                     .await?,
             ),
             r#in: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, r#in, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, r#in, row, schema)
                     .await?,
             ),
         }),
         Expr::Extract { field, expr } => Ok(Expr::Extract {
             field: *field,
             expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, expr, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
                     .await?,
             ),
         }),
         Expr::Ceil { expr, field } => Ok(Expr::Ceil {
             expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, expr, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
                     .await?,
             ),
             field: *field,
         }),
         Expr::Floor { expr, field } => Ok(Expr::Floor {
             expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, expr, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
                     .await?,
             ),
             field: *field,
@@ -639,12 +836,12 @@ pub(crate) fn replace_sequence_functions<'a>(
             right,
         } => Ok(Expr::JsonAccess {
             left: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, left, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, left, row, schema)
                     .await?,
             ),
             operator: *operator,
             right: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, right, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, right, row, schema)
                     .await?,
             ),
         }),
@@ -652,7 +849,7 @@ pub(crate) fn replace_sequence_functions<'a>(
             let mut elems = Vec::with_capacity(arr.elem.len());
             for elem in &arr.elem {
                 elems.push(
-                    replace_sequence_functions(store, txn, last_sequence_values, elem, row, schema)
+                    replace_sequence_functions(store, txn, last_sequence_values, search_path, elem, row, schema)
                         .await?,
                 );
             }
@@ -663,12 +860,12 @@ pub(crate) fn replace_sequence_functions<'a>(
         }
         Expr::ArrayIndex { obj, indexes } => {
             let resolved_obj =
-                replace_sequence_functions(store, txn, last_sequence_values, obj, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, obj, row, schema)
                     .await?;
             let mut resolved_indexes = Vec::with_capacity(indexes.len());
             for idx in indexes {
                 resolved_indexes.push(
-                    replace_sequence_functions(store, txn, last_sequence_values, idx, row, schema)
+                    replace_sequence_functions(store, txn, last_sequence_values, search_path, idx, row, schema)
                         .await?,
                 );
             }
@@ -683,12 +880,12 @@ pub(crate) fn replace_sequence_functions<'a>(
             right,
         } => Ok(Expr::AnyOp {
             left: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, left, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, left, row, schema)
                     .await?,
             ),
             compare_op: compare_op.clone(),
             right: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, right, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, right, row, schema)
                     .await?,
             ),
         }),
@@ -698,12 +895,12 @@ pub(crate) fn replace_sequence_functions<'a>(
             right,
         } => Ok(Expr::AllOp {
             left: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, left, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, left, row, schema)
                     .await?,
             ),
             compare_op: compare_op.clone(),
             right: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, right, row, schema)
+                replace_sequence_functions(store, txn, last_sequence_values, search_path, right, row, schema)
                     .await?,
             ),
         }),
@@ -716,6 +913,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
     store: &'a Arc<TikvStore>,
     txn: &'a mut Transaction,
     last_sequence_values: &'a mut HashMap<String, i64>,
+    search_path: &'a [String],
     expr: &'a Expr,
     join_ctx: &'a JoinContext<'a>,
 ) -> Pin<Box<dyn Future<Output = Result<Expr>> + Send + 'a>> {
@@ -724,20 +922,34 @@ pub(crate) fn replace_sequence_functions_join<'a>(
             Expr::Function(func) => {
                 let name = function_name_upper(func);
                 match name.as_str() {
+                    "CURRENT_SCHEMA" => Ok(value_to_sql_expr(&crate::types::Value::Text(
+                        names::default_schema(search_path).to_string(),
+                    ))),
                     "NEXTVAL" => {
                         let arg0 = extract_arg_expr(&func.args, 0)?;
-                        let full_name = parse_sequence_full_name_from_value(eval_expr_join(
-                            arg0, join_ctx,
-                        )?)?;
+                        let full_name = resolve_sequence_full_name_from_value(
+                            store,
+                            txn,
+                            search_path,
+                            eval_expr_join(arg0, join_ctx)?,
+                        )
+                        .await?;
                         let val = store.nextval_sequence(txn, &full_name).await?;
                         last_sequence_values.insert(full_name, val);
                         Ok(value_to_sql_expr(&crate::types::Value::Int64(val)))
                     }
                     "CURRVAL" => {
                         let arg0 = extract_arg_expr(&func.args, 0)?;
-                        let full_name = parse_sequence_full_name_from_value(eval_expr_join(
-                            arg0, join_ctx,
-                        )?)?;
+                        let full_name = resolve_sequence_full_name_from_value(
+                            store,
+                            txn,
+                            search_path,
+                            eval_expr_join(arg0, join_ctx)?,
+                        )
+                        .await?;
+                        if store.get_sequence(txn, &full_name).await?.is_none() {
+                            return Err(anyhow!("Sequence '{}' does not exist", full_name));
+                        }
                         let val = last_sequence_values.get(&full_name).copied().ok_or_else(|| {
                             anyhow!(
                                 "currval of sequence \"{}\" is not yet defined in this session",
@@ -749,9 +961,13 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     "SETVAL" => {
                         let arg0 = extract_arg_expr(&func.args, 0)?;
                         let arg1 = extract_arg_expr(&func.args, 1)?;
-                        let full_name = parse_sequence_full_name_from_value(eval_expr_join(
-                            arg0, join_ctx,
-                        )?)?;
+                        let full_name = resolve_sequence_full_name_from_value(
+                            store,
+                            txn,
+                            search_path,
+                            eval_expr_join(arg0, join_ctx)?,
+                        )
+                        .await?;
                         let val = eval_expr_join(arg1, join_ctx)?;
                         let value_i64 = match val {
                             crate::types::Value::Int32(n) => n as i64,
@@ -801,6 +1017,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                                             store,
                                             txn,
                                             last_sequence_values,
+                                            search_path,
                                             e,
                                             join_ctx,
                                         )
@@ -818,6 +1035,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                                     store,
                                     txn,
                                     last_sequence_values,
+                                    search_path,
                                     filter,
                                     join_ctx,
                                 )
@@ -842,8 +1060,15 @@ pub(crate) fn replace_sequence_functions_join<'a>(
             }
             Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
                 left: Box::new(
-                    replace_sequence_functions_join(store, txn, last_sequence_values, left, join_ctx)
-                        .await?,
+                    replace_sequence_functions_join(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        left,
+                        join_ctx,
+                    )
+                    .await?,
                 ),
                 op: op.clone(),
                 right: Box::new(
@@ -851,6 +1076,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         right,
                         join_ctx,
                     )
@@ -864,6 +1090,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         inner,
                         join_ctx,
                     )
@@ -871,8 +1098,15 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                 ),
             }),
             Expr::Nested(inner) => Ok(Expr::Nested(Box::new(
-                replace_sequence_functions_join(store, txn, last_sequence_values, inner, join_ctx)
-                    .await?,
+                replace_sequence_functions_join(
+                    store,
+                    txn,
+                    last_sequence_values,
+                    search_path,
+                    inner,
+                    join_ctx,
+                )
+                .await?,
             ))),
             Expr::InList {
                 expr,
@@ -883,6 +1117,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     store,
                     txn,
                     last_sequence_values,
+                    search_path,
                     expr,
                     join_ctx,
                 )
@@ -894,6 +1129,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             store,
                             txn,
                             last_sequence_values,
+                            search_path,
                             item,
                             join_ctx,
                         )
@@ -917,6 +1153,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         expr,
                         join_ctx,
                     )
@@ -928,6 +1165,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         low,
                         join_ctx,
                     )
@@ -938,6 +1176,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         high,
                         join_ctx,
                     )
@@ -956,6 +1195,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             store,
                             txn,
                             last_sequence_values,
+                            search_path,
                             op,
                             join_ctx,
                         )
@@ -971,6 +1211,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             store,
                             txn,
                             last_sequence_values,
+                            search_path,
                             cond,
                             join_ctx,
                         )
@@ -984,6 +1225,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             store,
                             txn,
                             last_sequence_values,
+                            search_path,
                             res,
                             join_ctx,
                         )
@@ -996,6 +1238,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             store,
                             txn,
                             last_sequence_values,
+                            search_path,
                             else_expr,
                             join_ctx,
                         )
@@ -1021,6 +1264,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         expr,
                         join_ctx,
                     )
@@ -1040,6 +1284,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         expr,
                         join_ctx,
                     )
@@ -1051,6 +1296,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             store,
                             txn,
                             last_sequence_values,
+                            search_path,
                             e,
                             join_ctx,
                         )
@@ -1064,6 +1310,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             store,
                             txn,
                             last_sequence_values,
+                            search_path,
                             e,
                             join_ctx,
                         )
@@ -1084,6 +1331,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         expr,
                         join_ctx,
                     )
@@ -1096,6 +1344,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             store,
                             txn,
                             last_sequence_values,
+                            search_path,
                             e,
                             join_ctx,
                         )
@@ -1111,6 +1360,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         expr,
                         join_ctx,
                     )
@@ -1121,6 +1371,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         r#in,
                         join_ctx,
                     )
@@ -1134,6 +1385,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         expr,
                         join_ctx,
                     )
@@ -1146,6 +1398,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         expr,
                         join_ctx,
                     )
@@ -1159,6 +1412,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         expr,
                         join_ctx,
                     )
@@ -1176,6 +1430,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         left,
                         join_ctx,
                     )
@@ -1187,6 +1442,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         right,
                         join_ctx,
                     )
@@ -1201,6 +1457,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             store,
                             txn,
                             last_sequence_values,
+                            search_path,
                             elem,
                             join_ctx,
                         )
@@ -1217,6 +1474,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     store,
                     txn,
                     last_sequence_values,
+                    search_path,
                     obj,
                     join_ctx,
                 )
@@ -1228,6 +1486,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             store,
                             txn,
                             last_sequence_values,
+                            search_path,
                             idx,
                             join_ctx,
                         )
@@ -1249,6 +1508,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         left,
                         join_ctx,
                     )
@@ -1260,6 +1520,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         right,
                         join_ctx,
                     )
@@ -1276,6 +1537,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         left,
                         join_ctx,
                     )
@@ -1287,6 +1549,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         store,
                         txn,
                         last_sequence_values,
+                        search_path,
                         right,
                         join_ctx,
                     )

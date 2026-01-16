@@ -1,6 +1,7 @@
 //! DDL operation execution (CREATE TABLE AS, CREATE/DROP INDEX, ALTER TABLE)
 
 use super::ddl;
+use super::names;
 use super::ExecuteResult;
 use super::Executor;
 use anyhow::{anyhow, Result};
@@ -15,22 +16,24 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
         name: &ObjectName,
         query: &Query,
         columns: &[SqlColumnDef],
         if_not_exists: bool,
         _temporary: bool,
     ) -> Result<ExecuteResult> {
-        let table_name = name
-            .0
-            .last()
-            .ok_or_else(|| anyhow!("Invalid table name"))?
-            .value
-            .clone();
+        let resolved = names::resolve_ddl_object_name(name, search_path)?;
+        if !self.store().schema_exists(txn, &resolved.schema).await? {
+            return Err(anyhow!("schema '{}' does not exist", resolved.schema));
+        }
+        let table_name = resolved.full;
 
-        let ctes = self.build_cte_context(txn, sequence_values, query).await?;
+        let ctes = self
+            .build_cte_context(txn, sequence_values, search_path, query)
+            .await?;
         let result = self
-            .execute_query_with_ctes(txn, sequence_values, query, &ctes)
+            .execute_query_with_ctes(txn, sequence_values, search_path, query, &ctes)
             .await?;
 
         let (result_cols, result_rows) = match result {
@@ -57,15 +60,15 @@ impl Executor {
     pub(crate) async fn create_table_from_result(
         &self,
         txn: &mut Transaction,
+        search_path: &[String],
         target_name: &ObjectName,
         result: ExecuteResult,
     ) -> Result<ExecuteResult> {
-        let table_name = target_name
-            .0
-            .last()
-            .ok_or_else(|| anyhow!("Invalid table name"))?
-            .value
-            .clone();
+        let resolved = names::resolve_ddl_object_name(target_name, search_path)?;
+        if !self.store().schema_exists(txn, &resolved.schema).await? {
+            return Err(anyhow!("schema '{}' does not exist", resolved.schema));
+        }
+        let table_name = resolved.full;
 
         let (result_cols, result_rows) = match result {
             ExecuteResult::Select {
@@ -89,13 +92,18 @@ impl Executor {
     pub(crate) async fn execute_create_index(
         &self,
         txn: &mut Transaction,
+        search_path: &[String],
         idx_name: &str,
         table_name: &ObjectName,
         columns: &[OrderByExpr],
         unique: bool,
         if_not_exists: bool,
     ) -> Result<ExecuteResult> {
-        let tbl_name = table_name.0.last().unwrap().value.clone();
+        let resolved =
+            names::resolve_existing_table_name(self.store().as_ref(), txn, table_name, search_path)
+                .await?
+                .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
+        let tbl_name = resolved.full;
         let schema = self
             .store()
             .get_schema(txn, &tbl_name)
@@ -106,7 +114,7 @@ impl Executor {
             &self.store(),
             txn,
             idx_name,
-            table_name,
+            &tbl_name,
             columns,
             unique,
             if_not_exists,
@@ -118,6 +126,7 @@ impl Executor {
     pub(crate) async fn execute_drop_index(
         &self,
         txn: &mut Transaction,
+        _search_path: &[String],
         names: &[ObjectName],
         if_exists: bool,
     ) -> Result<ExecuteResult> {
@@ -162,9 +171,10 @@ impl Executor {
     pub(crate) async fn execute_alter_table(
         &self,
         txn: &mut Transaction,
+        search_path: &[String],
         name: &ObjectName,
         operation: &AlterTableOperation,
     ) -> Result<ExecuteResult> {
-        ddl::execute_alter_table(&self.store(), txn, name, operation).await
+        ddl::execute_alter_table(&self.store(), txn, search_path, name, operation).await
     }
 }

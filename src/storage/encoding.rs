@@ -3,6 +3,7 @@
 //! Key layout:
 //! - `_sys_next_table_id` -> u64 (auto-incrementing table ID)
 //! - `_sys_schema_{table_name}` -> TableSchema (serialized)
+//! - `_sys_schemadef_{schema_name}` -> empty (schema catalog entry)
 //! - `t_{table_id}_{row_key}` -> Row (serialized)
 //! - `i_{table_id}_{index_id}_{index_values}` -> PK (Unique Index)
 //! - `i_{table_id}_{index_id}_{index_values}_{pk}` -> Empty (Non-Unique Index)
@@ -17,6 +18,7 @@ use memcomparable::Deserializer;
 const SYS_NEXT_TABLE_ID: &[u8] = b"_sys_next_table_id";
 const SYS_NEXT_TYPE_OID: &[u8] = b"_sys_next_type_oid";
 const SYS_SCHEMA_PREFIX: &[u8] = b"_sys_schema_";
+const SYS_SCHEMADEF_PREFIX: &[u8] = b"_sys_schemadef_";
 const SYS_VIEW_PREFIX: &[u8] = b"_sys_view_";
 const SYS_MATVIEW_PREFIX: &[u8] = b"_sys_matview_";
 const SYS_PROCEDURE_PREFIX: &[u8] = b"_sys_proc_";
@@ -40,6 +42,16 @@ pub fn encode_schema_key(table_name: &str) -> Vec<u8> {
     let mut key = SYS_SCHEMA_PREFIX.to_vec();
     key.extend_from_slice(table_name.as_bytes());
     key
+}
+
+pub fn encode_schema_def_key(schema_name: &str) -> Vec<u8> {
+    let mut key = SYS_SCHEMADEF_PREFIX.to_vec();
+    key.extend_from_slice(schema_name.as_bytes());
+    key
+}
+
+pub fn encode_schema_def_prefix() -> Vec<u8> {
+    SYS_SCHEMADEF_PREFIX.to_vec()
 }
 
 /// Encode the key for a user-defined type definition.
@@ -349,8 +361,8 @@ mod tests {
 
     #[test]
     fn test_encode_schema_key() {
-        let key = encode_schema_key("users");
-        assert_eq!(key, b"_sys_schema_users".to_vec());
+        let key = encode_schema_key("public.users");
+        assert_eq!(key, b"_sys_schema_public.users".to_vec());
     }
 
     #[test]

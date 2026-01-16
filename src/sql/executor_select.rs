@@ -5,6 +5,7 @@ use super::helpers::{
     eval_having_expr, fill_row_defaults, get_select_item_name, infer_expr_type, AggExpr,
 };
 use super::planner::{self, ScanType};
+use super::names;
 use super::sequences;
 use super::window::{compute_window_functions, extract_window_functions, WindowFuncInfo};
 use super::{expr::eval_expr, Aggregator, ExecuteResult, Executor};
@@ -18,23 +19,12 @@ use std::collections::HashMap;
 use tikv_client::Transaction;
 use tracing::debug;
 
-fn get_full_table_name(name: &ObjectName) -> String {
-    name.0
-        .iter()
-        .map(|i| i.value.clone())
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
-fn get_simple_table_name(name: &ObjectName) -> String {
-    name.0.last().map(|i| i.value.clone()).unwrap_or_default()
-}
-
 impl Executor {
     pub(crate) async fn execute_query_with_ctes(
         &self,
         txn: &mut Transaction,
         sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
         query: &Query,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
@@ -46,7 +36,7 @@ impl Executor {
         } = &*query.body
         {
             return self
-                .execute_set_operation(txn, sequence_values, op, set_quantifier, left, right, ctes)
+                .execute_set_operation(txn, sequence_values, search_path, op, set_quantifier, left, right, ctes)
                 .await;
         }
 
@@ -61,10 +51,12 @@ impl Executor {
             .map(|into| (into.name.clone(), into.temporary));
 
         if select.from.is_empty() {
-            let result = self.execute_tableless_query(txn, sequence_values, select).await?;
+            let result = self
+                .execute_tableless_query(txn, sequence_values, search_path, select)
+                .await?;
             if let Some((target_name, _temp)) = select_into_target {
                 return self
-                    .create_table_from_result(txn, &target_name, result)
+                    .create_table_from_result(txn, search_path, &target_name, result)
                     .await;
             }
             return Ok(result);
@@ -74,11 +66,11 @@ impl Executor {
 
         if has_joins {
             let result = self
-                .execute_join_query_with_ctes(txn, sequence_values, query, select, ctes)
+                .execute_join_query_with_ctes(txn, sequence_values, search_path, query, select, ctes)
                 .await?;
             if let Some((target_name, _temp)) = select_into_target {
                 return self
-                    .create_table_from_result(txn, &target_name, result)
+                    .create_table_from_result(txn, search_path, &target_name, result)
                     .await;
             }
             return Ok(result);
@@ -86,28 +78,20 @@ impl Executor {
 
         let (t, outer_alias, schema, all_rows_base, is_virtual) = match &select.from[0].relation {
             TableFactor::Table { name, alias, .. } => {
-                let full_name = get_full_table_name(name);
-                let simple_name = get_simple_table_name(name);
-                let lookup_name =
-                    if super::information_schema::get_information_schema_schema(&full_name)
-                        .is_some()
-                    {
-                        full_name.clone()
-                    } else {
-                        simple_name.clone()
-                    };
-                let t_lower = lookup_name.to_lowercase();
+                let (schema_opt, obj_name) = names::split_object_name(name)?;
+                let lookup_name = match schema_opt {
+                    Some(schema) => format!("{}.{}", schema, obj_name),
+                    None => obj_name.clone(),
+                };
                 let (schema, rows) = self
-                    .get_table_data(txn, sequence_values, &lookup_name, ctes)
+                    .get_table_data(txn, sequence_values, search_path, &lookup_name, ctes)
                     .await?;
-                let is_virtual = ctes.contains_key(&t_lower)
-                    || super::information_schema::get_information_schema_schema(&t_lower).is_some()
-                    || self.store().get_view(txn, &t_lower).await?.is_some();
+                let is_virtual = schema.table_id == 0;
                 let alias_str = alias
                     .as_ref()
                     .map(|a| a.name.value.clone())
-                    .unwrap_or_else(|| simple_name.clone());
-                (simple_name, alias_str, schema, rows, is_virtual)
+                    .unwrap_or_else(|| obj_name.clone());
+                (schema.name.clone(), alias_str, schema, rows, is_virtual)
             }
             TableFactor::Derived {
                 subquery, alias, ..
@@ -117,7 +101,14 @@ impl Executor {
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "subquery".to_string());
                 let (schema, rows) = self
-                    .execute_derived_table(txn, sequence_values, subquery, &alias_name, ctes)
+                    .execute_derived_table(
+                        txn,
+                        sequence_values,
+                        search_path,
+                        subquery,
+                        &alias_name,
+                        ctes,
+                    )
                     .await?;
                 (alias_name.clone(), alias_name, schema, rows, true)
             }
@@ -134,7 +125,10 @@ impl Executor {
             if has_correlated_exists {
                 Some(sel.clone())
             } else {
-                Some(self.resolve_subqueries(txn, sequence_values, sel).await?)
+                Some(
+                    self.resolve_subqueries(txn, sequence_values, search_path, sel)
+                        .await?,
+                )
             }
         } else {
             None
@@ -144,6 +138,7 @@ impl Executor {
             .resolve_projection_subqueries_with_outer_context(
                 txn,
                 sequence_values,
+                search_path,
                 &select.projection,
                 &outer_alias,
             )
@@ -263,6 +258,7 @@ impl Executor {
                             txn,
                             sequence_values,
                             sel,
+                            search_path,
                             &outer_alias,
                             &schema,
                             &r,
@@ -278,6 +274,7 @@ impl Executor {
                         self.eval_expr_maybe_sequence(
                             txn,
                             sequence_values,
+                            search_path,
                             sel,
                             Some(&r),
                             Some(&schema),
@@ -361,6 +358,7 @@ impl Executor {
                 .execute_aggregate_query(
                     txn,
                     sequence_values,
+                    search_path,
                     query,
                     select,
                     &schema,
@@ -403,6 +401,7 @@ impl Executor {
                 self.apply_order_by(
                     txn,
                     sequence_values,
+                    search_path,
                     filtered_rows,
                     window_results,
                     &query.order_by,
@@ -439,6 +438,7 @@ impl Executor {
             self.project_rows(
                 txn,
                 sequence_values,
+                search_path,
                 select,
                 &schema,
                 &outer_alias,
@@ -486,7 +486,7 @@ impl Executor {
         };
         if let Some((target_name, _temp)) = select_into_target {
             return self
-                .create_table_from_result(txn, &target_name, result)
+                .create_table_from_result(txn, search_path, &target_name, result)
                 .await;
         }
         Ok(result)
@@ -496,6 +496,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
         query: &Query,
         select: &sqlparser::ast::Select,
         schema: &TableSchema,
@@ -512,8 +513,15 @@ impl Executor {
             let mut key = Vec::new();
             for expr in group_keys_exprs {
                 key.push(
-                    self.eval_expr_maybe_sequence(txn, sequence_values, expr, Some(&row), Some(schema))
-                        .await?,
+                    self.eval_expr_maybe_sequence(
+                        txn,
+                        sequence_values,
+                        search_path,
+                        expr,
+                        Some(&row),
+                        Some(schema),
+                    )
+                    .await?,
                 );
             }
             let key_bytes = bincode::serialize(&key).unwrap();
@@ -532,6 +540,7 @@ impl Executor {
                                                 .eval_expr_maybe_sequence(
                                                     txn,
                                                     sequence_values,
+                                                    search_path,
                                                     e,
                                                     Some(&row),
                                                     Some(schema),
@@ -585,6 +594,7 @@ impl Executor {
                         .eval_expr_maybe_sequence(
                             txn,
                             sequence_values,
+                            search_path,
                             filter,
                             Some(&row),
                             Some(schema),
@@ -596,7 +606,14 @@ impl Executor {
                 }
 
                 let val = if let Some(e) = arg_expr {
-                    self.eval_expr_maybe_sequence(txn, sequence_values, e, Some(&row), Some(schema))
+                    self.eval_expr_maybe_sequence(
+                        txn,
+                        sequence_values,
+                        search_path,
+                        e,
+                        Some(&row),
+                        Some(schema),
+                    )
                         .await?
                 } else {
                     Value::Int32(1)
@@ -640,11 +657,14 @@ impl Executor {
             let representative = &group_rows[&key_bytes];
 
             if let Some(having_expr) = &select.having {
-                let having_expr = if sequences::expr_uses_sequence_functions(having_expr) {
+                let having_expr = if sequences::expr_uses_sequence_functions(having_expr)
+                    || sequences::expr_uses_current_schema(having_expr)
+                {
                     sequences::replace_sequence_functions(
                         &self.store(),
                         txn,
                         sequence_values,
+                        search_path,
                         having_expr,
                         Some(representative),
                         Some(schema),
@@ -670,11 +690,14 @@ impl Executor {
                         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
                         _ => return Err(anyhow!("Unsupported item")),
                     };
-                    let expr = if sequences::expr_uses_sequence_functions(expr) {
+                    let expr = if sequences::expr_uses_sequence_functions(expr)
+                        || sequences::expr_uses_current_schema(expr)
+                    {
                         sequences::replace_sequence_functions(
                             &self.store(),
                             txn,
                             sequence_values,
+                            search_path,
                             expr,
                             Some(representative),
                             Some(schema),
@@ -710,7 +733,7 @@ impl Executor {
         };
         if let Some((target_name, _temp)) = select_into_target {
             return self
-                .create_table_from_result(txn, &target_name, result)
+                .create_table_from_result(txn, search_path, &target_name, result)
                 .await;
         }
         Ok(result)
@@ -766,6 +789,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
         filtered_rows: Vec<Row>,
         window_results: Option<Vec<Vec<Value>>>,
         order_by: &[sqlparser::ast::OrderByExpr],
@@ -788,9 +812,9 @@ impl Executor {
             })
             .collect();
 
-        let order_by_uses_sequences = resolved_order_exprs
-            .iter()
-            .any(sequences::expr_uses_sequence_functions);
+        let order_by_uses_sequences = resolved_order_exprs.iter().any(|e| {
+            sequences::expr_uses_sequence_functions(e) || sequences::expr_uses_current_schema(e)
+        });
 
         if order_by_uses_sequences {
             let mut rows_with_keys: Vec<(usize, Row, Vec<Value>)> =
@@ -798,10 +822,13 @@ impl Executor {
             for (orig_idx, row) in filtered_rows.into_iter().enumerate() {
                 let mut keys = Vec::with_capacity(order_by.len());
                 for actual_expr in &resolved_order_exprs {
-                    let val = if sequences::expr_uses_sequence_functions(actual_expr) {
+                    let val = if sequences::expr_uses_sequence_functions(actual_expr)
+                        || sequences::expr_uses_current_schema(actual_expr)
+                    {
                         self.eval_expr_maybe_sequence(
                             txn,
                             sequence_values,
+                            search_path,
                             actual_expr,
                             Some(&row),
                             Some(schema),
@@ -886,6 +913,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
         select: &sqlparser::ast::Select,
         schema: &TableSchema,
         outer_alias: &str,
@@ -969,16 +997,18 @@ impl Executor {
                         self.eval_correlated_subquery(
                             txn,
                             sequence_values,
+                            search_path,
                             subquery,
                             outer_alias,
                             schema,
                             row,
                         )
-                            .await?
+                        .await?
                     } else {
                         self.eval_expr_maybe_sequence(
                             txn,
                             sequence_values,
+                            search_path,
                             expr,
                             Some(row),
                             Some(schema),

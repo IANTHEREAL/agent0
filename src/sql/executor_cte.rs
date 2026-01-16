@@ -1,7 +1,7 @@
 //! CTE (Common Table Expression) execution for the SQL executor
 
 use super::executor::Executor;
-use super::helpers::{cte_is_recursive, set_expr_references_table};
+use super::helpers::{cte_is_recursive, normalize_ident, set_expr_references_table};
 use super::ExecuteResult;
 use crate::types::{ColumnDef, DataType, Row, TableSchema};
 use anyhow::{anyhow, Result};
@@ -14,6 +14,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
         query: &Query,
     ) -> Result<HashMap<String, (TableSchema, Vec<Row>)>> {
         let mut ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
@@ -26,6 +27,7 @@ impl Executor {
                         .execute_recursive_cte(
                             txn,
                             sequence_values,
+                            search_path,
                             &cte_name,
                             &cte.query,
                             &cte.alias.columns,
@@ -35,27 +37,42 @@ impl Executor {
                     ctes.insert(cte_name, (schema, rows));
                 } else {
                     let cte_result = self
-                        .execute_query_with_ctes(txn, sequence_values, &cte.query, &ctes)
+                        .execute_query_with_ctes(txn, sequence_values, search_path, &cte.query, &ctes)
                         .await?;
                     match cte_result {
                         ExecuteResult::Select {
                             columns,
-                            column_types: _,
+                            column_types,
                             rows,
                         } => {
                             let col_names: Vec<String> = if cte.alias.columns.is_empty() {
                                 columns
                             } else {
-                                cte.alias.columns.iter().map(|c| c.value.clone()).collect()
+                                cte.alias.columns.iter().map(normalize_ident).collect()
+                            };
+                            let inferred_types: Vec<DataType> = if let Some(types) = column_types {
+                                types
+                            } else if let Some(first_row) = rows.first() {
+                                first_row
+                                    .values
+                                    .iter()
+                                    .map(|v| v.data_type().unwrap_or(DataType::Text))
+                                    .collect()
+                            } else {
+                                vec![DataType::Text; col_names.len()]
                             };
                             let schema = TableSchema {
                                 table_id: 0,
                                 name: cte_name.clone(),
                                 columns: col_names
                                     .iter()
-                                    .map(|n| ColumnDef {
+                                    .enumerate()
+                                    .map(|(idx, n)| ColumnDef {
                                         name: n.clone(),
-                                        data_type: DataType::Text,
+                                        data_type: inferred_types
+                                            .get(idx)
+                                            .cloned()
+                                            .unwrap_or(DataType::Text),
                                         nullable: true,
                                         primary_key: false,
                                         unique: false,
@@ -83,6 +100,7 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
         cte_name: &str,
         query: &Query,
         alias_columns: &[Ident],
@@ -117,30 +135,45 @@ impl Executor {
             for_clause: None,
         };
         let base_result = self
-            .execute_query_with_ctes(txn, sequence_values, &base_query, existing_ctes)
+            .execute_query_with_ctes(txn, sequence_values, search_path, &base_query, existing_ctes)
             .await?;
-        let (columns, mut all_rows) = match base_result {
+        let (columns, base_types, mut all_rows) = match base_result {
             ExecuteResult::Select {
                 columns,
-                column_types: _,
+                column_types,
                 rows,
-            } => (columns, rows),
+            } => (columns, column_types, rows),
             _ => return Err(anyhow!("Recursive CTE base must be SELECT")),
         };
 
         let col_names: Vec<String> = if alias_columns.is_empty() {
             columns
         } else {
-            alias_columns.iter().map(|c| c.value.clone()).collect()
+            alias_columns.iter().map(normalize_ident).collect()
+        };
+        let inferred_types: Vec<DataType> = if let Some(types) = base_types {
+            types
+        } else if let Some(first_row) = all_rows.first() {
+            first_row
+                .values
+                .iter()
+                .map(|v| v.data_type().unwrap_or(DataType::Text))
+                .collect()
+        } else {
+            vec![DataType::Text; col_names.len()]
         };
         let schema = TableSchema {
             table_id: 0,
             name: cte_name.to_string(),
             columns: col_names
                 .iter()
-                .map(|n| ColumnDef {
+                .enumerate()
+                .map(|(idx, n)| ColumnDef {
                     name: n.clone(),
-                    data_type: DataType::Text,
+                    data_type: inferred_types
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or(DataType::Text),
                     nullable: true,
                     primary_key: false,
                     unique: false,
@@ -180,7 +213,13 @@ impl Executor {
                 for_clause: None,
             };
             let recursive_result = self
-                .execute_query_with_ctes(txn, sequence_values, &recursive_query, &temp_ctes)
+                .execute_query_with_ctes(
+                    txn,
+                    sequence_values,
+                    search_path,
+                    &recursive_query,
+                    &temp_ctes,
+                )
                 .await?;
 
             let new_rows = match recursive_result {

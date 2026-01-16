@@ -932,6 +932,13 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
             }
         }
         Expr::Cast { data_type, .. } => sql_datatype_to_internal(data_type),
+        Expr::JsonAccess { operator, .. } => match operator {
+            sqlparser::ast::JsonOperator::Arrow => DataType::Jsonb,
+            sqlparser::ast::JsonOperator::LongArrow => DataType::Text,
+            sqlparser::ast::JsonOperator::HashArrow => DataType::Jsonb,
+            sqlparser::ast::JsonOperator::HashLongArrow => DataType::Text,
+            _ => DataType::Text,
+        },
         Expr::Function(f) => {
             let func_name = f
                 .name
@@ -1017,7 +1024,15 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
             _ => DataType::Text,
         },
         Expr::Value(val) => match val {
-            SqlValue::Number(_, _) => DataType::Int64,
+            SqlValue::Number(n, _) => {
+                if n.contains(['.', 'e', 'E']) {
+                    DataType::Float64
+                } else if n.parse::<i32>().is_ok() {
+                    DataType::Int32
+                } else {
+                    DataType::Int64
+                }
+            }
             SqlValue::SingleQuotedString(_)
             | SqlValue::DoubleQuotedString(_)
             | SqlValue::EscapedStringLiteral(_) => DataType::Text,

@@ -164,6 +164,152 @@ impl TikvStore {
         Ok(exists)
     }
 
+    fn is_builtin_schema(schema: &str) -> bool {
+        matches!(schema, "public" | "pg_catalog" | "information_schema")
+    }
+
+    pub async fn schema_exists(&self, txn: &mut Transaction, schema: &str) -> Result<bool> {
+        if Self::is_builtin_schema(schema) {
+            return Ok(true);
+        }
+        let key = self.key(&encode_schema_def_key(schema));
+        Ok(txn.get(key).await?.is_some())
+    }
+
+    pub async fn create_schema(
+        &self,
+        txn: &mut Transaction,
+        schema: &str,
+        if_not_exists: bool,
+    ) -> Result<bool> {
+        if schema.is_empty() {
+            return Err(anyhow!("schema name must not be empty"));
+        }
+        if schema.contains('.') {
+            return Err(anyhow!("schema name '{}' must not contain '.'", schema));
+        }
+
+        if Self::is_builtin_schema(schema) {
+            if if_not_exists {
+                return Ok(false);
+            }
+            return Err(anyhow!("Schema '{}' already exists", schema));
+        }
+
+        let key = self.key(&encode_schema_def_key(schema));
+        if txn.get(key.clone()).await?.is_some() {
+            if if_not_exists {
+                return Ok(false);
+            }
+            return Err(anyhow!("Schema '{}' already exists", schema));
+        }
+        txn_put(txn, key, Vec::new()).await?;
+        Ok(true)
+    }
+
+    async fn prefix_has_any(&self, txn: &mut Transaction, prefix: Vec<u8>) -> Result<bool> {
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix..end).into();
+        let mut pairs = txn.scan(range, 1).await?;
+        Ok(pairs.next().is_some())
+    }
+
+    pub async fn drop_schema_restrict(
+        &self,
+        txn: &mut Transaction,
+        schema: &str,
+        if_exists: bool,
+    ) -> Result<bool> {
+        if schema.is_empty() {
+            return Err(anyhow!("schema name must not be empty"));
+        }
+        if schema.contains('.') {
+            return Err(anyhow!("schema name '{}' must not contain '.'", schema));
+        }
+        if Self::is_builtin_schema(schema) {
+            return Err(anyhow!("cannot drop schema '{}'", schema));
+        }
+
+        let key = self.key(&encode_schema_def_key(schema));
+        if txn.get(key.clone()).await?.is_none() {
+            if if_exists {
+                return Ok(false);
+            }
+            return Err(anyhow!("Schema '{}' does not exist", schema));
+        }
+
+        let mut table_prefix = encode_schema_prefix();
+        table_prefix.extend_from_slice(schema.as_bytes());
+        table_prefix.push(b'.');
+        if self.prefix_has_any(txn, table_prefix).await? {
+            return Err(anyhow!("cannot drop schema '{}': schema is not empty", schema));
+        }
+
+        let mut view_prefix = encode_view_prefix();
+        view_prefix.extend_from_slice(schema.as_bytes());
+        view_prefix.push(b'.');
+        if self.prefix_has_any(txn, view_prefix).await? {
+            return Err(anyhow!("cannot drop schema '{}': schema is not empty", schema));
+        }
+
+        let mut matview_prefix = encode_matview_prefix();
+        matview_prefix.extend_from_slice(schema.as_bytes());
+        matview_prefix.push(b'.');
+        if self.prefix_has_any(txn, matview_prefix).await? {
+            return Err(anyhow!("cannot drop schema '{}': schema is not empty", schema));
+        }
+
+        let mut procedure_prefix = encode_procedure_prefix();
+        procedure_prefix.extend_from_slice(schema.as_bytes());
+        procedure_prefix.push(b'.');
+        if self.prefix_has_any(txn, procedure_prefix).await? {
+            return Err(anyhow!("cannot drop schema '{}': schema is not empty", schema));
+        }
+
+        let mut type_prefix = encode_type_prefix();
+        type_prefix.extend_from_slice(schema.as_bytes());
+        type_prefix.push(b'.');
+        if self.prefix_has_any(txn, type_prefix).await? {
+            return Err(anyhow!("cannot drop schema '{}': schema is not empty", schema));
+        }
+
+        let mut sequence_prefix = encode_sequence_prefix();
+        sequence_prefix.extend_from_slice(schema.as_bytes());
+        sequence_prefix.push(b'.');
+        if self.prefix_has_any(txn, sequence_prefix).await? {
+            return Err(anyhow!("cannot drop schema '{}': schema is not empty", schema));
+        }
+
+        txn_delete(txn, key).await?;
+        Ok(true)
+    }
+
+    pub async fn list_schemas(&self, txn: &mut Transaction) -> Result<Vec<String>> {
+        let prefix = encode_schema_def_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let mut schemas = vec![
+            "public".to_string(),
+            "information_schema".to_string(),
+            "pg_catalog".to_string(),
+        ];
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if key.starts_with(&prefix) {
+                let name = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
+                if !name.is_empty() && !Self::is_builtin_schema(&name) {
+                    schemas.push(name);
+                }
+            }
+        }
+        schemas.sort();
+        schemas.dedup();
+        Ok(schemas)
+    }
+
     /// Get the next table ID (auto-increment)
     pub async fn next_table_id(&self, txn: &mut Transaction) -> Result<u64> {
         self.increment_sys_key(txn, encode_next_table_id_key())

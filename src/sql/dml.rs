@@ -180,6 +180,7 @@ pub async fn eval_returning_row(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     sequence_values: &mut HashMap<String, i64>,
+    search_path: &[String],
     returning: &Option<Vec<SelectItem>>,
     row: &Row,
     schema: &TableSchema,
@@ -189,11 +190,14 @@ pub async fn eval_returning_row(
         for item in items {
             match item {
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                    vals.push(if sequences::expr_uses_sequence_functions(e) {
+                    vals.push(if sequences::expr_uses_sequence_functions(e)
+                        || sequences::expr_uses_current_schema(e)
+                    {
                         sequences::eval_expr_with_sequences(
                             store,
                             txn,
                             sequence_values,
+                            search_path,
                             e,
                             Some(row),
                             Some(schema),
@@ -892,6 +896,7 @@ pub async fn prepare_insert_row(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     sequence_values: &mut HashMap<String, i64>,
+    search_path: &[String],
     schema: &TableSchema,
     columns: &[Ident],
     exprs: &[Expr],
@@ -912,9 +917,19 @@ pub async fn prepare_insert_row(
                 // Don't add to indices, leave as NULL, will be filled by fill_missing_columns
                 row_vals[i] = Value::Null;
             } else {
-                row_vals[i] = if sequences::expr_uses_sequence_functions(e) {
-                    sequences::eval_expr_with_sequences(store, txn, sequence_values, e, None, None)
-                        .await?
+                row_vals[i] = if sequences::expr_uses_sequence_functions(e)
+                    || sequences::expr_uses_current_schema(e)
+                {
+                    sequences::eval_expr_with_sequences(
+                        store,
+                        txn,
+                        sequence_values,
+                        search_path,
+                        e,
+                        None,
+                        None,
+                    )
+                    .await?
                 } else {
                     eval_expr(e, None, None)?
                 };
@@ -937,11 +952,14 @@ pub async fn prepare_insert_row(
                 // Don't add to indices, leave as NULL, will be filled by fill_missing_columns
                 row_vals[idx] = Value::Null;
             } else {
-                row_vals[idx] = if sequences::expr_uses_sequence_functions(&exprs[i]) {
+                row_vals[idx] = if sequences::expr_uses_sequence_functions(&exprs[i])
+                    || sequences::expr_uses_current_schema(&exprs[i])
+                {
                     sequences::eval_expr_with_sequences(
                         store,
                         txn,
                         sequence_values,
+                        search_path,
                         &exprs[i],
                         None,
                         None,
@@ -962,6 +980,7 @@ async fn eval_default_expr_maybe_sequence(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     sequence_values: &mut HashMap<String, i64>,
+    search_path: &[String],
     expr_str: &str,
 ) -> Result<Value> {
     let sql = format!("SELECT {}", expr_str);
@@ -973,11 +992,14 @@ async fn eval_default_expr_maybe_sequence(
         if let sqlparser::ast::SetExpr::Select(s) = *q.body {
             if let Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) = s.projection.into_iter().next()
             {
-                return if sequences::expr_uses_sequence_functions(&e) {
+                return if sequences::expr_uses_sequence_functions(&e)
+                    || sequences::expr_uses_current_schema(&e)
+                {
                     sequences::eval_expr_with_sequences(
                         store,
                         txn,
                         sequence_values,
+                        search_path,
                         &e,
                         None,
                         None,
@@ -997,6 +1019,7 @@ pub async fn fill_missing_columns(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     sequence_values: &mut HashMap<String, i64>,
+    search_path: &[String],
     schema: &TableSchema,
     row_vals: &mut Vec<Value>,
     indices: &[usize],
@@ -1010,8 +1033,9 @@ pub async fn fill_missing_columns(
                     _ => Value::Int32(seq_val),
                 };
             } else if let Some(def) = &c.default_expr {
-                row_vals[i] = eval_default_expr_maybe_sequence(store, txn, sequence_values, def)
-                    .await?;
+                row_vals[i] =
+                    eval_default_expr_maybe_sequence(store, txn, sequence_values, search_path, def)
+                        .await?;
             } else if !c.nullable {
                 return Err(anyhow!("Column '{}' cannot be null", c.name));
             }
@@ -1144,6 +1168,7 @@ pub async fn compute_update_values(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     sequence_values: &mut HashMap<String, i64>,
+    search_path: &[String],
     schema: &TableSchema,
     old_row: &Row,
     assignments: &[Assignment],
@@ -1158,11 +1183,14 @@ pub async fn compute_update_values(
             (old_row, schema)
         };
 
-        let raw_val = if sequences::expr_uses_sequence_functions(&a.value) {
+        let raw_val = if sequences::expr_uses_sequence_functions(&a.value)
+            || sequences::expr_uses_current_schema(&a.value)
+        {
             sequences::eval_expr_with_sequences(
                 store,
                 txn,
                 sequence_values,
+                search_path,
                 &a.value,
                 Some(eval_row),
                 Some(eval_schema),

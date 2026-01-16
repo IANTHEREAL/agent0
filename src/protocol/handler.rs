@@ -23,9 +23,11 @@ use pgwire::messages::data::DataRow;
 use pgwire::messages::response::{CommandComplete, ErrorResponse};
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+use sqlparser::ast::{Expr, ObjectName, SelectItem, Statement, TableFactor};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use tikv_client::Transaction;
 use tokio::sync::{Mutex, OnceCell};
 use tracing::{debug, error, info, warn};
 
@@ -117,6 +119,7 @@ fn count_sql_parameters(sql: &str) -> usize {
     max_param
 }
 
+#[allow(dead_code)]
 fn find_keyword_outside_strings(query: &str, keyword: &str) -> Option<usize> {
     let mut in_single_quote = false;
     let mut in_double_quote = false;
@@ -143,6 +146,171 @@ fn find_keyword_outside_strings(query: &str, keyword: &str) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+fn normalize_sql_ident(ident: &sqlparser::ast::Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_lowercase()
+    }
+}
+
+fn split_object_name_for_catalog(name: &ObjectName) -> Option<(Option<String>, String)> {
+    match name.0.len() {
+        1 => Some((None, normalize_sql_ident(&name.0[0]))),
+        2 => Some((
+            Some(normalize_sql_ident(&name.0[0])),
+            normalize_sql_ident(&name.0[1]),
+        )),
+        _ => None,
+    }
+}
+
+fn expr_column_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(normalize_sql_ident(ident)),
+        Expr::CompoundIdentifier(parts) => parts.last().map(normalize_sql_ident),
+        _ => None,
+    }
+}
+
+fn expr_referenced_column_type<'a>(
+    schema: &'a crate::types::TableSchema,
+    expr: &Expr,
+) -> Option<&'a DataType> {
+    let col_name = expr_column_name(expr)?;
+    schema
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(&col_name))
+        .map(|c| &c.data_type)
+}
+
+async fn resolve_table_schema_for_object_name(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    table_name: &ObjectName,
+    search_path: &[String],
+) -> Option<crate::types::TableSchema> {
+    let (schema_opt, name) = split_object_name_for_catalog(table_name)?;
+
+    if let Some(schema) = schema_opt {
+        let full = format!("{}.{}", schema, name);
+        return store.get_schema(txn, &full).await.ok().flatten();
+    }
+
+    for schema in search_path {
+        let full = format!("{}.{}", schema, name);
+        if let Ok(Some(s)) = store.get_schema(txn, &full).await {
+            return Some(s);
+        }
+    }
+
+    // As a last resort, try the default schema even if it's not present in the session search_path.
+    let default_schema = search_path.first().map(String::as_str).unwrap_or("public");
+    let full = format!("{}.{}", default_schema, name);
+    store.get_schema(txn, &full).await.ok().flatten()
+}
+
+async fn infer_returning_fields_with_txn(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    search_path: &[String],
+    table_name: &ObjectName,
+    returning: &[SelectItem],
+) -> Option<Vec<FieldInfo>> {
+    let schema = resolve_table_schema_for_object_name(store, txn, table_name, search_path).await?;
+
+    let mut fields = Vec::new();
+    for item in returning {
+        match item {
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                fields.extend(schema.columns.iter().map(|c| {
+                    FieldInfo::new(
+                        c.name.clone(),
+                        None,
+                        None,
+                        datatype_to_pgtype(Some(&c.data_type)),
+                        FieldFormat::Text,
+                    )
+                }));
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                let name = expr_column_name(expr).unwrap_or_else(|| "?column?".to_string());
+                fields.push(FieldInfo::new(
+                    name,
+                    None,
+                    None,
+                    datatype_to_pgtype(expr_referenced_column_type(&schema, expr)),
+                    FieldFormat::Text,
+                ));
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                fields.push(FieldInfo::new(
+                    normalize_sql_ident(alias),
+                    None,
+                    None,
+                    datatype_to_pgtype(expr_referenced_column_type(&schema, expr)),
+                    FieldFormat::Text,
+                ));
+            }
+        }
+    }
+
+    Some(fields)
+}
+
+async fn infer_returning_fields_from_statement(
+    store: &Arc<TikvStore>,
+    session: &mut Session,
+    stmt: &Statement,
+) -> Option<Vec<FieldInfo>> {
+    let (table_name, returning) = match stmt {
+        Statement::Insert {
+            table_name,
+            returning: Some(items),
+            ..
+        } => (table_name, items),
+        Statement::Update {
+            table,
+            returning: Some(items),
+            ..
+        } => match &table.relation {
+            TableFactor::Table { name, .. } => (name, items),
+            _ => return None,
+        },
+        Statement::Delete {
+            from,
+            returning: Some(items),
+            ..
+        } => {
+            let first = from.first()?;
+            match &first.relation {
+                TableFactor::Table { name, .. } => (name, items),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+
+    let search_path = session.search_path().to_vec();
+    let search_path = search_path.as_slice();
+
+    if let Some(txn) = session.get_mut_txn() {
+        infer_returning_fields_with_txn(store.as_ref(), txn, search_path, table_name, returning)
+            .await
+    } else {
+        let mut temp_txn = store.begin().await.ok()?;
+        infer_returning_fields_with_txn(
+            store.as_ref(),
+            &mut temp_txn,
+            search_path,
+            table_name,
+            returning,
+        )
+        .await
+    }
 }
 
 pub struct DynamicPgHandler {
@@ -186,13 +354,35 @@ impl DynamicPgHandler {
 
     async fn infer_result_fields_from_query(&self, query: &str) -> Vec<FieldInfo> {
         let query_trimmed = query.trim();
+        if query_trimmed.is_empty() {
+            return vec![];
+        }
+
+        let parsed_stmt = crate::sql::parse_sql(query_trimmed)
+            .ok()
+            .and_then(|stmts| stmts.into_iter().next());
         let query_upper = query_trimmed.to_uppercase();
 
-        // Only try to infer fields for SELECT queries and queries with RETURNING
-        let is_select = query_upper.starts_with("SELECT") || query_upper.starts_with("WITH");
-        let has_returning = query_upper.contains("RETURNING");
+        let is_select_str = query_upper.starts_with("SELECT") || query_upper.starts_with("WITH");
+        let has_returning_str = query_upper.contains("RETURNING");
+        let should_infer = matches!(
+            parsed_stmt,
+            Some(Statement::Query(_))
+                | Some(Statement::Insert {
+                    returning: Some(_),
+                    ..
+                })
+                | Some(Statement::Update {
+                    returning: Some(_),
+                    ..
+                })
+                | Some(Statement::Delete {
+                    returning: Some(_),
+                    ..
+                })
+        ) || (parsed_stmt.is_none() && (is_select_str || has_returning_str));
 
-        if !is_select && !has_returning {
+        if !should_infer {
             return vec![];
         }
 
@@ -226,115 +416,27 @@ impl DynamicPgHandler {
             )];
         }
 
-        if has_returning {
-            if let Some(returning_pos) = find_keyword_outside_strings(&query_upper, "RETURNING") {
-                let table_name = if let Some(into_pos) = query_upper.find("INSERT INTO") {
-                    let after_into = &query_trimmed[into_pos + 11..].trim();
-                    let first_token = after_into.split_whitespace().next().unwrap_or("");
-                    Some(first_token.split('(').next().unwrap_or(first_token))
-                } else if let Some(update_pos) = query_upper.find("UPDATE") {
-                    let after_update = &query_trimmed[update_pos + 6..].trim();
-                    let first_token = after_update.split_whitespace().next().unwrap_or("");
-                    Some(first_token.split('(').next().unwrap_or(first_token))
-                } else if let Some(delete_pos) = query_upper.find("DELETE FROM") {
-                    let after_from = &query_trimmed[delete_pos + 11..].trim();
-                    let first_token = after_from.split_whitespace().next().unwrap_or("");
-                    Some(first_token.split('(').next().unwrap_or(first_token))
-                } else {
-                    None
-                };
+        let store = executor.store();
+        let session = session_guard.as_mut().unwrap();
 
-                let returning_clause = &query_trimmed[returning_pos + "RETURNING".len()..];
-                let columns: Vec<String> = returning_clause
-                    .trim()
-                    .trim_end_matches(';')
-                    .split(',')
-                    .map(|col| {
-                        let mut col = col.trim();
-                        // Handle "table.column" or just "column"
-                        if let Some(dot_pos) = col.rfind('.') {
-                            col = col[dot_pos + 1..].trim();
-                        }
-                        // Strip quotes from column name if present
-                        if (col.starts_with('"') && col.ends_with('"'))
-                            || (col.starts_with('\'') && col.ends_with('\''))
-                        {
-                            col = &col[1..col.len() - 1];
-                        }
-                        col.to_string()
-                    })
-                    .collect();
-
-                if let Some(tbl) = table_name {
-                    let table_name_clean = tbl.trim_matches('"').trim_matches('\'').to_lowercase();
-
-                    let store = executor.store();
-                    let schema_opt = if let Some(session) = session_guard.as_mut() {
-                        match session.get_mut_txn() {
-                            Some(txn) => store
-                                .get_schema(txn, &table_name_clean)
-                                .await
-                                .ok()
-                                .flatten(),
-                            None => {
-                                if let Ok(mut temp_txn) = store.begin().await {
-                                    store
-                                        .get_schema(&mut temp_txn, &table_name_clean)
-                                        .await
-                                        .ok()
-                                        .flatten()
-                                } else {
-                                    None
-                                }
-                            }
-                        }
-                    } else {
-                        None
-                    };
-
-                    if let Some(schema) = schema_opt {
-                        let expanded_columns: Vec<String> =
-                            if columns.len() == 1 && columns[0] == "*" {
-                                schema.columns.iter().map(|c| c.name.clone()).collect()
-                            } else {
-                                columns.clone()
-                            };
-
-                        return expanded_columns
-                            .iter()
-                            .map(|name| {
-                                let pg_type = if let Some(col) = schema
-                                    .columns
-                                    .iter()
-                                    .find(|c| c.name.eq_ignore_ascii_case(name))
-                                {
-                                    match col.data_type {
-                                        crate::types::DataType::Int32 => Type::INT4,
-                                        crate::types::DataType::Int64 => Type::INT8,
-                                        crate::types::DataType::Float64 => Type::FLOAT8,
-                                        crate::types::DataType::Boolean => Type::BOOL,
-                                        crate::types::DataType::Timestamp => Type::TIMESTAMP,
-                                        crate::types::DataType::Uuid => Type::UUID,
-                                        crate::types::DataType::Json
-                                        | crate::types::DataType::Jsonb => Type::JSONB,
-                                        _ => Type::TEXT,
-                                    }
-                                } else {
-                                    Type::TEXT
-                                };
-                                FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
-                            })
-                            .collect();
-                    }
-                }
-
-                return columns
-                    .iter()
-                    .map(|name| {
-                        FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text)
-                    })
-                    .collect();
+        if let Some(ref stmt) = parsed_stmt {
+            if let Some(fields) = infer_returning_fields_from_statement(&store, session, stmt).await
+            {
+                return fields;
             }
+        }
+
+        // Only infer SELECT (Statement::Query) metadata here; RETURNING is handled above.
+        let is_select = matches!(parsed_stmt, Some(Statement::Query(_)))
+            || (parsed_stmt.is_none() && is_select_str);
+        if !is_select {
+            return vec![FieldInfo::new(
+                "column".to_string(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            )];
         }
 
         // Execute SELECT query with LIMIT 1 to get column metadata without side effects
@@ -346,7 +448,6 @@ impl DynamicPgHandler {
             format!("{} LIMIT 1", query_with_defaults)
         };
 
-        let session = session_guard.as_mut().unwrap();
         match executor.execute(session, &metadata_query).await {
             Ok(crate::sql::ExecuteResult::Select {
                 columns,
@@ -358,21 +459,13 @@ impl DynamicPgHandler {
                         .iter()
                         .enumerate()
                         .map(|(i, name)| {
-                            let pg_type = types
-                                .get(i)
-                                .map(|dt| match dt {
-                                    crate::types::DataType::Int32 => Type::INT4,
-                                    crate::types::DataType::Int64 => Type::INT8,
-                                    crate::types::DataType::Float64 => Type::FLOAT8,
-                                    crate::types::DataType::Boolean => Type::BOOL,
-                                    crate::types::DataType::Timestamp => Type::TIMESTAMP,
-                                    crate::types::DataType::Uuid => Type::UUID,
-                                    crate::types::DataType::Json
-                                    | crate::types::DataType::Jsonb => Type::JSONB,
-                                    _ => Type::TEXT,
-                                })
-                                .unwrap_or(Type::TEXT);
-                            FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
+                            FieldInfo::new(
+                                name.clone(),
+                                None,
+                                None,
+                                datatype_to_pgtype(types.get(i)),
+                                FieldFormat::Text,
+                            )
                         })
                         .collect()
                 } else if let Some(first_row) = rows.first() {
@@ -382,18 +475,8 @@ impl DynamicPgHandler {
                         .enumerate()
                         .map(|(i, name)| {
                             let pg_type = if let Some(value) = first_row.values.get(i) {
-                                match value {
-                                    crate::types::Value::Int32(_) => Type::INT4,
-                                    crate::types::Value::Int64(_) => Type::INT8,
-                                    crate::types::Value::Float64(_) => Type::FLOAT8,
-                                    crate::types::Value::Boolean(_) => Type::BOOL,
-                                    crate::types::Value::Timestamp(_) => Type::TIMESTAMP,
-                                    crate::types::Value::Uuid(_) => Type::UUID,
-                                    crate::types::Value::Json(_)
-                                    | crate::types::Value::Jsonb(_) => Type::JSONB,
-                                    crate::types::Value::Array(_) => Type::TEXT_ARRAY,
-                                    _ => Type::TEXT,
-                                }
+                                let dt = value.data_type();
+                                datatype_to_pgtype(dt.as_ref())
                             } else {
                                 Type::TEXT
                             };
@@ -1358,32 +1441,73 @@ impl PgHandler {
 
     #[allow(dead_code)]
     async fn infer_result_fields_from_query(&self, query: &str) -> Vec<FieldInfo> {
-        let query_upper = query.trim().to_uppercase();
+        let query_trimmed = query.trim();
+        if query_trimmed.is_empty() {
+            return vec![];
+        }
 
-        // Only try to infer fields for SELECT queries and queries with RETURNING
-        let is_select = query_upper.starts_with("SELECT") || query_upper.starts_with("WITH");
-        let has_returning = query_upper.contains("RETURNING");
+        let parsed_stmt = crate::sql::parse_sql(query_trimmed)
+            .ok()
+            .and_then(|stmts| stmts.into_iter().next());
+        let query_upper = query_trimmed.to_uppercase();
+        let is_select_str = query_upper.starts_with("SELECT") || query_upper.starts_with("WITH");
+        let has_returning_str = query_upper.contains("RETURNING");
+        let should_infer = matches!(
+            parsed_stmt,
+            Some(Statement::Query(_))
+                | Some(Statement::Insert {
+                    returning: Some(_),
+                    ..
+                })
+                | Some(Statement::Update {
+                    returning: Some(_),
+                    ..
+                })
+                | Some(Statement::Delete {
+                    returning: Some(_),
+                    ..
+                })
+        ) || (parsed_stmt.is_none() && (is_select_str || has_returning_str));
 
-        if !is_select && !has_returning {
+        if !should_infer {
             return vec![];
         }
 
         // Get the session
         let mut session_guard = self.session.lock().await;
 
-        // For INSERT/UPDATE/DELETE with RETURNING, we can't add LIMIT, so just use the query as-is
+        let store = self.executor.store();
+        if let Some(ref stmt) = parsed_stmt {
+            if let Some(fields) =
+                infer_returning_fields_from_statement(&store, &mut session_guard, stmt).await
+            {
+                return fields;
+            }
+        };
+
+        // Only infer SELECT (Statement::Query) metadata here; RETURNING is handled above.
+        let is_select = matches!(parsed_stmt, Some(Statement::Query(_)))
+            || (parsed_stmt.is_none() && is_select_str);
+        if !is_select {
+            return vec![FieldInfo::new(
+                "column".to_string(),
+                None,
+                None,
+                Type::TEXT,
+                FieldFormat::Text,
+            )];
+        }
+
+        // Execute SELECT query with LIMIT 1 to get column metadata without side effects
+        // Replace any parameter placeholders ($1, $2, etc.) with defaults for type inference
         let query_with_defaults = replace_placeholders_for_inference(query);
-        let metadata_query = if query_upper.contains(" LIMIT ") || has_returning {
+        let metadata_query = if query_upper.contains(" LIMIT ") {
             query_with_defaults
         } else {
             format!("{} LIMIT 1", query_with_defaults)
         };
 
-        match self
-            .executor
-            .execute(&mut session_guard, &metadata_query)
-            .await
-        {
+        match self.executor.execute(&mut session_guard, &metadata_query).await {
             Ok(crate::sql::ExecuteResult::Select {
                 columns,
                 column_types,
@@ -1394,21 +1518,13 @@ impl PgHandler {
                         .iter()
                         .enumerate()
                         .map(|(i, name)| {
-                            let pg_type = types
-                                .get(i)
-                                .map(|dt| match dt {
-                                    crate::types::DataType::Int32 => Type::INT4,
-                                    crate::types::DataType::Int64 => Type::INT8,
-                                    crate::types::DataType::Float64 => Type::FLOAT8,
-                                    crate::types::DataType::Boolean => Type::BOOL,
-                                    crate::types::DataType::Timestamp => Type::TIMESTAMP,
-                                    crate::types::DataType::Uuid => Type::UUID,
-                                    crate::types::DataType::Json
-                                    | crate::types::DataType::Jsonb => Type::JSONB,
-                                    _ => Type::TEXT,
-                                })
-                                .unwrap_or(Type::TEXT);
-                            FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
+                            FieldInfo::new(
+                                name.clone(),
+                                None,
+                                None,
+                                datatype_to_pgtype(types.get(i)),
+                                FieldFormat::Text,
+                            )
                         })
                         .collect()
                 } else if let Some(first_row) = rows.first() {
@@ -1418,18 +1534,8 @@ impl PgHandler {
                         .enumerate()
                         .map(|(i, name)| {
                             let pg_type = if let Some(value) = first_row.values.get(i) {
-                                match value {
-                                    crate::types::Value::Int32(_) => Type::INT4,
-                                    crate::types::Value::Int64(_) => Type::INT8,
-                                    crate::types::Value::Float64(_) => Type::FLOAT8,
-                                    crate::types::Value::Boolean(_) => Type::BOOL,
-                                    crate::types::Value::Timestamp(_) => Type::TIMESTAMP,
-                                    crate::types::Value::Uuid(_) => Type::UUID,
-                                    crate::types::Value::Json(_)
-                                    | crate::types::Value::Jsonb(_) => Type::JSONB,
-                                    crate::types::Value::Array(_) => Type::TEXT_ARRAY,
-                                    _ => Type::TEXT,
-                                }
+                                let dt = value.data_type();
+                                datatype_to_pgtype(dt.as_ref())
                             } else {
                                 Type::TEXT
                             };
@@ -1881,19 +1987,23 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
     match result {
         ExecuteResult::Select {
             columns,
-            column_types: _,
+            column_types,
             rows,
         } => {
-            let inferred_types: Vec<Type> = if let Some(first_row) = rows.first() {
-                let types: Vec<Type> = first_row
+            let inferred_types: Vec<Type> = if let Some(types) = column_types.as_ref() {
+                types
+                    .iter()
+                    .map(|dt| datatype_to_pgtype(Some(dt)))
+                    .collect()
+            } else if let Some(first_row) = rows.first() {
+                first_row
                     .values
                     .iter()
                     .map(|v| {
                         let dt = v.data_type();
                         datatype_to_pgtype(dt.as_ref())
                     })
-                    .collect();
-                types
+                    .collect()
             } else {
                 vec![Type::TEXT; columns.len()]
             };
