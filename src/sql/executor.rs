@@ -20,6 +20,7 @@ use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, SetOperator, SetQuantifie
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tikv_client::Transaction;
 use tracing::debug;
 
@@ -578,8 +579,15 @@ impl Executor {
                 verbose,
                 ..
             } => {
-                self.execute_explain(txn, statement, *analyze, *verbose)
-                    .await
+                self.execute_explain(
+                    txn,
+                    sequence_values,
+                    search_path,
+                    statement,
+                    *analyze,
+                    *verbose,
+                )
+                .await
             }
             _ => Err(anyhow!("Unsupported statement: {:?}", stmt)),
         }
@@ -854,10 +862,36 @@ impl Executor {
     async fn execute_explain(
         &self,
         txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
         statement: &Statement,
-        _analyze: bool,
+        analyze: bool,
         _verbose: bool,
     ) -> Result<ExecuteResult> {
+        let (actual_rows, execution_time_ms) = if analyze {
+            match statement {
+                Statement::Query(query) => {
+                    let start = Instant::now();
+                    let result = self
+                        .execute_query(txn, sequence_values, search_path, query)
+                        .await?;
+                    let elapsed = start.elapsed();
+                    let actual_rows = match result {
+                        ExecuteResult::Select { rows, .. } => rows.len(),
+                        _ => 0,
+                    };
+                    (Some(actual_rows), Some(elapsed.as_secs_f64() * 1000.0))
+                }
+                _ => {
+                    return Err(anyhow!(
+                        "EXPLAIN (ANALYZE) is only supported for SELECT/WITH statements"
+                    ));
+                }
+            }
+        } else {
+            (None, None)
+        };
+
         let tables = self.store.list_tables(txn).await?;
         let mut schemas: HashMap<String, TableSchema> = HashMap::new();
         for table_name in &tables {
@@ -872,7 +906,17 @@ impl Executor {
         let row_count_lookup = |_table_name: &str| -> usize { 1000 };
 
         let plan = explain::generate_plan(statement, schema_lookup, row_count_lookup);
-        let plan_text = explain::format_plan_text(&plan, 0);
+        let mut plan_text = explain::format_plan_text(&plan, 0);
+        if let (Some(actual_rows), Some(execution_time_ms)) = (actual_rows, execution_time_ms) {
+            use std::fmt::Write;
+            writeln!(&mut plan_text, "Actual Rows: {}", actual_rows).unwrap();
+            writeln!(
+                &mut plan_text,
+                "Execution Time: {:.3} ms",
+                execution_time_ms
+            )
+            .unwrap();
+        }
 
         let lines: Vec<Row> = plan_text
             .lines()

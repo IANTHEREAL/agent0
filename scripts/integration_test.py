@@ -176,6 +176,7 @@ def run_sql_file(sql_file: Path) -> Tuple[str, int]:
 def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
     expected_file = sql_file.with_suffix(".expected")
     errors_file = sql_file.with_suffix(".errors")
+    assert_file = sql_file.with_suffix(".assert")
     out_file = sql_file.with_suffix(".out")
     setup_file = sql_file.with_name(sql_file.stem + "_setup.sql")
     load_script = sql_file.with_name(sql_file.stem + "_load.py")
@@ -226,19 +227,31 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
                 print(output[:500])
             return TestResult.FAILED
 
+    errors_ok = True
     if has_error:
+        errors_ok = False
         if errors_file.exists():
-            expected_errors = [line.strip() for line in errors_file.read_text().strip().split("\n") if line.strip()]
-            actual_errors = [line for line in output.split("\n") if any(p in line for p in error_patterns)]
-            unexpected_errors = [actual for actual in actual_errors if not any(exp in actual for exp in expected_errors)]
+            expected_errors = [
+                line.strip()
+                for line in errors_file.read_text().strip().split("\n")
+                if line.strip()
+            ]
+            actual_errors = [
+                line
+                for line in output.split("\n")
+                if any(p in line for p in error_patterns)
+            ]
+            unexpected_errors = [
+                actual
+                for actual in actual_errors
+                if not any(exp in actual for exp in expected_errors)
+            ]
             if unexpected_errors:
                 log_test(sql_file.name, TestResult.FAILED, "unexpected SQL errors")
                 for line in unexpected_errors[:3]:
                     print(f"  {RED}{line}{NC}")
                 return TestResult.FAILED
-            else:
-                log_test(sql_file.name, TestResult.PASSED, "all errors were expected")
-                return TestResult.PASSED
+            errors_ok = True
         else:
             log_test(sql_file.name, TestResult.FAILED, "SQL errors detected")
             for line in output.split("\n"):
@@ -246,6 +259,28 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
                     print(f"  {RED}{line}{NC}")
                     break
             return TestResult.FAILED
+
+    if assert_file.exists():
+        required = [
+            line.strip()
+            for line in assert_file.read_text().splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        missing = [needle for needle in required if needle not in output]
+        if missing:
+            log_test(sql_file.name, TestResult.FAILED, f"missing expected output: {missing[0]}")
+            if config.verbose:
+                print(output[:500])
+            return TestResult.FAILED
+
+    if errors_ok and (has_error or assert_file.exists()):
+        details = []
+        if has_error:
+            details.append("all errors were expected")
+        if assert_file.exists():
+            details.append("assertions passed")
+        log_test(sql_file.name, TestResult.PASSED, "; ".join(details))
+        return TestResult.PASSED
 
     log_test(sql_file.name, TestResult.PASSED, "no .expected file, checked for errors only")
     return TestResult.PASSED
