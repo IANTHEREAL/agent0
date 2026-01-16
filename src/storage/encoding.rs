@@ -194,6 +194,10 @@ fn encode_value_memcomparable(value: &Value, buf: &mut Vec<u8>) {
             buf.push(NOT_NULL_TAG);
             buf.extend(memcomparable::to_vec(t).unwrap());
         }
+        Value::Date(d) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(d).unwrap());
+        }
         Value::Uuid(bytes) => {
             buf.push(NOT_NULL_TAG);
             buf.extend(memcomparable::to_vec(&bytes.to_vec()).unwrap());
@@ -267,6 +271,10 @@ pub fn decode_value_memcomparable(data: &[u8], data_type: &DataType) -> Result<(
         DataType::Time => {
             let v: i64 = serde::Deserialize::deserialize(&mut deserializer)?;
             (Value::Time(v), deserializer.position())
+        }
+        DataType::Date => {
+            let v: i32 = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Date(v), deserializer.position())
         }
         DataType::Uuid => {
             let v: Vec<u8> = serde::Deserialize::deserialize(&mut deserializer)?;

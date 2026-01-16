@@ -1969,6 +1969,7 @@ fn datatype_to_pgtype(dt: Option<&DataType>) -> Type {
         Some(DataType::Int64) => Type::INT8,
         Some(DataType::Float64) => Type::FLOAT8,
         Some(DataType::Timestamp) => Type::TIMESTAMPTZ,
+        Some(DataType::Date) => Type::DATE,
         Some(DataType::Interval) => Type::INTERVAL,
         Some(DataType::Uuid) => Type::UUID,
         Some(DataType::Bytes) => Type::BYTEA,
@@ -2305,6 +2306,10 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
             } else {
                 encoder.encode_field(&format!("{:02}:{:02}:{:02}", hours, mins, secs))
             }
+        }
+        Value::Date(days) => {
+            let s = crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string());
+            encoder.encode_field(&s)
         }
     }
 }

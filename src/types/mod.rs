@@ -3,6 +3,8 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+pub mod date;
+
 /// Supported column data types
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum DataType {
@@ -22,6 +24,7 @@ pub enum DataType {
     Jsonb,
     Time, // Time of day (microseconds since midnight)
     UserDefined(String),
+    Date, // Date without time zone (days since 1970-01-01)
 }
 
 impl DataType {
@@ -42,6 +45,7 @@ impl DataType {
             DataType::Jsonb => 64,
             DataType::Time => 8,
             DataType::UserDefined(_) => 32,
+            DataType::Date => 4,
         }
     }
 }
@@ -64,6 +68,7 @@ impl fmt::Display for DataType {
             DataType::Jsonb => write!(f, "JSONB"),
             DataType::Time => write!(f, "TIME"),
             DataType::UserDefined(name) => write!(f, "{name}"),
+            DataType::Date => write!(f, "DATE"),
         }
     }
 }
@@ -86,6 +91,7 @@ pub enum Value {
     Json(String),
     Jsonb(String),
     Time(i64),
+    Date(i32),
 }
 
 impl Value {
@@ -111,6 +117,7 @@ impl Value {
             Value::Json(_) => Some(DataType::Json),
             Value::Jsonb(_) => Some(DataType::Jsonb),
             Value::Time(_) => Some(DataType::Time),
+            Value::Date(_) => Some(DataType::Date),
         }
     }
 }
@@ -187,6 +194,10 @@ impl fmt::Display for Value {
             }
             Value::Json(s) => write!(f, "{}", s),
             Value::Jsonb(s) => write!(f, "{}", s),
+            Value::Date(days) => match date::format_date_days(*days) {
+                Ok(s) => write!(f, "{s}"),
+                Err(_) => write!(f, "{days}"),
+            },
         }
     }
 }

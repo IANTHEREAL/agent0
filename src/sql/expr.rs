@@ -552,29 +552,19 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
             Ok(Value::Timestamp(ts))
         }
         "DATE" => {
-            let ts = match args.into_iter().next() {
-                Some(Value::Timestamp(t)) => t,
+            let days = match args.into_iter().next() {
+                Some(Value::Date(days)) => days,
+                Some(Value::Timestamp(ts)) => crate::types::date::timestamp_millis_to_date_days(ts)?,
                 Some(Value::Text(s)) => {
-                    use chrono::NaiveDateTime;
-                    let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
-                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f"))
-                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d"))
-                        .map_err(|e| anyhow!("Invalid date format: {}", e))?;
-                    dt.and_utc().timestamp_millis()
+                    let ts = match parse_timestamp_string(&s).map_err(|e| anyhow!("Invalid date format: {}", e))? {
+                        Value::Timestamp(ts) => ts,
+                        _ => return Ok(Value::Null),
+                    };
+                    crate::types::date::timestamp_millis_to_date_days(ts)?
                 }
                 _ => return Ok(Value::Null),
             };
-            use chrono::{Datelike, TimeZone, Utc};
-            let dt = Utc
-                .timestamp_millis_opt(ts)
-                .single()
-                .ok_or_else(|| anyhow!("Invalid timestamp"))?;
-            let date_only = chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day())
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc();
-            Ok(Value::Timestamp(date_only.timestamp_millis()))
+            Ok(Value::Date(days))
         }
         "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => {
             let uuid = uuid::Uuid::new_v4();
@@ -971,6 +961,7 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
         Expr::TypedString { data_type, value } => match data_type {
             sqlparser::ast::DataType::Interval => parse_interval_string(value),
             sqlparser::ast::DataType::Timestamp(_, _) => parse_timestamp_string(value),
+            sqlparser::ast::DataType::Date => crate::types::date::parse_date_days(value).map(Value::Date),
             _ => Ok(Value::Text(value.clone())),
         },
         Expr::JsonAccess {
@@ -1490,15 +1481,10 @@ fn eval_function(
             Ok(Value::Timestamp(ts))
         }
         "CURRENT_DATE" => {
-            use chrono::{Datelike, Utc};
-            let today = Utc::now();
-            let ts = chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), today.day())
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc()
-                .timestamp_millis();
-            Ok(Value::Timestamp(ts))
+            use chrono::Utc;
+            let today = Utc::now().date_naive();
+            let days = crate::types::date::naive_date_to_days(today)?;
+            Ok(Value::Date(days))
         }
         "DATE_TRUNC" => {
             let mut iter = args.into_iter();
@@ -1560,29 +1546,19 @@ fn eval_function(
             Ok(Value::Timestamp(truncated.timestamp_millis()))
         }
         "DATE" => {
-            let ts = match args.into_iter().next() {
-                Some(Value::Timestamp(t)) => t,
+            let days = match args.into_iter().next() {
+                Some(Value::Date(days)) => days,
+                Some(Value::Timestamp(ts)) => crate::types::date::timestamp_millis_to_date_days(ts)?,
                 Some(Value::Text(s)) => {
-                    use chrono::NaiveDateTime;
-                    let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
-                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f"))
-                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d"))
-                        .map_err(|e| anyhow!("Invalid date format: {}", e))?;
-                    dt.and_utc().timestamp_millis()
+                    let ts = match parse_timestamp_string(&s).map_err(|e| anyhow!("Invalid date format: {}", e))? {
+                        Value::Timestamp(ts) => ts,
+                        _ => return Ok(Value::Null),
+                    };
+                    crate::types::date::timestamp_millis_to_date_days(ts)?
                 }
                 _ => return Ok(Value::Null),
             };
-            use chrono::{Datelike, TimeZone, Utc};
-            let dt = Utc
-                .timestamp_millis_opt(ts)
-                .single()
-                .ok_or_else(|| anyhow!("Invalid timestamp"))?;
-            let date_only = chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day())
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc();
-            Ok(Value::Timestamp(date_only.timestamp_millis()))
+            Ok(Value::Date(days))
         }
         "TO_CHAR" => {
             let mut iter = args.into_iter();
@@ -1606,10 +1582,12 @@ fn eval_function(
             let mut iter = args.into_iter();
             let ts1 = match iter.next() {
                 Some(Value::Timestamp(t)) => t,
+                Some(Value::Date(days)) => crate::types::date::date_days_to_timestamp_millis(days)?,
                 _ => return Ok(Value::Null),
             };
             let ts2 = match iter.next() {
                 Some(Value::Timestamp(t)) => t,
+                Some(Value::Date(days)) => crate::types::date::date_days_to_timestamp_millis(days)?,
                 _ => SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()
@@ -2037,6 +2015,12 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
         (Value::Text(s), SqlType::Interval) => parse_interval_string(&s),
         (Value::Text(s), SqlType::Timestamp(_, _)) => parse_timestamp_string(&s),
         (Value::Timestamp(ts), SqlType::Timestamp(_, _)) => Ok(Value::Timestamp(ts)),
+        (Value::Text(s), SqlType::Date) => crate::types::date::parse_date_days(&s).map(Value::Date),
+        (Value::Timestamp(ts), SqlType::Date) => {
+            crate::types::date::timestamp_millis_to_date_days(ts).map(Value::Date)
+        }
+        (Value::Date(days), SqlType::Date) => Ok(Value::Date(days)),
+        (Value::Date(days), SqlType::Timestamp(_, _)) => crate::types::date::date_days_to_timestamp_millis(days).map(Value::Timestamp),
         (Value::Text(s), SqlType::Time(_, _)) => {
             use crate::sql::helpers::parse_time_string;
             parse_time_string(&s)
@@ -2259,6 +2243,14 @@ fn add_values(left: Value, right: Value) -> Result<Value> {
         (Value::Float64(l), Value::Int32(r)) => Ok(Value::Float64(l + r as f64)),
         (Value::Timestamp(ts), Value::Interval(iv)) => Ok(Value::Timestamp(ts + iv)),
         (Value::Interval(iv), Value::Timestamp(ts)) => Ok(Value::Timestamp(ts + iv)),
+        (Value::Date(days), Value::Interval(iv)) => {
+            let ts = crate::types::date::date_days_to_timestamp_millis(days)?;
+            Ok(Value::Timestamp(ts + iv))
+        }
+        (Value::Interval(iv), Value::Date(days)) => {
+            let ts = crate::types::date::date_days_to_timestamp_millis(days)?;
+            Ok(Value::Timestamp(ts + iv))
+        }
         (Value::Interval(l), Value::Interval(r)) => Ok(Value::Interval(l + r)),
         _ => Err(anyhow!("Unsupported types for addition")),
     }
@@ -2273,6 +2265,15 @@ fn sub_values(left: Value, right: Value) -> Result<Value> {
         (Value::Float64(l), Value::Float64(r)) => Ok(Value::Float64(l - r)),
         (Value::Timestamp(l), Value::Timestamp(r)) => Ok(Value::Interval(l - r)),
         (Value::Timestamp(ts), Value::Interval(iv)) => Ok(Value::Timestamp(ts - iv)),
+        (Value::Date(days), Value::Interval(iv)) => {
+            let ts = crate::types::date::date_days_to_timestamp_millis(days)?;
+            Ok(Value::Timestamp(ts - iv))
+        }
+        (Value::Date(l), Value::Date(r)) => {
+            let diff = (l as i64) - (r as i64);
+            let days = i32::try_from(diff).map_err(|_| anyhow!("date difference out of range"))?;
+            Ok(Value::Int32(days))
+        }
         (Value::Interval(l), Value::Interval(r)) => Ok(Value::Interval(l - r)),
         _ => Err(anyhow!("Unsupported types for subtraction")),
     }
@@ -2374,6 +2375,15 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         (Value::Text(l), Value::Text(r)) => Ok(l.cmp(r) as i8),
         (Value::Boolean(l), Value::Boolean(r)) => Ok(l.cmp(r) as i8),
         (Value::Timestamp(l), Value::Timestamp(r)) => Ok(l.cmp(r) as i8),
+        (Value::Date(l), Value::Date(r)) => Ok(l.cmp(r) as i8),
+        (Value::Date(l), Value::Timestamp(r)) => {
+            let l_ts = crate::types::date::date_days_to_timestamp_millis(*l)?;
+            Ok(l_ts.cmp(r) as i8)
+        }
+        (Value::Timestamp(l), Value::Date(r)) => {
+            let r_ts = crate::types::date::date_days_to_timestamp_millis(*r)?;
+            Ok(l.cmp(&r_ts) as i8)
+        }
         (Value::Timestamp(l), Value::Text(r)) => match parse_timestamp_string(r)? {
             Value::Timestamp(r_ts) => Ok(l.cmp(&r_ts) as i8),
             _ => Err(anyhow!("Cannot compare")),
@@ -2382,6 +2392,14 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
             Value::Timestamp(l_ts) => Ok(l_ts.cmp(r) as i8),
             _ => Err(anyhow!("Cannot compare")),
         },
+        (Value::Date(l), Value::Text(r)) => {
+            let r_days = crate::types::date::parse_date_days(r)?;
+            Ok(l.cmp(&r_days) as i8)
+        }
+        (Value::Text(l), Value::Date(r)) => {
+            let l_days = crate::types::date::parse_date_days(l)?;
+            Ok(l_days.cmp(r) as i8)
+        }
         (Value::Uuid(l), Value::Uuid(r)) => Ok(l.cmp(r) as i8),
         (Value::Null, Value::Null) => Ok(0),
         (Value::Null, _) => Ok(-1),
@@ -2760,6 +2778,9 @@ fn value_to_json(val: &Value) -> serde_json::Value {
                 .collect(),
         ),
         Value::Time(micros) => serde_json::Value::Number(serde_json::Number::from(*micros)),
+        Value::Date(days) => serde_json::Value::String(
+            crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string()),
+        ),
     }
 }
 

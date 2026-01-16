@@ -157,6 +157,10 @@ pub fn apply_offset_limit_fetch(mut rows: Vec<Row>, query: &Query) -> Vec<Row> {
 pub fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Value> {
     match (&val, &col.data_type) {
         (Value::Null, _) => Ok(Value::Null),
+        (Value::Text(s), DataType::Date) => crate::types::date::parse_date_days(s).map(Value::Date),
+        (Value::Timestamp(ts), DataType::Date) => {
+            crate::types::date::timestamp_millis_to_date_days(*ts).map(Value::Date)
+        }
         (Value::Text(s), DataType::Int32) => s
             .trim()
             .parse::<i32>()
@@ -255,6 +259,10 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
         }
         Value::Json(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
         Value::Jsonb(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
+        Value::Date(days) => {
+            let s = crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string());
+            Expr::Value(SqlValue::SingleQuotedString(s))
+        }
         Value::Time(micros) => {
             let total_secs = micros / 1_000_000;
             let hours = total_secs / 3600;
@@ -360,7 +368,7 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
         | SqlDataType::CharacterVarying(_) => Ok(DataType::Text),
         SqlDataType::Bytea => Ok(DataType::Bytes),
         SqlDataType::Timestamp(_, _) => Ok(DataType::Timestamp),
-        SqlDataType::Date => Ok(DataType::Timestamp),
+        SqlDataType::Date => Ok(DataType::Date),
         SqlDataType::Time(_, _) => Ok(DataType::Time),
         SqlDataType::Uuid => Ok(DataType::Uuid),
         SqlDataType::JSON => Ok(DataType::Jsonb),
@@ -769,6 +777,7 @@ pub fn infer_data_type(value: &Value) -> DataType {
         Value::Timestamp(_) => DataType::Timestamp,
         Value::Interval { .. } => DataType::Interval,
         Value::Time(_) => DataType::Time,
+        Value::Date(_) => DataType::Date,
         Value::Uuid(_) => DataType::Uuid,
         Value::Vector(vec) => DataType::Vector(vec.len() as u32),
         Value::Json(_) => DataType::Json,
@@ -932,6 +941,8 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
             }
         }
         Expr::Cast { data_type, .. } => sql_datatype_to_internal(data_type),
+        Expr::TypedString { data_type, .. } => sql_datatype_to_internal(data_type),
+        Expr::Interval(_) => DataType::Interval,
         Expr::JsonAccess { operator, .. } => match operator {
             sqlparser::ast::JsonOperator::Arrow => DataType::Jsonb,
             sqlparser::ast::JsonOperator::LongArrow => DataType::Text,
@@ -969,7 +980,9 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                         DataType::Text
                     }
                 }
-                "NOW" | "CURRENT_TIMESTAMP" | "CURRENT_DATE" => DataType::Timestamp,
+                "NOW" | "CURRENT_TIMESTAMP" => DataType::Timestamp,
+                "CURRENT_DATE" => DataType::Date,
+                "DATE" => DataType::Date,
                 "NEXTVAL" | "CURRVAL" | "SETVAL" => DataType::Int64,
                 "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => DataType::Uuid,
                 "JSONB_BUILD_OBJECT" | "JSONB_AGG" | "TO_JSONB" => DataType::Jsonb,
@@ -987,11 +1000,60 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
             }
         }
         Expr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::Plus
-            | BinaryOperator::Minus
-            | BinaryOperator::Multiply
-            | BinaryOperator::Divide
-            | BinaryOperator::Modulo => {
+            BinaryOperator::Plus | BinaryOperator::Minus => {
+                let left_type = infer_expr_type(left, schema);
+                let right_type = infer_expr_type(right, schema);
+                match (op, &left_type, &right_type) {
+                    (BinaryOperator::Plus, DataType::Timestamp, DataType::Interval)
+                    | (BinaryOperator::Plus, DataType::Interval, DataType::Timestamp) => {
+                        DataType::Timestamp
+                    }
+                    (BinaryOperator::Plus, DataType::Date, DataType::Interval)
+                    | (BinaryOperator::Plus, DataType::Interval, DataType::Date) => {
+                        DataType::Timestamp
+                    }
+                    (BinaryOperator::Plus, DataType::Interval, DataType::Interval) => {
+                        DataType::Interval
+                    }
+                    (BinaryOperator::Minus, DataType::Timestamp, DataType::Timestamp) => {
+                        DataType::Interval
+                    }
+                    (BinaryOperator::Minus, DataType::Timestamp, DataType::Interval) => {
+                        DataType::Timestamp
+                    }
+                    (BinaryOperator::Minus, DataType::Interval, DataType::Interval) => {
+                        DataType::Interval
+                    }
+                    (BinaryOperator::Minus, DataType::Date, DataType::Interval) => DataType::Timestamp,
+                    (BinaryOperator::Minus, DataType::Date, DataType::Date) => DataType::Int32,
+                    _ => {
+                        let left_numeric = matches!(
+                            left_type,
+                            DataType::Int32 | DataType::Int64 | DataType::Float64
+                        );
+                        let right_numeric = matches!(
+                            right_type,
+                            DataType::Int32 | DataType::Int64 | DataType::Float64
+                        );
+                        if left_numeric && right_numeric {
+                            if matches!(left_type, DataType::Float64)
+                                || matches!(right_type, DataType::Float64)
+                            {
+                                DataType::Float64
+                            } else if matches!(left_type, DataType::Int64)
+                                || matches!(right_type, DataType::Int64)
+                            {
+                                DataType::Int64
+                            } else {
+                                DataType::Int32
+                            }
+                        } else {
+                            DataType::Text
+                        }
+                    }
+                }
+            }
+            BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Modulo => {
                 let left_type = infer_expr_type(left, schema);
                 let right_type = infer_expr_type(right, schema);
                 if matches!(left_type, DataType::Float64) || matches!(right_type, DataType::Float64)
@@ -1063,6 +1125,7 @@ fn sql_datatype_to_internal(dt: &SqlDataType) -> DataType {
         | SqlDataType::Numeric(_)
         | SqlDataType::Decimal(_) => DataType::Float64,
         SqlDataType::Timestamp(_, _) => DataType::Timestamp,
+        SqlDataType::Date => DataType::Date,
         SqlDataType::Time(_, _) => DataType::Time,
         SqlDataType::Interval => DataType::Interval,
         SqlDataType::Uuid => DataType::Uuid,
@@ -1315,6 +1378,9 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
                 Value::Text(unescaped)
             }
         }
+        DataType::Date => crate::types::date::parse_date_days(&unescaped)
+            .map(Value::Date)
+            .unwrap_or(Value::Text(unescaped)),
         DataType::Uuid => {
             if let Ok(u) = uuid::Uuid::parse_str(&unescaped) {
                 Value::Uuid(*u.as_bytes())

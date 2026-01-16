@@ -653,6 +653,7 @@ fn data_type_to_pg_type(dt: &DataType) -> &'static str {
         DataType::Text => "character varying",
         DataType::Bytes => "bytea",
         DataType::Timestamp => "timestamp without time zone",
+        DataType::Date => "date",
         DataType::Interval => "interval",
         DataType::Uuid => "uuid",
         DataType::Array(inner) => match inner.as_ref() {
@@ -1531,6 +1532,7 @@ async fn get_pg_attribute_rows(
                         DataType::Text => 25,
                         DataType::Bytes => 17,
                         DataType::Timestamp => 1114,
+                        DataType::Date => 1082,
                         DataType::Uuid => 2950,
                         DataType::Json => 114,
                         DataType::Jsonb => 3802,
@@ -1543,6 +1545,7 @@ async fn get_pg_attribute_rows(
                         DataType::Int32 => 4,
                         DataType::Int64 => 8,
                         DataType::Float64 => 8,
+                        DataType::Date => 4,
                         _ => -1, // Variable length
                     };
                     (oid, len)
@@ -1808,6 +1811,23 @@ async fn get_pg_type_rows(
         int_val(0),         // typrelid: not a composite type
         int_val(0),         // typelem: not an array
         int_val(0),         // typarray: no array type
+    ]));
+
+    rows.push(Row::new(vec![
+        int_val(1082), // oid: built-in date
+        text_val("date"),
+        int_val(schema_oid(schema_oids, "pg_catalog")),
+        int_val(10),
+        int_val(4),
+        text_val("t"),
+        text_val("b"),
+        text_val("D"),
+        text_val("t"),
+        text_val("t"),
+        text_val(","),
+        int_val(0),
+        int_val(0),
+        int_val(0),
     ]));
 
     let mut user_types = store.list_types(txn).await?;
