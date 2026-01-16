@@ -71,12 +71,19 @@ pub(crate) fn normalize_sequence_name(
     }
 
     let (schema, seq_name) = match parts.as_slice() {
-        [seq_name] => (names::default_schema(search_path).to_string(), seq_name.clone()),
+        [seq_name] => (
+            names::default_schema(search_path).to_string(),
+            seq_name.clone(),
+        ),
         [schema, seq_name] => (schema.clone(), seq_name.clone()),
         _ => return Err(anyhow!("Invalid sequence name")),
     };
 
-    Ok((schema.clone(), seq_name.clone(), format!("{}.{}", schema, seq_name)))
+    Ok((
+        schema.clone(),
+        seq_name.clone(),
+        format!("{}.{}", schema, seq_name),
+    ))
 }
 
 pub(crate) fn implicit_sequence_name(table_name: &str, column_name: &str) -> String {
@@ -338,9 +345,7 @@ async fn resolve_sequence_full_name_from_value(
         }
     }
 
-    Ok(
-        names::ResolvedName::new(names::default_schema(search_path).to_string(), seq_name)?.full,
-    )
+    Ok(names::ResolvedName::new(names::default_schema(search_path).to_string(), seq_name)?.full)
 }
 
 pub(crate) async fn eval_expr_with_sequences(
@@ -396,515 +401,719 @@ pub(crate) fn replace_sequence_functions<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<Expr>> + Send + 'a>> {
     Box::pin(async move {
         match expr {
-        Expr::Function(func) => {
-            let name = function_name_upper(func);
-            match name.as_str() {
-                "CURRENT_SCHEMA" => Ok(value_to_sql_expr(&crate::types::Value::Text(
-                    names::default_schema(search_path).to_string(),
-                ))),
-                "NEXTVAL" => {
-                    let arg0 = extract_arg_expr(&func.args, 0)?;
-                    let full_name = resolve_sequence_full_name_from_value(
-                        store,
-                        txn,
-                        search_path,
-                        eval_expr(arg0, row, schema)?,
-                    )
-                    .await?;
-                    let val = store.nextval_sequence(txn, &full_name).await?;
-                    last_sequence_values.insert(full_name, val);
-                    Ok(value_to_sql_expr(&crate::types::Value::Int64(val)))
-                }
-                "CURRVAL" => {
-                    let arg0 = extract_arg_expr(&func.args, 0)?;
-                    let full_name = resolve_sequence_full_name_from_value(
-                        store,
-                        txn,
-                        search_path,
-                        eval_expr(arg0, row, schema)?,
-                    )
-                    .await?;
-                    if store.get_sequence(txn, &full_name).await?.is_none() {
-                        return Err(anyhow!("Sequence '{}' does not exist", full_name));
+            Expr::Function(func) => {
+                let name = function_name_upper(func);
+                match name.as_str() {
+                    "CURRENT_SCHEMA" => Ok(value_to_sql_expr(&crate::types::Value::Text(
+                        names::default_schema(search_path).to_string(),
+                    ))),
+                    "NEXTVAL" => {
+                        let arg0 = extract_arg_expr(&func.args, 0)?;
+                        let full_name = resolve_sequence_full_name_from_value(
+                            store,
+                            txn,
+                            search_path,
+                            eval_expr(arg0, row, schema)?,
+                        )
+                        .await?;
+                        let val = store.nextval_sequence(txn, &full_name).await?;
+                        last_sequence_values.insert(full_name, val);
+                        Ok(value_to_sql_expr(&crate::types::Value::Int64(val)))
                     }
-                    let val = last_sequence_values.get(&full_name).copied().ok_or_else(|| {
-                        anyhow!(
+                    "CURRVAL" => {
+                        let arg0 = extract_arg_expr(&func.args, 0)?;
+                        let full_name = resolve_sequence_full_name_from_value(
+                            store,
+                            txn,
+                            search_path,
+                            eval_expr(arg0, row, schema)?,
+                        )
+                        .await?;
+                        if store.get_sequence(txn, &full_name).await?.is_none() {
+                            return Err(anyhow!("Sequence '{}' does not exist", full_name));
+                        }
+                        let val =
+                            last_sequence_values
+                                .get(&full_name)
+                                .copied()
+                                .ok_or_else(|| {
+                                    anyhow!(
                             "currval of sequence \"{}\" is not yet defined in this session",
                             full_name
                         )
-                    })?;
-                    Ok(value_to_sql_expr(&crate::types::Value::Int64(val)))
-                }
-                "SETVAL" => {
-                    let arg0 = extract_arg_expr(&func.args, 0)?;
-                    let arg1 = extract_arg_expr(&func.args, 1)?;
-                    let full_name = resolve_sequence_full_name_from_value(
-                        store,
-                        txn,
-                        search_path,
-                        eval_expr(arg0, row, schema)?,
-                    )
-                    .await?;
-                    let val = eval_expr(arg1, row, schema)?;
-                    let value_i64 = match val {
-                        crate::types::Value::Int32(n) => n as i64,
-                        crate::types::Value::Int64(n) => n,
-                        crate::types::Value::Float64(n) => n as i64,
-                        crate::types::Value::Text(s) => s
-                            .trim()
-                            .parse::<i64>()
-                            .map_err(|_| anyhow!("setval: value must be integer, got {}", s))?,
-                        other => return Err(anyhow!("setval: value must be integer, got {}", other)),
-                    };
-                    let is_called = if func.args.len() >= 3 {
-                        let arg2 = extract_arg_expr(&func.args, 2)?;
-                        match eval_expr(arg2, row, schema)? {
-                            crate::types::Value::Boolean(b) => b,
-                            crate::types::Value::Text(s) => {
-                                matches!(s.to_lowercase().as_str(), "true" | "t" | "1" | "yes" | "y")
-                            }
-                            other => return Err(anyhow!("setval: is_called must be boolean, got {}", other)),
-                        }
-                    } else {
-                        true
-                    };
-                    let res = store
-                        .setval_sequence(txn, &full_name, value_i64, is_called)
-                        .await?;
-                    Ok(value_to_sql_expr(&crate::types::Value::Int64(res)))
-                }
-                _ => {
-                    let mut resolved_args = Vec::with_capacity(func.args.len());
-                    for arg in &func.args {
-                        let resolved_arg = match arg {
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                                FunctionArg::Unnamed(FunctionArgExpr::Expr(
-                                    replace_sequence_functions(
-                                        store,
-                                        txn,
-                                        last_sequence_values,
-                                        search_path,
-                                        e,
-                                        row,
-                                        schema,
-                                    )
-                                    .await?,
-                                ))
-                            }
-                            other => other.clone(),
-                        };
-                        resolved_args.push(resolved_arg);
+                                })?;
+                        Ok(value_to_sql_expr(&crate::types::Value::Int64(val)))
                     }
-                    let resolved_filter = if let Some(filter) = &func.filter {
-                        Some(Box::new(
-                            replace_sequence_functions(
+                    "SETVAL" => {
+                        let arg0 = extract_arg_expr(&func.args, 0)?;
+                        let arg1 = extract_arg_expr(&func.args, 1)?;
+                        let full_name = resolve_sequence_full_name_from_value(
+                            store,
+                            txn,
+                            search_path,
+                            eval_expr(arg0, row, schema)?,
+                        )
+                        .await?;
+                        let val = eval_expr(arg1, row, schema)?;
+                        let value_i64 = match val {
+                            crate::types::Value::Int32(n) => n as i64,
+                            crate::types::Value::Int64(n) => n,
+                            crate::types::Value::Float64(n) => n as i64,
+                            crate::types::Value::Text(s) => s
+                                .trim()
+                                .parse::<i64>()
+                                .map_err(|_| anyhow!("setval: value must be integer, got {}", s))?,
+                            other => {
+                                return Err(anyhow!("setval: value must be integer, got {}", other))
+                            }
+                        };
+                        let is_called = if func.args.len() >= 3 {
+                            let arg2 = extract_arg_expr(&func.args, 2)?;
+                            match eval_expr(arg2, row, schema)? {
+                                crate::types::Value::Boolean(b) => b,
+                                crate::types::Value::Text(s) => {
+                                    matches!(
+                                        s.to_lowercase().as_str(),
+                                        "true" | "t" | "1" | "yes" | "y"
+                                    )
+                                }
+                                other => {
+                                    return Err(anyhow!(
+                                        "setval: is_called must be boolean, got {}",
+                                        other
+                                    ))
+                                }
+                            }
+                        } else {
+                            true
+                        };
+                        let res = store
+                            .setval_sequence(txn, &full_name, value_i64, is_called)
+                            .await?;
+                        Ok(value_to_sql_expr(&crate::types::Value::Int64(res)))
+                    }
+                    _ => {
+                        let mut resolved_args = Vec::with_capacity(func.args.len());
+                        for arg in &func.args {
+                            let resolved_arg = match arg {
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                        replace_sequence_functions(
+                                            store,
+                                            txn,
+                                            last_sequence_values,
+                                            search_path,
+                                            e,
+                                            row,
+                                            schema,
+                                        )
+                                        .await?,
+                                    ))
+                                }
+                                other => other.clone(),
+                            };
+                            resolved_args.push(resolved_arg);
+                        }
+                        let resolved_filter = if let Some(filter) = &func.filter {
+                            Some(Box::new(
+                                replace_sequence_functions(
+                                    store,
+                                    txn,
+                                    last_sequence_values,
+                                    search_path,
+                                    filter,
+                                    row,
+                                    schema,
+                                )
+                                .await?,
+                            ))
+                        } else {
+                            None
+                        };
+
+                        let mut resolved_order_by = func.order_by.clone();
+                        for ob in &mut resolved_order_by {
+                            ob.expr = replace_sequence_functions(
                                 store,
                                 txn,
                                 last_sequence_values,
                                 search_path,
-                                filter,
+                                &ob.expr,
                                 row,
                                 schema,
                             )
-                            .await?,
-                        ))
-                    } else {
-                        None
-                    };
+                            .await?;
+                        }
 
-                    let mut resolved_order_by = func.order_by.clone();
-                    for ob in &mut resolved_order_by {
-                        ob.expr = replace_sequence_functions(
+                        Ok(Expr::Function(Function {
+                            name: func.name.clone(),
+                            args: resolved_args,
+                            filter: resolved_filter,
+                            null_treatment: func.null_treatment.clone(),
+                            over: func.over.clone(),
+                            distinct: func.distinct,
+                            special: func.special,
+                            order_by: resolved_order_by,
+                        }))
+                    }
+                }
+            }
+            Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
+                left: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        left,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+                op: op.clone(),
+                right: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        right,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+            }),
+            Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
+                op: op.clone(),
+                expr: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        expr,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+            }),
+            Expr::Nested(inner) => Ok(Expr::Nested(Box::new(
+                replace_sequence_functions(
+                    store,
+                    txn,
+                    last_sequence_values,
+                    search_path,
+                    inner,
+                    row,
+                    schema,
+                )
+                .await?,
+            ))),
+            Expr::IsNull(inner) => Ok(Expr::IsNull(Box::new(
+                replace_sequence_functions(
+                    store,
+                    txn,
+                    last_sequence_values,
+                    search_path,
+                    inner,
+                    row,
+                    schema,
+                )
+                .await?,
+            ))),
+            Expr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(
+                replace_sequence_functions(
+                    store,
+                    txn,
+                    last_sequence_values,
+                    search_path,
+                    inner,
+                    row,
+                    schema,
+                )
+                .await?,
+            ))),
+            Expr::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let resolved_expr = replace_sequence_functions(
+                    store,
+                    txn,
+                    last_sequence_values,
+                    search_path,
+                    expr,
+                    row,
+                    schema,
+                )
+                .await?;
+                let mut resolved_list = Vec::with_capacity(list.len());
+                for item in list {
+                    resolved_list.push(
+                        replace_sequence_functions(
                             store,
                             txn,
                             last_sequence_values,
                             search_path,
-                            &ob.expr,
+                            item,
                             row,
                             schema,
                         )
-                        .await?;
-                    }
-
-                    Ok(Expr::Function(Function {
-                        name: func.name.clone(),
-                        args: resolved_args,
-                        filter: resolved_filter,
-                        null_treatment: func.null_treatment.clone(),
-                        over: func.over.clone(),
-                        distinct: func.distinct,
-                        special: func.special,
-                        order_by: resolved_order_by,
-                    }))
+                        .await?,
+                    );
                 }
+                Ok(Expr::InList {
+                    expr: Box::new(resolved_expr),
+                    list: resolved_list,
+                    negated: *negated,
+                })
             }
-        }
-        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
-            left: Box::new(
-                replace_sequence_functions(
-                    store,
-                    txn,
-                    last_sequence_values,
-                    search_path,
-                    left,
-                    row,
-                    schema,
-                )
-                    .await?,
-            ),
-            op: op.clone(),
-            right: Box::new(
-                replace_sequence_functions(
-                    store,
-                    txn,
-                    last_sequence_values,
-                    search_path,
-                    right,
-                    row,
-                    schema,
-                )
-                    .await?,
-            ),
-        }),
-        Expr::UnaryOp { op, expr } => Ok(Expr::UnaryOp {
-            op: op.clone(),
-            expr: Box::new(
-                replace_sequence_functions(
-                    store,
-                    txn,
-                    last_sequence_values,
-                    search_path,
-                    expr,
-                    row,
-                    schema,
-                )
-                    .await?,
-            ),
-        }),
-        Expr::Nested(inner) => Ok(Expr::Nested(Box::new(
-            replace_sequence_functions(store, txn, last_sequence_values, search_path, inner, row, schema).await?,
-        ))),
-        Expr::IsNull(inner) => Ok(Expr::IsNull(Box::new(
-            replace_sequence_functions(store, txn, last_sequence_values, search_path, inner, row, schema).await?,
-        ))),
-        Expr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(
-            replace_sequence_functions(store, txn, last_sequence_values, search_path, inner, row, schema).await?,
-        ))),
-        Expr::InList {
-            expr,
-            list,
-            negated,
-        } => {
-            let resolved_expr = replace_sequence_functions(
-                store,
-                txn,
-                last_sequence_values,
-                search_path,
+            Expr::Between {
                 expr,
-                row,
-                schema,
-            )
-            .await?;
-            let mut resolved_list = Vec::with_capacity(list.len());
-            for item in list {
-                resolved_list.push(
+                negated,
+                low,
+                high,
+            } => Ok(Expr::Between {
+                expr: Box::new(
                     replace_sequence_functions(
                         store,
                         txn,
                         last_sequence_values,
                         search_path,
-                        item,
+                        expr,
                         row,
                         schema,
                     )
-                        .await?,
-                );
-            }
-            Ok(Expr::InList {
-                expr: Box::new(resolved_expr),
-                list: resolved_list,
+                    .await?,
+                ),
                 negated: *negated,
-            })
-        }
-        Expr::Between {
-            expr,
-            negated,
-            low,
-            high,
-        } => Ok(Expr::Between {
-            expr: Box::new(
-                replace_sequence_functions(
+                low: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        low,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+                high: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        high,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+            }),
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
+                let resolved_operand = if let Some(op) = operand {
+                    Some(Box::new(
+                        replace_sequence_functions(
+                            store,
+                            txn,
+                            last_sequence_values,
+                            search_path,
+                            op,
+                            row,
+                            schema,
+                        )
+                        .await?,
+                    ))
+                } else {
+                    None
+                };
+                let mut resolved_conditions = Vec::with_capacity(conditions.len());
+                for cond in conditions {
+                    resolved_conditions.push(
+                        replace_sequence_functions(
+                            store,
+                            txn,
+                            last_sequence_values,
+                            search_path,
+                            cond,
+                            row,
+                            schema,
+                        )
+                        .await?,
+                    );
+                }
+                let mut resolved_results = Vec::with_capacity(results.len());
+                for res in results {
+                    resolved_results.push(
+                        replace_sequence_functions(
+                            store,
+                            txn,
+                            last_sequence_values,
+                            search_path,
+                            res,
+                            row,
+                            schema,
+                        )
+                        .await?,
+                    );
+                }
+                let resolved_else = if let Some(else_expr) = else_result {
+                    Some(Box::new(
+                        replace_sequence_functions(
+                            store,
+                            txn,
+                            last_sequence_values,
+                            search_path,
+                            else_expr,
+                            row,
+                            schema,
+                        )
+                        .await?,
+                    ))
+                } else {
+                    None
+                };
+                Ok(Expr::Case {
+                    operand: resolved_operand,
+                    conditions: resolved_conditions,
+                    results: resolved_results,
+                    else_result: resolved_else,
+                })
+            }
+            Expr::Cast {
+                expr,
+                data_type,
+                format,
+            } => Ok(Expr::Cast {
+                expr: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        expr,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+                data_type: data_type.clone(),
+                format: format.clone(),
+            }),
+            Expr::Substring {
+                expr,
+                substring_from,
+                substring_for,
+                special,
+            } => Ok(Expr::Substring {
+                expr: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        expr,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+                substring_from: match substring_from {
+                    Some(e) => Some(Box::new(
+                        replace_sequence_functions(
+                            store,
+                            txn,
+                            last_sequence_values,
+                            search_path,
+                            e,
+                            row,
+                            schema,
+                        )
+                        .await?,
+                    )),
+                    None => None,
+                },
+                substring_for: match substring_for {
+                    Some(e) => Some(Box::new(
+                        replace_sequence_functions(
+                            store,
+                            txn,
+                            last_sequence_values,
+                            search_path,
+                            e,
+                            row,
+                            schema,
+                        )
+                        .await?,
+                    )),
+                    None => None,
+                },
+                special: *special,
+            }),
+            Expr::Trim {
+                expr,
+                trim_where,
+                trim_what,
+                trim_characters,
+            } => Ok(Expr::Trim {
+                expr: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        expr,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+                trim_where: trim_where.clone(),
+                trim_what: match trim_what {
+                    Some(e) => Some(Box::new(
+                        replace_sequence_functions(
+                            store,
+                            txn,
+                            last_sequence_values,
+                            search_path,
+                            e,
+                            row,
+                            schema,
+                        )
+                        .await?,
+                    )),
+                    None => None,
+                },
+                trim_characters: trim_characters.clone(),
+            }),
+            Expr::Position { expr, r#in } => Ok(Expr::Position {
+                expr: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        expr,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+                r#in: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        r#in,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+            }),
+            Expr::Extract { field, expr } => Ok(Expr::Extract {
+                field: *field,
+                expr: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        expr,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+            }),
+            Expr::Ceil { expr, field } => Ok(Expr::Ceil {
+                expr: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        expr,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+                field: *field,
+            }),
+            Expr::Floor { expr, field } => Ok(Expr::Floor {
+                expr: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        expr,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+                field: *field,
+            }),
+            Expr::JsonAccess {
+                left,
+                operator,
+                right,
+            } => Ok(Expr::JsonAccess {
+                left: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        left,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+                operator: *operator,
+                right: Box::new(
+                    replace_sequence_functions(
+                        store,
+                        txn,
+                        last_sequence_values,
+                        search_path,
+                        right,
+                        row,
+                        schema,
+                    )
+                    .await?,
+                ),
+            }),
+            Expr::Array(arr) => {
+                let mut elems = Vec::with_capacity(arr.elem.len());
+                for elem in &arr.elem {
+                    elems.push(
+                        replace_sequence_functions(
+                            store,
+                            txn,
+                            last_sequence_values,
+                            search_path,
+                            elem,
+                            row,
+                            schema,
+                        )
+                        .await?,
+                    );
+                }
+                Ok(Expr::Array(sqlparser::ast::Array {
+                    elem: elems,
+                    named: arr.named,
+                }))
+            }
+            Expr::ArrayIndex { obj, indexes } => {
+                let resolved_obj = replace_sequence_functions(
                     store,
                     txn,
                     last_sequence_values,
                     search_path,
-                    expr,
+                    obj,
                     row,
                     schema,
                 )
-                    .await?,
-            ),
-            negated: *negated,
-            low: Box::new(
-                replace_sequence_functions(
-                    store,
-                    txn,
-                    last_sequence_values,
-                    search_path,
-                    low,
-                    row,
-                    schema,
-                )
-                    .await?,
-            ),
-            high: Box::new(
-                replace_sequence_functions(
-                    store,
-                    txn,
-                    last_sequence_values,
-                    search_path,
-                    high,
-                    row,
-                    schema,
-                )
-                    .await?,
-            ),
-        }),
-        Expr::Case {
-            operand,
-            conditions,
-            results,
-            else_result,
-        } => {
-            let resolved_operand = if let Some(op) = operand {
-                Some(Box::new(
+                .await?;
+                let mut resolved_indexes = Vec::with_capacity(indexes.len());
+                for idx in indexes {
+                    resolved_indexes.push(
+                        replace_sequence_functions(
+                            store,
+                            txn,
+                            last_sequence_values,
+                            search_path,
+                            idx,
+                            row,
+                            schema,
+                        )
+                        .await?,
+                    );
+                }
+                Ok(Expr::ArrayIndex {
+                    obj: Box::new(resolved_obj),
+                    indexes: resolved_indexes,
+                })
+            }
+            Expr::AnyOp {
+                left,
+                compare_op,
+                right,
+            } => Ok(Expr::AnyOp {
+                left: Box::new(
                     replace_sequence_functions(
                         store,
                         txn,
                         last_sequence_values,
                         search_path,
-                        op,
+                        left,
                         row,
                         schema,
                     )
-                        .await?,
-                ))
-            } else {
-                None
-            };
-            let mut resolved_conditions = Vec::with_capacity(conditions.len());
-            for cond in conditions {
-                resolved_conditions.push(
+                    .await?,
+                ),
+                compare_op: compare_op.clone(),
+                right: Box::new(
                     replace_sequence_functions(
                         store,
                         txn,
                         last_sequence_values,
                         search_path,
-                        cond,
+                        right,
                         row,
                         schema,
                     )
-                        .await?,
-                );
-            }
-            let mut resolved_results = Vec::with_capacity(results.len());
-            for res in results {
-                resolved_results.push(
+                    .await?,
+                ),
+            }),
+            Expr::AllOp {
+                left,
+                compare_op,
+                right,
+            } => Ok(Expr::AllOp {
+                left: Box::new(
                     replace_sequence_functions(
                         store,
                         txn,
                         last_sequence_values,
                         search_path,
-                        res,
+                        left,
                         row,
                         schema,
                     )
-                        .await?,
-                );
-            }
-            let resolved_else = if let Some(else_expr) = else_result {
-                Some(Box::new(
+                    .await?,
+                ),
+                compare_op: compare_op.clone(),
+                right: Box::new(
                     replace_sequence_functions(
                         store,
                         txn,
                         last_sequence_values,
                         search_path,
-                        else_expr,
+                        right,
                         row,
                         schema,
                     )
                     .await?,
-                ))
-            } else {
-                None
-            };
-            Ok(Expr::Case {
-                operand: resolved_operand,
-                conditions: resolved_conditions,
-                results: resolved_results,
-                else_result: resolved_else,
-            })
-        }
-        Expr::Cast { expr, data_type, format } => Ok(Expr::Cast {
-            expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
-                    .await?,
-            ),
-            data_type: data_type.clone(),
-            format: format.clone(),
-        }),
-        Expr::Substring {
-            expr,
-            substring_from,
-            substring_for,
-            special,
-        } => Ok(Expr::Substring {
-            expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
-                    .await?,
-            ),
-            substring_from: match substring_from {
-                Some(e) => Some(Box::new(
-                    replace_sequence_functions(store, txn, last_sequence_values, search_path, e, row, schema)
-                        .await?,
-                )),
-                None => None,
-            },
-            substring_for: match substring_for {
-                Some(e) => Some(Box::new(
-                    replace_sequence_functions(store, txn, last_sequence_values, search_path, e, row, schema)
-                        .await?,
-                )),
-                None => None,
-            },
-            special: *special,
-        }),
-        Expr::Trim {
-            expr,
-            trim_where,
-            trim_what,
-            trim_characters,
-        } => Ok(Expr::Trim {
-            expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
-                    .await?,
-            ),
-            trim_where: trim_where.clone(),
-            trim_what: match trim_what {
-                Some(e) => Some(Box::new(
-                    replace_sequence_functions(store, txn, last_sequence_values, search_path, e, row, schema)
-                        .await?,
-                )),
-                None => None,
-            },
-            trim_characters: trim_characters.clone(),
-        }),
-        Expr::Position { expr, r#in } => Ok(Expr::Position {
-            expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
-                    .await?,
-            ),
-            r#in: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, r#in, row, schema)
-                    .await?,
-            ),
-        }),
-        Expr::Extract { field, expr } => Ok(Expr::Extract {
-            field: *field,
-            expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
-                    .await?,
-            ),
-        }),
-        Expr::Ceil { expr, field } => Ok(Expr::Ceil {
-            expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
-                    .await?,
-            ),
-            field: *field,
-        }),
-        Expr::Floor { expr, field } => Ok(Expr::Floor {
-            expr: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, expr, row, schema)
-                    .await?,
-            ),
-            field: *field,
-        }),
-        Expr::JsonAccess {
-            left,
-            operator,
-            right,
-        } => Ok(Expr::JsonAccess {
-            left: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, left, row, schema)
-                    .await?,
-            ),
-            operator: *operator,
-            right: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, right, row, schema)
-                    .await?,
-            ),
-        }),
-        Expr::Array(arr) => {
-            let mut elems = Vec::with_capacity(arr.elem.len());
-            for elem in &arr.elem {
-                elems.push(
-                    replace_sequence_functions(store, txn, last_sequence_values, search_path, elem, row, schema)
-                        .await?,
-                );
-            }
-            Ok(Expr::Array(sqlparser::ast::Array {
-                elem: elems,
-                named: arr.named,
-            }))
-        }
-        Expr::ArrayIndex { obj, indexes } => {
-            let resolved_obj =
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, obj, row, schema)
-                    .await?;
-            let mut resolved_indexes = Vec::with_capacity(indexes.len());
-            for idx in indexes {
-                resolved_indexes.push(
-                    replace_sequence_functions(store, txn, last_sequence_values, search_path, idx, row, schema)
-                        .await?,
-                );
-            }
-            Ok(Expr::ArrayIndex {
-                obj: Box::new(resolved_obj),
-                indexes: resolved_indexes,
-            })
-        }
-        Expr::AnyOp {
-            left,
-            compare_op,
-            right,
-        } => Ok(Expr::AnyOp {
-            left: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, left, row, schema)
-                    .await?,
-            ),
-            compare_op: compare_op.clone(),
-            right: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, right, row, schema)
-                    .await?,
-            ),
-        }),
-        Expr::AllOp {
-            left,
-            compare_op,
-            right,
-        } => Ok(Expr::AllOp {
-            left: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, left, row, schema)
-                    .await?,
-            ),
-            compare_op: compare_op.clone(),
-            right: Box::new(
-                replace_sequence_functions(store, txn, last_sequence_values, search_path, right, row, schema)
-                    .await?,
-            ),
-        }),
-        _ => Ok(expr.clone()),
+                ),
+            }),
+            _ => Ok(expr.clone()),
         }
     })
 }
@@ -950,12 +1159,16 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         if store.get_sequence(txn, &full_name).await?.is_none() {
                             return Err(anyhow!("Sequence '{}' does not exist", full_name));
                         }
-                        let val = last_sequence_values.get(&full_name).copied().ok_or_else(|| {
-                            anyhow!(
+                        let val =
+                            last_sequence_values
+                                .get(&full_name)
+                                .copied()
+                                .ok_or_else(|| {
+                                    anyhow!(
                                 "currval of sequence \"{}\" is not yet defined in this session",
                                 full_name
                             )
-                        })?;
+                                })?;
                         Ok(value_to_sql_expr(&crate::types::Value::Int64(val)))
                     }
                     "SETVAL" => {
@@ -978,10 +1191,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                                 .parse::<i64>()
                                 .map_err(|_| anyhow!("setval: value must be integer, got {}", s))?,
                             other => {
-                                return Err(anyhow!(
-                                    "setval: value must be integer, got {}",
-                                    other
-                                ))
+                                return Err(anyhow!("setval: value must be integer, got {}", other))
                             }
                         };
                         let is_called = if func.args.len() >= 3 {

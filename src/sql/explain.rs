@@ -466,7 +466,8 @@ fn format_value(value: &crate::types::Value) -> String {
             format!("'{:02}:{:02}:{:02}'", hours, mins, secs)
         }
         crate::types::Value::Date(days) => {
-            let s = crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string());
+            let s =
+                crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string());
             format!("'{}'", s)
         }
     }

@@ -69,7 +69,10 @@ pub(crate) fn split_object_name(name: &ObjectName) -> Result<(Option<String>, St
     }
 }
 
-pub(crate) fn resolve_ddl_object_name(name: &ObjectName, search_path: &[String]) -> Result<ResolvedName> {
+pub(crate) fn resolve_ddl_object_name(
+    name: &ObjectName,
+    search_path: &[String],
+) -> Result<ResolvedName> {
     let (schema_opt, obj) = split_object_name(name)?;
     let schema = schema_opt.unwrap_or_else(|| default_schema(search_path).to_string());
     ResolvedName::new(schema, obj)
@@ -92,7 +95,10 @@ pub(crate) async fn resolve_existing_table_name(
     match schema_opt {
         Some(schema) => {
             let resolved = ResolvedName::new(schema, obj)?;
-            Ok(store.get_schema(txn, &resolved.full).await?.map(|_| resolved))
+            Ok(store
+                .get_schema(txn, &resolved.full)
+                .await?
+                .map(|_| resolved))
         }
         None => {
             for schema in search_path_schemas(search_path) {
@@ -171,7 +177,10 @@ pub(crate) async fn resolve_existing_procedure_name(
     match schema_opt {
         Some(schema) => {
             let resolved = ResolvedName::new(schema, obj)?;
-            Ok(store.get_procedure(txn, &resolved.full).await?.map(|_| resolved))
+            Ok(store
+                .get_procedure(txn, &resolved.full)
+                .await?
+                .map(|_| resolved))
         }
         None => {
             for schema in search_path_schemas(search_path) {
@@ -257,7 +266,8 @@ mod tests {
     #[test]
     fn resolve_ddl_object_name_uses_search_path_head() {
         let name = ObjectName(vec![ident("t")]);
-        let resolved = resolve_ddl_object_name(&name, &["app".to_string(), "public".to_string()]).unwrap();
+        let resolved =
+            resolve_ddl_object_name(&name, &["app".to_string(), "public".to_string()]).unwrap();
         assert_eq!(resolved.full, "app.t");
     }
 

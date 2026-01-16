@@ -260,7 +260,8 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
         Value::Json(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
         Value::Jsonb(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
         Value::Date(days) => {
-            let s = crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string());
+            let s =
+                crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string());
             Expr::Value(SqlValue::SingleQuotedString(s))
         }
         Value::Time(micros) => {
@@ -1024,7 +1025,9 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                     (BinaryOperator::Minus, DataType::Interval, DataType::Interval) => {
                         DataType::Interval
                     }
-                    (BinaryOperator::Minus, DataType::Date, DataType::Interval) => DataType::Timestamp,
+                    (BinaryOperator::Minus, DataType::Date, DataType::Interval) => {
+                        DataType::Timestamp
+                    }
                     (BinaryOperator::Minus, DataType::Date, DataType::Date) => DataType::Int32,
                     _ => {
                         let left_numeric = matches!(

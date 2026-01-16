@@ -157,9 +157,7 @@ impl Executor {
                 .store()
                 .get_materialized_view(txn, &view_full_name)
                 .await?
-                .ok_or_else(|| {
-                    anyhow!("Materialized view '{}' does not exist", view_full_name)
-                })?;
+                .ok_or_else(|| anyhow!("Materialized view '{}' does not exist", view_full_name))?;
 
             let ast = parse_sql(&query_str)?;
             let query = match ast.into_iter().next() {
@@ -241,14 +239,8 @@ impl Executor {
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
             let name = object_name_from_token(&view_name)?;
-            ddl::execute_drop_materialized_view(
-                &self.store(),
-                txn,
-                search_path,
-                &[name],
-                if_exists,
-            )
-            .await
+            ddl::execute_drop_materialized_view(&self.store(), txn, search_path, &[name], if_exists)
+                .await
         }
         .await;
 

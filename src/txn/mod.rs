@@ -28,11 +28,7 @@ pub(crate) async fn with_savepoints<R>(
 
 /// TiKV `put` wrapper that records undo information when SAVEPOINT is active.
 #[inline]
-pub(crate) async fn txn_put(
-    txn: &mut Transaction,
-    key: Vec<u8>,
-    value: Vec<u8>,
-) -> Result<()> {
+pub(crate) async fn txn_put(txn: &mut Transaction, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
     let should_record = match SAVEPOINTS.try_with(|sp| sp.should_record_key(&key)) {
         Ok(res) => res?,
         Err(_) => false,

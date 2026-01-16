@@ -4,8 +4,8 @@ use super::helpers::{
     apply_offset_limit_fetch, collect_having_agg_funcs, dedup_rows, distinct_on_rows_with_indices,
     eval_having_expr, fill_row_defaults, get_select_item_name, infer_expr_type, AggExpr,
 };
-use super::planner::{self, ScanType};
 use super::names;
+use super::planner::{self, ScanType};
 use super::sequences;
 use super::window::{compute_window_functions, extract_window_functions, WindowFuncInfo};
 use super::{expr::eval_expr, Aggregator, ExecuteResult, Executor};
@@ -36,7 +36,16 @@ impl Executor {
         } = &*query.body
         {
             return self
-                .execute_set_operation(txn, sequence_values, search_path, op, set_quantifier, left, right, ctes)
+                .execute_set_operation(
+                    txn,
+                    sequence_values,
+                    search_path,
+                    op,
+                    set_quantifier,
+                    left,
+                    right,
+                    ctes,
+                )
                 .await;
         }
 
@@ -66,7 +75,14 @@ impl Executor {
 
         if has_joins {
             let result = self
-                .execute_join_query_with_ctes(txn, sequence_values, search_path, query, select, ctes)
+                .execute_join_query_with_ctes(
+                    txn,
+                    sequence_values,
+                    search_path,
+                    query,
+                    select,
+                    ctes,
+                )
                 .await?;
             if let Some((target_name, _temp)) = select_into_target {
                 return self
@@ -614,7 +630,7 @@ impl Executor {
                         Some(&row),
                         Some(schema),
                     )
-                        .await?
+                    .await?
                 } else {
                     Value::Int32(1)
                 };
@@ -878,8 +894,10 @@ impl Executor {
             indexed.sort_by(|(_, a), (_, b)| {
                 for (idx, order_expr) in order_by.iter().enumerate() {
                     let actual_expr = &resolved_order_exprs[idx];
-                    let val_a = eval_expr(actual_expr, Some(a), Some(schema)).unwrap_or(Value::Null);
-                    let val_b = eval_expr(actual_expr, Some(b), Some(schema)).unwrap_or(Value::Null);
+                    let val_a =
+                        eval_expr(actual_expr, Some(a), Some(schema)).unwrap_or(Value::Null);
+                    let val_b =
+                        eval_expr(actual_expr, Some(b), Some(schema)).unwrap_or(Value::Null);
                     let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
                     if cmp != 0 {
                         let asc = order_expr.asc.unwrap_or(true);

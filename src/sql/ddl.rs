@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    AlterColumnOperation, AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption, Expr,
-    DataType as SqlDataType, GeneratedAs, ObjectName, OrderByExpr, Query, TableConstraint,
+    AlterColumnOperation, AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption,
+    DataType as SqlDataType, Expr, GeneratedAs, ObjectName, OrderByExpr, Query, TableConstraint,
 };
 use tikv_client::Transaction;
 
@@ -15,11 +15,11 @@ use super::names;
 use super::sequences;
 use super::{expr::eval_expr, ExecuteResult};
 use crate::storage::TikvStore;
+use crate::txn::{txn_delete, txn_put};
 use crate::types::{
     CheckConstraint, ColumnDef, DataType, ForeignKeyAction, ForeignKeyConstraint, IndexDef, Row,
     TableSchema, Value,
 };
-use crate::txn::{txn_delete, txn_put};
 
 const DDL_SCAN_BATCH_SIZE: u32 = 1024;
 
@@ -31,10 +31,7 @@ async fn resolve_column_data_type(
 ) -> Result<(DataType, bool)> {
     match sql_type {
         SqlDataType::Custom(name, _) => {
-            let type_ident = name
-                .0
-                .last()
-                .ok_or_else(|| anyhow!("Invalid type name"))?;
+            let type_ident = name.0.last().ok_or_else(|| anyhow!("Invalid type name"))?;
             let type_name = type_ident.value.to_uppercase();
 
             match type_name.as_str() {
@@ -79,7 +76,11 @@ async fn create_implicit_sequences_for_schema(
             store
                 .create_sequence(
                     txn,
-                    sequences::build_implicit_sequence_def(&schema.name, &col.name, schema.table_id),
+                    sequences::build_implicit_sequence_def(
+                        &schema.name,
+                        &col.name,
+                        schema.table_id,
+                    ),
                 )
                 .await?;
         }
@@ -156,12 +157,7 @@ fn assign_generated_check_constraint_names(
     }
     used_names.extend(indexes.iter().map(|idx| idx.name.clone()));
     used_names.extend(foreign_keys.iter().map(|fk| fk.name.clone()));
-    used_names.extend(
-        checks
-            .iter()
-            .filter_map(|c| c.name.as_ref())
-            .cloned(),
-    );
+    used_names.extend(checks.iter().filter_map(|c| c.name.as_ref()).cloned());
 
     for (ordinal, check) in checks.iter_mut().enumerate() {
         if check.name.is_some() {
@@ -480,7 +476,9 @@ pub async fn execute_create_table(
                             search_path,
                         )
                         .await?
-                        .ok_or_else(|| anyhow!("Referenced table '{}' does not exist", foreign_table))?
+                        .ok_or_else(|| {
+                            anyhow!("Referenced table '{}' does not exist", foreign_table)
+                        })?
                         .full
                     };
                     let ref_cols: Vec<String> =
@@ -582,10 +580,9 @@ pub async fn execute_create_table(
             } => {
                 if !*is_primary {
                     let col_names: Vec<String> = columns.iter().map(normalize_ident).collect();
-                    let idx_name = name
-                        .as_ref()
-                        .map(|n| n.value.clone())
-                        .unwrap_or_else(|| format!("{}_{}_key", table_object_name, col_names.join("_")));
+                    let idx_name = name.as_ref().map(|n| n.value.clone()).unwrap_or_else(|| {
+                        format!("{}_{}_key", table_object_name, col_names.join("_"))
+                    });
                     indexes.push(IndexDef {
                         name: idx_name,
                         id: next_index_id,
@@ -966,16 +963,22 @@ pub async fn execute_drop_view(
 ) -> Result<ExecuteResult> {
     let mut last = String::new();
     for name in names {
-        let resolved =
-            match names::resolve_existing_view_name(store.as_ref(), txn, name, search_path).await? {
-                Some(resolved) => resolved,
-                None => {
-                    if !if_exists {
-                        return Err(anyhow!("View '{}' does not exist", name));
-                    }
-                    continue;
+        let resolved = match names::resolve_existing_view_name(
+            store.as_ref(),
+            txn,
+            name,
+            search_path,
+        )
+        .await?
+        {
+            Some(resolved) => resolved,
+            None => {
+                if !if_exists {
+                    return Err(anyhow!("View '{}' does not exist", name));
                 }
-            };
+                continue;
+            }
+        };
         if !store.drop_view(txn, &resolved.full).await? && !if_exists {
             return Err(anyhow!("View '{}' does not exist", resolved.full));
         }
@@ -1032,9 +1035,7 @@ pub async fn execute_create_materialized_view(
             .await?;
     }
 
-    Ok(ExecuteResult::CreateMaterializedView {
-        view_name,
-    })
+    Ok(ExecuteResult::CreateMaterializedView { view_name })
 }
 
 pub async fn execute_drop_materialized_view(
@@ -1085,11 +1086,7 @@ pub async fn execute_refresh_materialized_view(
     name: &str,
     rows: Vec<Row>,
 ) -> Result<ExecuteResult> {
-    if store
-        .get_materialized_view(txn, name)
-        .await?
-        .is_none()
-    {
+    if store.get_materialized_view(txn, name).await?.is_none() {
         return Err(anyhow!("Materialized view '{}' does not exist", name));
     }
 
@@ -1125,15 +1122,17 @@ pub async fn execute_drop_table(
 ) -> Result<ExecuteResult> {
     let mut last = String::new();
     for name in names {
-        let resolved = match names::resolve_existing_table_name(store.as_ref(), txn, name, search_path).await? {
-            Some(resolved) => resolved,
-            None => {
-                if !if_exists {
-                    return Err(anyhow!("Table '{}' does not exist", name));
+        let resolved =
+            match names::resolve_existing_table_name(store.as_ref(), txn, name, search_path).await?
+            {
+                Some(resolved) => resolved,
+                None => {
+                    if !if_exists {
+                        return Err(anyhow!("Table '{}' does not exist", name));
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
         drop_owned_sequences_for_table(store, txn, &resolved.full).await?;
         store.drop_table(txn, &resolved.full).await?;
         last = resolved.full;
@@ -1264,7 +1263,12 @@ pub async fn execute_alter_table(
                         txn,
                         sequences::build_implicit_sequence_def(
                             &schema.name,
-                            schema.columns.last().expect("column just pushed").name.as_str(),
+                            schema
+                                .columns
+                                .last()
+                                .expect("column just pushed")
+                                .name
+                                .as_str(),
                             schema.table_id,
                         ),
                     )
@@ -1308,10 +1312,9 @@ pub async fn execute_alter_table(
                     schema.columns[idx].unique = true;
                 }
 
-                let index_name = name
-                    .as_ref()
-                    .map(normalize_ident)
-                    .unwrap_or_else(|| format!("{}_{}_key", table_object_name, col_names.join("_")));
+                let index_name = name.as_ref().map(normalize_ident).unwrap_or_else(|| {
+                    format!("{}_{}_key", table_object_name, col_names.join("_"))
+                });
 
                 if schema.indexes.iter().any(|i| i.name == index_name) {
                     return Err(anyhow!("Index exists"));
@@ -1440,9 +1443,7 @@ pub async fn execute_alter_table(
                         let mut fk_values: Vec<Value> = Vec::with_capacity(fk_cols.len());
                         let mut all_null = true;
                         for col_name in &fk_cols {
-                            let idx = schema
-                                .column_index(col_name)
-                                .expect("validated above");
+                            let idx = schema.column_index(col_name).expect("validated above");
                             let val = row.values[idx].clone();
                             if val != Value::Null {
                                 all_null = false;
@@ -1591,7 +1592,11 @@ pub async fn execute_alter_table(
                 });
             }
 
-            if let Some(pos) = schema.indexes.iter().position(|i| i.name == constraint_name) {
+            if let Some(pos) = schema
+                .indexes
+                .iter()
+                .position(|i| i.name == constraint_name)
+            {
                 let index = schema.indexes[pos].clone();
                 if !index.unique {
                     if !if_exists {
@@ -1682,8 +1687,7 @@ pub async fn execute_alter_table(
                     let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                     while let Some(batch) = scanner.next_batch(txn).await? {
                         for pair in batch {
-                            let (key, value): (tikv_client::Key, tikv_client::Value) =
-                                pair.into();
+                            let (key, value): (tikv_client::Key, tikv_client::Value) = pair.into();
                             let mut row = crate::storage::deserialize_row(&value)?;
                             fill_row_defaults(&mut row, &schema)?;
                             row.values.remove(idx);
@@ -1757,9 +1761,7 @@ pub async fn execute_alter_table(
 
             let (schema_name, _) = names::parse_full_name(&t)?;
             let new_full = format!("{}.{}", schema_name, new_table);
-            store
-                .rename_table_schema(txn, &t, &new_full)
-                .await?;
+            store.rename_table_schema(txn, &t, &new_full).await?;
             result_table_name = new_full.clone();
 
             // Update referencing-side metadata (FKs store ref_table as a string).
@@ -1879,7 +1881,10 @@ pub async fn execute_alter_table(
                     }
 
                     if schema.pk_indices.contains(&col_idx) {
-                        return Err(anyhow!("Cannot alter type of primary key column '{}'", col_name));
+                        return Err(anyhow!(
+                            "Cannot alter type of primary key column '{}'",
+                            col_name
+                        ));
                     }
                     if schema
                         .foreign_keys
@@ -1919,8 +1924,7 @@ pub async fn execute_alter_table(
                     let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                     while let Some(batch) = scanner.next_batch(txn).await? {
                         for pair in batch {
-                            let (key, value): (tikv_client::Key, tikv_client::Value) =
-                                pair.into();
+                            let (key, value): (tikv_client::Key, tikv_client::Value) = pair.into();
                             let mut row = crate::storage::deserialize_row(&value)?;
                             fill_row_defaults(&mut row, &schema)?;
 

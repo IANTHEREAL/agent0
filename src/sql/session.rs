@@ -91,7 +91,9 @@ impl Session {
         &mut self,
     ) -> Option<(&mut Transaction, &mut HashMap<String, i64>, &[String])> {
         match &mut self.state {
-            TransactionState::Active(txn) => Some((txn, &mut self.last_sequence_values, &self.search_path)),
+            TransactionState::Active(txn) => {
+                Some((txn, &mut self.last_sequence_values, &self.search_path))
+            }
             _ => None,
         }
     }
@@ -114,14 +116,18 @@ impl Session {
 
     pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
         if !self.is_in_transaction() {
-            return Err(anyhow!("RELEASE SAVEPOINT can only be used in transaction blocks"));
+            return Err(anyhow!(
+                "RELEASE SAVEPOINT can only be used in transaction blocks"
+            ));
         }
         self.savepoints.release(name)
     }
 
     pub async fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
         if !self.is_in_transaction() {
-            return Err(anyhow!("ROLLBACK TO SAVEPOINT can only be used in transaction blocks"));
+            return Err(anyhow!(
+                "ROLLBACK TO SAVEPOINT can only be used in transaction blocks"
+            ));
         }
 
         let mut prepared = self.savepoints.prepare_rollback_to(name)?;

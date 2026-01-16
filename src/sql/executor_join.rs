@@ -344,8 +344,8 @@ impl Executor {
                     let mut combined_schema = base_schema;
 
                     for join in &table_with_joins.joins {
-                        let (join_alias, join_schema, join_rows) =
-                            self.resolve_table_factor(
+                        let (join_alias, join_schema, join_rows) = self
+                            .resolve_table_factor(
                                 txn,
                                 sequence_values,
                                 search_path,
@@ -615,9 +615,9 @@ impl Executor {
                         .as_ref()
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| obj_name.clone());
-                    let (schema, rows) =
-                        self.get_table_data(txn, sequence_values, search_path, &tbl, ctes)
-                            .await?;
+                    let (schema, rows) = self
+                        .get_table_data(txn, sequence_values, search_path, &tbl, ctes)
+                        .await?;
                     (als, schema, rows)
                 }
                 TableFactor::Derived {
@@ -675,9 +675,9 @@ impl Executor {
                             .as_ref()
                             .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| obj_name.clone());
-                        let (schema, rows) =
-                            self.get_table_data(txn, sequence_values, search_path, &tbl, ctes)
-                                .await?;
+                        let (schema, rows) = self
+                            .get_table_data(txn, sequence_values, search_path, &tbl, ctes)
+                            .await?;
                         (als, schema, rows)
                     }
                     TableFactor::Derived {
@@ -737,9 +737,9 @@ impl Executor {
                         .as_ref()
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| obj_name.clone());
-                    let (schema, rows) =
-                        self.get_table_data(txn, sequence_values, search_path, &tbl, ctes)
-                            .await?;
+                    let (schema, rows) = self
+                        .get_table_data(txn, sequence_values, search_path, &tbl, ctes)
+                        .await?;
                     (als, schema, rows)
                 }
                 TableFactor::Derived {
@@ -762,8 +762,14 @@ impl Executor {
                     (alias_name, schema, rows)
                 }
                 TableFactor::NestedJoin { .. } => {
-                    self.resolve_table_factor(txn, sequence_values, search_path, &join.relation, ctes)
-                        .await?
+                    self.resolve_table_factor(
+                        txn,
+                        sequence_values,
+                        search_path,
+                        &join.relation,
+                        ctes,
+                    )
+                    .await?
                 }
                 _ => return Err(anyhow!("Unsupported join table")),
             };
@@ -909,8 +915,13 @@ impl Executor {
                             value_offset += schema.columns.len();
                         }
                         Some(
-                            self.resolve_subqueries(txn, sequence_values, search_path, &substituted)
-                                .await?,
+                            self.resolve_subqueries(
+                                txn,
+                                sequence_values,
+                                search_path,
+                                &substituted,
+                            )
+                            .await?,
                         )
                     } else {
                         None
@@ -1025,8 +1036,14 @@ impl Executor {
                     combined_schema: &final_schema,
                 };
                 if matches!(
-                    self.eval_expr_join_maybe_sequence(txn, sequence_values, search_path, sel, &ctx)
-                        .await?,
+                    self.eval_expr_join_maybe_sequence(
+                        txn,
+                        sequence_values,
+                        search_path,
+                        sel,
+                        &ctx
+                    )
+                    .await?,
                     Value::Boolean(true)
                 ) {
                     v.push(row);
@@ -1109,8 +1126,14 @@ impl Executor {
                 let mut key = Vec::new();
                 for expr in group_keys_exprs {
                     key.push(
-                        self.eval_expr_join_maybe_sequence(txn, sequence_values, search_path, expr, &ctx)
-                            .await?,
+                        self.eval_expr_join_maybe_sequence(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            expr,
+                            &ctx,
+                        )
+                        .await?,
                     );
                 }
                 let key_bytes = bincode::serialize(&key).unwrap();
@@ -1193,8 +1216,14 @@ impl Executor {
                     }
 
                     let val = if let Some(e) = arg_expr {
-                        self.eval_expr_join_maybe_sequence(txn, sequence_values, search_path, e, &ctx)
-                            .await?
+                        self.eval_expr_join_maybe_sequence(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            e,
+                            &ctx,
+                        )
+                        .await?
                     } else {
                         Value::Int32(1)
                     };
@@ -1656,7 +1685,7 @@ impl Executor {
                                     e,
                                     &ctx,
                                 )
-                                    .await?,
+                                .await?,
                             );
                         }
                         SelectItem::Wildcard(_) => {}
@@ -1724,7 +1753,7 @@ impl Executor {
                             expr,
                             &ctx,
                         )
-                            .await?,
+                        .await?,
                     );
                 }
                 result_rows.push(Row::new(vals));

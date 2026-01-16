@@ -193,12 +193,10 @@ impl Executor {
         let mut resolved = Vec::with_capacity(projection.len());
         for item in projection {
             let resolved_item = match item {
-                SelectItem::UnnamedExpr(e) => {
-                    SelectItem::UnnamedExpr(
-                        self.resolve_subqueries(txn, sequence_values, search_path, e)
-                            .await?,
-                    )
-                }
+                SelectItem::UnnamedExpr(e) => SelectItem::UnnamedExpr(
+                    self.resolve_subqueries(txn, sequence_values, search_path, e)
+                        .await?,
+                ),
                 SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias {
                     expr: self
                         .resolve_subqueries(txn, sequence_values, search_path, expr)

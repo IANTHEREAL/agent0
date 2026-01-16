@@ -50,17 +50,16 @@ impl Executor {
         let ret_cols = dml::build_returning_columns(returning, &schema)?;
 
         for exprs in values {
-            let (mut row_vals, indices) =
-                dml::prepare_insert_row(
-                    &self.store(),
-                    txn,
-                    sequence_values,
-                    search_path,
-                    &schema,
-                    columns,
-                    exprs,
-                )
-                .await?;
+            let (mut row_vals, indices) = dml::prepare_insert_row(
+                &self.store(),
+                txn,
+                sequence_values,
+                search_path,
+                &schema,
+                columns,
+                exprs,
+            )
+            .await?;
             dml::fill_missing_columns(
                 &self.store(),
                 txn,
@@ -75,21 +74,28 @@ impl Executor {
             let row = Row::new(row_vals);
             dml::validate_check_constraints(&schema, &row)?;
 
-            let result =
-                dml::execute_insert_row(&self.store(), txn, &t, &schema, row, on_conflict, &enum_cache).await?;
+            let result = dml::execute_insert_row(
+                &self.store(),
+                txn,
+                &t,
+                &schema,
+                row,
+                on_conflict,
+                &enum_cache,
+            )
+            .await?;
             if let Some(final_row) = result {
                 affected += 1;
-                if let Some(ret_row) =
-                    dml::eval_returning_row(
-                        &self.store(),
-                        txn,
-                        sequence_values,
-                        search_path,
-                        returning,
-                        &final_row,
-                        &schema,
-                    )
-                        .await?
+                if let Some(ret_row) = dml::eval_returning_row(
+                    &self.store(),
+                    txn,
+                    sequence_values,
+                    search_path,
+                    returning,
+                    &final_row,
+                    &schema,
+                )
+                .await?
                 {
                     ret_rows.push(ret_row);
                 }
@@ -133,10 +139,14 @@ impl Executor {
     ) -> Result<ExecuteResult> {
         let t = match &from[0].relation {
             sqlparser::ast::TableFactor::Table { name, .. } => {
-                let resolved =
-                    names::resolve_existing_table_name(self.store().as_ref(), txn, name, search_path)
-                        .await?
-                        .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?;
+                let resolved = names::resolve_existing_table_name(
+                    self.store().as_ref(),
+                    txn,
+                    name,
+                    search_path,
+                )
+                .await?
+                .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?;
                 resolved.full
             }
             _ => return Err(anyhow!("Unsupported")),
@@ -173,23 +183,22 @@ impl Executor {
                         Some(&r),
                         Some(&schema)
                     )
-                        .await?,
+                    .await?,
                     Value::Boolean(true)
                 ) {
                     continue;
                 }
             }
-            if let Some(ret_row) =
-                dml::eval_returning_row(
-                    &self.store(),
-                    txn,
-                    sequence_values,
-                    search_path,
-                    returning,
-                    &r,
-                    &schema,
-                )
-                    .await?
+            if let Some(ret_row) = dml::eval_returning_row(
+                &self.store(),
+                txn,
+                sequence_values,
+                search_path,
+                returning,
+                &r,
+                &schema,
+            )
+            .await?
             {
                 ret_rows.push(ret_row);
             }
@@ -233,14 +242,11 @@ impl Executor {
         returning: &Option<Vec<SelectItem>>,
     ) -> Result<ExecuteResult> {
         let resolved_target = match &table.relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => names::resolve_existing_table_name(
-                self.store().as_ref(),
-                txn,
-                name,
-                search_path,
-            )
-            .await?
-            .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?,
+            sqlparser::ast::TableFactor::Table { name, .. } => {
+                names::resolve_existing_table_name(self.store().as_ref(), txn, name, search_path)
+                    .await?
+                    .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?
+            }
             _ => return Err(anyhow!("Unsupported")),
         };
         let t = resolved_target.full.clone();
@@ -272,14 +278,16 @@ impl Executor {
 
         let (from_schema, from_rows, from_alias) = if let Some(from_table) = from {
             let from_resolved = match &from_table.relation {
-                sqlparser::ast::TableFactor::Table { name, .. } => names::resolve_existing_table_name(
-                    self.store().as_ref(),
-                    txn,
-                    name,
-                    search_path,
-                )
-                .await?
-                .ok_or_else(|| anyhow!("FROM table '{}' does not exist", name))?,
+                sqlparser::ast::TableFactor::Table { name, .. } => {
+                    names::resolve_existing_table_name(
+                        self.store().as_ref(),
+                        txn,
+                        name,
+                        search_path,
+                    )
+                    .await?
+                    .ok_or_else(|| anyhow!("FROM table '{}' does not exist", name))?
+                }
                 _ => return Err(anyhow!("Unsupported FROM table")),
             };
             let from_name = from_resolved.full.clone();
@@ -354,7 +362,7 @@ impl Executor {
                             Some(r),
                             Some(&schema)
                         )
-                            .await?,
+                        .await?,
                         Value::Boolean(true)
                     ) {
                         continue;
@@ -421,19 +429,19 @@ impl Executor {
             let new_row = Row::new(new_vals);
             dml::validate_check_constraints(&schema, &new_row)?;
             let updated_row =
-                dml::execute_update_row(&self.store(), txn, &t, &schema, r, new_row, &enum_cache).await?;
+                dml::execute_update_row(&self.store(), txn, &t, &schema, r, new_row, &enum_cache)
+                    .await?;
 
-            if let Some(ret_row) =
-                dml::eval_returning_row(
-                    &self.store(),
-                    txn,
-                    sequence_values,
-                    search_path,
-                    returning,
-                    &updated_row,
-                    &schema,
-                )
-                    .await?
+            if let Some(ret_row) = dml::eval_returning_row(
+                &self.store(),
+                txn,
+                sequence_values,
+                search_path,
+                returning,
+                &updated_row,
+                &schema,
+            )
+            .await?
             {
                 ret_rows.push(ret_row);
             }

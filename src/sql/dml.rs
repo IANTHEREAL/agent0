@@ -190,22 +190,24 @@ pub async fn eval_returning_row(
         for item in items {
             match item {
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                    vals.push(if sequences::expr_uses_sequence_functions(e)
-                        || sequences::expr_uses_current_schema(e)
-                    {
-                        sequences::eval_expr_with_sequences(
-                            store,
-                            txn,
-                            sequence_values,
-                            search_path,
-                            e,
-                            Some(row),
-                            Some(schema),
-                        )
-                        .await?
-                    } else {
-                        eval_expr(e, Some(row), Some(schema))?
-                    });
+                    vals.push(
+                        if sequences::expr_uses_sequence_functions(e)
+                            || sequences::expr_uses_current_schema(e)
+                        {
+                            sequences::eval_expr_with_sequences(
+                                store,
+                                txn,
+                                sequence_values,
+                                search_path,
+                                e,
+                                Some(row),
+                                Some(schema),
+                            )
+                            .await?
+                        } else {
+                            eval_expr(e, Some(row), Some(schema))?
+                        },
+                    );
                 }
                 SelectItem::Wildcard(_) => vals.extend(row.values.clone()),
                 _ => {}
@@ -990,7 +992,8 @@ async fn eval_default_expr_maybe_sequence(
 
     if let Some(sqlparser::ast::Statement::Query(q)) = ast.into_iter().next() {
         if let sqlparser::ast::SetExpr::Select(s) = *q.body {
-            if let Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) = s.projection.into_iter().next()
+            if let Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) =
+                s.projection.into_iter().next()
             {
                 return if sequences::expr_uses_sequence_functions(&e)
                     || sequences::expr_uses_current_schema(&e)
@@ -1280,7 +1283,10 @@ mod tests {
         let mut cache: EnumLabelCache = HashMap::new();
         cache.insert(
             "public.role".to_string(),
-            ["USER", "ADMIN"].into_iter().map(|s| s.to_string()).collect(),
+            ["USER", "ADMIN"]
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
         );
         cache
     }

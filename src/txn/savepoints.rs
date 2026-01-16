@@ -185,7 +185,10 @@ mod tests {
         m.release("b").unwrap();
         assert_eq!(m.stack.len(), 1);
         let parent = &m.stack[0];
-        assert_eq!(parent.undo.get(b"k".as_slice()).cloned().flatten(), Some(vec![0]));
+        assert_eq!(
+            parent.undo.get(b"k".as_slice()).cloned().flatten(),
+            Some(vec![0])
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
+use super::{names, sequences};
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, ForeignKeyAction, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
-use super::{names, sequences};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tikv_client::Transaction;
@@ -843,8 +843,9 @@ async fn get_columns_rows(
             for (i, col) in schema.columns.iter().enumerate() {
                 let (data_type_str, udt_schema, udt_name) = match &col.data_type {
                     DataType::UserDefined(full_udt) => {
-                        let (schema_name, type_name) =
-                            full_udt.rsplit_once('.').unwrap_or(("public", full_udt.as_str()));
+                        let (schema_name, type_name) = full_udt
+                            .rsplit_once('.')
+                            .unwrap_or(("public", full_udt.as_str()));
                         ("USER-DEFINED", schema_name, type_name)
                     }
                     _ => {
@@ -869,10 +870,7 @@ async fn get_columns_rows(
                         table_schema,
                         sequences::implicit_sequence_name(&table_name, &col.name)
                     );
-                    text_val(&format!(
-                        "nextval('{}'::regclass)",
-                        seq_full_name
-                    ))
+                    text_val(&format!("nextval('{}'::regclass)", seq_full_name))
                 } else {
                     col.default_expr
                         .as_ref()
@@ -1800,17 +1798,17 @@ async fn get_pg_type_rows(
         int_val(16385),     // oid: custom type OID for vector
         text_val("vector"), // typname
         int_val(schema_oid(schema_oids, "pg_catalog")),
-        int_val(10),        // typowner: system user
-        int_val(-1),        // typlen: variable length
-        text_val("f"),      // typbyval: false (not passed by value)
-        text_val("b"),      // typtype: base type
-        text_val("A"),      // typcategory: Array type
-        text_val("f"),      // typispreferred: false
-        text_val("t"),      // typisdefined: true
-        text_val(","),      // typdelim: comma delimiter
-        int_val(0),         // typrelid: not a composite type
-        int_val(0),         // typelem: not an array
-        int_val(0),         // typarray: no array type
+        int_val(10),   // typowner: system user
+        int_val(-1),   // typlen: variable length
+        text_val("f"), // typbyval: false (not passed by value)
+        text_val("b"), // typtype: base type
+        text_val("A"), // typcategory: Array type
+        text_val("f"), // typispreferred: false
+        text_val("t"), // typisdefined: true
+        text_val(","), // typdelim: comma delimiter
+        int_val(0),    // typrelid: not a composite type
+        int_val(0),    // typelem: not an array
+        int_val(0),    // typarray: no array type
     ]));
 
     rows.push(Row::new(vec![

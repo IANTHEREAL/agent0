@@ -53,7 +53,8 @@ impl SavepointState {
             .lock()
             .map_err(|_| anyhow!("savepoint manager mutex poisoned"))?;
         let res = manager.release(name);
-        self.active.store(manager.has_savepoints(), Ordering::Release);
+        self.active
+            .store(manager.has_savepoints(), Ordering::Release);
         res
     }
 
@@ -63,7 +64,8 @@ impl SavepointState {
             .lock()
             .map_err(|_| anyhow!("savepoint manager mutex poisoned"))?;
         let prepared = manager.prepare_rollback_to(name)?;
-        self.active.store(manager.has_savepoints(), Ordering::Release);
+        self.active
+            .store(manager.has_savepoints(), Ordering::Release);
         Ok(prepared)
     }
 
@@ -92,4 +94,3 @@ impl SavepointState {
         Ok(())
     }
 }
-

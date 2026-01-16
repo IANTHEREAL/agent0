@@ -37,7 +37,13 @@ impl Executor {
                     ctes.insert(cte_name, (schema, rows));
                 } else {
                     let cte_result = self
-                        .execute_query_with_ctes(txn, sequence_values, search_path, &cte.query, &ctes)
+                        .execute_query_with_ctes(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            &cte.query,
+                            &ctes,
+                        )
                         .await?;
                     match cte_result {
                         ExecuteResult::Select {
@@ -135,7 +141,13 @@ impl Executor {
             for_clause: None,
         };
         let base_result = self
-            .execute_query_with_ctes(txn, sequence_values, search_path, &base_query, existing_ctes)
+            .execute_query_with_ctes(
+                txn,
+                sequence_values,
+                search_path,
+                &base_query,
+                existing_ctes,
+            )
             .await?;
         let (columns, base_types, mut all_rows) = match base_result {
             ExecuteResult::Select {
@@ -170,10 +182,7 @@ impl Executor {
                 .enumerate()
                 .map(|(idx, n)| ColumnDef {
                     name: n.clone(),
-                    data_type: inferred_types
-                        .get(idx)
-                        .cloned()
-                        .unwrap_or(DataType::Text),
+                    data_type: inferred_types.get(idx).cloned().unwrap_or(DataType::Text),
                     nullable: true,
                     primary_key: false,
                     unique: false,

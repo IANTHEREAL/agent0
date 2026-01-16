@@ -250,14 +250,18 @@ impl Executor {
         sql: &str,
     ) -> Result<ExecuteResult> {
         let sql = trim_sql_end(sql);
-        let mut rest = consume_keyword(sql, "CREATE").ok_or_else(|| anyhow!("Invalid CREATE TYPE syntax"))?;
-        rest = consume_keyword(rest, "TYPE").ok_or_else(|| anyhow!("Invalid CREATE TYPE syntax"))?;
+        let mut rest =
+            consume_keyword(sql, "CREATE").ok_or_else(|| anyhow!("Invalid CREATE TYPE syntax"))?;
+        rest =
+            consume_keyword(rest, "TYPE").ok_or_else(|| anyhow!("Invalid CREATE TYPE syntax"))?;
 
         let (type_token, rest) = next_token(rest).ok_or_else(|| anyhow!("Missing type name"))?;
         let mut rest = rest;
 
-        rest = consume_keyword(rest, "AS").ok_or_else(|| anyhow!("Invalid CREATE TYPE AS ENUM syntax"))?;
-        rest = consume_keyword(rest, "ENUM").ok_or_else(|| anyhow!("Invalid CREATE TYPE AS ENUM syntax"))?;
+        rest = consume_keyword(rest, "AS")
+            .ok_or_else(|| anyhow!("Invalid CREATE TYPE AS ENUM syntax"))?;
+        rest = consume_keyword(rest, "ENUM")
+            .ok_or_else(|| anyhow!("Invalid CREATE TYPE AS ENUM syntax"))?;
 
         let (schema, name, _full_name) = parse_type_name_token(type_token)?;
         let (labels, _tail) = parse_enum_labels(rest)?;
@@ -345,10 +349,7 @@ mod tests {
     #[test]
     fn test_consume_keyword_accepts_paren_boundary() {
         assert_eq!(consume_keyword("ENUM('USER')", "ENUM"), Some("('USER')"));
-        assert_eq!(
-            consume_keyword("ENUM ('USER')", "ENUM"),
-            Some(" ('USER')")
-        );
+        assert_eq!(consume_keyword("ENUM ('USER')", "ENUM"), Some(" ('USER')"));
         assert_eq!(consume_keyword("ENUMX('USER')", "ENUM"), None);
     }
 

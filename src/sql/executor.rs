@@ -143,7 +143,9 @@ impl Executor {
                         session.rollback_to_savepoint(&sp).await?;
                         ExecuteResult::Empty
                     }
-                    Statement::Rollback { savepoint: None, .. } => {
+                    Statement::Rollback {
+                        savepoint: None, ..
+                    } => {
                         session.rollback().await?;
                         ExecuteResult::Empty
                     }
@@ -330,16 +332,25 @@ impl Executor {
                             .await
                     }
                     ObjectType::Index => {
-                        self.execute_drop_index(txn, search_path, names, *if_exists).await
+                        self.execute_drop_index(txn, search_path, names, *if_exists)
+                            .await
                     }
                     ObjectType::Role => {
                         rbac::execute_drop_role(&self.auth_manager, txn, names, *if_exists).await
                     }
                     ObjectType::Sequence => {
-                        sequences::execute_drop_sequence(&self.store, txn, search_path, names, *if_exists).await
+                        sequences::execute_drop_sequence(
+                            &self.store,
+                            txn,
+                            search_path,
+                            names,
+                            *if_exists,
+                        )
+                        .await
                     }
                     ObjectType::Schema => {
-                        self.execute_drop_schema(txn, search_path, names, *if_exists).await
+                        self.execute_drop_schema(txn, search_path, names, *if_exists)
+                            .await
                     }
                     _ => Ok(ExecuteResult::Empty),
                 }
@@ -364,17 +375,34 @@ impl Executor {
                 on,
                 ..
             } => {
-                self.execute_insert(txn, sequence_values, search_path, table_name, columns, source, returning, on)
-                    .await
+                self.execute_insert(
+                    txn,
+                    sequence_values,
+                    search_path,
+                    table_name,
+                    columns,
+                    source,
+                    returning,
+                    on,
+                )
+                .await
             }
             Statement::Delete {
                 from,
                 selection,
                 returning,
                 ..
-            } => self
-                .execute_delete(txn, sequence_values, search_path, from, selection, returning)
-                .await,
+            } => {
+                self.execute_delete(
+                    txn,
+                    sequence_values,
+                    search_path,
+                    from,
+                    selection,
+                    returning,
+                )
+                .await
+            }
             Statement::Update {
                 table,
                 assignments,
@@ -383,16 +411,31 @@ impl Executor {
                 returning,
                 ..
             } => {
-                self.execute_update(txn, sequence_values, search_path, table, assignments, from, selection, returning)
+                self.execute_update(
+                    txn,
+                    sequence_values,
+                    search_path,
+                    table,
+                    assignments,
+                    from,
+                    selection,
+                    returning,
+                )
+                .await
+            }
+            Statement::Query(query) => {
+                self.execute_query(txn, sequence_values, search_path, query)
                     .await
             }
-            Statement::Query(query) => self.execute_query(txn, sequence_values, search_path, query).await,
             Statement::ShowTables { .. } => self.execute_show_tables(txn, search_path).await,
             Statement::SetVariable { .. }
             | Statement::SetTimeZone { .. }
             | Statement::SetNames { .. }
             | Statement::SetTransaction { .. } => Ok(ExecuteResult::Empty),
-            Statement::CreateType { name, representation } => {
+            Statement::CreateType {
+                name,
+                representation,
+            } => {
                 udt::execute_create_type(&self.store, txn, search_path, name, representation).await
             }
             Statement::CreateSchema {
@@ -411,7 +454,9 @@ impl Executor {
                 if schema_prefix.is_some() {
                     return Err(anyhow!("Invalid schema name '{}'", schema_obj));
                 }
-                self.store.create_schema(txn, &schema, *if_not_exists).await?;
+                self.store
+                    .create_schema(txn, &schema, *if_not_exists)
+                    .await?;
                 Ok(ExecuteResult::Empty)
             }
             Statement::CreateFunction { .. } => Ok(ExecuteResult::Empty),
@@ -445,10 +490,25 @@ impl Executor {
                 ..
             } => {
                 if *materialized {
-                    self.execute_create_materialized_view(txn, sequence_values, search_path, name, query, *or_replace)
-                        .await
+                    self.execute_create_materialized_view(
+                        txn,
+                        sequence_values,
+                        search_path,
+                        name,
+                        query,
+                        *or_replace,
+                    )
+                    .await
                 } else {
-                    ddl::execute_create_view(&self.store, txn, search_path, name, query, *or_replace).await
+                    ddl::execute_create_view(
+                        &self.store,
+                        txn,
+                        search_path,
+                        name,
+                        query,
+                        *or_replace,
+                    )
+                    .await
                 }
             }
             Statement::AlterIndex { .. } => Ok(ExecuteResult::Empty),
@@ -534,9 +594,19 @@ impl Executor {
         row: Option<&Row>,
         schema: Option<&TableSchema>,
     ) -> Result<Value> {
-        if sequences::expr_uses_sequence_functions(expr) || sequences::expr_uses_current_schema(expr) {
-            sequences::eval_expr_with_sequences(&self.store, txn, sequence_values, search_path, expr, row, schema)
-                .await
+        if sequences::expr_uses_sequence_functions(expr)
+            || sequences::expr_uses_current_schema(expr)
+        {
+            sequences::eval_expr_with_sequences(
+                &self.store,
+                txn,
+                sequence_values,
+                search_path,
+                expr,
+                row,
+                schema,
+            )
+            .await
         } else {
             super::expr::eval_expr(expr, row, schema)
         }
@@ -550,9 +620,18 @@ impl Executor {
         expr: &Expr,
         join_ctx: &super::expr::JoinContext<'_>,
     ) -> Result<Value> {
-        if sequences::expr_uses_sequence_functions(expr) || sequences::expr_uses_current_schema(expr) {
-            sequences::eval_expr_join_with_sequences(&self.store, txn, sequence_values, search_path, expr, join_ctx)
-                .await
+        if sequences::expr_uses_sequence_functions(expr)
+            || sequences::expr_uses_current_schema(expr)
+        {
+            sequences::eval_expr_join_with_sequences(
+                &self.store,
+                txn,
+                sequence_values,
+                search_path,
+                expr,
+                join_ctx,
+            )
+            .await
         } else {
             super::expr::eval_expr_join(expr, join_ctx)
         }
@@ -746,7 +825,9 @@ impl Executor {
             if schema_prefix.is_some() {
                 return Err(anyhow!("Invalid schema name '{}'", name));
             }
-            self.store.drop_schema_restrict(txn, &schema, if_exists).await?;
+            self.store
+                .drop_schema_restrict(txn, &schema, if_exists)
+                .await?;
         }
         Ok(ExecuteResult::Empty)
     }

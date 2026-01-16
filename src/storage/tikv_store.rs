@@ -1,8 +1,8 @@
 use super::encoding::*;
+use crate::txn::{txn_delete, txn_put};
 use crate::types::{
     DataType, Row, SequenceBacking, SequenceDef, SequenceState, TableSchema, UserTypeDef, Value,
 };
-use crate::txn::{txn_delete, txn_put};
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
 use tikv_client::{
@@ -243,42 +243,60 @@ impl TikvStore {
         table_prefix.extend_from_slice(schema.as_bytes());
         table_prefix.push(b'.');
         if self.prefix_has_any(txn, table_prefix).await? {
-            return Err(anyhow!("cannot drop schema '{}': schema is not empty", schema));
+            return Err(anyhow!(
+                "cannot drop schema '{}': schema is not empty",
+                schema
+            ));
         }
 
         let mut view_prefix = encode_view_prefix();
         view_prefix.extend_from_slice(schema.as_bytes());
         view_prefix.push(b'.');
         if self.prefix_has_any(txn, view_prefix).await? {
-            return Err(anyhow!("cannot drop schema '{}': schema is not empty", schema));
+            return Err(anyhow!(
+                "cannot drop schema '{}': schema is not empty",
+                schema
+            ));
         }
 
         let mut matview_prefix = encode_matview_prefix();
         matview_prefix.extend_from_slice(schema.as_bytes());
         matview_prefix.push(b'.');
         if self.prefix_has_any(txn, matview_prefix).await? {
-            return Err(anyhow!("cannot drop schema '{}': schema is not empty", schema));
+            return Err(anyhow!(
+                "cannot drop schema '{}': schema is not empty",
+                schema
+            ));
         }
 
         let mut procedure_prefix = encode_procedure_prefix();
         procedure_prefix.extend_from_slice(schema.as_bytes());
         procedure_prefix.push(b'.');
         if self.prefix_has_any(txn, procedure_prefix).await? {
-            return Err(anyhow!("cannot drop schema '{}': schema is not empty", schema));
+            return Err(anyhow!(
+                "cannot drop schema '{}': schema is not empty",
+                schema
+            ));
         }
 
         let mut type_prefix = encode_type_prefix();
         type_prefix.extend_from_slice(schema.as_bytes());
         type_prefix.push(b'.');
         if self.prefix_has_any(txn, type_prefix).await? {
-            return Err(anyhow!("cannot drop schema '{}': schema is not empty", schema));
+            return Err(anyhow!(
+                "cannot drop schema '{}': schema is not empty",
+                schema
+            ));
         }
 
         let mut sequence_prefix = encode_sequence_prefix();
         sequence_prefix.extend_from_slice(schema.as_bytes());
         sequence_prefix.push(b'.');
         if self.prefix_has_any(txn, sequence_prefix).await? {
-            return Err(anyhow!("cannot drop schema '{}': schema is not empty", schema));
+            return Err(anyhow!(
+                "cannot drop schema '{}': schema is not empty",
+                schema
+            ));
         }
 
         txn_delete(txn, key).await?;
@@ -689,21 +707,36 @@ impl TikvStore {
                         full_name
                     ));
                 }
-                let value_u64: u64 = value
-                    .try_into()
-                    .map_err(|_| anyhow!("setval: value {} is too large for sequence \"{}\"", value, full_name))?;
+                let value_u64: u64 = value.try_into().map_err(|_| {
+                    anyhow!(
+                        "setval: value {} is too large for sequence \"{}\"",
+                        value,
+                        full_name
+                    )
+                })?;
                 let stored = if is_called {
                     value_u64
                 } else {
-                    value_u64
-                        .checked_sub(1)
-                        .ok_or_else(|| anyhow!("setval: value {} is out of bounds for sequence \"{}\"", value, full_name))?
+                    value_u64.checked_sub(1).ok_or_else(|| {
+                        anyhow!(
+                            "setval: value {} is out of bounds for sequence \"{}\"",
+                            value,
+                            full_name
+                        )
+                    })?
                 };
                 self.set_sequence_value(txn, *table_id, stored).await?;
                 Ok(value)
             }
             SequenceBacking::Standalone(state) => {
-                setval_standalone(full_name, def.min_value, def.max_value, state, value, is_called)?;
+                setval_standalone(
+                    full_name,
+                    def.min_value,
+                    def.max_value,
+                    state,
+                    value,
+                    is_called,
+                )?;
 
                 let key = self.key(&encode_sequence_key(full_name));
                 let data =

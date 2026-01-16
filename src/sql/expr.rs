@@ -554,9 +554,13 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
         "DATE" => {
             let days = match args.into_iter().next() {
                 Some(Value::Date(days)) => days,
-                Some(Value::Timestamp(ts)) => crate::types::date::timestamp_millis_to_date_days(ts)?,
+                Some(Value::Timestamp(ts)) => {
+                    crate::types::date::timestamp_millis_to_date_days(ts)?
+                }
                 Some(Value::Text(s)) => {
-                    let ts = match parse_timestamp_string(&s).map_err(|e| anyhow!("Invalid date format: {}", e))? {
+                    let ts = match parse_timestamp_string(&s)
+                        .map_err(|e| anyhow!("Invalid date format: {}", e))?
+                    {
                         Value::Timestamp(ts) => ts,
                         _ => return Ok(Value::Null),
                     };
@@ -961,7 +965,9 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
         Expr::TypedString { data_type, value } => match data_type {
             sqlparser::ast::DataType::Interval => parse_interval_string(value),
             sqlparser::ast::DataType::Timestamp(_, _) => parse_timestamp_string(value),
-            sqlparser::ast::DataType::Date => crate::types::date::parse_date_days(value).map(Value::Date),
+            sqlparser::ast::DataType::Date => {
+                crate::types::date::parse_date_days(value).map(Value::Date)
+            }
             _ => Ok(Value::Text(value.clone())),
         },
         Expr::JsonAccess {
@@ -1548,9 +1554,13 @@ fn eval_function(
         "DATE" => {
             let days = match args.into_iter().next() {
                 Some(Value::Date(days)) => days,
-                Some(Value::Timestamp(ts)) => crate::types::date::timestamp_millis_to_date_days(ts)?,
+                Some(Value::Timestamp(ts)) => {
+                    crate::types::date::timestamp_millis_to_date_days(ts)?
+                }
                 Some(Value::Text(s)) => {
-                    let ts = match parse_timestamp_string(&s).map_err(|e| anyhow!("Invalid date format: {}", e))? {
+                    let ts = match parse_timestamp_string(&s)
+                        .map_err(|e| anyhow!("Invalid date format: {}", e))?
+                    {
                         Value::Timestamp(ts) => ts,
                         _ => return Ok(Value::Null),
                     };
@@ -2020,7 +2030,9 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
             crate::types::date::timestamp_millis_to_date_days(ts).map(Value::Date)
         }
         (Value::Date(days), SqlType::Date) => Ok(Value::Date(days)),
-        (Value::Date(days), SqlType::Timestamp(_, _)) => crate::types::date::date_days_to_timestamp_millis(days).map(Value::Timestamp),
+        (Value::Date(days), SqlType::Timestamp(_, _)) => {
+            crate::types::date::date_days_to_timestamp_millis(days).map(Value::Timestamp)
+        }
         (Value::Text(s), SqlType::Time(_, _)) => {
             use crate::sql::helpers::parse_time_string;
             parse_time_string(&s)
