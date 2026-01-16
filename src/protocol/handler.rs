@@ -2224,6 +2224,16 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
 
         ExecuteResult::DropProcedure { .. } => Ok(Response::Execution(Tag::new("DROP PROCEDURE"))),
 
+        ExecuteResult::CreateFunction { .. } => {
+            Ok(Response::Execution(Tag::new("CREATE FUNCTION")))
+        }
+
+        ExecuteResult::DropFunction { .. } => Ok(Response::Execution(Tag::new("DROP FUNCTION"))),
+
+        ExecuteResult::CreateTrigger { .. } => Ok(Response::Execution(Tag::new("CREATE TRIGGER"))),
+
+        ExecuteResult::DropTrigger { .. } => Ok(Response::Execution(Tag::new("DROP TRIGGER"))),
+
         ExecuteResult::Call => Ok(Response::Execution(Tag::new("CALL"))),
 
         ExecuteResult::AlterTable { .. } => Ok(Response::Execution(Tag::new("ALTER TABLE"))),

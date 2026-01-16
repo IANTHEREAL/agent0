@@ -1,7 +1,8 @@
 use super::encoding::*;
 use crate::txn::{txn_delete, txn_put};
 use crate::types::{
-    DataType, Row, SequenceBacking, SequenceDef, SequenceState, TableSchema, UserTypeDef, Value,
+    DataType, FunctionDef, Row, SequenceBacking, SequenceDef, SequenceState, TableSchema,
+    TriggerDef, UserTypeDef, Value,
 };
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
@@ -273,6 +274,26 @@ impl TikvStore {
         procedure_prefix.extend_from_slice(schema.as_bytes());
         procedure_prefix.push(b'.');
         if self.prefix_has_any(txn, procedure_prefix).await? {
+            return Err(anyhow!(
+                "cannot drop schema '{}': schema is not empty",
+                schema
+            ));
+        }
+
+        let mut function_prefix = encode_function_prefix();
+        function_prefix.extend_from_slice(schema.as_bytes());
+        function_prefix.push(b'.');
+        if self.prefix_has_any(txn, function_prefix).await? {
+            return Err(anyhow!(
+                "cannot drop schema '{}': schema is not empty",
+                schema
+            ));
+        }
+
+        let mut trigger_prefix = encode_trigger_prefix();
+        trigger_prefix.extend_from_slice(schema.as_bytes());
+        trigger_prefix.push(b'.');
+        if self.prefix_has_any(txn, trigger_prefix).await? {
             return Err(anyhow!(
                 "cannot drop schema '{}': schema is not empty",
                 schema
@@ -649,6 +670,145 @@ impl TikvStore {
 
     pub async fn drop_sequence(&self, txn: &mut Transaction, full_name: &str) -> Result<bool> {
         let key = self.key(&encode_sequence_key(full_name));
+        if txn.get(key.clone()).await?.is_some() {
+            txn_delete(txn, key).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn create_function(&self, txn: &mut Transaction, def: FunctionDef) -> Result<()> {
+        let full_name = format!("{}.{}", def.schema, def.name);
+        let key = self.key(&encode_function_key(&full_name));
+        if txn.get(key.clone()).await?.is_some() {
+            return Err(anyhow!("Function '{}' already exists", full_name));
+        }
+        let data = bincode::serialize(&def).context("Failed to serialize function definition")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
+    pub async fn replace_function(&self, txn: &mut Transaction, def: FunctionDef) -> Result<()> {
+        let full_name = format!("{}.{}", def.schema, def.name);
+        let key = self.key(&encode_function_key(&full_name));
+        let data = bincode::serialize(&def).context("Failed to serialize function definition")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
+    pub async fn get_function(
+        &self,
+        txn: &mut Transaction,
+        full_name: &str,
+    ) -> Result<Option<FunctionDef>> {
+        let key = self.key(&encode_function_key(full_name));
+        match txn.get(key).await? {
+            Some(data) => Ok(Some(
+                bincode::deserialize(&data).context("Failed to deserialize function definition")?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_functions(&self, txn: &mut Transaction) -> Result<Vec<FunctionDef>> {
+        let prefix = encode_function_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut funcs = Vec::new();
+        for pair in pairs {
+            let def: FunctionDef =
+                bincode::deserialize(pair.value()).context("Failed to deserialize function")?;
+            funcs.push(def);
+        }
+        Ok(funcs)
+    }
+
+    pub async fn drop_function(&self, txn: &mut Transaction, full_name: &str) -> Result<bool> {
+        let key = self.key(&encode_function_key(full_name));
+        if txn.get(key.clone()).await?.is_some() {
+            txn_delete(txn, key).await?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn create_trigger(&self, txn: &mut Transaction, def: TriggerDef) -> Result<()> {
+        let key = self.key(&encode_trigger_key(&def.table, def.name.as_str()));
+        if txn.get(key.clone()).await?.is_some() {
+            return Err(anyhow!(
+                "Trigger '{}' already exists on '{}'",
+                def.name,
+                def.table
+            ));
+        }
+        let data = bincode::serialize(&def).context("Failed to serialize trigger definition")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
+    pub async fn get_trigger(
+        &self,
+        txn: &mut Transaction,
+        table_full_name: &str,
+        trigger_name: &str,
+    ) -> Result<Option<TriggerDef>> {
+        let key = self.key(&encode_trigger_key(table_full_name, trigger_name));
+        match txn.get(key).await? {
+            Some(data) => Ok(Some(
+                bincode::deserialize(&data).context("Failed to deserialize trigger definition")?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn list_triggers(&self, txn: &mut Transaction) -> Result<Vec<TriggerDef>> {
+        let prefix = encode_trigger_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut triggers = Vec::new();
+        for pair in pairs {
+            let def: TriggerDef =
+                bincode::deserialize(pair.value()).context("Failed to deserialize trigger")?;
+            triggers.push(def);
+        }
+        Ok(triggers)
+    }
+
+    pub async fn list_triggers_for_table(
+        &self,
+        txn: &mut Transaction,
+        table_full_name: &str,
+    ) -> Result<Vec<TriggerDef>> {
+        let prefix = encode_trigger_table_prefix(table_full_name);
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut triggers = Vec::new();
+        for pair in pairs {
+            let def: TriggerDef =
+                bincode::deserialize(pair.value()).context("Failed to deserialize trigger")?;
+            triggers.push(def);
+        }
+        Ok(triggers)
+    }
+
+    pub async fn drop_trigger(
+        &self,
+        txn: &mut Transaction,
+        table_full_name: &str,
+        trigger_name: &str,
+    ) -> Result<bool> {
+        let key = self.key(&encode_trigger_key(table_full_name, trigger_name));
         if txn.get(key.clone()).await?.is_some() {
             txn_delete(txn, key).await?;
             Ok(true)

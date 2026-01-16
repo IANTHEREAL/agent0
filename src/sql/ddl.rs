@@ -1133,6 +1133,11 @@ pub async fn execute_drop_table(
                     continue;
                 }
             };
+        for trigger in store.list_triggers_for_table(txn, &resolved.full).await? {
+            let _ = store
+                .drop_trigger(txn, &resolved.full, &trigger.name)
+                .await?;
+        }
         drop_owned_sequences_for_table(store, txn, &resolved.full).await?;
         store.drop_table(txn, &resolved.full).await?;
         last = resolved.full;

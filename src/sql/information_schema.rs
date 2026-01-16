@@ -29,6 +29,7 @@ pub fn is_information_schema_table(table_name: &str) -> bool {
                 | "pg_attribute"
                 | "pg_namespace"
                 | "pg_proc"
+                | "pg_trigger"
                 | "pg_description"
                 | "pg_constraint"
                 | "pg_am"
@@ -62,6 +63,7 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
             "pg_attribute" => "pg_attribute",
             "pg_namespace" => "pg_namespace",
             "pg_proc" => "pg_proc",
+            "pg_trigger" => "pg_trigger",
             "pg_description" => "pg_description",
             "pg_constraint" => "pg_constraint",
             "pg_am" => "pg_am",
@@ -77,6 +79,7 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
         "pg_attribute" => Some("pg_attribute"),
         "pg_namespace" => Some("pg_namespace"),
         "pg_proc" => Some("pg_proc"),
+        "pg_trigger" => Some("pg_trigger"),
         "pg_description" => Some("pg_description"),
         "pg_constraint" => Some("pg_constraint"),
         "pg_am" => Some("pg_am"),
@@ -535,6 +538,25 @@ fn pg_proc_schema() -> TableSchema {
     }
 }
 
+fn pg_trigger_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_trigger".to_string(),
+        columns: vec![
+            int_col("oid"),
+            text_col("tgname"),
+            int_col("tgrelid"),
+            int_col("tgfoid"),
+            text_col("tgenabled"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
 fn pg_constraint_schema() -> TableSchema {
     TableSchema {
         table_id: 0,
@@ -636,6 +658,7 @@ pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
         "pg_attribute" => Some(pg_attribute_schema()),
         "pg_namespace" => Some(pg_namespace_schema()),
         "pg_proc" => Some(pg_proc_schema()),
+        "pg_trigger" => Some(pg_trigger_schema()),
         "pg_description" => Some(pg_description_schema()),
         "pg_constraint" => Some(pg_constraint_schema()),
         "pg_am" => Some(pg_am_schema()),
@@ -755,7 +778,8 @@ pub async fn get_information_schema_data(
         "pg_class" => get_pg_class_rows(store, txn, &user_tables, &schema_oids).await?,
         "pg_index" => get_pg_index_rows(store, txn, &user_tables, &schema_oids).await?,
         "pg_attribute" => get_pg_attribute_rows(store, txn, &user_tables).await?,
-        "pg_proc" => get_pg_proc_rows(),
+        "pg_proc" => get_pg_proc_rows(store, txn, &schema_oids).await?,
+        "pg_trigger" => get_pg_trigger_rows(store, txn, &user_tables).await?,
         "pg_description" => get_pg_description_rows(),
         "pg_constraint" => get_pg_constraint_rows(store, txn, &user_tables, &schema_oids).await?,
         "pg_am" => get_pg_am_rows(),
@@ -1886,9 +1910,115 @@ async fn get_pg_enum_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Resu
     Ok(rows)
 }
 
-fn get_pg_proc_rows() -> Vec<Row> {
-    // Return empty for now - ORMs mostly just check if the table exists
-    vec![]
+async fn get_pg_proc_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    schema_oids: &HashMap<String, i64>,
+) -> Result<Vec<Row>> {
+    let mut funcs = store.list_functions(txn).await?;
+    funcs.sort_by(|a, b| {
+        (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str()))
+    });
+
+    let mut rows = Vec::new();
+    let mut oid: i64 = 60000;
+
+    for f in funcs {
+        let namespace_oid = schema_oid(schema_oids, &f.schema);
+        let ret = f.return_type.to_ascii_lowercase();
+        let base_ret = ret.trim().strip_prefix("setof ").unwrap_or(ret.trim());
+
+        let prorettype = if base_ret.contains('.') {
+            store
+                .get_type(txn, base_ret)
+                .await?
+                .map(|t| t.oid as i64)
+                .unwrap_or(25)
+        } else {
+            match base_ret.split_whitespace().next().unwrap_or(base_ret) {
+                "bool" | "boolean" => 16,
+                "int2" | "smallint" => 21,
+                "int" | "int4" | "integer" => 23,
+                "int8" | "bigint" => 20,
+                "text" => 25,
+                "bytea" => 17,
+                "uuid" => 2950,
+                "date" => 1082,
+                "timestamp" | "timestamptz" => 1114,
+                "time" => 1083,
+                "interval" => 1186,
+                "json" => 114,
+                "jsonb" => 3802,
+                "numeric" | "decimal" => 1700,
+                "trigger" => 2279,
+                _ => 25,
+            }
+        };
+
+        rows.push(Row::new(vec![
+            int_val(oid),
+            text_val(&f.name),
+            int_val(namespace_oid),
+            int_val(10),
+            int_val(prorettype),
+            text_val("f"),
+        ]));
+        oid += 1;
+    }
+
+    Ok(rows)
+}
+
+async fn get_pg_trigger_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    user_tables: &[String],
+) -> Result<Vec<Row>> {
+    let mut table_oids: HashMap<String, i64> = HashMap::new();
+    let mut table_oid: i64 = 16384;
+    for table_name in user_tables {
+        if let Some(schema) = store.get_schema(txn, table_name).await? {
+            let base_table_oid = table_oid;
+            let num_indexes =
+                schema.indexes.len() + if !schema.pk_indices.is_empty() { 1 } else { 0 };
+            table_oid += 1 + num_indexes as i64;
+            table_oids.insert(table_name.to_string(), base_table_oid);
+        }
+    }
+
+    let mut func_oids: HashMap<String, i64> = HashMap::new();
+    let mut funcs = store.list_functions(txn).await?;
+    funcs.sort_by(|a, b| {
+        (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str()))
+    });
+    let mut func_oid: i64 = 60000;
+    for f in funcs {
+        func_oids.insert(format!("{}.{}", f.schema, f.name), func_oid);
+        func_oid += 1;
+    }
+
+    let mut triggers = store.list_triggers(txn).await?;
+    triggers.sort_by(|a, b| {
+        (a.table.as_str(), a.name.as_str()).cmp(&(b.table.as_str(), b.name.as_str()))
+    });
+
+    let mut rows = Vec::new();
+    let mut oid: i64 = 70000;
+    for t in triggers {
+        let tgrelid = table_oids.get(&t.table).copied().unwrap_or(0);
+        let tgfoid = func_oids.get(&t.function).copied().unwrap_or(0);
+
+        rows.push(Row::new(vec![
+            int_val(oid),
+            text_val(&t.name),
+            int_val(tgrelid),
+            int_val(tgfoid),
+            text_val("O"),
+        ]));
+        oid += 1;
+    }
+
+    Ok(rows)
 }
 
 fn get_pg_description_rows() -> Vec<Row> {

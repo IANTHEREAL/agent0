@@ -810,9 +810,6 @@ pub fn get_skip_reason(sql_upper: &str) -> Option<String> {
 
 /// Check if a SQL statement is unsupported
 pub fn get_unsupported_reason(sql_upper: &str) -> Option<String> {
-    if sql_upper.starts_with("CREATE TRIGGER") {
-        return Some("CREATE TRIGGER not supported".into());
-    }
     if sql_upper.starts_with("CREATE DOMAIN") {
         return Some("CREATE DOMAIN not supported".into());
     }
@@ -1238,7 +1235,6 @@ mod tests {
 
     #[test]
     fn test_get_unsupported_reason() {
-        assert!(get_unsupported_reason("CREATE TRIGGER foo").is_some());
         assert!(get_unsupported_reason("CREATE DOMAIN foo").is_some());
         assert!(get_unsupported_reason("SELECT * FROM foo").is_none());
     }

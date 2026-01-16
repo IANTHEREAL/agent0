@@ -194,6 +194,33 @@ pub(crate) async fn resolve_existing_procedure_name(
     }
 }
 
+pub(crate) async fn resolve_existing_function_name(
+    store: &crate::storage::TikvStore,
+    txn: &mut Transaction,
+    name: &ObjectName,
+    search_path: &[String],
+) -> Result<Option<ResolvedName>> {
+    let (schema_opt, obj) = split_object_name(name)?;
+    match schema_opt {
+        Some(schema) => {
+            let resolved = ResolvedName::new(schema, obj)?;
+            Ok(store
+                .get_function(txn, &resolved.full)
+                .await?
+                .map(|_| resolved))
+        }
+        None => {
+            for schema in search_path_schemas(search_path) {
+                let resolved = ResolvedName::new(schema.to_string(), obj.clone())?;
+                if store.get_function(txn, &resolved.full).await?.is_some() {
+                    return Ok(Some(resolved));
+                }
+            }
+            Ok(None)
+        }
+    }
+}
+
 pub(crate) async fn resolve_existing_sequence_name(
     store: &crate::storage::TikvStore,
     txn: &mut Transaction,

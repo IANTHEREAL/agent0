@@ -56,6 +56,20 @@ pub enum ExecuteResult {
     DropProcedure {
         proc_name: String,
     },
+    CreateFunction {
+        func_name: String,
+    },
+    DropFunction {
+        func_name: String,
+    },
+    CreateTrigger {
+        trigger_name: String,
+        table_name: String,
+    },
+    DropTrigger {
+        trigger_name: String,
+        table_name: String,
+    },
     Call,
     CreateRole,
     AlterRole,

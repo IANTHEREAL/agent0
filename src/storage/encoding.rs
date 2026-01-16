@@ -22,6 +22,8 @@ const SYS_SCHEMADEF_PREFIX: &[u8] = b"_sys_schemadef_";
 const SYS_VIEW_PREFIX: &[u8] = b"_sys_view_";
 const SYS_MATVIEW_PREFIX: &[u8] = b"_sys_matview_";
 const SYS_PROCEDURE_PREFIX: &[u8] = b"_sys_proc_";
+const SYS_FUNCTION_PREFIX: &[u8] = b"_sys_func_";
+const SYS_TRIGGER_PREFIX: &[u8] = b"_sys_trigger_";
 const SYS_TYPE_PREFIX: &[u8] = b"_sys_type_";
 const SYS_SEQUENCE_PREFIX: &[u8] = b"_sys_seqdef_";
 const TABLE_DATA_PREFIX: &[u8] = b"t_";
@@ -111,6 +113,45 @@ pub fn encode_procedure_key(proc_name: &str) -> Vec<u8> {
 #[allow(dead_code)]
 pub fn encode_procedure_prefix() -> Vec<u8> {
     SYS_PROCEDURE_PREFIX.to_vec()
+}
+
+/// Encode the key for a function definition.
+///
+/// `full_name` should be `schema.name` (e.g. `public.last_updated`).
+pub fn encode_function_key(full_name: &str) -> Vec<u8> {
+    let mut key = SYS_FUNCTION_PREFIX.to_vec();
+    key.extend_from_slice(full_name.as_bytes());
+    key
+}
+
+#[allow(dead_code)]
+pub fn encode_function_prefix() -> Vec<u8> {
+    SYS_FUNCTION_PREFIX.to_vec()
+}
+
+/// Encode the key for a trigger definition.
+///
+/// Triggers are keyed by `<table_full_name>/<trigger_name>` to avoid collisions
+/// between tables (PostgreSQL trigger names are scoped to a table).
+pub fn encode_trigger_key(table_full_name: &str, trigger_name: &str) -> Vec<u8> {
+    let mut key = SYS_TRIGGER_PREFIX.to_vec();
+    key.extend_from_slice(table_full_name.as_bytes());
+    key.push(b'/');
+    key.extend_from_slice(trigger_name.as_bytes());
+    key
+}
+
+#[allow(dead_code)]
+pub fn encode_trigger_prefix() -> Vec<u8> {
+    SYS_TRIGGER_PREFIX.to_vec()
+}
+
+#[allow(dead_code)]
+pub fn encode_trigger_table_prefix(table_full_name: &str) -> Vec<u8> {
+    let mut key = SYS_TRIGGER_PREFIX.to_vec();
+    key.extend_from_slice(table_full_name.as_bytes());
+    key.push(b'/');
+    key
 }
 
 /// Encode a data key for a row

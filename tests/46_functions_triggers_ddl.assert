@@ -1,0 +1,5 @@
+# Required output substrings.
+FUNC_FOUND=1
+TRIGGER_FOUND=1
+TRIGGER_LEFT=0
+FUNC_LEFT=0

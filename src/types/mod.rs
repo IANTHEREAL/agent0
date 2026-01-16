@@ -374,3 +374,23 @@ impl SequenceDef {
         format!("{}.{}", self.schema, self.name)
     }
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FunctionDef {
+    pub schema: String,
+    pub name: String,
+    pub arg_types: Vec<String>,
+    pub return_type: String,
+    pub language: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriggerDef {
+    pub schema: String,
+    pub name: String,
+    pub table: String,
+    pub timing: String,
+    pub events: Vec<String>,
+    pub function: String,
+}

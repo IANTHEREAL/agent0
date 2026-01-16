@@ -1,6 +1,7 @@
 //! SQL executor
 
 use super::ddl;
+use super::executor_functions_triggers::strip_leading_sql_comments;
 use super::explain;
 use super::helpers::{
     eval_default_expr, fill_row_defaults, get_expr_name, get_skip_reason, get_unsupported_reason,
@@ -51,7 +52,27 @@ impl Executor {
     pub async fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecuteResult> {
         let savepoints = session.savepoints();
         crate::txn::with_savepoints(savepoints, async {
-            let sql_upper = sql.trim().to_uppercase();
+            let sql_stripped = strip_leading_sql_comments(sql);
+            let sql_trimmed = sql_stripped.trim_start();
+            let starts_with = |prefix: &str| {
+                sql_trimmed.len() >= prefix.len()
+                    && sql_trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
+            };
+
+            if starts_with("CREATE OR REPLACE FUNCTION") || starts_with("CREATE FUNCTION") {
+                return self.execute_create_function_cmd(session, sql).await;
+            }
+            if starts_with("DROP FUNCTION") {
+                return self.execute_drop_function_cmd(session, sql).await;
+            }
+            if starts_with("CREATE CONSTRAINT TRIGGER") || starts_with("CREATE TRIGGER") {
+                return self.execute_create_trigger_cmd(session, sql).await;
+            }
+            if starts_with("DROP TRIGGER") {
+                return self.execute_drop_trigger_cmd(session, sql).await;
+            }
+
+            let sql_upper = sql_trimmed.trim().to_uppercase();
             if let Some(reason) = get_skip_reason(&sql_upper) {
                 return Ok(ExecuteResult::Skipped { message: reason });
             }
