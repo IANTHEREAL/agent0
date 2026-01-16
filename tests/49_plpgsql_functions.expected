@@ -126,7 +126,7 @@ CREATE FUNCTION
 CREATE FUNCTION
  circle_area 
 -------------
-    12.56636
+  12.5663600
 (1 row)
 
 CREATE FUNCTION

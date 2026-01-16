@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
+use rust_decimal::prelude::ToPrimitive;
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, OrderByExpr, SelectItem, Value as SqlValue, WindowType,
 };
@@ -205,6 +206,7 @@ fn compute_sum(
                     Value::Int32(n) => total += n as f64,
                     Value::Int64(n) => total += n as f64,
                     Value::Float64(n) => total += n,
+                    Value::Numeric(d) => total += d.to_f64().unwrap_or(0.0),
                     _ => {}
                 }
             }
@@ -221,6 +223,7 @@ fn compute_sum(
                     Value::Int32(n) => running_sum += n as f64,
                     Value::Int64(n) => running_sum += n as f64,
                     Value::Float64(n) => running_sum += n,
+                    Value::Numeric(d) => running_sum += d.to_f64().unwrap_or(0.0),
                     _ => {}
                 }
             }
@@ -277,6 +280,10 @@ fn compute_avg(
                         total_sum += n;
                         total_count += 1;
                     }
+                    Value::Numeric(d) => {
+                        total_sum += d.to_f64().unwrap_or(0.0);
+                        total_count += 1;
+                    }
                     Value::Null => {}
                     _ => {
                         total_count += 1;
@@ -309,6 +316,10 @@ fn compute_avg(
                     }
                     Value::Float64(n) => {
                         running_sum += n;
+                        running_count += 1;
+                    }
+                    Value::Numeric(d) => {
+                        running_sum += d.to_f64().unwrap_or(0.0);
                         running_count += 1;
                     }
                     Value::Null => {}
@@ -722,6 +733,7 @@ fn compute_sum_join(
                     Value::Int32(n) => total += n as f64,
                     Value::Int64(n) => total += n as f64,
                     Value::Float64(n) => total += n,
+                    Value::Numeric(d) => total += d.to_f64().unwrap_or(0.0),
                     _ => {}
                 }
             }
@@ -745,6 +757,7 @@ fn compute_sum_join(
                     Value::Int32(n) => running_sum += n as f64,
                     Value::Int64(n) => running_sum += n as f64,
                     Value::Float64(n) => running_sum += n,
+                    Value::Numeric(d) => running_sum += d.to_f64().unwrap_or(0.0),
                     _ => {}
                 }
             }
@@ -788,6 +801,10 @@ fn compute_avg_join(
                         total_sum += n;
                         total_count += 1;
                     }
+                    Value::Numeric(d) => {
+                        total_sum += d.to_f64().unwrap_or(0.0);
+                        total_count += 1;
+                    }
                     Value::Null => {}
                     _ => {
                         total_count += 1;
@@ -826,6 +843,10 @@ fn compute_avg_join(
                     }
                     Value::Float64(n) => {
                         running_sum += n;
+                        running_count += 1;
+                    }
+                    Value::Numeric(d) => {
+                        running_sum += d.to_f64().unwrap_or(0.0);
                         running_count += 1;
                     }
                     Value::Null => {}
