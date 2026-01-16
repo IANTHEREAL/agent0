@@ -355,17 +355,8 @@ fn parse_arg_types(args: &str) -> Vec<String> {
             continue;
         }
 
-        let ty = if tokens.len() == 1 {
-            tokens[0].to_string()
-        } else if looks_like_type_keyword(tokens[0]) {
-            tokens.join(" ")
-        } else if looks_like_type_keyword(tokens[1]) || tokens[1].contains('.') {
-            tokens[1..].join(" ")
-        } else {
-            tokens[1..].join(" ")
-        };
-
-        out.push(ty.trim().to_lowercase());
+        let arg_str = tokens.join(" ");
+        out.push(arg_str.to_lowercase());
     }
 
     out

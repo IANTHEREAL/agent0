@@ -13,6 +13,7 @@ use tikv_client::Transaction;
 use super::expr::{eval_expr, eval_expr_join, JoinContext};
 use super::helpers::{normalize_ident, value_to_sql_expr};
 use super::names;
+use super::plpgsql;
 use super::ExecuteResult;
 
 pub(crate) fn expr_uses_sequence_functions(expr: &Expr) -> bool {
@@ -59,6 +60,99 @@ pub(crate) fn expr_uses_current_schema(expr: &Expr) -> bool {
         ControlFlow::<()>::Continue(())
     });
     found
+}
+
+/// Check if expression needs async evaluation (sequence functions, current_schema, or potential user functions)
+pub(crate) fn expr_needs_async_eval(expr: &Expr) -> bool {
+    expr_uses_sequence_functions(expr)
+        || expr_uses_current_schema(expr)
+        || expr_may_have_user_function(expr)
+}
+
+/// Check if expression contains any function call that might be a user-defined function.
+/// This is a superset of `expr_uses_sequence_functions` - it matches ANY function call
+/// that is not a known built-in pure function (like COALESCE, UPPER, etc.).
+fn expr_may_have_user_function(expr: &Expr) -> bool {
+    use core::ops::ControlFlow;
+    use sqlparser::ast::visit_expressions;
+
+    let mut found = false;
+    let _ = visit_expressions(expr, |e| {
+        if found {
+            return ControlFlow::Break(());
+        }
+
+        if let Expr::Function(func) = e {
+            let name = function_name_upper(func);
+            // Skip known built-in functions that don't need async resolution.
+            // Any function NOT in this list will trigger the user-function lookup path.
+            if !is_known_builtin_function(&name) {
+                found = true;
+                return ControlFlow::Break(());
+            }
+        }
+
+        ControlFlow::<()>::Continue(())
+    });
+    found
+}
+
+fn is_known_builtin_function(name: &str) -> bool {
+    matches!(
+        name,
+        // Aggregate functions
+        "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "ARRAY_AGG" | "STRING_AGG" | "BOOL_AND" | "BOOL_OR"
+        // Window functions
+        | "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "LEAD" | "LAG" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" | "NTILE"
+        // Math functions
+        | "ABS" | "CEIL" | "CEILING" | "FLOOR" | "ROUND" | "TRUNC" | "TRUNCATE" | "SQRT" | "CBRT"
+        | "POWER" | "POW" | "EXP" | "LN" | "LOG" | "LOG10" | "SIGN" | "MOD" | "PI" | "RANDOM"
+        | "DEGREES" | "RADIANS" | "SIN" | "COS" | "TAN" | "ASIN" | "ACOS" | "ATAN" | "ATAN2"
+        | "GREATEST" | "LEAST" | "NULLIF" | "COALESCE"
+        // String functions
+        | "UPPER" | "LOWER" | "LENGTH" | "CHAR_LENGTH" | "CHARACTER_LENGTH" | "BIT_LENGTH" | "OCTET_LENGTH"
+        | "CONCAT" | "CONCAT_WS" | "LEFT" | "RIGHT" | "SUBSTRING" | "SUBSTR"
+        | "TRIM" | "LTRIM" | "RTRIM" | "BTRIM" | "LPAD" | "RPAD"
+        | "REPLACE" | "REVERSE" | "REPEAT" | "SPLIT_PART" | "INITCAP" | "POSITION"
+        | "STRPOS" | "OVERLAY" | "TRANSLATE" | "ASCII" | "CHR" | "ENCODE" | "DECODE"
+        | "MD5" | "SHA256" | "DIGEST" | "QUOTE_LITERAL" | "QUOTE_IDENT" | "FORMAT"
+        | "REGEXP_REPLACE" | "REGEXP_MATCHES" | "REGEXP_MATCH" | "REGEXP_SPLIT_TO_ARRAY"
+        | "TO_HEX" | "STARTS_WITH" | "ENDS_WITH"
+        // Date/time functions
+        | "NOW" | "CURRENT_TIMESTAMP" | "CURRENT_DATE" | "CURRENT_TIME" | "LOCALTIME" | "LOCALTIMESTAMP"
+        | "DATE_TRUNC" | "EXTRACT" | "DATE_PART" | "TO_CHAR" | "TO_DATE" | "TO_TIMESTAMP" | "TO_NUMBER"
+        | "AGE" | "MAKE_DATE" | "MAKE_TIME" | "MAKE_TIMESTAMP" | "MAKE_TIMESTAMPTZ" | "MAKE_INTERVAL"
+        | "CLOCK_TIMESTAMP" | "STATEMENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" | "TIMEOFDAY"
+        | "ISFINITE" | "JUSTIFY_DAYS" | "JUSTIFY_HOURS" | "JUSTIFY_INTERVAL"
+        // Type conversion
+        | "CAST" | "TRY_CAST"
+        // JSON functions
+        | "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "JSONB_BUILD_OBJECT" | "JSONB_BUILD_ARRAY"
+        | "JSON_OBJECT" | "JSON_ARRAY" | "JSON_AGG" | "JSONB_AGG" | "JSON_OBJECT_AGG" | "JSONB_OBJECT_AGG"
+        | "JSON_ARRAY_LENGTH" | "JSONB_ARRAY_LENGTH" | "JSON_ARRAY_ELEMENTS" | "JSONB_ARRAY_ELEMENTS"
+        | "JSON_ARRAY_ELEMENTS_TEXT" | "JSONB_ARRAY_ELEMENTS_TEXT"
+        | "JSON_EACH" | "JSONB_EACH" | "JSON_EACH_TEXT" | "JSONB_EACH_TEXT"
+        | "JSON_EXTRACT_PATH" | "JSONB_EXTRACT_PATH" | "JSON_EXTRACT_PATH_TEXT" | "JSONB_EXTRACT_PATH_TEXT"
+        | "JSON_TYPEOF" | "JSONB_TYPEOF" | "JSON_STRIP_NULLS" | "JSONB_STRIP_NULLS"
+        | "JSON_POPULATE_RECORD" | "JSONB_POPULATE_RECORD" | "JSON_POPULATE_RECORDSET" | "JSONB_POPULATE_RECORDSET"
+        | "JSON_TO_RECORD" | "JSONB_TO_RECORD" | "JSON_TO_RECORDSET" | "JSONB_TO_RECORDSET"
+        | "JSONB_SET" | "JSONB_INSERT" | "JSONB_PRETTY" | "ROW_TO_JSON" | "TO_JSON" | "TO_JSONB"
+        // Array functions
+        | "ARRAY_LENGTH" | "ARRAY_LOWER" | "ARRAY_UPPER" | "ARRAY_NDIMS" | "ARRAY_DIMS"
+        | "ARRAY_POSITION" | "ARRAY_POSITIONS" | "ARRAY_PREPEND" | "ARRAY_APPEND" | "ARRAY_CAT"
+        | "ARRAY_REMOVE" | "ARRAY_REPLACE" | "ARRAY_TO_STRING" | "STRING_TO_ARRAY" | "UNNEST"
+        | "CARDINALITY" | "ARRAY_FILL"
+        // UUID
+        | "GEN_RANDOM_UUID" | "UUID_GENERATE_V4"
+        // Misc
+        | "PG_TYPEOF" | "VERSION" | "CURRENT_USER" | "CURRENT_ROLE" | "SESSION_USER"
+        | "PG_BACKEND_PID" | "PG_CLIENT_ENCODING" | "PG_CATALOG" | "OBJ_DESCRIPTION" | "COL_DESCRIPTION"
+        | "GENERATE_SERIES" | "GENERATE_SUBSCRIPTS"
+        // These are handled specially but are built-in
+        | "CURRENT_SCHEMA" | "NEXTVAL" | "CURRVAL" | "SETVAL"
+        // Vector functions (if supported)
+        | "VECTOR_DIMS" | "VECTOR_NORM"
+    )
 }
 
 pub(crate) fn normalize_sequence_name(
@@ -494,26 +588,50 @@ pub(crate) fn replace_sequence_functions<'a>(
                     }
                     _ => {
                         let mut resolved_args = Vec::with_capacity(func.args.len());
+                        let mut arg_values = Vec::new();
                         for arg in &func.args {
                             let resolved_arg = match arg {
                                 FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(
-                                        replace_sequence_functions(
-                                            store,
-                                            txn,
-                                            last_sequence_values,
-                                            search_path,
-                                            e,
-                                            row,
-                                            schema,
-                                        )
-                                        .await?,
-                                    ))
+                                    let resolved = replace_sequence_functions(
+                                        store,
+                                        txn,
+                                        last_sequence_values,
+                                        search_path,
+                                        e,
+                                        row,
+                                        schema,
+                                    )
+                                    .await?;
+                                    if let Ok(val) = eval_expr(&resolved, row, schema) {
+                                        arg_values.push(val);
+                                    }
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(resolved))
                                 }
                                 other => other.clone(),
                             };
                             resolved_args.push(resolved_arg);
                         }
+
+                        let func_name_str = func
+                            .name
+                            .0
+                            .iter()
+                            .map(|i| i.value.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        if let Ok(Some(result)) = plpgsql::try_execute_user_function(
+                            store,
+                            txn,
+                            last_sequence_values,
+                            search_path,
+                            &func_name_str,
+                            arg_values,
+                        )
+                        .await
+                        {
+                            return Ok(value_to_sql_expr(&result));
+                        }
+
                         let resolved_filter = if let Some(filter) = &func.filter {
                             Some(Box::new(
                                 replace_sequence_functions(

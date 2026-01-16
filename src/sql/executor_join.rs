@@ -1245,9 +1245,7 @@ impl Executor {
                 };
 
                 if let Some(having_expr) = &select.having {
-                    let having_expr = if sequences::expr_uses_sequence_functions(having_expr)
-                        || sequences::expr_uses_current_schema(having_expr)
-                    {
+                    let having_expr = if sequences::expr_needs_async_eval(having_expr) {
                         sequences::replace_sequence_functions_join(
                             &self.store(),
                             txn,
@@ -1276,9 +1274,7 @@ impl Executor {
                             | SelectItem::ExprWithAlias { expr: e, .. } => e,
                             _ => return Err(anyhow!("Unsupported projection item")),
                         };
-                        let expr = if sequences::expr_uses_sequence_functions(expr)
-                            || sequences::expr_uses_current_schema(expr)
-                        {
+                        let expr = if sequences::expr_needs_async_eval(expr) {
                             sequences::replace_sequence_functions_join(
                                 &self.store(),
                                 txn,
@@ -1379,9 +1375,9 @@ impl Executor {
                 })
                 .collect();
 
-            let order_by_uses_sequences = resolved_order_exprs.iter().any(|e| {
-                sequences::expr_uses_sequence_functions(e) || sequences::expr_uses_current_schema(e)
-            });
+            let order_by_uses_sequences = resolved_order_exprs
+                .iter()
+                .any(|e| sequences::expr_needs_async_eval(e));
 
             if order_by_uses_sequences {
                 let mut rows_with_keys: Vec<(usize, Row, Vec<Value>)> =
@@ -1397,9 +1393,7 @@ impl Executor {
 
                     let mut keys = Vec::with_capacity(resolved_order_exprs.len());
                     for expr in &resolved_order_exprs {
-                        let val = if sequences::expr_uses_sequence_functions(expr)
-                            || sequences::expr_uses_current_schema(expr)
-                        {
+                        let val = if sequences::expr_needs_async_eval(expr) {
                             self.eval_expr_join_maybe_sequence(
                                 txn,
                                 sequence_values,

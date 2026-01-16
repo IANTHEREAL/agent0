@@ -19,6 +19,7 @@ mod information_schema;
 mod names;
 mod parser;
 mod planner;
+mod plpgsql;
 mod query;
 mod rbac;
 mod result;

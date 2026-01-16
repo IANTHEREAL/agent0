@@ -837,9 +837,6 @@ pub fn get_unsupported_reason(sql_upper: &str) -> Option<String> {
     if sql_upper.contains("$_$") || sql_upper.contains("$$") {
         return Some("Dollar-quoted strings not supported".into());
     }
-    if sql_upper.starts_with("CREATE SEQUENCE") && sql_upper.contains("INCREMENT") {
-        return Some("CREATE SEQUENCE not supported".into());
-    }
     if sql_upper.starts_with("CREATE INDEX") && sql_upper.contains("USING GIST") {
         return Some("GIST index not supported".into());
     }

@@ -69,6 +69,20 @@ pub(crate) fn split_object_name(name: &ObjectName) -> Result<(Option<String>, St
     }
 }
 
+pub(crate) fn object_name_from_str(s: &str) -> Result<ObjectName> {
+    use sqlparser::ast::Ident;
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(anyhow!("empty object name"));
+    }
+    let parts: Vec<&str> = s.split('.').collect();
+    match parts.as_slice() {
+        [name] => Ok(ObjectName(vec![Ident::new(*name)])),
+        [schema, name] => Ok(ObjectName(vec![Ident::new(*schema), Ident::new(*name)])),
+        _ => Err(anyhow!("invalid object name '{}'", s)),
+    }
+}
+
 pub(crate) fn resolve_ddl_object_name(
     name: &ObjectName,
     search_path: &[String],

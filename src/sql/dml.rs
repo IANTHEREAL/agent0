@@ -190,24 +190,20 @@ pub async fn eval_returning_row(
         for item in items {
             match item {
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                    vals.push(
-                        if sequences::expr_uses_sequence_functions(e)
-                            || sequences::expr_uses_current_schema(e)
-                        {
-                            sequences::eval_expr_with_sequences(
-                                store,
-                                txn,
-                                sequence_values,
-                                search_path,
-                                e,
-                                Some(row),
-                                Some(schema),
-                            )
-                            .await?
-                        } else {
-                            eval_expr(e, Some(row), Some(schema))?
-                        },
-                    );
+                    vals.push(if sequences::expr_needs_async_eval(e) {
+                        sequences::eval_expr_with_sequences(
+                            store,
+                            txn,
+                            sequence_values,
+                            search_path,
+                            e,
+                            Some(row),
+                            Some(schema),
+                        )
+                        .await?
+                    } else {
+                        eval_expr(e, Some(row), Some(schema))?
+                    });
                 }
                 SelectItem::Wildcard(_) => vals.extend(row.values.clone()),
                 _ => {}
@@ -919,9 +915,7 @@ pub async fn prepare_insert_row(
                 // Don't add to indices, leave as NULL, will be filled by fill_missing_columns
                 row_vals[i] = Value::Null;
             } else {
-                row_vals[i] = if sequences::expr_uses_sequence_functions(e)
-                    || sequences::expr_uses_current_schema(e)
-                {
+                row_vals[i] = if sequences::expr_needs_async_eval(e) {
                     sequences::eval_expr_with_sequences(
                         store,
                         txn,
@@ -954,9 +948,7 @@ pub async fn prepare_insert_row(
                 // Don't add to indices, leave as NULL, will be filled by fill_missing_columns
                 row_vals[idx] = Value::Null;
             } else {
-                row_vals[idx] = if sequences::expr_uses_sequence_functions(&exprs[i])
-                    || sequences::expr_uses_current_schema(&exprs[i])
-                {
+                row_vals[idx] = if sequences::expr_needs_async_eval(&exprs[i]) {
                     sequences::eval_expr_with_sequences(
                         store,
                         txn,
@@ -995,9 +987,7 @@ async fn eval_default_expr_maybe_sequence(
             if let Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) =
                 s.projection.into_iter().next()
             {
-                return if sequences::expr_uses_sequence_functions(&e)
-                    || sequences::expr_uses_current_schema(&e)
-                {
+                return if sequences::expr_needs_async_eval(&e) {
                     sequences::eval_expr_with_sequences(
                         store,
                         txn,
@@ -1186,9 +1176,7 @@ pub async fn compute_update_values(
             (old_row, schema)
         };
 
-        let raw_val = if sequences::expr_uses_sequence_functions(&a.value)
-            || sequences::expr_uses_current_schema(&a.value)
-        {
+        let raw_val = if sequences::expr_needs_async_eval(&a.value) {
             sequences::eval_expr_with_sequences(
                 store,
                 txn,
