@@ -168,6 +168,12 @@ enum PlpgsqlStatement {
     Null,
 }
 
+pub fn validate_plpgsql_body(body: &str) -> Result<()> {
+    let _ = parse_declare_block(body)?;
+    let _ = parse_begin_block(body)?;
+    Ok(())
+}
+
 fn parse_begin_block(body: &str) -> Result<Vec<PlpgsqlStatement>> {
     let body_upper = body.to_uppercase();
     let begin_pos = body_upper
@@ -309,6 +315,10 @@ fn parse_single_statement(s: &str) -> Result<PlpgsqlStatement> {
     if s_upper.starts_with("RETURN ") || s_upper == "RETURN" {
         let expr = if s.len() > 7 { s[7..].trim() } else { "" };
         return Ok(PlpgsqlStatement::Return(expr.to_string()));
+    }
+
+    if s_upper.starts_with("CALL ") {
+        return Err(anyhow!("CALL is not allowed in a function"));
     }
 
     if s_upper.starts_with("RAISE ") {

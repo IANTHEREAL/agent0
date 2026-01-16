@@ -1,5 +1,6 @@
 use super::executor::Executor;
 use super::names;
+use super::plpgsql;
 use super::{ExecuteResult, Session};
 use crate::types::{FunctionDef, TriggerDef};
 use anyhow::{anyhow, Result};
@@ -647,6 +648,10 @@ impl Executor {
         sql: &str,
     ) -> Result<ExecuteResult> {
         let (name, mut def, or_replace) = parse_create_function_sql(sql)?;
+
+        if def.language.to_lowercase() == "plpgsql" {
+            plpgsql::validate_plpgsql_body(&def.body)?;
+        }
 
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {
