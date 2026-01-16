@@ -589,6 +589,127 @@ impl DynamicPgHandler {
         None
     }
 
+    fn parse_copy_to_command(query: &str) -> Option<(String, Vec<String>)> {
+        let query_upper = query.to_uppercase();
+        if !query_upper.contains("COPY") || !query_upper.contains("TO") {
+            return None;
+        }
+        if !query_upper.contains("STDOUT") {
+            return None;
+        }
+
+        // COPY [schema.]table (col1, col2) TO STDOUT
+        let re =
+            regex::Regex::new(r"(?i)COPY\s+(?:(\w+)\.)?(\w+)\s*\(([^)]+)\)\s+TO\s+STDOUT").ok()?;
+        if let Some(caps) = re.captures(query) {
+            let schema = caps.get(1).map(|m| m.as_str().to_string());
+            let table = caps.get(2)?.as_str().to_string();
+            let table_name = match schema {
+                Some(s) => format!("{}.{}", s, table),
+                None => table,
+            };
+            let columns: Vec<String> = caps
+                .get(3)?
+                .as_str()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
+            return Some((table_name, columns));
+        }
+
+        // COPY [schema.]table TO STDOUT (no columns)
+        let re2 = regex::Regex::new(r"(?i)COPY\s+(?:(\w+)\.)?(\w+)\s+TO\s+STDOUT").ok()?;
+        if let Some(caps) = re2.captures(query) {
+            let schema = caps.get(1).map(|m| m.as_str().to_string());
+            let table = caps.get(2)?.as_str().to_string();
+            let table_name = match schema {
+                Some(s) => format!("{}.{}", s, table),
+                None => table,
+            };
+            return Some((table_name, vec![]));
+        }
+
+        None
+    }
+
+    async fn handle_copy_to_stdout<'a, C>(
+        &self,
+        client: &mut C,
+        table_name: &str,
+        columns: &[String],
+    ) -> PgWireResult<Vec<Response<'a>>>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let executor = self.get_executor()?;
+
+        let select_sql = if columns.is_empty() {
+            format!("SELECT * FROM {}", table_name)
+        } else {
+            format!("SELECT {} FROM {}", columns.join(", "), table_name)
+        };
+
+        let mut session_guard = self.session.lock().await;
+        let session = session_guard.as_mut().ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "XX000".to_string(),
+                "Session not initialized".to_string(),
+            )))
+        })?;
+
+        let result = executor.execute(session, &select_sql).await.map_err(|e| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "XX000".to_string(),
+                e.to_string(),
+            )))
+        })?;
+
+        let rows = match result {
+            crate::sql::ExecuteResult::Select { rows, .. } => rows,
+            _ => {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "XX000".to_string(),
+                    "COPY TO requires a table".to_string(),
+                ))));
+            }
+        };
+
+        drop(session_guard);
+
+        let col_count = if let Some(first) = rows.first() {
+            first.values.len()
+        } else {
+            1
+        };
+        let column_formats: Vec<i16> = vec![0; col_count];
+        let copy_resp = CopyResponse::new(0, col_count, column_formats);
+        pgwire::api::copy::send_copy_out_response(client, copy_resp).await?;
+
+        let mut buf = Vec::with_capacity(4096);
+        for row in &rows {
+            buf.clear();
+            super::copy_format::encode_row(&row.values, &mut buf);
+            let data = pgwire::messages::copy::CopyData::new(bytes::Bytes::copy_from_slice(&buf));
+            client.send(PgWireBackendMessage::CopyData(data)).await?;
+        }
+
+        let done = pgwire::messages::copy::CopyDone::new();
+        client.send(PgWireBackendMessage::CopyDone(done)).await?;
+
+        let complete =
+            pgwire::messages::response::CommandComplete::new(format!("COPY {}", rows.len()));
+        client
+            .send(PgWireBackendMessage::CommandComplete(complete))
+            .await?;
+
+        Ok(vec![])
+    }
+
     async fn authenticate_user(
         &self,
         keyspace: &Option<String>,
@@ -796,7 +917,7 @@ impl StartupHandler for DynamicPgHandler {
 impl SimpleQueryHandler for DynamicPgHandler {
     async fn do_query<'a, C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         query: &'a str,
     ) -> PgWireResult<Vec<Response<'a>>>
     where
@@ -809,9 +930,19 @@ impl SimpleQueryHandler for DynamicPgHandler {
 
         let executor = self.get_executor()?;
 
+        if let Some((table_name, columns)) = Self::parse_copy_to_command(query) {
+            info!(
+                "COPY TO STDOUT: table={}, columns={:?}",
+                table_name, columns
+            );
+            return self
+                .handle_copy_to_stdout(client, &table_name, &columns)
+                .await;
+        }
+
         if let Some((table_name, columns)) = Self::parse_copy_command(query) {
             info!(
-                "COPY command detected: table={}, columns={:?}",
+                "COPY FROM STDIN: table={}, columns={:?}",
                 table_name, columns
             );
 
@@ -1507,7 +1638,11 @@ impl PgHandler {
             format!("{} LIMIT 1", query_with_defaults)
         };
 
-        match self.executor.execute(&mut session_guard, &metadata_query).await {
+        match self
+            .executor
+            .execute(&mut session_guard, &metadata_query)
+            .await
+        {
             Ok(crate::sql::ExecuteResult::Select {
                 columns,
                 column_types,
@@ -2308,7 +2443,8 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
             }
         }
         Value::Date(days) => {
-            let s = crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string());
+            let s =
+                crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string());
             encoder.encode_field(&s)
         }
     }
@@ -2498,6 +2634,46 @@ mod tests {
     fn test_parse_copy_command_copy_to() {
         assert_eq!(
             DynamicPgHandler::parse_copy_command("COPY users TO stdout"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_copy_to_command_basic() {
+        let result = DynamicPgHandler::parse_copy_to_command("COPY users TO STDOUT");
+        assert_eq!(result, Some(("users".to_string(), vec![])));
+    }
+
+    #[test]
+    fn test_parse_copy_to_command_with_columns() {
+        let result = DynamicPgHandler::parse_copy_to_command("COPY users (id, name) TO STDOUT");
+        assert_eq!(
+            result,
+            Some((
+                "users".to_string(),
+                vec!["id".to_string(), "name".to_string()]
+            ))
+        );
+    }
+
+    #[test]
+    fn test_parse_copy_to_command_with_schema() {
+        let result = DynamicPgHandler::parse_copy_to_command("COPY myschema.users TO STDOUT");
+        assert_eq!(result, Some(("myschema.users".to_string(), vec![])));
+    }
+
+    #[test]
+    fn test_parse_copy_to_command_not_stdout() {
+        assert_eq!(
+            DynamicPgHandler::parse_copy_to_command("COPY users TO '/tmp/file'"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_copy_to_command_from_stdin() {
+        assert_eq!(
+            DynamicPgHandler::parse_copy_to_command("COPY users FROM stdin"),
             None
         );
     }
