@@ -2126,6 +2126,7 @@ fn datatype_to_pgtype(dt: Option<&DataType>) -> Type {
         Some(DataType::Json) => Type::JSON,
         Some(DataType::Jsonb) => Type::JSONB,
         Some(DataType::Time) => Type::TIME,
+        Some(DataType::Numeric { .. }) => Type::NUMERIC,
         Some(DataType::Vector(_))
         | Some(DataType::Array(_))
         | Some(DataType::Text)
@@ -2472,6 +2473,7 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
                 crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string());
             encoder.encode_field(&s)
         }
+        Value::Numeric(d) => encoder.encode_field(&d.to_string()),
     }
 }
 

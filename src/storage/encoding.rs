@@ -13,6 +13,7 @@
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{Context, Result};
 use memcomparable::Deserializer;
+use rust_decimal::Decimal;
 
 /// System key prefixes
 const SYS_NEXT_TABLE_ID: &[u8] = b"_sys_next_table_id";
@@ -193,6 +194,11 @@ pub fn encode_index_key(
 
 const NULL_TAG: u8 = 0x00;
 const NOT_NULL_TAG: u8 = 0x01;
+const DECIMAL_SIGN_NEG: u8 = 0x00;
+const DECIMAL_SIGN_ZERO: u8 = 0x01;
+const DECIMAL_SIGN_POS: u8 = 0x02;
+// rust_decimal supports up to 28 significant base-10 digits.
+const DECIMAL_MAX_DIGITS: usize = 28;
 
 fn encode_value_memcomparable(value: &Value, buf: &mut Vec<u8>) {
     match value {
@@ -260,6 +266,60 @@ fn encode_value_memcomparable(value: &Value, buf: &mut Vec<u8>) {
         Value::Json(s) | Value::Jsonb(s) => {
             buf.push(NOT_NULL_TAG);
             buf.extend(memcomparable::to_vec(s).unwrap());
+        }
+        Value::Numeric(d) => {
+            buf.push(NOT_NULL_TAG);
+            // Memcomparable encoding for Decimal.
+            //
+            // We need a stable, order-preserving, *canonical* encoding so that:
+            // - Lexicographic order of the encoded bytes matches numeric order.
+            // - Equal numeric values encode to identical bytes (e.g. 1.0 == 1.00).
+            //
+            // Encoding format (32 bytes after NOT_NULL_TAG):
+            //   [sign:1][exp:2][digits:28][digits_len:1]
+            // - sign: 0x00 negative, 0x01 zero, 0x02 positive
+            // - exp: i16 (digits_count - scale), stored as (exp ^ 0x8000) big-endian
+            // - digits: absolute mantissa digits, left-aligned, right-padded with ASCII '0'
+            // - digits_len: number of mantissa digits (1..=28), needed to decode values whose
+            //   mantissa ends in 0 (e.g. 100)
+            // For negative values, exp+digits bytes are bitwise inverted to reverse ordering.
+
+            let mut normalized = *d;
+            normalized.normalize_assign();
+            let unpacked = normalized.unpack();
+            let mantissa =
+                unpacked.lo as u128 | (unpacked.mid as u128) << 32 | (unpacked.hi as u128) << 64;
+
+            if mantissa == 0 {
+                buf.push(DECIMAL_SIGN_ZERO);
+                buf.extend_from_slice(&[0u8; 2 + DECIMAL_MAX_DIGITS + 1]);
+                return;
+            }
+
+            let scale = unpacked.scale as i16;
+            let mantissa_str = mantissa.to_string();
+            let digits_len =
+                u8::try_from(mantissa_str.len()).expect("Decimal mantissa digits fit in u8");
+            let digits_count = i16::from(digits_len);
+            let exp = digits_count - scale;
+
+            let exp_u16 = (exp as u16) ^ 0x8000;
+            let exp_bytes = exp_u16.to_be_bytes();
+
+            let mut digits_buf = [b'0'; DECIMAL_MAX_DIGITS];
+            digits_buf[..mantissa_str.len()].copy_from_slice(mantissa_str.as_bytes());
+
+            if unpacked.negative {
+                buf.push(DECIMAL_SIGN_NEG);
+                buf.extend(exp_bytes.map(|b| !b));
+                buf.extend(digits_buf.map(|b| !b));
+                buf.push(!digits_len);
+            } else {
+                buf.push(DECIMAL_SIGN_POS);
+                buf.extend(exp_bytes);
+                buf.extend(digits_buf);
+                buf.push(digits_len);
+            }
         }
     }
 }
@@ -336,6 +396,78 @@ pub fn decode_value_memcomparable(data: &[u8], data_type: &DataType) -> Result<(
         }
         DataType::Array(_) | DataType::Vector(_) => {
             anyhow::bail!("Array/Vector decoding not supported in index keys");
+        }
+        DataType::Numeric { .. } => {
+            // Decode memcomparable Numeric:
+            //   [sign:1][exp:2][digits:28][digits_len:1]
+            let expected = 1 + 2 + DECIMAL_MAX_DIGITS + 1;
+            if payload.len() < expected {
+                anyhow::bail!(
+                    "Numeric decode: expected {} bytes, got {}",
+                    expected,
+                    payload.len()
+                );
+            }
+
+            let sign_byte = payload[0];
+            if sign_byte == DECIMAL_SIGN_ZERO {
+                return Ok((Value::Numeric(Decimal::ZERO), 1 + expected));
+            }
+
+            if sign_byte != DECIMAL_SIGN_NEG && sign_byte != DECIMAL_SIGN_POS {
+                anyhow::bail!("Numeric decode: invalid sign byte: {}", sign_byte);
+            }
+
+            let is_negative = sign_byte == DECIMAL_SIGN_NEG;
+            let exp_bytes: [u8; 2] = payload[1..3].try_into().unwrap();
+            let digits_bytes: &[u8] = &payload[3..3 + DECIMAL_MAX_DIGITS];
+            let digits_len_byte = payload[3 + DECIMAL_MAX_DIGITS];
+
+            let exp_bytes = if is_negative {
+                exp_bytes.map(|b| !b)
+            } else {
+                exp_bytes
+            };
+            let digits_bytes: Vec<u8> = if is_negative {
+                digits_bytes.iter().map(|b| !b).collect()
+            } else {
+                digits_bytes.to_vec()
+            };
+            let digits_len_byte = if is_negative {
+                !digits_len_byte
+            } else {
+                digits_len_byte
+            };
+
+            let exp_u16 = u16::from_be_bytes(exp_bytes);
+            let exp = ((exp_u16 ^ 0x8000) as i16) as i32;
+
+            let digits_len = usize::from(digits_len_byte);
+            if !(1..=DECIMAL_MAX_DIGITS).contains(&digits_len) {
+                anyhow::bail!("Numeric decode: invalid digits_len: {}", digits_len);
+            }
+            let digits_str = std::str::from_utf8(&digits_bytes[..digits_len])
+                .context("Numeric decode: mantissa digits not utf8")?;
+            let mantissa = digits_str
+                .parse::<u128>()
+                .context("Numeric decode: invalid mantissa digits")?;
+
+            let scale_i32 = (digits_len as i32)
+                .checked_sub(exp)
+                .ok_or_else(|| anyhow::anyhow!("Numeric decode: invalid scale computation"))?;
+            if !(0..=28).contains(&scale_i32) {
+                anyhow::bail!("Numeric decode: scale out of range: {}", scale_i32);
+            }
+            if (mantissa >> 96) != 0 {
+                anyhow::bail!("Numeric decode: mantissa out of range");
+            }
+
+            let lo = mantissa as u32;
+            let mid = (mantissa >> 32) as u32;
+            let hi = (mantissa >> 64) as u32;
+
+            let d = Decimal::from_parts(lo, mid, hi, is_negative, scale_i32 as u32);
+            (Value::Numeric(d), expected)
         }
     };
 
@@ -471,6 +603,20 @@ mod tests {
     }
 
     #[test]
+    fn test_serialize_deserialize_numeric() {
+        use std::str::FromStr;
+        let row = Row::new(vec![
+            Value::Int32(1),
+            Value::Numeric(Decimal::from_str("123.45").unwrap()),
+            Value::Numeric(Decimal::from_str("-999.99").unwrap()),
+            Value::Numeric(Decimal::ZERO),
+        ]);
+        let serialized = serialize_row(&row).unwrap();
+        let deserialized = deserialize_row(&serialized).unwrap();
+        assert_eq!(deserialized.values, row.values);
+    }
+
+    #[test]
     fn test_serialize_deserialize_schema() {
         let schema = TableSchema {
             name: "test_table".to_string(),
@@ -565,6 +711,56 @@ mod tests {
         let key_pos = encode_pk_values(&[Value::Float64(1.5)]);
         assert!(key_neg < key_zero);
         assert!(key_zero < key_pos);
+    }
+
+    #[test]
+    fn test_memcomparable_numeric_ordering() {
+        use std::str::FromStr;
+
+        let k_009 = encode_pk_values(&[Value::Numeric(Decimal::from_str("0.09").unwrap())]);
+        let k_01 = encode_pk_values(&[Value::Numeric(Decimal::from_str("0.1").unwrap())]);
+        let k_119 = encode_pk_values(&[Value::Numeric(Decimal::from_str("1.19").unwrap())]);
+        let k_12 = encode_pk_values(&[Value::Numeric(Decimal::from_str("1.2").unwrap())]);
+        assert!(k_009 < k_01);
+        assert!(k_119 < k_12);
+
+        let k_n100 = encode_pk_values(&[Value::Numeric(Decimal::from_str("-100").unwrap())]);
+        let k_n2 = encode_pk_values(&[Value::Numeric(Decimal::from_str("-2").unwrap())]);
+        assert!(k_n100 < k_n2);
+
+        let k_zero = encode_pk_values(&[Value::Numeric(Decimal::ZERO)]);
+        assert!(k_n2 < k_zero);
+        assert!(k_zero < k_01);
+    }
+
+    #[test]
+    fn test_memcomparable_numeric_canonicalization() {
+        use std::str::FromStr;
+
+        let a = encode_pk_values(&[Value::Numeric(Decimal::from_str("1.0").unwrap())]);
+        let b = encode_pk_values(&[Value::Numeric(Decimal::from_str("1.00").unwrap())]);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn test_decode_memcomparable_numeric() {
+        use std::str::FromStr;
+
+        let values = vec![
+            Value::Numeric(Decimal::from_str("100").unwrap()),
+            Value::Numeric(Decimal::from_str("-0.09").unwrap()),
+            Value::Numeric(Decimal::from_str("1.2").unwrap()),
+        ];
+        let ty = DataType::Numeric {
+            precision: None,
+            scale: None,
+        };
+        for value in values {
+            let encoded = encode_pk_values(&[value.clone()]);
+            let (decoded, consumed) = decode_value_memcomparable(&encoded, &ty).unwrap();
+            assert_eq!(consumed, encoded.len());
+            assert_eq!(decoded, value);
+        }
     }
 
     #[test]

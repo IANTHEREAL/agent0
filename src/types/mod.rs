@@ -1,9 +1,47 @@
 //! Data types for the SQL engine
 
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
 pub mod date;
+
+mod decimal_serde {
+    use rust_decimal::Decimal;
+    use serde::{de::Deserializer, ser::Serializer, Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    struct DecimalParts {
+        lo: u32,
+        mid: u32,
+        hi: u32,
+        negative: bool,
+        scale: u32,
+    }
+
+    pub fn serialize<S: Serializer>(d: &Decimal, serializer: S) -> Result<S::Ok, S::Error> {
+        let unpacked = d.unpack();
+        let parts = DecimalParts {
+            lo: unpacked.lo,
+            mid: unpacked.mid,
+            hi: unpacked.hi,
+            negative: unpacked.negative,
+            scale: unpacked.scale,
+        };
+        parts.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Decimal, D::Error> {
+        let parts = DecimalParts::deserialize(deserializer)?;
+        Ok(Decimal::from_parts(
+            parts.lo,
+            parts.mid,
+            parts.hi,
+            parts.negative,
+            parts.scale,
+        ))
+    }
+}
 
 /// Supported column data types
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -25,6 +63,14 @@ pub enum DataType {
     Time, // Time of day (microseconds since midnight)
     UserDefined(String),
     Date, // Date without time zone (days since 1970-01-01)
+    /// NUMERIC/DECIMAL with optional precision and scale
+    /// Currently backed by `rust_decimal` (max 28 digits, scale 0-28).
+    /// precision: total number of digits (<= 28, default unlimited)
+    /// scale: digits after decimal point (0-28, default 0)
+    Numeric {
+        precision: Option<u32>,
+        scale: Option<u32>,
+    },
 }
 
 impl DataType {
@@ -46,6 +92,7 @@ impl DataType {
             DataType::Time => 8,
             DataType::UserDefined(_) => 32,
             DataType::Date => 4,
+            DataType::Numeric { .. } => 16,
         }
     }
 }
@@ -69,6 +116,15 @@ impl fmt::Display for DataType {
             DataType::Time => write!(f, "TIME"),
             DataType::UserDefined(name) => write!(f, "{name}"),
             DataType::Date => write!(f, "DATE"),
+            DataType::Numeric {
+                precision: Some(p),
+                scale: Some(s),
+            } => write!(f, "NUMERIC({},{})", p, s),
+            DataType::Numeric {
+                precision: Some(p),
+                scale: None,
+            } => write!(f, "NUMERIC({})", p),
+            DataType::Numeric { .. } => write!(f, "NUMERIC"),
         }
     }
 }
@@ -92,6 +148,7 @@ pub enum Value {
     Jsonb(String),
     Time(i64),
     Date(i32),
+    Numeric(#[serde(with = "decimal_serde")] Decimal),
 }
 
 impl Value {
@@ -118,6 +175,10 @@ impl Value {
             Value::Jsonb(_) => Some(DataType::Jsonb),
             Value::Time(_) => Some(DataType::Time),
             Value::Date(_) => Some(DataType::Date),
+            Value::Numeric(d) => Some(DataType::Numeric {
+                precision: None,
+                scale: Some(d.scale()),
+            }),
         }
     }
 }
@@ -198,6 +259,7 @@ impl fmt::Display for Value {
                 Ok(s) => write!(f, "{s}"),
                 Err(_) => write!(f, "{days}"),
             },
+            Value::Numeric(d) => write!(f, "{}", d),
         }
     }
 }

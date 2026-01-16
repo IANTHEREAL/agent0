@@ -1359,6 +1359,7 @@ dependencies = [
  "rand 0.8.5",
  "regex",
  "reqwest",
+ "rust_decimal",
  "rustls-pemfile 2.2.0",
  "rustls-pki-types",
  "ryu",

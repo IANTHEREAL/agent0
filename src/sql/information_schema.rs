@@ -690,6 +690,7 @@ fn data_type_to_pg_type(dt: &DataType) -> &'static str {
         DataType::Vector(_) => "vector",
         DataType::Time => "time without time zone",
         DataType::UserDefined(_) => "character varying",
+        DataType::Numeric { .. } => "numeric",
     }
 }
 
@@ -880,11 +881,16 @@ async fn get_columns_rows(
                 let is_nullable = if col.nullable { "YES" } else { "NO" };
                 let ordinal = (i + 1) as i64;
 
-                let (char_max_len, num_precision, num_scale) = match col.data_type {
+                let (char_max_len, num_precision, num_scale) = match &col.data_type {
                     DataType::Int32 => (null_val(), int_val(32), int_val(0)),
                     DataType::Int64 => (null_val(), int_val(64), int_val(0)),
                     DataType::Float64 => (null_val(), int_val(53), null_val()),
                     DataType::Text => (null_val(), null_val(), null_val()),
+                    DataType::Numeric { precision, scale } => {
+                        let p = precision.map(|v| int_val(v as i64)).unwrap_or(null_val());
+                        let s = scale.map(|v| int_val(v as i64)).unwrap_or(null_val());
+                        (null_val(), p, s)
+                    }
                     _ => (null_val(), null_val(), null_val()),
                 };
 

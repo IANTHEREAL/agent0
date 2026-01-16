@@ -470,6 +470,7 @@ fn format_value(value: &crate::types::Value) -> String {
                 crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string());
             format!("'{}'", s)
         }
+        crate::types::Value::Numeric(d) => d.to_string(),
     }
 }
 

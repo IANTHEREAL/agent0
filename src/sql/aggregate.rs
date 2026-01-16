@@ -3,6 +3,8 @@
 use crate::sql::expr::compare_values;
 use crate::types::Value;
 use anyhow::{anyhow, Result};
+use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
 
 #[derive(Debug)]
 pub enum Aggregator {
@@ -97,6 +99,9 @@ impl Aggregator {
                         Value::Int32(i) => *i as f64,
                         Value::Int64(i) => *i as f64,
                         Value::Float64(f) => *f,
+                        Value::Numeric(d) => d.to_f64().ok_or_else(|| {
+                            anyhow!("numeric value out of range for double precision")
+                        })?,
                         _ => return Err(anyhow!("AVG requires numeric type")),
                     };
                     *sum += v;
@@ -197,6 +202,19 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
             } else {
                 Err(anyhow!("Cannot add non-numeric text to number"))
             }
+        }
+        (Value::Numeric(l), Value::Numeric(r)) => Ok(Value::Numeric(l + r)),
+        (Value::Numeric(d), Value::Int32(i)) | (Value::Int32(i), Value::Numeric(d)) => {
+            Ok(Value::Numeric(d + Decimal::from(*i)))
+        }
+        (Value::Numeric(d), Value::Int64(i)) | (Value::Int64(i), Value::Numeric(d)) => {
+            Ok(Value::Numeric(d + Decimal::from(*i)))
+        }
+        (Value::Numeric(d), Value::Float64(f)) | (Value::Float64(f), Value::Numeric(d)) => {
+            let df = d
+                .to_f64()
+                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+            Ok(Value::Float64(df + *f))
         }
         _ => Err(anyhow!("Unsupported types for SUM")),
     }

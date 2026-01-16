@@ -2,8 +2,10 @@
 
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Context, Result};
+use rust_decimal::Decimal;
 use sqlparser::ast::{BinaryOperator, Expr, JsonOperator, Value as SqlValue};
 use std::collections::HashMap;
+use std::str::FromStr;
 
 pub struct JoinContext<'a> {
     #[allow(dead_code)]
@@ -78,6 +80,7 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
                     Value::Int32(i) => Ok(Value::Int32(-i)),
                     Value::Int64(i) => Ok(Value::Int64(-i)),
                     Value::Float64(f) => Ok(Value::Float64(-f)),
+                    Value::Numeric(d) => Ok(Value::Numeric(-d)),
                     _ => Err(anyhow!("Cannot negate {:?}", val)),
                 },
                 sqlparser::ast::UnaryOperator::Not => match val {
@@ -505,18 +508,33 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
             Some(Value::Int32(n)) => Ok(Value::Int32(n.abs())),
             Some(Value::Int64(n)) => Ok(Value::Int64(n.abs())),
             Some(Value::Float64(n)) => Ok(Value::Float64(n.abs())),
+            Some(Value::Numeric(d)) => Ok(Value::Numeric(d.abs())),
             _ => Ok(Value::Null),
         },
         "CEIL" | "CEILING" => match args.into_iter().next() {
             Some(Value::Float64(n)) => Ok(Value::Float64(n.ceil())),
             Some(Value::Int32(n)) => Ok(Value::Int32(n)),
             Some(Value::Int64(n)) => Ok(Value::Int64(n)),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let f = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(f.ceil()))
+            }
             _ => Ok(Value::Null),
         },
         "FLOOR" => match args.into_iter().next() {
             Some(Value::Float64(n)) => Ok(Value::Float64(n.floor())),
             Some(Value::Int32(n)) => Ok(Value::Int32(n)),
             Some(Value::Int64(n)) => Ok(Value::Int64(n)),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let f = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(f.floor()))
+            }
             _ => Ok(Value::Null),
         },
         "ROUND" => {
@@ -532,6 +550,14 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
                     let factor = 10_f64.powi(precision);
                     Ok(Value::Float64((n * factor).round() / factor))
                 }
+                Some(Value::Numeric(d)) => {
+                    use rust_decimal::prelude::ToPrimitive;
+                    let n = d.to_f64().ok_or_else(|| {
+                        anyhow!("numeric value out of range for double precision")
+                    })?;
+                    let factor = 10_f64.powi(precision);
+                    Ok(Value::Float64((n * factor).round() / factor))
+                }
                 Some(Value::Int32(n)) => Ok(Value::Int32(n)),
                 Some(Value::Int64(n)) => Ok(Value::Int64(n)),
                 _ => Ok(Value::Null),
@@ -541,6 +567,13 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
             Some(Value::Float64(n)) => Ok(Value::Float64(n.sqrt())),
             Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).sqrt())),
             Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).sqrt())),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let n = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(n.sqrt()))
+            }
             _ => Ok(Value::Null),
         },
         "NOW" | "CURRENT_TIMESTAMP" => {
@@ -701,6 +734,7 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
                     Value::Int32(i) => Ok(Value::Int32(-i)),
                     Value::Int64(i) => Ok(Value::Int64(-i)),
                     Value::Float64(f) => Ok(Value::Float64(-f)),
+                    Value::Numeric(d) => Ok(Value::Numeric(-d)),
                     _ => Err(anyhow!("Cannot negate {:?}", val)),
                 },
                 sqlparser::ast::UnaryOperator::Not => match val {
@@ -941,6 +975,13 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
                 Value::Float64(n) => Ok(Value::Float64(n.ceil())),
                 Value::Int32(n) => Ok(Value::Int32(n)),
                 Value::Int64(n) => Ok(Value::Int64(n)),
+                Value::Numeric(d) => {
+                    use rust_decimal::prelude::ToPrimitive;
+                    let f = d.to_f64().ok_or_else(|| {
+                        anyhow!("numeric value out of range for double precision")
+                    })?;
+                    Ok(Value::Float64(f.ceil()))
+                }
                 _ => Ok(Value::Null),
             }
         }
@@ -950,6 +991,13 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
                 Value::Float64(n) => Ok(Value::Float64(n.floor())),
                 Value::Int32(n) => Ok(Value::Int32(n)),
                 Value::Int64(n) => Ok(Value::Int64(n)),
+                Value::Numeric(d) => {
+                    use rust_decimal::prelude::ToPrimitive;
+                    let f = d.to_f64().ok_or_else(|| {
+                        anyhow!("numeric value out of range for double precision")
+                    })?;
+                    Ok(Value::Float64(f.floor()))
+                }
                 _ => Ok(Value::Null),
             }
         }
@@ -1351,18 +1399,33 @@ fn eval_function(
             Some(Value::Int32(n)) => Ok(Value::Int32(n.abs())),
             Some(Value::Int64(n)) => Ok(Value::Int64(n.abs())),
             Some(Value::Float64(n)) => Ok(Value::Float64(n.abs())),
+            Some(Value::Numeric(d)) => Ok(Value::Numeric(d.abs())),
             _ => Ok(Value::Null),
         },
         "CEIL" | "CEILING" => match args.into_iter().next() {
             Some(Value::Float64(n)) => Ok(Value::Float64(n.ceil())),
             Some(Value::Int32(n)) => Ok(Value::Int32(n)),
             Some(Value::Int64(n)) => Ok(Value::Int64(n)),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let f = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(f.ceil()))
+            }
             _ => Ok(Value::Null),
         },
         "FLOOR" => match args.into_iter().next() {
             Some(Value::Float64(n)) => Ok(Value::Float64(n.floor())),
             Some(Value::Int32(n)) => Ok(Value::Int32(n)),
             Some(Value::Int64(n)) => Ok(Value::Int64(n)),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let f = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(f.floor()))
+            }
             _ => Ok(Value::Null),
         },
         "ROUND" => {
@@ -1375,6 +1438,14 @@ fn eval_function(
             };
             match val {
                 Some(Value::Float64(n)) => {
+                    let factor = 10_f64.powi(precision);
+                    Ok(Value::Float64((n * factor).round() / factor))
+                }
+                Some(Value::Numeric(d)) => {
+                    use rust_decimal::prelude::ToPrimitive;
+                    let n = d.to_f64().ok_or_else(|| {
+                        anyhow!("numeric value out of range for double precision")
+                    })?;
                     let factor = 10_f64.powi(precision);
                     Ok(Value::Float64((n * factor).round() / factor))
                 }
@@ -1396,6 +1467,14 @@ fn eval_function(
                     let factor = 10_f64.powi(precision);
                     Ok(Value::Float64((n * factor).trunc() / factor))
                 }
+                Some(Value::Numeric(d)) => {
+                    use rust_decimal::prelude::ToPrimitive;
+                    let n = d.to_f64().ok_or_else(|| {
+                        anyhow!("numeric value out of range for double precision")
+                    })?;
+                    let factor = 10_f64.powi(precision);
+                    Ok(Value::Float64((n * factor).trunc() / factor))
+                }
                 Some(Value::Int32(n)) => Ok(Value::Int32(n)),
                 Some(Value::Int64(n)) => Ok(Value::Int64(n)),
                 _ => Ok(Value::Null),
@@ -1405,6 +1484,13 @@ fn eval_function(
             Some(Value::Float64(n)) => Ok(Value::Float64(n.sqrt())),
             Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).sqrt())),
             Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).sqrt())),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let n = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(n.sqrt()))
+            }
             _ => Ok(Value::Null),
         },
         "POWER" | "POW" => {
@@ -1413,12 +1499,22 @@ fn eval_function(
                 Some(Value::Float64(n)) => n,
                 Some(Value::Int32(n)) => n as f64,
                 Some(Value::Int64(n)) => n as f64,
+                Some(Value::Numeric(d)) => {
+                    use rust_decimal::prelude::ToPrimitive;
+                    d.to_f64()
+                        .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?
+                }
                 _ => return Ok(Value::Null),
             };
             let exp = match iter.next() {
                 Some(Value::Float64(n)) => n,
                 Some(Value::Int32(n)) => n as f64,
                 Some(Value::Int64(n)) => n as f64,
+                Some(Value::Numeric(d)) => {
+                    use rust_decimal::prelude::ToPrimitive;
+                    d.to_f64()
+                        .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?
+                }
                 _ => return Ok(Value::Null),
             };
             Ok(Value::Float64(base.powf(exp)))
@@ -1427,18 +1523,39 @@ fn eval_function(
             Some(Value::Float64(n)) => Ok(Value::Float64(n.exp())),
             Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).exp())),
             Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).exp())),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let n = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(n.exp()))
+            }
             _ => Ok(Value::Null),
         },
         "LN" => match args.into_iter().next() {
             Some(Value::Float64(n)) => Ok(Value::Float64(n.ln())),
             Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).ln())),
             Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).ln())),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let n = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(n.ln()))
+            }
             _ => Ok(Value::Null),
         },
         "LOG" | "LOG10" => match args.into_iter().next() {
             Some(Value::Float64(n)) => Ok(Value::Float64(n.log10())),
             Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).log10())),
             Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).log10())),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let n = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(n.log10()))
+            }
             _ => Ok(Value::Null),
         },
         "SIGN" => match args.into_iter().next() {
@@ -1463,6 +1580,7 @@ fn eval_function(
             } else {
                 0.0
             })),
+            Some(Value::Numeric(d)) => Ok(Value::Int32(d.cmp(&Decimal::ZERO) as i32)),
             _ => Ok(Value::Null),
         },
         "MOD" => {
@@ -1988,6 +2106,58 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
     use sqlparser::ast::DataType as SqlType;
     match (val, data_type) {
         (Value::Null, _) => Ok(Value::Null),
+        (v, SqlType::Numeric(info) | SqlType::Decimal(info)) => {
+            let (precision, scale) = match info {
+                sqlparser::ast::ExactNumberInfo::None => (None, None),
+                // Postgres: NUMERIC(p) implies scale=0
+                sqlparser::ast::ExactNumberInfo::Precision(p) => (Some(*p as u32), Some(0)),
+                sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
+                    (Some(*p as u32), Some(*s as u32))
+                }
+            };
+            if let Some(p) = precision {
+                if p > 28 {
+                    return Err(anyhow!(
+                        "NUMERIC precision {} exceeds supported maximum 28",
+                        p
+                    ));
+                }
+            }
+            if let Some(s) = scale {
+                if s > 28 {
+                    return Err(anyhow!("NUMERIC scale {} exceeds supported maximum 28", s));
+                }
+            }
+            if let (Some(p), Some(s)) = (precision, scale) {
+                if s > p {
+                    return Err(anyhow!(
+                        "NUMERIC scale {} must be between 0 and precision {}",
+                        s,
+                        p
+                    ));
+                }
+            }
+
+            let mut d = match v {
+                Value::Numeric(d) => d,
+                Value::Int32(i) => Decimal::from(i),
+                Value::Int64(i) => Decimal::from(i),
+                Value::Float64(f) => Decimal::try_from(f)
+                    .map_err(|_| anyhow!("invalid input syntax for type numeric: \"{}\"", f))?,
+                Value::Text(s) => Decimal::from_str(s.trim())
+                    .map_err(|_| anyhow!("invalid input syntax for type numeric: \"{}\"", s))?,
+                other => {
+                    return Err(anyhow!(
+                        "cannot cast {} to numeric",
+                        other.data_type().unwrap_or(crate::types::DataType::Text)
+                    ))
+                }
+            };
+            if let Some(s) = scale {
+                d.rescale(s);
+            }
+            Ok(Value::Numeric(d))
+        }
         (v, SqlType::Text | SqlType::Varchar(_) | SqlType::String(_)) => {
             Ok(Value::Text(v.to_string()))
         }
@@ -1997,18 +2167,31 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
         (Value::Text(s), SqlType::BigInt(_) | SqlType::Int8(_)) => {
             Ok(Value::Int64(s.trim().parse().unwrap_or(0)))
         }
-        (
-            Value::Text(s),
-            SqlType::Float(_)
-            | SqlType::Double
-            | SqlType::Real
-            | SqlType::Numeric(_)
-            | SqlType::Decimal(_),
-        ) => Ok(Value::Float64(s.trim().parse().unwrap_or(0.0))),
+        (Value::Text(s), SqlType::Float(_) | SqlType::Double | SqlType::Real) => {
+            Ok(Value::Float64(s.trim().parse().unwrap_or(0.0)))
+        }
         (Value::Text(s), SqlType::Boolean) => Ok(Value::Boolean(matches!(
             s.to_lowercase().as_str(),
             "true" | "t" | "yes" | "y" | "1"
         ))),
+        (Value::Numeric(d), SqlType::Int(_) | SqlType::Integer(_)) => {
+            use rust_decimal::prelude::ToPrimitive;
+            d.to_i32()
+                .map(Value::Int32)
+                .ok_or_else(|| anyhow!("numeric value out of range for integer"))
+        }
+        (Value::Numeric(d), SqlType::BigInt(_) | SqlType::Int8(_)) => {
+            use rust_decimal::prelude::ToPrimitive;
+            d.to_i64()
+                .map(Value::Int64)
+                .ok_or_else(|| anyhow!("numeric value out of range for bigint"))
+        }
+        (Value::Numeric(d), SqlType::Float(_) | SqlType::Double | SqlType::Real) => {
+            use rust_decimal::prelude::ToPrimitive;
+            d.to_f64()
+                .map(Value::Float64)
+                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))
+        }
         (Value::Int32(n), SqlType::BigInt(_) | SqlType::Int8(_)) => Ok(Value::Int64(n as i64)),
         (Value::Int32(n), SqlType::Float(_) | SqlType::Double | SqlType::Real) => {
             Ok(Value::Float64(n as f64))
@@ -2173,8 +2356,14 @@ fn eval_value(v: &SqlValue) -> Result<Value> {
         SqlValue::Null => Ok(Value::Null),
         SqlValue::Boolean(b) => Ok(Value::Boolean(*b)),
         SqlValue::Number(n, _) => {
-            if n.contains('.') {
+            if n.contains(['e', 'E']) {
                 Ok(Value::Float64(n.parse()?))
+            } else if n.contains('.') {
+                if let Ok(d) = Decimal::from_str(n) {
+                    Ok(Value::Numeric(d))
+                } else {
+                    Ok(Value::Float64(n.parse()?))
+                }
             } else {
                 if let Ok(i) = n.parse::<i32>() {
                     Ok(Value::Int32(i))
@@ -2253,6 +2442,25 @@ fn add_values(left: Value, right: Value) -> Result<Value> {
         (Value::Float64(l), Value::Float64(r)) => Ok(Value::Float64(l + r)),
         (Value::Int32(l), Value::Float64(r)) => Ok(Value::Float64(l as f64 + r)),
         (Value::Float64(l), Value::Int32(r)) => Ok(Value::Float64(l + r as f64)),
+        (Value::Numeric(l), Value::Numeric(r)) => Ok(Value::Numeric(l + r)),
+        (Value::Numeric(l), Value::Int32(r)) => Ok(Value::Numeric(l + Decimal::from(r))),
+        (Value::Int32(l), Value::Numeric(r)) => Ok(Value::Numeric(Decimal::from(l) + r)),
+        (Value::Numeric(l), Value::Int64(r)) => Ok(Value::Numeric(l + Decimal::from(r))),
+        (Value::Int64(l), Value::Numeric(r)) => Ok(Value::Numeric(Decimal::from(l) + r)),
+        (Value::Numeric(l), Value::Float64(r)) => {
+            use rust_decimal::prelude::ToPrimitive;
+            let lf = l
+                .to_f64()
+                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+            Ok(Value::Float64(lf + r))
+        }
+        (Value::Float64(l), Value::Numeric(r)) => {
+            use rust_decimal::prelude::ToPrimitive;
+            let rf = r
+                .to_f64()
+                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+            Ok(Value::Float64(l + rf))
+        }
         (Value::Timestamp(ts), Value::Interval(iv)) => Ok(Value::Timestamp(ts + iv)),
         (Value::Interval(iv), Value::Timestamp(ts)) => Ok(Value::Timestamp(ts + iv)),
         (Value::Date(days), Value::Interval(iv)) => {
@@ -2275,6 +2483,25 @@ fn sub_values(left: Value, right: Value) -> Result<Value> {
         (Value::Int32(l), Value::Int64(r)) => Ok(Value::Int64(l as i64 - r)),
         (Value::Int64(l), Value::Int32(r)) => Ok(Value::Int64(l - r as i64)),
         (Value::Float64(l), Value::Float64(r)) => Ok(Value::Float64(l - r)),
+        (Value::Numeric(l), Value::Numeric(r)) => Ok(Value::Numeric(l - r)),
+        (Value::Numeric(l), Value::Int32(r)) => Ok(Value::Numeric(l - Decimal::from(r))),
+        (Value::Int32(l), Value::Numeric(r)) => Ok(Value::Numeric(Decimal::from(l) - r)),
+        (Value::Numeric(l), Value::Int64(r)) => Ok(Value::Numeric(l - Decimal::from(r))),
+        (Value::Int64(l), Value::Numeric(r)) => Ok(Value::Numeric(Decimal::from(l) - r)),
+        (Value::Numeric(l), Value::Float64(r)) => {
+            use rust_decimal::prelude::ToPrimitive;
+            let lf = l
+                .to_f64()
+                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+            Ok(Value::Float64(lf - r))
+        }
+        (Value::Float64(l), Value::Numeric(r)) => {
+            use rust_decimal::prelude::ToPrimitive;
+            let rf = r
+                .to_f64()
+                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+            Ok(Value::Float64(l - rf))
+        }
         (Value::Timestamp(l), Value::Timestamp(r)) => Ok(Value::Interval(l - r)),
         (Value::Timestamp(ts), Value::Interval(iv)) => Ok(Value::Timestamp(ts - iv)),
         (Value::Date(days), Value::Interval(iv)) => {
@@ -2302,6 +2529,25 @@ fn mul_values(left: Value, right: Value) -> Result<Value> {
         (Value::Float64(l), Value::Int32(r)) => Ok(Value::Float64(l * r as f64)),
         (Value::Int64(l), Value::Float64(r)) => Ok(Value::Float64(l as f64 * r)),
         (Value::Float64(l), Value::Int64(r)) => Ok(Value::Float64(l * r as f64)),
+        (Value::Numeric(l), Value::Numeric(r)) => Ok(Value::Numeric(l * r)),
+        (Value::Numeric(l), Value::Int32(r)) => Ok(Value::Numeric(l * Decimal::from(r))),
+        (Value::Int32(l), Value::Numeric(r)) => Ok(Value::Numeric(Decimal::from(l) * r)),
+        (Value::Numeric(l), Value::Int64(r)) => Ok(Value::Numeric(l * Decimal::from(r))),
+        (Value::Int64(l), Value::Numeric(r)) => Ok(Value::Numeric(Decimal::from(l) * r)),
+        (Value::Numeric(l), Value::Float64(r)) => {
+            use rust_decimal::prelude::ToPrimitive;
+            let lf = l
+                .to_f64()
+                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+            Ok(Value::Float64(lf * r))
+        }
+        (Value::Float64(l), Value::Numeric(r)) => {
+            use rust_decimal::prelude::ToPrimitive;
+            let rf = r
+                .to_f64()
+                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+            Ok(Value::Float64(l * rf))
+        }
         _ => Err(anyhow!("Unsupported types for multiplication")),
     }
 }
@@ -2337,6 +2583,56 @@ fn div_values(left: Value, right: Value) -> Result<Value> {
         (Value::Float64(l), Value::Int32(r)) => Ok(Value::Float64(l / r as f64)),
         (Value::Int64(l), Value::Float64(r)) => Ok(Value::Float64(l as f64 / r)),
         (Value::Float64(l), Value::Int64(r)) => Ok(Value::Float64(l / r as f64)),
+        (Value::Numeric(l), Value::Numeric(r)) => {
+            if r.is_zero() {
+                return Err(anyhow!("Division by zero"));
+            }
+            Ok(Value::Numeric(l / r))
+        }
+        (Value::Numeric(l), Value::Int32(r)) => {
+            if r == 0 {
+                return Err(anyhow!("Division by zero"));
+            }
+            Ok(Value::Numeric(l / Decimal::from(r)))
+        }
+        (Value::Int32(l), Value::Numeric(r)) => {
+            if r.is_zero() {
+                return Err(anyhow!("Division by zero"));
+            }
+            Ok(Value::Numeric(Decimal::from(l) / r))
+        }
+        (Value::Numeric(l), Value::Int64(r)) => {
+            if r == 0 {
+                return Err(anyhow!("Division by zero"));
+            }
+            Ok(Value::Numeric(l / Decimal::from(r)))
+        }
+        (Value::Int64(l), Value::Numeric(r)) => {
+            if r.is_zero() {
+                return Err(anyhow!("Division by zero"));
+            }
+            Ok(Value::Numeric(Decimal::from(l) / r))
+        }
+        (Value::Numeric(l), Value::Float64(r)) => {
+            if r == 0.0 {
+                return Err(anyhow!("Division by zero"));
+            }
+            use rust_decimal::prelude::ToPrimitive;
+            let lf = l
+                .to_f64()
+                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+            Ok(Value::Float64(lf / r))
+        }
+        (Value::Float64(l), Value::Numeric(r)) => {
+            if r.is_zero() {
+                return Err(anyhow!("Division by zero"));
+            }
+            use rust_decimal::prelude::ToPrimitive;
+            let rf = r
+                .to_f64()
+                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+            Ok(Value::Float64(l / rf))
+        }
         _ => Err(anyhow!("Unsupported types for division")),
     }
 }
@@ -2473,6 +2769,45 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         (Value::Float64(f), Value::Int64(i)) => {
             Ok(f.partial_cmp(&(*i as f64))
                 .unwrap_or(std::cmp::Ordering::Equal) as i8)
+        }
+        (Value::Numeric(l), Value::Numeric(r)) => Ok(l.cmp(r) as i8),
+        (Value::Numeric(d), Value::Int32(i)) => Ok(d.cmp(&Decimal::from(*i)) as i8),
+        (Value::Int32(i), Value::Numeric(d)) => Ok(Decimal::from(*i).cmp(d) as i8),
+        (Value::Numeric(d), Value::Int64(i)) => Ok(d.cmp(&Decimal::from(*i)) as i8),
+        (Value::Int64(i), Value::Numeric(d)) => Ok(Decimal::from(*i).cmp(d) as i8),
+        (Value::Numeric(d), Value::Float64(f)) => {
+            if let Some(fd) = Decimal::try_from(*f).ok() {
+                Ok(d.cmp(&fd) as i8)
+            } else {
+                use rust_decimal::prelude::ToPrimitive;
+                Ok(d.to_f64()
+                    .unwrap_or(f64::NAN)
+                    .partial_cmp(f)
+                    .unwrap_or(std::cmp::Ordering::Equal) as i8)
+            }
+        }
+        (Value::Float64(f), Value::Numeric(d)) => {
+            if let Some(fd) = Decimal::try_from(*f).ok() {
+                Ok(fd.cmp(d) as i8)
+            } else {
+                use rust_decimal::prelude::ToPrimitive;
+                Ok(f.partial_cmp(&d.to_f64().unwrap_or(f64::NAN))
+                    .unwrap_or(std::cmp::Ordering::Equal) as i8)
+            }
+        }
+        (Value::Numeric(d), Value::Text(t)) => {
+            if let Ok(td) = Decimal::from_str(t) {
+                Ok(d.cmp(&td) as i8)
+            } else {
+                Err(anyhow!("Cannot compare numeric with non-numeric string"))
+            }
+        }
+        (Value::Text(t), Value::Numeric(d)) => {
+            if let Ok(td) = Decimal::from_str(t) {
+                Ok(td.cmp(d) as i8)
+            } else {
+                Err(anyhow!("Cannot compare numeric with non-numeric string"))
+            }
         }
         (Value::Json(_), _) | (_, Value::Json(_)) => Err(anyhow!(
             "could not identify a comparison function for type json"
@@ -2793,6 +3128,21 @@ fn value_to_json(val: &Value) -> serde_json::Value {
         Value::Date(days) => serde_json::Value::String(
             crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string()),
         ),
+        Value::Numeric(d) => {
+            let s = d.to_string();
+            if let Ok(i) = s.parse::<i64>() {
+                return serde_json::Value::Number(serde_json::Number::from(i));
+            }
+            if let Ok(u) = s.parse::<u64>() {
+                return serde_json::Value::Number(serde_json::Number::from(u));
+            }
+            if let Ok(f) = s.parse::<f64>() {
+                if let Some(n) = serde_json::Number::from_f64(f) {
+                    return serde_json::Value::Number(n);
+                }
+            }
+            serde_json::Value::String(s)
+        }
     }
 }
 
@@ -2993,8 +3343,10 @@ fn vector_norm(vec: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
+    use std::str::FromStr;
 
     fn parse_expr(sql: &str) -> Expr {
         let full_sql = format!("SELECT {}", sql);
@@ -3018,7 +3370,7 @@ mod tests {
         );
         assert_eq!(
             eval_expr(&parse_expr("3.14"), None, None).unwrap(),
-            Value::Float64(3.14)
+            Value::Numeric(Decimal::from_str("3.14").unwrap())
         );
         assert_eq!(
             eval_expr(&parse_expr("'hello'"), None, None).unwrap(),
@@ -3138,7 +3490,7 @@ mod tests {
         );
         assert_eq!(
             eval_expr(&parse_expr("-3.14"), None, None).unwrap(),
-            Value::Float64(-3.14)
+            Value::Numeric(Decimal::from_str("-3.14").unwrap())
         );
     }
 
@@ -3233,7 +3585,7 @@ mod tests {
     #[test]
     fn test_mixed_type_arithmetic() {
         let result = eval_expr(&parse_expr("1 + 2.5"), None, None).unwrap();
-        assert!(matches!(result, Value::Float64(f) if (f - 3.5).abs() < 0.001));
+        assert_eq!(result, Value::Numeric(Decimal::from_str("3.5").unwrap()));
     }
 
     #[test]

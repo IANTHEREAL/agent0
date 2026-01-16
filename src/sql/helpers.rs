@@ -25,6 +25,9 @@ pub fn normalize_ident(ident: &Ident) -> String {
     }
 }
 
+use rust_decimal::Decimal;
+use std::str::FromStr;
+
 use super::expr::{eval_expr, eval_expr_join, JoinContext};
 use super::Aggregator;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
@@ -217,6 +220,59 @@ pub fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Value> {
         }
         (Value::Jsonb(s), DataType::Json) => Ok(Value::Json(s.clone())),
         (Value::Jsonb(s), DataType::Jsonb) => Ok(Value::Jsonb(s.clone())),
+        (Value::Text(s), DataType::Numeric { scale, .. }) => {
+            let mut d = Decimal::from_str(s.trim())
+                .map_err(|_| anyhow!("invalid input syntax for type numeric: \"{}\"", s))?;
+            if let Some(s) = scale {
+                d.rescale(*s);
+            }
+            Ok(Value::Numeric(d))
+        }
+        (Value::Int32(n), DataType::Numeric { scale, .. }) => {
+            let mut d = Decimal::from(*n);
+            if let Some(s) = scale {
+                d.rescale(*s);
+            }
+            Ok(Value::Numeric(d))
+        }
+        (Value::Int64(n), DataType::Numeric { scale, .. }) => {
+            let mut d = Decimal::from(*n);
+            if let Some(s) = scale {
+                d.rescale(*s);
+            }
+            Ok(Value::Numeric(d))
+        }
+        (Value::Float64(f), DataType::Numeric { scale, .. }) => {
+            let mut d = Decimal::try_from(*f)
+                .map_err(|_| anyhow!("invalid input for type numeric: \"{}\"", f))?;
+            if let Some(s) = scale {
+                d.rescale(*s);
+            }
+            Ok(Value::Numeric(d))
+        }
+        (Value::Numeric(d), DataType::Numeric { scale, .. }) => {
+            let mut d = *d;
+            if let Some(s) = scale {
+                d.rescale(*s);
+            }
+            Ok(Value::Numeric(d))
+        }
+        (Value::Numeric(d), DataType::Float64) => {
+            use rust_decimal::prelude::ToPrimitive;
+            Ok(Value::Float64(d.to_f64().unwrap_or(f64::NAN)))
+        }
+        (Value::Numeric(d), DataType::Int32) => {
+            use rust_decimal::prelude::ToPrimitive;
+            d.to_i32()
+                .map(Value::Int32)
+                .ok_or_else(|| anyhow!("numeric value out of range for integer"))
+        }
+        (Value::Numeric(d), DataType::Int64) => {
+            use rust_decimal::prelude::ToPrimitive;
+            d.to_i64()
+                .map(Value::Int64)
+                .ok_or_else(|| anyhow!("numeric value out of range for bigint"))
+        }
         _ => Ok(val),
     }
 }
@@ -228,7 +284,7 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
         Value::Boolean(b) => Expr::Value(SqlValue::Boolean(*b)),
         Value::Int32(i) => Expr::Value(SqlValue::Number(i.to_string(), false)),
         Value::Int64(i) => Expr::Value(SqlValue::Number(i.to_string(), false)),
-        Value::Float64(f) => Expr::Value(SqlValue::Number(f.to_string(), false)),
+        Value::Float64(f) => Expr::Value(SqlValue::Number(format!("{:E}", f), false)),
         Value::Text(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
         Value::Bytes(b) => Expr::Value(SqlValue::SingleQuotedString(format!(
             "\\x{}",
@@ -274,6 +330,7 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
                 hours, mins, secs
             )))
         }
+        Value::Numeric(d) => Expr::Value(SqlValue::Number(d.to_string(), false)),
     }
 }
 
@@ -358,9 +415,40 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
         SqlDataType::Float(_)
         | SqlDataType::Double
         | SqlDataType::DoublePrecision
-        | SqlDataType::Real
-        | SqlDataType::Numeric(_)
-        | SqlDataType::Decimal(_) => Ok(DataType::Float64),
+        | SqlDataType::Real => Ok(DataType::Float64),
+        SqlDataType::Numeric(info) | SqlDataType::Decimal(info) => {
+            let (precision, scale) = match info {
+                sqlparser::ast::ExactNumberInfo::None => (None, None),
+                // Postgres: NUMERIC(p) implies scale=0
+                sqlparser::ast::ExactNumberInfo::Precision(p) => (Some(*p as u32), Some(0)),
+                sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
+                    (Some(*p as u32), Some(*s as u32))
+                }
+            };
+            if let Some(p) = precision {
+                if p > 28 {
+                    return Err(anyhow!(
+                        "NUMERIC precision {} exceeds supported maximum 28",
+                        p
+                    ));
+                }
+            }
+            if let Some(s) = scale {
+                if s > 28 {
+                    return Err(anyhow!("NUMERIC scale {} exceeds supported maximum 28", s));
+                }
+            }
+            if let (Some(p), Some(s)) = (precision, scale) {
+                if s > p {
+                    return Err(anyhow!(
+                        "NUMERIC scale {} must be between 0 and precision {}",
+                        s,
+                        p
+                    ));
+                }
+            }
+            Ok(DataType::Numeric { precision, scale })
+        }
         SqlDataType::Varchar(_)
         | SqlDataType::Text
         | SqlDataType::String(_)
@@ -785,6 +873,10 @@ pub fn infer_data_type(value: &Value) -> DataType {
         Value::Jsonb(_) => DataType::Jsonb,
         Value::Array(_) => DataType::Text,
         Value::Null => DataType::Text,
+        Value::Numeric(_) => DataType::Numeric {
+            precision: None,
+            scale: None,
+        },
     }
 }
 
@@ -954,7 +1046,16 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                 .unwrap_or_default();
             match func_name.as_str() {
                 "COUNT" => DataType::Int64,
-                "SUM" | "AVG" => DataType::Float64,
+                "SUM" => {
+                    if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
+                        f.args.first()
+                    {
+                        infer_expr_type(arg_expr, schema)
+                    } else {
+                        DataType::Text
+                    }
+                }
+                "AVG" => DataType::Float64,
                 "MIN" | "MAX" => {
                     if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
                         f.args.first()
@@ -1026,17 +1127,30 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                     _ => {
                         let left_numeric = matches!(
                             left_type,
-                            DataType::Int32 | DataType::Int64 | DataType::Float64
+                            DataType::Int32
+                                | DataType::Int64
+                                | DataType::Float64
+                                | DataType::Numeric { .. }
                         );
                         let right_numeric = matches!(
                             right_type,
-                            DataType::Int32 | DataType::Int64 | DataType::Float64
+                            DataType::Int32
+                                | DataType::Int64
+                                | DataType::Float64
+                                | DataType::Numeric { .. }
                         );
                         if left_numeric && right_numeric {
                             if matches!(left_type, DataType::Float64)
                                 || matches!(right_type, DataType::Float64)
                             {
                                 DataType::Float64
+                            } else if matches!(left_type, DataType::Numeric { .. })
+                                || matches!(right_type, DataType::Numeric { .. })
+                            {
+                                DataType::Numeric {
+                                    precision: None,
+                                    scale: None,
+                                }
                             } else if matches!(left_type, DataType::Int64)
                                 || matches!(right_type, DataType::Int64)
                             {
@@ -1056,6 +1170,13 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                 if matches!(left_type, DataType::Float64) || matches!(right_type, DataType::Float64)
                 {
                     DataType::Float64
+                } else if matches!(left_type, DataType::Numeric { .. })
+                    || matches!(right_type, DataType::Numeric { .. })
+                {
+                    DataType::Numeric {
+                        precision: None,
+                        scale: None,
+                    }
                 } else if matches!(left_type, DataType::Int64)
                     || matches!(right_type, DataType::Int64)
                 {
@@ -1078,14 +1199,31 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
         Expr::UnaryOp { op, .. } => match op {
             sqlparser::ast::UnaryOperator::Not => DataType::Boolean,
             sqlparser::ast::UnaryOperator::Minus | sqlparser::ast::UnaryOperator::Plus => {
-                DataType::Float64
+                let inner = match expr {
+                    Expr::UnaryOp { expr: inner, .. } => inner.as_ref(),
+                    _ => expr,
+                };
+                match infer_expr_type(inner, schema) {
+                    DataType::Int32 => DataType::Int32,
+                    DataType::Int64 => DataType::Int64,
+                    DataType::Numeric { .. } => DataType::Numeric {
+                        precision: None,
+                        scale: None,
+                    },
+                    _ => DataType::Float64,
+                }
             }
             _ => DataType::Text,
         },
         Expr::Value(val) => match val {
             SqlValue::Number(n, _) => {
-                if n.contains(['.', 'e', 'E']) {
+                if n.contains(['e', 'E']) {
                     DataType::Float64
+                } else if n.contains('.') {
+                    DataType::Numeric {
+                        precision: None,
+                        scale: None,
+                    }
                 } else if n.parse::<i32>().is_ok() {
                     DataType::Int32
                 } else {
@@ -1118,9 +1256,17 @@ fn sql_datatype_to_internal(dt: &SqlDataType) -> DataType {
         SqlDataType::Double
         | SqlDataType::DoublePrecision
         | SqlDataType::Float8
-        | SqlDataType::Float(_)
-        | SqlDataType::Numeric(_)
-        | SqlDataType::Decimal(_) => DataType::Float64,
+        | SqlDataType::Float(_) => DataType::Float64,
+        SqlDataType::Numeric(info) | SqlDataType::Decimal(info) => {
+            let (precision, scale) = match info {
+                sqlparser::ast::ExactNumberInfo::None => (None, None),
+                sqlparser::ast::ExactNumberInfo::Precision(p) => (Some(*p as u32), Some(0)),
+                sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
+                    (Some(*p as u32), Some(*s as u32))
+                }
+            };
+            DataType::Numeric { precision, scale }
+        }
         SqlDataType::Timestamp(_, _) => DataType::Timestamp,
         SqlDataType::Date => DataType::Date,
         SqlDataType::Time(_, _) => DataType::Time,
@@ -1423,7 +1569,6 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
             }
         }
         DataType::Vector(_) => {
-            // Parse vector literal: [1.0, 2.0, 3.0]
             if unescaped.starts_with('[') && unescaped.ends_with(']') {
                 let inner = &unescaped[1..unescaped.len() - 1];
                 let elements: Result<Vec<f64>, _> =
@@ -1433,6 +1578,16 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
                 } else {
                     Value::Text(unescaped)
                 }
+            } else {
+                Value::Text(unescaped)
+            }
+        }
+        DataType::Numeric { scale, .. } => {
+            if let Ok(mut d) = Decimal::from_str(&unescaped) {
+                if let Some(s) = scale {
+                    d.rescale(*s);
+                }
+                Value::Numeric(d)
             } else {
                 Value::Text(unescaped)
             }
