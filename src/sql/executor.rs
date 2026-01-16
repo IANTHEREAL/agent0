@@ -12,7 +12,7 @@ use super::query;
 use super::rbac;
 use super::sequences;
 use super::udt;
-use super::{parse_sql, ExecuteResult, Session};
+use super::{parse_sql, ExecuteResult, ExecuteResults, Session};
 use crate::auth::AuthManager;
 use crate::storage::TikvStore;
 use crate::types::{DataType, Row, TableSchema, Value};
@@ -49,7 +49,8 @@ impl Executor {
 
     /// Execute a SQL statement string using the provided session
     /// Supports multiple statements separated by semicolons (e.g., "BEGIN; UPDATE...; COMMIT;")
-    pub async fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecuteResult> {
+    /// Returns all results for proper PostgreSQL Simple Query Protocol compliance.
+    pub async fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecuteResults> {
         let savepoints = session.savepoints();
         crate::txn::with_savepoints(savepoints, async {
             let sql_stripped = strip_leading_sql_comments(sql);
@@ -60,43 +61,70 @@ impl Executor {
             };
 
             if starts_with("CREATE OR REPLACE FUNCTION") || starts_with("CREATE FUNCTION") {
-                return self.execute_create_function_cmd(session, sql).await;
+                return self
+                    .execute_create_function_cmd(session, sql)
+                    .await
+                    .map(ExecuteResults::single);
             }
             if starts_with("DROP FUNCTION") {
-                return self.execute_drop_function_cmd(session, sql).await;
+                return self
+                    .execute_drop_function_cmd(session, sql)
+                    .await
+                    .map(ExecuteResults::single);
             }
             if starts_with("CREATE CONSTRAINT TRIGGER") || starts_with("CREATE TRIGGER") {
-                return self.execute_create_trigger_cmd(session, sql).await;
+                return self
+                    .execute_create_trigger_cmd(session, sql)
+                    .await
+                    .map(ExecuteResults::single);
             }
             if starts_with("DROP TRIGGER") {
-                return self.execute_drop_trigger_cmd(session, sql).await;
+                return self
+                    .execute_drop_trigger_cmd(session, sql)
+                    .await
+                    .map(ExecuteResults::single);
             }
 
             let sql_upper = sql_trimmed.trim().to_uppercase();
             if let Some(reason) = get_skip_reason(&sql_upper) {
-                return Ok(ExecuteResult::Skipped { message: reason });
+                return Ok(ExecuteResults::single(ExecuteResult::Skipped {
+                    message: reason,
+                }));
             }
 
             if sql_upper.starts_with("REFRESH MATERIALIZED VIEW") {
                 return self
                     .execute_refresh_materialized_view_cmd(session, sql)
-                    .await;
+                    .await
+                    .map(ExecuteResults::single);
             }
 
             if sql_upper.starts_with("DROP MATERIALIZED VIEW") {
-                return self.execute_drop_materialized_view_cmd(session, sql).await;
+                return self
+                    .execute_drop_materialized_view_cmd(session, sql)
+                    .await
+                    .map(ExecuteResults::single);
             }
 
             if sql_upper.starts_with("CALL ") {
-                return self.execute_call_cmd(session, sql).await;
+                return self
+                    .execute_call_cmd(session, sql)
+                    .await
+                    .map(ExecuteResults::single);
             }
 
             if sql_upper.starts_with("DROP PROCEDURE") {
-                return self.execute_drop_procedure_cmd(session, sql).await;
+                return self
+                    .execute_drop_procedure_cmd(session, sql)
+                    .await
+                    .map(ExecuteResults::single);
             }
 
             if sql_upper.starts_with("CREATE PROCEDURE") {
-                return self.execute_create_procedure_cmd(session, sql).await;
+                return self
+                    .execute_create_procedure_cmd(session, sql)
+                    .await
+                    .map(ExecuteResults::single);
             }
 
             if sql_upper.starts_with("CREATE TYPE") {
@@ -110,35 +138,42 @@ impl Executor {
                     prev = token;
                 }
                 if is_enum {
-                    return self.execute_create_type_enum_cmd(session, sql).await;
+                    return self
+                        .execute_create_type_enum_cmd(session, sql)
+                        .await
+                        .map(ExecuteResults::single);
                 }
             }
 
             if sql_upper.starts_with("DROP TYPE") {
-                return self.execute_drop_type_cmd(session, sql).await;
+                return self
+                    .execute_drop_type_cmd(session, sql)
+                    .await
+                    .map(ExecuteResults::single);
             }
 
             let statements = match parse_sql(sql) {
                 Ok(stmts) => stmts,
                 Err(e) => {
                     if let Some(reason) = get_unsupported_reason(&sql_upper) {
-                        return Ok(ExecuteResult::Skipped { message: reason });
+                        return Ok(ExecuteResults::single(ExecuteResult::Skipped {
+                            message: reason,
+                        }));
                     }
                     return Err(e);
                 }
             };
 
             if statements.is_empty() {
-                return Ok(ExecuteResult::Empty);
+                return Ok(ExecuteResults::single(ExecuteResult::Empty));
             }
 
-            // Execute all statements in order, returning the result of the last one
-            let mut last_result = ExecuteResult::Empty;
+            let mut results: Vec<ExecuteResult> = Vec::with_capacity(statements.len());
 
             for stmt in &statements {
                 debug!("Executing statement: {:?}", stmt);
 
-                last_result = match stmt {
+                let result = match stmt {
                     // Transaction Control
                     Statement::StartTransaction { .. } => {
                         session.begin().await?;
@@ -264,9 +299,10 @@ impl Executor {
                         res?
                     }
                 };
+                results.push(result);
             }
 
-            Ok(last_result)
+            Ok(ExecuteResults(results))
         })
         .await
     }
@@ -610,6 +646,35 @@ impl Executor {
                 )
                 .await
             }
+            Statement::DropFunction {
+                if_exists,
+                func_desc,
+                ..
+            } => {
+                let mut last_name = None;
+                for desc in func_desc {
+                    let func_name = &desc.name;
+                    let resolved = names::resolve_existing_function_name(
+                        self.store.as_ref(),
+                        txn,
+                        func_name,
+                        search_path,
+                    )
+                    .await?;
+                    let func_full_name = match resolved {
+                        Some(resolved) => resolved.full,
+                        None => names::resolve_ddl_object_name(func_name, search_path)?.full,
+                    };
+                    last_name = Some(func_full_name.clone());
+                    let dropped = self.store.drop_function(txn, &func_full_name).await?;
+                    if !dropped && !if_exists {
+                        return Err(anyhow!("Function '{}' does not exist", func_full_name));
+                    }
+                }
+                Ok(ExecuteResult::DropFunction {
+                    func_name: last_name.unwrap_or_else(|| "unknown".to_string()),
+                })
+            }
             _ => Err(anyhow!("Unsupported statement: {:?}", stmt)),
         }
     }
@@ -623,9 +688,7 @@ impl Executor {
         row: Option<&Row>,
         schema: Option<&TableSchema>,
     ) -> Result<Value> {
-        if sequences::expr_uses_sequence_functions(expr)
-            || sequences::expr_uses_current_schema(expr)
-        {
+        if sequences::expr_needs_async_eval(expr) {
             sequences::eval_expr_with_sequences(
                 &self.store,
                 txn,
@@ -649,9 +712,7 @@ impl Executor {
         expr: &Expr,
         join_ctx: &super::expr::JoinContext<'_>,
     ) -> Result<Value> {
-        if sequences::expr_uses_sequence_functions(expr)
-            || sequences::expr_uses_current_schema(expr)
-        {
+        if sequences::expr_needs_async_eval(expr) {
             sequences::eval_expr_join_with_sequences(
                 &self.store,
                 txn,

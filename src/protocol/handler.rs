@@ -1,6 +1,6 @@
 use crate::auth::AuthManager;
 use crate::pool::TikvClientPool;
-use crate::sql::{ExecuteResult, Executor, Session};
+use crate::sql::{ExecuteResult, ExecuteResults, Executor, Session};
 use crate::storage::TikvStore;
 use crate::types::{DataType, Value};
 use async_trait::async_trait;
@@ -448,7 +448,11 @@ impl DynamicPgHandler {
             format!("{} LIMIT 1", query_with_defaults)
         };
 
-        match executor.execute(session, &metadata_query).await {
+        match executor
+            .execute(session, &metadata_query)
+            .await
+            .map(|r| r.last())
+        {
             Ok(crate::sql::ExecuteResult::Select {
                 columns,
                 column_types,
@@ -660,13 +664,17 @@ impl DynamicPgHandler {
             )))
         })?;
 
-        let result = executor.execute(session, &select_sql).await.map_err(|e| {
-            PgWireError::UserError(Box::new(ErrorInfo::new(
-                "ERROR".to_string(),
-                "XX000".to_string(),
-                e.to_string(),
-            )))
-        })?;
+        let result = executor
+            .execute(session, &select_sql)
+            .await
+            .map(|r| r.last())
+            .map_err(|e| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "XX000".to_string(),
+                    e.to_string(),
+                )))
+            })?;
 
         let rows = match result {
             crate::sql::ExecuteResult::Select { rows, .. } => rows,
@@ -996,11 +1004,13 @@ impl SimpleQueryHandler for DynamicPgHandler {
         })?;
 
         match executor.execute(session, query).await {
-            Ok(result) => {
-                tracing::info!("==== Query executed successfully, calling result_to_response ====");
-                let response = result_to_response(result)?;
-                tracing::info!("==== result_to_response returned ====");
-                Ok(vec![response])
+            Ok(results) => {
+                let responses: PgWireResult<Vec<Response<'a>>> = results
+                    .into_vec()
+                    .into_iter()
+                    .map(result_to_response)
+                    .collect();
+                responses
             }
             Err(e) => {
                 error!("Query execution error: {}", e);
@@ -1230,7 +1240,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         })?;
 
         match executor.execute(session, &final_query).await {
-            Ok(result) => result_to_response(result),
+            Ok(results) => result_to_response(results.last()),
             Err(e) => {
                 error!("Extended query execution error: {}", e);
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -1642,6 +1652,7 @@ impl PgHandler {
             .executor
             .execute(&mut session_guard, &metadata_query)
             .await
+            .map(|r| r.last())
         {
             Ok(crate::sql::ExecuteResult::Select {
                 columns,
@@ -1810,9 +1821,13 @@ impl SimpleQueryHandler for PgHandler {
         let mut session = self.session.lock().await;
 
         match self.executor.execute(&mut session, query).await {
-            Ok(result) => {
-                let response = result_to_response(result)?;
-                Ok(vec![response])
+            Ok(results) => {
+                let responses: PgWireResult<Vec<Response<'a>>> = results
+                    .into_vec()
+                    .into_iter()
+                    .map(result_to_response)
+                    .collect();
+                responses
             }
             Err(e) => {
                 error!("Query execution error: {}", e);
@@ -2024,7 +2039,7 @@ impl ExtendedQueryHandler for PgHandler {
 
         let mut session = self.session.lock().await;
         match self.executor.execute(&mut session, &final_query).await {
-            Ok(result) => result_to_response(result),
+            Ok(results) => result_to_response(results.last()),
             Err(e) => {
                 error!("Extended query execution error: {}", e);
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(

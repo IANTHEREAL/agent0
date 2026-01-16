@@ -126,3 +126,21 @@ impl ExecuteResult {
         )
     }
 }
+
+/// Results from executing multiple statements in a batch
+#[derive(Debug)]
+pub struct ExecuteResults(pub Vec<ExecuteResult>);
+
+impl ExecuteResults {
+    pub fn single(result: ExecuteResult) -> Self {
+        ExecuteResults(vec![result])
+    }
+
+    pub fn into_vec(self) -> Vec<ExecuteResult> {
+        self.0
+    }
+
+    pub fn last(self) -> ExecuteResult {
+        self.0.into_iter().last().unwrap_or(ExecuteResult::Empty)
+    }
+}

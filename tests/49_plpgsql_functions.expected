@@ -1,0 +1,232 @@
+CREATE FUNCTION
+ get_answer 
+------------
+         42
+(1 row)
+
+CREATE FUNCTION
+ add_numbers 
+-------------
+          30
+(1 row)
+
+CREATE FUNCTION
+ calculate_sum 
+---------------
+            10
+(1 row)
+
+CREATE FUNCTION
+ check_sign 
+------------
+ positive
+(1 row)
+
+ check_sign 
+------------
+ 
+(1 row)
+
+ check_sign 
+------------
+ 
+(1 row)
+
+CREATE FUNCTION
+ must_be_positive 
+------------------
+               10
+(1 row)
+
+CREATE FUNCTION
+ double_it 
+-----------
+        14
+(1 row)
+
+     ?column?      
+-------------------
+ The answer is: 42
+(1 row)
+
+CREATE TABLE
+INSERT 0 5
+ val 
+-----
+  30
+  40
+  50
+(3 rows)
+
+CREATE FUNCTION
+ grade_score 
+-------------
+ A
+(1 row)
+
+ grade_score 
+-------------
+ 
+(1 row)
+
+ grade_score 
+-------------
+ 
+(1 row)
+
+ grade_score 
+-------------
+ 
+(1 row)
+
+ grade_score 
+-------------
+ 
+(1 row)
+
+CREATE FUNCTION
+ swap_and_sum 
+--------------
+           10
+(1 row)
+
+CREATE FUNCTION
+     greet     
+---------------
+ Hello, World!
+(1 row)
+
+       greet        
+--------------------
+ Hello, PostgreSQL!
+(1 row)
+
+CREATE FUNCTION
+ is_even 
+---------
+ t
+(1 row)
+
+ is_even 
+---------
+ f
+(1 row)
+
+CREATE FUNCTION
+ maybe_null 
+------------
+          5
+(1 row)
+
+ maybe_null 
+------------
+ 
+(1 row)
+
+CREATE FUNCTION
+ circle_area 
+-------------
+    12.56636
+(1 row)
+
+CREATE FUNCTION
+ sql_multiply 
+--------------
+           42
+(1 row)
+
+ val | even 
+-----+------
+  10 | t
+  20 | t
+  30 | t
+  40 | t
+  50 | t
+(5 rows)
+
+ val | parity 
+-----+--------
+  10 | even
+  20 | even
+  30 | even
+  40 | even
+  50 | even
+(5 rows)
+
+ add_numbers 
+-------------
+          10
+(1 row)
+
+CREATE FUNCTION
+ with_default 
+--------------
+          100
+(1 row)
+
+CREATE FUNCTION
+ my_abs 
+--------
+      5
+(1 row)
+
+ my_abs 
+--------
+ --5
+(1 row)
+
+ my_abs 
+--------
+      0
+(1 row)
+
+CREATE FUNCTION
+ my_max 
+--------
+     20
+(1 row)
+
+ my_max 
+--------
+     30
+(1 row)
+
+ my_max 
+--------
+      7
+(1 row)
+
+CREATE FUNCTION
+ simple_factorial 
+------------------
+                1
+(1 row)
+
+ simple_factorial 
+------------------
+ 
+(1 row)
+
+ simple_factorial 
+------------------
+ 
+(1 row)
+
+DROP TABLE
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
+DROP FUNCTION
