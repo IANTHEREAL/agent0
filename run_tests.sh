@@ -134,7 +134,7 @@ echo ""
 
 echo "[4/5] Running integration tests..."
 INTEGRATION_START=$(date +%s)
-INTEGRATION_OUTPUT=$(uv run "$SCRIPT_DIR/scripts/integration_test.py" --dsn "$PG_DSN" "$@" 2>&1) || INTEGRATION_EXIT=$?
+INTEGRATION_OUTPUT=$(uv run "$SCRIPT_DIR/scripts/integration_test.py" --dsn "$PG_DSN" "$SCRIPT_DIR/tests/" "$@" 2>&1) || INTEGRATION_EXIT=$?
 INTEGRATION_END=$(date +%s)
 INTEGRATION_TIME=$((INTEGRATION_END - INTEGRATION_START))
 echo "$INTEGRATION_OUTPUT"

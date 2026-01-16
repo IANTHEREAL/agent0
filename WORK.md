@@ -231,6 +231,152 @@ Implement schemas and session-level `search_path` described in `docs/design/05_s
 - [x] Record CTE typing + JSON access typing facts in `.codex/knowledge/sql_type_inference_cte_json.md`.
 - [x] Re-check `git diff` vs implemented design docs; add follow-up hardening items if any.
 
+## Work: EXPLAIN ANALYZE (SELECT-only)
+
+## Feature Request
+
+Implement `EXPLAIN (ANALYZE)` for SELECT statements as described in `docs/design/15_explain_analyze.md`.
+
+### MVP (P3)
+- Support `EXPLAIN (ANALYZE)` for `SELECT/WITH`:
+  - Include existing plan tree output.
+  - Include total execution time.
+  - Include actual row count (at least top-level).
+- When `ANALYZE` is requested for non-`SELECT/WITH` statements, return a clear error (MVP avoids DML side effects).
+- Keep plain `EXPLAIN` behavior unchanged.
+
+### Non-goals (MVP)
+- `EXPLAIN (ANALYZE)` for DML (INSERT/UPDATE/DELETE).
+- Accurate per-node timing/rows or statistics system integration.
+
+## Agent Work Plan
+
+### 0) Repo Work Tracking + Knowledge Base
+- [x] Read existing `.codex/knowledge/*` for any prior EXPLAIN/plan formatting notes (if any).
+- [x] Create/update `.codex/knowledge/explain_analyze.md` with concrete facts + code locations.
+- [x] Update this `WORK.md` continuously (plan + progress) while implementing.
+
+### 1) Executor Wiring: `EXPLAIN (ANALYZE)` for SELECT
+- [x] Thread `sequence_values` + `search_path` into `Executor::execute_explain(...)` so ANALYZE can execute the inner query consistently.
+- [x] Implement `analyze=true` behavior:
+  - [x] Only allow `Statement::Query(_)` (SELECT/WITH); error otherwise.
+  - [x] Execute the query once, measure total duration, compute `actual_rows`.
+- [x] Ensure plain `EXPLAIN` output remains unchanged.
+
+### 2) Output Formatting
+- [x] Append ANALYZE summary lines (e.g., `Actual Rows:` and `Execution Time:`) to the existing plan text output.
+
+### 3) Integration Test Coverage
+- [x] Add `tests/48_explain_analyze.sql` exercising `EXPLAIN (ANALYZE) SELECT ...`.
+- [x] If needed for stable assertions, extend `scripts/integration_test.py` to support pattern-based expected output for non-deterministic fields (timing).
+
+### 4) Verification
+- [x] Run `CARGO_NET_OFFLINE=true cargo test -q` (and `cargo clippy -q` if quick).
+
+### Progress Notes
+- `CARGO_NET_OFFLINE=true cargo test -q` passes.
+- `CARGO_NET_OFFLINE=true cargo clippy -q` reports preexisting warnings (not EXPLAIN-related).
+
+## Follow-up Task: Post-Implementation Review (EXPLAIN ANALYZE)
+
+### Feature Request
+
+Validate the EXPLAIN ANALYZE implementation against `docs/design/15_explain_analyze.md`, and record any follow-up engineering improvements (correctness, performance, readability, test coverage).
+
+### Agent Work Plan
+- [x] Review `git diff` vs `docs/design/15_explain_analyze.md` + the work plan above.
+- [x] Ensure formatting passes: `cargo fmt -- --check`.
+- [x] Ensure unit tests pass: `CARGO_NET_OFFLINE=true cargo test -q`.
+- [x] Add stable integration assertions for non-deterministic output via `.assert` support in `scripts/integration_test.py`.
+
+### Progress Notes
+- MVP matches the design doc scope; remaining per-node timing/stats are deferred as planned.
+
+## Work: CREATE FUNCTION / TRIGGER (Stage 1: store definitions)
+
+## Feature Request
+
+Implement Stage 1 of `CREATE FUNCTION / TRIGGER` support described in `docs/design/12_functions_and_triggers.md`:
+- Accept and persist `CREATE/DROP FUNCTION` and `CREATE/DROP TRIGGER` (migration unblock).
+- Add minimal pg_catalog introspection so migrations/ORMs can discover stored objects.
+- Triggers do **not** execute in Stage 1 (no side effects).
+
+### MVP (Stage 1 / P1)
+- DDL:
+  - `CREATE [OR REPLACE] FUNCTION ...` stores `FunctionDef` under `_sys_func_*`.
+  - `DROP FUNCTION [IF EXISTS] ...` removes stored function definition(s).
+  - `CREATE TRIGGER ...` stores `TriggerDef` under `_sys_trigger_*` (keyed per table + trigger name).
+  - `DROP TRIGGER [IF EXISTS] ... ON <table>` removes stored trigger definition.
+- Name resolution:
+  - Unqualified function names default to `search_path[0]`.
+  - Trigger target table resolves via `search_path` (must exist).
+  - Trigger referenced function is stored as fully-qualified name (weak existence check).
+- Introspection:
+  - `pg_catalog.pg_proc` returns stored functions (minimal columns).
+  - `pg_catalog.pg_trigger` returns stored triggers (minimal columns, joinable to tables/functions when possible).
+
+### Non-goals (Stage 1)
+- Trigger execution semantics (`BEFORE INSERT/UPDATE` row transforms).
+- PL/pgSQL execution engine.
+- Full signature-based overload resolution for functions.
+
+## Agent Work Plan
+
+### 0) Repo Work Tracking + Knowledge Base
+- [x] Read existing `.codex/knowledge/*` relevant to name resolution and system catalogs.
+- [x] Create/update `.codex/knowledge/functions_triggers.md` with concrete facts + code locations.
+- [x] Update this `WORK.md` continuously (plan + progress) while implementing.
+
+### 1) Core Types + Storage Catalog
+- [x] Add `FunctionDef` / `TriggerDef` structs (`serde` + `bincode`) in `src/types/mod.rs`.
+- [x] Add `_sys_func_` and `_sys_trigger_` key encoders in `src/storage/encoding.rs`.
+- [x] Add `TikvStore` CRUD + listing APIs for functions/triggers in `src/storage/tikv_store.rs`.
+
+### 2) Executor Wiring (DDL)
+- [x] Add raw-SQL command handlers (pre-parser intercept) for:
+  - [x] `CREATE [OR REPLACE] FUNCTION ...` (supports `$tag$...$tag$` bodies)
+  - [x] `DROP FUNCTION [IF EXISTS] ...`
+  - [x] `CREATE TRIGGER ... EXECUTE {FUNCTION|PROCEDURE} ...`
+  - [x] `DROP TRIGGER [IF EXISTS] ... ON <table>`
+- [x] Remove `CREATE TRIGGER not supported` pre-rejection from `src/sql/helpers.rs`.
+- [x] Add `ExecuteResult` variants + pgwire tags for function/trigger DDL.
+
+### 3) pg_catalog Introspection
+- [x] Extend `src/sql/information_schema.rs`:
+  - [x] Fill `pg_proc` rows from stored functions.
+  - [x] Add `pg_trigger` table schema + rows from stored triggers.
+
+### 4) Tests + Verification
+- [x] Add SQL integration coverage: `tests/46_functions_triggers_ddl.sql` (+ `.assert` if needed).
+- [x] Run `cargo fmt -- --check` and `CARGO_NET_OFFLINE=true cargo test -q`.
+
+### Progress Notes
+- `cargo fmt -- --check` passes.
+- `CARGO_NET_OFFLINE=true cargo test -q` passes.
+
+## Follow-up Task: Post-Implementation Review (FUNCTION/TRIGGER)
+
+### Feature Request
+
+Validate Stage 1 behavior against `docs/design/12_functions_and_triggers.md`, and record follow-up engineering tasks (correctness, parsing robustness, introspection coverage, performance).
+
+### Agent Work Plan
+- [x] Review `git diff` vs `docs/design/12_functions_and_triggers.md` + the work plan above.
+- [x] Ensure formatting passes: `cargo fmt -- --check`.
+- [x] Ensure unit tests pass: `CARGO_NET_OFFLINE=true cargo test -q`.
+- [x] Fix review items from `review.md`:
+  - [x] `DROP SCHEMA` RESTRICT checks `_sys_func_` and `_sys_trigger_` prefixes.
+  - [x] `DROP TABLE` cleans up triggers for the table to avoid orphan metadata.
+  - [x] Add regression SQL test for schema drop behavior.
+- [ ] Follow-up candidates to consider next:
+  - [ ] Implement Stage 2 trigger execution for a limited subset (e.g. `updated_at` assignment).
+  - [ ] Implement `docs/design/07_dollar_quoted_strings.md` (allow `SELECT $$...$$` and remove `$$` pre-rejection) to reduce special-casing.
+  - [ ] Extend pg_catalog coverage for functions/triggers (additional columns used by ORMs), if needed by real migrations.
+
+### Progress Notes
+- Stage 1 MVP complete; trigger execution semantics intentionally deferred.
+- Review fixes applied; added regression SQL test `tests/47_schema_drop_functions.sql`.
+
 ## Archived (Previous Work)
 
 - Sequences (CREATE SEQUENCE / nextval / SERIAL): implementation facts + code locations in `.codex/knowledge/sequences.md`.
