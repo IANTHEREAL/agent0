@@ -2381,6 +2381,15 @@ fn eval_value(v: &SqlValue) -> Result<Value> {
             }
             Ok(Value::Text(s.clone()))
         }
+        SqlValue::DollarQuotedString(s) => {
+            let body = &s.value;
+            if body.starts_with('[') && body.ends_with(']') {
+                if let Ok(vec) = parse_vector_literal(body) {
+                    return Ok(Value::Vector(vec));
+                }
+            }
+            Ok(Value::Text(body.clone()))
+        }
         _ => Err(anyhow!("Unsupported value literal: {:?}", v)),
     }
 }
@@ -3375,6 +3384,18 @@ mod tests {
         assert_eq!(
             eval_expr(&parse_expr("'hello'"), None, None).unwrap(),
             Value::Text("hello".to_string())
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("$$hello$$"), None, None).unwrap(),
+            Value::Text("hello".to_string())
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("$tag$hello$tag$"), None, None).unwrap(),
+            Value::Text("hello".to_string())
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("$$ $1 $$"), None, None).unwrap(),
+            Value::Text(" $1 ".to_string())
         );
         assert_eq!(
             eval_expr(&parse_expr("NULL"), None, None).unwrap(),

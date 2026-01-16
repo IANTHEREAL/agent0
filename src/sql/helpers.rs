@@ -926,9 +926,6 @@ pub fn get_unsupported_reason(sql_upper: &str) -> Option<String> {
     if sql_upper.starts_with("ALTER TABLE") && sql_upper.contains("OWNER TO") {
         return Some("ALTER TABLE OWNER TO not supported".into());
     }
-    if sql_upper.contains("$_$") || sql_upper.contains("$$") {
-        return Some("Dollar-quoted strings not supported".into());
-    }
     if sql_upper.starts_with("CREATE INDEX") && sql_upper.contains("USING GIST") {
         return Some("GIST index not supported".into());
     }
@@ -1380,6 +1377,8 @@ mod tests {
     fn test_get_unsupported_reason() {
         assert!(get_unsupported_reason("CREATE DOMAIN foo").is_some());
         assert!(get_unsupported_reason("SELECT * FROM foo").is_none());
+        assert!(get_unsupported_reason("SELECT $$abc$$").is_none());
+        assert!(get_unsupported_reason("SELECT $tag$abc$tag$").is_none());
     }
 
     #[test]

@@ -370,12 +370,72 @@ Validate Stage 1 behavior against `docs/design/12_functions_and_triggers.md`, an
   - [x] Add regression SQL test for schema drop behavior.
 - [ ] Follow-up candidates to consider next:
   - [ ] Implement Stage 2 trigger execution for a limited subset (e.g. `updated_at` assignment).
-  - [ ] Implement `docs/design/07_dollar_quoted_strings.md` (allow `SELECT $$...$$` and remove `$$` pre-rejection) to reduce special-casing.
+  - [x] Implement `docs/design/07_dollar_quoted_strings.md` (allow `SELECT $$...$$` and remove `$$` pre-rejection) to reduce special-casing.
   - [ ] Extend pg_catalog coverage for functions/triggers (additional columns used by ORMs), if needed by real migrations.
 
 ### Progress Notes
 - Stage 1 MVP complete; trigger execution semantics intentionally deferred.
 - Review fixes applied; added regression SQL test `tests/47_schema_drop_functions.sql`.
+
+# Work: Dollar-Quoted Strings (`$$...$$` / `$tag$...$tag$`)
+
+## Feature Request
+
+Implement dollar-quoted strings support described in `docs/design/07_dollar_quoted_strings.md`.
+
+### MVP (P0)
+- Allow dollar-quoted strings in SQL and evaluate them as text values.
+- Remove `$$` / `$_$` parsing “unsupported” fallback that skips statements on parse errors.
+- Fix pgwire SQL scanning helpers to treat dollar-quoted regions as string literals:
+  - `count_sql_parameters()` should not count `$1` inside `$tag$...$tag$` / `$$...$$`
+  - `substitute_parameters()` should not replace `$1` inside dollar-quoted strings
+  - `find_keyword_outside_strings()` should ignore keywords inside dollar-quoted strings
+- Add unit tests + integration SQL coverage.
+
+### Non-goals (MVP)
+- PL/pgSQL execution semantics (string literal parsing only).
+- Perfect compatibility for every edge-case variant; focus on `$$` and `$tag$`.
+
+## Agent Work Plan
+
+### 0) Repo Work Tracking + Knowledge Base
+- [x] Read existing `.codex/knowledge/*` relevant to SQL parsing + pgwire scanning.
+- [x] Create/update `.codex/knowledge/dollar_quoted_strings.md` with concrete facts + code locations.
+- [x] Update this `WORK.md` continuously (plan + progress) while implementing.
+
+### 1) Remove `$$` Unsupported Fallback
+- [x] `src/sql/helpers.rs`: remove dollar-quote check in `get_unsupported_reason()` and update the unit test.
+
+### 2) SQL Expression Evaluation
+- [x] `src/sql/expr.rs`: support `sqlparser::ast::Value::DollarQuotedString` in `eval_value()` (treat as `Value::Text`).
+- [x] Add unit tests for `SELECT $$hello$$` and `SELECT $tag$hello$tag$`.
+
+### 3) pgwire Scanning: Params / Keywords
+- [x] `src/protocol/handler.rs`: update `count_sql_parameters()` to ignore dollar-quoted strings (and handle escaped quotes).
+- [x] `src/protocol/handler.rs`: update `substitute_parameters()` to only replace placeholders outside quoted/dollar-quoted regions.
+- [x] `src/protocol/handler.rs`: update `find_keyword_outside_strings()` to ignore dollar-quoted regions.
+- [x] Add unit tests covering parameter counting + keyword search around dollar quotes.
+
+### 4) Integration Tests + Verification
+- [x] Add `tests/42_dollar_quote.sql` (+ `.assert`/`.out` as needed).
+- [x] Run `cargo fmt -- --check` and `CARGO_NET_OFFLINE=true cargo test -q`.
+
+### Progress Notes
+- `cargo fmt -- --check` passes.
+- `CARGO_NET_OFFLINE=true cargo test -q` passes.
+
+## Follow-up Task: Post-Implementation Review (DOLLAR-QUOTED STRINGS)
+
+### Feature Request
+
+Validate the dollar-quote MVP against `docs/design/07_dollar_quoted_strings.md`, and capture follow-up engineering improvements (correctness, parsing robustness, test coverage).
+
+### Agent Work Plan
+- [x] Review `git diff` vs `docs/design/07_dollar_quoted_strings.md` + the work plan above.
+- [x] Confirm formatting + unit tests: `cargo fmt -- --check`, `CARGO_NET_OFFLINE=true cargo test -q`.
+- [ ] Follow-up candidates to consider next:
+  - [ ] Add comment-aware scanning to pgwire helpers (`--` / `/* ... */`) if real migrations embed `$1`/keywords inside comments.
+  - [ ] Consider supporting `sqlparser::ast::Value::EscapedStringLiteral` (`E'...'`) in `src/sql/expr.rs::eval_value()` if encountered by ORMs.
 
 ## Archived (Previous Work)
 
