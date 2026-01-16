@@ -1,6 +1,6 @@
 use crate::auth::AuthManager;
 use crate::pool::TikvClientPool;
-use crate::sql::{ExecuteResult, ExecuteResults, Executor, Session};
+use crate::sql::{ExecuteResult, Executor, Session};
 use crate::storage::TikvStore;
 use crate::types::{DataType, Value};
 use async_trait::async_trait;
@@ -82,69 +82,185 @@ fn parse_tenant_username(username: &str) -> (Option<String>, String) {
 /// Count the number of parameter placeholders ($1, $2, ...) in a SQL query.
 /// Returns the maximum placeholder number found, which indicates how many parameters are expected.
 fn count_sql_parameters(sql: &str) -> usize {
-    let mut max_param = 0;
+    let bytes = sql.as_bytes();
+    let mut max_param = 0usize;
     let mut in_single_quote = false;
     let mut in_double_quote = false;
-    let chars: Vec<char> = sql.chars().collect();
-    let mut i = 0;
+    let mut dollar_delim: Option<Vec<u8>> = None;
 
-    while i < chars.len() {
-        let c = chars[i];
-
-        // Track string state
-        if c == '\'' && !in_double_quote {
-            in_single_quote = !in_single_quote;
-        } else if c == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(delim) = dollar_delim.as_ref() {
+            let delim_len = delim.len();
+            let matches =
+                i + delim_len <= bytes.len() && &bytes[i..i + delim_len] == delim.as_slice();
+            if matches {
+                dollar_delim = None;
+                i += delim_len;
+            } else {
+                i += 1;
+            }
+            continue;
         }
 
-        // Look for $ followed by digits, but only outside strings
-        if !in_single_quote && !in_double_quote && c == '$' && i + 1 < chars.len() {
-            let mut num_str = String::new();
+        let b = bytes[i];
+
+        if b == b'\'' && !in_double_quote {
+            if in_single_quote && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            in_single_quote = !in_single_quote;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single_quote {
+            if in_double_quote && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                i += 2;
+                continue;
+            }
+            in_double_quote = !in_double_quote;
+            i += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote && b == b'$' {
+            // Prepared-statement placeholder: $1, $2, ...
             let mut j = i + 1;
-            while j < chars.len() && chars[j].is_ascii_digit() {
-                num_str.push(chars[j]);
+            let mut saw_digit = false;
+            let mut num = 0usize;
+            while j < bytes.len() && bytes[j].is_ascii_digit() && j - i <= 10 {
+                saw_digit = true;
+                num = num
+                    .saturating_mul(10)
+                    .saturating_add((bytes[j] - b'0') as usize);
                 j += 1;
             }
-            if !num_str.is_empty() {
-                if let Ok(num) = num_str.parse::<usize>() {
-                    if num > max_param {
-                        max_param = num;
-                    }
+            if saw_digit {
+                max_param = max_param.max(num);
+                i = j;
+                continue;
+            }
+
+            // PostgreSQL dollar-quoted strings ($tag$...$tag$ or $$...$$)
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'$' {
+                if !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    break;
                 }
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'$' {
+                dollar_delim = Some(bytes[i..=j].to_vec());
+                i = j + 1;
+                continue;
             }
         }
+
         i += 1;
     }
+
     max_param
+}
+
+fn is_ident_char(b: u8) -> bool {
+    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
 }
 
 #[allow(dead_code)]
 fn find_keyword_outside_strings(query: &str, keyword: &str) -> Option<usize> {
+    let bytes = query.as_bytes();
+    let kw = keyword.as_bytes();
+    if kw.is_empty() || bytes.len() < kw.len() {
+        return None;
+    }
+
     let mut in_single_quote = false;
     let mut in_double_quote = false;
-    let mut i = 0;
-    let chars: Vec<char> = query.chars().collect();
-    let keyword_chars: Vec<char> = keyword.chars().collect();
+    let mut dollar_delim: Option<Vec<u8>> = None;
 
-    while i < chars.len() {
-        let c = chars[i];
-
-        if c == '\'' && !in_double_quote {
-            in_single_quote = !in_single_quote;
-        } else if c == '"' && !in_single_quote {
-            in_double_quote = !in_double_quote;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(delim) = dollar_delim.as_ref() {
+            let delim_len = delim.len();
+            let matches =
+                i + delim_len <= bytes.len() && &bytes[i..i + delim_len] == delim.as_slice();
+            if matches {
+                dollar_delim = None;
+                i += delim_len;
+            } else {
+                i += 1;
+            }
+            continue;
         }
 
-        if !in_single_quote && !in_double_quote && i + keyword_chars.len() <= chars.len() {
-            let slice: String = chars[i..i + keyword_chars.len()].iter().collect();
-            if slice == keyword {
-                return Some(i);
+        let b = bytes[i];
+
+        if b == b'\'' && !in_double_quote {
+            if in_single_quote && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            in_single_quote = !in_single_quote;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single_quote {
+            if in_double_quote && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                i += 2;
+                continue;
+            }
+            in_double_quote = !in_double_quote;
+            i += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote && b == b'$' {
+            // Skip placeholders like $1 and keep scanning.
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 {
+                i = j;
+                continue;
+            }
+
+            // Track dollar-quoted strings ($tag$...$tag$ or $$...$$)
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'$' {
+                if !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    break;
+                }
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'$' {
+                dollar_delim = Some(bytes[i..=j].to_vec());
+                i = j + 1;
+                continue;
+            }
+        }
+
+        if !in_single_quote && !in_double_quote && i + kw.len() <= bytes.len() {
+            let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+            let after_ok = i + kw.len() == bytes.len() || !is_ident_char(bytes[i + kw.len()]);
+            if before_ok && after_ok {
+                let mut matched = true;
+                for (j, kw_b) in kw.iter().enumerate() {
+                    if bytes[i + j].to_ascii_uppercase() != kw_b.to_ascii_uppercase() {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    return Some(i);
+                }
             }
         }
 
         i += 1;
     }
+
     None
 }
 
@@ -1367,11 +1483,106 @@ fn replace_placeholders_for_inference(query: &str) -> String {
     result
 }
 
-fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
-    let mut result = query.to_string();
+fn substitute_placeholders_outside_strings_and_dollar(query: &str, values: &[String]) -> String {
+    let bytes = query.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(query.len());
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut dollar_delim: Option<Vec<u8>> = None;
+    let mut i = 0usize;
 
-    for i in (0..portal.parameter_len()).rev() {
-        let placeholder = format!("${}", i + 1);
+    while i < bytes.len() {
+        if let Some(ref delim) = dollar_delim {
+            let delim_len = delim.len();
+            if i + delim_len <= bytes.len() && &bytes[i..i + delim_len] == delim.as_slice() {
+                out.extend_from_slice(delim);
+                i += delim_len;
+                dollar_delim = None;
+            } else {
+                out.push(bytes[i]);
+                i += 1;
+            }
+            continue;
+        }
+
+        let b = bytes[i];
+
+        if b == b'\'' && !in_double_quote {
+            if in_single_quote && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                out.push(b'\'');
+                out.push(b'\'');
+                i += 2;
+                continue;
+            }
+            in_single_quote = !in_single_quote;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+
+        if b == b'"' && !in_single_quote {
+            if in_double_quote && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                out.push(b'"');
+                out.push(b'"');
+                i += 2;
+                continue;
+            }
+            in_double_quote = !in_double_quote;
+            out.push(b);
+            i += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote && b == b'$' {
+            // Prepared-statement placeholder: $1, $2, ...
+            let mut j = i + 1;
+            let mut saw_digit = false;
+            let mut num = 0usize;
+            while j < bytes.len() && bytes[j].is_ascii_digit() && j - i <= 10 {
+                saw_digit = true;
+                num = num
+                    .saturating_mul(10)
+                    .saturating_add((bytes[j] - b'0') as usize);
+                j += 1;
+            }
+            if saw_digit {
+                if num >= 1 && num <= values.len() {
+                    out.extend_from_slice(values[num - 1].as_bytes());
+                } else {
+                    out.extend_from_slice(&bytes[i..j]);
+                }
+                i = j;
+                continue;
+            }
+
+            // PostgreSQL dollar-quoted strings ($tag$ ... $tag$ or $$ ... $$)
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'$' {
+                if !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    break;
+                }
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'$' {
+                let delim = bytes[i..=j].to_vec();
+                out.extend_from_slice(&delim);
+                dollar_delim = Some(delim);
+                i = j + 1;
+                continue;
+            }
+        }
+
+        out.push(b);
+        i += 1;
+    }
+
+    String::from_utf8(out).unwrap_or_else(|_| query.to_string())
+}
+
+fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
+    let mut values: Vec<String> = Vec::with_capacity(portal.parameter_len());
+
+    for i in 0..portal.parameter_len() {
         let param_type = portal
             .statement
             .parameter_types
@@ -1470,10 +1681,10 @@ fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
                 .unwrap_or_else(|| "NULL".to_string()),
         };
 
-        result = result.replace(&placeholder, &value_str);
+        values.push(value_str);
     }
 
-    result
+    substitute_placeholders_outside_strings_and_dollar(query, &values)
 }
 
 #[allow(dead_code)]
@@ -2791,6 +3002,70 @@ mod tests {
         assert_eq!(
             replace_placeholders_for_inference("SELECT $1, $10, $100, $999"),
             "SELECT 1, 1, 1, 1"
+        );
+    }
+
+    #[test]
+    fn test_count_sql_parameters_ignores_dollar_quoted_strings() {
+        assert_eq!(count_sql_parameters("SELECT $$ $99 $$, $1;"), 1);
+        assert_eq!(count_sql_parameters("SELECT $tag$ $2 $tag$, $1;"), 1);
+        assert_eq!(count_sql_parameters("SELECT $$ $100 $$, $2;"), 2);
+        assert_eq!(count_sql_parameters("SELECT 'it''s $10', $2;"), 2);
+        assert_eq!(count_sql_parameters(r#"SELECT "table$5", $1;"#), 1);
+        assert_eq!(count_sql_parameters("SELECT $1, $10;"), 10);
+    }
+
+    #[test]
+    fn test_find_keyword_outside_strings_ignores_dollar_quoted_strings() {
+        let query = "INSERT INTO t VALUES (1) $$ RETURNING $$ RETURNING id";
+        let pos = find_keyword_outside_strings(query, "RETURNING").unwrap();
+        assert_eq!(pos, query.rfind("RETURNING").unwrap());
+
+        let query = "SELECT $tag$RETURNING$tag$ RETURNING";
+        let pos = find_keyword_outside_strings(query, "RETURNING").unwrap();
+        assert_eq!(pos, query.rfind("RETURNING").unwrap());
+
+        let query = "SELECT RETURNINGX RETURNING";
+        let pos = find_keyword_outside_strings(query, "RETURNING").unwrap();
+        assert_eq!(pos, query.rfind("RETURNING").unwrap());
+    }
+
+    #[test]
+    fn test_substitute_placeholders_preserves_dollar_quoted_strings() {
+        let values = vec!["111".to_string()];
+        assert_eq!(
+            substitute_placeholders_outside_strings_and_dollar(
+                "SELECT $$ $1 $$ AS body, $1 AS v",
+                &values
+            ),
+            "SELECT $$ $1 $$ AS body, 111 AS v"
+        );
+
+        assert_eq!(
+            substitute_placeholders_outside_strings_and_dollar(
+                "SELECT 'it''s $1' AS msg, $1",
+                &values
+            ),
+            "SELECT 'it''s $1' AS msg, 111"
+        );
+    }
+
+    #[test]
+    fn test_substitute_placeholders_handles_multi_digit_numbers() {
+        let values = (1..=10).map(|i| i.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            substitute_placeholders_outside_strings_and_dollar("SELECT $10, $1", &values),
+            "SELECT 10, 1"
+        );
+
+        assert_eq!(
+            substitute_placeholders_outside_strings_and_dollar("SELECT '${10}', $1", &values),
+            "SELECT '${10}', 1"
+        );
+
+        assert_eq!(
+            substitute_placeholders_outside_strings_and_dollar("SELECT $$ $10 $$, $10", &values),
+            "SELECT $$ $10 $$, 10"
         );
     }
 }
