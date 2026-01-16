@@ -39,7 +39,7 @@ A DATABASE FOR AI BY AI
 
 | Category | Features |
 |----------|----------|
-| **DDL** | `CREATE TABLE`, `DROP TABLE`, `TRUNCATE`, `ALTER TABLE ADD COLUMN`, `CREATE INDEX`, `CREATE VIEW`, `DROP VIEW`, `CREATE MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, `SHOW TABLES` |
+| **DDL** | `CREATE TABLE`, `DROP TABLE`, `TRUNCATE`, `ALTER TABLE`, `CREATE INDEX`, `CREATE VIEW`, `DROP VIEW`, `CREATE MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, `CREATE SCHEMA`, `DROP SCHEMA`, `CREATE SEQUENCE`, `DROP SEQUENCE`, `CREATE TYPE`, `DROP TYPE`, `SHOW TABLES` |
 | **DML** | `INSERT`, `UPDATE`, `DELETE` with `RETURNING`, `SELECT` with full `WHERE` support |
 | **Queries** | `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `GROUP BY`, `HAVING`, `WITH ... AS` (CTEs), `WITH RECURSIVE` (Recursive CTEs) |
 | **Joins** | `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN`, `CROSS JOIN`, `NATURAL JOIN` |
@@ -49,7 +49,7 @@ A DATABASE FOR AI BY AI
 | **Predicates** | `IN (...)`, `IN (SELECT ...)`, `EXISTS`, `BETWEEN`, `LIKE`, `ILIKE`, `IS NULL`, `IS NOT NULL`, Scalar Subqueries |
 | **Functions** | String, Math, Date/Time, `CASE WHEN`, `CAST`, `COALESCE`, `NULLIF` |
 | **Procedures** | `CREATE PROCEDURE`, `DROP PROCEDURE`, `CALL` |
-| **Transactions** | `BEGIN`, `COMMIT`, `ROLLBACK`, `SELECT FOR UPDATE` |
+| **Transactions** | `BEGIN`, `COMMIT`, `ROLLBACK`, `SAVEPOINT`, `ROLLBACK TO`, `SELECT FOR UPDATE` |
 | **COPY** | `COPY FROM stdin` for bulk loading, pg_restore compatible |
 
 ### Data Types
@@ -67,6 +67,7 @@ A DATABASE FOR AI BY AI
 | `INTERVAL` | - |
 | `UUID` | - |
 | `JSON` | `JSONB` |
+| `ENUM` | User-defined enum types |
 
 ### PostgreSQL Functions
 
@@ -80,6 +81,9 @@ ABS, CEIL, FLOOR, ROUND, TRUNC, SQRT, POWER, EXP, LN, LOG, SIGN, MOD, PI, RANDOM
 
 -- Date/Time
 NOW, CURRENT_TIMESTAMP, CURRENT_DATE, DATE_TRUNC, EXTRACT, TO_CHAR, AGE
+
+-- Sequence
+nextval, currval, setval
 
 -- Other
 COALESCE, NULLIF, GREATEST, LEAST, gen_random_uuid()
@@ -139,6 +143,23 @@ SELECT id, name, LEAD(name, 1, 'N/A') OVER (ORDER BY id) as next_name FROM users
 -- RETURNING clause
 UPDATE users SET name = 'Robert' WHERE name = 'Bob' RETURNING *;
 DELETE FROM users WHERE id = 1 RETURNING id, name;
+
+-- Sequences
+CREATE SEQUENCE order_seq START 1000;
+SELECT nextval('order_seq');
+SELECT currval('order_seq');
+SELECT setval('order_seq', 2000);
+
+-- Schemas
+CREATE SCHEMA sales;
+CREATE TABLE sales.orders (id SERIAL PRIMARY KEY, total INT);
+SELECT * FROM sales.orders;
+SET search_path TO sales, public;
+
+-- User-defined enum types
+CREATE TYPE status AS ENUM ('pending', 'active', 'completed');
+CREATE TABLE tasks (id SERIAL PRIMARY KEY, state status);
+INSERT INTO tasks (state) VALUES ('active');
 ```
 
 ### Restore a PostgreSQL Dump
@@ -204,6 +225,73 @@ DROP PROCEDURE update_prices;
 
 **Limitations**: No OUT/INOUT parameters, no control flow (IF/WHILE), no exception handling.
 
+## Schemas
+
+PostgreSQL-style schema support with `search_path`:
+
+```sql
+-- Create schema
+CREATE SCHEMA myapp;
+
+-- Create objects in schema
+CREATE TABLE myapp.users (id SERIAL PRIMARY KEY, name TEXT);
+CREATE SEQUENCE myapp.order_seq;
+
+-- Query with qualified names
+SELECT * FROM myapp.users;
+
+-- Set search path for unqualified names
+SET search_path TO myapp, public;
+SELECT * FROM users;  -- Resolves to myapp.users
+
+-- Default search_path is 'public'
+```
+
+**Supported**: `CREATE SCHEMA`, `DROP SCHEMA`, schema-qualified table/view/sequence names, `SET search_path`, `SHOW search_path`.
+
+## Sequences
+
+PostgreSQL-compatible sequences:
+
+```sql
+-- Standalone sequences
+CREATE SEQUENCE order_seq START 1000 INCREMENT 1;
+SELECT nextval('order_seq');  -- 1000
+SELECT nextval('order_seq');  -- 1001
+SELECT currval('order_seq');  -- 1001 (last value in session)
+SELECT setval('order_seq', 5000);
+SELECT setval('order_seq', 5000, false);  -- Next nextval returns 5000
+DROP SEQUENCE order_seq;
+
+-- Implicit sequences (SERIAL columns)
+CREATE TABLE orders (id SERIAL PRIMARY KEY);
+INSERT INTO orders DEFAULT VALUES;  -- id = 1
+SELECT currval('orders_id_seq');    -- Auto-created sequence
+```
+
+**Options**: `START`, `INCREMENT`, `MINVALUE`, `MAXVALUE`, `CYCLE`/`NO CYCLE`.
+
+## User-Defined Types
+
+PostgreSQL-style enum types:
+
+```sql
+-- Create enum type
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
+
+-- Use in table
+CREATE TABLE people (
+    name TEXT,
+    current_mood mood
+);
+
+INSERT INTO people VALUES ('Alice', 'happy');
+SELECT * FROM people WHERE current_mood = 'happy';
+
+-- Drop type
+DROP TYPE mood;
+```
+
 ## Project Structure
 
 ```
@@ -219,6 +307,8 @@ src/
 │   ├── expr.rs          # Expression evaluation
 │   ├── aggregate.rs     # Aggregation functions
 │   ├── session.rs       # Transaction management
+│   ├── names.rs         # Schema-aware name resolution
+│   ├── sequences.rs     # Sequence operations
 │   ├── information_schema.rs  # information_schema virtual tables
 │   └── result.rs        # Result types
 ├── storage/
@@ -274,15 +364,15 @@ cd orm-tests && npm test
 
 | Test Suite | Coverage |
 |------------|----------|
-| DDL | CREATE, DROP, ALTER, TRUNCATE, Views |
+| DDL | CREATE, DROP, ALTER, TRUNCATE, Views, Schemas |
 | DML | INSERT, UPDATE, DELETE, SELECT, RETURNING |
-| Transactions | BEGIN, COMMIT, ROLLBACK, SELECT FOR UPDATE |
+| Transactions | BEGIN, COMMIT, ROLLBACK, SAVEPOINT, SELECT FOR UPDATE |
 | Queries | WHERE, ORDER BY, LIMIT, GROUP BY, HAVING, JOIN, CTEs |
 | Subqueries | IN (SELECT ...), EXISTS, NOT EXISTS, Scalar Subqueries |
 | Window Functions | ROW_NUMBER, RANK, DENSE_RANK, LEAD, LAG, SUM/AVG/COUNT OVER |
-| Functions | String, Math, Date, CASE, CAST |
+| Functions | String, Math, Date, CASE, CAST, Sequences |
 | Indexes | CREATE INDEX, Index Scan optimization |
-| Types | UUID, INTERVAL, TIMESTAMP, JSONB |
+| Types | UUID, INTERVAL, TIMESTAMP, JSONB, ENUM |
 | Compatibility | COPY protocol, pg_restore, Extended Query, ORMs |
 
 ## License
