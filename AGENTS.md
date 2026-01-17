@@ -307,7 +307,7 @@ Unsupported function in JOIN: count
 ### Adding New SQL File Tests
 
 1. Create `tests/NN_feature_name.sql` (NN = next available number)
-2. Run against PostgreSQL to generate expected output:
+2. Run against **real PostgreSQL** (not pg-tikv) to generate expected output:
    ```bash
    psql -h localhost -U postgres -f tests/NN_feature_name.sql > tests/NN_feature_name.expected 2>&1
    ```
