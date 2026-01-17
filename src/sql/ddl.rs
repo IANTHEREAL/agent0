@@ -11,6 +11,7 @@ use tikv_client::Transaction;
 use super::helpers::{
     coerce_value_for_column, convert_data_type, fill_row_defaults, infer_data_type, normalize_ident,
 };
+use super::index_helpers;
 use super::names;
 use super::sequences;
 use super::{expr::eval_expr, ExecuteResult};
@@ -936,19 +937,13 @@ pub async fn execute_create_index(
         expressions: idx_exprs,
     };
 
-    let is_btree = new_index
-        .method
-        .as_deref()
-        .map(|m| m.eq_ignore_ascii_case("btree"))
-        .unwrap_or(true);
-    let should_materialize = is_btree
-        && new_index.predicate.is_none()
-        && new_index.expressions.is_empty()
-        && !new_index.columns.is_empty();
-
-    if should_materialize {
+    if index_helpers::is_index_materializable(&new_index) {
         for row in rows {
-            let idx_values = schema.get_index_values(&new_index, &row);
+            if !index_helpers::eval_index_predicate(&new_index, &schema, &row)? {
+                continue;
+            }
+            let idx_values =
+                index_helpers::get_index_values_with_expressions(&new_index, &schema, &row)?;
             let pk_values = schema.get_pk_values(&row);
             store
                 .create_index_entry(

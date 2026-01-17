@@ -15,6 +15,7 @@ mod executor_udt_cmd;
 mod explain;
 mod expr;
 mod helpers;
+mod index_helpers;
 mod information_schema;
 mod names;
 mod parser;
@@ -24,6 +25,7 @@ mod query;
 mod rbac;
 mod result;
 mod sequences;
+mod triggers;
 mod udt;
 mod window;
 

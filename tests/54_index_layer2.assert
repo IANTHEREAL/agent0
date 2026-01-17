@@ -1,0 +1,5 @@
+PARTIAL_INDEX=1
+EXPR_INDEX=1
+ACTIVE_NAMES=alice,charlie
+AFTER_INSERT=alice,charlie,dave
+AFTER_UPDATE=charlie,dave

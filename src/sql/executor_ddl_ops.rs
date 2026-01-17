@@ -114,15 +114,7 @@ impl Executor {
         let is_btree = using
             .map(|u| u.value.eq_ignore_ascii_case("btree"))
             .unwrap_or(true);
-        let has_expr_columns = columns.iter().any(|c| {
-            let mut expr = &c.expr;
-            while let Expr::Nested(inner) = expr {
-                expr = inner.as_ref();
-            }
-            !matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-        });
-        let should_materialize = is_btree && predicate.is_none() && !has_expr_columns;
-        let rows = if should_materialize {
+        let rows = if is_btree {
             self.scan_and_fill(txn, &tbl_name, &schema).await?
         } else {
             Vec::new()

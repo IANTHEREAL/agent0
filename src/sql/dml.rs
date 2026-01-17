@@ -9,6 +9,7 @@ use tikv_client::Transaction;
 
 use super::expr::eval_expr;
 use super::helpers::{coerce_value_for_column, eval_default_expr};
+use super::index_helpers;
 use super::sequences;
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
@@ -245,7 +246,14 @@ pub async fn execute_insert_row(
     match insert_result {
         Ok(()) => {
             for index in &schema.indexes {
-                let idx_values = schema.get_index_values(index, &row);
+                if !index_helpers::is_index_materializable(index) {
+                    continue;
+                }
+                if !index_helpers::eval_index_predicate(index, schema, &row)? {
+                    continue;
+                }
+                let idx_values =
+                    index_helpers::get_index_values_with_expressions(index, schema, &row)?;
                 let result = store
                     .create_index_entry(
                         txn,
@@ -875,17 +883,30 @@ pub async fn execute_update_row(
 
     let pks = schema.get_pk_values(old_row);
     for index in &schema.indexes {
-        let old_idx = schema.get_index_values(index, old_row);
-        store
-            .delete_index_entry(txn, schema.table_id, index.id, &old_idx, &pks, index.unique)
-            .await?;
+        if !index_helpers::is_index_materializable(index) {
+            continue;
+        }
+        let old_matches = index_helpers::eval_index_predicate(index, schema, old_row)?;
+        if old_matches {
+            let old_idx = index_helpers::get_index_values_with_expressions(index, schema, old_row)?;
+            store
+                .delete_index_entry(txn, schema.table_id, index.id, &old_idx, &pks, index.unique)
+                .await?;
+        }
     }
     store.upsert(txn, table_name, new_row.clone()).await?;
     for index in &schema.indexes {
-        let new_idx = schema.get_index_values(index, &new_row);
-        store
-            .create_index_entry(txn, schema.table_id, index.id, &new_idx, &pks, index.unique)
-            .await?;
+        if !index_helpers::is_index_materializable(index) {
+            continue;
+        }
+        let new_matches = index_helpers::eval_index_predicate(index, schema, &new_row)?;
+        if new_matches {
+            let new_idx =
+                index_helpers::get_index_values_with_expressions(index, schema, &new_row)?;
+            store
+                .create_index_entry(txn, schema.table_id, index.id, &new_idx, &pks, index.unique)
+                .await?;
+        }
     }
     Ok(new_row)
 }

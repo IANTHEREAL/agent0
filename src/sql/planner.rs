@@ -175,6 +175,9 @@ pub fn choose_best_access_path(
         if !is_planner_usable_index(index) {
             continue;
         }
+        if index.predicate.is_some() && !predicate_implies_index_predicate(predicates, index) {
+            continue;
+        }
         if let Some((scan_type, cost)) = evaluate_index(index, &predicate_map, estimated_table_rows)
         {
             if cost < best_path.cost {
@@ -186,8 +189,43 @@ pub fn choose_best_access_path(
     best_path
 }
 
+fn predicate_implies_index_predicate(predicates: &[PredicateInfo], index: &IndexDef) -> bool {
+    let Some(index_pred) = &index.predicate else {
+        return true;
+    };
+
+    let pred_upper = index_pred.to_uppercase();
+
+    for pred in predicates {
+        let col_upper = pred.column.to_uppercase();
+        let value_str = match &pred.value {
+            Value::Int32(n) => n.to_string(),
+            Value::Int64(n) => n.to_string(),
+            Value::Float64(f) => f.to_string(),
+            Value::Text(s) => format!("'{}'", s),
+            Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            _ => continue,
+        };
+
+        let check_pattern = match pred.op {
+            PredicateOp::Eq => format!("{} = {}", col_upper, value_str),
+            PredicateOp::Gt => format!("{} > {}", col_upper, value_str),
+            PredicateOp::Ge => format!("{} >= {}", col_upper, value_str),
+            PredicateOp::Lt => format!("{} < {}", col_upper, value_str),
+            PredicateOp::Le => format!("{} <= {}", col_upper, value_str),
+            _ => continue,
+        };
+
+        if pred_upper.contains(&check_pattern) {
+            return true;
+        }
+    }
+
+    false
+}
+
 fn is_planner_usable_index(index: &IndexDef) -> bool {
-    if index.columns.is_empty() || index.predicate.is_some() || !index.expressions.is_empty() {
+    if index.columns.is_empty() || !index.expressions.is_empty() {
         return false;
     }
     index

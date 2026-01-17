@@ -5,6 +5,7 @@ use super::executor::Executor;
 use super::expr::JoinContext;
 use super::helpers::normalize_ident;
 use super::names;
+use super::triggers;
 use super::ExecuteResult;
 use crate::types::{DataType, Row, Value};
 use anyhow::{anyhow, Result};
@@ -73,6 +74,23 @@ impl Executor {
             dml::coerce_row_values(&schema, &mut row_vals)?;
             let row = Row::new(row_vals);
             dml::validate_check_constraints(&schema, &row)?;
+
+            let row = match triggers::apply_before_triggers(
+                &self.store(),
+                txn,
+                sequence_values,
+                search_path,
+                &t,
+                &schema,
+                "INSERT",
+                row,
+                None,
+            )
+            .await?
+            {
+                Some(r) => r,
+                None => continue,
+            };
 
             let result = dml::execute_insert_row(
                 &self.store(),
@@ -428,6 +446,24 @@ impl Executor {
 
             let new_row = Row::new(new_vals);
             dml::validate_check_constraints(&schema, &new_row)?;
+
+            let new_row = match triggers::apply_before_triggers(
+                &self.store(),
+                txn,
+                sequence_values,
+                search_path,
+                &t,
+                &schema,
+                "UPDATE",
+                new_row,
+                Some(r),
+            )
+            .await?
+            {
+                Some(row) => row,
+                None => continue,
+            };
+
             let updated_row =
                 dml::execute_update_row(&self.store(), txn, &t, &schema, r, new_row, &enum_cache)
                     .await?;

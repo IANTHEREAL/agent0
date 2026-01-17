@@ -369,13 +369,14 @@ Validate Stage 1 behavior against `docs/design/12_functions_and_triggers.md`, an
   - [x] `DROP TABLE` cleans up triggers for the table to avoid orphan metadata.
   - [x] Add regression SQL test for schema drop behavior.
 - [ ] Follow-up candidates to consider next:
-  - [ ] Implement Stage 2 trigger execution for a limited subset (e.g. `updated_at` assignment).
+  - [x] Implement Stage 2 trigger execution for a limited subset (e.g. `updated_at` assignment).
   - [x] Implement `docs/design/07_dollar_quoted_strings.md` (allow `SELECT $$...$$` and remove `$$` pre-rejection) to reduce special-casing.
   - [ ] Extend pg_catalog coverage for functions/triggers (additional columns used by ORMs), if needed by real migrations.
 
 ### Progress Notes
 - Stage 1 MVP complete; trigger execution semantics intentionally deferred.
 - Review fixes applied; added regression SQL test `tests/47_schema_drop_functions.sql`.
+- Stage 2 trigger execution implemented (`tests/53_trigger_execution.sql`).
 
 # Work: Dollar-Quoted Strings (`$$...$$` / `$tag$...$tag$`)
 
@@ -516,7 +517,37 @@ Validate index DDL-compat behavior against `docs/design/14_index_features.md`, a
 - [ ] Follow-up candidates to consider next:
   - [ ] Preserve mixed column/expression order (current `IndexDef.columns` + `IndexDef.expressions` loses interleaving order).
   - [ ] Include index options in `indexdef` when present (`DESC`, `NULLS FIRST/LAST`, `INCLUDE`, `NULLS DISTINCT`).
-  - [ ] Implement Layer 2 acceleration (partial/expression entry generation + planner usage).
+  - [x] Implement Layer 2 acceleration (partial/expression entry generation + planner usage).
+
+# Work: Index Layer 2 Acceleration (partial / expression indexes)
+
+## Feature Request
+
+Implement Layer 2 of index features: partial and expression index acceleration per `docs/design/14_index_features.md`.
+
+### MVP (P1)
+- Partial indexes: evaluate predicate at write time, only materialize index entries for matching rows.
+- Expression indexes: evaluate expression at write time, use computed values as index keys.
+- Planner: use partial indexes when query predicates imply the index predicate.
+
+### Non-goals (MVP)
+- Full expression index planner support (matching query expressions to index expressions).
+- GIN/GiST acceleration (token-based indexing).
+
+## Agent Work Plan
+- [x] `src/sql/index_helpers.rs`: add `is_index_materializable()`, `eval_index_predicate()`, `get_index_values_with_expressions()`.
+- [x] `src/sql/dml.rs`: use index helpers in `execute_insert_row()` and `execute_update_row()`.
+- [x] `src/sql/ddl.rs`: use index helpers in `execute_create_index()`.
+- [x] `src/sql/planner.rs`: support partial indexes in `choose_best_access_path()`.
+- [x] Tests: add `tests/54_index_layer2.sql` for partial/expression index acceleration.
+- [x] Verify: `cargo fmt -- --check` and `CARGO_NET_OFFLINE=true cargo test -q`.
+
+### Progress Notes
+- `cargo fmt -- --check` passes.
+- `CARGO_NET_OFFLINE=true cargo test -q` passes (265 tests).
+- Partial indexes are now materialized with predicate evaluation.
+- Expression indexes are now materialized with expression evaluation.
+- Planner supports partial indexes when query predicates match.
 
 ## Follow-up Task: `pg_get_indexdef(oid)` Correctness (Index Features)
 
