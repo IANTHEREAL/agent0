@@ -1,0 +1,115 @@
+id|len
+1|11
+2|11
+3|9
+4|9
+(4 rows)
+id|upper_s
+1|HELLO WORLD
+2|  TRIMMED  
+3|UPPERCASE
+4|LOWERCASE
+(4 rows)
+id|lower_s
+1|hello world
+2|  trimmed  
+3|uppercase
+4|lowercase
+(4 rows)
+id|initcap_s
+1|Hello World
+2|  Trimmed  
+3|Uppercase
+4|Lowercase
+(4 rows)
+id|trimmed
+2|trimmed
+(1 row)
+id|ltrimmed
+2|trimmed  
+(1 row)
+id|rtrimmed
+2|  trimmed
+(1 row)
+trim_char
+hello
+(1 row)
+id|left5
+1|Hello
+2|  tri
+3|UPPER
+4|lower
+(4 rows)
+id|right5
+1|World
+2|med  
+3|RCASE
+4|rcase
+(4 rows)
+id|substr
+1|Hello
+2|  tri
+3|UPPER
+4|lower
+(4 rows)
+id|substr_from
+1|World
+(1 row)
+concatenated
+Hello World
+(1 row)
+concat_ws
+a-b-c
+(1 row)
+pipe_concat
+Hello World
+(1 row)
+replaced
+Hello PostgreSQL
+(1 row)
+repeated
+ababab
+(1 row)
+reversed
+olleH
+(1 row)
+pos
+7
+(1 row)
+strpos
+7
+(1 row)
+lpadded
+00042
+(1 row)
+rpadded
+42000
+(1 row)
+second_part
+b
+(1 row)
+id|s
+1|Hello World
+(1 row)
+id|s
+1|Hello World
+(1 row)
+id|s
+3|UPPERCASE
+4|lowercase
+(2 rows)
+ascii_a
+65
+(1 row)
+chr_65
+A
+(1 row)
+formatted
+Hello World
+(1 row)
+translated
+hippo
+(1 row)
+result
+String function tests completed
+(1 row)

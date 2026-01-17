@@ -2612,8 +2612,12 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
             let millis = (ts % 1000).unsigned_abs() as u32;
             let nanos = millis * 1_000_000;
             if let Some(dt) = DateTime::<Utc>::from_timestamp(seconds, nanos) {
-                // PostgreSQL timestamp format: YYYY-MM-DD HH:MM:SS.microseconds
-                encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+                let micros = nanos / 1000;
+                if micros == 0 {
+                    encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                } else {
+                    encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+                }
             } else {
                 encoder.encode_field(&ts.to_string())
             }

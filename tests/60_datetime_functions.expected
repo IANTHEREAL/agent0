@@ -1,0 +1,84 @@
+date_literal
+2024-01-15
+(1 row)
+timestamp_literal
+2024-01-15 10:30:00
+(1 row)
+interval_literal
+1 day
+(1 row)
+date_plus_int
+2024-01-22
+(1 row)
+date_minus_int
+2024-01-08
+(1 row)
+date_diff
+14
+(1 row)
+date_plus_interval
+2024-02-15 00:00:00
+(1 row)
+ts_plus_interval
+2024-01-15 12:30:00
+(1 row)
+year
+2024
+(1 row)
+month
+6
+(1 row)
+day
+15
+(1 row)
+dow
+6
+(1 row)
+hour
+14
+(1 row)
+minute
+30
+(1 row)
+second
+45.000000
+(1 row)
+trunc_year
+2024-01-01 00:00:00
+(1 row)
+trunc_month
+2024-06-01 00:00:00
+(1 row)
+trunc_day
+2024-06-15 00:00:00
+(1 row)
+trunc_hour
+2024-06-15 14:00:00
+(1 row)
+formatted_date
+2024-01-15
+(1 row)
+formatted_ts
+2024-01-15 14:30:45
+(1 row)
+age_result
+5 mons 14 days
+(1 row)
+date_gt
+t
+(1 row)
+date_lt
+f
+(1 row)
+date_eq
+t
+(1 row)
+interval_add
+1 day 02:00:00
+(1 row)
+interval_mult
+3 days
+(1 row)
+result
+Date/time function tests completed
+(1 row)

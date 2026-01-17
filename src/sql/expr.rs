@@ -1427,6 +1427,118 @@ fn eval_function(
                     .unwrap_or_default(),
             ))
         }
+        "STRPOS" => {
+            let mut iter = args.into_iter();
+            let s = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Ok(Value::Null),
+            };
+            let substr = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Ok(Value::Null),
+            };
+            if substr.is_empty() {
+                return Ok(Value::Int32(1));
+            }
+            match s.find(&substr) {
+                Some(pos) => Ok(Value::Int32((s[..pos].chars().count() + 1) as i32)),
+                None => Ok(Value::Int32(0)),
+            }
+        }
+        "ASCII" => match args.into_iter().next() {
+            Some(Value::Text(s)) => {
+                if s.is_empty() {
+                    Ok(Value::Int32(0))
+                } else {
+                    Ok(Value::Int32(s.chars().next().unwrap() as i32))
+                }
+            }
+            Some(Value::Null) => Ok(Value::Null),
+            _ => Ok(Value::Null),
+        },
+        "CHR" => match args.into_iter().next() {
+            Some(Value::Int32(n)) => {
+                if n < 0 {
+                    Err(anyhow!("chr() argument must be >= 0"))
+                } else {
+                    match char::from_u32(n as u32) {
+                        Some(c) => Ok(Value::Text(c.to_string())),
+                        None => Err(anyhow!("invalid character code: {}", n)),
+                    }
+                }
+            }
+            Some(Value::Int64(n)) => {
+                if n < 0 {
+                    Err(anyhow!("chr() argument must be >= 0"))
+                } else {
+                    match char::from_u32(n as u32) {
+                        Some(c) => Ok(Value::Text(c.to_string())),
+                        None => Err(anyhow!("invalid character code: {}", n)),
+                    }
+                }
+            }
+            Some(Value::Null) => Ok(Value::Null),
+            _ => Err(anyhow!("chr() requires integer argument")),
+        },
+        "FORMAT" => {
+            let mut iter = args.into_iter();
+            let fmt = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Err(anyhow!("format() requires text format string")),
+            };
+            let mut result = fmt;
+            for val in iter {
+                let replacement = match val {
+                    Value::Null => "".to_string(),
+                    Value::Text(s) => s,
+                    v => v.to_string(),
+                };
+                if let Some(pos) = result.find("%s") {
+                    result = format!("{}{}{}", &result[..pos], replacement, &result[pos + 2..]);
+                } else if let Some(pos) = result.find("%I") {
+                    result = format!("\"{}\"", replacement);
+                    let _ = pos;
+                } else if let Some(pos) = result.find("%L") {
+                    result = format!("'{}'", replacement.replace('\'', "''"));
+                    let _ = pos;
+                }
+            }
+            Ok(Value::Text(result))
+        }
+        "TRANSLATE" => {
+            let mut iter = args.into_iter();
+            let s = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Ok(Value::Null),
+            };
+            let from = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Ok(Value::Text(s)),
+            };
+            let to = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => String::new(),
+            };
+            let from_chars: Vec<char> = from.chars().collect();
+            let to_chars: Vec<char> = to.chars().collect();
+            let result: String = s
+                .chars()
+                .filter_map(|c| {
+                    if let Some(pos) = from_chars.iter().position(|&fc| fc == c) {
+                        to_chars.get(pos).copied()
+                    } else {
+                        Some(c)
+                    }
+                })
+                .collect();
+            Ok(Value::Text(result))
+        }
         "INITCAP" => match args.into_iter().next() {
             Some(Value::Text(s)) => {
                 let mut result = String::new();
@@ -1546,6 +1658,19 @@ fn eval_function(
             }
             _ => Ok(Value::Null),
         },
+        "CBRT" => match args.into_iter().next() {
+            Some(Value::Float64(n)) => Ok(Value::Float64(n.cbrt())),
+            Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).cbrt())),
+            Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).cbrt())),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let n = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(n.cbrt()))
+            }
+            _ => Ok(Value::Null),
+        },
         "POWER" | "POW" => {
             let mut iter = args.into_iter();
             let base = match iter.next() {
@@ -1647,6 +1772,71 @@ fn eval_function(
                 _ => Ok(Value::Null),
             }
         }
+        "DEGREES" => match args.into_iter().next() {
+            Some(Value::Float64(n)) => Ok(Value::Float64(n.to_degrees())),
+            Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).to_degrees())),
+            Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).to_degrees())),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let n = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(n.to_degrees()))
+            }
+            _ => Ok(Value::Null),
+        },
+        "RADIANS" => match args.into_iter().next() {
+            Some(Value::Float64(n)) => Ok(Value::Float64(n.to_radians())),
+            Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).to_radians())),
+            Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).to_radians())),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let n = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(n.to_radians()))
+            }
+            _ => Ok(Value::Null),
+        },
+        "SIN" => match args.into_iter().next() {
+            Some(Value::Float64(n)) => Ok(Value::Float64(n.sin())),
+            Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).sin())),
+            Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).sin())),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let n = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(n.sin()))
+            }
+            _ => Ok(Value::Null),
+        },
+        "COS" => match args.into_iter().next() {
+            Some(Value::Float64(n)) => Ok(Value::Float64(n.cos())),
+            Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).cos())),
+            Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).cos())),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let n = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(n.cos()))
+            }
+            _ => Ok(Value::Null),
+        },
+        "TAN" => match args.into_iter().next() {
+            Some(Value::Float64(n)) => Ok(Value::Float64(n.tan())),
+            Some(Value::Int32(n)) => Ok(Value::Float64((n as f64).tan())),
+            Some(Value::Int64(n)) => Ok(Value::Float64((n as f64).tan())),
+            Some(Value::Numeric(d)) => {
+                use rust_decimal::prelude::ToPrimitive;
+                let n = d
+                    .to_f64()
+                    .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
+                Ok(Value::Float64(n.tan()))
+            }
+            _ => Ok(Value::Null),
+        },
         "PI" => Ok(Value::Float64(std::f64::consts::PI)),
         "RANDOM" => Ok(Value::Float64(rand::random::<f64>())),
         "NOW" | "CURRENT_TIMESTAMP" => {
@@ -2213,6 +2403,14 @@ fn like_match(s: &str, pattern: &str, _escape: &str, case_insensitive: bool) -> 
         .unwrap_or(false)
 }
 
+fn round_half_away_from_zero(n: f64) -> f64 {
+    if n >= 0.0 {
+        (n + 0.5).floor()
+    } else {
+        (n - 0.5).ceil()
+    }
+}
+
 fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value> {
     use sqlparser::ast::DataType as SqlType;
     match (val, data_type) {
@@ -2269,8 +2467,26 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
             }
             Ok(Value::Numeric(d))
         }
-        (v, SqlType::Text | SqlType::Varchar(_) | SqlType::String(_)) => {
-            Ok(Value::Text(v.to_string()))
+        (v, SqlType::Text) => Ok(Value::Text(v.to_string())),
+        (v, SqlType::Varchar(len_opt)) => {
+            let s = v.to_string();
+            if let Some(sqlparser::ast::CharacterLength::IntegerLength { length, .. }) = len_opt {
+                let max_len = *length as usize;
+                if s.chars().count() > max_len {
+                    return Ok(Value::Text(s.chars().take(max_len).collect()));
+                }
+            }
+            Ok(Value::Text(s))
+        }
+        (v, SqlType::String(len_opt)) => {
+            let s = v.to_string();
+            if let Some(n) = len_opt {
+                let max_len = *n as usize;
+                if s.chars().count() > max_len {
+                    return Ok(Value::Text(s.chars().take(max_len).collect()));
+                }
+            }
+            Ok(Value::Text(s))
         }
         (Value::Text(s), SqlType::Int(_) | SqlType::Integer(_)) => {
             Ok(Value::Int32(s.trim().parse().unwrap_or(0)))
@@ -2285,15 +2501,23 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
             s.to_lowercase().as_str(),
             "true" | "t" | "yes" | "y" | "1"
         ))),
+        (Value::Int32(n), SqlType::Boolean) => Ok(Value::Boolean(n != 0)),
+        (Value::Int64(n), SqlType::Boolean) => Ok(Value::Boolean(n != 0)),
+        (Value::Float64(n), SqlType::Boolean) => Ok(Value::Boolean(n != 0.0)),
+        (Value::Numeric(d), SqlType::Boolean) => Ok(Value::Boolean(!d.is_zero())),
         (Value::Numeric(d), SqlType::Int(_) | SqlType::Integer(_)) => {
             use rust_decimal::prelude::ToPrimitive;
-            d.to_i32()
+            use rust_decimal::RoundingStrategy;
+            d.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
+                .to_i32()
                 .map(Value::Int32)
                 .ok_or_else(|| anyhow!("numeric value out of range for integer"))
         }
         (Value::Numeric(d), SqlType::BigInt(_) | SqlType::Int8(_)) => {
             use rust_decimal::prelude::ToPrimitive;
-            d.to_i64()
+            use rust_decimal::RoundingStrategy;
+            d.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
+                .to_i64()
                 .map(Value::Int64)
                 .ok_or_else(|| anyhow!("numeric value out of range for bigint"))
         }
@@ -2311,8 +2535,12 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
         (Value::Int64(n), SqlType::Float(_) | SqlType::Double | SqlType::Real) => {
             Ok(Value::Float64(n as f64))
         }
-        (Value::Float64(n), SqlType::Int(_) | SqlType::Integer(_)) => Ok(Value::Int32(n as i32)),
-        (Value::Float64(n), SqlType::BigInt(_) | SqlType::Int8(_)) => Ok(Value::Int64(n as i64)),
+        (Value::Float64(n), SqlType::Int(_) | SqlType::Integer(_)) => {
+            Ok(Value::Int32(round_half_away_from_zero(n) as i32))
+        }
+        (Value::Float64(n), SqlType::BigInt(_) | SqlType::Int8(_)) => {
+            Ok(Value::Int64(round_half_away_from_zero(n) as i64))
+        }
         (Value::Boolean(b), SqlType::Int(_) | SqlType::Integer(_)) => {
             Ok(Value::Int32(if b { 1 } else { 0 }))
         }
@@ -2589,7 +2817,27 @@ fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<Valu
 
 // --- Arithmetic Helpers ---
 
+fn try_coerce_text_to_numeric(v: Value) -> Value {
+    match &v {
+        Value::Text(s) => {
+            if let Ok(i) = s.trim().parse::<i64>() {
+                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
+                    return Value::Int32(i as i32);
+                }
+                return Value::Int64(i);
+            }
+            if let Ok(f) = s.trim().parse::<f64>() {
+                return Value::Float64(f);
+            }
+            v
+        }
+        _ => v,
+    }
+}
+
 fn add_values(left: Value, right: Value) -> Result<Value> {
+    let left = try_coerce_text_to_numeric(left);
+    let right = try_coerce_text_to_numeric(right);
     match (left, right) {
         (Value::Int32(l), Value::Int32(r)) => Ok(Value::Int32(l + r)),
         (Value::Int64(l), Value::Int64(r)) => Ok(Value::Int64(l + r)),
@@ -2633,6 +2881,8 @@ fn add_values(left: Value, right: Value) -> Result<Value> {
 }
 
 fn sub_values(left: Value, right: Value) -> Result<Value> {
+    let left = try_coerce_text_to_numeric(left);
+    let right = try_coerce_text_to_numeric(right);
     match (left, right) {
         (Value::Int32(l), Value::Int32(r)) => Ok(Value::Int32(l - r)),
         (Value::Int64(l), Value::Int64(r)) => Ok(Value::Int64(l - r)),
@@ -2675,6 +2925,8 @@ fn sub_values(left: Value, right: Value) -> Result<Value> {
 }
 
 fn mul_values(left: Value, right: Value) -> Result<Value> {
+    let left = try_coerce_text_to_numeric(left);
+    let right = try_coerce_text_to_numeric(right);
     match (left, right) {
         (Value::Int32(l), Value::Int32(r)) => Ok(Value::Int32(l * r)),
         (Value::Int64(l), Value::Int64(r)) => Ok(Value::Int64(l * r)),
@@ -2709,6 +2961,8 @@ fn mul_values(left: Value, right: Value) -> Result<Value> {
 }
 
 fn div_values(left: Value, right: Value) -> Result<Value> {
+    let left = try_coerce_text_to_numeric(left);
+    let right = try_coerce_text_to_numeric(right);
     match (left, right) {
         (Value::Int32(l), Value::Int32(r)) => {
             if r == 0 {

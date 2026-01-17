@@ -1,0 +1,68 @@
+id|int_to_text
+1|42
+2|-100
+3|0
+(3 rows)
+id|text_to_int
+2|12345
+(1 row)
+id|float_to_int
+1|3
+2|-3
+3|0
+(3 rows)
+id|int_to_text
+1|42
+2|-100
+3|0
+(3 rows)
+id|float_to_int
+1|3
+2|-3
+3|0
+(3 rows)
+literal_to_int
+123
+(1 row)
+truncated
+hel
+(1 row)
+to_numeric
+12345.00
+(1 row)
+rounded_numeric
+3.14
+(1 row)
+date_cast
+2024-01-15
+(1 row)
+timestamp_cast
+2024-01-15 10:30:00
+(1 row)
+one_to_bool
+t
+(1 row)
+zero_to_bool
+f
+(1 row)
+t_to_bool
+t
+(1 row)
+false_to_bool
+f
+(1 row)
+bool_to_int
+1
+(1 row)
+false_to_int
+0
+(1 row)
+implicit_text_to_int
+150
+(1 row)
+implicit_int_to_float
+15.5
+(1 row)
+result
+Type casting tests completed
+(1 row)

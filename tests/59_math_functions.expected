@@ -1,0 +1,114 @@
+abs_neg
+42
+(1 row)
+abs_pos
+42
+(1 row)
+ceil_pos
+5
+(1 row)
+ceil_neg
+-4
+(1 row)
+floor_pos
+4
+(1 row)
+floor_neg
+-5
+(1 row)
+round_half
+5
+(1 row)
+round_down
+4
+(1 row)
+round_2dp
+4.57
+(1 row)
+trunc_int
+4
+(1 row)
+trunc_2dp
+4.56
+(1 row)
+sqrt_16
+4
+(1 row)
+sqrt_2
+1.4142135623730951
+(1 row)
+cbrt_27
+3
+(1 row)
+power_2_10
+1024
+(1 row)
+exp_1
+2.718281828459045
+(1 row)
+ln_e
+0.9999999998311266
+(1 row)
+log_100
+2
+(1 row)
+mod_17_5
+2
+(1 row)
+mod_neg
+-2
+(1 row)
+modulo_op
+2
+(1 row)
+sign_pos
+1
+(1 row)
+sign_neg
+-1
+(1 row)
+sign_zero
+0
+(1 row)
+greatest
+9
+(1 row)
+least
+1
+(1 row)
+pi_value
+3.141592653589793
+(1 row)
+degrees_pi
+180
+(1 row)
+radians_180
+3.141592653589793
+(1 row)
+sin_0
+0
+(1 row)
+cos_0
+1
+(1 row)
+tan_0
+0
+(1 row)
+add
+8
+(1 row)
+subtract
+6
+(1 row)
+multiply
+42
+(1 row)
+int_divide
+3
+(1 row)
+float_divide
+3.750
+(1 row)
+result
+Math function tests completed
+(1 row)

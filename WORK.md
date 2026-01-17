@@ -779,3 +779,116 @@ Affected: 16_dvdrental_compat, 21_views
 - [ ] Phase 3: Column alias
 - [ ] Phase 4: Timestamp format
 - [ ] Phase 5: Core bugs
+
+---
+
+# Work: PostgreSQL Compatibility - Functions and Type Handling
+
+**Generated:** 2026-01-17  
+**Status:** In Progress
+
+## Summary
+
+Integration tests revealed multiple PostgreSQL compatibility gaps. This work item tracks fixes for missing functions, type conversion issues, and date/time handling.
+
+## Test Files Added
+
+- `tests/56_null_handling.sql` - NULL handling and three-valued logic
+- `tests/57_type_casting.sql` - Type casting and conversion
+- `tests/58_string_functions.sql` - String functions coverage
+- `tests/59_math_functions.sql` - Math functions coverage
+- `tests/60_datetime_functions.sql` - Date/time functions coverage
+- `tests/61_join_comprehensive.sql` - JOIN operations coverage
+
+## Issues Found
+
+### 1. Missing String Functions (High Priority)
+| Function | Description | Status |
+|----------|-------------|--------|
+| `STRPOS(string, substring)` | Find position of substring | ❌ Not implemented |
+| `ASCII(char)` | Get ASCII code of character | ❌ Not implemented |
+| `CHR(int)` | Get character from ASCII code | ❌ Not implemented |
+| `FORMAT(format, ...)` | Format string with arguments | ❌ Not implemented |
+| `TRANSLATE(string, from, to)` | Replace characters | ❌ Not implemented |
+
+### 2. Missing Math Functions (High Priority)
+| Function | Description | Status |
+|----------|-------------|--------|
+| `CBRT(x)` | Cube root | ❌ Not implemented |
+| `DEGREES(radians)` | Convert radians to degrees | ❌ Not implemented |
+| `RADIANS(degrees)` | Convert degrees to radians | ❌ Not implemented |
+| `SIN(x)` | Sine | ❌ Not implemented |
+| `COS(x)` | Cosine | ❌ Not implemented |
+| `TAN(x)` | Tangent | ❌ Not implemented |
+
+### 3. Type Conversion Issues (High Priority)
+| Issue | Expected | Actual | Status |
+|-------|----------|--------|--------|
+| FLOAT→INT rounding | `-2.71828::INT` = `-3` | `-2` | ❌ Bug |
+| VARCHAR(n) truncation | `'hello'::VARCHAR(3)` = `'hel'` | `'hello'` | ❌ Bug |
+| BOOLEAN display | `t` / `f` | `1` / `0` | ❌ Bug |
+| Implicit type conversion | `'100' + 50` = `150` | Error | ❌ Bug |
+
+### 4. Date/Time Issues (High Priority)
+| Issue | Expected | Actual | Status |
+|-------|----------|--------|--------|
+| `EXTRACT(YEAR FROM date)` | `2024` | `NULL` | ❌ Bug |
+| `DATE + INT` | `2024-01-22` | Error | ❌ Bug |
+| `DATE - INT` | `2024-01-08` | Error | ❌ Bug |
+| `INTERVAL + INTERVAL` | `1 day 02:00:00` | Error | ❌ Bug |
+| `INTERVAL * INT` | `3 days` | Error | ❌ Bug |
+| INTERVAL format | `1 day` | `1 days 00:00:00` | ❌ Bug |
+| DATE + INTERVAL month | `2024-02-15` | `2024-02-14` | ❌ Bug |
+
+### 5. Format Differences (Medium Priority)
+| Issue | Expected | Actual | Status |
+|-------|----------|--------|--------|
+| AVG() precision | `150.0000000000000000` | `150` | ❌ Bug |
+| Timestamp format | `2024-01-15 10:30:00` | `2024-01-15 10:30:00.000000` | ❌ Bug |
+| Float division precision | `3.7500000000000000` | `3.750` | ❌ Bug |
+
+## Implementation Plan
+
+### Phase 1: Missing Functions ✅
+- [x] 1.1 Implement string functions (STRPOS, ASCII, CHR, FORMAT, TRANSLATE)
+- [x] 1.2 Implement math functions (CBRT, DEGREES, RADIANS, SIN, COS, TAN)
+
+### Phase 2: Type Conversion Fixes ✅
+- [x] 2.1 Fix FLOAT→INT rounding (use proper round-half-away-from-zero)
+- [x] 2.2 Fix VARCHAR(n) truncation in CAST
+- [x] 2.3 Fix int-to-BOOLEAN casting (0 = false, non-zero = true)
+- [x] 2.4 Implement implicit text-to-numeric conversion for arithmetic
+- [x] 2.5 Fix timestamp display (omit microseconds when zero)
+
+### Phase 3: Date/Time Fixes
+- [ ] 3.1 Fix EXTRACT to return actual values instead of NULL
+- [ ] 3.2 Implement DATE ± INT arithmetic
+- [ ] 3.3 Implement INTERVAL arithmetic (+ and *)
+- [ ] 3.4 Fix INTERVAL display format
+- [ ] 3.5 Fix DATE + INTERVAL month calculation
+
+### Phase 4: Format Fixes
+- [ ] 4.1 Fix AVG() to return proper decimal precision
+- [x] 4.2 Remove unnecessary microseconds from timestamp display (merged into 2.5)
+- [ ] 4.3 Fix float division precision display
+
+## Progress Log
+
+### 2026-01-17 (continued)
+**Phase 1 completed** (previous session):
+- STRPOS, ASCII, CHR, FORMAT, TRANSLATE string functions
+- CBRT, DEGREES, RADIANS, SIN, COS, TAN math functions
+
+**Phase 2 completed**:
+- Fixed FLOAT/NUMERIC→INT rounding to use round-half-away-from-zero (PostgreSQL semantics)
+- Fixed VARCHAR(n) truncation in CAST to respect max length
+- Fixed int-to-BOOLEAN casting (0=false, non-zero=true)
+- Added implicit text-to-numeric conversion in arithmetic operators (+, -, *, /)
+- Fixed timestamp display to omit microseconds when zero
+
+**Tests passing**: 266 unit tests, tests/57_type_casting.sql, tests/58_string_functions.sql, tests/59_math_functions.sql
+
+### 2026-01-17 (initial)
+- Created 6 new integration test files covering NULL handling, type casting, string/math/datetime functions, and JOINs
+- Generated PostgreSQL expected outputs
+- Identified 25+ compatibility issues across 5 categories
