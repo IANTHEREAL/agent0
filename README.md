@@ -375,6 +375,23 @@ cd orm-tests && npm test
 | Types | UUID, INTERVAL, TIMESTAMP, JSONB, ENUM |
 | Compatibility | COPY protocol, pg_restore, Extended Query, ORMs |
 
+## Admin Portal
+
+A web-based admin portal is available for managing multi-tenant deployments:
+
+```bash
+cd cloud-admin-portal
+./scripts/dev.sh
+```
+
+Features:
+- Tenant management (create, view, disable keyspaces)
+- User management per tenant (requires tenant credentials)
+- Health monitoring
+- Modern React UI with shadcn/ui
+
+See [cloud-admin-portal/README.md](cloud-admin-portal/README.md) for details.
+
 ## License
 
 Apache 2.0
