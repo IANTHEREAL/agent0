@@ -1,8 +1,11 @@
 # pg-tikv Admin Portal Redesign
 
-**Status**: Draft  
+**Status**: In Progress  
 **Date**: 2025-01-14  
-**Related Code**: `scripts/pg_tikv_admin_api.py`, `scripts/pg_tikv_admin.py`
+**Updated**: 2025-01-16  
+**Related Code**: `scripts/pg_tikv_admin_api.py`, `scripts/pg_tikv_admin.py`  
+**Implementation**: `cloud-admin-portal/` (new project)  
+**Progress Tracking**: [WEB_WORK.md](/WEB_WORK.md)
 
 ## 1. Background and Current State Analysis
 
@@ -137,34 +140,57 @@ This causes passwords to be:
 
 ### 4.1 New Architecture Overview
 
+**Note**: The implementation creates a standalone `cloud-admin-portal/` project at the pg-tikv root level, containing both backend and frontend code with deployment scripts. This keeps the admin portal as a separate deployable unit.
+
 ```
 pg-tikv/
 ├── scripts/
 │   ├── pg_tikv_admin.py          # CLI tool (keep as-is)
-│   └── pg_tikv_admin_api.py      # REST API (refactor)
+│   └── pg_tikv_admin_api.py      # Legacy API (deprecated)
 │
-└── admin-ui/                      # NEW: Frontend project
-    ├── package.json
-    ├── vite.config.ts
-    ├── tailwind.config.js
-    ├── tsconfig.json
-    ├── index.html
-    └── src/
-        ├── main.tsx
-        ├── App.tsx
-        ├── api/                   # API client
-        │   ├── client.ts
-        │   ├── tenants.ts
-        │   └── users.ts
-        ├── components/
-        │   ├── ui/               # shadcn/ui components
-        │   ├── layout/           # Layout components
-        │   ├── tenants/          # Tenant-related components
-        │   └── users/            # User-related components
-        ├── hooks/                 # Custom hooks
-        ├── lib/                   # Utility functions
-        ├── pages/                 # Page components
-        └── types/                 # TypeScript types
+└── cloud-admin-portal/            # NEW: Complete admin portal project
+    ├── backend/                   # FastAPI backend (Python)
+    │   ├── app/
+    │   │   ├── __init__.py
+    │   │   ├── main.py           # FastAPI app entry
+    │   │   ├── config.py         # Pydantic settings
+    │   │   ├── auth/             # JWT authentication
+    │   │   ├── api/              # API route handlers
+    │   │   ├── models/           # Pydantic models
+    │   │   ├── services/         # Business logic (PD/pg clients)
+    │   │   └── session.py        # Tenant session management
+    │   ├── requirements.txt
+    │   └── Dockerfile
+    │
+    ├── frontend/                  # React frontend
+    │   ├── src/
+    │   │   ├── main.tsx
+    │   │   ├── App.tsx
+    │   │   ├── api/              # API client + TanStack Query hooks
+    │   │   ├── components/       # UI components
+    │   │   │   ├── ui/           # shadcn/ui components
+    │   │   │   ├── layout/       # Layout components
+    │   │   │   ├── tenants/      # Tenant management
+    │   │   │   └── users/        # User management
+    │   │   ├── hooks/            # Custom hooks (useAuth, etc)
+    │   │   ├── lib/              # Utility functions
+    │   │   ├── pages/            # Page components
+    │   │   └── types/            # TypeScript types
+    │   ├── package.json
+    │   ├── vite.config.ts
+    │   └── Dockerfile
+    │
+    ├── deploy/                    # Deployment configs
+    │   ├── docker-compose.yml
+    │   ├── docker-compose.dev.yml
+    │   └── nginx/nginx.conf
+    │
+    ├── scripts/                   # Dev/deploy helper scripts
+    │   ├── dev.sh
+    │   ├── build.sh
+    │   └── deploy.sh
+    │
+    └── README.md
 ```
 
 ### 4.2 Deployment Architecture
