@@ -163,13 +163,25 @@ SELECT * FROM my_mv;
 SELECT col1, col2 FROM my_mv ORDER BY col1;
 ```
 
+### Test File Priority (IMPORTANT)
+
+The test framework processes files in this priority order:
+
+1. **`.expected`** - If exists, does exact match and returns immediately
+2. **`.errors`** - Only checked if no `.expected` and output contains errors
+3. **`.assert`** - Only checked if no `.expected`
+
+**Rule: Never have both `.expected` AND `.assert`/`.errors` for the same test.**
+- If `.expected` exists, `.assert` and `.errors` are ignored
+- Choose ONE validation method per test
+
 ### When to Use Each File Type
 
 | Scenario | Use |
 |----------|-----|
-| Exact output match | `.expected` |
+| Exact output match (including expected errors) | `.expected` |
 | Dynamic execution time (EXPLAIN ANALYZE) | `.assert` |
-| Known unsupported features | `.errors` |
+| No `.expected`, need to allow specific errors | `.errors` |
 | Non-deterministic order (last resort) | `.expected` with `# unordered` first line |
 
 ### Test File Examples
