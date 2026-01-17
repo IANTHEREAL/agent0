@@ -311,7 +311,42 @@ Unsupported function in JOIN: count
    ```bash
    psql -h localhost -U postgres -f tests/NN_feature_name.sql > tests/NN_feature_name.expected 2>&1
    ```
-3. Review and adjust `.expected` for pg-tikv differences if needed
+3. Run the same test against pg-tikv and compare results
+
+### Handling Test Discrepancies (IMPORTANT)
+
+**When pg-tikv output differs from real PostgreSQL:**
+
+⚠️ **DO NOT immediately modify the test or expected file to make it pass.**
+
+Instead, follow this process:
+
+1. **Analyze the difference** - Determine which category it falls into:
+   - **Bug in pg-tikv**: pg-tikv behavior is incorrect and should be fixed
+   - **Intentional difference**: pg-tikv has different but valid behavior (e.g., precision, format)
+   - **Missing feature**: pg-tikv doesn't support this feature yet
+   - **Test issue**: The test itself has problems (non-deterministic, etc.)
+
+2. **Document the finding** - Add to `WORK.md` with:
+   - What the difference is
+   - Expected (PostgreSQL) vs Actual (pg-tikv)
+   - Your analysis of the root cause
+
+3. **Ask for decision** - Let the administrator decide:
+   - Fix the bug in pg-tikv?
+   - Accept the difference and update `.expected`?
+   - Mark as known limitation?
+   - Defer to future work?
+
+**Example workflow:**
+```
+# Found: pg-tikv returns '2024-01-15 10:30:00.000000' 
+#        PostgreSQL returns '2024-01-15 10:30:00'
+# Analysis: pg-tikv always shows 6 decimal places for timestamps
+# Question: Should we fix timestamp formatting or accept this difference?
+```
+
+**Never silently change `.expected` files to hide compatibility issues.**
 
 ### Debugging Test Failures
 
