@@ -6,7 +6,6 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 
-from ..auth import get_current_user
 from ..config import get_settings, Settings
 from ..models import (
     UserCreate,
@@ -73,7 +72,6 @@ async def get_tenant_session(
 )
 async def list_users(
     name: str,
-    _: str = Depends(get_current_user),
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
 ):
@@ -101,7 +99,6 @@ async def list_users(
 async def create_user(
     name: str,
     request: UserCreate,
-    _: str = Depends(get_current_user),
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
     settings: Settings = Depends(get_settings),
@@ -140,7 +137,6 @@ async def create_user(
 async def delete_user(
     name: str,
     username: str,
-    _: str = Depends(get_current_user),
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
 ):
@@ -165,7 +161,6 @@ async def delete_user(
 async def reset_password(
     name: str,
     username: str,
-    _: str = Depends(get_current_user),
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
 ):

@@ -28,8 +28,6 @@ services:
       - PGTIKV_PD_ENDPOINTS=${PD_ENDPOINTS:-127.0.0.1:2379}
       - PGTIKV_PG_HOST=${PG_HOST:-pg-tikv}
       - PGTIKV_PG_PORT=${PG_PORT:-5433}
-      - PGTIKV_ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
-      - PGTIKV_JWT_SECRET=${JWT_SECRET}
       - PGTIKV_CORS_ORIGINS=["http://localhost", "https://admin.example.com"]
     expose:
       - "8080"

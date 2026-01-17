@@ -4,9 +4,9 @@ A modern web interface for managing pg-tikv multi-tenant database instances.
 
 ## Features
 
-- **JWT Authentication**: Secure API access with token-based authentication
 - **Tenant Management**: Create, view, and disable database tenants
 - **User Management**: Manage users within each tenant with secure credential handling
+- **Per-Tenant Authentication**: No global portal auth - authenticate per tenant when needed
 - **Modern UI**: Built with React, TypeScript, and shadcn/ui components
 - **Production Ready**: Docker deployment with nginx reverse proxy
 
@@ -17,7 +17,6 @@ cloud-admin-portal/
 ├── backend/              # FastAPI Python backend
 │   ├── app/
 │   │   ├── api/          # REST API endpoints
-│   │   ├── auth/         # JWT authentication
 │   │   ├── models/       # Pydantic models
 │   │   └── services/     # Business logic
 │   └── Dockerfile
@@ -39,17 +38,19 @@ cloud-admin-portal/
 ### Development
 
 ```bash
-# Start both frontend and backend in development mode
+# Start both frontend and backend with one command
 ./scripts/dev.sh
+```
 
-# Or start them separately:
+Or start them separately:
 
+```bash
 # Backend (terminal 1)
 cd backend
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8080
+uvicorn app.main:app --reload --port 8090
 
 # Frontend (terminal 2)
 cd frontend
@@ -59,16 +60,14 @@ npm run dev
 
 **URLs:**
 - Frontend: http://localhost:5173
-- Backend API: http://localhost:8080/api
-- API Docs: http://localhost:8080/api/docs
+- Backend API: http://localhost:8090/api
+- API Docs: http://localhost:8090/api/docs
 
 ### Production
 
 ```bash
-# Build and start with Docker Compose
 cd deploy
 cp .env.example .env
-# Edit .env with your configuration
 docker-compose up -d
 ```
 
@@ -81,8 +80,7 @@ docker-compose up -d
 | `PGTIKV_PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD addresses |
 | `PGTIKV_PG_HOST` | `127.0.0.1` | pg-tikv server host |
 | `PGTIKV_PG_PORT` | `5433` | pg-tikv server port |
-| `PGTIKV_ADMIN_PASSWORD` | `admin` | Admin login password |
-| `PGTIKV_JWT_SECRET` | (auto) | JWT signing secret |
+| `PGTIKV_API_PORT` | `8080` | API server port |
 | `PGTIKV_CORS_ORIGINS` | `["http://localhost:5173"]` | Allowed CORS origins |
 
 ### Frontend Environment Variables
@@ -93,13 +91,6 @@ docker-compose up -d
 
 ## API Endpoints
 
-### Authentication
-
-| Method | Path | Description |
-|--------|------|-------------|
-| POST | `/api/auth/login` | Login with password |
-| GET | `/api/auth/me` | Get current user info |
-
 ### Tenants
 
 | Method | Path | Description |
@@ -108,9 +99,9 @@ docker-compose up -d
 | POST | `/api/tenants` | Create new tenant |
 | GET | `/api/tenants/{name}` | Get tenant details |
 | DELETE | `/api/tenants/{name}` | Disable tenant |
-| POST | `/api/tenants/{name}/connect` | Connect to tenant |
+| POST | `/api/tenants/{name}/connect` | Connect to tenant (get session) |
 
-### Users
+### Users (requires tenant session)
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -126,27 +117,19 @@ docker-compose up -d
 | GET | `/api/health` | Health check |
 | GET | `/api/info` | API information |
 
-## Security
+## Authentication Model
 
-- All API endpoints (except `/api/auth/login`, `/api/health`, `/api/info`) require JWT authentication
-- User management endpoints additionally require a tenant session (via `X-Tenant-Session` header)
-- Passwords are never passed in URL query parameters
-- CORS is restricted to configured origins only
+This portal uses **per-tenant authentication** instead of a global portal login:
+
+1. **Tenant list/create/delete**: No authentication required
+2. **User management**: Requires connecting to the tenant first
+   - Call `POST /api/tenants/{name}/connect` with tenant admin credentials
+   - Returns a session ID valid for 1 hour
+   - Include session ID in `X-Tenant-Session` header for user operations
+
+This design ensures that only users with valid tenant credentials can manage that tenant's users.
 
 ## Development
-
-### Quick Start (Recommended)
-
-```bash
-# Start both backend and frontend with one command
-./scripts/dev.sh
-```
-
-This will:
-- Create Python venv and install dependencies
-- Install npm packages
-- Start backend on port 8090
-- Start frontend on port 5173
 
 ### Backend Tests
 
@@ -156,15 +139,12 @@ source .venv/bin/activate
 pytest -v
 ```
 
-**Test Coverage**: 16 tests covering auth, system, and tenant endpoints.
-
 ### Frontend Build
 
 ```bash
 cd frontend
-npm run build     # Production build
-npm run lint      # Lint check
-npx tsc --noEmit  # Type check
+npm run build
+npx tsc --noEmit
 ```
 
 ## License

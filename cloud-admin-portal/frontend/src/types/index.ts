@@ -56,11 +56,6 @@ export interface PasswordResetResponse {
   password: string
 }
 
-export interface LoginResponse {
-  token: string
-  expires_at: string
-}
-
 export interface HealthResponse {
   status: string
   pd_healthy: boolean

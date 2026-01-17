@@ -1,6 +1,5 @@
 """Application configuration using pydantic-settings."""
 
-import secrets
 from functools import lru_cache
 from typing import List
 
@@ -12,7 +11,6 @@ class Settings(BaseSettings):
     """Application settings loaded from environment variables.
     
     All settings can be overridden via environment variables with PGTIKV_ prefix.
-    Example: PGTIKV_ADMIN_PASSWORD=mysecret
     """
     
     # TiKV PD Configuration
@@ -39,24 +37,6 @@ class Settings(BaseSettings):
     api_host: str = Field(
         default="0.0.0.0",
         description="API server bind address"
-    )
-    
-    # Authentication
-    admin_password: str = Field(
-        default="admin",
-        description="Admin login password. MUST change in production!"
-    )
-    jwt_secret: str = Field(
-        default_factory=lambda: secrets.token_hex(32),
-        description="JWT signing secret. Auto-generated if not set."
-    )
-    jwt_expiry_hours: int = Field(
-        default=24,
-        description="JWT token validity in hours"
-    )
-    jwt_algorithm: str = Field(
-        default="HS256",
-        description="JWT signing algorithm"
     )
     
     # Tenant Sessions

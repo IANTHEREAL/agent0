@@ -7,7 +7,6 @@ from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
 
-from ..auth import get_current_user
 from ..config import get_settings, Settings
 from ..models import (
     TenantCreate,
@@ -47,7 +46,6 @@ def generate_password(length: int = 16) -> str:
     description="List all tenants (TiKV keyspaces)."
 )
 async def list_tenants(
-    _: str = Depends(get_current_user),
     pd: PDClient = Depends(get_pd_client),
 ):
     """List all tenants."""
@@ -82,7 +80,6 @@ async def list_tenants(
 )
 async def create_tenant(
     request: TenantCreate,
-    _: str = Depends(get_current_user),
     pd: PDClient = Depends(get_pd_client),
     settings: Settings = Depends(get_settings),
 ):
@@ -123,7 +120,6 @@ async def create_tenant(
 )
 async def get_tenant(
     name: str,
-    _: str = Depends(get_current_user),
     pd: PDClient = Depends(get_pd_client),
     settings: Settings = Depends(get_settings),
 ):
@@ -156,7 +152,6 @@ async def get_tenant(
 )
 async def delete_tenant(
     name: str,
-    _: str = Depends(get_current_user),
     pd: PDClient = Depends(get_pd_client),
 ):
     """Disable a tenant."""
@@ -189,7 +184,6 @@ async def delete_tenant(
 async def connect_tenant(
     name: str,
     request: TenantConnectRequest,
-    _: str = Depends(get_current_user),
     pd: PDClient = Depends(get_pd_client),
     pg: PgTikvClient = Depends(get_pg_client),
 ):

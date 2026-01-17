@@ -1,7 +1,3 @@
-/**
- * API Client for pg-tikv Admin Portal
- */
-
 const API_BASE = import.meta.env.VITE_API_URL || "/api"
 
 export class ApiError extends Error {
@@ -19,7 +15,6 @@ export async function apiRequest<T>(
   endpoint: string,
   options: RequestInit = {}
 ): Promise<T> {
-  const token = localStorage.getItem("auth_token")
   const tenantSession = sessionStorage.getItem("tenant_session")
   
   const headers: Record<string, string> = {
@@ -27,9 +22,6 @@ export async function apiRequest<T>(
     ...(options.headers as Record<string, string>),
   }
   
-  if (token) {
-    headers["Authorization"] = `Bearer ${token}`
-  }
   if (tenantSession) {
     headers["X-Tenant-Session"] = tenantSession
   }
@@ -41,14 +33,6 @@ export async function apiRequest<T>(
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({ message: "Unknown error" }))
-    
-    // Handle 401 - redirect to login
-    if (response.status === 401 && !endpoint.includes("/auth/")) {
-      localStorage.removeItem("auth_token")
-      sessionStorage.removeItem("tenant_session")
-      window.location.href = "/login"
-    }
-    
     throw new ApiError(response.status, error.message || error.detail, error.details)
   }
 

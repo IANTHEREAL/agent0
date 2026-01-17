@@ -16,7 +16,6 @@ services:
       - PGTIKV_PD_ENDPOINTS=${PD_ENDPOINTS:-127.0.0.1:2379}
       - PGTIKV_PG_HOST=${PG_HOST:-host.docker.internal}
       - PGTIKV_PG_PORT=${PG_PORT:-5433}
-      - PGTIKV_ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
       - PGTIKV_CORS_ORIGINS=["http://localhost:5173", "http://127.0.0.1:5173"]
       - PGTIKV_DEBUG=true
     volumes:
