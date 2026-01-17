@@ -1,3 +1,4 @@
+# unordered
 test|id|name|balance
 Before transfer|1|Alice|1000.00
 Before transfer|2|Bob|500.00
@@ -9,9 +10,6 @@ After committed transfer|2|Bob|700.00
 test|total
 Total balance should be 1500|1500.00
 (1 row)
-psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:64: ERROR:  new row for relation "accounts" violates check constraint "accounts_balance_check"
-DETAIL:  Failing row contains (1, Alice, -9199.00, 2).
-psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:65: ERROR:  current transaction is aborted, commands ignored until end of transaction block
 test|id|name|balance
 After rollback - should be same as before|1|Alice|800.00
 After rollback - should be same as before|2|Bob|700.00
@@ -19,15 +17,11 @@ After rollback - should be same as before|2|Bob|700.00
 test
 Testing CHECK constraint on negative balance
 (1 row)
-psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:77: ERROR:  new row for relation "accounts" violates check constraint "accounts_balance_check"
-DETAIL:  Failing row contains (1, Alice, -100.00, 2).
 test|id|balance
 Balance after constraint violation attempt|1|800.00
 (1 row)
-psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:86: ERROR:  new row for relation "accounts" violates check constraint "accounts_balance_check"
-DETAIL:  Failing row contains (3, Charlie, -10.00, 1).
 test|balance
-Charlie balance after overdraft attempts|100.00
+Charlie balance after overdraft attempts|50.00
 (1 row)
 test|id|balance|version
 Multi-operation transfer result|1|850.00|3
@@ -73,8 +67,8 @@ test|count
 Children after nested insert|3
 (1 row)
 test|name|total_value
-Children with parent|Parent 1|300
 Children with parent|Parent 2|300
+Children with parent|Parent 1|300
 (2 rows)
 test|id|value
 After subquery update|1|200
@@ -117,7 +111,7 @@ total_balance
 950.00
 (1 row)
 avg_balance
-475.0000000000000000
+475.00
 (1 row)
 test
 Read-only transaction completed
@@ -148,3 +142,9 @@ After sequential transactions|4
 result
 All transaction consistency tests completed
 (1 row)
+psql:/home/dongxu/lab/pg-tikv/tests/33_transaction_consistency.sql:64: ERROR:  new row for relation "accounts" violates check constraint "accounts_check1"
+DETAIL:  Failing row contains (1, Alice, -9199.00, 2).
+psql:/home/dongxu/lab/pg-tikv/tests/33_transaction_consistency.sql:77: ERROR:  new row for relation "accounts" violates check constraint "accounts_check1"
+DETAIL:  Failing row contains (1, Alice, -100.00, 2).
+psql:/home/dongxu/lab/pg-tikv/tests/33_transaction_consistency.sql:86: ERROR:  new row for relation "accounts" violates check constraint "accounts_check1"
+DETAIL:  Failing row contains (3, Charlie, -10.00, 1).

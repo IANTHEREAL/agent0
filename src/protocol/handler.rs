@@ -2607,11 +2607,13 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
         Value::Text(s) => encoder.encode_field(s),
         Value::Bytes(b) => encoder.encode_field(&format!("\\x{}", hex::encode(b))),
         Value::Timestamp(ts) => {
-            use chrono::DateTime;
+            use chrono::{DateTime, Utc};
             let seconds = ts / 1000;
-            let nanos = (ts % 1000) * 1_000_000;
-            if let Some(dt) = DateTime::from_timestamp(seconds, nanos as u32) {
-                encoder.encode_field(&dt.to_rfc3339())
+            let millis = (ts % 1000).unsigned_abs() as u32;
+            let nanos = millis * 1_000_000;
+            if let Some(dt) = DateTime::<Utc>::from_timestamp(seconds, nanos) {
+                // PostgreSQL timestamp format: YYYY-MM-DD HH:MM:SS.microseconds
+                encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
             } else {
                 encoder.encode_field(&ts.to_string())
             }

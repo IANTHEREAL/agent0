@@ -1,3 +1,4 @@
+# unordered
 ?column?
 Hello World
 (1 row)
@@ -43,10 +44,10 @@ ababab
 abs
 5
 (1 row)
-ceil
+?column?
 5
 (1 row)
-floor
+?column?
 4
 (1 row)
 round
@@ -109,10 +110,10 @@ int4
 btrim
 hello
 (1 row)
-ltrim
+btrim
 hello
 (1 row)
-rtrim
+btrim
 hello
 (1 row)
 position
@@ -152,8 +153,8 @@ f
 t
 (1 row)
 category|sum
-B|40
 A|30
+B|40
 (2 rows)
 category|count
 B|2

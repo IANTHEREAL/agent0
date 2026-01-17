@@ -1,20 +1,25 @@
-psql:/tmp/tipg-tests/tests/36_vector_text.sql:20: ERROR:  function l2_distance(text, unknown) does not exist
-LINE 1: SELECT name, l2_distance(embedding, '[1.0, 2.0, 3.0]') as di...
-                     ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-psql:/tmp/tipg-tests/tests/36_vector_text.sql:25: ERROR:  function cosine_distance(text, unknown) does not exist
-LINE 1: SELECT name, cosine_distance(embedding, '[1.0, 1.0, 1.0]') a...
-                     ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-psql:/tmp/tipg-tests/tests/36_vector_text.sql:30: ERROR:  function inner_product(text, unknown) does not exist
-LINE 1: SELECT name, inner_product(embedding, '[1.0, 1.0, 1.0]') as ...
-                     ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-psql:/tmp/tipg-tests/tests/36_vector_text.sql:34: ERROR:  function vector_dims(text) does not exist
-LINE 1: SELECT name, vector_dims(embedding) as dims
-                     ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-psql:/tmp/tipg-tests/tests/36_vector_text.sql:38: ERROR:  function vector_norm(text) does not exist
-LINE 1: SELECT name, vector_norm(embedding) as norm
-                     ^
-HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
+name|distance
+doc1|0
+doc3|3.605551275463989
+doc2|5.196152422706632
+(3 rows)
+name|similarity
+doc2|0.013072457560346584
+doc1|0.07417990022744847
+doc3|0.42264973081037416
+(3 rows)
+name|product
+doc3|-1
+doc1|-6
+doc2|-15
+(3 rows)
+name|dims
+doc1|3
+doc2|3
+doc3|3
+(3 rows)
+name|norm
+doc1|3.7416573867739413
+doc2|8.774964387392123
+doc3|1
+(3 rows)

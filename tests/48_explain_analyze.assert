@@ -1,3 +1,8 @@
-# Required output substrings (non-empty lines).
-Execution Time:
+Sort  (cost=9976.78..9976.78 rows=1000 width=40)
+Sort Key: id
+Seq Scan on explain_analyze_t  (cost=0.00..11.00 rows=1000 width=40)
+Filter: (id >= 2)
 Actual Rows: 2
+Execution Time:
+Result  (cost=0.00..0.01 rows=1 width=4)
+Actual Rows: 1

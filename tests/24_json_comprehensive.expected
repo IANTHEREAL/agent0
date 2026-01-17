@@ -1,14 +1,14 @@
 id|name|properties
-1|Ink Fusion T-Shirt|{"size": ["S", "M", "L", "XL"], "color": "white"}
+1|Ink Fusion T-Shirt|{"color":"white","size":["S","M","L","XL"]}
 (1 row)
 id|name|properties
-2|ThreadVerse T-Shirt|{"size": ["S", "M", "L", "XL"], "color": "black"}
-3|Design Dynamo T-Shirt|{"size": ["S", "M", "L", "XL"], "color": "blue"}
+2|ThreadVerse T-Shirt|{"color":"black","size":["S","M","L","XL"]}
+3|Design Dynamo T-Shirt|{"color":"blue","size":["S","M","L","XL"]}
 (2 rows)
 id|name|properties
-1|Ink Fusion T-Shirt|{"size": ["S", "M", "L", "XL"], "color": "white"}
-2|ThreadVerse T-Shirt|{"size": ["S", "M", "L", "XL"], "color": "black"}
-3|Design Dynamo T-Shirt|{"size": ["S", "M", "L", "XL"], "color": "blue"}
+1|Ink Fusion T-Shirt|{"color":"white","size":["S","M","L","XL"]}
+2|ThreadVerse T-Shirt|{"color":"black","size":["S","M","L","XL"]}
+3|Design Dynamo T-Shirt|{"color":"blue","size":["S","M","L","XL"]}
 (3 rows)
 id|name|color
 1|Ink Fusion T-Shirt|"white"
@@ -28,8 +28,8 @@ id|name|color
 3|Design Dynamo T-Shirt|blue
 (1 row)
 id|name|phones
-1|John Doe|["408-111-2222", "408-111-2223"]
-2|Jane Doe|["212-111-2222", "212-111-2223"]
+1|John Doe|["408-111-2222","408-111-2223"]
+2|Jane Doe|["212-111-2222","212-111-2223"]
 (2 rows)
 name|work_phone
 John Doe|408-111-2222
@@ -40,9 +40,9 @@ John Doe|408-111-2223
 Jane Doe|212-111-2223
 (2 rows)
 id|data
-1|{"user": {"name": "Alice", "email": "alice@example.com"}, "active": true}
-2|{"user": {"name": "Bob", "email": "bob@example.com"}, "active": false}
-3|{"user": {"name": "Charlie", "email": "charlie@example.com"}, "active": true}
+1|{"active":true,"user":{"email":"alice@example.com","name":"Alice"}}
+2|{"active":false,"user":{"email":"bob@example.com","name":"Bob"}}
+3|{"active":true,"user":{"email":"charlie@example.com","name":"Charlie"}}
 (3 rows)
 id|username
 1|Alice
@@ -54,11 +54,11 @@ id|email
 3|charlie@example.com
 (2 rows)
 id|order_data
-1|{"items": [{"qty": 2, "name": "Book"}, {"qty": 5, "name": "Pen"}], "total": 25.50, "customer": "Alice"}
-2|{"items": [{"qty": 1, "name": "Laptop"}], "total": 999.99, "customer": "Bob"}
+1|{"customer":"Alice","items":[{"name":"Book","qty":2},{"name":"Pen","qty":5}],"total":25.5}
+2|{"customer":"Bob","items":[{"name":"Laptop","qty":1}],"total":999.99}
 (2 rows)
 id|customer|total
-1|Alice|25.50
+1|Alice|25.5
 2|Bob|999.99
 (2 rows)
 id|first_item
@@ -66,29 +66,29 @@ id|first_item
 2|Laptop
 (2 rows)
 id|json_col|jsonb_col
-1|{"b": 2, "a": 1}|{"a": 1, "b": 2}
+1|{"a":1,"b":2}|{"a":1,"b":2}
 (1 row)
 json_col|jsonb_col
-{"b": 2, "a": 1}|{"a": 1, "b": 2}
+{"a":1,"b":2}|{"a":1,"b":2}
 (1 row)
 id|name|properties
-1|Ink Fusion T-Shirt|{"size": ["S", "M", "L", "XL"], "color": "white"}
+1|Ink Fusion T-Shirt|{"color":"white","size":["S","M","L","XL"]}
 (1 row)
 id|name|properties
-2|ThreadVerse T-Shirt|{"size": ["S", "M", "L", "XL"], "color": "black"}
+2|ThreadVerse T-Shirt|{"color":"black","size":["S","M","L","XL"]}
 (1 row)
 json_cast
 {"test": 123}
 (1 row)
 jsonb_cast
-{"test": 123}
+{"test":123}
 (1 row)
 nested_value
 value
 (1 row)
 id|data
-1|{"humidity": 45, "pressure": 1013.25, "temperature": 72.5}
-2|{"humidity": 55, "pressure": 1015.00, "temperature": 68.0}
+1|{"humidity":45,"pressure":1013.25,"temperature":72.5}
+2|{"humidity":55,"pressure":1015.0,"temperature":68.0}
 (2 rows)
 id|temp|humidity
 1|72.5|45
@@ -100,18 +100,15 @@ Ink Fusion T-Shirt|white|S|XL
 ThreadVerse T-Shirt|black|S|XL
 (3 rows)
 id|name|properties
-1|Ink Fusion T-Shirt|{"size": ["XS", "S", "M", "L", "XL", "XXL"], "color": "red"}
+1|Ink Fusion T-Shirt|{"color":"red","size":["XS","S","M","L","XL","XXL"]}
 (1 row)
 id|name|properties
-1|Ink Fusion T-Shirt|{"size": ["XS", "S", "M", "L", "XL", "XXL"], "color": "red"}
+1|Ink Fusion T-Shirt|{"color":"red","size":["XS","S","M","L","XL","XXL"]}
 (1 row)
 id|name|properties
-4|Premium Polo|{"size": ["M", "L"], "color": "white", "premium": true}
-5|Basic Tee|{"size": ["S", "M", "L"], "color": "white", "premium": false}
+4|Premium Polo|{"color":"white","premium":true,"size":["M","L"]}
+5|Basic Tee|{"color":"white","premium":false,"size":["S","M","L"]}
 (2 rows)
-name|color
-Premium Polo|white
-(1 row)
 status
 JSON comprehensive tests completed
 (1 row)

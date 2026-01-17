@@ -219,7 +219,8 @@ SELECT ol.ol_o_id, SUM(ol.ol_amount)
 FROM order_line ol
 INNER JOIN orders o ON ol.ol_o_id = o.o_id AND ol.ol_d_id = o.o_d_id AND ol.ol_w_id = o.o_w_id
 WHERE ol.ol_w_id = 1 AND ol.ol_d_id = 1
-GROUP BY ol.ol_o_id;
+GROUP BY ol.ol_o_id
+ORDER BY ol.ol_o_id;
 
 -- 5.3 JOIN item and order_line
 SELECT ol.ol_o_id, i.i_name, ol.ol_quantity, ol.ol_amount

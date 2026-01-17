@@ -624,7 +624,28 @@ impl TikvStore {
         let data_key = self.key(&encode_data_key(schema.table_id, &row_key));
         let row_data = serialize_row(&row)?;
         if txn.get(data_key.clone()).await?.is_some() {
-            return Err(anyhow!("Duplicate primary key: {:?}", pk_values));
+            let short_table = table_name.rsplit('.').next().unwrap_or(table_name);
+            let pk_col_names: Vec<String> = schema
+                .pk_indices
+                .iter()
+                .map(|&i| schema.columns[i].name.clone())
+                .collect();
+            let pk_val_strs: Vec<String> = pk_values
+                .iter()
+                .map(|v| match v {
+                    crate::types::Value::Int32(n) => n.to_string(),
+                    crate::types::Value::Int64(n) => n.to_string(),
+                    crate::types::Value::Text(s) => s.clone(),
+                    crate::types::Value::Uuid(bytes) => uuid::Uuid::from_bytes(*bytes).to_string(),
+                    other => format!("{}", other),
+                })
+                .collect();
+            return Err(anyhow!(
+                "duplicate key value violates unique constraint \"{}_pkey\"\nDETAIL:  Key ({})=({}) already exists.",
+                short_table,
+                pk_col_names.join(", "),
+                pk_val_strs.join(", ")
+            ));
         }
         txn_put(txn, data_key, row_data).await?;
         debug!("Inserted row into '{}'", table_name);

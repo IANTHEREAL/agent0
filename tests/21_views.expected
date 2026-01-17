@@ -1,7 +1,7 @@
-id|name|email|active|created_at
-1|Alice|alice@example.com|t|2026-01-17 03:37:11.58929
-2|Bob|bob@example.com|t|2026-01-17 03:37:11.589986
-4|Diana|diana@example.com|t|2026-01-17 03:37:11.590901
+id|name|email|active
+1|Alice|alice@example.com|t
+2|Bob|bob@example.com|t
+4|Diana|diana@example.com|t
 (3 rows)
 id|name|email
 1|Alice|alice@example.com
@@ -10,21 +10,21 @@ id|name|email
 4|Diana|diana@example.com
 (4 rows)
 user_id|order_count|total_amount
-4|1|300
-2|2|200
 1|2|300
+2|2|200
+4|1|300
 (3 rows)
-id|name|email|active|created_at
-1|Alice|alice@example.com|t|2026-01-17 03:37:11.58929
+id|name|email|active
+1|Alice|alice@example.com|t
 (1 row)
-id|name|email|active|created_at
-1|Alice|alice@example.com|t|2026-01-17 03:37:11.58929
-2|Bob|bob@example.com|t|2026-01-17 03:37:11.589986
-4|Diana|diana@example.com|t|2026-01-17 03:37:11.590901
+id|name|email|active
+1|Alice|alice@example.com|t
+2|Bob|bob@example.com|t
+4|Diana|diana@example.com|t
 (3 rows)
-id|name|email|active|created_at
-1|Alice|alice@example.com|t|2026-01-17 03:37:11.58929
-2|Bob|bob@example.com|t|2026-01-17 03:37:11.589986
+id|name|email|active
+1|Alice|alice@example.com|t
+2|Bob|bob@example.com|t
 (2 rows)
 name|order_count|total_amount
 Alice|2|300
@@ -49,20 +49,19 @@ id|user_id|amount|tax|total
 4|2|50|5.0|55.0
 5|4|300|30.0|330.0
 (5 rows)
-psql:/tmp/tipg-tests/tests/21_views.sql:92: ERROR:  cannot drop columns from view
-id|name|email|active|created_at
-1|Alice|alice@example.com|t|2026-01-17 03:37:11.58929
-2|Bob|bob@example.com|t|2026-01-17 03:37:11.589986
-4|Diana|diana@example.com|t|2026-01-17 03:37:11.590901
+id|name
+1|Alice
+2|Bob
+4|Diana
 (3 rows)
-id|name|email|active|created_at
-1|Alice|alice@example.com|t|2026-01-17 03:37:11.58929
-2|Bob|bob@example.com|t|2026-01-17 03:37:11.589986
-4|Diana|diana@example.com|t|2026-01-17 03:37:11.590901
+id|name|email|active
+1|Alice|alice@example.com|t
+2|Bob|bob@example.com|t
+4|Diana|diana@example.com|t
 (3 rows)
 user_id|amount|rank
-1|200|1
 1|100|2
+1|200|1
 2|150|1
 2|50|2
 4|300|1
@@ -82,11 +81,11 @@ count
 3
 (1 row)
 avg
-266.6666666666666667
+266.66666666666666666666666667
 (1 row)
-id|name|email|active|created_at
-1|Alice|alice@example.com|t|2026-01-17 03:37:11.58929
-2|Bob|bob@example.com|t|2026-01-17 03:37:11.589986
+id|name
+1|Alice
+2|Bob
 (2 rows)
 name|order_count|total_amount
 Alice|2|300

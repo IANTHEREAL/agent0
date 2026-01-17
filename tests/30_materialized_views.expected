@@ -1,64 +1,65 @@
-category|order_count|total_quantity|total_revenue
-Electronics|1|20|4000
-Hardware|4|38|4450
-Software|3|6|3250
+# unordered
+_mv_rowid|category|order_count|total_quantity|total_revenue
+2|Electronics|1|20|4000
+1|Hardware|4|38|4450
+3|Software|3|6|3250
 (3 rows)
-customer_name|region|tier|order_count|total_spent
-Gamma LLC|North|Bronze|1|4000
-Delta Co|East|Gold|2|2700
-Acme Corp|North|Gold|2|2000
-Beta Inc|South|Silver|2|1500
-Epsilon Ltd|West|Silver|1|1500
+_mv_rowid|customer_name|region|tier|order_count|total_spent
+4|Gamma LLC|North|Bronze|1|4000
+5|Delta Co|East|Gold|2|2700
+3|Acme Corp|North|Gold|2|2000
+1|Epsilon Ltd|West|Silver|1|1500
+2|Beta Inc|South|Silver|2|1500
 (5 rows)
-category|order_count|total_quantity|total_revenue
-Electronics|1|20|4000
-Hardware|4|38|4450
-Software|3|6|3250
+_mv_rowid|category|order_count|total_quantity|total_revenue
+1|Hardware|4|38|4450
+2|Electronics|1|20|4000
+3|Software|3|6|3250
 (3 rows)
-customer_name|region|tier|order_count|total_spent
-Acme Corp|North|Gold|2|2000
-Beta Inc|South|Silver|2|1500
-Delta Co|East|Gold|2|2700
-Epsilon Ltd|West|Silver|1|1500
-Gamma LLC|North|Bronze|1|4000
+_mv_rowid|customer_name|region|tier|order_count|total_spent
+3|Acme Corp|North|Gold|2|2000
+2|Beta Inc|South|Silver|2|1500
+5|Delta Co|East|Gold|2|2700
+1|Epsilon Ltd|West|Silver|1|1500
+4|Gamma LLC|North|Bronze|1|4000
 (5 rows)
 grand_total
 11700
 (1 row)
 avg_customer_spend
-2340.0000000000000000
+2340
 (1 row)
 name|order_count|total_spent
-Delta Co|2|2700
 Acme Corp|2|2000
+Delta Co|2|2700
 (2 rows)
-category|order_count|total_quantity|total_revenue
-Electronics|1|20|4000
-Hardware|4|38|4450
-Software|3|6|3250
+_mv_rowid|category|order_count|total_quantity|total_revenue
+2|Electronics|1|20|4000
+1|Hardware|4|38|4450
+3|Software|3|6|3250
 (3 rows)
-category|order_count|total_quantity|total_revenue
-Electronics|1|20|4000
-Hardware|4|38|4450
-Software|5|21|12000
+_mv_rowid|category|order_count|total_quantity|total_revenue
+1|Electronics|1|20|4000
+3|Hardware|4|38|4450
+2|Software|5|21|12000
 (3 rows)
-customer_name|region|tier|order_count|total_spent
-Gamma LLC|North|Bronze|2|9000
-Acme Corp|North|Gold|3|5750
-Delta Co|East|Gold|2|2700
-Beta Inc|South|Silver|2|1500
-Epsilon Ltd|West|Silver|1|1500
+_mv_rowid|customer_name|region|tier|order_count|total_spent
+3|Gamma LLC|North|Bronze|2|9000
+1|Acme Corp|North|Gold|3|5750
+4|Delta Co|East|Gold|2|2700
+2|Beta Inc|South|Silver|2|1500
+5|Epsilon Ltd|West|Silver|1|1500
 (5 rows)
-product_name|category|price|units_sold|revenue|demand_level
-Service X|Software|500|15|7500|High
-Service Y|Software|750|6|4500|Medium
-Gadget Z|Electronics|200|20|4000|High
-Widget A|Hardware|100|25|2500|High
-Widget B|Hardware|150|13|1950|High
+_mv_rowid|product_name|category|price|units_sold|revenue|demand_level
+2|Service X|Software|500|15|7500|Low
+5|Service Y|Software|750|6|4500|Low
+4|Gadget Z|Electronics|200|20|4000|Low
+3|Widget A|Hardware|100|25|2500|Low
+1|Widget B|Hardware|150|13|1950|Low
 (5 rows)
-product_name|category|price|units_sold|revenue|demand_level
-Service Y|Software|750|6|4500|Medium
-Service X|Software|500|15|7500|High
+_mv_rowid|product_name|category|price|units_sold|revenue|demand_level
+2|Service X|Software|500|15|7500|Low
+5|Service Y|Software|750|6|4500|Low
 (2 rows)
 category|total_revenue
 Software|12000
@@ -74,10 +75,10 @@ sales_summary|3
 customer_stats|5
 product_ranking|5
 (3 rows)
-name|qty
-Widget A|25
-Gadget Z|20
-Service X|15
-Widget B|13
-Service Y|6
+_mv_rowid|name|qty
+4|Widget A|25
+5|Gadget Z|20
+2|Service X|15
+1|Widget B|13
+3|Service Y|6
 (5 rows)

@@ -1,3 +1,4 @@
+# unordered
 test_section
 === 1. BASIC TABLE CREATION ===
 (1 row)
@@ -12,9 +13,9 @@ id|name|description
 2|Return of the Jedi|After a daring mission to rescue Han Solo from Jabba the Hutt, the Rebels dispatch to Endor to destroy the second Death Star.
 (2 rows)
 id|task|is_complete|created_at
-1|Learn SQL|t|2026-01-17 03:37:12.876566
-2|Build an app|f|2026-01-17 03:37:12.876566
-3|Deploy to production|f|2026-01-17 03:37:12.876566
+1|Learn SQL|t|2024-01-15 10:30:00
+2|Build an app|f|2024-01-15 10:30:00
+3|Deploy to production|f|2024-01-15 10:30:00
 (3 rows)
 test_section
 === 3. FOREIGN KEYS ===
@@ -97,12 +98,12 @@ test_section
 === 10. AGGREGATE FUNCTIONS ===
 (1 row)
 name|course_count|all_grades
-Anakin Skywalker|3|A, A-, B-
+Anakin Skywalker|3|A-, A, B-
 Princess Leia|2|B+, A+
 Yoda|2|A, A+
 (3 rows)
 avg_price|min_price|max_price
-9.374|3.99|24.95
+9.3740|3.99|24.95
 (1 row)
 test_section
 === 11. SUBQUERIES ===
@@ -194,9 +195,9 @@ test_section
 === 20. DATE/TIME FUNCTIONS ===
 (1 row)
 task|created_at|created_date|year|month
-Learn SQL|2026-01-17 03:37:12.876566|2026-01-17|2026|1
-Build an app|2026-01-17 03:37:12.876566|2026-01-17|2026|1
-Deploy to production|2026-01-17 03:37:12.876566|2026-01-17|2026|1
+Learn SQL|2024-01-15 10:30:00|2024-01-15|2024|1
+Build an app|2024-01-15 10:30:00|2024-01-15|2024|1
+Deploy to production|2024-01-15 10:30:00|2024-01-15|2024|1
 (3 rows)
 test_section
 === CLEANUP ===

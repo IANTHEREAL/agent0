@@ -1,12 +1,12 @@
-contact_id|first_name|last_name|email|phone
-e975d6b2-682f-4929-ad6f-13987167adb9|John|Smith|john.smith@example.com|408-237-2345
+first_name|last_name|email|phone
+John|Smith|john.smith@example.com|408-237-2345
 (1 row)
-contact_id|first_name|last_name|email|phone
-e10aa1e3-9a2c-4574-a60c-ca6cbfbabbca|Jane|Doe|jane.doe@example.com|408-237-2346
+first_name|last_name|email|phone
+Jane|Doe|jane.doe@example.com|408-237-2346
 (1 row)
-contact_id|first_name|last_name|email|phone
-e975d6b2-682f-4929-ad6f-13987167adb9|John|Smith|john.smith@example.com|408-237-2345
-e10aa1e3-9a2c-4574-a60c-ca6cbfbabbca|Jane|Doe|jane.doe@example.com|408-237-2346
+first_name|last_name|email|phone
+Jane|Doe|jane.doe@example.com|408-237-2346
+John|Smith|john.smith@example.com|408-237-2345
 (2 rows)
 contact_id|first_name|last_name|email|phone
 550e8400-e29b-41d4-a716-446655440000|Bob|Wilson|bob@example.com|408-111-2222
@@ -14,6 +14,6 @@ contact_id|first_name|last_name|email|phone
 contact_id|first_name|last_name|email|phone
 550e8400-e29b-41d4-a716-446655440000|Bob|Wilson|bob@example.com|408-111-2222
 (1 row)
-gen_random_uuid
-fb3677e5-e4fe-432f-b6bd-1493bf769041
+uuid_length
+36
 (1 row)

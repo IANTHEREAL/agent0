@@ -1909,7 +1909,13 @@ pub async fn execute_alter_table(
                             let mut row = crate::storage::deserialize_row(pair.value())?;
                             fill_row_defaults(&mut row, &schema)?;
                             if matches!(row.values[col_idx], Value::Null) {
-                                return Err(anyhow!("Column '{}' cannot be null", col_name));
+                                let short_table =
+                                    schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                                return Err(anyhow!(
+                                    "column \"{}\" of relation \"{}\" contains null values",
+                                    col_name,
+                                    short_table
+                                ));
                             }
                         }
                     }

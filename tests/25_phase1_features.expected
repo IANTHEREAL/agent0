@@ -1,3 +1,4 @@
+# unordered
 id|name|score
 1|Alice|95
 (1 row)
@@ -36,10 +37,10 @@ Bob|87
 Eve|88
 (2 rows)
 dept_id|emp_id|name|salary|dept_name|location
-1|101|Alice|75000|Engineering|Building A
-2|102|Bob|65000|Sales|Building B
-1|103|Charlie|80000|Engineering|Building A
-3|105|Eve|60000|HR|Building C
+101|Alice|1|75000|Engineering|Building A
+102|Bob|2|65000|Sales|Building B
+103|Charlie|1|80000|Engineering|Building A
+105|Eve|3|60000|HR|Building C
 (4 rows)
 emp_id|name|dept_name|location
 101|Alice|Engineering|Building A
@@ -52,8 +53,8 @@ Alice|Engineering
 Charlie|Engineering
 (2 rows)
 dept_id|emp_id|name|salary|dept_name|location
-1|101|Alice|75000|Engineering|Building A
-1|103|Charlie|80000|Engineering|Building A
+101|Alice|1|75000|Engineering|Building A
+103|Charlie|1|80000|Engineering|Building A
 (2 rows)
 name|location
 Alice|Building A
@@ -61,9 +62,9 @@ Bob|Building B
 Eve|Building C
 (3 rows)
 dept_name|emp_count|avg_salary
-Engineering|2|77500.000000000000
-HR|1|60000.000000000000
-Sales|1|65000.000000000000
+Engineering|2|77500
+HR|1|60000
+Sales|1|65000
 (3 rows)
 dept_name|max_sal
 Engineering|80000
@@ -79,8 +80,8 @@ emp_id|name|dept_name
 102|Bob|Sales
 (3 rows)
 dept_id|emp_id|name|salary|dept_name|location
-2|102|Bob|65000|Sales|Building B
-1|103|Charlie|80000|Engineering|Building A
+102|Bob|2|65000|Sales|Building B
+103|Charlie|1|80000|Engineering|Building A
 (2 rows)
 matched_count
 4
@@ -142,15 +143,15 @@ Red|S|Cotton
 Red|S|Polyester
 (8 rows)
 color|size_count
-Blue|4
 Green|4
 Red|4
+Blue|4
 (3 rows)
 size|color_id_sum
 L|6
-M|6
-S|6
 XL|6
+S|6
+M|6
 (4 rows)
 color|size
 Blue|L
@@ -236,78 +237,78 @@ id|name|price|category_id
 id|name|price
 5|Book|30
 (1 row)
-id|name
-1|Alice
-2|Bob
-3|Charlie
-5|Eve
+_rowid|id|name
+1|1|Alice
+2|2|Bob
+3|3|Charlie
+4|5|Eve
 (4 rows)
-name|score|grade
-Alice|95|A
-Charlie|92|A
+_rowid|name|score|grade
+1|Alice|95|A
+2|Charlie|92|A
 (2 rows)
-grade
-A
-B
-C
+_rowid|grade
+1|A
+2|B
+3|C
 (3 rows)
 count
 4
 (1 row)
-grade|cnt|avg_score
-A|2|93.5000000000000000
-B|2|87.5000000000000000
-C|1|78.0000000000000000
+_rowid|grade|cnt|avg_score
+3|A|2|93.50
+1|B|2|87.50
+2|C|1|78
 (3 rows)
-name|total
-Alice|300
-Bob|150
+_rowid|name|total
+2|Alice|300
+1|Bob|150
 (2 rows)
-id|name|double_score|high_performer
-1|Alice|190|t
-2|Bob|174|f
-3|Charlie|184|t
-4|David|156|f
-5|Eve|176|f
+_rowid|id|name|double_score|high_performer
+1|1|Alice|190|t
+2|2|Bob|174|f
+3|3|Charlie|184|t
+4|4|David|156|f
+5|5|Eve|176|f
 (5 rows)
-name|score
-Alice|95
-Charlie|92
-Eve|88
+_rowid|name|score
+1|Alice|95
+2|Charlie|92
+3|Eve|88
 (3 rows)
-id|name|salary
-6|Frank|85000
-3|Charlie|80000
-1|Alice|75000
+_rowid|id|name|salary
+3|6|Frank|85000
+2|3|Charlie|80000
+1|1|Alice|75000
 (3 rows)
-dept|emp_count|avg_salary
-Engineering|3|80000.000000000000
-Sales|2|67500.000000000000
-HR|1|55000.000000000000
+_rowid|dept|emp_count|avg_salary
+1|Engineering|3|80000
+2|Sales|2|67500
+3|HR|1|55000
 (3 rows)
-name|salary
-Frank|85000
-Charlie|80000
+_rowid|name|salary
+1|Frank|85000
+2|Charlie|80000
 (2 rows)
-dept
-Engineering
-HR
-Sales
+_rowid|dept
+1|Engineering
+2|HR
+3|Sales
 (3 rows)
-id|name|monthly_salary|above_avg
-1|Alice|6250|t
-2|Bob|5416|f
-3|Charlie|6666|t
-4|David|4583|f
-5|Eve|5833|f
-6|Frank|7083|t
+_rowid|id|name|monthly_salary|above_avg
+1|1|Alice|6250|t
+2|2|Bob|5416|f
+3|3|Charlie|6666|t
+4|4|David|4583|f
+5|5|Eve|5833|f
+6|6|Frank|7083|t
 (6 rows)
-hire_year|hires|min_sal|max_sal
-2017|1|85000|85000
-2018|1|80000|80000
-2019|1|65000|65000
-2020|2|70000|75000
-2021|1|55000|55000
+_rowid|hire_year|hires|min_sal|max_sal
+5|2017|1|85000|85000
+2|2018|1|80000|80000
+4|2019|1|65000|65000
+3|2020|2|70000|75000
+1|2021|1|55000|55000
 (5 rows)
 high_earner_count
 3
@@ -318,14 +319,14 @@ dept_count
 distinct_dept_count
 3
 (1 row)
-name|region|total_amount
-Acme Corp|North|2500
-Gamma LLC|North|2000
+_rowid|name|region|total_amount
+1|Acme Corp|North|2500
+3|Gamma LLC|North|2000
 (2 rows)
-name|region|total_amount
-Acme Corp|North|2750
-Beta Inc|South|800
-Gamma LLC|North|2200
+_rowid|name|region|total_amount
+1|Acme Corp|North|2750
+2|Beta Inc|South|800
+3|Gamma LLC|North|2200
 (3 rows)
 status
 All Phase 1 tests completed successfully!

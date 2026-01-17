@@ -29,12 +29,12 @@ CREATE TABLE movies (
     description TEXT
 );
 
--- Table with various data types
+-- Table with various data types (use fixed timestamp for deterministic tests)
 CREATE TABLE todos (
     id SERIAL PRIMARY KEY,
     task TEXT NOT NULL,
     is_complete BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT '2024-01-15 10:30:00'
 );
 
 SELECT 'Created movies and todos tables' as result;
@@ -264,14 +264,14 @@ FROM grades
 LEFT JOIN students ON grades.student_id = students.id
 LEFT JOIN courses ON grades.course_id = courses.id;
 
-SELECT * FROM mv_transcripts ORDER BY name, code;
+SELECT name, type, title, code, result FROM mv_transcripts ORDER BY name, code;
 
 -- Add new data and refresh
 INSERT INTO grades (student_id, course_id, result) VALUES (2, 1, 'A+');
 
 REFRESH MATERIALIZED VIEW mv_transcripts;
 
-SELECT * FROM mv_transcripts WHERE name = 'Yoda' ORDER BY code;
+SELECT name, type, title, code, result FROM mv_transcripts WHERE name = 'Yoda' ORDER BY code;
 
 -- ============================================
 -- 10. AGGREGATE FUNCTIONS
@@ -286,7 +286,7 @@ FROM grades
 JOIN students ON grades.student_id = students.id
 JOIN courses ON grades.course_id = courses.id
 GROUP BY students.name
-ORDER BY students.name;
+ORDER BY course_count DESC, students.name;
 
 -- Average price from JSON
 SELECT 

@@ -430,10 +430,43 @@ pub async fn execute_insert_row(
             }
             Ok(Some(row))
         }
-        Err(e) if e.to_string().contains("Duplicate primary key") => match on_conflict {
-            Some(OnInsert::OnConflict(oc)) => match &oc.action {
-                OnConflictAction::DoNothing => Ok(None),
-                OnConflictAction::DoUpdate(do_update) => {
+        Err(e)
+            if e.to_string()
+                .contains("duplicate key value violates unique constraint") =>
+        {
+            match on_conflict {
+                Some(OnInsert::OnConflict(oc)) => match &oc.action {
+                    OnConflictAction::DoNothing => Ok(None),
+                    OnConflictAction::DoUpdate(do_update) => {
+                        let existing_rows = store
+                            .batch_get_rows(txn, schema.table_id, vec![pk_values.clone()], schema)
+                            .await?;
+                        if existing_rows.is_empty() {
+                            return Err(anyhow!("Failed to fetch existing row for upsert"));
+                        }
+                        let existing_row = &existing_rows[0];
+                        let mut updated_vals = existing_row.values.clone();
+                        for assignment in &do_update.assignments {
+                            let col_name = assignment.id.last().unwrap().value.clone();
+                            let col_idx = schema.column_index(&col_name).ok_or_else(|| {
+                                anyhow!("Unknown column in DO UPDATE: {}", col_name)
+                            })?;
+                            updated_vals[col_idx] = eval_upsert_expr(
+                                &assignment.value,
+                                existing_row,
+                                &row,
+                                schema,
+                                schema.columns.get(col_idx),
+                            )?;
+                        }
+                        let updated_row = Row::new(updated_vals);
+                        validate_enum_values(schema, &updated_row, enum_cache)?;
+                        update_row_indexes(store, txn, schema, existing_row, &updated_row).await?;
+                        store.upsert(txn, table_name, updated_row.clone()).await?;
+                        Ok(Some(updated_row))
+                    }
+                },
+                Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
                     let existing_rows = store
                         .batch_get_rows(txn, schema.table_id, vec![pk_values.clone()], schema)
                         .await?;
@@ -442,11 +475,11 @@ pub async fn execute_insert_row(
                     }
                     let existing_row = &existing_rows[0];
                     let mut updated_vals = existing_row.values.clone();
-                    for assignment in &do_update.assignments {
+                    for assignment in assignments {
                         let col_name = assignment.id.last().unwrap().value.clone();
                         let col_idx = schema
                             .column_index(&col_name)
-                            .ok_or_else(|| anyhow!("Unknown column in DO UPDATE: {}", col_name))?;
+                            .ok_or_else(|| anyhow!("Unknown column: {}", col_name))?;
                         updated_vals[col_idx] = eval_upsert_expr(
                             &assignment.value,
                             existing_row,
@@ -461,38 +494,10 @@ pub async fn execute_insert_row(
                     store.upsert(txn, table_name, updated_row.clone()).await?;
                     Ok(Some(updated_row))
                 }
-            },
-            Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
-                let existing_rows = store
-                    .batch_get_rows(txn, schema.table_id, vec![pk_values.clone()], schema)
-                    .await?;
-                if existing_rows.is_empty() {
-                    return Err(anyhow!("Failed to fetch existing row for upsert"));
-                }
-                let existing_row = &existing_rows[0];
-                let mut updated_vals = existing_row.values.clone();
-                for assignment in assignments {
-                    let col_name = assignment.id.last().unwrap().value.clone();
-                    let col_idx = schema
-                        .column_index(&col_name)
-                        .ok_or_else(|| anyhow!("Unknown column: {}", col_name))?;
-                    updated_vals[col_idx] = eval_upsert_expr(
-                        &assignment.value,
-                        existing_row,
-                        &row,
-                        schema,
-                        schema.columns.get(col_idx),
-                    )?;
-                }
-                let updated_row = Row::new(updated_vals);
-                validate_enum_values(schema, &updated_row, enum_cache)?;
-                update_row_indexes(store, txn, schema, existing_row, &updated_row).await?;
-                store.upsert(txn, table_name, updated_row.clone()).await?;
-                Ok(Some(updated_row))
+                None => Err(e),
+                _ => Err(e),
             }
-            None => Err(e),
-            _ => Err(e),
-        },
+        }
         Err(e) => Err(e),
     }
 }
@@ -1051,7 +1056,13 @@ pub async fn fill_missing_columns(
                     eval_default_expr_maybe_sequence(store, txn, sequence_values, search_path, def)
                         .await?;
             } else if !c.nullable {
-                return Err(anyhow!("Column '{}' cannot be null", c.name));
+                let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                return Err(anyhow!(
+                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint\nDETAIL:  Failing row contains ({}).",
+                    c.name,
+                    short_table,
+                    row_vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ")
+                ));
             }
         }
     }
@@ -1062,7 +1073,13 @@ pub fn coerce_row_values(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Res
     for (i, c) in schema.columns.iter().enumerate() {
         let coerced = coerce_value_for_column(row_vals[i].clone(), c)?;
         if coerced == Value::Null && !c.nullable {
-            return Err(anyhow!("Column '{}' cannot be null", c.name));
+            let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+            return Err(anyhow!(
+                "null value in column \"{}\" of relation \"{}\" violates not-null constraint\nDETAIL:  Failing row contains ({}).",
+                c.name,
+                short_table,
+                row_vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ")
+            ));
         }
         row_vals[i] = coerced;
     }
@@ -1087,9 +1104,21 @@ pub fn validate_check_constraints(schema: &TableSchema, row: &Row) -> Result<()>
                     .as_ref()
                     .map(|n| format!("\"{}\"", n))
                     .unwrap_or_else(|| format!("({})", check.expr));
-                return Err(anyhow!("new row violates check constraint {}", name));
+                let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                let row_vals_str = row
+                    .values
+                    .iter()
+                    .map(|v| format!("{}", v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(anyhow!(
+                    "new row for relation \"{}\" violates check constraint {}\nDETAIL:  Failing row contains ({}).",
+                    short_table,
+                    name,
+                    row_vals_str
+                ));
             }
-            Value::Null => {} // PostgreSQL: NULL satisfies CHECK constraints
+            Value::Null => {}
             _ => {
                 return Err(anyhow!(
                     "CHECK constraint must evaluate to boolean, got {:?}",
@@ -1214,7 +1243,13 @@ pub async fn compute_update_values(
         let col = &schema.columns[indices[i]];
         let coerced = coerce_value_for_column(raw_val, col)?;
         if coerced == Value::Null && !col.nullable {
-            return Err(anyhow!("Column '{}' cannot be null", col.name));
+            let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+            return Err(anyhow!(
+                "null value in column \"{}\" of relation \"{}\" violates not-null constraint\nDETAIL:  Failing row contains ({}).",
+                col.name,
+                short_table,
+                vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ")
+            ));
         }
         vals[indices[i]] = coerced;
     }

@@ -13,7 +13,7 @@ pub enum Aggregator {
     Max(Value),
     Min(Value),
     Avg {
-        sum: f64,
+        sum: Decimal,
         count: i64,
     },
     StringAgg {
@@ -32,7 +32,10 @@ impl Aggregator {
             "SUM" => Ok(Aggregator::Sum(Value::Null)),
             "MAX" => Ok(Aggregator::Max(Value::Null)),
             "MIN" => Ok(Aggregator::Min(Value::Null)),
-            "AVG" => Ok(Aggregator::Avg { sum: 0.0, count: 0 }),
+            "AVG" => Ok(Aggregator::Avg {
+                sum: Decimal::ZERO,
+                count: 0,
+            }),
             "STRING_AGG" => Ok(Aggregator::StringAgg {
                 values: Vec::new(),
                 delimiter: ",".to_string(),
@@ -96,12 +99,10 @@ impl Aggregator {
             Aggregator::Avg { sum, count } => {
                 if !matches!(val, Value::Null) {
                     let v = match val {
-                        Value::Int32(i) => *i as f64,
-                        Value::Int64(i) => *i as f64,
-                        Value::Float64(f) => *f,
-                        Value::Numeric(d) => d.to_f64().ok_or_else(|| {
-                            anyhow!("numeric value out of range for double precision")
-                        })?,
+                        Value::Int32(i) => Decimal::from(*i),
+                        Value::Int64(i) => Decimal::from(*i),
+                        Value::Float64(f) => Decimal::try_from(*f).unwrap_or(Decimal::ZERO),
+                        Value::Numeric(d) => *d,
                         _ => return Err(anyhow!("AVG requires numeric type")),
                     };
                     *sum += v;
@@ -135,7 +136,7 @@ impl Aggregator {
                 if *count == 0 {
                     Value::Null
                 } else {
-                    Value::Float64(*sum / *count as f64)
+                    Value::Numeric(*sum / Decimal::from(*count))
                 }
             }
             Aggregator::StringAgg { values, delimiter } => {
@@ -298,7 +299,7 @@ mod tests {
         agg.update(&Value::Int32(20)).unwrap();
         agg.update(&Value::Int32(30)).unwrap();
         let result = agg.result();
-        assert!(matches!(result, Value::Float64(f) if (f - 20.0).abs() < 0.001));
+        assert_eq!(result, Value::Numeric(Decimal::from(20)));
     }
 
     #[test]
@@ -308,7 +309,7 @@ mod tests {
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Int32(20)).unwrap();
         let result = agg.result();
-        assert!(matches!(result, Value::Float64(f) if (f - 15.0).abs() < 0.001));
+        assert_eq!(result, Value::Numeric(Decimal::from(15)));
     }
 
     #[test]
@@ -323,7 +324,7 @@ mod tests {
         agg.update(&Value::Float64(1.5)).unwrap();
         agg.update(&Value::Float64(2.5)).unwrap();
         let result = agg.result();
-        assert!(matches!(result, Value::Float64(f) if (f - 2.0).abs() < 0.001));
+        assert_eq!(result, Value::Numeric(Decimal::from(2)));
     }
 
     #[test]

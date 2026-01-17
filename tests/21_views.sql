@@ -11,8 +11,7 @@ CREATE TABLE users (
     id SERIAL PRIMARY KEY,
     name TEXT,
     email TEXT,
-    active BOOLEAN DEFAULT TRUE,
-    created_at TIMESTAMP DEFAULT NOW()
+    active BOOLEAN DEFAULT TRUE
 );
 
 CREATE TABLE orders (
@@ -46,7 +45,7 @@ CREATE VIEW order_totals AS
 SELECT user_id, COUNT(*) as order_count, SUM(amount) as total_amount 
 FROM orders 
 GROUP BY user_id;
-SELECT * FROM order_totals;
+SELECT * FROM order_totals ORDER BY user_id;
 
 -- 4. Query view with WHERE
 SELECT * FROM active_users WHERE name LIKE 'A%';

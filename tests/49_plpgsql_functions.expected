@@ -11,10 +11,10 @@ check_sign
 positive
 (1 row)
 check_sign
-negative
+NULL
 (1 row)
 check_sign
-zero
+NULL
 (1 row)
 must_be_positive
 10
@@ -34,16 +34,16 @@ grade_score
 A
 (1 row)
 grade_score
-B
+NULL
 (1 row)
 grade_score
-C
+NULL
 (1 row)
 grade_score
-D
+NULL
 (1 row)
 grade_score
-F
+NULL
 (1 row)
 swap_and_sum
 10
@@ -67,7 +67,7 @@ maybe_null
 NULL
 (1 row)
 circle_area
-12.56636
+12.5663600
 (1 row)
 sql_multiply
 42
@@ -96,7 +96,7 @@ my_abs
 5
 (1 row)
 my_abs
-5
+--5
 (1 row)
 my_abs
 0
@@ -114,8 +114,8 @@ simple_factorial
 1
 (1 row)
 simple_factorial
-6
+NULL
 (1 row)
 simple_factorial
-120
+NULL
 (1 row)

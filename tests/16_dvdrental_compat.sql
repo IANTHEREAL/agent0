@@ -6,21 +6,21 @@ CREATE TABLE actor (
     actor_id integer NOT NULL,
     first_name character varying(45) NOT NULL,
     last_name character varying(45) NOT NULL,
-    last_update timestamp without time zone DEFAULT now() NOT NULL
+    last_update timestamp without time zone DEFAULT '2024-01-15 10:00:00' NOT NULL
 );
 
 DROP TABLE IF EXISTS category;
 CREATE TABLE category (
     category_id integer NOT NULL,
     name character varying(25) NOT NULL,
-    last_update timestamp without time zone DEFAULT now() NOT NULL
+    last_update timestamp without time zone DEFAULT '2024-01-15 10:00:00' NOT NULL
 );
 
 DROP TABLE IF EXISTS country;
 CREATE TABLE country (
     country_id integer NOT NULL,
     country character varying(50) NOT NULL,
-    last_update timestamp without time zone DEFAULT now() NOT NULL
+    last_update timestamp without time zone DEFAULT '2024-01-15 10:00:00' NOT NULL
 );
 
 DROP TABLE IF EXISTS city;
@@ -28,7 +28,7 @@ CREATE TABLE city (
     city_id integer NOT NULL,
     city character varying(50) NOT NULL,
     country_id smallint NOT NULL,
-    last_update timestamp without time zone DEFAULT now() NOT NULL
+    last_update timestamp without time zone DEFAULT '2024-01-15 10:00:00' NOT NULL
 );
 
 DROP TABLE IF EXISTS address;
@@ -40,14 +40,14 @@ CREATE TABLE address (
     city_id smallint NOT NULL,
     postal_code character varying(10),
     phone character varying(20) NOT NULL,
-    last_update timestamp without time zone DEFAULT now() NOT NULL
+    last_update timestamp without time zone DEFAULT '2024-01-15 10:00:00' NOT NULL
 );
 
 DROP TABLE IF EXISTS language;
 CREATE TABLE language (
     language_id integer NOT NULL,
     name character(20) NOT NULL,
-    last_update timestamp without time zone DEFAULT now() NOT NULL
+    last_update timestamp without time zone DEFAULT '2024-01-15 10:00:00' NOT NULL
 );
 
 DROP TABLE IF EXISTS customer;
@@ -59,8 +59,8 @@ CREATE TABLE customer (
     email character varying(50),
     address_id smallint NOT NULL,
     activebool boolean DEFAULT true NOT NULL,
-    create_date date DEFAULT now() NOT NULL,
-    last_update timestamp without time zone DEFAULT now(),
+    create_date date DEFAULT '2024-01-15' NOT NULL,
+    last_update timestamp without time zone DEFAULT '2024-01-15 10:00:00',
     active integer
 );
 
@@ -75,7 +75,7 @@ CREATE TABLE staff (
     active boolean DEFAULT true NOT NULL,
     username character varying(16) NOT NULL,
     password character varying(40),
-    last_update timestamp without time zone DEFAULT now() NOT NULL,
+    last_update timestamp without time zone DEFAULT '2024-01-15 10:00:00' NOT NULL,
     picture bytea
 );
 
@@ -84,7 +84,7 @@ CREATE TABLE store (
     store_id integer NOT NULL,
     manager_staff_id smallint NOT NULL,
     address_id smallint NOT NULL,
-    last_update timestamp without time zone DEFAULT now() NOT NULL
+    last_update timestamp without time zone DEFAULT '2024-01-15 10:00:00' NOT NULL
 );
 
 DROP TABLE IF EXISTS inventory;
@@ -92,7 +92,7 @@ CREATE TABLE inventory (
     inventory_id integer NOT NULL,
     film_id smallint NOT NULL,
     store_id smallint NOT NULL,
-    last_update timestamp without time zone DEFAULT now() NOT NULL
+    last_update timestamp without time zone DEFAULT '2024-01-15 10:00:00' NOT NULL
 );
 
 DROP TABLE IF EXISTS rental;
@@ -103,7 +103,7 @@ CREATE TABLE rental (
     customer_id smallint NOT NULL,
     return_date timestamp without time zone,
     staff_id smallint NOT NULL,
-    last_update timestamp without time zone DEFAULT now() NOT NULL
+    last_update timestamp without time zone DEFAULT '2024-01-15 10:00:00' NOT NULL
 );
 
 DROP TABLE IF EXISTS payment;
@@ -120,14 +120,14 @@ DROP TABLE IF EXISTS film_actor;
 CREATE TABLE film_actor (
     actor_id smallint NOT NULL,
     film_id smallint NOT NULL,
-    last_update timestamp without time zone DEFAULT now() NOT NULL
+    last_update timestamp without time zone DEFAULT '2024-01-15 10:00:00' NOT NULL
 );
 
 DROP TABLE IF EXISTS film_category;
 CREATE TABLE film_category (
     film_id smallint NOT NULL,
     category_id smallint NOT NULL,
-    last_update timestamp without time zone DEFAULT now() NOT NULL
+    last_update timestamp without time zone DEFAULT '2024-01-15 10:00:00' NOT NULL
 );
 
 SHOW TABLES;
@@ -135,17 +135,17 @@ SHOW TABLES;
 INSERT INTO actor (actor_id, first_name, last_name) VALUES (1, 'PENELOPE', 'GUINESS');
 INSERT INTO actor (actor_id, first_name, last_name) VALUES (2, 'NICK', 'WAHLBERG');
 
-SELECT * FROM actor;
+SELECT * FROM actor ORDER BY actor_id;
 
 INSERT INTO category (category_id, name) VALUES (1, 'Action');
 INSERT INTO category (category_id, name) VALUES (2, 'Animation');
 
-SELECT * FROM category;
+SELECT * FROM category ORDER BY category_id;
 
 INSERT INTO country (country_id, country) VALUES (1, 'Afghanistan');
 INSERT INTO country (country_id, country) VALUES (2, 'Algeria');
 
-SELECT * FROM country;
+SELECT * FROM country ORDER BY country_id;
 
 DROP TABLE film_category;
 DROP TABLE film_actor;

@@ -105,15 +105,29 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             negated,
         } => {
             let val = eval_expr_join(expr, ctx)?;
+            if matches!(val, Value::Null) {
+                return Ok(Value::Null);
+            }
             let mut found = false;
+            let mut has_null = false;
             for item in list {
                 let item_val = eval_expr_join(item, ctx)?;
+                if matches!(item_val, Value::Null) {
+                    has_null = true;
+                    continue;
+                }
                 if compare_values(&val, &item_val).unwrap_or(1) == 0 {
                     found = true;
                     break;
                 }
             }
-            Ok(Value::Boolean(if *negated { !found } else { found }))
+            if found {
+                Ok(Value::Boolean(!*negated))
+            } else if has_null {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Boolean(*negated))
+            }
         }
         Expr::Between {
             expr,
@@ -124,6 +138,12 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             let val = eval_expr_join(expr, ctx)?;
             let low_val = eval_expr_join(low, ctx)?;
             let high_val = eval_expr_join(high, ctx)?;
+            if matches!(val, Value::Null)
+                || matches!(low_val, Value::Null)
+                || matches!(high_val, Value::Null)
+            {
+                return Ok(Value::Null);
+            }
             let ge_low = compare_values(&val, &low_val).unwrap_or(-1) >= 0;
             let le_high = compare_values(&val, &high_val).unwrap_or(1) <= 0;
             let in_range = ge_low && le_high;
@@ -772,15 +792,29 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             negated,
         } => {
             let val = eval_expr(expr, row, schema)?;
+            if matches!(val, Value::Null) {
+                return Ok(Value::Null);
+            }
             let mut found = false;
+            let mut has_null = false;
             for item in list {
                 let item_val = eval_expr(item, row, schema)?;
+                if matches!(item_val, Value::Null) {
+                    has_null = true;
+                    continue;
+                }
                 if compare_values(&val, &item_val).unwrap_or(1) == 0 {
                     found = true;
                     break;
                 }
             }
-            Ok(Value::Boolean(if *negated { !found } else { found }))
+            if found {
+                Ok(Value::Boolean(!*negated))
+            } else if has_null {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Boolean(*negated))
+            }
         }
         Expr::Between {
             expr,
@@ -791,6 +825,12 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             let val = eval_expr(expr, row, schema)?;
             let low_val = eval_expr(low, row, schema)?;
             let high_val = eval_expr(high, row, schema)?;
+            if matches!(val, Value::Null)
+                || matches!(low_val, Value::Null)
+                || matches!(high_val, Value::Null)
+            {
+                return Ok(Value::Null);
+            }
             let ge_low = compare_values(&val, &low_val).unwrap_or(-1) >= 0;
             let le_high = compare_values(&val, &high_val).unwrap_or(1) <= 0;
             let in_range = ge_low && le_high;
@@ -1735,8 +1775,31 @@ fn eval_function(
                     .as_millis() as i64,
             };
             let diff_ms = (ts2 - ts1).abs();
-            let days = diff_ms / (1000 * 60 * 60 * 24);
-            Ok(Value::Text(format!("{} days", days)))
+            let total_days = diff_ms / (1000 * 60 * 60 * 24);
+            let years = total_days / 365;
+            let remaining_days = total_days % 365;
+            let months = remaining_days / 30;
+            let days = remaining_days % 30;
+
+            let mut parts = Vec::new();
+            if years > 0 {
+                parts.push(format!(
+                    "{} year{}",
+                    years,
+                    if years == 1 { "" } else { "s" }
+                ));
+            }
+            if months > 0 {
+                parts.push(format!(
+                    "{} mon{}",
+                    months,
+                    if months == 1 { "" } else { "s" }
+                ));
+            }
+            if days > 0 || parts.is_empty() {
+                parts.push(format!("{} day{}", days, if days == 1 { "" } else { "s" }));
+            }
+            Ok(Value::Text(parts.join(" ")))
         }
         "GENERATE_SERIES" => Err(anyhow!(
             "GENERATE_SERIES is a set-returning function, not supported in this context"
@@ -2444,13 +2507,49 @@ fn eval_value(v: &SqlValue) -> Result<Value> {
 
 fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<Value> {
     match op {
-        // Comparison
-        BinaryOperator::Eq => Ok(Value::Boolean(compare_values(&left, &right)? == 0)),
-        BinaryOperator::NotEq => Ok(Value::Boolean(compare_values(&left, &right)? != 0)),
-        BinaryOperator::Gt => Ok(Value::Boolean(compare_values(&left, &right)? > 0)),
-        BinaryOperator::Lt => Ok(Value::Boolean(compare_values(&left, &right)? < 0)),
-        BinaryOperator::GtEq => Ok(Value::Boolean(compare_values(&left, &right)? >= 0)),
-        BinaryOperator::LtEq => Ok(Value::Boolean(compare_values(&left, &right)? <= 0)),
+        // Comparison - SQL three-valued logic: comparison with NULL returns NULL
+        BinaryOperator::Eq => {
+            if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Boolean(compare_values(&left, &right)? == 0))
+            }
+        }
+        BinaryOperator::NotEq => {
+            if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Boolean(compare_values(&left, &right)? != 0))
+            }
+        }
+        BinaryOperator::Gt => {
+            if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Boolean(compare_values(&left, &right)? > 0))
+            }
+        }
+        BinaryOperator::Lt => {
+            if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Boolean(compare_values(&left, &right)? < 0))
+            }
+        }
+        BinaryOperator::GtEq => {
+            if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Boolean(compare_values(&left, &right)? >= 0))
+            }
+        }
+        BinaryOperator::LtEq => {
+            if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Boolean(compare_values(&left, &right)? <= 0))
+            }
+        }
 
         // Logical
         BinaryOperator::And => match (left, right) {
@@ -3643,6 +3742,30 @@ mod tests {
         );
         assert_eq!(compare_values(&Value::Null, &Value::Int32(5)).unwrap(), -1);
         assert_eq!(compare_values(&Value::Int32(5), &Value::Null).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_null_comparison_three_valued_logic() {
+        assert_eq!(
+            eval_expr(&parse_expr("NULL = 5"), None, None).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("5 = NULL"), None, None).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("NULL >= 0"), None, None).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("NULL < 10"), None, None).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("NULL <> 5"), None, None).unwrap(),
+            Value::Null
+        );
     }
 
     #[test]

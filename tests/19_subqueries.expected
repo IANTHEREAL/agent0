@@ -1,3 +1,4 @@
+# unordered
 id|name|vip
 1|Alice|t
 2|Bob|f
@@ -66,9 +67,10 @@ id|customer_id|amount|status
 (3 rows)
 name|order_count
 Alice|2
+Diana|0
 Bob|1
 Charlie|1
-(3 rows)
+(4 rows)
 name|price|above_min
 Widget|10|0
 Gadget|20|10
@@ -82,10 +84,10 @@ Gizmo|15|cheap
 Thing|25|expensive
 (4 rows)
 name|price|category|category_avg
-Widget|10|A|15.0000000000000000
-Gadget|20|A|15.0000000000000000
-Gizmo|15|B|20.0000000000000000
-Thing|25|B|20.0000000000000000
+Widget|10|A|15
+Gadget|20|A|15
+Gizmo|15|B|20
+Thing|25|B|20
 (4 rows)
 id|name|price|category
 1|Widget|10|A

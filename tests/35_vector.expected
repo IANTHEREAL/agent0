@@ -1,31 +1,35 @@
-psql:/tmp/tipg-tests/tests/35_vector.sql:9: ERROR:  type "vector" does not exist
-LINE 4:     embedding vector(3)
-                      ^
-psql:/tmp/tipg-tests/tests/35_vector.sql:15: ERROR:  relation "embeddings" does not exist
-LINE 1: INSERT INTO embeddings (name, embedding) VALUES
-                    ^
-psql:/tmp/tipg-tests/tests/35_vector.sql:20: ERROR:  relation "embeddings" does not exist
-LINE 2: FROM embeddings
-             ^
-psql:/tmp/tipg-tests/tests/35_vector.sql:25: ERROR:  relation "embeddings" does not exist
-LINE 2: FROM embeddings
-             ^
-psql:/tmp/tipg-tests/tests/35_vector.sql:30: ERROR:  relation "embeddings" does not exist
-LINE 2: FROM embeddings
-             ^
-psql:/tmp/tipg-tests/tests/35_vector.sql:34: ERROR:  relation "embeddings" does not exist
-LINE 2: FROM embeddings;
-             ^
-psql:/tmp/tipg-tests/tests/35_vector.sql:38: ERROR:  relation "embeddings" does not exist
-LINE 2: FROM embeddings;
-             ^
-psql:/tmp/tipg-tests/tests/35_vector.sql:41: ERROR:  type "vector" does not exist
-LINE 1: SELECT CAST('[7.0, 8.0, 9.0]' AS vector) AS vec;
-                                         ^
-psql:/tmp/tipg-tests/tests/35_vector.sql:47: ERROR:  relation "embeddings" does not exist
-LINE 2: FROM embeddings
-             ^
-psql:/tmp/tipg-tests/tests/35_vector.sql:53: ERROR:  relation "embeddings" does not exist
-LINE 2: FROM embeddings
-             ^
-psql:/tmp/tipg-tests/tests/35_vector.sql:56: ERROR:  table "embeddings" does not exist
+name|distance
+doc1|0
+doc3|3.605551275463989
+doc2|5.196152422706632
+(3 rows)
+name|distance
+doc2|0.013072457560346584
+doc1|0.07417990022744847
+doc3|0.42264973081037416
+(3 rows)
+name|product
+doc2|-15
+doc1|-6
+doc3|-1
+(3 rows)
+name|dims
+doc1|3
+doc2|3
+doc3|3
+(3 rows)
+name|norm
+doc1|3.7416573867739413
+doc2|8.774964387392123
+doc3|1
+(3 rows)
+vec
+[7,8,9]
+(1 row)
+name|similarity
+doc1|0
+doc2|0.025368153802923787
+(2 rows)
+name|distance
+doc3|0.5
+(1 row)

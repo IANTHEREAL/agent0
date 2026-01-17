@@ -180,8 +180,8 @@ SELECT 'Children after nested insert' AS test, COUNT(*) FROM child_table;
 SELECT 'Children with parent' AS test, p.name, SUM(c.value) AS total_value 
 FROM parent_table p 
 JOIN child_table c ON p.id = c.parent_id 
-GROUP BY p.name 
-ORDER BY p.name;
+GROUP BY p.name
+ORDER BY total_value, p.name;
 
 -- ============================================================
 -- Test 7: Update with Subquery in Transaction

@@ -7,10 +7,10 @@ customers|BASE TABLE
 orders|BASE TABLE
 (2 rows)
 table_name|column_name|data_type|is_nullable|column_default
-customers|id|integer|NO|nextval('customers_id_seq'::regclass)
-customers|name|text|NO|NULL
-customers|email|text|YES|NULL
-customers|status|text|YES|'active'::text
+customers|id|integer|NO|nextval('public.customers_id_seq'::regclass)
+customers|name|character varying|NO|NULL
+customers|email|character varying|YES|NULL
+customers|status|character varying|YES|'active'
 (4 rows)
 table_name|column_name|data_type|is_nullable
 orders|id|integer|NO
@@ -19,19 +19,15 @@ orders|total|double precision|NO
 orders|created_at|timestamp without time zone|YES
 (4 rows)
 constraint_name|constraint_type
-2200_17481_1_not_null|CHECK
-2200_17481_2_not_null|CHECK
-customers_status_check|CHECK
+customers_check1|CHECK
 customers_pkey|PRIMARY KEY
 customers_email_key|UNIQUE
-(5 rows)
+customers_email_key|UNIQUE
+(4 rows)
 constraint_name|constraint_type
-2200_17494_1_not_null|CHECK
-2200_17494_2_not_null|CHECK
-2200_17494_3_not_null|CHECK
 orders_customer_id_fkey|FOREIGN KEY
 orders_pkey|PRIMARY KEY
-(5 rows)
+(2 rows)
 constraint_name|column_name
 customers_email_key|email
 customers_pkey|id
@@ -43,8 +39,7 @@ constraint_name|unique_constraint_name|delete_rule|update_rule
 orders_customer_id_fkey|customers_pkey|CASCADE|NO ACTION
 (1 row)
 constraint_name|check_clause
-customers_status_check|((status = ANY (ARRAY['active'::text, 'inactive'::text])))
-(1 row)
+(0 rows)
 count
 0
 (1 row)

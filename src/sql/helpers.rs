@@ -947,14 +947,38 @@ pub fn get_expr_name(expr: &Expr) -> String {
             .map(|p| p.value.clone())
             .unwrap_or_else(|| "?column?".to_string()),
         Expr::Function(f) => {
-            // Get the last part of the function name (handles schema-qualified names)
             if let Some(last_ident) = f.name.0.last() {
-                let func_name = last_ident.value.to_lowercase();
-                func_name
+                last_ident.value.to_lowercase()
             } else {
                 "?column?".to_string()
             }
         }
+        Expr::Case { .. } => "case".to_string(),
+        Expr::Cast { data_type, .. } => {
+            use sqlparser::ast::DataType;
+            match data_type {
+                DataType::Int(_) | DataType::Integer(_) => "int4".to_string(),
+                DataType::BigInt(_) => "int8".to_string(),
+                DataType::SmallInt(_) => "int2".to_string(),
+                DataType::Text => "text".to_string(),
+                DataType::Varchar(_) | DataType::CharVarying(_) => "varchar".to_string(),
+                DataType::Boolean => "bool".to_string(),
+                DataType::Float(_) | DataType::Real => "float4".to_string(),
+                DataType::Double | DataType::DoublePrecision => "float8".to_string(),
+                DataType::Numeric(_) | DataType::Decimal(_) => "numeric".to_string(),
+                DataType::Timestamp(_, _) => "timestamp".to_string(),
+                DataType::Date => "date".to_string(),
+                DataType::Uuid => "uuid".to_string(),
+                DataType::JSON => "json".to_string(),
+                _ => data_type.to_string().to_lowercase(),
+            }
+        }
+        Expr::Substring { .. } => "substring".to_string(),
+        Expr::Trim { .. } => "btrim".to_string(),
+        Expr::Position { .. } => "position".to_string(),
+        Expr::Extract { .. } => "extract".to_string(),
+        Expr::Subquery(_) => "subquery".to_string(),
+        Expr::Nested(inner) => get_expr_name(inner),
         _ => "?column?".to_string(),
     }
 }
