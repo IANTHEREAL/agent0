@@ -6,17 +6,23 @@ from datetime import datetime, timezone
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
 
 from ..config import get_settings, Settings
+from ..database import get_db
 from ..models import (
     TenantCreate,
     TenantResponse,
     TenantCreateResponse,
     TenantConnectRequest,
     TenantConnectResponse,
+    TenantUpdate,
+    TenantResponseExtended,
     MessageResponse,
 )
+from ..models.db import TenantDB
 from ..services import PDClient, PgTikvClient
+from ..services.audit import get_audit_service
 from ..session import session_manager
 
 
@@ -41,17 +47,19 @@ def generate_password(length: int = 16) -> str:
 
 @router.get(
     "",
-    response_model=List[TenantResponse],
-    summary="List all tenants",
-    description="List all tenants (TiKV keyspaces)."
+    response_model=List[TenantResponseExtended],
+    summary="List all active tenants",
+    description="List all active (non-deleted) tenants with metadata."
 )
 async def list_tenants(
     pd: PDClient = Depends(get_pd_client),
+    db: Session = Depends(get_db),
 ):
-    """List all tenants."""
+    """List all active tenants."""
+    # Get keyspaces from TiKV
     keyspaces = pd.list_keyspaces()
-    tenants = []
-    
+    tikv_keyspaces = {}
+
     for ks in keyspaces:
         if isinstance(ks, dict):
             name = ks.get("name", "")
@@ -59,11 +67,29 @@ async def list_tenants(
         else:
             name = str(ks)
             state = "ENABLED"
-        
+
         # Skip system keyspaces
         if name and name != "DEFAULT" and not name.startswith("_"):
-            tenants.append(TenantResponse(name=name, state=state))
-    
+            tikv_keyspaces[name] = state
+
+    # Get active tenants from database
+    active_tenants = db.query(TenantDB).filter(TenantDB.is_deleted == False).all()
+
+    # Build response - only include tenants that exist in both TiKV and DB
+    tenants = []
+    for tenant_db in active_tenants:
+        if tenant_db.name in tikv_keyspaces:
+            tenants.append(TenantResponseExtended(
+                name=tenant_db.name,
+                state=tikv_keyspaces[tenant_db.name],
+                is_deleted=tenant_db.is_deleted,
+                created_at=tenant_db.created_at,
+                created_by=tenant_db.created_by,
+                notes=tenant_db.notes,
+                tags=tenant_db.tags,
+                updated_at=tenant_db.updated_at,
+            ))
+
     return tenants
 
 
@@ -74,7 +100,7 @@ async def list_tenants(
     summary="Create a new tenant",
     description="""
     Create a new tenant with its own isolated keyspace.
-    
+
     Returns the admin credentials. Save the password - it won't be shown again.
     """
 )
@@ -82,34 +108,78 @@ async def create_tenant(
     request: TenantCreate,
     pd: PDClient = Depends(get_pd_client),
     settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
 ):
     """Create a new tenant."""
-    # Check if already exists
+    # Check if already exists in TiKV
     if pd.get_keyspace(request.name):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Tenant '{request.name}' already exists",
         )
-    
-    # Create keyspace
-    if not pd.create_keyspace(request.name):
+
+    # Check if exists in database (including soft-deleted)
+    existing = db.query(TenantDB).filter(TenantDB.name == request.name).first()
+    if existing:
+        if existing.is_deleted:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Tenant '{request.name}' was previously deleted and cannot be reused",
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Tenant '{request.name}' already exists",
+            )
+
+    audit = get_audit_service(db)
+
+    try:
+        # Create keyspace in TiKV
+        if not pd.create_keyspace(request.name):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create keyspace in TiKV",
+            )
+
+        # Generate password
+        password = request.admin_password or generate_password()
+
+        # Create tenant record in database
+        tenant_db = TenantDB(
+            name=request.name,
+            is_deleted=False,
+            created_at=datetime.now(timezone.utc),
+            created_by=None,  # TODO: Add operator tracking when auth is implemented
+        )
+        db.add(tenant_db)
+        db.commit()
+
+        # Log successful creation
+        audit.log_tenant_created(request.name, success=True)
+
+        return TenantCreateResponse(
+            name=request.name,
+            admin_user=request.admin_user,
+            admin_password=password,
+            connection_string=(
+                f"postgresql://{request.name}.{request.admin_user}:{password}"
+                f"@{settings.pg_host}:{settings.pg_port}/postgres"
+            ),
+            created_at=tenant_db.created_at,
+        )
+
+    except HTTPException:
+        # Log failure and re-raise
+        audit.log_tenant_created(request.name, success=False, error="HTTP error during creation")
+        raise
+    except Exception as e:
+        # Log failure
+        audit.log_tenant_created(request.name, success=False, error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create keyspace in TiKV",
+            detail=f"Failed to create tenant: {str(e)}",
         )
-    
-    password = request.admin_password or generate_password()
-    
-    return TenantCreateResponse(
-        name=request.name,
-        admin_user=request.admin_user,
-        admin_password=password,
-        connection_string=(
-            f"postgresql://{request.name}.{request.admin_user}:{password}"
-            f"@{settings.pg_host}:{settings.pg_port}/postgres"
-        ),
-        created_at=datetime.now(timezone.utc),
-    )
 
 
 @router.get(
@@ -213,3 +283,135 @@ async def connect_tenant(
         session_id=session.session_id,
         expires_at=session.expires_at,
     )
+
+
+@router.post(
+    "/{name}/remove",
+    response_model=MessageResponse,
+    summary="Remove tenant from portal (soft delete)",
+    description="""
+    Remove tenant from the portal UI by marking it as deleted.
+
+    This does NOT delete the TiKV keyspace - it only hides the tenant
+    from the portal interface. The keyspace will be disabled in TiKV
+    and marked as deleted in the portal database.
+
+    This action cannot be undone and the tenant name cannot be reused.
+    """
+)
+async def remove_tenant(
+    name: str,
+    pd: PDClient = Depends(get_pd_client),
+    db: Session = Depends(get_db),
+):
+    """Soft delete a tenant."""
+    # Check if exists in database
+    tenant = db.query(TenantDB).filter(TenantDB.name == name).first()
+    if not tenant or tenant.is_deleted:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant '{name}' not found",
+        )
+
+    audit = get_audit_service(db)
+
+    try:
+        # Disable keyspace in TiKV
+        if not pd.disable_keyspace(name):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to disable keyspace in TiKV",
+            )
+
+        # Mark as deleted in database
+        tenant.is_deleted = True
+        tenant.updated_at = datetime.now(timezone.utc)
+        db.commit()
+
+        # Log successful deletion
+        audit.log_tenant_deleted(name, success=True)
+
+        return MessageResponse(message=f"Tenant '{name}' removed from portal")
+
+    except HTTPException:
+        audit.log_tenant_deleted(name, success=False, error="HTTP error during removal")
+        raise
+    except Exception as e:
+        audit.log_tenant_deleted(name, success=False, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to remove tenant: {str(e)}",
+        )
+
+
+@router.put(
+    "/{name}",
+    response_model=TenantResponseExtended,
+    summary="Update tenant metadata",
+    description="""
+    Update tenant notes and tags.
+
+    This endpoint allows you to add organizational metadata to tenants
+    without affecting their operational state.
+    """
+)
+async def update_tenant(
+    name: str,
+    request: TenantUpdate,
+    pd: PDClient = Depends(get_pd_client),
+    db: Session = Depends(get_db),
+):
+    """Update tenant metadata."""
+    # Check if exists in database
+    tenant = db.query(TenantDB).filter(
+        TenantDB.name == name,
+        TenantDB.is_deleted == False
+    ).first()
+
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant '{name}' not found",
+        )
+
+    audit = get_audit_service(db)
+
+    try:
+        # Update fields
+        if request.notes is not None:
+            tenant.notes = request.notes
+        if request.tags is not None:
+            tenant.tags = request.tags
+
+        tenant.updated_at = datetime.now(timezone.utc)
+        db.commit()
+        db.refresh(tenant)
+
+        # Get current state from TiKV
+        ks = pd.get_keyspace(name)
+        state = ks.get("state", "ENABLED") if isinstance(ks, dict) else "ENABLED"
+
+        # Log update
+        audit.log_tenant_updated(
+            name,
+            success=True,
+            extra_metadata={"notes_updated": request.notes is not None, "tags_updated": request.tags is not None}
+        )
+
+        return TenantResponseExtended(
+            name=tenant.name,
+            state=state,
+            is_deleted=tenant.is_deleted,
+            created_at=tenant.created_at,
+            created_by=tenant.created_by,
+            notes=tenant.notes,
+            tags=tenant.tags,
+            updated_at=tenant.updated_at,
+        )
+
+    except Exception as e:
+        audit.log_tenant_updated(name, success=False, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update tenant: {str(e)}",
+        )

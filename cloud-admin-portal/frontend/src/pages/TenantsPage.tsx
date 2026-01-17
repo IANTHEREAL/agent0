@@ -4,35 +4,36 @@
 
 import { useState } from "react"
 import { Link } from "react-router-dom"
-import { Plus, Trash2, Users } from "lucide-react"
-import { useTenants, useDeleteTenant } from "@/api/tenants"
+import { Plus, Ban, Users, Edit } from "lucide-react"
+import { useTenants, useRemoveTenant } from "@/api/tenants"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { useToast } from "@/components/ui/use-toast"
 import { cn } from "@/lib/utils"
 import { CreateTenantDialog } from "@/components/tenants/CreateTenantDialog"
+import { EditTenantMetadataDialog } from "@/components/tenants/EditTenantMetadataDialog"
+import { ConfirmDialog } from "@/components/common/ConfirmDialog"
+import type { Tenant } from "@/types"
 
 export function TenantsPage() {
   const [showCreateDialog, setShowCreateDialog] = useState(false)
+  const [confirmRemove, setConfirmRemove] = useState<string | null>(null)
+  const [editingTenant, setEditingTenant] = useState<Tenant | null>(null)
   const { data: tenants, isLoading } = useTenants()
-  const deleteMutation = useDeleteTenant()
+  const removeMutation = useRemoveTenant()
   const { toast } = useToast()
 
-  const handleDelete = async (name: string) => {
-    if (!confirm(`Are you sure you want to disable tenant "${name}"?`)) {
-      return
-    }
-
+  const handleRemove = async (name: string) => {
     try {
-      await deleteMutation.mutateAsync(name)
+      await removeMutation.mutateAsync(name)
       toast({
-        title: "Tenant Disabled",
-        description: `Tenant "${name}" has been disabled.`,
+        title: "Tenant Removed",
+        description: `Tenant "${name}" has been removed from the portal.`,
       })
     } catch (error) {
       toast({
         title: "Error",
-        description: "Failed to disable tenant",
+        description: "Failed to remove tenant",
         variant: "destructive",
       })
     }
@@ -80,6 +81,9 @@ export function TenantsPage() {
                       Status
                     </th>
                     <th className="text-left p-4 text-sm font-medium text-muted-foreground">
+                      Tags
+                    </th>
+                    <th className="text-left p-4 text-sm font-medium text-muted-foreground">
                       Connection
                     </th>
                     <th className="text-right p-4 text-sm font-medium text-muted-foreground">
@@ -119,6 +123,22 @@ export function TenantsPage() {
                         </span>
                       </td>
                       <td className="p-4">
+                        {tenant.tags && tenant.tags.length > 0 ? (
+                          <div className="flex flex-wrap gap-1">
+                            {tenant.tags.map((tag) => (
+                              <span
+                                key={tag}
+                                className="inline-flex items-center px-2 py-0.5 rounded-full text-xs bg-blue-100 text-blue-700"
+                              >
+                                {tag}
+                              </span>
+                            ))}
+                          </div>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">-</span>
+                        )}
+                      </td>
+                      <td className="p-4">
                         <code className="text-sm bg-muted px-2 py-1 rounded">
                           {tenant.name}.&lt;user&gt;
                         </code>
@@ -138,10 +158,17 @@ export function TenantsPage() {
                           <Button
                             variant="ghost"
                             size="sm"
-                            className="text-destructive hover:text-destructive"
-                            onClick={() => handleDelete(tenant.name)}
+                            onClick={() => setEditingTenant(tenant)}
                           >
-                            <Trash2 className="w-4 h-4" />
+                            <Edit className="w-4 h-4" />
+                          </Button>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="text-destructive hover:text-destructive"
+                            onClick={() => setConfirmRemove(tenant.name)}
+                          >
+                            <Ban className="w-4 h-4" />
                           </Button>
                         </div>
                       </td>
@@ -157,6 +184,32 @@ export function TenantsPage() {
       <CreateTenantDialog
         open={showCreateDialog}
         onOpenChange={setShowCreateDialog}
+      />
+
+      <EditTenantMetadataDialog
+        tenant={editingTenant}
+        open={editingTenant !== null}
+        onOpenChange={(open) => !open && setEditingTenant(null)}
+      />
+
+      <ConfirmDialog
+        open={confirmRemove !== null}
+        onOpenChange={(open) => !open && setConfirmRemove(null)}
+        title="Remove Tenant?"
+        description={
+          <div className="space-y-2">
+            <p>
+              This will remove tenant <strong>{confirmRemove}</strong> from the portal interface.
+            </p>
+            <p className="text-sm text-muted-foreground">
+              The tenant's keyspace will be disabled in TiKV and hidden from this portal.
+              Data remains in storage but becomes inaccessible. This action cannot be undone.
+            </p>
+          </div>
+        }
+        confirmLabel="Remove Tenant"
+        variant="destructive"
+        onConfirm={() => handleRemove(confirmRemove!)}
       />
     </div>
   )

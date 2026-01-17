@@ -22,22 +22,29 @@ class PDClient:
     
     def create_keyspace(self, name: str) -> bool:
         """Create a new keyspace.
-        
+
         Args:
             name: Keyspace name
-        
+
         Returns:
             True if created successfully or already exists
         """
         url = f"{self.base_url}/pd/api/v2/keyspaces"
         try:
             resp = requests.post(url, json={"name": name}, timeout=self._timeout)
+            print(f"[DEBUG] Creating keyspace '{name}': POST {url}")
+            print(f"[DEBUG] Response status: {resp.status_code}")
+            print(f"[DEBUG] Response body: {resp.text}")
+
             if resp.status_code == 200:
                 return True
             if "already exists" in resp.text.lower():
                 return True
+
+            print(f"[ERROR] Failed to create keyspace: {resp.status_code} - {resp.text}")
             return False
-        except requests.RequestException:
+        except requests.RequestException as e:
+            print(f"[ERROR] Request exception when creating keyspace: {e}")
             return False
     
     def list_keyspaces(self) -> List[dict]:
@@ -58,20 +65,27 @@ class PDClient:
     
     def get_keyspace(self, name: str) -> Optional[dict]:
         """Get keyspace details.
-        
+
         Args:
             name: Keyspace name
-        
+
         Returns:
             Keyspace info dict or None
         """
         url = f"{self.base_url}/pd/api/v2/keyspaces/{name}"
         try:
             resp = requests.get(url, timeout=self._timeout)
+            print(f"[DEBUG] Getting keyspace '{name}': GET {url}")
+            print(f"[DEBUG] Response status: {resp.status_code}")
+
             if resp.status_code == 200:
-                return resp.json()
+                data = resp.json()
+                print(f"[DEBUG] Keyspace data: {data}")
+                return data
+            print(f"[DEBUG] Keyspace '{name}' not found (status {resp.status_code})")
             return None
-        except requests.RequestException:
+        except requests.RequestException as e:
+            print(f"[ERROR] Request exception when getting keyspace: {e}")
             return None
     
     def disable_keyspace(self, name: str) -> bool:

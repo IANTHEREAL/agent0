@@ -8,6 +8,12 @@ from .tenant import (
     TenantConnectRequest,
     TenantConnectResponse,
 )
+from .tenant_extended import (
+    TenantUpdate,
+    TenantResponseExtended,
+    AuditLogResponse,
+    AuditLogFilter,
+)
 from .user import (
     UserCreate,
     UserResponse,
@@ -27,6 +33,11 @@ __all__ = [
     "TenantCreateResponse",
     "TenantConnectRequest",
     "TenantConnectResponse",
+    # Tenant Extended
+    "TenantUpdate",
+    "TenantResponseExtended",
+    "AuditLogResponse",
+    "AuditLogFilter",
     # User
     "UserCreate",
     "UserResponse",

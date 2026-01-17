@@ -10,6 +10,9 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Configuration (can be overridden by env vars)
 BACKEND_PORT="${PGTIKV_API_PORT:-8090}"
 FRONTEND_PORT="${FRONTEND_PORT:-5173}"
+PD_ENDPOINTS="${PD_ENDPOINTS:-127.0.0.1:2379}"
+PG_HOST="${PGTIKV_PG_HOST:-127.0.0.1}"
+PG_PORT="${PGTIKV_PG_PORT:-5433}"
 
 # Colors
 RED='\033[0;31m'
@@ -21,7 +24,7 @@ echo -e "${GREEN}pg-tikv Cloud Admin Portal - Development Mode${NC}"
 echo "================================================"
 
 # Check prerequisites
-command -v python3 >/dev/null 2>&1 || { echo -e "${RED}Python3 required but not found${NC}"; exit 1; }
+command -v uv >/dev/null 2>&1 || { echo -e "${RED}uv required but not found. Install with: curl -LsSf https://astral.sh/uv/install.sh | sh${NC}"; exit 1; }
 command -v node >/dev/null 2>&1 || { echo -e "${RED}Node.js required but not found${NC}"; exit 1; }
 
 # Check if ports are available
@@ -42,16 +45,10 @@ if ! check_port $BACKEND_PORT; then
 fi
 
 # Install backend dependencies if needed
-if [ ! -d "$PROJECT_DIR/backend/.venv" ]; then
-    echo -e "${YELLOW}Creating Python virtual environment...${NC}"
-    python3 -m venv "$PROJECT_DIR/backend/.venv"
-fi
-
-source "$PROJECT_DIR/backend/.venv/bin/activate"
-
-if ! pip show fastapi &>/dev/null; then
-    echo -e "${YELLOW}Installing backend dependencies...${NC}"
-    pip install -r "$PROJECT_DIR/backend/requirements.txt"
+cd "$PROJECT_DIR/backend"
+if [ ! -f "uv.lock" ]; then
+    echo -e "${YELLOW}Installing backend dependencies with uv...${NC}"
+    uv sync
 fi
 
 # Install frontend dependencies if needed
@@ -63,8 +60,10 @@ fi
 
 # Start backend in background
 echo -e "${GREEN}Starting backend on http://localhost:$BACKEND_PORT${NC}"
+echo -e "${YELLOW}PD Endpoints: $PD_ENDPOINTS${NC}"
+echo -e "${YELLOW}pg-tikv: $PG_HOST:$PG_PORT${NC}"
 cd "$PROJECT_DIR/backend"
-PGTIKV_DEBUG=true PGTIKV_API_PORT=$BACKEND_PORT python -m uvicorn app.main:app --host 0.0.0.0 --port $BACKEND_PORT --reload &
+PGTIKV_DEBUG=true PGTIKV_API_PORT=$BACKEND_PORT PD_ENDPOINTS=$PD_ENDPOINTS PGTIKV_PG_HOST=$PG_HOST PGTIKV_PG_PORT=$PG_PORT uv run uvicorn app.main:app --host 0.0.0.0 --port $BACKEND_PORT --reload &
 BACKEND_PID=$!
 
 # Wait for backend to start

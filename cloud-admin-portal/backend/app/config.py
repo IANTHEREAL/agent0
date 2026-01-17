@@ -3,7 +3,7 @@
 from functools import lru_cache
 from typing import List
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings
 
 
@@ -16,7 +16,8 @@ class Settings(BaseSettings):
     # TiKV PD Configuration
     pd_endpoints: str = Field(
         default="127.0.0.1:2379",
-        description="Comma-separated TiKV PD addresses"
+        description="Comma-separated TiKV PD addresses",
+        validation_alias=AliasChoices('PD_ENDPOINTS', 'pd_endpoints')  # Read from PD_ENDPOINTS env var
     )
     
     # pg-tikv Server Configuration
@@ -44,7 +45,13 @@ class Settings(BaseSettings):
         default=1,
         description="Tenant session validity in hours"
     )
-    
+
+    # Database Configuration
+    database_url: str = Field(
+        default="sqlite:///backend/data/portal.db",
+        description="Database URL for portal data"
+    )
+
     # CORS Configuration
     cors_origins: List[str] = Field(
         default=["http://localhost:5173", "http://localhost:3000"],

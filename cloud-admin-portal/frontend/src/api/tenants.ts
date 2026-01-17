@@ -45,12 +45,40 @@ export function useCreateTenant() {
 
 export function useDeleteTenant() {
   const queryClient = useQueryClient()
-  
+
   return useMutation({
     mutationFn: (name: string) =>
       apiRequest<MessageResponse>(`/tenants/${name}`, { method: "DELETE" }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["tenants"] })
+    },
+  })
+}
+
+export function useRemoveTenant() {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: (name: string) =>
+      apiRequest<MessageResponse>(`/tenants/${name}/remove`, { method: "POST" }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["tenants"] })
+    },
+  })
+}
+
+export function useUpdateTenant(name: string) {
+  const queryClient = useQueryClient()
+
+  return useMutation({
+    mutationFn: (data: { notes?: string | null; tags?: string[] | null }) =>
+      apiRequest<Tenant>(`/tenants/${name}`, {
+        method: "PUT",
+        body: JSON.stringify(data),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["tenants"] })
+      queryClient.invalidateQueries({ queryKey: ["tenants", name] })
     },
   })
 }

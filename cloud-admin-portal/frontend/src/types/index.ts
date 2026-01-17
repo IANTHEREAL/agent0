@@ -5,6 +5,12 @@ export interface Tenant {
   state: string
   host?: string
   port?: number
+  is_deleted?: boolean
+  created_at?: string
+  created_by?: string | null
+  notes?: string | null
+  tags?: string[] | null
+  updated_at?: string | null
 }
 
 export interface CreateTenantRequest {
@@ -45,11 +51,17 @@ export interface CreateUserRequest {
   superuser?: boolean
 }
 
-export interface CreateUserResponse {
+export interface UserCreateResponse {
   username: string
   password: string
   connection: string
 }
+
+// Alias for backwards compatibility
+export type CreateUserResponse = UserCreateResponse
+
+// Alias for TenantCreateResponse (already defined above)
+export type TenantCreateResponse = CreateTenantResponse
 
 export interface PasswordResetResponse {
   username: string

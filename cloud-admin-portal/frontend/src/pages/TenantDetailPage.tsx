@@ -15,6 +15,8 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { useToast } from "@/components/ui/use-toast"
 import { cn } from "@/lib/utils"
 import { CreateUserDialog } from "@/components/users/CreateUserDialog"
+import { CredentialsModal } from "@/components/common/CredentialsModal"
+import { ConfirmDialog } from "@/components/common/ConfirmDialog"
 
 export function TenantDetailPage() {
   const { name } = useParams<{ name: string }>()
@@ -38,6 +40,12 @@ export function TenantDetailPage() {
 
   const [copied, setCopied] = useState(false)
   const [showCreateUser, setShowCreateUser] = useState(false)
+  const [showPasswordModal, setShowPasswordModal] = useState(false)
+  const [resetPasswordResult, setResetPasswordResult] = useState<{
+    username: string
+    password: string
+  } | null>(null)
+  const [confirmDeleteUser, setConfirmDeleteUser] = useState<string | null>(null)
 
   const handleConnect = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -57,8 +65,6 @@ export function TenantDetailPage() {
   }
 
   const handleDeleteUser = async (username: string) => {
-    if (!confirm(`Delete user "${username}"?`)) return
-
     try {
       await deleteUserMutation.mutateAsync(username)
       toast({
@@ -77,14 +83,18 @@ export function TenantDetailPage() {
   const handleResetPassword = async (username: string) => {
     try {
       const result = await resetPasswordMutation.mutateAsync(username)
+
+      // Save result and show credentials modal
+      setResetPasswordResult({
+        username,
+        password: result.password,
+      })
+      setShowPasswordModal(true)
+
+      // Show simple success toast
       toast({
         title: "Password Reset",
-        description: (
-          <div className="mt-2">
-            <p>New password: <code className="bg-muted px-1 rounded">{result.password}</code></p>
-            <p className="text-xs mt-1 text-muted-foreground">Save this password - it won't be shown again.</p>
-          </div>
-        ),
+        description: `Password for user "${username}" has been reset.`,
       })
     } catch (error) {
       toast({
@@ -266,7 +276,7 @@ export function TenantDetailPage() {
                             variant="ghost"
                             size="sm"
                             className="text-destructive hover:text-destructive"
-                            onClick={() => handleDeleteUser(user.name)}
+                            onClick={() => setConfirmDeleteUser(user.name)}
                           >
                             <Trash2 className="w-4 h-4" />
                           </Button>
@@ -285,6 +295,40 @@ export function TenantDetailPage() {
         tenantName={name!}
         open={showCreateUser}
         onOpenChange={setShowCreateUser}
+      />
+
+      {/* Password Reset Modal */}
+      {resetPasswordResult && (
+        <CredentialsModal
+          open={showPasswordModal}
+          onOpenChange={setShowPasswordModal}
+          title="Password Reset Successfully"
+          description={`New password for user "${resetPasswordResult.username}"`}
+          credentials={[
+            {
+              label: "Username",
+              value: resetPasswordResult.username,
+              copyable: true,
+            },
+            {
+              label: "New Password",
+              value: resetPasswordResult.password,
+              sensitive: true,
+              copyable: true,
+            },
+          ]}
+        />
+      )}
+
+      {/* Delete User Confirmation */}
+      <ConfirmDialog
+        open={confirmDeleteUser !== null}
+        onOpenChange={(open) => !open && setConfirmDeleteUser(null)}
+        title="Delete User?"
+        description={`This will permanently delete user "${confirmDeleteUser}" and revoke all access. This action cannot be undone.`}
+        confirmLabel="Delete User"
+        variant="destructive"
+        onConfirm={() => handleDeleteUser(confirmDeleteUser!)}
       />
     </div>
   )

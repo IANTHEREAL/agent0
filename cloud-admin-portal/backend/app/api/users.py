@@ -5,8 +5,10 @@ import string
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
+from sqlalchemy.orm import Session
 
 from ..config import get_settings, Settings
+from ..database import get_db
 from ..models import (
     UserCreate,
     UserResponse,
@@ -15,6 +17,7 @@ from ..models import (
     MessageResponse,
 )
 from ..services import PgTikvClient
+from ..services.audit import get_audit_service
 from ..session import session_manager, TenantSession
 
 
@@ -102,30 +105,46 @@ async def create_user(
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
     settings: Settings = Depends(get_settings),
+    db: Session = Depends(get_db),
 ):
     """Create a new user in the tenant."""
     password = request.password or generate_password()
-    
-    success = pg.create_user(
-        name,
-        session.admin_user,
-        session.admin_password,
-        request.username,
-        password,
-        request.superuser,
-    )
-    
-    if not success:
+    audit = get_audit_service(db)
+
+    try:
+        success = pg.create_user(
+            name,
+            session.admin_user,
+            session.admin_password,
+            request.username,
+            password,
+            request.superuser,
+        )
+
+        if not success:
+            audit.log_user_created(name, request.username, success=False, error="PG client returned failure")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create user",
+            )
+
+        # Log successful creation
+        audit.log_user_created(name, request.username, success=True, operator=session.admin_user)
+
+        return UserCreateResponse(
+            username=request.username,
+            password=password,
+            connection=f"psql -h {settings.pg_host} -p {settings.pg_port} -U {name}.{request.username}",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        audit.log_user_created(name, request.username, success=False, error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create user",
+            detail=f"Failed to create user: {str(e)}",
         )
-    
-    return UserCreateResponse(
-        username=request.username,
-        password=password,
-        connection=f"psql -h {settings.pg_host} -p {settings.pg_port} -U {name}.{request.username}",
-    )
 
 
 @router.delete(
@@ -139,17 +158,34 @@ async def delete_user(
     username: str,
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
+    db: Session = Depends(get_db),
 ):
     """Delete a user from the tenant."""
-    success = pg.drop_user(name, session.admin_user, session.admin_password, username)
-    
-    if not success:
+    audit = get_audit_service(db)
+
+    try:
+        success = pg.drop_user(name, session.admin_user, session.admin_password, username)
+
+        if not success:
+            audit.log_user_deleted(name, username, success=False, error="PG client returned failure")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to delete user",
+            )
+
+        # Log successful deletion
+        audit.log_user_deleted(name, username, success=True, operator=session.admin_user)
+
+        return MessageResponse(message=f"User '{username}' deleted")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        audit.log_user_deleted(name, username, success=False, error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to delete user",
+            detail=f"Failed to delete user: {str(e)}",
         )
-    
-    return MessageResponse(message=f"User '{username}' deleted")
 
 
 @router.post(
@@ -163,22 +199,38 @@ async def reset_password(
     username: str,
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
+    db: Session = Depends(get_db),
 ):
     """Reset a user's password."""
     new_password = generate_password()
-    
-    success = pg.reset_password(
-        name,
-        session.admin_user,
-        session.admin_password,
-        username,
-        new_password,
-    )
-    
-    if not success:
+    audit = get_audit_service(db)
+
+    try:
+        success = pg.reset_password(
+            name,
+            session.admin_user,
+            session.admin_password,
+            username,
+            new_password,
+        )
+
+        if not success:
+            audit.log_password_reset(name, username, success=False, error="PG client returned failure")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to reset password",
+            )
+
+        # Log successful password reset
+        audit.log_password_reset(name, username, success=True, operator=session.admin_user)
+
+        return PasswordResetResponse(username=username, password=new_password)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        audit.log_password_reset(name, username, success=False, error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to reset password",
+            detail=f"Failed to reset password: {str(e)}",
         )
-    
-    return PasswordResetResponse(username=username, password=new_password)
