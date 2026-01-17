@@ -1,0 +1,54 @@
+# pg-tikv Cloud Admin Portal - Production Docker Compose
+# Usage: docker-compose up -d
+
+version: "3.8"
+
+services:
+  # Nginx reverse proxy - serves frontend static files and proxies API
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - frontend-dist:/usr/share/nginx/html:ro
+      # Uncomment for HTTPS
+      # - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+  # FastAPI backend
+  backend:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    environment:
+      - PGTIKV_PD_ENDPOINTS=${PD_ENDPOINTS:-127.0.0.1:2379}
+      - PGTIKV_PG_HOST=${PG_HOST:-pg-tikv}
+      - PGTIKV_PG_PORT=${PG_PORT:-5433}
+      - PGTIKV_ADMIN_PASSWORD=${ADMIN_PASSWORD:-admin}
+      - PGTIKV_JWT_SECRET=${JWT_SECRET}
+      - PGTIKV_CORS_ORIGINS=["http://localhost", "https://admin.example.com"]
+    expose:
+      - "8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Frontend build stage (for building static files)
+  frontend-builder:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+      target: build
+    volumes:
+      - frontend-dist:/app/dist
+
+volumes:
+  frontend-dist:
