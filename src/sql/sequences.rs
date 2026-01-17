@@ -1,5 +1,5 @@
 use crate::storage::TikvStore;
-use crate::types::{SequenceBacking, SequenceDef, SequenceState};
+use crate::types::{IndexDef, SequenceBacking, SequenceDef, SequenceState, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, MinMaxValue, ObjectName, SequenceOptions,
@@ -412,6 +412,100 @@ fn extract_arg_expr<'a>(args: &'a [FunctionArg], idx: usize) -> Result<&'a Expr>
     }
 }
 
+fn value_to_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int32(n) => Some(*n as i64),
+        Value::Int64(n) => Some(*n),
+        Value::Float64(n) => Some(*n as i64),
+        Value::Text(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn split_schema_and_name(full: &str) -> (String, String) {
+    match names::parse_full_name(full) {
+        Ok((schema, name)) => (schema, name),
+        Err(_) => ("public".to_string(), full.to_string()),
+    }
+}
+
+fn access_method_name(method: Option<&str>) -> &str {
+    method.unwrap_or("btree")
+}
+
+fn format_index_columns(idx: &IndexDef) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.extend(idx.columns.iter().cloned());
+    parts.extend(idx.expressions.iter().map(|e| format!("({})", e)));
+    parts.join(", ")
+}
+
+fn format_indexdef(table_schema: &str, table_name: &str, idx: &IndexDef) -> String {
+    let cols = format_index_columns(idx);
+    let mut indexdef = format!(
+        "CREATE {}INDEX {} ON {}.{} USING {} ({})",
+        if idx.unique { "UNIQUE " } else { "" },
+        idx.name,
+        table_schema,
+        table_name,
+        access_method_name(idx.method.as_deref()),
+        cols
+    );
+    if let Some(pred) = idx.predicate.as_ref() {
+        indexdef.push_str(" WHERE ");
+        indexdef.push_str(pred);
+    }
+    indexdef
+}
+
+async fn lookup_indexdef_by_oid(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    oid: i64,
+) -> Result<Option<String>> {
+    let user_tables = store.list_tables(txn).await?;
+    let mut oid_counter: i64 = 16384;
+
+    for full_table_name in user_tables {
+        let (table_schema, table_name) = split_schema_and_name(&full_table_name);
+        let Some(schema) = store.get_schema(txn, &full_table_name).await? else {
+            continue;
+        };
+
+        oid_counter += 1; // table oid
+
+        for idx in &schema.indexes {
+            let index_oid = oid_counter;
+            oid_counter += 1;
+            if index_oid == oid {
+                return Ok(Some(format_indexdef(&table_schema, &table_name, idx)));
+            }
+        }
+
+        if !schema.pk_indices.is_empty() {
+            let pk_oid = oid_counter;
+            oid_counter += 1;
+            if pk_oid == oid {
+                let pk_cols: Vec<String> = schema
+                    .pk_indices
+                    .iter()
+                    .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
+                    .collect();
+                let indexdef = format!(
+                    "CREATE UNIQUE INDEX {}_pkey ON {}.{} USING btree ({})",
+                    table_name,
+                    table_schema,
+                    table_name,
+                    pk_cols.join(", ")
+                );
+                return Ok(Some(indexdef));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
 async fn resolve_sequence_full_name_from_value(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -585,6 +679,48 @@ pub(crate) fn replace_sequence_functions<'a>(
                             .setval_sequence(txn, &full_name, value_i64, is_called)
                             .await?;
                         Ok(value_to_sql_expr(&crate::types::Value::Int64(res)))
+                    }
+                    "PG_GET_INDEXDEF" => {
+                        let arg0 = match extract_arg_expr(&func.args, 0) {
+                            Ok(expr) => expr,
+                            Err(_) => {
+                                return Ok(value_to_sql_expr(&Value::Text(
+                                    "CREATE INDEX".to_string(),
+                                )));
+                            }
+                        };
+                        let oid_val = eval_expr(arg0, row, schema)?;
+                        let Some(oid) = value_to_i64(&oid_val) else {
+                            return Ok(value_to_sql_expr(&Value::Text("CREATE INDEX".to_string())));
+                        };
+
+                        if let (Some(row), Some(schema)) = (row, schema) {
+                            if let (Some(relid_idx), Some(def_idx)) = (
+                                schema
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case("indexrelid")),
+                                schema
+                                    .columns
+                                    .iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case("indexdef")),
+                            ) {
+                                if let Some(row_relid) = row.values.get(relid_idx) {
+                                    if value_to_i64(row_relid) == Some(oid) {
+                                        if let Some(row_def) = row.values.get(def_idx) {
+                                            if !matches!(row_def, Value::Null) {
+                                                return Ok(value_to_sql_expr(row_def));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let indexdef = lookup_indexdef_by_oid(store, txn, oid).await?;
+                        Ok(value_to_sql_expr(&Value::Text(
+                            indexdef.unwrap_or_else(|| "CREATE INDEX".to_string()),
+                        )))
                     }
                     _ => {
                         let mut resolved_args = Vec::with_capacity(func.args.len());
@@ -1334,6 +1470,54 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             .setval_sequence(txn, &full_name, value_i64, is_called)
                             .await?;
                         Ok(value_to_sql_expr(&crate::types::Value::Int64(res)))
+                    }
+                    "PG_GET_INDEXDEF" => {
+                        let arg0 = match extract_arg_expr(&func.args, 0) {
+                            Ok(expr) => expr,
+                            Err(_) => {
+                                return Ok(value_to_sql_expr(&Value::Text(
+                                    "CREATE INDEX".to_string(),
+                                )));
+                            }
+                        };
+                        let oid_val = eval_expr_join(arg0, join_ctx)?;
+                        let Some(oid) = value_to_i64(&oid_val) else {
+                            return Ok(value_to_sql_expr(&Value::Text("CREATE INDEX".to_string())));
+                        };
+
+                        let mut relid: Option<i64> = None;
+                        let mut def: Option<&Value> = None;
+                        for (col_key, &offset) in &join_ctx.column_offsets {
+                            if relid.is_none()
+                                && (col_key.ends_with(".indexrelid") || col_key == "indexrelid")
+                            {
+                                if let Some(val) = join_ctx.combined_row.values.get(offset) {
+                                    relid = value_to_i64(val);
+                                }
+                            }
+                            if def.is_none()
+                                && (col_key.ends_with(".indexdef") || col_key == "indexdef")
+                            {
+                                if let Some(val) = join_ctx.combined_row.values.get(offset) {
+                                    if !matches!(val, Value::Null) {
+                                        def = Some(val);
+                                    }
+                                }
+                            }
+                            if relid.is_some() && def.is_some() {
+                                break;
+                            }
+                        }
+                        if relid == Some(oid) {
+                            if let Some(def) = def {
+                                return Ok(value_to_sql_expr(def));
+                            }
+                        }
+
+                        let indexdef = lookup_indexdef_by_oid(store, txn, oid).await?;
+                        Ok(value_to_sql_expr(&Value::Text(
+                            indexdef.unwrap_or_else(|| "CREATE INDEX".to_string()),
+                        )))
                     }
                     _ => {
                         let mut resolved_args = Vec::with_capacity(func.args.len());

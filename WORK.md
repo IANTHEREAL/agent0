@@ -437,6 +437,109 @@ Validate the dollar-quote MVP against `docs/design/07_dollar_quoted_strings.md`,
   - [ ] Add comment-aware scanning to pgwire helpers (`--` / `/* ... */`) if real migrations embed `$1`/keywords inside comments.
   - [ ] Consider supporting `sqlparser::ast::Value::EscapedStringLiteral` (`E'...'`) in `src/sql/expr.rs::eval_value()` if encountered by ORMs.
 
+# Work: Index Features (partial / expression / method metadata)
+
+## Feature Request
+
+Implement index feature compatibility described in `docs/design/14_index_features.md`.
+
+### MVP (P1: DDL compatibility)
+- Allow `CREATE INDEX` to persist index metadata for:
+  - partial indexes (`... WHERE ...`)
+  - expression indexes (`... ( (expr) )`)
+  - `USING gin/gist/...` (store method)
+- Keep existing btree-column indexes working (build entries + planner can use).
+- For non-btree / partial / expression indexes:
+  - DDL succeeds and introspection shows definition
+  - Planner ignores them (no index scans; fallback to existing btree indexes / full scan)
+
+### Non-goals (MVP)
+- Implement partial/expression index acceleration (entry generation + planner usage).
+- Implement real GIN/GiST semantics or operator classes.
+
+## Agent Work Plan
+
+### 0) Repo Work Tracking + Knowledge Base
+- [x] Read existing `.codex/knowledge/*` relevant to indexes / planner / system catalogs.
+- [x] Create/update `.codex/knowledge/index_features.md` with concrete facts + code locations.
+- [x] Update this `WORK.md` continuously (plan + progress) while implementing.
+
+### 1) Types: Extend `IndexDef` (backward compatible)
+- [x] `src/types/mod.rs`: extend `IndexDef` with:
+  - [x] `method: Option<String>` (`#[serde(default)]`)
+  - [x] `predicate: Option<String>` (`#[serde(default)]`)
+  - [x] `expressions: Vec<String>` (`#[serde(default)]`)
+- [x] Update all `IndexDef { ... }` constructors across code/tests.
+
+### 2) DDL: Relax `CREATE INDEX` Handling
+- [x] `src/sql/executor.rs` / `src/sql/executor_ddl_ops.rs`: thread `using` + `predicate` into DDL execution.
+- [x] `src/sql/ddl.rs::execute_create_index`:
+  - [x] Accept identifier columns and/or expressions (store `expr.to_string()`).
+  - [x] Store `USING <method>` and `WHERE <predicate>` into `IndexDef`.
+  - [x] Only build physical index entries for btree column-only indexes without predicate.
+- [x] `src/sql/helpers.rs`: remove `USING GIST` unsupported fallback.
+
+### 3) Planner: Ignore Unsupported Index Forms
+- [x] `src/sql/planner.rs`: only consider indexes usable when:
+  - [x] method is `None`/`btree`
+  - [x] `predicate` is `None`
+  - [x] `expressions` is empty
+  - [x] `columns` is non-empty
+
+### 4) Introspection: Reflect Method/Predicate/Expressions
+- [x] `src/sql/information_schema.rs`:
+  - [x] `pg_indexes.indexdef` includes method + expressions + predicate.
+  - [x] `pg_index.indexdef` includes method + expressions + predicate; `indkey` uses `0` for expression columns.
+  - [x] `pg_class.relam` uses access method OID based on stored method; `pg_am` includes at least `btree/gin/gist`.
+- [x] `src/sql/expr.rs`: implement `PG_GET_INDEXDEF` for non-JOIN context by returning the `indexdef` column when present.
+
+### 5) Tests + Verification
+- [x] Add SQL integration coverage `tests/50_index_features.sql` (+ `.assert`) for:
+  - [x] partial index definition visible in `pg_indexes.indexdef`
+  - [x] expression index definition visible in `pg_indexes.indexdef`
+  - [x] `USING gin`/`USING gist` DDL does not fail and definition shows method
+- [x] Run `cargo fmt -- --check` and `CARGO_NET_OFFLINE=true cargo test -q`.
+
+### Progress Notes
+- `cargo fmt -- --check` passes.
+- `CARGO_NET_OFFLINE=true cargo test -q` passes.
+
+## Follow-up Task: Post-Implementation Review (INDEX FEATURES)
+
+### Feature Request
+
+Validate index DDL-compat behavior against `docs/design/14_index_features.md`, and record follow-up engineering items (correctness, introspection fidelity, performance, future acceleration work).
+
+### Agent Work Plan
+- [x] Review `git diff` vs `docs/design/14_index_features.md` + the work plan above.
+- [x] Confirm formatting + unit tests: `cargo fmt -- --check`, `CARGO_NET_OFFLINE=true cargo test -q`.
+- [ ] Follow-up candidates to consider next:
+  - [ ] Preserve mixed column/expression order (current `IndexDef.columns` + `IndexDef.expressions` loses interleaving order).
+  - [ ] Include index options in `indexdef` when present (`DESC`, `NULLS FIRST/LAST`, `INCLUDE`, `NULLS DISTINCT`).
+  - [ ] Implement Layer 2 acceleration (partial/expression entry generation + planner usage).
+
+## Follow-up Task: `pg_get_indexdef(oid)` Correctness (Index Features)
+
+### Feature Request
+
+Fix `pg_get_indexdef(oid)` so it respects its OID argument and works outside of a `pg_index` row context (standalone calls, subqueries, etc). Prefer row-context `pg_index.indexdef` when available to avoid repeated catalog scans.
+
+### Agent Work Plan
+- [x] `src/sql/sequences.rs`: add async rewrite support for `PG_GET_INDEXDEF` in:
+  - [x] `replace_sequence_functions(...)`
+  - [x] `replace_sequence_functions_join(...)`
+  - [x] OID extraction from first argument (int32/int64/text numeric).
+  - [x] Fast path: if row contains both `indexrelid` and `indexdef` and OID matches, return `indexdef`.
+  - [x] Fallback: lookup by OID by scanning `store.list_tables(txn)` and mirroring `src/sql/information_schema.rs::get_pg_index_rows` OID assignment.
+  - [x] Rewrite to a literal via `value_to_sql_expr(Value::Text(indexdef))`; keep `"CREATE INDEX"` fallback when unknown.
+- [x] Tests: add integration coverage that calls `pg_get_indexdef(<oid>)` outside `pg_index` row context.
+- [x] Docs: update `.codex/knowledge/index_features.md` + `review.md` accordingly.
+- [x] Verify: `cargo fmt -- --check` and `CARGO_NET_OFFLINE=true cargo test -q`.
+
+### Progress Notes
+- `cargo fmt -- --check` passes.
+- `CARGO_NET_OFFLINE=true cargo test -q` passes.
+
 ## Archived (Previous Work)
 
 - Sequences (CREATE SEQUENCE / nextval / SERIAL): implementation facts + code locations in `.codex/knowledge/sequences.md`.

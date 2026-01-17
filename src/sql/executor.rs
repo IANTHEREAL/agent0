@@ -353,9 +353,11 @@ impl Executor {
             Statement::CreateIndex {
                 name,
                 table_name,
+                using,
                 columns,
                 unique,
                 if_not_exists,
+                predicate,
                 ..
             } => {
                 let index_name = name
@@ -367,9 +369,11 @@ impl Executor {
                     search_path,
                     idx_name_str,
                     table_name,
+                    using.as_ref(),
                     columns,
                     *unique,
                     *if_not_exists,
+                    predicate.as_ref(),
                 )
                 .await
             }

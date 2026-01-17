@@ -564,6 +564,9 @@ pub async fn execute_create_table(
                 id: next_index_id,
                 columns: vec![col.name.clone()],
                 unique: true,
+                method: None,
+                predicate: None,
+                expressions: Vec::new(),
             });
             next_index_id += 1;
         }
@@ -588,6 +591,9 @@ pub async fn execute_create_table(
                         id: next_index_id,
                         columns: col_names,
                         unique: true,
+                        method: None,
+                        predicate: None,
+                        expressions: Vec::new(),
                     });
                     next_index_id += 1;
                 }
@@ -853,9 +859,11 @@ pub async fn execute_create_index(
     txn: &mut Transaction,
     idx_name: &str,
     table_name: &str,
+    using: Option<&sqlparser::ast::Ident>,
     columns: &[OrderByExpr],
     unique: bool,
     if_not_exists: bool,
+    predicate: Option<&Expr>,
     rows: Vec<Row>,
 ) -> Result<ExecuteResult> {
     let idx_name_str = idx_name.to_lowercase();
@@ -875,16 +883,38 @@ pub async fn execute_create_index(
         return Err(anyhow!("Index exists"));
     }
 
+    let method = using.map(|m| m.value.to_lowercase());
+    let predicate_str = predicate.map(|p| p.to_string());
+
     let mut idx_cols = Vec::new();
+    let mut idx_exprs = Vec::new();
     for col_expr in columns {
-        if let Expr::Identifier(ident) = &col_expr.expr {
-            let col_name = normalize_ident(ident);
-            if schema.column_index(&col_name).is_none() {
-                return Err(anyhow!("Column not found"));
+        let mut expr = &col_expr.expr;
+        while let Expr::Nested(inner) = expr {
+            expr = inner.as_ref();
+        }
+
+        match expr {
+            Expr::Identifier(ident) => {
+                let col_name = normalize_ident(ident);
+                if schema.column_index(&col_name).is_none() {
+                    return Err(anyhow!("Column not found"));
+                }
+                idx_cols.push(col_name);
             }
-            idx_cols.push(col_name);
-        } else {
-            return Err(anyhow!("Index column must be identifier"));
+            Expr::CompoundIdentifier(parts) => {
+                let Some(last) = parts.last() else {
+                    return Err(anyhow!("Index column must be identifier"));
+                };
+                let col_name = normalize_ident(last);
+                if schema.column_index(&col_name).is_none() {
+                    return Err(anyhow!("Column not found"));
+                }
+                idx_cols.push(col_name);
+            }
+            _ => {
+                idx_exprs.push(expr.to_string());
+            }
         }
     }
 
@@ -901,21 +931,36 @@ pub async fn execute_create_index(
         id: index_id,
         columns: idx_cols,
         unique,
+        method,
+        predicate: predicate_str,
+        expressions: idx_exprs,
     };
 
-    for row in rows {
-        let idx_values = schema.get_index_values(&new_index, &row);
-        let pk_values = schema.get_pk_values(&row);
-        store
-            .create_index_entry(
-                txn,
-                schema.table_id,
-                index_id,
-                &idx_values,
-                &pk_values,
-                unique,
-            )
-            .await?;
+    let is_btree = new_index
+        .method
+        .as_deref()
+        .map(|m| m.eq_ignore_ascii_case("btree"))
+        .unwrap_or(true);
+    let should_materialize = is_btree
+        && new_index.predicate.is_none()
+        && new_index.expressions.is_empty()
+        && !new_index.columns.is_empty();
+
+    if should_materialize {
+        for row in rows {
+            let idx_values = schema.get_index_values(&new_index, &row);
+            let pk_values = schema.get_pk_values(&row);
+            store
+                .create_index_entry(
+                    txn,
+                    schema.table_id,
+                    index_id,
+                    &idx_values,
+                    &pk_values,
+                    unique,
+                )
+                .await?;
+        }
     }
 
     schema.indexes.push(new_index);
@@ -1337,6 +1382,9 @@ pub async fn execute_alter_table(
                     name: index_name,
                     columns: col_names,
                     unique: true,
+                    method: None,
+                    predicate: None,
+                    expressions: Vec::new(),
                 };
 
                 let (start, end) = crate::storage::encode_table_data_range(schema.table_id);

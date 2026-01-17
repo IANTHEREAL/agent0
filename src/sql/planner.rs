@@ -172,6 +172,9 @@ pub fn choose_best_access_path(
         .collect();
 
     for index in &schema.indexes {
+        if !is_planner_usable_index(index) {
+            continue;
+        }
         if let Some((scan_type, cost)) = evaluate_index(index, &predicate_map, estimated_table_rows)
         {
             if cost < best_path.cost {
@@ -181,6 +184,17 @@ pub fn choose_best_access_path(
     }
 
     best_path
+}
+
+fn is_planner_usable_index(index: &IndexDef) -> bool {
+    if index.columns.is_empty() || index.predicate.is_some() || !index.expressions.is_empty() {
+        return false;
+    }
+    index
+        .method
+        .as_deref()
+        .map(|m| m.eq_ignore_ascii_case("btree"))
+        .unwrap_or(true)
 }
 
 fn evaluate_index(
@@ -415,6 +429,9 @@ mod tests {
                 name: "idx_a".to_string(),
                 columns: vec!["a".to_string()],
                 unique: false,
+                method: None,
+                predicate: None,
+                expressions: Vec::new(),
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -535,12 +552,18 @@ mod tests {
                     name: "idx_a".to_string(),
                     columns: vec!["a".to_string()],
                     unique: false,
+                    method: None,
+                    predicate: None,
+                    expressions: Vec::new(),
                 },
                 IndexDef {
                     id: 2,
                     name: "idx_a_unique".to_string(),
                     columns: vec!["a".to_string()],
                     unique: true,
+                    method: None,
+                    predicate: None,
+                    expressions: Vec::new(),
                 },
             ],
             check_constraints: vec![],
@@ -573,12 +596,18 @@ mod tests {
                     name: "idx_a".to_string(),
                     columns: vec!["a".to_string()],
                     unique: false,
+                    method: None,
+                    predicate: None,
+                    expressions: Vec::new(),
                 },
                 IndexDef {
                     id: 2,
                     name: "idx_ab".to_string(),
                     columns: vec!["a".to_string(), "b".to_string()],
                     unique: false,
+                    method: None,
+                    predicate: None,
+                    expressions: Vec::new(),
                 },
             ],
             check_constraints: vec![],
@@ -621,6 +650,9 @@ mod tests {
                 name: "idx_abc".to_string(),
                 columns: vec!["a".to_string(), "b".to_string(), "c".to_string()],
                 unique: false,
+                method: None,
+                predicate: None,
+                expressions: Vec::new(),
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
@@ -821,6 +853,9 @@ mod tests {
                 name: "idx_a".to_string(),
                 columns: vec!["a".to_string()],
                 unique: false,
+                method: None,
+                predicate: None,
+                expressions: Vec::new(),
             }],
             check_constraints: vec![],
             foreign_keys: vec![],

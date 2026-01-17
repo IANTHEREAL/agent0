@@ -6,7 +6,7 @@ use super::ExecuteResult;
 use super::Executor;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    AlterTableOperation, ColumnDef as SqlColumnDef, ObjectName, OrderByExpr, Query,
+    AlterTableOperation, ColumnDef as SqlColumnDef, Expr, Ident, ObjectName, OrderByExpr, Query,
 };
 use std::collections::HashMap;
 use tikv_client::Transaction;
@@ -95,9 +95,11 @@ impl Executor {
         search_path: &[String],
         idx_name: &str,
         table_name: &ObjectName,
+        using: Option<&Ident>,
         columns: &[OrderByExpr],
         unique: bool,
         if_not_exists: bool,
+        predicate: Option<&Expr>,
     ) -> Result<ExecuteResult> {
         let resolved =
             names::resolve_existing_table_name(self.store().as_ref(), txn, table_name, search_path)
@@ -109,15 +111,32 @@ impl Executor {
             .get_schema(txn, &tbl_name)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
-        let rows = self.scan_and_fill(txn, &tbl_name, &schema).await?;
+        let is_btree = using
+            .map(|u| u.value.eq_ignore_ascii_case("btree"))
+            .unwrap_or(true);
+        let has_expr_columns = columns.iter().any(|c| {
+            let mut expr = &c.expr;
+            while let Expr::Nested(inner) = expr {
+                expr = inner.as_ref();
+            }
+            !matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+        });
+        let should_materialize = is_btree && predicate.is_none() && !has_expr_columns;
+        let rows = if should_materialize {
+            self.scan_and_fill(txn, &tbl_name, &schema).await?
+        } else {
+            Vec::new()
+        };
         ddl::execute_create_index(
             &self.store(),
             txn,
             idx_name,
             &tbl_name,
+            using,
             columns,
             unique,
             if_not_exists,
+            predicate,
             rows,
         )
         .await

@@ -1749,6 +1749,22 @@ fn eval_function(
         "HAS_SCHEMA_PRIVILEGE" | "HAS_TABLE_PRIVILEGE" | "HAS_DATABASE_PRIVILEGE" => {
             Ok(Value::Boolean(true))
         }
+        "PG_GET_INDEXDEF" => {
+            if let (Some(row), Some(schema)) = (row, schema) {
+                if let Some(idx) = schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case("indexdef"))
+                {
+                    if let Some(val) = row.values.get(idx) {
+                        if !matches!(val, Value::Null) {
+                            return Ok(val.clone());
+                        }
+                    }
+                }
+            }
+            Ok(Value::Text("CREATE INDEX".to_string()))
+        }
         "PG_GET_CONSTRAINTDEF" => Ok(Value::Text(String::new())),
         "PG_GET_EXPR" => Ok(Value::Null),
         "FORMAT_TYPE" => {

@@ -926,9 +926,6 @@ pub fn get_unsupported_reason(sql_upper: &str) -> Option<String> {
     if sql_upper.starts_with("ALTER TABLE") && sql_upper.contains("OWNER TO") {
         return Some("ALTER TABLE OWNER TO not supported".into());
     }
-    if sql_upper.starts_with("CREATE INDEX") && sql_upper.contains("USING GIST") {
-        return Some("GIST index not supported".into());
-    }
     None
 }
 

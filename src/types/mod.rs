@@ -283,6 +283,12 @@ pub struct IndexDef {
     pub id: u64,
     pub columns: Vec<String>,
     pub unique: bool,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub predicate: Option<String>,
+    #[serde(default)]
+    pub expressions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

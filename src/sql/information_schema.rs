@@ -1,6 +1,6 @@
 use super::{names, sequences};
 use crate::storage::TikvStore;
-use crate::types::{ColumnDef, DataType, ForeignKeyAction, Row, TableSchema, Value};
+use crate::types::{ColumnDef, DataType, ForeignKeyAction, IndexDef, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -717,6 +717,47 @@ fn split_schema_and_name(full: &str) -> (String, String) {
     }
 }
 
+fn access_method_oid(method: Option<&str>) -> i64 {
+    match method.unwrap_or("btree").to_ascii_lowercase().as_str() {
+        "btree" => 403,
+        "hash" => 405,
+        "gist" => 783,
+        "gin" => 2742,
+        "spgist" => 4000,
+        "brin" => 3580,
+        _ => 403,
+    }
+}
+
+fn access_method_name(method: Option<&str>) -> &str {
+    method.unwrap_or("btree")
+}
+
+fn format_index_columns(idx: &IndexDef) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.extend(idx.columns.iter().cloned());
+    parts.extend(idx.expressions.iter().map(|e| format!("({})", e)));
+    parts.join(", ")
+}
+
+fn format_indexdef(table_schema: &str, table_name: &str, idx: &IndexDef) -> String {
+    let cols = format_index_columns(idx);
+    let mut indexdef = format!(
+        "CREATE {}INDEX {} ON {}.{} USING {} ({})",
+        if idx.unique { "UNIQUE " } else { "" },
+        idx.name,
+        table_schema,
+        table_name,
+        access_method_name(idx.method.as_deref()),
+        cols
+    );
+    if let Some(pred) = idx.predicate.as_ref() {
+        indexdef.push_str(" WHERE ");
+        indexdef.push_str(pred);
+    }
+    indexdef
+}
+
 fn build_schema_oid_map(schemas: &[String]) -> HashMap<String, i64> {
     let mut map: HashMap<String, i64> = HashMap::new();
     map.insert("pg_catalog".to_string(), 11);
@@ -1318,7 +1359,7 @@ async fn get_pg_class_rows(
                     int_val(namespace_oid),
                     text_val("i"), // i = index
                     int_val(10),   // owner
-                    int_val(403),  // btree access method
+                    int_val(access_method_oid(idx.method.as_deref())),
                     int_val(0),    // tuples
                     int_val(0),    // pages
                     text_val("f"), // has index (false)
@@ -1394,27 +1435,24 @@ async fn get_pg_index_rows(
                 let index_oid = oid_counter;
                 oid_counter += 1;
 
+                let index_col_count = idx.columns.len() + idx.expressions.len();
                 let mut col_indices = Vec::new();
                 for col_name in &idx.columns {
                     if let Some(pos) = schema.columns.iter().position(|c| &c.name == col_name) {
                         col_indices.push(Value::Int64((pos + 1) as i64));
                     }
                 }
+                for _ in &idx.expressions {
+                    col_indices.push(Value::Int64(0));
+                }
                 let indkey = Value::Array(col_indices);
 
-                let indexdef = format!(
-                    "CREATE {}INDEX {} ON {}.{} USING btree ({})",
-                    if idx.unique { "UNIQUE " } else { "" },
-                    idx.name,
-                    table_schema,
-                    table_name,
-                    idx.columns.join(", ")
-                );
+                let indexdef = format_indexdef(&table_schema, &table_name, idx);
 
                 rows.push(Row::new(vec![
                     int_val(index_oid),
                     int_val(base_table_oid),
-                    int_val(idx.columns.len() as i64),
+                    int_val(index_col_count as i64),
                     text_val(if idx.unique { "t" } else { "f" }),
                     text_val("f"),
                     text_val("f"),
@@ -1504,14 +1542,7 @@ async fn get_pg_indexes_rows(
             }
 
             for idx in &schema.indexes {
-                let indexdef = format!(
-                    "CREATE {}INDEX {} ON {}.{} USING btree ({})",
-                    if idx.unique { "UNIQUE " } else { "" },
-                    idx.name,
-                    table_schema,
-                    table_name,
-                    idx.columns.join(", ")
-                );
+                let indexdef = format_indexdef(&table_schema, &table_name, idx);
                 rows.push(Row::new(vec![
                     text_val(&table_schema),
                     text_val(&table_name),
@@ -1603,7 +1634,14 @@ async fn get_pg_attribute_rows(
 }
 
 fn get_pg_am_rows() -> Vec<Row> {
-    vec![Row::new(vec![int_val(403), text_val("btree")])]
+    vec![
+        Row::new(vec![int_val(403), text_val("btree")]),
+        Row::new(vec![int_val(405), text_val("hash")]),
+        Row::new(vec![int_val(783), text_val("gist")]),
+        Row::new(vec![int_val(2742), text_val("gin")]),
+        Row::new(vec![int_val(4000), text_val("spgist")]),
+        Row::new(vec![int_val(3580), text_val("brin")]),
+    ]
 }
 
 async fn get_pg_constraint_rows(
