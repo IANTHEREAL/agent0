@@ -1,0 +1,13 @@
+# Minimal substrings expected in tests/55_pg_catalog_introspection.out
+builtin_pg_proc=1
+index_count=2
+attrdef_count=3
+default=nextval('public.cat_users_id_seq'::regclass)
+default=true
+default=now()
+pg_sequence_row=1
+pg_depend_row=1
+enum_typ=mood,label=sad
+format_type=mood
+pg_tables=public.cat_posts
+pg_views=public.cat_users_view

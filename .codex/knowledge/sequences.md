@@ -10,7 +10,7 @@
 - `src/types/mod.rs`
   - `SequenceState { last_value: i64, is_called: bool }`
   - `SequenceBacking::{ TableId(u64), Standalone(SequenceState) }`
-  - `SequenceDef { schema, name, increment, min_value, max_value, is_cycled, owned_by, owner, backing }`
+  - `SequenceDef { oid, schema, name, start_value, increment, min_value, max_value, cache_size, is_cycled, owned_by, owner, backing }`
   - `SequenceDef::full_name() -> String` → `"{schema}.{name}"`
 
 ### Storage keyspace
@@ -42,7 +42,7 @@
   - Function-arg name resolution: `resolve_sequence_full_name_from_value(store, txn, search_path, Value)` probes `search_path` for unqualified sequence names (first match wins).
   - Implicit SERIAL/IDENTITY sequence def: `build_implicit_sequence_def(table, column, table_id)` → `SequenceBacking::TableId(table_id)` + `owned_by = Some((table, column))`.
   - DDL execution:
-    - `execute_create_sequence(...)` parses `SequenceOptions::{StartWith,IncrementBy,MinValue,MaxValue,Cycle}`.
+    - `execute_create_sequence(...)` parses `SequenceOptions::{StartWith,IncrementBy,MinValue,MaxValue,Cycle,Cache}`.
     - `execute_drop_sequence(...)`.
   - Expression evaluation wiring:
     - `expr_uses_sequence_functions(&Expr) -> bool` (via `sqlparser::ast::visit_expressions`).
@@ -80,7 +80,8 @@
 
 ### System catalog + type inference
 - `src/sql/information_schema.rs`
-  - `get_pg_class_rows(...)` appends sequences from `store.list_sequences(txn)` as `relkind='S'`.
+  - `get_pg_class_rows(...)` appends sequences from `store.list_sequences(txn)` as `relkind='S'` (OID derived from persisted `SequenceDef.oid`).
+  - `get_pg_sequence_rows(...)` exposes `pg_catalog.pg_sequence` and joins to `pg_class` via `seqrelid`.
 - `src/sql/helpers.rs`
   - `infer_expr_type()` returns `DataType::Int64` for `NEXTVAL/CURRVAL/SETVAL`.
 

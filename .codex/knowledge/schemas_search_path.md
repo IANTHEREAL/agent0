@@ -112,11 +112,11 @@
 ## Introspection understands `schema.table` keys
 - `src/sql/information_schema.rs`
   - `split_schema_and_name(full)` uses `names::parse_full_name(full)` to derive `(table_schema, table_name)`
-  - Schema enumeration uses `store.list_schemas(txn)`
+  - Schema enumeration uses `store.list_schemas(txn)`; schema OIDs come from `store.list_schema_oids(txn)`.
   - `columns.column_default` for SERIAL uses schema-qualified implicit sequence:
     - `nextval('schema.table_col_seq'::regclass)`
   - Custom schema OIDs:
-    - Built-ins have fixed OIDs; custom schemas assigned deterministically starting at 20000 (via schema list ordering).
+    - Built-ins have fixed OIDs; custom schemas store a persistent `u32` OID in `_sys_schemadef_{schema}` (allocated via `_sys_next_schema_oid`).
   - `pg_catalog.pg_namespace`, `pg_catalog.pg_class.relnamespace`, `pg_catalog.pg_constraint.connamespace`, `pg_catalog.pg_type.typnamespace` use that schema OID mapping.
 
 ## Materialized view / procedure command parsing (string-based)

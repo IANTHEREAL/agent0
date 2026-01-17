@@ -1,4 +1,4 @@
-use super::{names, sequences};
+use super::{catalog_oids, names, sequences};
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, ForeignKeyAction, IndexDef, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
@@ -33,6 +33,11 @@ pub fn is_information_schema_table(table_name: &str) -> bool {
                 | "pg_description"
                 | "pg_constraint"
                 | "pg_am"
+                | "pg_attrdef"
+                | "pg_sequence"
+                | "pg_tables"
+                | "pg_views"
+                | "pg_depend"
                 | "pg_indexes"
         )
 }
@@ -67,6 +72,11 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
             "pg_description" => "pg_description",
             "pg_constraint" => "pg_constraint",
             "pg_am" => "pg_am",
+            "pg_attrdef" => "pg_attrdef",
+            "pg_sequence" => "pg_sequence",
+            "pg_tables" => "pg_tables",
+            "pg_views" => "pg_views",
+            "pg_depend" => "pg_depend",
             "pg_indexes" => "pg_indexes",
             _ => return None,
         });
@@ -85,6 +95,11 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
         "pg_am" => Some("pg_am"),
         "pg_indexes" => Some("pg_indexes"),
         "pg_enum" => Some("pg_enum"),
+        "pg_attrdef" => Some("pg_attrdef"),
+        "pg_sequence" => Some("pg_sequence"),
+        "pg_tables" => Some("pg_tables"),
+        "pg_views" => Some("pg_views"),
+        "pg_depend" => Some("pg_depend"),
         _ => None,
     }
 }
@@ -442,10 +457,10 @@ fn pg_class_schema() -> TableSchema {
             int_col("relam"),
             int_col("reltuples"),
             int_col("relpages"),
-            text_col("relhasindex"),
-            text_col("relispopulated"),
+            bool_col("relhasindex"),
+            bool_col("relispopulated"),
             text_col("relreplident"),
-            text_col("relispartition"),
+            bool_col("relispartition"),
         ],
         version: 1,
         pk_indices: vec![],
@@ -463,12 +478,12 @@ fn pg_index_schema() -> TableSchema {
             int_col("indexrelid"),
             int_col("indrelid"),
             int_col("indnatts"),
-            text_col("indisunique"),
-            text_col("indisprimary"),
-            text_col("indisexclusion"),
-            text_col("indimmediate"),
-            text_col("indisclustered"),
-            text_col("indisvalid"),
+            bool_col("indisunique"),
+            bool_col("indisprimary"),
+            bool_col("indisexclusion"),
+            bool_col("indimmediate"),
+            bool_col("indisclustered"),
+            bool_col("indisvalid"),
             int_array_col("indkey"),
             text_col("indpred"),
             text_col("indexdef"), // Pre-computed index definition for pg_get_indexdef()
@@ -491,10 +506,10 @@ fn pg_attribute_schema() -> TableSchema {
             int_col("atttypid"),
             int_col("attnum"),
             int_col("attlen"),
-            text_col("attnotnull"),
-            text_col("atthasdef"),
-            text_col("attisdropped"),
-            text_col("attislocal"),
+            bool_col("attnotnull"),
+            bool_col("atthasdef"),
+            bool_col("attisdropped"),
+            bool_col("attislocal"),
             int_col("atttypmod"),
         ],
         version: 1,
@@ -634,6 +649,108 @@ fn pg_indexes_schema() -> TableSchema {
     }
 }
 
+fn pg_attrdef_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_attrdef".to_string(),
+        columns: vec![
+            int_col("oid"),
+            int_col("adrelid"),
+            int_col("adnum"),
+            text_col("adbin"),
+            text_col("adsrc"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
+fn pg_sequence_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_sequence".to_string(),
+        columns: vec![
+            int_col("seqrelid"),
+            int_col("seqtypid"),
+            int_col("seqstart"),
+            int_col("seqincrement"),
+            int_col("seqmax"),
+            int_col("seqmin"),
+            int_col("seqcache"),
+            bool_col("seqcycle"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
+fn pg_tables_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_tables".to_string(),
+        columns: vec![
+            text_col("schemaname"),
+            text_col("tablename"),
+            text_col("tableowner"),
+            text_col("tablespace"),
+            bool_col("hasindexes"),
+            bool_col("hasrules"),
+            bool_col("hastriggers"),
+            bool_col("rowsecurity"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
+fn pg_views_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_views".to_string(),
+        columns: vec![
+            text_col("schemaname"),
+            text_col("viewname"),
+            text_col("viewowner"),
+            text_col("definition"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
+fn pg_depend_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_depend".to_string(),
+        columns: vec![
+            int_col("classid"),
+            int_col("objid"),
+            int_col("objsubid"),
+            int_col("refclassid"),
+            int_col("refobjid"),
+            int_col("refobjsubid"),
+            text_col("deptype"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
 pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
     let lower = table_name.to_lowercase();
     let name = lower
@@ -662,6 +779,11 @@ pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
         "pg_description" => Some(pg_description_schema()),
         "pg_constraint" => Some(pg_constraint_schema()),
         "pg_am" => Some(pg_am_schema()),
+        "pg_attrdef" => Some(pg_attrdef_schema()),
+        "pg_sequence" => Some(pg_sequence_schema()),
+        "pg_tables" => Some(pg_tables_schema()),
+        "pg_views" => Some(pg_views_schema()),
+        "pg_depend" => Some(pg_depend_schema()),
         "pg_indexes" => Some(pg_indexes_schema()),
         _ => None,
     }
@@ -758,28 +880,8 @@ fn format_indexdef(table_schema: &str, table_name: &str, idx: &IndexDef) -> Stri
     indexdef
 }
 
-fn build_schema_oid_map(schemas: &[String]) -> HashMap<String, i64> {
-    let mut map: HashMap<String, i64> = HashMap::new();
-    map.insert("pg_catalog".to_string(), 11);
-    map.insert("public".to_string(), 2200);
-    map.insert("information_schema".to_string(), 13222);
-
-    let mut next_oid: i64 = 20000;
-    let mut schemas_sorted = schemas.to_vec();
-    schemas_sorted.sort();
-    schemas_sorted.dedup();
-    for schema in schemas_sorted {
-        if map.contains_key(&schema) {
-            continue;
-        }
-        map.insert(schema, next_oid);
-        next_oid += 1;
-    }
-    map
-}
-
-fn schema_oid(schema_oids: &HashMap<String, i64>, schema: &str) -> i64 {
-    schema_oids.get(schema).copied().unwrap_or(2200)
+fn schema_oid(schema_oids: &HashMap<String, u32>, schema: &str) -> i64 {
+    schema_oids.get(schema).copied().unwrap_or(2200) as i64
 }
 
 pub async fn get_information_schema_data(
@@ -798,7 +900,7 @@ pub async fn get_information_schema_data(
 
     let user_tables = store.list_tables(txn).await?;
     let schemas = store.list_schemas(txn).await?;
-    let schema_oids = build_schema_oid_map(&schemas);
+    let schema_oids = store.list_schema_oids(txn).await?;
 
     let rows = match name {
         "schemata" => get_schemata_rows(&schemas),
@@ -825,6 +927,11 @@ pub async fn get_information_schema_data(
         "pg_description" => get_pg_description_rows(),
         "pg_constraint" => get_pg_constraint_rows(store, txn, &user_tables, &schema_oids).await?,
         "pg_am" => get_pg_am_rows(),
+        "pg_attrdef" => get_pg_attrdef_rows(store, txn, &user_tables).await?,
+        "pg_sequence" => get_pg_sequence_rows(store, txn).await?,
+        "pg_tables" => get_pg_tables_rows(store, txn, &user_tables).await?,
+        "pg_views" => get_pg_views_rows(store, txn).await?,
+        "pg_depend" => get_pg_depend_rows(store, txn).await?,
         "pg_indexes" => get_pg_indexes_rows(store, txn, &user_tables).await?,
         _ => vec![],
     };
@@ -875,12 +982,11 @@ async fn get_tables_rows(
     }
 
     let views = store.list_views(txn).await.unwrap_or_default();
-    for full_view_name in views {
-        let (view_schema, view_name) = split_schema_and_name(&full_view_name);
+    for view_def in views {
         rows.push(Row::new(vec![
             text_val("postgres"),
-            text_val(&view_schema),
-            text_val(&view_name),
+            text_val(&view_def.schema),
+            text_val(&view_def.name),
             text_val("VIEW"),
             null_val(),
             null_val(),
@@ -1304,7 +1410,7 @@ async fn get_check_constraints_rows(
     Ok(rows)
 }
 
-fn get_pg_namespace_rows(schemas: &[String], schema_oids: &HashMap<String, i64>) -> Vec<Row> {
+fn get_pg_namespace_rows(schemas: &[String], schema_oids: &HashMap<String, u32>) -> Vec<Row> {
     schemas
         .iter()
         .map(|schema| {
@@ -1321,19 +1427,18 @@ async fn get_pg_class_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     user_tables: &[String],
-    schema_oids: &HashMap<String, i64>,
+    schema_oids: &HashMap<String, u32>,
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
-    let mut oid_counter = 16384; // Start from standard PostgreSQL user object OID
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
         let namespace_oid = schema_oid(schema_oids, &table_schema);
         if let Some(schema) = store.get_schema(txn, full_table_name).await? {
-            let table_oid = oid_counter;
-            oid_counter += 1;
+            let table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
 
             // Add the table itself
+            let relhasindex = !schema.indexes.is_empty() || !schema.pk_indices.is_empty();
             rows.push(Row::new(vec![
                 int_val(table_oid),
                 text_val(&table_name),
@@ -1343,16 +1448,15 @@ async fn get_pg_class_rows(
                 int_val(0),    // access method
                 int_val(0),    // tuples (unknown)
                 int_val(0),    // pages (unknown)
-                text_val("t"), // has index (true if any indexes)
-                text_val("t"), // is populated
+                Value::Boolean(relhasindex),
+                Value::Boolean(true),
                 text_val("d"), // replica identity (default)
-                text_val("f"), // is partition (false)
+                Value::Boolean(false),
             ]));
 
             // Add indexes as separate entries
             for idx in &schema.indexes {
-                let index_oid = oid_counter;
-                oid_counter += 1;
+                let index_oid = catalog_oids::pg_class_index_oid(schema.table_id, idx.id)?;
                 rows.push(Row::new(vec![
                     int_val(index_oid),
                     text_val(&idx.name),
@@ -1360,20 +1464,19 @@ async fn get_pg_class_rows(
                     text_val("i"), // i = index
                     int_val(10),   // owner
                     int_val(access_method_oid(idx.method.as_deref())),
-                    int_val(0),    // tuples
-                    int_val(0),    // pages
-                    text_val("f"), // has index (false)
-                    text_val("t"), // is populated
+                    int_val(0), // tuples
+                    int_val(0), // pages
+                    Value::Boolean(false),
+                    Value::Boolean(true),
                     text_val("d"), // replica identity
-                    text_val("f"), // is partition
+                    Value::Boolean(false),
                 ]));
             }
 
             // Add primary key index if exists
             if !schema.pk_indices.is_empty() {
                 let pk_name = format!("{}_pkey", table_name);
-                let pk_oid = oid_counter;
-                oid_counter += 1;
+                let pk_oid = catalog_oids::pg_class_pk_index_oid(schema.table_id)?;
                 rows.push(Row::new(vec![
                     int_val(pk_oid),
                     text_val(&pk_name),
@@ -1383,10 +1486,10 @@ async fn get_pg_class_rows(
                     int_val(403),
                     int_val(0),
                     int_val(0),
-                    text_val("f"),
-                    text_val("t"),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
                     text_val("d"),
-                    text_val("f"),
+                    Value::Boolean(false),
                 ]));
             }
         }
@@ -1394,8 +1497,7 @@ async fn get_pg_class_rows(
 
     let sequences = store.list_sequences(txn).await?;
     for seq in sequences {
-        let seq_oid = oid_counter;
-        oid_counter += 1;
+        let seq_oid = catalog_oids::pg_class_sequence_oid(seq.oid);
         let namespace_oid = schema_oid(schema_oids, &seq.schema);
         rows.push(Row::new(vec![
             int_val(seq_oid),
@@ -1406,10 +1508,30 @@ async fn get_pg_class_rows(
             int_val(0),    // access method
             int_val(0),    // tuples (unknown)
             int_val(0),    // pages (unknown)
-            text_val("f"), // has index
-            text_val("t"), // is populated
+            Value::Boolean(false),
+            Value::Boolean(true),
             text_val("d"), // replica identity
-            text_val("f"), // is partition
+            Value::Boolean(false),
+        ]));
+    }
+
+    let views = store.list_views(txn).await.unwrap_or_default();
+    for view_def in views {
+        let namespace_oid = schema_oid(schema_oids, &view_def.schema);
+        let view_oid = catalog_oids::pg_class_view_oid(view_def.oid);
+        rows.push(Row::new(vec![
+            int_val(view_oid),
+            text_val(&view_def.name),
+            int_val(namespace_oid),
+            text_val("v"), // v = view
+            int_val(10),
+            int_val(0),
+            int_val(0),
+            int_val(0),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            text_val("d"),
+            Value::Boolean(false),
         ]));
     }
 
@@ -1420,20 +1542,17 @@ async fn get_pg_index_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     user_tables: &[String],
-    _schema_oids: &HashMap<String, i64>,
+    _schema_oids: &HashMap<String, u32>,
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
-    let mut oid_counter = 16384;
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
         if let Some(schema) = store.get_schema(txn, full_table_name).await? {
-            let base_table_oid = oid_counter;
-            oid_counter += 1;
+            let base_table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
 
             for idx in &schema.indexes {
-                let index_oid = oid_counter;
-                oid_counter += 1;
+                let index_oid = catalog_oids::pg_class_index_oid(schema.table_id, idx.id)?;
 
                 let index_col_count = idx.columns.len() + idx.expressions.len();
                 let mut col_indices = Vec::new();
@@ -1453,12 +1572,12 @@ async fn get_pg_index_rows(
                     int_val(index_oid),
                     int_val(base_table_oid),
                     int_val(index_col_count as i64),
-                    text_val(if idx.unique { "t" } else { "f" }),
-                    text_val("f"),
-                    text_val("f"),
-                    text_val("t"),
-                    text_val("f"),
-                    text_val("t"),
+                    Value::Boolean(idx.unique),
+                    Value::Boolean(false),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
                     indkey,
                     null_val(),
                     text_val(&indexdef),
@@ -1466,8 +1585,7 @@ async fn get_pg_index_rows(
             }
 
             if !schema.pk_indices.is_empty() {
-                let pk_oid = oid_counter;
-                oid_counter += 1;
+                let pk_oid = catalog_oids::pg_class_pk_index_oid(schema.table_id)?;
 
                 let indkey = schema
                     .pk_indices
@@ -1492,12 +1610,12 @@ async fn get_pg_index_rows(
                     int_val(pk_oid),
                     int_val(base_table_oid),
                     int_val(schema.pk_indices.len() as i64),
-                    text_val("t"),
-                    text_val("t"),
-                    text_val("f"),
-                    text_val("t"),
-                    text_val("f"),
-                    text_val("t"),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
                     Value::Array(indkey),
                     null_val(),
                     text_val(&indexdef),
@@ -1557,22 +1675,171 @@ async fn get_pg_indexes_rows(
     Ok(rows)
 }
 
+async fn get_pg_attrdef_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    user_tables: &[String],
+) -> Result<Vec<Row>> {
+    let mut rows = Vec::new();
+
+    for full_table_name in user_tables {
+        let (table_schema, table_name) = split_schema_and_name(full_table_name);
+        let Some(schema) = store.get_schema(txn, full_table_name).await? else {
+            continue;
+        };
+        let table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
+
+        for (i, col) in schema.columns.iter().enumerate() {
+            let expr = if col.is_serial {
+                let seq_full_name = format!(
+                    "{}.{}",
+                    table_schema,
+                    sequences::implicit_sequence_name(&table_name, &col.name)
+                );
+                Some(format!("nextval('{}'::regclass)", seq_full_name))
+            } else {
+                col.default_expr.clone()
+            };
+            let Some(expr) = expr else {
+                continue;
+            };
+            let attnum = (i + 1) as i64;
+            let oid = catalog_oids::pg_attrdef_oid(schema.table_id, (i + 1) as u32)?;
+
+            rows.push(Row::new(vec![
+                int_val(oid),
+                int_val(table_oid),
+                int_val(attnum),
+                text_val(&expr),
+                text_val(&expr),
+            ]));
+        }
+    }
+
+    Ok(rows)
+}
+
+async fn get_pg_sequence_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
+    let seqs = store.list_sequences(txn).await?;
+    let mut rows = Vec::with_capacity(seqs.len());
+
+    for seq in seqs {
+        rows.push(Row::new(vec![
+            int_val(catalog_oids::pg_class_sequence_oid(seq.oid)),
+            int_val(20), // seqtypid: int8
+            int_val(seq.start_value),
+            int_val(seq.increment),
+            int_val(seq.max_value),
+            int_val(seq.min_value),
+            int_val(seq.cache_size),
+            Value::Boolean(seq.is_cycled),
+        ]));
+    }
+
+    Ok(rows)
+}
+
+async fn get_pg_tables_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    user_tables: &[String],
+) -> Result<Vec<Row>> {
+    let triggers = store.list_triggers(txn).await.unwrap_or_default();
+    let mut tables_with_triggers: HashMap<String, bool> = HashMap::new();
+    for t in triggers {
+        tables_with_triggers.insert(t.table, true);
+    }
+
+    let mut rows = Vec::new();
+    for full_table_name in user_tables {
+        let (table_schema, table_name) = split_schema_and_name(full_table_name);
+        let Some(schema) = store.get_schema(txn, full_table_name).await? else {
+            continue;
+        };
+        let hasindexes = !schema.pk_indices.is_empty() || !schema.indexes.is_empty();
+        let hastriggers = tables_with_triggers
+            .get(full_table_name)
+            .copied()
+            .unwrap_or(false);
+
+        rows.push(Row::new(vec![
+            text_val(&table_schema),
+            text_val(&table_name),
+            text_val("postgres"),
+            null_val(),
+            Value::Boolean(hasindexes),
+            Value::Boolean(false),
+            Value::Boolean(hastriggers),
+            Value::Boolean(false),
+        ]));
+    }
+
+    Ok(rows)
+}
+
+async fn get_pg_views_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
+    let mut views = store.list_views(txn).await?;
+    views.sort_by(|a, b| a.full_name().cmp(&b.full_name()));
+
+    let mut rows = Vec::new();
+    for view_def in views {
+        rows.push(Row::new(vec![
+            text_val(&view_def.schema),
+            text_val(&view_def.name),
+            text_val("postgres"),
+            text_val(&view_def.query),
+        ]));
+    }
+
+    Ok(rows)
+}
+
+async fn get_pg_depend_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
+    // pg_class has OID 1259 in PostgreSQL; use the standard constant so ORMs can join if needed.
+    const PG_CLASS_OID: i64 = 1259;
+
+    let seqs = store.list_sequences(txn).await?;
+    let mut rows = Vec::new();
+
+    for seq in seqs {
+        let Some((owned_table, owned_col)) = seq.owned_by.as_ref() else {
+            continue;
+        };
+        let Some(schema) = store.get_schema(txn, owned_table).await? else {
+            continue;
+        };
+        let Some(col_idx) = schema.columns.iter().position(|c| c.name == *owned_col) else {
+            continue;
+        };
+
+        let seq_oid = catalog_oids::pg_class_sequence_oid(seq.oid);
+        let table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
+        let refobjsubid = (col_idx + 1) as i64;
+
+        rows.push(Row::new(vec![
+            int_val(PG_CLASS_OID),
+            int_val(seq_oid),
+            int_val(0),
+            int_val(PG_CLASS_OID),
+            int_val(table_oid),
+            int_val(refobjsubid),
+            text_val("a"),
+        ]));
+    }
+
+    Ok(rows)
+}
+
 async fn get_pg_attribute_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
-    let mut table_oid: i64 = 16384;
 
     for table_name in user_tables {
         if let Some(schema) = store.get_schema(txn, table_name).await? {
-            let base_table_oid = table_oid;
-
-            // Calculate how many OIDs this table uses (1 for table + indexes)
-            let num_indexes =
-                schema.indexes.len() + if !schema.pk_indices.is_empty() { 1 } else { 0 };
-            table_oid += 1 + num_indexes as i64;
+            let base_table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
 
             for (i, col) in schema.columns.iter().enumerate() {
                 let (type_oid, attlen) = if let DataType::UserDefined(udt_name) = &col.data_type {
@@ -1616,15 +1883,11 @@ async fn get_pg_attribute_rows(
                     int_val(type_oid),
                     int_val((i + 1) as i64),
                     int_val(attlen),
-                    text_val(if !col.nullable { "t" } else { "f" }),
-                    text_val(if col.is_serial || col.default_expr.is_some() {
-                        "t"
-                    } else {
-                        "f"
-                    }),
-                    text_val("f"), // not dropped
-                    text_val("t"), // is local
-                    int_val(-1),   // type modifier
+                    Value::Boolean(!col.nullable),
+                    Value::Boolean(col.is_serial || col.default_expr.is_some()),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                    int_val(-1), // type modifier
                 ]));
             }
         }
@@ -1648,7 +1911,7 @@ async fn get_pg_constraint_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     user_tables: &[String],
-    schema_oids: &HashMap<String, i64>,
+    schema_oids: &HashMap<String, u32>,
 ) -> Result<Vec<Row>> {
     fn fk_action_code(action: &ForeignKeyAction) -> &'static str {
         match action {
@@ -1673,13 +1936,9 @@ async fn get_pg_constraint_rows(
     let mut table_oids: HashMap<String, i64> = HashMap::new();
     let mut table_schemas: HashMap<String, TableSchema> = HashMap::new();
 
-    let mut table_oid: i64 = 16384;
     for table_name in user_tables {
         if let Some(schema) = store.get_schema(txn, table_name).await? {
-            let base_table_oid = table_oid;
-            let num_indexes =
-                schema.indexes.len() + if !schema.pk_indices.is_empty() { 1 } else { 0 };
-            table_oid += 1 + num_indexes as i64;
+            let base_table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
 
             table_oids.insert(table_name.to_string(), base_table_oid);
             table_schemas.insert(table_name.to_string(), schema);
@@ -1712,7 +1971,6 @@ async fn get_pg_constraint_rows(
                 .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
                 .collect();
             let constraintdef = format!("PRIMARY KEY ({})", pk_cols.join(", "));
-            let conindid = conrelid + 1 + schema.indexes.len() as i64;
 
             rows.push(Row::new(vec![
                 int_val(constraint_oid),
@@ -1730,12 +1988,9 @@ async fn get_pg_constraint_rows(
                 text_val(&constraintdef),
             ]));
             constraint_oid += 1;
-
-            // Keep primary key index discoverable via conindid in case ORMs query it.
-            let _ = conindid;
         }
 
-        for (idx_pos, idx) in schema.indexes.iter().enumerate() {
+        for idx in &schema.indexes {
             if !idx.unique {
                 continue;
             }
@@ -1746,7 +2001,6 @@ async fn get_pg_constraint_rows(
                 }
             }
             let constraintdef = format!("UNIQUE ({})", idx.columns.join(", "));
-            let _conindid = conrelid + 1 + idx_pos as i64;
 
             rows.push(Row::new(vec![
                 int_val(constraint_oid),
@@ -1857,7 +2111,7 @@ async fn get_pg_constraint_rows(
 async fn get_pg_type_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
-    schema_oids: &HashMap<String, i64>,
+    schema_oids: &HashMap<String, u32>,
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
@@ -1957,17 +2211,41 @@ async fn get_pg_enum_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Resu
 async fn get_pg_proc_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
-    schema_oids: &HashMap<String, i64>,
+    schema_oids: &HashMap<String, u32>,
 ) -> Result<Vec<Row>> {
+    let pg_catalog_oid = schema_oid(schema_oids, "pg_catalog");
+
     let mut funcs = store.list_functions(txn).await?;
-    funcs.sort_by(|a, b| {
-        (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str()))
-    });
+    funcs.sort_by_key(|f| f.oid);
 
     let mut rows = Vec::new();
-    let mut oid: i64 = 60000;
+
+    // Minimal builtin set for ORM introspection joins.
+    for (oid, name, prorettype) in [
+        (1001_i64, "format_type", 25_i64),
+        (1002, "pg_get_expr", 25),
+        (1003, "pg_get_indexdef", 25),
+        (1004, "pg_get_constraintdef", 25),
+        (1005, "version", 25),
+        (1006, "current_schema", 25),
+        (1007, "current_database", 25),
+        (1008, "current_user", 25),
+        (1009, "set_config", 25),
+        (1010, "pg_is_in_recovery", 16),
+        (1011, "pg_backend_pid", 23),
+    ] {
+        rows.push(Row::new(vec![
+            int_val(oid),
+            text_val(name),
+            int_val(pg_catalog_oid),
+            int_val(10),
+            int_val(prorettype),
+            text_val("f"),
+        ]));
+    }
 
     for f in funcs {
+        let oid = catalog_oids::pg_proc_function_oid(f.oid);
         let namespace_oid = schema_oid(schema_oids, &f.schema);
         let ret = f.return_type.to_ascii_lowercase();
         let base_ret = ret.trim().strip_prefix("setof ").unwrap_or(ret.trim());
@@ -2007,7 +2285,6 @@ async fn get_pg_proc_rows(
             int_val(prorettype),
             text_val("f"),
         ]));
-        oid += 1;
     }
 
     Ok(rows)
@@ -2019,47 +2296,39 @@ async fn get_pg_trigger_rows(
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut table_oids: HashMap<String, i64> = HashMap::new();
-    let mut table_oid: i64 = 16384;
     for table_name in user_tables {
         if let Some(schema) = store.get_schema(txn, table_name).await? {
-            let base_table_oid = table_oid;
-            let num_indexes =
-                schema.indexes.len() + if !schema.pk_indices.is_empty() { 1 } else { 0 };
-            table_oid += 1 + num_indexes as i64;
-            table_oids.insert(table_name.to_string(), base_table_oid);
+            table_oids.insert(
+                table_name.to_string(),
+                catalog_oids::pg_class_table_oid(schema.table_id)?,
+            );
         }
     }
 
     let mut func_oids: HashMap<String, i64> = HashMap::new();
-    let mut funcs = store.list_functions(txn).await?;
-    funcs.sort_by(|a, b| {
-        (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str()))
-    });
-    let mut func_oid: i64 = 60000;
+    let funcs = store.list_functions(txn).await?;
     for f in funcs {
-        func_oids.insert(format!("{}.{}", f.schema, f.name), func_oid);
-        func_oid += 1;
+        func_oids.insert(
+            format!("{}.{}", f.schema, f.name),
+            catalog_oids::pg_proc_function_oid(f.oid),
+        );
     }
 
     let mut triggers = store.list_triggers(txn).await?;
-    triggers.sort_by(|a, b| {
-        (a.table.as_str(), a.name.as_str()).cmp(&(b.table.as_str(), b.name.as_str()))
-    });
+    triggers.sort_by_key(|t| t.oid);
 
     let mut rows = Vec::new();
-    let mut oid: i64 = 70000;
     for t in triggers {
         let tgrelid = table_oids.get(&t.table).copied().unwrap_or(0);
         let tgfoid = func_oids.get(&t.function).copied().unwrap_or(0);
 
         rows.push(Row::new(vec![
-            int_val(oid),
+            int_val(catalog_oids::pg_trigger_oid(t.oid)),
             text_val(&t.name),
             int_val(tgrelid),
             int_val(tgfoid),
             text_val("O"),
         ]));
-        oid += 1;
     }
 
     Ok(rows)

@@ -3,7 +3,7 @@
 //! Key layout:
 //! - `_sys_next_table_id` -> u64 (auto-incrementing table ID)
 //! - `_sys_schema_{table_name}` -> TableSchema (serialized)
-//! - `_sys_schemadef_{schema_name}` -> empty (schema catalog entry)
+//! - `_sys_schemadef_{schema_name}` -> u32 schema OID (big-endian)
 //! - `t_{table_id}_{row_key}` -> Row (serialized)
 //! - `i_{table_id}_{index_id}_{index_values}` -> PK (Unique Index)
 //! - `i_{table_id}_{index_id}_{index_values}_{pk}` -> Empty (Non-Unique Index)
@@ -18,6 +18,11 @@ use rust_decimal::Decimal;
 /// System key prefixes
 const SYS_NEXT_TABLE_ID: &[u8] = b"_sys_next_table_id";
 const SYS_NEXT_TYPE_OID: &[u8] = b"_sys_next_type_oid";
+const SYS_NEXT_SCHEMA_OID: &[u8] = b"_sys_next_schema_oid";
+const SYS_NEXT_SEQUENCE_OID: &[u8] = b"_sys_next_sequence_oid";
+const SYS_NEXT_FUNCTION_OID: &[u8] = b"_sys_next_function_oid";
+const SYS_NEXT_TRIGGER_OID: &[u8] = b"_sys_next_trigger_oid";
+const SYS_NEXT_VIEW_OID: &[u8] = b"_sys_next_view_oid";
 const SYS_SCHEMA_PREFIX: &[u8] = b"_sys_schema_";
 const SYS_SCHEMADEF_PREFIX: &[u8] = b"_sys_schemadef_";
 const SYS_VIEW_PREFIX: &[u8] = b"_sys_view_";
@@ -38,6 +43,31 @@ pub fn encode_next_table_id_key() -> Vec<u8> {
 /// Encode the system key for next type OID (user-defined types)
 pub fn encode_next_type_oid_key() -> Vec<u8> {
     SYS_NEXT_TYPE_OID.to_vec()
+}
+
+/// Encode the system key for next schema OID (user-defined schemas)
+pub fn encode_next_schema_oid_key() -> Vec<u8> {
+    SYS_NEXT_SCHEMA_OID.to_vec()
+}
+
+/// Encode the system key for next sequence OID (standalone + implicit sequences)
+pub fn encode_next_sequence_oid_key() -> Vec<u8> {
+    SYS_NEXT_SEQUENCE_OID.to_vec()
+}
+
+/// Encode the system key for next function OID (user-defined functions)
+pub fn encode_next_function_oid_key() -> Vec<u8> {
+    SYS_NEXT_FUNCTION_OID.to_vec()
+}
+
+/// Encode the system key for next trigger OID (user-defined triggers)
+pub fn encode_next_trigger_oid_key() -> Vec<u8> {
+    SYS_NEXT_TRIGGER_OID.to_vec()
+}
+
+/// Encode the system key for next view OID (user-defined views)
+pub fn encode_next_view_oid_key() -> Vec<u8> {
+    SYS_NEXT_VIEW_OID.to_vec()
 }
 
 /// Encode the schema key for a table

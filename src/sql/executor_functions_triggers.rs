@@ -460,6 +460,7 @@ fn parse_create_function_sql(sql: &str) -> Result<(ObjectName, FunctionDef, bool
     let body = parse_sql_string_or_dollar_literal(body_tail)?;
 
     let def = FunctionDef {
+        oid: 0,
         schema: String::new(),
         name: String::new(),
         arg_types: parse_arg_types(args_str),
@@ -780,6 +781,7 @@ impl Executor {
             };
 
             let def = TriggerDef {
+                oid: 0,
                 schema: table_resolved.schema.clone(),
                 name: trigger_name.clone(),
                 table: table_resolved.full.clone(),

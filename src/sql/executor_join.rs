@@ -114,9 +114,9 @@ impl Executor {
         };
 
         for candidate in &candidates {
-            if let Some(view_query) = self.store().get_view(txn, candidate).await? {
+            if let Some(view_def) = self.store().get_view(txn, candidate).await? {
                 let result = self
-                    .execute_view_query(txn, sequence_values, search_path, &view_query, ctes)
+                    .execute_view_query(txn, sequence_values, search_path, &view_def.query, ctes)
                     .await?;
                 return match result {
                     ExecuteResult::Select {

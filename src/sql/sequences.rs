@@ -10,6 +10,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tikv_client::Transaction;
 
+use super::catalog_oids;
 use super::expr::{eval_expr, eval_expr_join, JoinContext};
 use super::helpers::{normalize_ident, value_to_sql_expr};
 use super::names;
@@ -196,11 +197,14 @@ pub(crate) fn build_implicit_sequence_def(
         _ => ("public".to_string(), table_full_name.to_string()),
     };
     SequenceDef {
+        oid: 0,
         schema,
         name: implicit_sequence_name(&table_name, column_name),
+        start_value: 1,
         increment: 1,
         min_value: 1,
         max_value: i64::MAX,
+        cache_size: 1,
         is_cycled: false,
         owned_by: Some((table_full_name.to_string(), column_name.to_string())),
         owner: "postgres".to_string(),
@@ -309,6 +313,7 @@ pub(crate) async fn execute_create_sequence(
     let mut increment: i64 = 1;
     let mut min_value: i64 = 1;
     let mut max_value: i64 = i64::MAX;
+    let mut cache_size: i64 = 1;
     let mut is_cycled: bool = false;
 
     for opt in sequence_options {
@@ -328,7 +333,7 @@ pub(crate) async fn execute_create_sequence(
             SequenceOptions::Cycle(no_cycle) => {
                 is_cycled = !*no_cycle;
             }
-            SequenceOptions::Cache(_) => {}
+            SequenceOptions::Cache(expr) => cache_size = eval_i64(expr)?,
         }
     }
 
@@ -354,11 +359,14 @@ pub(crate) async fn execute_create_sequence(
     }
 
     let def = SequenceDef {
+        oid: 0,
         schema,
         name: seq_name,
+        start_value,
         increment,
         min_value,
         max_value,
+        cache_size,
         is_cycled,
         owned_by: None,
         owner: "postgres".to_string(),
@@ -464,7 +472,6 @@ async fn lookup_indexdef_by_oid(
     oid: i64,
 ) -> Result<Option<String>> {
     let user_tables = store.list_tables(txn).await?;
-    let mut oid_counter: i64 = 16384;
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(&full_table_name);
@@ -472,19 +479,15 @@ async fn lookup_indexdef_by_oid(
             continue;
         };
 
-        oid_counter += 1; // table oid
-
         for idx in &schema.indexes {
-            let index_oid = oid_counter;
-            oid_counter += 1;
+            let index_oid = catalog_oids::pg_class_index_oid(schema.table_id, idx.id)?;
             if index_oid == oid {
                 return Ok(Some(format_indexdef(&table_schema, &table_name, idx)));
             }
         }
 
         if !schema.pk_indices.is_empty() {
-            let pk_oid = oid_counter;
-            oid_counter += 1;
+            let pk_oid = catalog_oids::pg_class_pk_index_oid(schema.table_id)?;
             if pk_oid == oid {
                 let pk_cols: Vec<String> = schema
                     .pk_indices

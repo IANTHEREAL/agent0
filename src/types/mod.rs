@@ -426,11 +426,17 @@ pub enum SequenceBacking {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SequenceDef {
+    #[serde(default)]
+    pub oid: u32,
     pub schema: String,
     pub name: String,
+    #[serde(default)]
+    pub start_value: i64,
     pub increment: i64,
     pub min_value: i64,
     pub max_value: i64,
+    #[serde(default)]
+    pub cache_size: i64,
     pub is_cycled: bool,
     pub owned_by: Option<(String, String)>,
     pub owner: String,
@@ -445,6 +451,8 @@ impl SequenceDef {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FunctionDef {
+    #[serde(default)]
+    pub oid: u32,
     pub schema: String,
     pub name: String,
     pub arg_types: Vec<String>,
@@ -455,10 +463,27 @@ pub struct FunctionDef {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TriggerDef {
+    #[serde(default)]
+    pub oid: u32,
     pub schema: String,
     pub name: String,
     pub table: String,
     pub timing: String,
     pub events: Vec<String>,
     pub function: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ViewDef {
+    #[serde(default)]
+    pub oid: u32,
+    pub schema: String,
+    pub name: String,
+    pub query: String,
+}
+
+impl ViewDef {
+    pub fn full_name(&self) -> String {
+        format!("{}.{}", self.schema, self.name)
+    }
 }

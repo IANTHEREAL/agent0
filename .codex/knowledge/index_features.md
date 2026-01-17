@@ -81,6 +81,6 @@
   - `replace_sequence_functions(...)` and `replace_sequence_functions_join(...)` special-case `PG_GET_INDEXDEF` during async expression rewriting:
     - Extract OID from arg0 (`Value::{Int32,Int64,Float64,Text(numeric)}`).
     - Fast path: if the current row contains both `indexrelid` and `indexdef` and `indexrelid == oid`, rewrite to the row’s `indexdef`.
-    - Fallback: `lookup_indexdef_by_oid(store, txn, oid)` scans `store.list_tables(txn)` and mirrors `src/sql/information_schema.rs::get_pg_index_rows` deterministic OID assignment (starts at `16384`; per table: +1 table oid, then +1 per `schema.indexes`, then +1 for pk index when present).
+    - Fallback: `lookup_indexdef_by_oid(store, txn, oid)` scans `store.list_tables(txn)` and matches catalog OIDs via `src/sql/catalog_oids.rs` (`pg_class_index_oid` / `pg_class_pk_index_oid`) rather than mirroring a per-query counter.
     - Rewrites to a literal via `value_to_sql_expr(Value::Text(indexdef))` so later evaluation is pure/sync.
   - Integration coverage: `tests/50_index_features.sql` asserts `PG_GET_INDEXDEF_STANDALONE=...` works without `pg_index` row context.

@@ -12,8 +12,8 @@
 
 ## Types (metadata structs)
 - `src/types/mod.rs`
-  - `FunctionDef { schema, name, arg_types: Vec<String>, return_type: String, language: String, body: String }`
-  - `TriggerDef { schema, name, table, timing, events: Vec<String>, function }`
+  - `FunctionDef { oid, schema, name, arg_types: Vec<String>, return_type: String, language: String, body: String }`
+  - `TriggerDef { oid, schema, name, table, timing, events: Vec<String>, function }`
 
 ## Storage keys + encoding
 - `src/storage/encoding.rs`
@@ -90,8 +90,8 @@
     - `get_information_schema_data(..., "pg_trigger")`
   - `get_pg_proc_rows(store, txn, schema_oids)` now returns stored functions from `store.list_functions(txn)`
   - `get_pg_trigger_rows(store, txn, user_tables)` returns stored triggers from `store.list_triggers(txn)`
-    - `tgrelid` computed to match `pg_class` OID assignment (`16384 + 1 + num_indexes` walk)
-    - `tgfoid` uses the same function OID assignment as `get_pg_proc_rows` (`60000 + sorted index`)
+    - `tgrelid` matches `pg_class` table OIDs (derived from stable `table_id` via `src/sql/catalog_oids.rs`).
+    - `tgfoid` matches `pg_proc.oid` for stored functions (derived from persisted `FunctionDef.oid` via `src/sql/catalog_oids.rs`).
 
 ## Integration tests
 - `tests/46_functions_triggers_ddl.sql`
@@ -112,7 +112,5 @@
 - `src/storage/tikv_store.rs`
   - Catalog entries for types/sequences use `bincode` serialization and prefix scans (`list_types`, `list_sequences`).
 
-## System catalog baseline
-- `src/sql/information_schema.rs`
-  - `pg_proc` table exists but `get_pg_proc_rows()` returns empty.
-  - No `pg_trigger` table yet.
+## System catalog baseline (historical)
+- Before Stage 1, `pg_proc` returned empty and `pg_trigger` did not exist; this task added minimal, joinable introspection rows.

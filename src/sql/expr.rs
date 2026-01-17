@@ -647,7 +647,16 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
                 114 => "json",
                 3802 => "jsonb",
                 16385 => "vector",
-                _ => "text",
+                _ => {
+                    for (col_key, &offset) in &ctx.column_offsets {
+                        if col_key.ends_with(".typname") || col_key == "typname" {
+                            if let Some(Value::Text(s)) = ctx.combined_row.values.get(offset) {
+                                return Ok(Value::Text(s.clone()));
+                            }
+                        }
+                    }
+                    "text"
+                }
             };
             Ok(Value::Text(type_name.to_string()))
         }
@@ -663,7 +672,11 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
             }
             Ok(Value::Text(String::new()))
         }
-        "PG_GET_EXPR" => Ok(Value::Null),
+        "PG_GET_EXPR" => match args.into_iter().next() {
+            Some(Value::Text(s)) => Ok(Value::Text(s)),
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(v) => Ok(Value::Text(v.to_string())),
+        },
         "UNNEST" => match args.into_iter().next() {
             Some(Value::Array(arr)) => Ok(arr.into_iter().next().unwrap_or(Value::Null)),
             Some(Value::Null) | None => Ok(Value::Null),
@@ -1765,8 +1778,27 @@ fn eval_function(
             }
             Ok(Value::Text("CREATE INDEX".to_string()))
         }
-        "PG_GET_CONSTRAINTDEF" => Ok(Value::Text(String::new())),
-        "PG_GET_EXPR" => Ok(Value::Null),
+        "PG_GET_CONSTRAINTDEF" => {
+            if let (Some(row), Some(schema)) = (row, schema) {
+                if let Some(idx) = schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case("constraintdef"))
+                {
+                    if let Some(val) = row.values.get(idx) {
+                        if !matches!(val, Value::Null) {
+                            return Ok(val.clone());
+                        }
+                    }
+                }
+            }
+            Ok(Value::Text(String::new()))
+        }
+        "PG_GET_EXPR" => match args.into_iter().next() {
+            Some(Value::Text(s)) => Ok(Value::Text(s)),
+            Some(Value::Null) | None => Ok(Value::Null),
+            Some(v) => Ok(Value::Text(v.to_string())),
+        },
         "FORMAT_TYPE" => {
             let mut iter = args.into_iter();
             let oid = match iter.next().unwrap_or(Value::Null) {

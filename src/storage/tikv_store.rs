@@ -2,9 +2,10 @@ use super::encoding::*;
 use crate::txn::{txn_delete, txn_put};
 use crate::types::{
     DataType, FunctionDef, Row, SequenceBacking, SequenceDef, SequenceState, TableSchema,
-    TriggerDef, UserTypeDef, Value,
+    TriggerDef, UserTypeDef, Value, ViewDef,
 };
 use anyhow::{anyhow, Context, Result};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tikv_client::{
     BoundRange, CheckLevel, Config, Transaction, TransactionClient, TransactionOptions,
@@ -204,8 +205,55 @@ impl TikvStore {
             }
             return Err(anyhow!("Schema '{}' already exists", schema));
         }
-        txn_put(txn, key, Vec::new()).await?;
+        let oid = self.next_schema_oid(txn).await?;
+        txn_put(txn, key, oid.to_be_bytes().to_vec()).await?;
         Ok(true)
+    }
+
+    pub async fn list_schema_oids(&self, txn: &mut Transaction) -> Result<HashMap<String, u32>> {
+        let prefix = encode_schema_def_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut oids: HashMap<String, u32> = HashMap::new();
+        oids.insert("public".to_string(), 2200);
+        oids.insert("information_schema".to_string(), 13222);
+        oids.insert("pg_catalog".to_string(), 11);
+
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let schema = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
+            if schema.is_empty() || Self::is_builtin_schema(&schema) {
+                continue;
+            }
+
+            let oid = match pair.value().len() {
+                0 => {
+                    let new_oid = self.next_schema_oid(txn).await?;
+                    let schema_key = self.key(&encode_schema_def_key(&schema));
+                    txn_put(txn, schema_key, new_oid.to_be_bytes().to_vec()).await?;
+                    new_oid
+                }
+                4 => {
+                    let bytes: [u8; 4] = pair
+                        .value()
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| anyhow!("Invalid schema OID format"))?;
+                    u32::from_be_bytes(bytes)
+                }
+                _ => return Err(anyhow!("Invalid schema OID format")),
+            };
+
+            oids.insert(schema, oid);
+        }
+
+        Ok(oids)
     }
 
     async fn prefix_has_any(&self, txn: &mut Transaction, prefix: Vec<u8>) -> Result<bool> {
@@ -349,6 +397,26 @@ impl TikvStore {
         Ok(schemas)
     }
 
+    pub async fn next_schema_oid(&self, txn: &mut Transaction) -> Result<u32> {
+        const FIRST_USER_SCHEMA_OID: u32 = 20000;
+
+        let key = self.key(&encode_next_schema_oid_key());
+        let current = txn.get(key.clone()).await?;
+        let next_val = match current {
+            Some(data) => {
+                let oid = u32::from_be_bytes(
+                    data.try_into()
+                        .map_err(|_| anyhow!("Invalid schema OID format"))?,
+                );
+                oid.checked_add(1)
+                    .ok_or_else(|| anyhow!("Schema OID overflow"))?
+            }
+            None => FIRST_USER_SCHEMA_OID,
+        };
+        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
+        Ok(next_val)
+    }
+
     /// Get the next table ID (auto-increment)
     pub async fn next_table_id(&self, txn: &mut Transaction) -> Result<u64> {
         self.increment_sys_key(txn, encode_next_table_id_key())
@@ -370,6 +438,86 @@ impl TikvStore {
                     .ok_or_else(|| anyhow!("Type OID overflow"))?
             }
             None => FIRST_USER_TYPE_OID,
+        };
+        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
+        Ok(next_val)
+    }
+
+    pub async fn next_sequence_oid(&self, txn: &mut Transaction) -> Result<u32> {
+        const FIRST_SEQUENCE_OID: u32 = 1;
+
+        let key = self.key(&encode_next_sequence_oid_key());
+        let current = txn.get(key.clone()).await?;
+        let next_val = match current {
+            Some(data) => {
+                let oid = u32::from_be_bytes(
+                    data.try_into()
+                        .map_err(|_| anyhow!("Invalid sequence OID format"))?,
+                );
+                oid.checked_add(1)
+                    .ok_or_else(|| anyhow!("Sequence OID overflow"))?
+            }
+            None => FIRST_SEQUENCE_OID,
+        };
+        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
+        Ok(next_val)
+    }
+
+    pub async fn next_function_oid(&self, txn: &mut Transaction) -> Result<u32> {
+        const FIRST_FUNCTION_OID: u32 = 1;
+
+        let key = self.key(&encode_next_function_oid_key());
+        let current = txn.get(key.clone()).await?;
+        let next_val = match current {
+            Some(data) => {
+                let oid = u32::from_be_bytes(
+                    data.try_into()
+                        .map_err(|_| anyhow!("Invalid function OID format"))?,
+                );
+                oid.checked_add(1)
+                    .ok_or_else(|| anyhow!("Function OID overflow"))?
+            }
+            None => FIRST_FUNCTION_OID,
+        };
+        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
+        Ok(next_val)
+    }
+
+    pub async fn next_trigger_oid(&self, txn: &mut Transaction) -> Result<u32> {
+        const FIRST_TRIGGER_OID: u32 = 1;
+
+        let key = self.key(&encode_next_trigger_oid_key());
+        let current = txn.get(key.clone()).await?;
+        let next_val = match current {
+            Some(data) => {
+                let oid = u32::from_be_bytes(
+                    data.try_into()
+                        .map_err(|_| anyhow!("Invalid trigger OID format"))?,
+                );
+                oid.checked_add(1)
+                    .ok_or_else(|| anyhow!("Trigger OID overflow"))?
+            }
+            None => FIRST_TRIGGER_OID,
+        };
+        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
+        Ok(next_val)
+    }
+
+    pub async fn next_view_oid(&self, txn: &mut Transaction) -> Result<u32> {
+        const FIRST_VIEW_OID: u32 = 1;
+
+        let key = self.key(&encode_next_view_oid_key());
+        let current = txn.get(key.clone()).await?;
+        let next_val = match current {
+            Some(data) => {
+                let oid = u32::from_be_bytes(
+                    data.try_into()
+                        .map_err(|_| anyhow!("Invalid view OID format"))?,
+                );
+                oid.checked_add(1)
+                    .ok_or_else(|| anyhow!("View OID overflow"))?
+            }
+            None => FIRST_VIEW_OID,
         };
         txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
         Ok(next_val)
@@ -627,7 +775,11 @@ impl TikvStore {
         }
     }
 
-    pub async fn create_sequence(&self, txn: &mut Transaction, def: SequenceDef) -> Result<()> {
+    pub async fn create_sequence(&self, txn: &mut Transaction, mut def: SequenceDef) -> Result<()> {
+        if def.oid == 0 {
+            def.oid = self.next_sequence_oid(txn).await?;
+        }
+
         let full_name = def.full_name();
         let key = self.key(&encode_sequence_key(&full_name));
         if txn.get(key.clone()).await?.is_some() {
@@ -645,9 +797,29 @@ impl TikvStore {
     ) -> Result<Option<SequenceDef>> {
         let key = self.key(&encode_sequence_key(full_name));
         match txn.get(key).await? {
-            Some(data) => Ok(Some(
-                bincode::deserialize(&data).context("Failed to deserialize sequence definition")?,
-            )),
+            Some(data) => {
+                let mut def: SequenceDef = bincode::deserialize(&data)
+                    .context("Failed to deserialize sequence definition")?;
+                let mut needs_update = false;
+                if def.oid == 0 {
+                    def.oid = self.next_sequence_oid(txn).await?;
+                    needs_update = true;
+                }
+                if def.start_value == 0 {
+                    def.start_value = def.min_value;
+                    needs_update = true;
+                }
+                if def.cache_size == 0 {
+                    def.cache_size = 1;
+                    needs_update = true;
+                }
+                if needs_update {
+                    let data = bincode::serialize(&def)
+                        .context("Failed to serialize sequence definition")?;
+                    txn_put(txn, self.key(&encode_sequence_key(full_name)), data).await?;
+                }
+                Ok(Some(def))
+            }
             None => Ok(None),
         }
     }
@@ -661,8 +833,25 @@ impl TikvStore {
 
         let mut sequences = Vec::new();
         for pair in pairs {
-            let def: SequenceDef =
+            let mut def: SequenceDef =
                 bincode::deserialize(pair.value()).context("Failed to deserialize sequence")?;
+            let mut needs_update = false;
+            if def.oid == 0 {
+                def.oid = self.next_sequence_oid(txn).await?;
+                needs_update = true;
+            }
+            if def.start_value == 0 {
+                def.start_value = def.min_value;
+                needs_update = true;
+            }
+            if def.cache_size == 0 {
+                def.cache_size = 1;
+                needs_update = true;
+            }
+            if needs_update {
+                let data = bincode::serialize(&def).context("Failed to serialize sequence")?;
+                txn_put(txn, self.key(&encode_sequence_key(&def.full_name())), data).await?;
+            }
             sequences.push(def);
         }
         Ok(sequences)
@@ -678,7 +867,11 @@ impl TikvStore {
         }
     }
 
-    pub async fn create_function(&self, txn: &mut Transaction, def: FunctionDef) -> Result<()> {
+    pub async fn create_function(&self, txn: &mut Transaction, mut def: FunctionDef) -> Result<()> {
+        if def.oid == 0 {
+            def.oid = self.next_function_oid(txn).await?;
+        }
+
         let full_name = format!("{}.{}", def.schema, def.name);
         let key = self.key(&encode_function_key(&full_name));
         if txn.get(key.clone()).await?.is_some() {
@@ -689,9 +882,27 @@ impl TikvStore {
         Ok(())
     }
 
-    pub async fn replace_function(&self, txn: &mut Transaction, def: FunctionDef) -> Result<()> {
+    pub async fn replace_function(
+        &self,
+        txn: &mut Transaction,
+        mut def: FunctionDef,
+    ) -> Result<()> {
         let full_name = format!("{}.{}", def.schema, def.name);
         let key = self.key(&encode_function_key(&full_name));
+
+        if def.oid == 0 {
+            if let Some(existing) = txn.get(key.clone()).await? {
+                let existing: FunctionDef = bincode::deserialize(&existing)
+                    .context("Failed to deserialize function definition")?;
+                if existing.oid != 0 {
+                    def.oid = existing.oid;
+                }
+            }
+        }
+        if def.oid == 0 {
+            def.oid = self.next_function_oid(txn).await?;
+        }
+
         let data = bincode::serialize(&def).context("Failed to serialize function definition")?;
         txn_put(txn, key, data).await?;
         Ok(())
@@ -704,9 +915,17 @@ impl TikvStore {
     ) -> Result<Option<FunctionDef>> {
         let key = self.key(&encode_function_key(full_name));
         match txn.get(key).await? {
-            Some(data) => Ok(Some(
-                bincode::deserialize(&data).context("Failed to deserialize function definition")?,
-            )),
+            Some(data) => {
+                let mut def: FunctionDef = bincode::deserialize(&data)
+                    .context("Failed to deserialize function definition")?;
+                if def.oid == 0 {
+                    def.oid = self.next_function_oid(txn).await?;
+                    let data = bincode::serialize(&def)
+                        .context("Failed to serialize function definition")?;
+                    txn_put(txn, self.key(&encode_function_key(full_name)), data).await?;
+                }
+                Ok(Some(def))
+            }
             None => Ok(None),
         }
     }
@@ -720,8 +939,14 @@ impl TikvStore {
 
         let mut funcs = Vec::new();
         for pair in pairs {
-            let def: FunctionDef =
+            let mut def: FunctionDef =
                 bincode::deserialize(pair.value()).context("Failed to deserialize function")?;
+            if def.oid == 0 {
+                def.oid = self.next_function_oid(txn).await?;
+                let data = bincode::serialize(&def).context("Failed to serialize function")?;
+                let full_name = format!("{}.{}", def.schema, def.name);
+                txn_put(txn, self.key(&encode_function_key(&full_name)), data).await?;
+            }
             funcs.push(def);
         }
         Ok(funcs)
@@ -737,7 +962,11 @@ impl TikvStore {
         }
     }
 
-    pub async fn create_trigger(&self, txn: &mut Transaction, def: TriggerDef) -> Result<()> {
+    pub async fn create_trigger(&self, txn: &mut Transaction, mut def: TriggerDef) -> Result<()> {
+        if def.oid == 0 {
+            def.oid = self.next_trigger_oid(txn).await?;
+        }
+
         let key = self.key(&encode_trigger_key(&def.table, def.name.as_str()));
         if txn.get(key.clone()).await?.is_some() {
             return Err(anyhow!(
@@ -759,9 +988,22 @@ impl TikvStore {
     ) -> Result<Option<TriggerDef>> {
         let key = self.key(&encode_trigger_key(table_full_name, trigger_name));
         match txn.get(key).await? {
-            Some(data) => Ok(Some(
-                bincode::deserialize(&data).context("Failed to deserialize trigger definition")?,
-            )),
+            Some(data) => {
+                let mut def: TriggerDef = bincode::deserialize(&data)
+                    .context("Failed to deserialize trigger definition")?;
+                if def.oid == 0 {
+                    def.oid = self.next_trigger_oid(txn).await?;
+                    let data = bincode::serialize(&def)
+                        .context("Failed to serialize trigger definition")?;
+                    txn_put(
+                        txn,
+                        self.key(&encode_trigger_key(table_full_name, trigger_name)),
+                        data,
+                    )
+                    .await?;
+                }
+                Ok(Some(def))
+            }
             None => Ok(None),
         }
     }
@@ -775,8 +1017,18 @@ impl TikvStore {
 
         let mut triggers = Vec::new();
         for pair in pairs {
-            let def: TriggerDef =
+            let mut def: TriggerDef =
                 bincode::deserialize(pair.value()).context("Failed to deserialize trigger")?;
+            if def.oid == 0 {
+                def.oid = self.next_trigger_oid(txn).await?;
+                let data = bincode::serialize(&def).context("Failed to serialize trigger")?;
+                txn_put(
+                    txn,
+                    self.key(&encode_trigger_key(&def.table, def.name.as_str())),
+                    data,
+                )
+                .await?;
+            }
             triggers.push(def);
         }
         Ok(triggers)
@@ -1105,15 +1357,49 @@ impl TikvStore {
         if txn.get(key.clone()).await?.is_some() {
             return Err(anyhow!("View '{}' already exists", name));
         }
-        txn_put(txn, key, query.as_bytes().to_vec()).await?;
+
+        let (schema, view_name) = name.split_once('.').unwrap_or(("public", name));
+        let oid = self.next_view_oid(txn).await?;
+        let def = ViewDef {
+            oid,
+            schema: schema.to_string(),
+            name: view_name.to_string(),
+            query: query.to_string(),
+        };
+        let data = bincode::serialize(&def).context("Failed to serialize view definition")?;
+        txn_put(txn, key, data).await?;
         info!("Created view '{}'", name);
         Ok(())
     }
 
-    pub async fn get_view(&self, txn: &mut Transaction, name: &str) -> Result<Option<String>> {
+    pub async fn get_view(&self, txn: &mut Transaction, name: &str) -> Result<Option<ViewDef>> {
         let key = self.key(&encode_view_key(name));
-        match txn.get(key).await? {
-            Some(data) => Ok(Some(String::from_utf8(data)?)),
+        match txn.get(key.clone()).await? {
+            Some(data) => match bincode::deserialize::<ViewDef>(&data) {
+                Ok(mut def) => {
+                    if def.oid == 0 {
+                        def.oid = self.next_view_oid(txn).await?;
+                        let updated =
+                            bincode::serialize(&def).context("Failed to serialize view")?;
+                        txn_put(txn, key, updated).await?;
+                    }
+                    Ok(Some(def))
+                }
+                Err(_) => {
+                    let query = String::from_utf8(data)?;
+                    let (schema, view_name) = name.split_once('.').unwrap_or(("public", name));
+                    let oid = self.next_view_oid(txn).await?;
+                    let def = ViewDef {
+                        oid,
+                        schema: schema.to_string(),
+                        name: view_name.to_string(),
+                        query,
+                    };
+                    let updated = bincode::serialize(&def).context("Failed to serialize view")?;
+                    txn_put(txn, key, updated).await?;
+                    Ok(Some(def))
+                }
+            },
             None => Ok(None),
         }
     }
@@ -1129,7 +1415,7 @@ impl TikvStore {
         }
     }
 
-    pub async fn list_views(&self, txn: &mut Transaction) -> Result<Vec<String>> {
+    pub async fn list_views(&self, txn: &mut Transaction) -> Result<Vec<ViewDef>> {
         let prefix = encode_view_prefix();
         let mut end = prefix.clone();
         end.push(0xFF);
@@ -1137,10 +1423,37 @@ impl TikvStore {
         let pairs = txn.scan(range, SCAN_LIMIT).await?;
         let mut views = Vec::new();
         for pair in pairs {
-            let key: &[u8] = pair.key().as_ref().into();
-            if key.starts_with(&prefix) {
-                let name = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
-                views.push(name);
+            let key_bytes: &[u8] = pair.key().as_ref().into();
+            if !key_bytes.starts_with(&prefix) {
+                continue;
+            }
+            let name = String::from_utf8_lossy(&key_bytes[prefix.len()..]).to_string();
+            let key = self.key(&encode_view_key(&name));
+
+            match bincode::deserialize::<ViewDef>(pair.value()) {
+                Ok(mut def) => {
+                    if def.oid == 0 {
+                        def.oid = self.next_view_oid(txn).await?;
+                        let updated =
+                            bincode::serialize(&def).context("Failed to serialize view")?;
+                        txn_put(txn, key, updated).await?;
+                    }
+                    views.push(def);
+                }
+                Err(_) => {
+                    let query = String::from_utf8_lossy(pair.value()).to_string();
+                    let (schema, view_name) = name.split_once('.').unwrap_or(("public", &name));
+                    let oid = self.next_view_oid(txn).await?;
+                    let def = ViewDef {
+                        oid,
+                        schema: schema.to_string(),
+                        name: view_name.to_string(),
+                        query,
+                    };
+                    let updated = bincode::serialize(&def).context("Failed to serialize view")?;
+                    txn_put(txn, key, updated).await?;
+                    views.push(def);
+                }
             }
         }
         Ok(views)

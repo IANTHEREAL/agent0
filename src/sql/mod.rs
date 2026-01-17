@@ -1,5 +1,6 @@
 //! SQL parsing and execution
 
+mod catalog_oids;
 mod ddl;
 mod dml;
 mod executor;

@@ -575,3 +575,64 @@ Fix `pg_get_indexdef(oid)` so it respects its OID argument and works outside of 
 
 - Sequences (CREATE SEQUENCE / nextval / SERIAL): implementation facts + code locations in `.codex/knowledge/sequences.md`.
 - User-defined types (ENUM / Composite): implementation facts + code locations in `.codex/knowledge/udt_enum_composite.md`.
+
+# Work: System Catalog Coverage (pg_catalog / information_schema)
+
+## Feature Request
+
+Implement the feature described in `docs/design/11_system_catalog_coverage.md`:
+- Provide pg_catalog / information_schema coverage that is “real enough” and joinable for ORM migrations/introspection.
+- Ensure OID generation is stable across restarts/queries for join-heavy catalogs (namespace/class/type/function/sequence).
+- Fill key missing catalogs used by ORMs: `pg_attrdef`, `pg_sequence`, `pg_tables`, `pg_views` (and harden `pg_proc`).
+
+## Agent Work Plan
+
+### 0) Repo Work Tracking + Knowledge Base
+- [x] Read existing `.codex/knowledge/*` relevant to catalogs/OIDs (schemas, sequences, pgwire Describe).
+- [x] Create/update `.codex/knowledge/system_catalog_coverage.md` with concrete facts + code locations.
+- [x] Update this `WORK.md` continuously (plan + progress) while implementing.
+
+### 1) Stable OID Strategy (schemas / classes / functions / sequences)
+- [x] Replace unstable per-query OID assignment in `src/sql/information_schema.rs` with stable OIDs:
+  - [x] `pg_namespace.oid`: built-ins fixed; user schemas get persistent OIDs (not derived from sorted schema list).
+  - [x] `pg_class.oid`: tables derived from stable `table_id`; indexes derived from `(table_id, index_id)`; sequences/views get stable OIDs.
+  - [x] Update all dependent joins: `pg_index`, `pg_attribute`, `pg_constraint`, `pg_trigger`.
+- [x] Storage support for persistent OIDs where needed:
+  - [x] schema OIDs stored under `_sys_schemadef_*` (or an adjacent catalog key) + `_sys_next_schema_oid`.
+  - [x] sequence/function/trigger defs carry persistent OIDs + `_sys_next_*_oid` allocators.
+- [x] Keep `pg_get_indexdef(oid)` lookup logic consistent with the new OID strategy (no mirroring drift).
+
+### 2) Add Missing System Catalog Tables (ORM MVP)
+- [x] `src/sql/information_schema.rs`: add schemas + rows for:
+  - [x] `pg_attrdef` (column defaults; supports `pg_get_expr(def.adbin, def.adrelid)` patterns).
+  - [x] `pg_sequence` (sequence metadata; joinable via `seqrelid`).
+  - [x] `pg_tables` and `pg_views` (common introspection entry points).
+  - [x] `pg_depend` for owned-by dependencies (implicit SERIAL sequences).
+- [x] Fix boolean-ish pg_catalog columns to use boolean types/values where ORMs expect it:
+  - [x] `pg_index.indis*` and `pg_index.indimmediate` → `BOOLEAN` (`Value::Boolean`).
+  - [x] `pg_attribute.attnotnull/atthasdef/attisdropped/attislocal` → `BOOLEAN`.
+  - [x] `pg_class.relhasindex/relispopulated/relispartition` → `BOOLEAN`.
+
+### 3) `pg_proc` Minimal Builtins + Function Helpers
+- [x] Ensure `pg_catalog.pg_proc` includes a minimal builtin set used by ORMs:
+  - [x] `format_type`, `pg_get_expr`, `pg_get_indexdef`, `pg_get_constraintdef`, `version`, `current_schema`, `current_database`, etc.
+  - [x] OIDs + namespaces stable and joinable (`pg_namespace`).
+- [x] Improve function evaluation stubs to be ORM-friendly:
+  - [x] `PG_GET_EXPR` returns the first argument (text) instead of always NULL.
+  - [x] `PG_GET_CONSTRAINTDEF` returns row-context `constraintdef` when available (mirrors `PG_GET_INDEXDEF` behavior).
+  - [x] `FORMAT_TYPE` returns user-defined type names when `pg_type` is joined in the same row context (JOIN evaluator).
+
+### 4) SQL Integration Coverage (ORM Introspection Queries)
+- [x] Add `tests/55_pg_catalog_introspection.sql` containing common ORM introspection query fragments (Sequelize/TypeORM-style).
+- [ ] Ensure queries do not error and key joins return non-empty/consistent rows (enums/sequences/defaults/indexes/constraints).
+
+### 5) Verification
+- [x] Run `cargo fmt -- --check`.
+- [x] Run `CARGO_NET_OFFLINE=true cargo test -q`.
+
+### Progress Notes
+- Implemented stable OIDs across join-heavy catalogs and added `pg_attrdef`/`pg_sequence`/`pg_tables`/`pg_views`.
+- Added minimal `pg_depend` rows for implicit SERIAL sequence ownership.
+- Added ORM-style introspection regression SQL (`tests/55_pg_catalog_introspection.sql` + `.assert`).
+- `cargo fmt -- --check` and `CARGO_NET_OFFLINE=true cargo test -q` pass.
+- SQL integration verification requires a running server (e.g. `./run_tests.sh`).
