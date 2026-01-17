@@ -116,6 +116,7 @@ impl Executor {
                     .as_ref()
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "subquery".to_string());
+                let alias_columns = alias.as_ref().map(|a| a.columns.as_slice()).unwrap_or(&[]);
                 let (schema, rows) = self
                     .execute_derived_table(
                         txn,
@@ -123,6 +124,7 @@ impl Executor {
                         search_path,
                         subquery,
                         &alias_name,
+                        alias_columns,
                         ctes,
                     )
                     .await?;

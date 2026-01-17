@@ -123,21 +123,215 @@ fn preprocess_create_sequence(sql: &str) -> Option<String> {
 }
 
 /// Rewrite `expr op ALL (SELECT ...)` and `expr op ANY (SELECT ...)` patterns
-/// to equivalent forms that sqlparser 0.40 can handle.
+/// into equivalent forms that `sqlparser` can parse.
 ///
-/// Transformations:
-/// - `x >= ALL (SELECT col FROM ...)` → `x >= (SELECT MAX(col) FROM ...)`
-/// - `x <= ALL (SELECT col FROM ...)` → `x <= (SELECT MIN(col) FROM ...)`
-/// - `x > ALL (SELECT col FROM ...)`  → `x > (SELECT MAX(col) FROM ...)`
-/// - `x < ALL (SELECT col FROM ...)`  → `x < (SELECT MIN(col) FROM ...)`
-/// - `x = ALL (SELECT col FROM ...)`  → `NOT EXISTS (SELECT 1 FROM ... WHERE col <> x)`
-/// - `x > ANY (SELECT col FROM ...)`  → `x > (SELECT MIN(col) FROM ...)`
-/// - `x >= ANY (SELECT col FROM ...)` → `x >= (SELECT MIN(col) FROM ...)`
-/// - `x < ANY (SELECT col FROM ...)`  → `x < (SELECT MAX(col) FROM ...)`
-/// - `x <= ANY (SELECT col FROM ...)` → `x <= (SELECT MAX(col) FROM ...)`
-/// - `x = ANY (SELECT col FROM ...)`  → `x IN (SELECT col FROM ...)`
+/// Notes:
+/// - Empty subquery: `ALL(empty)` is true, `ANY(empty)` is false.
+/// - `NULL` values: the result can be `NULL` (unknown) per SQL 3-valued logic.
+/// - The rewrite preserves these edge cases via `COUNT(*)` / `COUNT(val)` checks.
 fn rewrite_all_any_subqueries(sql: &str) -> String {
     let mut result = sql.to_string();
+
+    const DERIVED_ALIAS: &str = "__pgtikv_all_any";
+    const DERIVED_COL: &str = "__pgtikv_val";
+
+    fn scalar_over_subquery(subquery: &str, select_expr: &str) -> String {
+        format!(
+            "(SELECT {} FROM ({}) AS {}({}))",
+            select_expr, subquery, DERIVED_ALIAS, DERIVED_COL
+        )
+    }
+
+    fn count_all(subquery: &str) -> String {
+        scalar_over_subquery(subquery, "COUNT(*)")
+    }
+
+    fn count_nonnull(subquery: &str) -> String {
+        scalar_over_subquery(subquery, "COUNT(__pgtikv_val)")
+    }
+
+    fn max_val(subquery: &str) -> String {
+        scalar_over_subquery(subquery, "MAX(__pgtikv_val)")
+    }
+
+    fn min_val(subquery: &str) -> String {
+        scalar_over_subquery(subquery, "MIN(__pgtikv_val)")
+    }
+
+    fn cast_bool(expr: &str) -> String {
+        format!("CAST({} AS BOOLEAN)", expr)
+    }
+
+    fn rewrite_all(expr: &str, op: &str, subquery: &str) -> Option<String> {
+        let expr = format!("({})", expr);
+        let cnt_all = count_all(subquery);
+        let cnt_nonnull = count_nonnull(subquery);
+        let has_nulls = format!("{} < {}", cnt_nonnull, cnt_all);
+
+        let rewritten = match op {
+            ">=" => {
+                let max = max_val(subquery);
+                format!(
+                    "({})",
+                    format!(
+                        "CASE WHEN {} = 0 THEN TRUE \
+                         WHEN {} IS NULL THEN NULL \
+                         WHEN {} < {} THEN FALSE \
+                         WHEN {} THEN NULL \
+                         ELSE TRUE END",
+                        cnt_all, expr, expr, max, has_nulls
+                    )
+                )
+            }
+            ">" => {
+                let max = max_val(subquery);
+                format!(
+                    "({})",
+                    format!(
+                        "CASE WHEN {} = 0 THEN TRUE \
+                         WHEN {} IS NULL THEN NULL \
+                         WHEN {} <= {} THEN FALSE \
+                         WHEN {} THEN NULL \
+                         ELSE TRUE END",
+                        cnt_all, expr, expr, max, has_nulls
+                    )
+                )
+            }
+            "<=" => {
+                let min = min_val(subquery);
+                format!(
+                    "({})",
+                    format!(
+                        "CASE WHEN {} = 0 THEN TRUE \
+                         WHEN {} IS NULL THEN NULL \
+                         WHEN {} > {} THEN FALSE \
+                         WHEN {} THEN NULL \
+                         ELSE TRUE END",
+                        cnt_all, expr, expr, min, has_nulls
+                    )
+                )
+            }
+            "<" => {
+                let min = min_val(subquery);
+                format!(
+                    "({})",
+                    format!(
+                        "CASE WHEN {} = 0 THEN TRUE \
+                         WHEN {} IS NULL THEN NULL \
+                         WHEN {} >= {} THEN FALSE \
+                         WHEN {} THEN NULL \
+                         ELSE TRUE END",
+                        cnt_all, expr, expr, min, has_nulls
+                    )
+                )
+            }
+            "=" | "==" => {
+                let min = min_val(subquery);
+                let max = max_val(subquery);
+                format!(
+                    "({})",
+                    format!(
+                        "CASE WHEN {} = 0 THEN TRUE \
+                         WHEN {} IS NULL THEN NULL \
+                         WHEN {} = 0 THEN NULL \
+                         WHEN {} = {} AND {} = {} THEN \
+                             CASE WHEN {} THEN NULL ELSE TRUE END \
+                         ELSE FALSE END",
+                        cnt_all, expr, cnt_nonnull, expr, min, expr, max, has_nulls
+                    )
+                )
+            }
+            "<>" | "!=" => format!("({} NOT IN ({}))", expr, subquery),
+            _ => return None,
+        };
+
+        Some(cast_bool(&rewritten))
+    }
+
+    fn rewrite_any(expr: &str, op: &str, subquery: &str) -> Option<String> {
+        let expr = format!("({})", expr);
+        let cnt_all = count_all(subquery);
+        let cnt_nonnull = count_nonnull(subquery);
+        let has_nulls = format!("{} < {}", cnt_nonnull, cnt_all);
+
+        let rewritten = match op {
+            ">" => {
+                let min = min_val(subquery);
+                format!(
+                    "({})",
+                    format!(
+                        "CASE WHEN {} = 0 THEN FALSE \
+                         WHEN {} IS NULL THEN NULL \
+                         WHEN {} > {} THEN TRUE \
+                         WHEN {} THEN NULL \
+                         ELSE FALSE END",
+                        cnt_all, expr, expr, min, has_nulls
+                    )
+                )
+            }
+            ">=" => {
+                let min = min_val(subquery);
+                format!(
+                    "({})",
+                    format!(
+                        "CASE WHEN {} = 0 THEN FALSE \
+                         WHEN {} IS NULL THEN NULL \
+                         WHEN {} >= {} THEN TRUE \
+                         WHEN {} THEN NULL \
+                         ELSE FALSE END",
+                        cnt_all, expr, expr, min, has_nulls
+                    )
+                )
+            }
+            "<" => {
+                let max = max_val(subquery);
+                format!(
+                    "({})",
+                    format!(
+                        "CASE WHEN {} = 0 THEN FALSE \
+                         WHEN {} IS NULL THEN NULL \
+                         WHEN {} < {} THEN TRUE \
+                         WHEN {} THEN NULL \
+                         ELSE FALSE END",
+                        cnt_all, expr, expr, max, has_nulls
+                    )
+                )
+            }
+            "<=" => {
+                let max = max_val(subquery);
+                format!(
+                    "({})",
+                    format!(
+                        "CASE WHEN {} = 0 THEN FALSE \
+                         WHEN {} IS NULL THEN NULL \
+                         WHEN {} <= {} THEN TRUE \
+                         WHEN {} THEN NULL \
+                         ELSE FALSE END",
+                        cnt_all, expr, expr, max, has_nulls
+                    )
+                )
+            }
+            "=" | "==" => format!("({} IN ({}))", expr, subquery),
+            "<>" | "!=" => {
+                let min = min_val(subquery);
+                let max = max_val(subquery);
+                format!(
+                    "({})",
+                    format!(
+                        "CASE WHEN {} = 0 THEN FALSE \
+                         WHEN {} IS NULL THEN NULL \
+                         WHEN {} <> {} OR {} <> {} THEN TRUE \
+                         WHEN {} THEN NULL \
+                         ELSE FALSE END",
+                        cnt_all, expr, expr, min, expr, max, has_nulls
+                    )
+                )
+            }
+            _ => return None,
+        };
+
+        Some(cast_bool(&rewritten))
+    }
 
     // Match: expr OP ALL (SELECT ...) or expr OP ANY (SELECT ...)
     let all_pattern =
@@ -157,16 +351,10 @@ fn rewrite_all_any_subqueries(sql: &str) -> String {
         let select_pos = full_match.end() - select_start.len();
 
         if let Some((subquery, end_pos)) = extract_subquery(&result, select_pos) {
-            // subquery is "SELECT col FROM ..." (without outer parens)
-            // We need to wrap col with MAX/MIN
-            let replacement = match op.to_uppercase().as_str() {
-                ">=" => wrap_subquery_with_agg(expr, ">=", &subquery, "MAX"),
-                "<=" => wrap_subquery_with_agg(expr, "<=", &subquery, "MIN"),
-                ">" => wrap_subquery_with_agg(expr, ">", &subquery, "MAX"),
-                "<" => wrap_subquery_with_agg(expr, "<", &subquery, "MIN"),
-                "=" | "==" => wrap_subquery_with_agg(expr, "=", &subquery, "MIN"),
-                "<>" | "!=" => format!("{} NOT IN ({})", expr, subquery),
-                _ => continue,
+            let op_upper = op.to_uppercase();
+            let replacement = match rewrite_all(expr, op_upper.as_str(), &subquery) {
+                Some(r) => r,
+                None => continue,
             };
 
             result = format!(
@@ -191,14 +379,10 @@ fn rewrite_all_any_subqueries(sql: &str) -> String {
         let select_pos = full_match.end() - select_start.len();
 
         if let Some((subquery, end_pos)) = extract_subquery(&result, select_pos) {
-            let replacement = match op.to_uppercase().as_str() {
-                ">" => wrap_subquery_with_agg(expr, ">", &subquery, "MIN"),
-                ">=" => wrap_subquery_with_agg(expr, ">=", &subquery, "MIN"),
-                "<" => wrap_subquery_with_agg(expr, "<", &subquery, "MAX"),
-                "<=" => wrap_subquery_with_agg(expr, "<=", &subquery, "MAX"),
-                "=" | "==" => format!("{} IN ({})", expr, subquery),
-                "<>" | "!=" => wrap_subquery_with_agg(expr, "<>", &subquery, "MIN"),
-                _ => continue,
+            let op_upper = op.to_uppercase();
+            let replacement = match rewrite_any(expr, op_upper.as_str(), &subquery) {
+                Some(r) => r,
+                None => continue,
             };
 
             result = format!(
@@ -215,49 +399,12 @@ fn rewrite_all_any_subqueries(sql: &str) -> String {
     result
 }
 
-/// Transform "SELECT col FROM ..." to "SELECT AGG(col) FROM ..." and build comparison
-fn wrap_subquery_with_agg(expr: &str, op: &str, subquery: &str, agg: &str) -> String {
-    // subquery format: "SELECT col FROM table WHERE ..."
-    // We need to extract "col" and wrap it with the aggregate function
-    let upper = subquery.to_uppercase();
-    if let Some(from_pos) = upper.find(" FROM ") {
-        let col_part = &subquery[7..from_pos]; // After "SELECT " before " FROM"
-        let rest = &subquery[from_pos..];
-        format!(
-            "{} {} (SELECT {}({}){})",
-            expr,
-            op,
-            agg,
-            col_part.trim(),
-            rest
-        )
-    } else {
-        // Fallback: just use the subquery as-is (shouldn't happen for valid SQL)
-        format!("{} {} ({})", expr, op, subquery)
-    }
-}
-
 /// Extract a subquery starting at the given position, handling nested parentheses.
 /// Returns the subquery string (including SELECT) and the position after the closing paren.
 fn extract_subquery(sql: &str, start: usize) -> Option<(String, usize)> {
     let bytes = sql.as_bytes();
     let mut depth = 1; // We're already inside the opening paren
     let mut pos = start;
-
-    // Find where the subquery content starts (after the opening paren we're inside)
-    // The start position is at "SELECT", and we need to find the matching close paren
-
-    // First, find where the opening paren was (before start)
-    let mut open_paren_pos = start;
-    for i in (0..start).rev() {
-        if bytes[i] == b'(' {
-            open_paren_pos = i;
-            break;
-        }
-    }
-
-    // Now scan forward from start to find the matching close paren
-    pos = start;
     while pos < bytes.len() {
         match bytes[pos] {
             b'(' => depth += 1,
@@ -429,6 +576,36 @@ mod tests {
             "EXPLAIN ANALYZE SELECT 1"
         );
         assert_eq!(preprocess_sql("SELECT 1"), "SELECT 1");
+    }
+
+    #[test]
+    fn test_rewrite_all_any_subqueries_parses() {
+        let sql = "SELECT 1 = ALL (SELECT x FROM t)";
+        let stmts = parse_sql(sql).unwrap();
+        assert_eq!(stmts.len(), 1);
+
+        let sql = "SELECT 1 > ANY (SELECT x FROM t)";
+        let stmts = parse_sql(sql).unwrap();
+        assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn test_rewrite_all_any_subqueries_all_eq_uses_min_max_and_null_handling() {
+        let preprocessed = preprocess_sql("SELECT a = ALL (SELECT DISTINCT x FROM t)");
+        assert!(preprocessed.contains("MIN(__pgtikv_val)"));
+        assert!(preprocessed.contains("MAX(__pgtikv_val)"));
+        assert!(preprocessed.contains("COUNT(*)"));
+        assert!(preprocessed.contains("COUNT(__pgtikv_val)"));
+        assert!(preprocessed.contains("SELECT DISTINCT x FROM t"));
+    }
+
+    #[test]
+    fn test_rewrite_all_any_subqueries_empty_and_null_semantics_checks_present() {
+        let preprocessed = preprocess_sql("SELECT a >= ALL (SELECT x FROM t)");
+        assert!(preprocessed.contains("CASE WHEN"));
+        assert!(preprocessed.contains("= 0 THEN TRUE"));
+        assert!(preprocessed.contains("COUNT(__pgtikv_val)"));
+        assert!(preprocessed.contains("< (SELECT COUNT(*)"));
     }
 
     #[test]

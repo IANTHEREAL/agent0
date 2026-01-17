@@ -3,7 +3,8 @@
 use super::executor::Executor;
 use super::helpers::{
     apply_offset_limit_fetch, collect_having_agg_funcs, dedup_rows,
-    distinct_on_rows_join_with_indices, eval_having_expr_join, get_select_item_name, AggExpr,
+    distinct_on_rows_join_with_indices, eval_having_expr_join, get_select_item_name,
+    normalize_ident, AggExpr,
 };
 use super::names;
 use super::sequences;
@@ -221,6 +222,7 @@ impl Executor {
         search_path: &'a [String],
         subquery: &'a Query,
         alias: &'a str,
+        alias_columns: &'a [Ident],
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(TableSchema, Vec<Row>)>> + Send + 'a>,
@@ -235,10 +237,21 @@ impl Executor {
                     column_types: _,
                     rows,
                 } => {
+                    let column_names = if alias_columns.is_empty() {
+                        columns
+                    } else if alias_columns.len() != columns.len() {
+                        return Err(anyhow!(
+                            "Derived table alias column count mismatch: expected {}, got {}",
+                            columns.len(),
+                            alias_columns.len()
+                        ));
+                    } else {
+                        alias_columns.iter().map(normalize_ident).collect()
+                    };
                     let schema = TableSchema {
                         table_id: 0,
                         name: alias.to_string(),
-                        columns: columns
+                        columns: column_names
                             .iter()
                             .map(|n| ColumnDef {
                                 name: n.clone(),
@@ -312,6 +325,7 @@ impl Executor {
                         .as_ref()
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| "subquery".to_string());
+                    let alias_columns = alias.as_ref().map(|a| a.columns.as_slice()).unwrap_or(&[]);
                     let (schema, rows) = self
                         .execute_derived_table(
                             txn,
@@ -319,6 +333,7 @@ impl Executor {
                             search_path,
                             subquery,
                             &alias_name,
+                            alias_columns,
                             ctes,
                         )
                         .await?;
@@ -572,6 +587,7 @@ impl Executor {
                     .as_ref()
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| "subquery".to_string());
+                let alias_columns = alias.as_ref().map(|a| a.columns.as_slice()).unwrap_or(&[]);
                 let (schema, rows) = self
                     .execute_derived_table(
                         txn,
@@ -579,6 +595,7 @@ impl Executor {
                         search_path,
                         subquery,
                         &alias_name,
+                        alias_columns,
                         ctes,
                     )
                     .await?;
@@ -627,6 +644,7 @@ impl Executor {
                         .as_ref()
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| "subquery".to_string());
+                    let alias_columns = alias.as_ref().map(|a| a.columns.as_slice()).unwrap_or(&[]);
                     let (schema, rows) = self
                         .execute_derived_table(
                             txn,
@@ -634,6 +652,7 @@ impl Executor {
                             search_path,
                             subquery,
                             &alias_name,
+                            alias_columns,
                             ctes,
                         )
                         .await?;
@@ -687,6 +706,8 @@ impl Executor {
                             .as_ref()
                             .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| "subquery".to_string());
+                        let alias_columns =
+                            alias.as_ref().map(|a| a.columns.as_slice()).unwrap_or(&[]);
                         let (schema, rows) = self
                             .execute_derived_table(
                                 txn,
@@ -694,6 +715,7 @@ impl Executor {
                                 search_path,
                                 subquery,
                                 &alias_name,
+                                alias_columns,
                                 ctes,
                             )
                             .await?;
@@ -749,6 +771,7 @@ impl Executor {
                         .as_ref()
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| "subquery".to_string());
+                    let alias_columns = alias.as_ref().map(|a| a.columns.as_slice()).unwrap_or(&[]);
                     let (schema, rows) = self
                         .execute_derived_table(
                             txn,
@@ -756,6 +779,7 @@ impl Executor {
                             search_path,
                             subquery,
                             &alias_name,
+                            alias_columns,
                             ctes,
                         )
                         .await?;

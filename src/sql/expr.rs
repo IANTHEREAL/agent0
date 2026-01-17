@@ -105,6 +105,9 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             negated,
         } => {
             let val = eval_expr_join(expr, ctx)?;
+            if list.is_empty() {
+                return Ok(Value::Boolean(*negated));
+            }
             if matches!(val, Value::Null) {
                 return Ok(Value::Null);
             }
