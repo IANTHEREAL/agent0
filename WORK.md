@@ -888,6 +888,108 @@ Integration tests revealed multiple PostgreSQL compatibility gaps. This work ite
 
 **Tests passing**: 266 unit tests, tests/57_type_casting.sql, tests/58_string_functions.sql, tests/59_math_functions.sql
 
+### 2026-01-17 (new tests round 2)
+Created 5 more integration tests. Discrepancies found below - **awaiting admin decision**.
+
+---
+
+## Test Discrepancy Analysis (Awaiting Decision)
+
+### Test 62: Array Operations (`tests/62_array_operations.sql`)
+
+| Issue | PostgreSQL | pg-tikv | Category |
+|-------|------------|---------|----------|
+| Text array format | `{a,b,c}` | `{"a","b","c"}` | Format difference |
+| Array concatenation `\|\|` | `{1,2,3,4}` | `{1,2}{3,4}` | **Bug** - not concatenating |
+| Array append `ARRAY \|\| elem` | `{1,2,3}` | `{1,2}3` | **Bug** - not appending |
+| Array prepend `elem \|\| ARRAY` | `{0,1,2}` | `0{1,2}` | **Bug** - not prepending |
+| `&&` overlap operator | Works | `Unsupported binary operator: PGOverlap` | **Missing feature** |
+| `ARRAY_TO_STRING` | Works | `Unsupported function` | **Missing function** |
+| `STRING_TO_ARRAY` | Works | `Unsupported function` | **Missing function** |
+| `UNNEST` | Returns all rows | Returns only first row | **Bug** |
+
+**Recommendation**: Array concatenation and UNNEST are significant bugs. ARRAY_TO_STRING/STRING_TO_ARRAY are useful functions.
+
+---
+
+### Test 63: Aggregate Functions (`tests/63_aggregate_functions.sql`)
+
+| Issue | PostgreSQL | pg-tikv | Category |
+|-------|------------|---------|----------|
+| `COUNT(DISTINCT col)` | `3` | `6` | **Bug** - not deduplicating |
+| `AVG(int)` precision | `30.0000000000000000` | `30` | Format difference |
+| `AVG(numeric)` precision | `200.4000000000000000` | `200.40` | Format difference |
+| `BOOL_AND` | Works | `Unsupported function` | **Missing function** |
+| `BOOL_OR` | Works | `Unsupported function` | **Missing function** |
+| `STRING_AGG(DISTINCT ...)` | `A-B-C` | `A-A-B-B-B-C` | **Bug** - DISTINCT ignored |
+
+**Recommendation**: COUNT(DISTINCT) and STRING_AGG(DISTINCT) bugs are significant. AVG precision is a format issue.
+
+---
+
+### Test 64: Subquery Patterns (`tests/64_subquery_patterns.sql`)
+
+| Issue | PostgreSQL | pg-tikv | Category |
+|-------|------------|---------|----------|
+| Scalar subquery in SELECT | `1.9500000000000000` | `1.95` | Format difference (precision) |
+| `>= ALL (subquery)` | Works | `SQL parse error` | **Missing feature** |
+| `> ANY (subquery)` | Works | `SQL parse error` | **Missing feature** |
+
+**Recommendation**: ALL/ANY with subqueries are useful PostgreSQL features. Precision is format only.
+
+---
+
+### Test 65: CASE Expressions (`tests/65_case_expressions.sql`)
+
+| Issue | PostgreSQL | pg-tikv | Category |
+|-------|------------|---------|----------|
+| COALESCE result alignment | Right-aligned integer | Left-aligned | Minor format difference |
+
+**Result**: ✅ Almost fully compatible! Only minor formatting differences.
+
+---
+
+### Test 66: Window Functions Advanced (`tests/66_window_functions_advanced.sql`)
+
+| Issue | PostgreSQL | pg-tikv | Category |
+|-------|------------|---------|----------|
+| Result ordering (no explicit ORDER BY) | Ordered by window order | Original order | Expected - need ORDER BY |
+| `FIRST_VALUE` | Works | `Unsupported window function` | **Missing function** |
+| `ROWS BETWEEN` frame | Computes correctly | Ignores frame clause | **Bug** - frame not applied |
+| AVG precision | `143.3333333333333333` | `143.33333333333334` | Float vs Decimal |
+
+**Recommendation**: FIRST_VALUE is useful. ROWS BETWEEN bug is significant for analytics.
+
+---
+
+## Summary of Issues by Priority
+
+### High Priority (Bugs)
+1. **COUNT(DISTINCT)** - returns wrong count
+2. **STRING_AGG(DISTINCT)** - DISTINCT ignored
+3. **Array concatenation** - `||` doesn't concatenate
+4. **UNNEST** - only returns first row
+5. **ROWS BETWEEN** - frame clause ignored in window functions
+
+### Medium Priority (Missing Features)
+1. `ARRAY_TO_STRING` / `STRING_TO_ARRAY` functions
+2. `BOOL_AND` / `BOOL_OR` aggregate functions
+3. `FIRST_VALUE` / `LAST_VALUE` window functions
+4. `>= ALL` / `> ANY` subquery operators
+5. `&&` array overlap operator
+
+### Low Priority (Format Differences)
+1. AVG() decimal precision display
+2. Text array quoting format
+3. Column alignment in output
+
+---
+
+**Administrator Decision Needed:**
+1. Which bugs should be fixed immediately?
+2. Which missing features should be added?
+3. Should format differences be accepted as pg-tikv behavior?
+
 ### 2026-01-17 (initial)
 - Created 6 new integration test files covering NULL handling, type casting, string/math/datetime functions, and JOINs
 - Generated PostgreSQL expected outputs
