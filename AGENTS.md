@@ -105,10 +105,120 @@ When TiKV client is created with `Config::default().with_keyspace(ks)`, all keys
 - **AVOID** `eval_expr` vs `eval_expr_join` confusion (single table vs JOIN context)
 - **NEVER** store data outside keyspace isolation (see Design Principles above)
 
+## Integration Testing
+
+### Test Framework
+
+Tests are in `tests/` directory. Run with `./run_tests.sh` or `python3 scripts/integration_test.py`.
+
+| File Type | Purpose |
+|-----------|---------|
+| `.sql` | Test input |
+| `.expected` | Expected output (exact match) |
+| `.assert` | Partial match (each line must appear in output) |
+| `.errors` | Expected error patterns |
+| `_setup.sql` | Pre-test setup |
+| `_load.py` | Data loading script |
+
+### Writing Deterministic Tests
+
+**Problem**: TiKV row order is non-deterministic. Tests must not depend on insertion order.
+
+#### Always add ORDER BY
+```sql
+-- BAD: order depends on storage
+SELECT * FROM users;
+
+-- GOOD: deterministic order
+SELECT * FROM users ORDER BY id;
+```
+
+#### Use fixed values for dynamic data
+```sql
+-- BAD: changes every run
+CREATE TABLE t (created_at TIMESTAMP DEFAULT NOW());
+
+-- GOOD: fixed timestamp
+CREATE TABLE t (created_at TIMESTAMP DEFAULT '2024-01-15 10:00:00');
+```
+
+#### Avoid selecting random/dynamic columns
+```sql
+-- BAD: UUID is random
+SELECT * FROM users;  -- includes uuid column
+
+-- GOOD: select specific columns
+SELECT name, email FROM users ORDER BY name;
+
+-- For UUID validation, check format not value
+SELECT LENGTH(gen_random_uuid()::text) AS uuid_length;  -- always 36
+```
+
+#### Handle materialized view internal columns
+```sql
+-- BAD: _mv_rowid is internal and may appear
+SELECT * FROM my_mv;
+
+-- GOOD: explicit columns
+SELECT col1, col2 FROM my_mv ORDER BY col1;
+```
+
+### When to Use Each File Type
+
+| Scenario | Use |
+|----------|-----|
+| Exact output match | `.expected` |
+| Dynamic execution time (EXPLAIN ANALYZE) | `.assert` |
+| Known unsupported features | `.errors` |
+| Non-deterministic order (last resort) | `.expected` with `# unordered` first line |
+
+### Test File Examples
+
+**Stable test (.expected)**:
+```sql
+-- test.sql
+SELECT id, name FROM users ORDER BY id;
+```
+```
+-- test.expected
+id|name
+1|Alice
+2|Bob
+(2 rows)
+```
+
+**Dynamic output (.assert)**:
+```
+-- Only for truly dynamic content like execution time
+Seq Scan on users
+Filter: (active = true)
+Actual Rows:
+Execution Time:
+```
+
+**Known errors (.errors)**:
+```
+-- One pattern per line
+Unsupported function in JOIN: count
+```
+
+### Common Pitfalls
+
+| Problem | Solution |
+|---------|----------|
+| Row order changes between runs | Add `ORDER BY` |
+| Timestamp changes | Use fixed `DEFAULT '2024-01-15 10:00:00'` |
+| UUID values differ | Don't SELECT uuid columns, or verify length |
+| GROUP BY order unstable | Add `ORDER BY` on grouping columns |
+| STRING_AGG order | Use `STRING_AGG(col, ',' ORDER BY ...)` |
+| MV shows `_mv_rowid` | SELECT explicit columns |
+| EXPLAIN costs differ | Use `.assert` for structure only |
+
 ## Known Issues
 
 - executor.rs and expr.rs are large (~3500 lines each)
 - Window functions sort entire result set (not streaming)
+- `count()` in JOIN context not supported (use `.errors` file)
 
 ## Environment Variables
 
