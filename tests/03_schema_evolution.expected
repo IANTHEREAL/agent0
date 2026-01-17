@@ -1,20 +1,8 @@
-psql:/tmp/tipg-tests/tests/03_schema_evolution.sql:4: NOTICE:  table "t_evolve" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-ALTER TABLE
- id | v1  |     v2      
-----+-----+-------------
-  1 | old | new_default
+id|v1|v2
+1|old|new_default
 (1 row)
-
-INSERT 0 1
-INSERT 0 1
- id |      v1      |     v2      
-----+--------------+-------------
-  1 | old          | new_default
-  2 | new_implicit | new_default
-  3 | new_explicit | overridden
+id|v1|v2
+1|old|new_default
+2|new_implicit|new_default
+3|new_explicit|overridden
 (3 rows)
-
-DROP TABLE

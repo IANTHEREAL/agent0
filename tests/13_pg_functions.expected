@@ -1,278 +1,161 @@
-  ?column?   
--------------
- Hello World
+?column?
+Hello World
 (1 row)
-
- ?column?  
------------
- Count: 42
+?column?
+Count: 42
 (1 row)
-
- case 
-------
- yes
+case
+yes
 (1 row)
-
- case 
-------
- no
+case
+no
 (1 row)
-
- case 
-------
- two
+case
+two
 (1 row)
-
- upper 
--------
- HELLO
+upper
+HELLO
 (1 row)
-
- lower 
--------
- hello
+lower
+hello
 (1 row)
-
- length 
---------
-      5
+length
+5
 (1 row)
-
- concat 
---------
- abc
+concat
+abc
 (1 row)
-
- left 
-------
- he
+left
+he
 (1 row)
-
- right 
--------
- lo
+right
+lo
 (1 row)
-
-   replace   
--------------
- hello there
+replace
+hello there
 (1 row)
-
- reverse 
----------
- olleh
+reverse
+olleh
 (1 row)
-
- repeat 
---------
- ababab
+repeat
+ababab
 (1 row)
-
- abs 
------
-   5
+abs
+5
 (1 row)
-
- ceil 
-------
-    5
+ceil
+5
 (1 row)
-
- floor 
--------
-     4
+floor
+4
 (1 row)
-
- round 
--------
-  4.57
+round
+4.57
 (1 row)
-
- sqrt 
-------
-    4
+sqrt
+4
 (1 row)
-
- power 
--------
-  1024
+power
+1024
 (1 row)
-
- mod 
------
-   2
+mod
+2
 (1 row)
-
- sign 
-------
-   -1
+sign
+-1
 (1 row)
-
- coalesce 
-----------
- default
+coalesce
+default
 (1 row)
-
- coalesce 
-----------
- first
+coalesce
+first
 (1 row)
-
- nullif 
---------
-       
+nullif
+NULL
 (1 row)
-
- nullif 
---------
-      5
+nullif
+5
 (1 row)
-
- greatest 
-----------
-        5
+greatest
+5
 (1 row)
-
- least 
--------
-     1
+least
+1
 (1 row)
-
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
- id | name  
-----+-------
-  1 | Alice
+id|name
+1|Alice
 (1 row)
-
- id |  name   
-----+---------
-  1 | Alice
-  3 | Charlie
+id|name
+1|Alice
+3|Charlie
 (2 rows)
-
- id |  name   
-----+---------
-  2 | Bob
-  3 | Charlie
-  4 | David
+id|name
+2|Bob
+3|Charlie
+4|David
 (3 rows)
-
- id | name  
-----+-------
-  1 | Alice
+id|name
+1|Alice
 (1 row)
-
-DROP TABLE
- text 
-------
- 123
+text
+123
 (1 row)
-
- int4 
-------
-  456
+int4
+456
 (1 row)
-
- int4 
-------
-    3
+int4
+3
 (1 row)
-
- btrim 
--------
- hello
+btrim
+hello
 (1 row)
-
- ltrim 
--------
- hello
+ltrim
+hello
 (1 row)
-
- rtrim 
--------
- hello
+rtrim
+hello
 (1 row)
-
- position 
-----------
-        4
+position
+4
 (1 row)
-
- substring 
------------
- ell
+substring
+ell
 (1 row)
-
- substring 
------------
- ello
+substring
+ello
 (1 row)
-
- ?column? 
-----------
- t
+?column?
+t
 (1 row)
-
- ?column? 
-----------
- f
+?column?
+f
 (1 row)
-
- ?column? 
-----------
- t
+?column?
+t
 (1 row)
-
- ?column? 
-----------
- t
+?column?
+t
 (1 row)
-
- ?column? 
-----------
- f
+?column?
+f
 (1 row)
-
- ?column? 
-----------
- t
+?column?
+t
 (1 row)
-
- ?column? 
-----------
- t
+?column?
+t
 (1 row)
-
- ?column? 
-----------
- f
+?column?
+f
 (1 row)
-
- ?column? 
-----------
- t
+?column?
+t
 (1 row)
-
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
- category | sum 
-----------+-----
- B        |  40
- A        |  30
+category|sum
+B|40
+A|30
 (2 rows)
-
- category | count 
-----------+-------
- B        |     2
- A        |     2
+category|count
+B|2
+A|2
 (2 rows)
-
-DROP TABLE

@@ -1,169 +1,83 @@
-psql:/tmp/tipg-tests/tests/30_materialized_views.sql:3: NOTICE:  materialized view "sales_summary" does not exist, skipping
-DROP MATERIALIZED VIEW
-psql:/tmp/tipg-tests/tests/30_materialized_views.sql:4: NOTICE:  materialized view "monthly_revenue" does not exist, skipping
-DROP MATERIALIZED VIEW
-psql:/tmp/tipg-tests/tests/30_materialized_views.sql:5: NOTICE:  materialized view "customer_stats" does not exist, skipping
-DROP MATERIALIZED VIEW
-psql:/tmp/tipg-tests/tests/30_materialized_views.sql:6: NOTICE:  materialized view "product_ranking" does not exist, skipping
-DROP MATERIALIZED VIEW
-psql:/tmp/tipg-tests/tests/30_materialized_views.sql:7: NOTICE:  table "order_items" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/30_materialized_views.sql:8: NOTICE:  table "mv_orders" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/30_materialized_views.sql:9: NOTICE:  table "products" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/30_materialized_views.sql:10: NOTICE:  table "customers" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-CREATE TABLE
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-SELECT 3
-  category   | order_count | total_quantity | total_revenue 
--------------+-------------+----------------+---------------
- Electronics |           1 |             20 |          4000
- Hardware    |           4 |             38 |          4450
- Software    |           3 |              6 |          3250
+category|order_count|total_quantity|total_revenue
+Electronics|1|20|4000
+Hardware|4|38|4450
+Software|3|6|3250
 (3 rows)
-
-SELECT 5
- customer_name | region |  tier  | order_count | total_spent 
----------------+--------+--------+-------------+-------------
- Gamma LLC     | North  | Bronze |           1 |        4000
- Delta Co      | East   | Gold   |           2 |        2700
- Acme Corp     | North  | Gold   |           2 |        2000
- Beta Inc      | South  | Silver |           2 |        1500
- Epsilon Ltd   | West   | Silver |           1 |        1500
+customer_name|region|tier|order_count|total_spent
+Gamma LLC|North|Bronze|1|4000
+Delta Co|East|Gold|2|2700
+Acme Corp|North|Gold|2|2000
+Beta Inc|South|Silver|2|1500
+Epsilon Ltd|West|Silver|1|1500
 (5 rows)
-
-  category   | order_count | total_quantity | total_revenue 
--------------+-------------+----------------+---------------
- Electronics |           1 |             20 |          4000
- Hardware    |           4 |             38 |          4450
- Software    |           3 |              6 |          3250
+category|order_count|total_quantity|total_revenue
+Electronics|1|20|4000
+Hardware|4|38|4450
+Software|3|6|3250
 (3 rows)
-
- customer_name | region |  tier  | order_count | total_spent 
----------------+--------+--------+-------------+-------------
- Acme Corp     | North  | Gold   |           2 |        2000
- Beta Inc      | South  | Silver |           2 |        1500
- Delta Co      | East   | Gold   |           2 |        2700
- Epsilon Ltd   | West   | Silver |           1 |        1500
- Gamma LLC     | North  | Bronze |           1 |        4000
+customer_name|region|tier|order_count|total_spent
+Acme Corp|North|Gold|2|2000
+Beta Inc|South|Silver|2|1500
+Delta Co|East|Gold|2|2700
+Epsilon Ltd|West|Silver|1|1500
+Gamma LLC|North|Bronze|1|4000
 (5 rows)
-
- grand_total 
--------------
-       11700
+grand_total
+11700
 (1 row)
-
-  avg_customer_spend   
------------------------
- 2340.0000000000000000
+avg_customer_spend
+2340.0000000000000000
 (1 row)
-
-   name    | order_count | total_spent 
------------+-------------+-------------
- Delta Co  |           2 |        2700
- Acme Corp |           2 |        2000
+name|order_count|total_spent
+Delta Co|2|2700
+Acme Corp|2|2000
 (2 rows)
-
-INSERT 0 1
-INSERT 0 1
-  category   | order_count | total_quantity | total_revenue 
--------------+-------------+----------------+---------------
- Electronics |           1 |             20 |          4000
- Hardware    |           4 |             38 |          4450
- Software    |           3 |              6 |          3250
+category|order_count|total_quantity|total_revenue
+Electronics|1|20|4000
+Hardware|4|38|4450
+Software|3|6|3250
 (3 rows)
-
-REFRESH MATERIALIZED VIEW
-  category   | order_count | total_quantity | total_revenue 
--------------+-------------+----------------+---------------
- Electronics |           1 |             20 |          4000
- Hardware    |           4 |             38 |          4450
- Software    |           5 |             21 |         12000
+category|order_count|total_quantity|total_revenue
+Electronics|1|20|4000
+Hardware|4|38|4450
+Software|5|21|12000
 (3 rows)
-
-REFRESH MATERIALIZED VIEW
- customer_name | region |  tier  | order_count | total_spent 
----------------+--------+--------+-------------+-------------
- Gamma LLC     | North  | Bronze |           2 |        9000
- Acme Corp     | North  | Gold   |           3 |        5750
- Delta Co      | East   | Gold   |           2 |        2700
- Beta Inc      | South  | Silver |           2 |        1500
- Epsilon Ltd   | West   | Silver |           1 |        1500
+customer_name|region|tier|order_count|total_spent
+Gamma LLC|North|Bronze|2|9000
+Acme Corp|North|Gold|3|5750
+Delta Co|East|Gold|2|2700
+Beta Inc|South|Silver|2|1500
+Epsilon Ltd|West|Silver|1|1500
 (5 rows)
-
-SELECT 5
- product_name |  category   | price | units_sold | revenue | demand_level 
---------------+-------------+-------+------------+---------+--------------
- Service X    | Software    |   500 |         15 |    7500 | High
- Service Y    | Software    |   750 |          6 |    4500 | Medium
- Gadget Z     | Electronics |   200 |         20 |    4000 | High
- Widget A     | Hardware    |   100 |         25 |    2500 | High
- Widget B     | Hardware    |   150 |         13 |    1950 | High
+product_name|category|price|units_sold|revenue|demand_level
+Service X|Software|500|15|7500|High
+Service Y|Software|750|6|4500|Medium
+Gadget Z|Electronics|200|20|4000|High
+Widget A|Hardware|100|25|2500|High
+Widget B|Hardware|150|13|1950|High
 (5 rows)
-
- product_name | category | price | units_sold | revenue | demand_level 
---------------+----------+-------+------------+---------+--------------
- Service Y    | Software |   750 |          6 |    4500 | Medium
- Service X    | Software |   500 |         15 |    7500 | High
+product_name|category|price|units_sold|revenue|demand_level
+Service Y|Software|750|6|4500|Medium
+Service X|Software|500|15|7500|High
 (2 rows)
-
- category | total_revenue 
-----------+---------------
- Software |         12000
- Hardware |          4450
+category|total_revenue
+Software|12000
+Hardware|4450
 (2 rows)
-
-  category   | total_revenue | premium_customers 
--------------+---------------+-------------------
- Software    |         12000 |                 5
- Hardware    |          4450 |                 5
- Electronics |          4000 |                 5
+category|total_revenue|premium_customers
+Software|12000|5
+Hardware|4450|5
+Electronics|4000|5
 (3 rows)
-
-    view_name    | rows 
------------------+------
- sales_summary   |    3
- customer_stats  |    5
- product_ranking |    5
+view_name|rows
+sales_summary|3
+customer_stats|5
+product_ranking|5
 (3 rows)
-
-DROP MATERIALIZED VIEW
-psql:/tmp/tipg-tests/tests/30_materialized_views.sql:163: NOTICE:  materialized view "nonexistent_matview" does not exist, skipping
-DROP MATERIALIZED VIEW
-SELECT 5
-   name    | qty 
------------+-----
- Widget A  |  25
- Gadget Z  |  20
- Service X |  15
- Widget B  |  13
- Service Y |   6
+name|qty
+Widget A|25
+Gadget Z|20
+Service X|15
+Widget B|13
+Service Y|6
 (5 rows)
-
-DROP MATERIALIZED VIEW
-DROP MATERIALIZED VIEW
-DROP MATERIALIZED VIEW
-DROP TABLE
-DROP TABLE
-DROP TABLE

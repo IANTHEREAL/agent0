@@ -1,298 +1,151 @@
-psql:/tmp/tipg-tests/tests/22_new_features.sql:6: NOTICE:  table "union_a" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/22_new_features.sql:7: NOTICE:  table "union_b" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-CREATE TABLE
-INSERT 0 2
-INSERT 0 2
- id |  name   
-----+---------
-  1 | Alice
-  2 | Bob
-  3 | Charlie
+id|name
+1|Alice
+2|Bob
+3|Charlie
 (3 rows)
-
- id |  name   
-----+---------
-  1 | Alice
-  2 | Bob
-  2 | Bob
-  3 | Charlie
+id|name
+1|Alice
+2|Bob
+2|Bob
+3|Charlie
 (4 rows)
-
- n 
----
- 1
- 2
- 3
+n
+1
+2
+3
 (3 rows)
-
- letter 
---------
- a
- b
+letter
+a
+b
 (2 rows)
-
-DROP TABLE
-DROP TABLE
-psql:/tmp/tipg-tests/tests/22_new_features.sql:26: NOTICE:  table "upsert_test" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
- id |  name   | counter 
-----+---------+---------
-  1 | updated |     100
+id|name|counter
+1|updated|100
 (1 row)
-
-INSERT 0 1
-INSERT 0 0
- id |  name  | counter 
-----+--------+---------
-  2 | second |       1
+id|name|counter
+2|second|1
 (1 row)
-
-DROP TABLE
-psql:/tmp/tipg-tests/tests/22_new_features.sql:46: NOTICE:  table "idx_test" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-CREATE INDEX
-CREATE INDEX
-DROP INDEX
-psql:/tmp/tipg-tests/tests/22_new_features.sql:52: NOTICE:  index "idx_name" does not exist, skipping
-DROP INDEX
-DROP INDEX
-DROP TABLE
-psql:/tmp/tipg-tests/tests/22_new_features.sql:60: NOTICE:  table "alter_test" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-ALTER TABLE
- id | name | age 
-----+------+-----
-  1 | Test |  25
+id|name|age
+1|Test|25
 (1 row)
-
-ALTER TABLE
- id | full_name | age 
-----+-----------+-----
-  1 | Test      |  25
+id|full_name|age
+1|Test|25
 (1 row)
-
-DROP TABLE
-psql:/tmp/tipg-tests/tests/22_new_features.sql:76: NOTICE:  table "join_left" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/22_new_features.sql:77: NOTICE:  table "join_right" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-CREATE TABLE
-INSERT 0 3
-INSERT 0 3
- id | val | data 
-----+-----+------
-  1 | A   | X
-  2 | B   | Y
-    |     | Z
+id|val|data
+1|A|X
+2|B|Y
+NULL|NULL|Z
 (3 rows)
-
- id | val | data 
-----+-----+------
-    |     | Z
-  1 | A   | X
-  2 | B   | Y
-  3 | C   | 
+id|val|data
+NULL|NULL|Z
+1|A|X
+2|B|Y
+3|C|NULL
 (4 rows)
-
-DROP TABLE
-DROP TABLE
- ?column? 
-----------
- "Alice"
+?column?
+"Alice"
 (1 row)
-
- ?column? 
-----------
- Alice
+?column?
+Alice
 (1 row)
-
- ?column? 
-----------
- 30
+?column?
+30
 (1 row)
-
- ?column? 
-----------
- Bob
+?column?
+Bob
 (1 row)
-
- ?column? 
-----------
- 1
+?column?
+1
 (1 row)
-
- ?column? 
-----------
- b
+?column?
+b
 (1 row)
-
- ?column? 
-----------
- 1
+?column?
+1
 (1 row)
-
-  array  
----------
- {1,2,3}
+array
+{1,2,3}
 (1 row)
-
-     array     
----------------
- {hello,world}
+array
+{hello,world}
 (1 row)
-
- array 
--------
-    10
+array
+10
 (1 row)
-
- array 
--------
-    20
+array
+20
 (1 row)
-
- array 
--------
- c
+array
+c
 (1 row)
-
- array_length 
---------------
-            5
+array_length
+5
 (1 row)
-
- cardinality 
--------------
-           3
+cardinality
+3
 (1 row)
-
- array_position 
-----------------
-              2
+array_position
+2
 (1 row)
-
- array_position 
-----------------
-              2
+array_position
+2
 (1 row)
-
- array_cat 
------------
- {1,2,3,4}
+array_cat
+{1,2,3,4}
 (1 row)
-
- array_append 
---------------
- {1,2,3}
+array_append
+{1,2,3}
 (1 row)
-
- array_prepend 
----------------
- {0,1,2}
+array_prepend
+{0,1,2}
 (1 row)
-
- array_remove 
---------------
- {1,3}
+array_remove
+{1,3}
 (1 row)
-
- array_upper 
--------------
-           3
+array_upper
+3
 (1 row)
-
- array_lower 
--------------
-           1
+array_lower
+1
 (1 row)
-
-psql:/tmp/tipg-tests/tests/22_new_features.sql:131: NOTICE:  table "combined_test" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
 psql:/tmp/tipg-tests/tests/22_new_features.sql:142: ERROR:  operator does not exist: text ->> unknown
 LINE 1: SELECT id, name, data ->> 'price' AS price FROM combined_tes...
                               ^
 HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
-INSERT 0 1
- id |  name   |      data      |    tags     
-----+---------+----------------+-------------
-  1 | Updated | {"price": 150} | {tag1,tag2}
+id|name|data|tags
+1|Updated|{"price": 150}|{tag1,tag2}
 (1 row)
-
- id |  name   
-----+---------
-  1 | Updated
-  2 | Item2
+id|name
+1|Updated
+2|Item2
 (2 rows)
-
-DROP TABLE
-psql:/tmp/tipg-tests/tests/22_new_features.sql:158: NOTICE:  table "json_test" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
- id | json_name | jsonb_name 
-----+-----------+------------
-  1 | Alice     | Alice
-  2 | Bob       | Bob
+id|json_name|jsonb_name
+1|Alice|Alice
+2|Bob|Bob
 (2 rows)
-
- id | first_tag 
-----+-----------
-  2 | "a"
+id|first_tag
+2|"a"
 (1 row)
-
-UPDATE 1
- id | ?column? 
-----+----------
-  1 | Charlie
+id|?column?
+1|Charlie
 (1 row)
-
- cast_json 
------------
- 1
+cast_json
+1
 (1 row)
-
- cast_jsonb 
-------------
- 2
+cast_jsonb
+2
 (1 row)
-
- contains_true 
----------------
- t
+contains_true
+t
 (1 row)
-
- contains_false 
-----------------
- f
+contains_false
+f
 (1 row)
-
- contained_true 
-----------------
- t
+contained_true
+t
 (1 row)
-
- contained_false 
------------------
- f
+contained_false
+f
 (1 row)
-
-DROP TABLE
-              status              
-----------------------------------
- All new feature tests completed!
+status
+All new feature tests completed!
 (1 row)
-

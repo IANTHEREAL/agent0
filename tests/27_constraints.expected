@@ -1,49 +1,28 @@
-psql:/tmp/tipg-tests/tests/27_constraints.sql:1: NOTICE:  table "not_null_test" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
 psql:/tmp/tipg-tests/tests/27_constraints.sql:13: ERROR:  null value in column "required_col" of relation "not_null_test" violates not-null constraint
 DETAIL:  Failing row contains (3, null, null).
 psql:/tmp/tipg-tests/tests/27_constraints.sql:15: ERROR:  null value in column "required_col" of relation "not_null_test" violates not-null constraint
 DETAIL:  Failing row contains (4, null, missing required).
 psql:/tmp/tipg-tests/tests/27_constraints.sql:17: ERROR:  null value in column "required_col" of relation "not_null_test" violates not-null constraint
 DETAIL:  Failing row contains (1, null, null).
-UPDATE 1
- id | required_col | optional_col 
-----+--------------+--------------
-  1 | valid        | 
-  2 | also valid   | 
+id|required_col|optional_col
+1|valid|NULL
+2|also valid|NULL
 (2 rows)
-
-DROP TABLE
-psql:/tmp/tipg-tests/tests/27_constraints.sql:25: NOTICE:  table "check_test" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
 psql:/tmp/tipg-tests/tests/27_constraints.sql:37: ERROR:  new row for relation "check_test" violates check constraint "check_test_age_check"
 DETAIL:  Failing row contains (4, -1, 10, active).
 psql:/tmp/tipg-tests/tests/27_constraints.sql:38: ERROR:  new row for relation "check_test" violates check constraint "positive_price"
 DETAIL:  Failing row contains (5, 30, 0, active).
 psql:/tmp/tipg-tests/tests/27_constraints.sql:39: ERROR:  new row for relation "check_test" violates check constraint "check_test_status_check"
 DETAIL:  Failing row contains (6, 30, 10, deleted).
- id | age | price |  status  
-----+-----+-------+----------
-  1 |  25 | 99.99 | active
-  2 |   0 |  0.01 | inactive
-  3 |     |       | 
+id|age|price|status
+1|25|99.99|active
+2|0|0.01|inactive
+3|NULL|NULL|NULL
 (3 rows)
-
-UPDATE 1
 psql:/tmp/tipg-tests/tests/27_constraints.sql:44: ERROR:  new row for relation "check_test" violates check constraint "check_test_age_check"
 DETAIL:  Failing row contains (1, -5, 99.99, active).
- id | age | price |  status  
-----+-----+-------+----------
-  1 |  30 | 99.99 | active
-  2 |   0 |  0.01 | inactive
-  3 |     |       | 
+id|age|price|status
+1|30|99.99|active
+2|0|0.01|inactive
+3|NULL|NULL|NULL
 (3 rows)
-
-DROP TABLE

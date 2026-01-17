@@ -122,12 +122,33 @@ def log_test(name: str, result: TestResult, details: str = ""):
 
 def psql_args() -> List[str]:
     db = config.db
-    return ["psql", "-h", db.host, "-p", str(db.port), "-U", db.user, "-d", db.database]
+    return [
+        "psql",
+        "-X",
+        "-q",
+        "-P",
+        "pager=off",
+        "-P",
+        "format=unaligned",
+        "-P",
+        "fieldsep=|",
+        "-P",
+        "null=NULL",
+        "-h",
+        db.host,
+        "-p",
+        str(db.port),
+        "-U",
+        db.user,
+        "-d",
+        db.database,
+    ]
 
 
 def psql_env() -> dict:
     env = os.environ.copy()
     env["PGPASSWORD"] = config.db.password
+    env["PGOPTIONS"] = env.get("PGOPTIONS", "") + " -c client_min_messages=warning"
     return env
 
 
@@ -299,6 +320,18 @@ def run_external_tests(test_paths: List[Path]) -> TestStats:
     if not sql_files:
         log_error("No .sql test files found")
         return stats
+
+    # Skip *_setup.sql only when a matching base test exists.
+    filtered_files = []
+    for sql_file in sql_files:
+        if sql_file.stem.endswith("_setup"):
+            base_name = sql_file.stem[: -len("_setup")]
+            base_file = sql_file.with_name(base_name + ".sql")
+            if base_file.exists():
+                continue
+        filtered_files.append(sql_file)
+
+    sql_files = filtered_files
 
     log_info(f"Found {len(sql_files)} test file(s)")
     log_info("=========================================")

@@ -1,367 +1,150 @@
-psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:8: NOTICE:  table "accounts" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:9: NOTICE:  table "transfer_log" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:10: NOTICE:  table "inventory" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:11: NOTICE:  table "orders" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:12: NOTICE:  table "test_isolation" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-CREATE TABLE
-CREATE TABLE
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
-      test       | id | name  | balance 
------------------+----+-------+---------
- Before transfer |  1 | Alice | 1000.00
- Before transfer |  2 | Bob   |  500.00
+test|id|name|balance
+Before transfer|1|Alice|1000.00
+Before transfer|2|Bob|500.00
 (2 rows)
-
-BEGIN
-UPDATE 1
-UPDATE 1
-INSERT 0 1
-COMMIT
-           test           | id | name  | balance 
---------------------------+----+-------+---------
- After committed transfer |  1 | Alice |  800.00
- After committed transfer |  2 | Bob   |  700.00
+test|id|name|balance
+After committed transfer|1|Alice|800.00
+After committed transfer|2|Bob|700.00
 (2 rows)
-
-             test             |  total  
-------------------------------+---------
- Total balance should be 1500 | 1500.00
+test|total
+Total balance should be 1500|1500.00
 (1 row)
-
-BEGIN
 psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:64: ERROR:  new row for relation "accounts" violates check constraint "accounts_balance_check"
 DETAIL:  Failing row contains (1, Alice, -9199.00, 2).
 psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:65: ERROR:  current transaction is aborted, commands ignored until end of transaction block
-ROLLBACK
-                   test                    | id | name  | balance 
--------------------------------------------+----+-------+---------
- After rollback - should be same as before |  1 | Alice |  800.00
- After rollback - should be same as before |  2 | Bob   |  700.00
+test|id|name|balance
+After rollback - should be same as before|1|Alice|800.00
+After rollback - should be same as before|2|Bob|700.00
 (2 rows)
-
-                     test                     
-----------------------------------------------
- Testing CHECK constraint on negative balance
+test
+Testing CHECK constraint on negative balance
 (1 row)
-
-BEGIN
 psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:77: ERROR:  new row for relation "accounts" violates check constraint "accounts_balance_check"
 DETAIL:  Failing row contains (1, Alice, -100.00, 2).
-ROLLBACK
-                    test                    | id | balance 
---------------------------------------------+----+---------
- Balance after constraint violation attempt |  1 |  800.00
+test|id|balance
+Balance after constraint violation attempt|1|800.00
 (1 row)
-
-INSERT 0 1
-BEGIN
-UPDATE 1
 psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:86: ERROR:  new row for relation "accounts" violates check constraint "accounts_balance_check"
 DETAIL:  Failing row contains (3, Charlie, -10.00, 1).
-ROLLBACK
-                   test                   | balance 
-------------------------------------------+---------
- Charlie balance after overdraft attempts |  100.00
+test|balance
+Charlie balance after overdraft attempts|100.00
 (1 row)
-
-TRUNCATE TABLE
-DELETE 1
-UPDATE 1
-UPDATE 1
-BEGIN
-UPDATE 1
-UPDATE 1
-INSERT 0 1
-UPDATE 1
-UPDATE 1
-INSERT 0 1
-COMMIT
-              test               | id | balance | version 
----------------------------------+----+---------+---------
- Multi-operation transfer result |  1 |  850.00 |       3
- Multi-operation transfer result |  2 |  650.00 |       3
+test|id|balance|version
+Multi-operation transfer result|1|850.00|3
+Multi-operation transfer result|2|650.00|3
 (2 rows)
-
-         test         | log_count 
-----------------------+-----------
- Transfer log entries |         2
+test|log_count
+Transfer log entries|2
 (1 row)
-
-              test               |  total  
----------------------------------+---------
- Total still 1500 (accounts 1+2) | 1500.00
+test|total
+Total still 1500 (accounts 1+2)|1500.00
 (1 row)
-
-INSERT 0 1
-       test        | product_id | quantity | reserved 
--------------------+------------+----------+----------
- Initial inventory |        101 |      100 |        0
+test|product_id|quantity|reserved
+Initial inventory|101|100|0
 (1 row)
-
-BEGIN
-UPDATE 1
-INSERT 0 1
-COMMIT
-       test        | product_id | quantity | reserved | available 
--------------------+------------+----------+----------+-----------
- After reservation |        101 |      100 |       10 |        90
+test|product_id|quantity|reserved|available
+After reservation|101|100|10|90
 (1 row)
-
-     test      | order_id | product_id | quantity |  status  
----------------+----------+------------+----------+----------
- Order created |        1 |        101 |       10 | reserved
+test|order_id|product_id|quantity|status
+Order created|1|101|10|reserved
 (1 row)
-
-BEGIN
-UPDATE 1
-UPDATE 1
-COMMIT
-       test        | product_id | quantity | reserved 
--------------------+------------+----------+----------
- After fulfillment |        101 |       90 |        0
+test|product_id|quantity|reserved
+After fulfillment|101|90|0
 (1 row)
-
-     test     | order_id |  status   
---------------+----------+-----------
- Order status |        1 | fulfilled
+test|order_id|status
+Order status|1|fulfilled
 (1 row)
-
-         test         | product_id | quantity 
-----------------------+------------+----------
- Before rollback test |        101 |       90
+test|product_id|quantity
+Before rollback test|101|90
 (1 row)
-
-BEGIN
-UPDATE 1
-INSERT 0 1
-        test        | quantity 
---------------------+----------
- Inside transaction |        0
+test|quantity
+Inside transaction|0
 (1 row)
-
-ROLLBACK
-                test                | quantity 
-------------------------------------+----------
- After rollback - quantity restored |       90
+test|quantity
+After rollback - quantity restored|90
 (1 row)
-
-                     test                     | count 
-----------------------------------------------+-------
- Order count (should not include rolled back) |     0
+test|count
+Order count (should not include rolled back)|0
 (1 row)
-
-psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:156: NOTICE:  table "parent_table" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:157: NOTICE:  table "child_table" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-CREATE TABLE
-BEGIN
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-COMMIT
-            test             | count 
------------------------------+-------
- Parents after nested insert |     2
+test|count
+Parents after nested insert|2
 (1 row)
-
-             test             | count 
-------------------------------+-------
- Children after nested insert |     3
+test|count
+Children after nested insert|3
 (1 row)
-
-         test         |   name   | total_value 
-----------------------+----------+-------------
- Children with parent | Parent 1 |         300
- Children with parent | Parent 2 |         300
+test|name|total_value
+Children with parent|Parent 1|300
+Children with parent|Parent 2|300
 (2 rows)
-
-BEGIN
-UPDATE 2
-COMMIT
-         test          | id | value 
------------------------+----+-------
- After subquery update |  1 |   200
- After subquery update |  2 |   400
+test|id|value
+After subquery update|1|200
+After subquery update|2|400
 (2 rows)
-
-BEGIN
-DELETE 1
-DELETE 1
-COMMIT
-              test              | count 
---------------------------------+-------
- Parents after cascading delete |     1
+test|count
+Parents after cascading delete|1
 (1 row)
-
-              test               | count 
----------------------------------+-------
- Children after cascading delete |     2
+test|count
+Children after cascading delete|2
 (1 row)
-
-UPDATE 1
-UPDATE 1
-BEGIN
-     test     | balance 
---------------+---------
- Read balance | 1000.00
+test|balance
+Read balance|1000.00
 (1 row)
-
-UPDATE 1
-               test               | balance 
-----------------------------------+---------
- Balance after update in same txn | 1500.00
+test|balance
+Balance after update in same txn|1500.00
 (1 row)
-
-UPDATE 1
-            test             | balance 
------------------------------+---------
- Balance after second update | 1300.00
+test|balance
+Balance after second update|1300.00
 (1 row)
-
-COMMIT
-            test            | balance 
-----------------------------+---------
- Final balance after commit | 1300.00
+test|balance
+Final balance after commit|1300.00
 (1 row)
-
-UPDATE 1
-UPDATE 1
-UPDATE 0
-     test      |  total  
----------------+---------
- Initial total | 1000.00
+test|total
+Initial total|1000.00
 (1 row)
-
-BEGIN
-UPDATE 1
-UPDATE 1
-UPDATE 0
-                    test                     | total  
----------------------------------------------+--------
- Total in transaction (should still be 1500) | 950.00
+test|total
+Total in transaction (should still be 1500)|950.00
 (1 row)
-
-COMMIT
-                test                 | total  
--------------------------------------+--------
- Total after commit (should be 1500) | 950.00
+test|total
+Total after commit (should be 1500)|950.00
 (1 row)
-
-BEGIN
-COMMIT
-BEGIN
-ROLLBACK
-             test             
-------------------------------
- Empty transactions completed
+test
+Empty transactions completed
 (1 row)
-
-BEGIN
- account_count 
----------------
-             2
+account_count
+2
 (1 row)
-
- total_balance 
----------------
-        950.00
+total_balance
+950.00
 (1 row)
-
-     avg_balance      
-----------------------
- 475.0000000000000000
+avg_balance
+475.0000000000000000
 (1 row)
-
-COMMIT
-              test               
----------------------------------
- Read-only transaction completed
+test
+Read-only transaction completed
 (1 row)
-
-psql:/tmp/tipg-tests/tests/33_transaction_consistency.sql:276: NOTICE:  table "batch_test" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-BEGIN
-INSERT 0 5
-INSERT 0 5
-COMMIT
-        test        | count 
---------------------+-------
- Batch insert count |    10
+test|count
+Batch insert count|10
 (1 row)
-
-BEGIN
-INSERT 0 3
-ROLLBACK
-                test                 | count 
--------------------------------------+-------
- Count after rollback (should be 10) |    10
+test|count
+Count after rollback (should be 10)|10
 (1 row)
-
-BEGIN
-UPDATE 10
-COMMIT
-        test         | id |     data     
----------------------+----+--------------
- Sample updated rows |  1 | updated_row1
- Sample updated rows |  2 | updated_row2
- Sample updated rows |  3 | updated_row3
+test|id|data
+Sample updated rows|1|updated_row1
+Sample updated rows|2|updated_row2
+Sample updated rows|3|updated_row3
 (3 rows)
-
-BEGIN
-DELETE 10
-        test         | count 
----------------------+-------
- After delete in txn |     0
+test|count
+After delete in txn|0
 (1 row)
-
-INSERT 0 1
-COMMIT
-          test           | count 
--------------------------+-------
- After delete and insert |     1
+test|count
+After delete and insert|1
 (1 row)
-
-  test   | id  |  data   
----------+-----+---------
- New row | 100 | new_row
+test|id|data
+New row|100|new_row
 (1 row)
-
-BEGIN
-INSERT 0 1
-COMMIT
-BEGIN
-INSERT 0 1
-COMMIT
-BEGIN
-INSERT 0 1
-COMMIT
-             test              | count 
--------------------------------+-------
- After sequential transactions |     4
+test|count
+After sequential transactions|4
 (1 row)
-
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-                   result                    
----------------------------------------------
- All transaction consistency tests completed
+result
+All transaction consistency tests completed
 (1 row)
-

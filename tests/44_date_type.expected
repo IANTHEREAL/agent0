@@ -1,27 +1,13 @@
-psql:/tmp/tipg-tests/tests/44_date_type.sql:3: NOTICE:  table "date_type_t" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
- id |     d      
-----+------------
-  1 | 2024-01-02
-  2 | 2024-01-03
+id|d
+1|2024-01-02
+2|2024-01-03
 (2 rows)
-
- id 
-----
-  2
+id
+2
 (1 row)
-
- data_type | udt_name 
------------+----------
- date      | date
+data_type|udt_name
+date|date
 (1 row)
-
-  json_build_object   
-----------------------
- {"d" : "2024-01-02"}
+json_build_object
+{"d" : "2024-01-02"}
 (1 row)
-
-DROP TABLE

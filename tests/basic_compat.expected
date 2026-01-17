@@ -1,384 +1,206 @@
-psql:/tmp/tipg-tests/tests/basic_compat.sql:7: NOTICE:  materialized view "mv_transcripts" does not exist, skipping
-DROP MATERIALIZED VIEW
-psql:/tmp/tipg-tests/tests/basic_compat.sql:8: NOTICE:  table "members" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/basic_compat.sql:9: NOTICE:  table "teams" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/basic_compat.sql:10: NOTICE:  table "grades" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/basic_compat.sql:11: NOTICE:  table "courses" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/basic_compat.sql:12: NOTICE:  table "students" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/basic_compat.sql:13: NOTICE:  table "instruments" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/basic_compat.sql:14: NOTICE:  table "orchestral_sections" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/basic_compat.sql:15: NOTICE:  table "books" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/basic_compat.sql:16: NOTICE:  table "movies" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/basic_compat.sql:17: NOTICE:  table "categories" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/basic_compat.sql:18: NOTICE:  table "todos" does not exist, skipping
-DROP TABLE
-          test_section           
----------------------------------
- === 1. BASIC TABLE CREATION ===
+test_section
+=== 1. BASIC TABLE CREATION ===
 (1 row)
-
-CREATE TABLE
-CREATE TABLE
-             result              
----------------------------------
- Created movies and todos tables
+result
+Created movies and todos tables
 (1 row)
-
-      test_section      
-------------------------
- === 2. INSERT DATA ===
+test_section
+=== 2. INSERT DATA ===
 (1 row)
-
-INSERT 0 2
-INSERT 0 3
- id |          name           |                                                          description                                                           
-----+-------------------------+--------------------------------------------------------------------------------------------------------------------------------
-  1 | The Empire Strikes Back | After the Rebels are brutally overpowered by the Empire on the ice planet Hoth, Luke Skywalker begins Jedi training with Yoda.
-  2 | Return of the Jedi      | After a daring mission to rescue Han Solo from Jabba the Hutt, the Rebels dispatch to Endor to destroy the second Death Star.
+id|name|description
+1|The Empire Strikes Back|After the Rebels are brutally overpowered by the Empire on the ice planet Hoth, Luke Skywalker begins Jedi training with Yoda.
+2|Return of the Jedi|After a daring mission to rescue Han Solo from Jabba the Hutt, the Rebels dispatch to Endor to destroy the second Death Star.
 (2 rows)
-
- id |         task         | is_complete |         created_at         
-----+----------------------+-------------+----------------------------
-  1 | Learn SQL            | t           | 2026-01-17 03:16:08.428248
-  2 | Build an app         | f           | 2026-01-17 03:16:08.428248
-  3 | Deploy to production | f           | 2026-01-17 03:16:08.428248
+id|task|is_complete|created_at
+1|Learn SQL|t|2026-01-17 03:37:12.876566
+2|Build an app|f|2026-01-17 03:37:12.876566
+3|Deploy to production|f|2026-01-17 03:37:12.876566
 (3 rows)
-
-      test_section       
--------------------------
- === 3. FOREIGN KEYS ===
+test_section
+=== 3. FOREIGN KEYS ===
 (1 row)
-
-CREATE TABLE
-INSERT 0 3
-ALTER TABLE
-UPDATE 1
-UPDATE 1
-          movie          | category 
--------------------------+----------
- The Empire Strikes Back | Sci-Fi
- Return of the Jedi      | Sci-Fi
+movie|category
+The Empire Strikes Back|Sci-Fi
+Return of the Jedi|Sci-Fi
 (2 rows)
-
-         test_section         
-------------------------------
- === 4. ONE-TO-MANY JOINS ===
+test_section
+=== 4. ONE-TO-MANY JOINS ===
 (1 row)
-
-CREATE TABLE
-CREATE TABLE
-INSERT 0 2
-INSERT 0 4
-  section  | instrument 
------------+------------
- strings   | viola
- strings   | violin
- woodwinds | flute
- woodwinds | oboe
+section|instrument
+strings|viola
+strings|violin
+woodwinds|flute
+woodwinds|oboe
 (4 rows)
-
-         test_section          
--------------------------------
- === 5. MANY-TO-MANY JOINS ===
+test_section
+=== 5. MANY-TO-MANY JOINS ===
 (1 row)
-
-CREATE TABLE
-CREATE TABLE
-CREATE TABLE
-INSERT 0 3
-INSERT 0 3
-INSERT 0 6
-       name       |     type      |          title           |  code   | result 
-------------------+---------------+--------------------------+---------+--------
- Anakin Skywalker | graduate      | Authentication Theories  | AUTH205 | A
- Anakin Skywalker | graduate      | Introduction to Postgres | PG101   | A-
- Anakin Skywalker | graduate      | Fundamentals of Supabase | SUP412  | B-
- Princess Leia    | undergraduate | Introduction to Postgres | PG101   | B+
- Princess Leia    | undergraduate | Fundamentals of Supabase | SUP412  | A+
- Yoda             | graduate      | Authentication Theories  | AUTH205 | A
+name|type|title|code|result
+Anakin Skywalker|graduate|Authentication Theories|AUTH205|A
+Anakin Skywalker|graduate|Introduction to Postgres|PG101|A-
+Anakin Skywalker|graduate|Fundamentals of Supabase|SUP412|B-
+Princess Leia|undergraduate|Introduction to Postgres|PG101|B+
+Princess Leia|undergraduate|Fundamentals of Supabase|SUP412|A+
+Yoda|graduate|Authentication Theories|AUTH205|A
 (6 rows)
-
-         test_section          
--------------------------------
- === 6. MANY-TO-MANY TEAMS ===
+test_section
+=== 6. MANY-TO-MANY TEAMS ===
 (1 row)
-
-psql:/tmp/tipg-tests/tests/basic_compat.sql:163: NOTICE:  table "members" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/basic_compat.sql:164: NOTICE:  table "teams" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-CREATE TABLE
-INSERT 0 2
-INSERT 0 4
-  team_name   |      member      
---------------+------------------
- Jedi Council | Princess Leia
- Jedi Council | Yoda
- Rebels       | Anakin Skywalker
- Rebels       | Princess Leia
+team_name|member
+Jedi Council|Princess Leia
+Jedi Council|Yoda
+Rebels|Anakin Skywalker
+Rebels|Princess Leia
 (4 rows)
-
-        test_section        
-----------------------------
- === 7. JSON/JSONB DATA ===
+test_section
+=== 7. JSON/JSONB DATA ===
 (1 row)
-
-psql:/tmp/tipg-tests/tests/basic_compat.sql:195: NOTICE:  table "books" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 5
-                title                | price_jsonb | low_age 
--------------------------------------+-------------+---------
- Green Eggs and Ham                  | 7.49        | 4
- Harry Potter and the Goblet of Fire | 24.95       | 10
- The Poky Little Puppy               | 5.95        | 3
- The Tale of Peter Rabbit            | 4.49        | 2
- Tootle                              | 3.99        | 2
+title|price_jsonb|low_age
+Green Eggs and Ham|7.49|4
+Harry Potter and the Goblet of Fire|24.95|10
+The Poky Little Puppy|5.95|3
+The Tale of Peter Rabbit|4.49|2
+Tootle|3.99|2
 (5 rows)
-
-                title                |                            description                             | price_text 
--------------------------------------+--------------------------------------------------------------------+------------
- Green Eggs and Ham                  | Sam has changing food preferences and eats unusually colored food. | 7.49
- Harry Potter and the Goblet of Fire | Fourth year of school starts, big drama ensues.                    | 24.95
- The Poky Little Puppy               | Puppy is slower than other, bigger animals.                        | 5.95
+title|description|price_text
+Green Eggs and Ham|Sam has changing food preferences and eats unusually colored food.|7.49
+Harry Potter and the Goblet of Fire|Fourth year of school starts, big drama ensues.|24.95
+The Poky Little Puppy|Puppy is slower than other, bigger animals.|5.95
 (3 rows)
-
-   test_section   
-------------------
- === 8. VIEWS ===
+test_section
+=== 8. VIEWS ===
 (1 row)
-
-CREATE VIEW
-       name       |     type      |          title           |  code   | result 
-------------------+---------------+--------------------------+---------+--------
- Anakin Skywalker | graduate      | Authentication Theories  | AUTH205 | A
- Anakin Skywalker | graduate      | Introduction to Postgres | PG101   | A-
- Anakin Skywalker | graduate      | Fundamentals of Supabase | SUP412  | B-
- Princess Leia    | undergraduate | Introduction to Postgres | PG101   | B+
- Princess Leia    | undergraduate | Fundamentals of Supabase | SUP412  | A+
- Yoda             | graduate      | Authentication Theories  | AUTH205 | A
+name|type|title|code|result
+Anakin Skywalker|graduate|Authentication Theories|AUTH205|A
+Anakin Skywalker|graduate|Introduction to Postgres|PG101|A-
+Anakin Skywalker|graduate|Fundamentals of Supabase|SUP412|B-
+Princess Leia|undergraduate|Introduction to Postgres|PG101|B+
+Princess Leia|undergraduate|Fundamentals of Supabase|SUP412|A+
+Yoda|graduate|Authentication Theories|AUTH205|A
 (6 rows)
-
-         test_section          
--------------------------------
- === 9. MATERIALIZED VIEWS ===
+test_section
+=== 9. MATERIALIZED VIEWS ===
 (1 row)
-
-SELECT 6
-       name       |     type      |          title           |  code   | result 
-------------------+---------------+--------------------------+---------+--------
- Anakin Skywalker | graduate      | Authentication Theories  | AUTH205 | A
- Anakin Skywalker | graduate      | Introduction to Postgres | PG101   | A-
- Anakin Skywalker | graduate      | Fundamentals of Supabase | SUP412  | B-
- Princess Leia    | undergraduate | Introduction to Postgres | PG101   | B+
- Princess Leia    | undergraduate | Fundamentals of Supabase | SUP412  | A+
- Yoda             | graduate      | Authentication Theories  | AUTH205 | A
+name|type|title|code|result
+Anakin Skywalker|graduate|Authentication Theories|AUTH205|A
+Anakin Skywalker|graduate|Introduction to Postgres|PG101|A-
+Anakin Skywalker|graduate|Fundamentals of Supabase|SUP412|B-
+Princess Leia|undergraduate|Introduction to Postgres|PG101|B+
+Princess Leia|undergraduate|Fundamentals of Supabase|SUP412|A+
+Yoda|graduate|Authentication Theories|AUTH205|A
 (6 rows)
-
-INSERT 0 1
-REFRESH MATERIALIZED VIEW
- name |   type   |          title           |  code   | result 
-------+----------+--------------------------+---------+--------
- Yoda | graduate | Authentication Theories  | AUTH205 | A
- Yoda | graduate | Introduction to Postgres | PG101   | A+
+name|type|title|code|result
+Yoda|graduate|Authentication Theories|AUTH205|A
+Yoda|graduate|Introduction to Postgres|PG101|A+
 (2 rows)
-
-          test_section           
----------------------------------
- === 10. AGGREGATE FUNCTIONS ===
+test_section
+=== 10. AGGREGATE FUNCTIONS ===
 (1 row)
-
-       name       | course_count | all_grades 
-------------------+--------------+------------
- Anakin Skywalker |            3 | A, A-, B-
- Princess Leia    |            2 | B+, A+
- Yoda             |            2 | A, A+
+name|course_count|all_grades
+Anakin Skywalker|3|A, A-, B-
+Princess Leia|2|B+, A+
+Yoda|2|A, A+
 (3 rows)
-
- avg_price | min_price | max_price 
------------+-----------+-----------
-     9.374 |      3.99 |     24.95
+avg_price|min_price|max_price
+9.374|3.99|24.95
 (1 row)
-
-      test_section      
-------------------------
- === 11. SUBQUERIES ===
+test_section
+=== 11. SUBQUERIES ===
 (1 row)
-
-       name       | course_count 
-------------------+--------------
- Anakin Skywalker |            3
+name|course_count
+Anakin Skywalker|3
 (1 row)
-
-         test_section         
-------------------------------
- === 12. CASE EXPRESSIONS ===
+test_section
+=== 12. CASE EXPRESSIONS ===
 (1 row)
-
-                title                | price | price_tier 
--------------------------------------+-------+------------
- Tootle                              |  3.99 | Budget
- The Tale of Peter Rabbit            |  4.49 | Budget
- The Poky Little Puppy               |  5.95 | Standard
- Green Eggs and Ham                  |  7.49 | Standard
- Harry Potter and the Goblet of Fire | 24.95 | Premium
+title|price|price_tier
+Tootle|3.99|Budget
+The Tale of Peter Rabbit|4.49|Budget
+The Poky Little Puppy|5.95|Standard
+Green Eggs and Ham|7.49|Standard
+Harry Potter and the Goblet of Fire|24.95|Premium
 (5 rows)
-
-         test_section         
-------------------------------
- === 13. WINDOW FUNCTIONS ===
+test_section
+=== 13. WINDOW FUNCTIONS ===
 (1 row)
-
-       name       |  code   | result | course_num | total_courses 
-------------------+---------+--------+------------+---------------
- Anakin Skywalker | AUTH205 | A      |          1 |             3
- Anakin Skywalker | PG101   | A-     |          2 |             3
- Anakin Skywalker | SUP412  | B-     |          3 |             3
- Princess Leia    | PG101   | B+     |          1 |             2
- Princess Leia    | SUP412  | A+     |          2 |             2
- Yoda             | AUTH205 | A      |          1 |             2
- Yoda             | PG101   | A+     |          2 |             2
+name|code|result|course_num|total_courses
+Anakin Skywalker|AUTH205|A|1|3
+Anakin Skywalker|PG101|A-|2|3
+Anakin Skywalker|SUP412|B-|3|3
+Princess Leia|PG101|B+|1|2
+Princess Leia|SUP412|A+|2|2
+Yoda|AUTH205|A|1|2
+Yoda|PG101|A+|2|2
 (7 rows)
-
-    test_section    
---------------------
- === 14. UPSERT ===
+test_section
+=== 14. UPSERT ===
 (1 row)
-
-psql:/tmp/tipg-tests/tests/basic_compat.sql:360: NOTICE:  table "user_settings" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
- user_id | theme | notifications 
----------+-------+---------------
-       1 | light | t
+user_id|theme|notifications
+1|light|t
 (1 row)
-
-INSERT 0 2
- user_id | theme  | notifications 
----------+--------+---------------
-       1 | system | f
-       2 | dark   | t
+user_id|theme|notifications
+1|system|f
+2|dark|t
 (2 rows)
-
-  test_section   
------------------
- === 15. CTE ===
+test_section
+=== 15. CTE ===
 (1 row)
-
-       name       | course_count | most_popular_course 
-------------------+--------------+---------------------
- Anakin Skywalker |            3 | PG101
- Princess Leia    |            2 | PG101
- Yoda             |            2 | PG101
+name|course_count|most_popular_course
+Anakin Skywalker|3|PG101
+Princess Leia|2|PG101
+Yoda|2|PG101
 (3 rows)
-
-       test_section        
----------------------------
- === 16. RECURSIVE CTE ===
+test_section
+=== 16. RECURSIVE CTE ===
 (1 row)
-
-psql:/tmp/tipg-tests/tests/basic_compat.sql:422: NOTICE:  table "employees" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 6
-      name      | level 
-----------------+-------
- CEO            |     1
- VP Engineering |     2
- VP Sales       |     2
- Lead Dev       |     3
- Sales Rep      |     3
- Senior Dev     |     4
+name|level
+CEO|1
+VP Engineering|2
+VP Sales|2
+Lead Dev|3
+Sales Rep|3
+Senior Dev|4
 (6 rows)
-
-      test_section       
--------------------------
- === 17. DISTINCT ON ===
+test_section
+=== 17. DISTINCT ON ===
 (1 row)
-
-       name       |  code   | result 
-------------------+---------+--------
- Anakin Skywalker | AUTH205 | A
- Princess Leia    | PG101   | B+
- Yoda             | AUTH205 | A
+name|code|result
+Anakin Skywalker|AUTH205|A
+Princess Leia|PG101|B+
+Yoda|AUTH205|A
 (3 rows)
-
-          test_section           
----------------------------------
- === 18. COALESCE AND NULLIF ===
+test_section
+=== 18. COALESCE AND NULLIF ===
 (1 row)
-
-      name      | manager_status | non_ceo_manager 
-----------------+----------------+-----------------
- CEO            | No Manager     |                
- VP Engineering | 1              |                
- VP Sales       | 1              |                
- Lead Dev       | 2              |               2
- Senior Dev     | 4              |               4
- Sales Rep      | 3              |               3
+name|manager_status|non_ceo_manager
+CEO|No Manager|NULL
+VP Engineering|1|NULL
+VP Sales|1|NULL
+Lead Dev|2|2
+Senior Dev|4|4
+Sales Rep|3|3
 (6 rows)
-
-         test_section         
-------------------------------
- === 19. STRING FUNCTIONS ===
+test_section
+=== 19. STRING FUNCTIONS ===
 (1 row)
-
-                title                |      author_upper      | title_length | title_short |           title_replaced            
--------------------------------------+------------------------+--------------+-------------+-------------------------------------
- Green Eggs and Ham                  | DR. SEUSS              |           18 | Green Eggs  | Green Eggs and Ham
- Harry Potter and the Goblet of Fire | J.K. ROWLING           |           35 | Harry Pott  | Harry Potter and THE Goblet of Fire
- The Poky Little Puppy               | JANETTE SEBRING LOWREY |           21 | The Poky L  | The Poky Little Puppy
- The Tale of Peter Rabbit            | BEATRIX POTTER         |           24 | The Tale o  | The Tale of Peter Rabbit
- Tootle                              | GERTRUDE CRAMPTON      |            6 | Tootle      | Tootle
+title|author_upper|title_length|title_short|title_replaced
+Green Eggs and Ham|DR. SEUSS|18|Green Eggs|Green Eggs and Ham
+Harry Potter and the Goblet of Fire|J.K. ROWLING|35|Harry Pott|Harry Potter and THE Goblet of Fire
+The Poky Little Puppy|JANETTE SEBRING LOWREY|21|The Poky L|The Poky Little Puppy
+The Tale of Peter Rabbit|BEATRIX POTTER|24|The Tale o|The Tale of Peter Rabbit
+Tootle|GERTRUDE CRAMPTON|6|Tootle|Tootle
 (5 rows)
-
-          test_section           
----------------------------------
- === 20. DATE/TIME FUNCTIONS ===
+test_section
+=== 20. DATE/TIME FUNCTIONS ===
 (1 row)
-
-         task         |         created_at         | created_date | year | month 
-----------------------+----------------------------+--------------+------+-------
- Learn SQL            | 2026-01-17 03:16:08.428248 | 2026-01-17   | 2026 |     1
- Build an app         | 2026-01-17 03:16:08.428248 | 2026-01-17   | 2026 |     1
- Deploy to production | 2026-01-17 03:16:08.428248 | 2026-01-17   | 2026 |     1
+task|created_at|created_date|year|month
+Learn SQL|2026-01-17 03:37:12.876566|2026-01-17|2026|1
+Build an app|2026-01-17 03:37:12.876566|2026-01-17|2026|1
+Deploy to production|2026-01-17 03:37:12.876566|2026-01-17|2026|1
 (3 rows)
-
-  test_section   
------------------
- === CLEANUP ===
+test_section
+=== CLEANUP ===
 (1 row)
-
-DROP MATERIALIZED VIEW
-DROP VIEW
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-DROP TABLE
-                final_result                 
----------------------------------------------
- All Supabase compatibility tests completed!
+final_result
+All Supabase compatibility tests completed!
 (1 row)
-

@@ -1,136 +1,84 @@
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:3: NOTICE:  procedure simple_insert() does not exist, skipping
-DROP PROCEDURE
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:4: NOTICE:  procedure update_salary() does not exist, skipping
-DROP PROCEDURE
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:5: NOTICE:  procedure bulk_insert() does not exist, skipping
-DROP PROCEDURE
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:6: NOTICE:  procedure conditional_update() does not exist, skipping
-DROP PROCEDURE
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:7: NOTICE:  procedure transfer_funds() does not exist, skipping
-DROP PROCEDURE
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:8: NOTICE:  table "proc_accounts" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:9: NOTICE:  table "proc_employees" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:10: NOTICE:  table "proc_logs" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-CREATE TABLE
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:44: ERROR:  syntax error at or near "BEGIN"
 LINE 2: AS BEGIN
            ^
- id |  name   | department  | salary 
-----+---------+-------------+--------
-  1 | Alice   | Engineering |  80000
-  2 | Bob     | Engineering |  75000
-  3 | Charlie | Sales       |  60000
-  4 | Diana   | Sales       |  65000
+id|name|department|salary
+1|Alice|Engineering|80000
+2|Bob|Engineering|75000
+3|Charlie|Sales|60000
+4|Diana|Sales|65000
 (4 rows)
-
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:48: ERROR:  procedure simple_insert(unknown, unknown, integer) does not exist
 LINE 1: CALL simple_insert('Eve', 'HR', 55000);
              ^
 HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.
- id |  name   | department  | salary 
-----+---------+-------------+--------
-  1 | Alice   | Engineering |  80000
-  2 | Bob     | Engineering |  75000
-  3 | Charlie | Sales       |  60000
-  4 | Diana   | Sales       |  65000
+id|name|department|salary
+1|Alice|Engineering|80000
+2|Bob|Engineering|75000
+3|Charlie|Sales|60000
+4|Diana|Sales|65000
 (4 rows)
-
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:56: ERROR:  syntax error at or near "BEGIN"
 LINE 2: AS BEGIN
            ^
- name  | department  | salary 
--------+-------------+--------
- Alice | Engineering |  80000
- Bob   | Engineering |  75000
+name|department|salary
+Alice|Engineering|80000
+Bob|Engineering|75000
 (2 rows)
-
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:60: ERROR:  procedure update_salary(unknown, integer) does not exist
 LINE 1: CALL update_salary('Engineering', 5000);
              ^
 HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.
- name  | department  | salary 
--------+-------------+--------
- Alice | Engineering |  80000
- Bob   | Engineering |  75000
+name|department|salary
+Alice|Engineering|80000
+Bob|Engineering|75000
 (2 rows)
-
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:69: ERROR:  syntax error at or near "BEGIN"
 LINE 2: AS BEGIN
            ^
- before_count 
---------------
-            4
+before_count
+4
 (1 row)
-
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:73: ERROR:  procedure bulk_insert(unknown, integer) does not exist
 LINE 1: CALL bulk_insert('TempUser', 1);
              ^
 HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.
- after_count 
--------------
-           4
+after_count
+4
 (1 row)
-
- id | action | details 
-----+--------+---------
+id|action|details
 (0 rows)
-
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:82: ERROR:  syntax error at or near "BEGIN"
 LINE 2: AS BEGIN
            ^
-  name   | salary 
----------+--------
- Charlie |  60000
- Diana   |  65000
- Bob     |  75000
- Alice   |  80000
+name|salary
+Charlie|60000
+Diana|65000
+Bob|75000
+Alice|80000
 (4 rows)
-
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:86: ERROR:  procedure raise_all(integer) does not exist
 LINE 1: CALL raise_all(10);
              ^
 HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.
-  name   | salary 
----------+--------
- Charlie |  60000
- Diana   |  65000
- Bob     |  75000
- Alice   |  80000
+name|salary
+Charlie|60000
+Diana|65000
+Bob|75000
+Alice|80000
 (4 rows)
-
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:91: NOTICE:  procedure cleanup_temp() does not exist, skipping
-DROP PROCEDURE
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:95: ERROR:  syntax error at or near "BEGIN"
 LINE 2: AS BEGIN
            ^
- before_cleanup 
-----------------
-              4
+before_cleanup
+4
 (1 row)
-
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:99: ERROR:  procedure cleanup_temp(unknown) does not exist
 LINE 1: CALL cleanup_temp('Temp');
              ^
 HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.
- after_cleanup 
----------------
-             4
+after_cleanup
+4
 (1 row)
-
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:104: NOTICE:  procedure log_action() does not exist, skipping
-DROP PROCEDURE
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:108: ERROR:  syntax error at or near "BEGIN"
 LINE 2: AS BEGIN
            ^
@@ -142,33 +90,23 @@ psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:111: ERROR:  procedure log_a
 LINE 1: CALL log_action('DATA_UPDATE', 'Salary update completed');
              ^
 HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.
- id | action | details 
-----+--------+---------
+id|action|details
 (0 rows)
-
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:116: NOTICE:  procedure set_bonus() does not exist, skipping
-DROP PROCEDURE
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:120: ERROR:  syntax error at or near "BEGIN"
 LINE 2: AS BEGIN
            ^
- name  | salary 
--------+--------
- Alice |  80000
+name|salary
+Alice|80000
 (1 row)
-
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:124: ERROR:  procedure set_bonus(unknown, integer) does not exist
 LINE 1: CALL set_bonus('Alice', 15);
              ^
 HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.
- name  | salary 
--------+--------
- Alice |  80000
+name|salary
+Alice|80000
 (1 row)
-
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:129: ERROR:  could not find a procedure named "simple_insert"
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:130: ERROR:  could not find a procedure named "update_salary"
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:133: NOTICE:  procedure nonexistent_proc() does not exist, skipping
-DROP PROCEDURE
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:136: ERROR:  procedure simple_insert(unknown, unknown, integer) does not exist
 LINE 1: CALL simple_insert('Test', 'Test', 1000);
              ^
@@ -180,31 +118,25 @@ psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:144: ERROR:  procedure simpl
 LINE 1: CALL simple_insert('Frank', 'Marketing', 58000);
              ^
 HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.
- id | name | department | salary 
-----+------+------------+--------
+id|name|department|salary
 (0 rows)
-
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:153: ERROR:  syntax error at or near "BEGIN"
 LINE 2: AS BEGIN
            ^
- id |  owner  | balance 
-----+---------+---------
-  1 | Alice   |   10000
-  2 | Bob     |    5000
-  3 | Charlie |    8000
+id|owner|balance
+1|Alice|10000
+2|Bob|5000
+3|Charlie|8000
 (3 rows)
-
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:157: ERROR:  procedure transfer_funds(unknown, unknown, integer) does not exist
 LINE 1: CALL transfer_funds('Alice', 'Bob', 2000);
              ^
 HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.
- id |  owner  | balance 
-----+---------+---------
-  1 | Alice   |   10000
-  2 | Bob     |    5000
-  3 | Charlie |    8000
+id|owner|balance
+1|Alice|10000
+2|Bob|5000
+3|Charlie|8000
 (3 rows)
-
 psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:162: ERROR:  procedure log_action(unknown, unknown) does not exist
 LINE 1: CALL log_action('TRANSFER', 'Alice to Bob 2000');
              ^
@@ -217,46 +149,19 @@ psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:164: ERROR:  procedure log_a
 LINE 1: CALL log_action('TRANSFER', 'Bob to Charlie 1000');
              ^
 HINT:  No procedure matches the given name and argument types. You might need to add explicit type casts.
- id |  owner  | balance 
-----+---------+---------
-  1 | Alice   |   10000
-  2 | Bob     |    5000
-  3 | Charlie |    8000
+id|owner|balance
+1|Alice|10000
+2|Bob|5000
+3|Charlie|8000
 (3 rows)
-
- id | action | details 
-----+--------+---------
+id|action|details
 (0 rows)
-
- total_employees 
------------------
-               4
+total_employees
+4
 (1 row)
-
- total_balance 
----------------
-         23000
+total_balance
+23000
 (1 row)
-
- log_entries 
--------------
-           0
+log_entries
+0
 (1 row)
-
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:175: NOTICE:  procedure simple_insert() does not exist, skipping
-DROP PROCEDURE
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:176: NOTICE:  procedure bulk_insert() does not exist, skipping
-DROP PROCEDURE
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:177: NOTICE:  procedure raise_all() does not exist, skipping
-DROP PROCEDURE
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:178: NOTICE:  procedure cleanup_temp() does not exist, skipping
-DROP PROCEDURE
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:179: NOTICE:  procedure log_action() does not exist, skipping
-DROP PROCEDURE
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:180: NOTICE:  procedure set_bonus() does not exist, skipping
-DROP PROCEDURE
-psql:/tmp/tipg-tests/tests/31_stored_procedures.sql:181: NOTICE:  procedure transfer_funds() does not exist, skipping
-DROP PROCEDURE
-DROP TABLE
-DROP TABLE
-DROP TABLE

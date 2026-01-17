@@ -1,30 +1,21 @@
-psql:/tmp/tipg-tests/tests/50_index_features.sql:3: NOTICE:  table "ix_t" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-CREATE INDEX
-CREATE INDEX
 psql:/tmp/tipg-tests/tests/50_index_features.sql:8: ERROR:  data type text has no default operator class for access method "gin"
 HINT:  You must specify an operator class for the index or define a default operator class for the data type.
 psql:/tmp/tipg-tests/tests/50_index_features.sql:9: ERROR:  data type integer has no default operator class for access method "gist"
 HINT:  You must specify an operator class for the index or define a default operator class for the data type.
-                                                ?column?                                                
---------------------------------------------------------------------------------------------------------
- IDXDEF=ix_t_a_partial:create index ix_t_a_partial on public.ix_t using btree (a) where (a is not null)
- IDXDEF=ix_t_expr_lower:create index ix_t_expr_lower on public.ix_t using btree (lower(b))
- IDXDEF=ix_t_pkey:create unique index ix_t_pkey on public.ix_t using btree (id)
+?column?
+IDXDEF=ix_t_a_partial:create index ix_t_a_partial on public.ix_t using btree (a) where (a is not null)
+IDXDEF=ix_t_expr_lower:create index ix_t_expr_lower on public.ix_t using btree (lower(b))
+IDXDEF=ix_t_pkey:create unique index ix_t_pkey on public.ix_t using btree (id)
 (3 rows)
-
-    ?column?    
-----------------
- AM=2:heap
- AM=403:btree
- AM=405:hash
- AM=783:gist
- AM=2742:gin
- AM=3580:brin
- AM=4000:spgist
+?column?
+AM=2:heap
+AM=403:btree
+AM=405:hash
+AM=783:gist
+AM=2742:gin
+AM=3580:brin
+AM=4000:spgist
 (7 rows)
-
 psql:/tmp/tipg-tests/tests/50_index_features.sql:22: ERROR:  column "indexdef" does not exist
 LINE 3: WHERE indexdef ILIKE '%ix_t_a_partial%'
               ^
@@ -33,4 +24,3 @@ psql:/tmp/tipg-tests/tests/50_index_features.sql:36: ERROR:  column "indexdef" d
 LINE 7:                 WHERE indexdef ILIKE '%ix_t_a_partial%'
                               ^
 HINT:  Perhaps you meant to reference the column "pg_index.indexprs".
-DROP TABLE

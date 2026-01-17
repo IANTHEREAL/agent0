@@ -1,45 +1,18 @@
-      ?column?       
----------------------
- 2026-01-18 00:00:00
+?column?
+2026-01-18 00:00:00
 (1 row)
-
-      ?column?       
----------------------
- 2025-12-17 00:00:00
+?column?
+2025-12-17 00:00:00
 (1 row)
-
- ?column? 
-----------
-        5
+?column?
+5
 (1 row)
-
-psql:/tmp/tipg-tests/tests/45_date_type_improvements.sql:11: NOTICE:  table "date_type_events" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
- id 
-----
-  1
+id
+1
 (1 row)
-
-DROP TABLE
-psql:/tmp/tipg-tests/tests/45_date_type_improvements.sql:18: NOTICE:  table "date_type_ts" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-    date    
-------------
- 2026-01-17
+date
+2026-01-17
 (1 row)
-
-DROP TABLE
-psql:/tmp/tipg-tests/tests/45_date_type_improvements.sql:25: NOTICE:  table "date_type_birth" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-       age        
-------------------
- 26 years 16 days
+age
+26 years 16 days
 (1 row)
-
-DROP TABLE

@@ -1,22 +1,7 @@
-psql:/tmp/tipg-tests/tests/01_ddl_basic.sql:5: NOTICE:  table "t_ddl" does not exist, skipping
-DROP TABLE
-CREATE TABLE
 psql:/tmp/tipg-tests/tests/01_ddl_basic.sql:11: ERROR:  relation "t_ddl" already exists
-psql:/tmp/tipg-tests/tests/01_ddl_basic.sql:14: NOTICE:  relation "t_ddl" already exists, skipping
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
- id | val 
-----+-----
-  1 | a
-  2 | b
+id|val
+1|a
+2|b
 (2 rows)
-
-TRUNCATE TABLE
- id | val 
-----+-----
+id|val
 (0 rows)
-
-DROP TABLE
-psql:/tmp/tipg-tests/tests/01_ddl_basic.sql:29: NOTICE:  table "t_ddl" does not exist, skipping
-DROP TABLE

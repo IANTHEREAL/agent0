@@ -1,39 +1,22 @@
-psql:/tmp/tipg-tests/tests/07_order_limit.sql:4: NOTICE:  table "scores" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-INSERT 0 1
-  name   | score 
----------+-------
- Charlie |    70
- Alice   |    80
- David   |    85
- Bob     |    90
- Eve     |    95
+name|score
+Charlie|70
+Alice|80
+David|85
+Bob|90
+Eve|95
 (5 rows)
-
-  name   | score 
----------+-------
- Eve     |    95
- Bob     |    90
- David   |    85
- Alice   |    80
- Charlie |    70
+name|score
+Eve|95
+Bob|90
+David|85
+Alice|80
+Charlie|70
 (5 rows)
-
- name | score 
-------+-------
- Eve  |    95
- Bob  |    90
+name|score
+Eve|95
+Bob|90
 (2 rows)
-
- name  | score 
--------+-------
- David |    85
- Alice |    80
+name|score
+David|85
+Alice|80
 (2 rows)
-
-DROP TABLE

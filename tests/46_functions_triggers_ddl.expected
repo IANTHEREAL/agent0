@@ -1,30 +1,12 @@
-psql:/tmp/tipg-tests/tests/46_functions_triggers_ddl.sql:3: NOTICE:  table "ft_t" does not exist, skipping
-DROP TABLE
-psql:/tmp/tipg-tests/tests/46_functions_triggers_ddl.sql:4: NOTICE:  function set_updated_at() does not exist, skipping
-DROP FUNCTION
-CREATE TABLE
-CREATE FUNCTION
-   ?column?   
---------------
- FUNC_FOUND=1
+?column?
+FUNC_FOUND=1
 (1 row)
-
-CREATE TRIGGER
-    ?column?     
------------------
- TRIGGER_FOUND=1
+?column?
+TRIGGER_FOUND=1
 (1 row)
-
-DROP TRIGGER
-    ?column?    
-----------------
- TRIGGER_LEFT=0
+?column?
+TRIGGER_LEFT=0
 (1 row)
-
-DROP FUNCTION
-  ?column?   
--------------
- FUNC_LEFT=0
+?column?
+FUNC_LEFT=0
 (1 row)
-
-DROP TABLE

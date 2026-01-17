@@ -1,5 +1,3 @@
-CREATE TABLE
-INSERT 0 3
 psql:/tmp/tipg-tests/tests/36_vector_text.sql:20: ERROR:  function l2_distance(text, unknown) does not exist
 LINE 1: SELECT name, l2_distance(embedding, '[1.0, 2.0, 3.0]') as di...
                      ^
@@ -20,4 +18,3 @@ psql:/tmp/tipg-tests/tests/36_vector_text.sql:38: ERROR:  function vector_norm(t
 LINE 1: SELECT name, vector_norm(embedding) as norm
                      ^
 HINT:  No function matches the given name and argument types. You might need to add explicit type casts.
-DROP TABLE

@@ -1,5 +1,3 @@
-psql:/tmp/tipg-tests/tests/35_vector.sql:2: NOTICE:  table "embeddings" does not exist, skipping
-DROP TABLE
 psql:/tmp/tipg-tests/tests/35_vector.sql:9: ERROR:  type "vector" does not exist
 LINE 4:     embedding vector(3)
                       ^

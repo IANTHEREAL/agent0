@@ -1,40 +1,18 @@
-psql:/tmp/tipg-tests/tests/14_pessimistic_txn.sql:1: NOTICE:  table "t_pessimistic" does not exist, skipping
-DROP TABLE
-CREATE TABLE
-INSERT 0 1
-INSERT 0 1
- id | balance | version 
-----+---------+---------
-  1 |    1000 |       1
-  2 |    2000 |       1
+id|balance|version
+1|1000|1
+2|2000|1
 (2 rows)
-
-BEGIN
- id | balance | version 
-----+---------+---------
-  1 |    1000 |       1
+id|balance|version
+1|1000|1
 (1 row)
-
-UPDATE 1
-UPDATE 1
-COMMIT
- id | balance | version 
-----+---------+---------
-  1 |     900 |       2
-  2 |    2100 |       2
+id|balance|version
+1|900|2
+2|2100|2
 (2 rows)
-
-BEGIN
- id | balance | version 
-----+---------+---------
-  1 |     900 |       2
+id|balance|version
+1|900|2
 (1 row)
-
-ROLLBACK
- id | balance | version 
-----+---------+---------
-  1 |     900 |       2
-  2 |    2100 |       2
+id|balance|version
+1|900|2
+2|2100|2
 (2 rows)
-
-DROP TABLE
