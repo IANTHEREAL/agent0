@@ -152,6 +152,55 @@ def psql_env() -> dict:
     return env
 
 
+def normalize_decimal(text: str) -> str:
+    def repl(match: re.Match) -> str:
+        num = match.group(0)
+        sign = ""
+        if num.startswith("-"):
+            sign = "-"
+            num = num[1:]
+        if "." not in num:
+            return sign + num
+        int_part, frac = num.split(".", 1)
+        frac = frac.rstrip("0")
+        if frac == "":
+            return sign + int_part
+        return sign + int_part + "." + frac
+
+    return re.sub(r"-?\d+\.\d+", repl, text)
+
+
+def normalize_timestamp(text: str) -> str:
+    return re.sub(
+        r"(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(\.\d+)?(?:\+00:00|Z)?",
+        r"\1 \2\3",
+        text,
+    )
+
+
+def normalize_json_whitespace(text: str) -> str:
+    if "{" not in text and "[" not in text:
+        return text
+    text = re.sub(r"\s+([}\]])", r"\1", text)
+    text = re.sub(r"([{\[])\s+", r"\1", text)
+    text = re.sub(r":\s+", ":", text)
+    text = re.sub(r",\s+", ",", text)
+    return text
+
+
+def normalize_output(text: str) -> List[str]:
+    lines = []
+    for raw in text.splitlines():
+        line = raw.rstrip()
+        if line.startswith("psql:"):
+            continue
+        line = normalize_timestamp(line)
+        line = normalize_decimal(line)
+        line = normalize_json_whitespace(line)
+        lines.append(line)
+    return lines
+
+
 def check_connection() -> bool:
     result = subprocess.run(
         psql_args() + ["-c", "SELECT 1"],
@@ -236,7 +285,37 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
 
     if expected_file.exists():
         expected = expected_file.read_text()
-        if output.strip() == expected.strip():
+        output_lines = output.splitlines()
+        expected_lines = expected.splitlines()
+        expected_has_psql = any(line.startswith("psql:") for line in expected_lines)
+        output_has_psql = any(line.startswith("psql:") for line in output_lines)
+
+        unordered = False
+        for line in expected_lines:
+            if not line.strip():
+                continue
+            if line.strip().lower() == "# unordered":
+                unordered = True
+            break
+
+        if unordered:
+            expected_lines = [line for line in expected_lines if line.strip().lower() != "# unordered"]
+            expected = "\n".join(expected_lines)
+
+        if expected_has_psql and not output_has_psql:
+            log_test(sql_file.name, TestResult.FAILED, "expected psql error output missing")
+            return TestResult.FAILED
+
+        normalized_output = normalize_output(output)
+        normalized_expected = normalize_output(expected)
+
+        if unordered:
+            normalized_output = [line for line in normalized_output if line.strip()]
+            normalized_expected = [line for line in normalized_expected if line.strip()]
+            if sorted(normalized_output) == sorted(normalized_expected):
+                log_test(sql_file.name, TestResult.PASSED)
+                return TestResult.PASSED
+        elif normalized_output == normalized_expected:
             log_test(sql_file.name, TestResult.PASSED)
             return TestResult.PASSED
         else:

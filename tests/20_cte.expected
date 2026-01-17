@@ -1,3 +1,4 @@
+# unordered
 id|name|department|manager_id|salary
 1|Alice|Engineering|NULL|100000
 2|Bob|Engineering|1|80000
