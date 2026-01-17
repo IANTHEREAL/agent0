@@ -48,10 +48,88 @@ psql/ORM → pgwire (handler.rs) → SQL Parser → Executor → TiKV Store → 
 
 ```bash
 cargo build                              # Build
-cargo test                               # Unit tests (191)
+cargo test                               # Unit tests (~190)
 PD_ENDPOINTS=127.0.0.1:2379 cargo run    # Run server
 python3 scripts/integration_test.py     # Integration tests (requires running server)
-cd orm-tests && npm test                  # ORM compatibility
+cd orm-tests && npm test                  # ORM compatibility (600+ tests)
+```
+
+## Quick Start Testing
+
+### Automated Full Test Suite
+
+```bash
+./run_tests.sh
+```
+
+This script automatically:
+1. Starts a fresh TiKV cluster
+2. Builds pg-tikv in release mode
+3. Runs integration tests
+4. Runs ORM tests
+5. Cleans up the cluster on exit
+
+### Manual Workflow
+
+```bash
+# 1. Start TiKV cluster (persistent mode)
+uv run scripts/tikv_admin.py start --name dev --persistent
+
+# 2. Start pg-tikv (use the port from step 1)
+PD_ENDPOINTS=127.0.0.1:2379 PG_PORT=5433 cargo run --release
+
+# 3. Run tests (in another terminal)
+export PG_DSN=postgres://admin:admin@127.0.0.1:5433/postgres
+
+# Integration tests
+python3 scripts/integration_test.py --dsn $PG_DSN
+
+# Or run specific SQL test files
+python3 scripts/integration_test.py --dsn $PG_DSN tests/01_ddl_basic.sql
+python3 scripts/integration_test.py --dsn $PG_DSN tests/
+
+# ORM tests
+cd orm-tests && npm test
+
+# 4. When done, stop the cluster
+uv run scripts/tikv_admin.py stop --name dev
+```
+
+## TiKV Cluster Management
+
+Use `scripts/tikv_admin.py` to manage local TiKV test clusters:
+
+```bash
+# Start a cluster (persistent mode - for development)
+uv run scripts/tikv_admin.py start --name dev --persistent
+
+# Start with specific PD port
+uv run scripts/tikv_admin.py start --name dev --pd-port 2379 --persistent
+
+# List all managed clusters
+uv run scripts/tikv_admin.py list
+
+# Stop a specific cluster
+uv run scripts/tikv_admin.py stop --name dev
+
+# Clean cluster data
+uv run scripts/tikv_admin.py clean --name dev
+```
+
+### Why Use tikv_admin.py?
+
+1. **API v2 mode**: pg-tikv requires TiKV API v2 for keyspace support. The script auto-generates required config.
+2. **Port discovery**: tiup playground assigns random ports. The script extracts and reports them.
+3. **Cluster tracking**: Manages cluster metadata in `~/.pg-tikv/clusters/`
+
+### Cluster Data Location
+
+```
+~/.pg-tikv/clusters/dev/
+├── cluster.json      # Cluster metadata (ports, PID, mode)
+├── data/             # TiKV data directory
+├── playground.log    # tiup playground output
+└── tikv.toml         # TiKV configuration (API v2)
 ```
 
 ## Design Principles
@@ -225,6 +303,31 @@ Unsupported function in JOIN: count
 | STRING_AGG order | Use `STRING_AGG(col, ',' ORDER BY ...)` |
 | MV shows `_mv_rowid` | SELECT explicit columns |
 | EXPLAIN costs differ | Use `.assert` for structure only |
+
+### Adding New SQL File Tests
+
+1. Create `tests/NN_feature_name.sql` (NN = next available number)
+2. Run against PostgreSQL to generate expected output:
+   ```bash
+   psql -h localhost -U postgres -f tests/NN_feature_name.sql > tests/NN_feature_name.expected 2>&1
+   ```
+3. Review and adjust `.expected` for pg-tikv differences if needed
+
+### Debugging Test Failures
+
+```bash
+# Check pg-tikv logs (if using run_tests.sh)
+cat /tmp/pgtikv-test.log
+
+# Run single test with verbose output
+python3 scripts/integration_test.py --dsn $PG_DSN --verbose tests/18_window_functions.sql
+
+# Connect directly with psql
+PGPASSWORD=admin psql -h 127.0.0.1 -p 5433 -U admin -d postgres
+
+# Run specific ORM test suite
+cd orm-tests && npm test -- --grep "TypeORM"
+```
 
 ## Known Issues
 
