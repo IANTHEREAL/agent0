@@ -1,0 +1,17 @@
+QUERY PLAN
+Sort  (cost=41.17..42.23 rows=423 width=36) (actual time=0.009..0.009 rows=2 loops=1)
+  Sort Key: id
+  Sort Method: quicksort  Memory: 25kB
+  ->  Bitmap Heap Scan on explain_analyze_t  (cost=7.43..22.72 rows=423 width=36) (actual time=0.004..0.004 rows=2 loops=1)
+        Recheck Cond: (id >= 2)
+        Heap Blocks: exact=1
+        ->  Bitmap Index Scan on explain_analyze_t_pkey  (cost=0.00..7.33 rows=423 width=0) (actual time=0.002..0.002 rows=2 loops=1)
+              Index Cond: (id >= 2)
+Planning Time: 0.054 ms
+Execution Time: 0.020 ms
+(10 rows)
+QUERY PLAN
+Result  (cost=0.00..0.01 rows=1 width=4) (actual time=0.001..0.001 rows=1 loops=1)
+Planning Time: 0.003 ms
+Execution Time: 0.002 ms
+(3 rows)

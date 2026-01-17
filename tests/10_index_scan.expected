@@ -1,0 +1,9 @@
+id|name|age
+1|Alice|20
+(1 row)
+id|name|age
+(0 rows)
+id|name|age
+3|Alice|25
+2|Bob|30
+(2 rows)

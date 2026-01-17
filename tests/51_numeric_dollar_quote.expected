@@ -1,0 +1,42 @@
+id|price|description
+1|123.45|Product with price 123.45
+2|999.99|Special item worth 999.99
+3|0.01|Tiny price: $0.01
+(3 rows)
+id|price|formatted
+1|123.45|Price is: 123.45
+2|999.99|Price is: 999.99
+3|0.01|Price is: 0.01
+(3 rows)
+id|price|description
+1|123.45|Product with price 123.45
+(1 row)
+total_price
+1123.45
+(1 row)
+id|formula|val|doubled
+1|price * 2|100.00|200.00
+2|val + 50|200.00|400.00
+(2 rows)
+cast_test
+Result: 123.46
+(1 row)
+multiline
+Line 1
+Line 2
+Line 3
+(1 row)
+id|price
+1|123.45
+(1 row)
+with_dollar
+Dollar sign in value: 0.01 dollars
+(1 row)
+category|price
+expensive|123.45
+expensive|999.99
+cheap|0.01
+(3 rows)
+result
+NUMERIC + Dollar-Quote tests passed!
+(1 row)

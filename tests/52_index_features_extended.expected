@@ -1,0 +1,59 @@
+?column?
+CREATE_BTREE:success
+(1 row)
+?column?
+CREATE_PARTIAL:success
+(1 row)
+?column?
+CREATE_PARTIAL_NOTNULL:success
+(1 row)
+?column?
+CREATE_EXPR:success
+(1 row)
+?column?
+CREATE_EXPR2:success
+(1 row)
+psql:/tmp/tipg-tests/tests/52_index_features_extended.sql:41: ERROR:  data type text has no default operator class for access method "gin"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+?column?
+CREATE_GIN:success
+(1 row)
+psql:/tmp/tipg-tests/tests/52_index_features_extended.sql:45: ERROR:  data type text has no default operator class for access method "gist"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
+?column?
+CREATE_GIST:success
+(1 row)
+?column?
+CREATE_HASH:success
+(1 row)
+?column?
+RESULT_PARTIAL:1:Alice
+RESULT_PARTIAL:3:Charlie
+RESULT_PARTIAL:5:Eve
+(3 rows)
+?column?
+RESULT_EXPR:1:Alice
+(1 row)
+?column?
+RESULT_BTREE:3:150
+(1 row)
+?column?
+AM:btree:403
+AM:gin:2742
+AM:gist:783
+AM:hash:405
+(4 rows)
+?column?
+IF_NOT_EXISTS:success
+(1 row)
+?column?
+CREATE_COMPLEX:success
+(1 row)
+psql:/tmp/tipg-tests/tests/52_index_features_extended.sql:82: ERROR:  index "idx_ext_tags_gin" does not exist
+psql:/tmp/tipg-tests/tests/52_index_features_extended.sql:83: ERROR:  index "idx_ext_data_gist" does not exist
+?column?
+DROP_ALL:success
+(1 row)
+?column?
+TEST_COMPLETE
+(1 row)

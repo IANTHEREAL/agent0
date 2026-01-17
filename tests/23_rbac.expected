@@ -1,0 +1,29 @@
+psql:/tmp/tipg-tests/tests/23_rbac.sql:29: ERROR:  syntax error at or near "NOT"
+LINE 1: CREATE ROLE IF NOT EXISTS test_reader WITH PASSWORD 'differe...
+                       ^
+psql:/tmp/tipg-tests/tests/23_rbac.sql:30: ERROR:  syntax error at or near "NOT"
+LINE 1: CREATE ROLE IF NOT EXISTS new_role WITH PASSWORD 'new123' LO...
+                       ^
+roles_test_complete
+1
+(1 row)
+psql:/tmp/tipg-tests/tests/23_rbac.sql:132: ERROR:  role "test_reader" cannot be dropped because some objects depend on it
+DETAIL:  privileges for table actor
+privileges for table category
+privileges for table film
+privileges for table customer
+privileges for table rental
+privileges for table payment
+privileges for table inventory
+privileges for table film_actor
+privileges for table film_category
+privileges for table grant_test_table
+privileges for table another_table
+psql:/tmp/tipg-tests/tests/23_rbac.sql:133: ERROR:  role "test_writer" cannot be dropped because some objects depend on it
+DETAIL:  privileges for table grant_test_table
+privileges for table another_table
+psql:/tmp/tipg-tests/tests/23_rbac.sql:134: ERROR:  role "test_admin" cannot be dropped because some objects depend on it
+DETAIL:  privileges for table grant_test_table
+status
+RBAC tests completed
+(1 row)

@@ -1,0 +1,12 @@
+?column?
+FUNC_FOUND=1
+(1 row)
+?column?
+TRIGGER_FOUND=1
+(1 row)
+?column?
+TRIGGER_LEFT=0
+(1 row)
+?column?
+FUNC_LEFT=0
+(1 row)

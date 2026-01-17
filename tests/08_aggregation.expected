@@ -1,0 +1,12 @@
+count
+4
+(1 row)
+sum
+45
+(1 row)
+max|min
+20|5
+(1 row)
+sum
+30
+(1 row)

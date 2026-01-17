@@ -1,0 +1,63 @@
+actor_count
+3
+(1 row)
+film_count
+10
+(1 row)
+customer_count
+3
+(1 row)
+rental_count
+3
+(1 row)
+payment_count
+5
+(1 row)
+film_actor_count
+4
+(1 row)
+inventory_count
+5
+(1 row)
+category_count
+3
+(1 row)
+g_films
+3
+(1 row)
+pg_films
+2
+(1 row)
+pg13_films
+2
+(1 row)
+r_films
+1
+(1 row)
+nc17_films
+2
+(1 row)
+min_len|max_len
+48|169
+(1 row)
+total_revenue
+20.950000000000003
+(1 row)
+short_films
+3
+(1 row)
+long_films
+2
+(1 row)
+active_customers
+2
+(1 row)
+sports_films
+2
+(1 row)
+action_films
+2
+(1 row)
+horror_films
+1
+(1 row)

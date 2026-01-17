@@ -1,0 +1,22 @@
+name|score
+Charlie|70
+Alice|80
+David|85
+Bob|90
+Eve|95
+(5 rows)
+name|score
+Eve|95
+Bob|90
+David|85
+Alice|80
+Charlie|70
+(5 rows)
+name|score
+Eve|95
+Bob|90
+(2 rows)
+name|score
+David|85
+Alice|80
+(2 rows)

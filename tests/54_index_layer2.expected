@@ -1,0 +1,15 @@
+?column?
+PARTIAL_INDEX=1
+(1 row)
+?column?
+EXPR_INDEX=1
+(1 row)
+psql:/tmp/tipg-tests/tests/54_index_layer2.sql:21: ERROR:  column "idx_test.name" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: ...agg(name, ',') FROM idx_test WHERE status = 1 ORDER BY name;
+                                                                  ^
+psql:/tmp/tipg-tests/tests/54_index_layer2.sql:25: ERROR:  column "idx_test.name" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: ...agg(name, ',') FROM idx_test WHERE status = 1 ORDER BY name;
+                                                                  ^
+psql:/tmp/tipg-tests/tests/54_index_layer2.sql:29: ERROR:  column "idx_test.name" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: ...agg(name, ',') FROM idx_test WHERE status = 1 ORDER BY name;
+                                                                  ^

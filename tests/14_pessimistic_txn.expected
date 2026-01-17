@@ -1,0 +1,18 @@
+id|balance|version
+1|1000|1
+2|2000|1
+(2 rows)
+id|balance|version
+1|1000|1
+(1 row)
+id|balance|version
+1|900|2
+2|2100|2
+(2 rows)
+id|balance|version
+1|900|2
+(1 row)
+id|balance|version
+1|900|2
+2|2100|2
+(2 rows)

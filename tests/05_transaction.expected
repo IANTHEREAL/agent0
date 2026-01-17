@@ -1,0 +1,17 @@
+id|val
+(0 rows)
+id|val
+2|committed
+3|also_committed
+(2 rows)
+id|val
+1|updated
+(1 row)
+id|val
+1|updated
+(1 row)
+id|val
+1|updated
+2|second
+3|third
+(3 rows)

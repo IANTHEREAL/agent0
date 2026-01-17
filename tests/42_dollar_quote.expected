@@ -1,0 +1,7 @@
+?column?
+ROW=1:hello
+ROW=2:world
+(2 rows)
+?column?
+BODY= $1 
+(1 row)

@@ -1,0 +1,13 @@
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:133: ERROR:  unrecognized configuration parameter "tables"
+actor_id|first_name|last_name|last_update
+1|PENELOPE|GUINESS|2026-01-17 03:37:11.422125
+2|NICK|WAHLBERG|2026-01-17 03:37:11.422768
+(2 rows)
+category_id|name|last_update
+1|Action|2026-01-17 03:37:11.423323
+2|Animation|2026-01-17 03:37:11.424016
+(2 rows)
+country_id|country|last_update
+1|Afghanistan|2026-01-17 03:37:11.424513
+2|Algeria|2026-01-17 03:37:11.42508
+(2 rows)

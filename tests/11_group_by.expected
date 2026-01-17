@@ -1,0 +1,11 @@
+# unordered
+customer|sum
+Alice|40
+Bob|25
+Charlie|50
+(3 rows)
+customer|count|max
+Alice|2|30
+Bob|2|20
+Charlie|1|50
+(3 rows)

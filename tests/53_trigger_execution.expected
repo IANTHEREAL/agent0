@@ -1,0 +1,6 @@
+?column?
+INSERT_HAS_TIMESTAMP=true
+(1 row)
+?column?
+UPDATE_HAS_TIMESTAMP=true
+(1 row)
