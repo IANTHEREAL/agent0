@@ -107,18 +107,17 @@ async def list_tenants(
 async def create_tenant(
     request: TenantCreate,
     pd: PDClient = Depends(get_pd_client),
+    pg: PgTikvClient = Depends(get_pg_client),
     settings: Settings = Depends(get_settings),
     db: Session = Depends(get_db),
 ):
     """Create a new tenant."""
-    # Check if already exists in TiKV
     if pd.get_keyspace(request.name):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Tenant '{request.name}' already exists",
         )
 
-    # Check if exists in database (including soft-deleted)
     existing = db.query(TenantDB).filter(TenantDB.name == request.name).first()
     if existing:
         if existing.is_deleted:
@@ -135,27 +134,29 @@ async def create_tenant(
     audit = get_audit_service(db)
 
     try:
-        # Create keyspace in TiKV
         if not pd.create_keyspace(request.name):
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to create keyspace in TiKV",
             )
 
-        # Generate password
         password = request.admin_password or generate_password()
 
-        # Create tenant record in database
+        if not pg.bootstrap_admin_password(request.name, request.admin_user, password):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to set admin password. Keyspace created but password unchanged.",
+            )
+
         tenant_db = TenantDB(
             name=request.name,
             is_deleted=False,
             created_at=datetime.now(timezone.utc),
-            created_by=None,  # TODO: Add operator tracking when auth is implemented
+            created_by=None,
         )
         db.add(tenant_db)
         db.commit()
 
-        # Log successful creation
         audit.log_tenant_created(request.name, success=True)
 
         return TenantCreateResponse(

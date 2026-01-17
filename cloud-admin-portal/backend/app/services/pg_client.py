@@ -249,3 +249,42 @@ class PgTikvClient:
         sql = f"ALTER ROLE {target_user} WITH PASSWORD '{escaped_password}'"
         result = self.execute_sql(tenant, admin_user, admin_password, sql)
         return result is not None
+
+    def bootstrap_admin_password(
+        self,
+        tenant: str,
+        admin_user: str,
+        new_password: str,
+        default_password: str = "admin",
+        max_retries: int = 5
+    ) -> bool:
+        """Set admin password for a newly created tenant.
+        
+        When a new keyspace is created, pg-tikv bootstraps an admin user
+        with default password "admin" on first connection. This method:
+        1. Connects with default password to trigger bootstrap
+        2. Changes password to the desired value
+        
+        Args:
+            tenant: Tenant name (keyspace)
+            admin_user: Admin username (typically "admin")
+            new_password: Desired admin password
+            default_password: Default bootstrap password (default: "admin")
+            max_retries: Number of connection attempts (keyspace creation may take time)
+        
+        Returns:
+            True if password was set successfully
+        """
+        import time
+        
+        for attempt in range(max_retries):
+            if self.test_connection(tenant, admin_user, default_password):
+                break
+            time.sleep(0.5)
+        else:
+            return False
+        
+        escaped_password = new_password.replace("'", "''")
+        sql = f"ALTER ROLE {admin_user} WITH PASSWORD '{escaped_password}'"
+        result = self.execute_sql(tenant, admin_user, default_password, sql)
+        return result is not None
