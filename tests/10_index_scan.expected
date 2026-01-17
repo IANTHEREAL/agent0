@@ -1,0 +1,23 @@
+psql:/tmp/tipg-tests/tests/10_index_scan.sql:4: NOTICE:  table "users" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ id | name  | age 
+----+-------+-----
+  1 | Alice |  20
+(1 row)
+
+ id | name | age 
+----+------+-----
+(0 rows)
+
+ id | name  | age 
+----+-------+-----
+  3 | Alice |  25
+  2 | Bob   |  30
+(2 rows)
+
+DROP TABLE

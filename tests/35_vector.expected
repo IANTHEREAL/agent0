@@ -1,0 +1,33 @@
+psql:/tmp/tipg-tests/tests/35_vector.sql:2: NOTICE:  table "embeddings" does not exist, skipping
+DROP TABLE
+psql:/tmp/tipg-tests/tests/35_vector.sql:9: ERROR:  type "vector" does not exist
+LINE 4:     embedding vector(3)
+                      ^
+psql:/tmp/tipg-tests/tests/35_vector.sql:15: ERROR:  relation "embeddings" does not exist
+LINE 1: INSERT INTO embeddings (name, embedding) VALUES
+                    ^
+psql:/tmp/tipg-tests/tests/35_vector.sql:20: ERROR:  relation "embeddings" does not exist
+LINE 2: FROM embeddings
+             ^
+psql:/tmp/tipg-tests/tests/35_vector.sql:25: ERROR:  relation "embeddings" does not exist
+LINE 2: FROM embeddings
+             ^
+psql:/tmp/tipg-tests/tests/35_vector.sql:30: ERROR:  relation "embeddings" does not exist
+LINE 2: FROM embeddings
+             ^
+psql:/tmp/tipg-tests/tests/35_vector.sql:34: ERROR:  relation "embeddings" does not exist
+LINE 2: FROM embeddings;
+             ^
+psql:/tmp/tipg-tests/tests/35_vector.sql:38: ERROR:  relation "embeddings" does not exist
+LINE 2: FROM embeddings;
+             ^
+psql:/tmp/tipg-tests/tests/35_vector.sql:41: ERROR:  type "vector" does not exist
+LINE 1: SELECT CAST('[7.0, 8.0, 9.0]' AS vector) AS vec;
+                                         ^
+psql:/tmp/tipg-tests/tests/35_vector.sql:47: ERROR:  relation "embeddings" does not exist
+LINE 2: FROM embeddings
+             ^
+psql:/tmp/tipg-tests/tests/35_vector.sql:53: ERROR:  relation "embeddings" does not exist
+LINE 2: FROM embeddings
+             ^
+psql:/tmp/tipg-tests/tests/35_vector.sql:56: ERROR:  table "embeddings" does not exist

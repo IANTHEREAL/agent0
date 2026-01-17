@@ -1,0 +1,32 @@
+psql:/tmp/tipg-tests/tests/54_index_layer2.sql:1: NOTICE:  table "idx_test" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+CREATE INDEX
+CREATE INDEX
+    ?column?     
+-----------------
+ PARTIAL_INDEX=1
+(1 row)
+
+   ?column?   
+--------------
+ EXPR_INDEX=1
+(1 row)
+
+psql:/tmp/tipg-tests/tests/54_index_layer2.sql:21: ERROR:  column "idx_test.name" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: ...agg(name, ',') FROM idx_test WHERE status = 1 ORDER BY name;
+                                                                  ^
+INSERT 0 1
+psql:/tmp/tipg-tests/tests/54_index_layer2.sql:25: ERROR:  column "idx_test.name" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: ...agg(name, ',') FROM idx_test WHERE status = 1 ORDER BY name;
+                                                                  ^
+UPDATE 1
+psql:/tmp/tipg-tests/tests/54_index_layer2.sql:29: ERROR:  column "idx_test.name" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: ...agg(name, ',') FROM idx_test WHERE status = 1 ORDER BY name;
+                                                                  ^
+DROP INDEX
+DROP INDEX
+DROP TABLE

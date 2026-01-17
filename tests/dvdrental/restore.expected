@@ -1,0 +1,18 @@
+SET
+SET
+SET
+SET
+SET
+ set_config 
+------------
+ 
+(1 row)
+
+SET
+SET
+SET
+psql:/tmp/tipg-tests/tests/dvdrental/restore.resolved.sql:25: ERROR:  database "dvdrental" does not exist
+psql:/tmp/tipg-tests/tests/dvdrental/restore.resolved.sql:30: ERROR:  invalid LC_COLLATE locale name: "English_United States.1252"
+HINT:  If the locale name is specific to ICU, use ICU_LOCALE.
+psql:/tmp/tipg-tests/tests/dvdrental/restore.resolved.sql:33: ERROR:  database "dvdrental" does not exist
+psql:/tmp/tipg-tests/tests/dvdrental/restore.resolved.sql:35: error: \connect: connection to server at "127.0.0.1", port 55432 failed: FATAL:  database "dvdrental" does not exist

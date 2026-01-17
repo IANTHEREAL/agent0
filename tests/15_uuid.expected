@@ -1,0 +1,38 @@
+psql:/tmp/tipg-tests/tests/15_uuid.sql:3: NOTICE:  table "contacts" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+              contact_id              | first_name | last_name |         email          |    phone     
+--------------------------------------+------------+-----------+------------------------+--------------
+ 9b3ed959-ea47-4338-bae4-a4201836b6d6 | John       | Smith     | john.smith@example.com | 408-237-2345
+(1 row)
+
+INSERT 0 1
+              contact_id              | first_name | last_name |        email         |    phone     
+--------------------------------------+------------+-----------+----------------------+--------------
+ 62081a0c-2670-4f97-bee6-bdbd8f6e2868 | Jane       | Doe       | jane.doe@example.com | 408-237-2346
+(1 row)
+
+INSERT 0 1
+              contact_id              | first_name | last_name |         email          |    phone     
+--------------------------------------+------------+-----------+------------------------+--------------
+ 9b3ed959-ea47-4338-bae4-a4201836b6d6 | John       | Smith     | john.smith@example.com | 408-237-2345
+ 62081a0c-2670-4f97-bee6-bdbd8f6e2868 | Jane       | Doe       | jane.doe@example.com   | 408-237-2346
+(2 rows)
+
+              contact_id              | first_name | last_name |      email      |    phone     
+--------------------------------------+------------+-----------+-----------------+--------------
+ 550e8400-e29b-41d4-a716-446655440000 | Bob        | Wilson    | bob@example.com | 408-111-2222
+(1 row)
+
+INSERT 0 1
+              contact_id              | first_name | last_name |      email      |    phone     
+--------------------------------------+------------+-----------+-----------------+--------------
+ 550e8400-e29b-41d4-a716-446655440000 | Bob        | Wilson    | bob@example.com | 408-111-2222
+(1 row)
+
+           gen_random_uuid            
+--------------------------------------
+ 13374301-8e16-4a4d-8e17-6a07a5ebf67b
+(1 row)
+
+DROP TABLE

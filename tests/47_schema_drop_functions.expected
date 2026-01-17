@@ -1,0 +1,27 @@
+psql:/tmp/tipg-tests/tests/47_schema_drop_functions.sql:3: NOTICE:  schema "ft_schema_drop" does not exist, skipping
+DROP TABLE
+psql:/tmp/tipg-tests/tests/47_schema_drop_functions.sql:4: NOTICE:  schema "ft_schema_drop" does not exist, skipping
+DROP FUNCTION
+psql:/tmp/tipg-tests/tests/47_schema_drop_functions.sql:5: NOTICE:  schema "ft_schema_drop" does not exist, skipping
+DROP SCHEMA
+CREATE SCHEMA
+SET
+CREATE TABLE
+CREATE FUNCTION
+CREATE TRIGGER
+DROP TABLE
+    ?column?    
+----------------
+ TRIGGER_LEFT=0
+(1 row)
+
+psql:/tmp/tipg-tests/tests/47_schema_drop_functions.sql:28: ERROR:  cannot drop schema ft_schema_drop because other objects depend on it
+DETAIL:  function f() depends on schema ft_schema_drop
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP FUNCTION
+DROP SCHEMA
+   ?column?    
+---------------
+ SCHEMA_LEFT=0
+(1 row)
+

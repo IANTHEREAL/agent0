@@ -1,0 +1,53 @@
+psql:/tmp/tipg-tests/tests/05_transaction.sql:4: NOTICE:  table "t_txn" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+BEGIN
+INSERT 0 1
+ROLLBACK
+ id | val 
+----+-----
+(0 rows)
+
+BEGIN
+INSERT 0 1
+INSERT 0 1
+COMMIT
+ id |      val       
+----+----------------
+  2 | committed
+  3 | also_committed
+(2 rows)
+
+psql:/tmp/tipg-tests/tests/05_transaction.sql:26: NOTICE:  table "t_txn_multi" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+BEGIN
+UPDATE 1
+COMMIT
+ id |   val   
+----+---------
+  1 | updated
+(1 row)
+
+BEGIN
+UPDATE 1
+ROLLBACK
+ id |   val   
+----+---------
+  1 | updated
+(1 row)
+
+BEGIN
+INSERT 0 1
+INSERT 0 1
+COMMIT
+ id |   val   
+----+---------
+  1 | updated
+  2 | second
+  3 | third
+(3 rows)
+
+DROP TABLE
+DROP TABLE

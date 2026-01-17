@@ -1,0 +1,18 @@
+psql:/tmp/tipg-tests/tests/09_index.sql:4: NOTICE:  table "idx_test" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+CREATE INDEX
+CREATE INDEX
+psql:/tmp/tipg-tests/tests/09_index.sql:23: ERROR:  duplicate key value violates unique constraint "idx_age"
+DETAIL:  Key (age)=(20) already exists.
+ id | name  | age 
+----+-------+-----
+  1 | Alice |  20
+  2 | Bob   |  30
+  3 | Alice |  25
+(3 rows)
+
+DROP TABLE

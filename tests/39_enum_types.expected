@@ -1,0 +1,47 @@
+psql:/tmp/tipg-tests/tests/39_enum_types.sql:2: NOTICE:  table "udt_enum_test" does not exist, skipping
+DROP TABLE
+psql:/tmp/tipg-tests/tests/39_enum_types.sql:3: NOTICE:  type "role" does not exist, skipping
+DROP TYPE
+psql:/tmp/tipg-tests/tests/39_enum_types.sql:4: NOTICE:  type "comp" does not exist, skipping
+DROP TYPE
+CREATE TYPE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+psql:/tmp/tipg-tests/tests/39_enum_types.sql:16: ERROR:  invalid input value for enum role: "INVALID"
+LINE 1: INSERT INTO udt_enum_test (id, r) VALUES (3, 'INVALID');
+                                                     ^
+ column_name |  data_type   | udt_schema | udt_name 
+-------------+--------------+------------+----------
+ id          | integer      | pg_catalog | int4
+ r           | USER-DEFINED | public     | role
+(2 rows)
+
+ typname | typtype | typcategory | enumlabel | enumsortorder 
+---------+---------+-------------+-----------+---------------
+ role    | e       | E           | USER      |             1
+ role    | e       | E           | ADMIN     |             2
+(2 rows)
+
+ attname | typname 
+---------+---------
+ r       | role
+(1 row)
+
+psql:/tmp/tipg-tests/tests/39_enum_types.sql:39: ERROR:  cannot drop type role because other objects depend on it
+DETAIL:  column r of table udt_enum_test depends on type role
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP TABLE
+DROP TYPE
+psql:/tmp/tipg-tests/tests/39_enum_types.sql:43: NOTICE:  type "role" does not exist, skipping
+DROP TYPE
+CREATE TYPE
+ typname | typtype 
+---------+---------
+ comp    | c
+(1 row)
+
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/39_enum_types.sql:49: ERROR:  cannot drop type comp because other objects depend on it
+DETAIL:  column c of table udt_comp_test depends on type comp
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.

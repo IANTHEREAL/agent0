@@ -1,0 +1,17 @@
+psql:/tmp/tipg-tests/tests/42_dollar_quote.sql:3: NOTICE:  table "dq_t" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+  ?column?   
+-------------
+ ROW=1:hello
+ ROW=2:world
+(2 rows)
+
+ ?column?  
+-----------
+ BODY= $1 
+(1 row)
+
+DROP TABLE

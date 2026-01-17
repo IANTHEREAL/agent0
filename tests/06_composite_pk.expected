@@ -1,0 +1,23 @@
+psql:/tmp/tipg-tests/tests/06_composite_pk.sql:4: NOTICE:  table "order_line" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+psql:/tmp/tipg-tests/tests/06_composite_pk.sql:19: ERROR:  duplicate key value violates unique constraint "order_line_pkey"
+DETAIL:  Key (w_id, d_id, o_id)=(1, 1, 100) already exists.
+ w_id | d_id | o_id |  info   
+------+------+------+---------
+    1 |    1 |  100 | Order 1
+    1 |    1 |  101 | Order 2
+    1 |    2 |  100 | Order 3
+(3 rows)
+
+DELETE 1
+ w_id | d_id | o_id |  info   
+------+------+------+---------
+    1 |    1 |  101 | Order 2
+    1 |    2 |  100 | Order 3
+(2 rows)
+
+DROP TABLE

@@ -1,0 +1,22 @@
+psql:/tmp/tipg-tests/tests/04_returning.sql:4: NOTICE:  table "t_ret" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+ id 
+----
+  1
+(1 row)
+
+INSERT 0 1
+ id | tag 
+----+-----
+  2 | B
+(1 row)
+
+INSERT 0 1
+ id | tag 
+----+-----
+  3 | C
+(1 row)
+
+INSERT 0 1
+DROP TABLE

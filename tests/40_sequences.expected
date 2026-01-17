@@ -1,0 +1,39 @@
+psql:/tmp/tipg-tests/tests/40_sequences.sql:4: NOTICE:  table "seq_sql_smoke" does not exist, skipping
+DROP TABLE
+psql:/tmp/tipg-tests/tests/40_sequences.sql:5: NOTICE:  sequence "seq_sql_s" does not exist, skipping
+DROP SEQUENCE
+CREATE SEQUENCE
+ nextval 
+---------
+       5
+(1 row)
+
+ currval 
+---------
+       5
+(1 row)
+
+ setval 
+--------
+     10
+(1 row)
+
+ setval 
+--------
+     20
+(1 row)
+
+ nextval 
+---------
+      20
+(1 row)
+
+DROP SEQUENCE
+CREATE TABLE
+INSERT 0 2
+ nextval 
+---------
+       3
+(1 row)
+
+DROP TABLE

@@ -1,0 +1,74 @@
+psql:/tmp/tipg-tests/tests/41_schemas.sql:4: NOTICE:  schema "app" does not exist, skipping
+DROP TABLE
+psql:/tmp/tipg-tests/tests/41_schemas.sql:5: NOTICE:  schema "app" does not exist, skipping
+DROP TABLE
+psql:/tmp/tipg-tests/tests/41_schemas.sql:6: NOTICE:  schema "app" does not exist, skipping
+DROP SEQUENCE
+psql:/tmp/tipg-tests/tests/41_schemas.sql:7: NOTICE:  sequence "s" does not exist, skipping
+DROP SEQUENCE
+psql:/tmp/tipg-tests/tests/41_schemas.sql:8: NOTICE:  schema "app" does not exist, skipping
+DROP SCHEMA
+CREATE SCHEMA
+CREATE TABLE
+INSERT 0 1
+SET
+ ?column? 
+----------
+        1
+(1 row)
+
+CREATE TABLE
+ ?column? 
+----------
+        1
+(1 row)
+
+ ?column? 
+----------
+        1
+(1 row)
+
+ ?column? 
+----------
+        1
+(1 row)
+
+CREATE SEQUENCE
+CREATE SEQUENCE
+ ?column? 
+----------
+        1
+(1 row)
+
+ ?column? 
+----------
+        1
+(1 row)
+
+SET
+ ?column? 
+----------
+        1
+(1 row)
+
+psql:/tmp/tipg-tests/tests/41_schemas.sql:50: ERROR:  cannot drop schema app because other objects depend on it
+DETAIL:  table users depends on schema app
+table t1 depends on schema app
+sequence app.s depends on schema app
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+ ?column? 
+----------
+        1
+(1 row)
+
+DROP TABLE
+DROP TABLE
+DROP SEQUENCE
+DROP SEQUENCE
+DROP SCHEMA
+SET
+ ?column? 
+----------
+        1
+(1 row)
+

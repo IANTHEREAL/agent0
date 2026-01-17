@@ -24,12 +24,12 @@ CREATE FUNCTION
 
  check_sign 
 ------------
- 
+ negative
 (1 row)
 
  check_sign 
 ------------
- 
+ zero
 (1 row)
 
 CREATE FUNCTION
@@ -66,22 +66,22 @@ CREATE FUNCTION
 
  grade_score 
 -------------
- 
+ B
 (1 row)
 
  grade_score 
 -------------
- 
+ C
 (1 row)
 
  grade_score 
 -------------
- 
+ D
 (1 row)
 
  grade_score 
 -------------
- 
+ F
 (1 row)
 
 CREATE FUNCTION
@@ -120,13 +120,13 @@ CREATE FUNCTION
 
  maybe_null 
 ------------
- 
+           
 (1 row)
 
 CREATE FUNCTION
  circle_area 
 -------------
-  12.5663600
+    12.56636
 (1 row)
 
 CREATE FUNCTION
@@ -172,7 +172,7 @@ CREATE FUNCTION
 
  my_abs 
 --------
- --5
+      5
 (1 row)
 
  my_abs 
@@ -204,12 +204,12 @@ CREATE FUNCTION
 
  simple_factorial 
 ------------------
- 
+                6
 (1 row)
 
  simple_factorial 
 ------------------
- 
+              120
 (1 row)
 
 DROP TABLE

@@ -1,0 +1,212 @@
+psql:/tmp/tipg-tests/tests/24_json_comprehensive.sql:7: NOTICE:  table "products" does not exist, skipping
+DROP TABLE
+psql:/tmp/tipg-tests/tests/24_json_comprehensive.sql:8: NOTICE:  table "contacts" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+CREATE TABLE
+ id |        name        |                    properties                     
+----+--------------------+---------------------------------------------------
+  1 | Ink Fusion T-Shirt | {"size": ["S", "M", "L", "XL"], "color": "white"}
+(1 row)
+
+INSERT 0 1
+ id |         name          |                    properties                     
+----+-----------------------+---------------------------------------------------
+  2 | ThreadVerse T-Shirt   | {"size": ["S", "M", "L", "XL"], "color": "black"}
+  3 | Design Dynamo T-Shirt | {"size": ["S", "M", "L", "XL"], "color": "blue"}
+(2 rows)
+
+INSERT 0 2
+ id |         name          |                    properties                     
+----+-----------------------+---------------------------------------------------
+  1 | Ink Fusion T-Shirt    | {"size": ["S", "M", "L", "XL"], "color": "white"}
+  2 | ThreadVerse T-Shirt   | {"size": ["S", "M", "L", "XL"], "color": "black"}
+  3 | Design Dynamo T-Shirt | {"size": ["S", "M", "L", "XL"], "color": "blue"}
+(3 rows)
+
+ id |         name          |  color  
+----+-----------------------+---------
+  1 | Ink Fusion T-Shirt    | "white"
+  2 | ThreadVerse T-Shirt   | "black"
+  3 | Design Dynamo T-Shirt | "blue"
+(3 rows)
+
+ id |         name          | color 
+----+-----------------------+-------
+  1 | Ink Fusion T-Shirt    | white
+  2 | ThreadVerse T-Shirt   | black
+  3 | Design Dynamo T-Shirt | blue
+(3 rows)
+
+ id |        name         | color 
+----+---------------------+-------
+  1 | Ink Fusion T-Shirt  | white
+  2 | ThreadVerse T-Shirt | black
+(2 rows)
+
+ id |         name          | color 
+----+-----------------------+-------
+  3 | Design Dynamo T-Shirt | blue
+(1 row)
+
+ id |   name   |              phones              
+----+----------+----------------------------------
+  1 | John Doe | ["408-111-2222", "408-111-2223"]
+  2 | Jane Doe | ["212-111-2222", "212-111-2223"]
+(2 rows)
+
+INSERT 0 2
+   name   |  work_phone  
+----------+--------------
+ John Doe | 408-111-2222
+ Jane Doe | 212-111-2222
+(2 rows)
+
+   name   | personal_phone 
+----------+----------------
+ John Doe | 408-111-2223
+ Jane Doe | 212-111-2223
+(2 rows)
+
+psql:/tmp/tipg-tests/tests/24_json_comprehensive.sql:78: NOTICE:  table "users_json" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+ id |                                     data                                      
+----+-------------------------------------------------------------------------------
+  1 | {"user": {"name": "Alice", "email": "alice@example.com"}, "active": true}
+  2 | {"user": {"name": "Bob", "email": "bob@example.com"}, "active": false}
+  3 | {"user": {"name": "Charlie", "email": "charlie@example.com"}, "active": true}
+(3 rows)
+
+INSERT 0 3
+ id | username 
+----+----------
+  1 | Alice
+  2 | Bob
+  3 | Charlie
+(3 rows)
+
+ id |        email        
+----+---------------------
+  1 | alice@example.com
+  3 | charlie@example.com
+(2 rows)
+
+psql:/tmp/tipg-tests/tests/24_json_comprehensive.sql:96: NOTICE:  table "orders_json" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+ id |                                               order_data                                                
+----+---------------------------------------------------------------------------------------------------------
+  1 | {"items": [{"qty": 2, "name": "Book"}, {"qty": 5, "name": "Pen"}], "total": 25.50, "customer": "Alice"}
+  2 | {"items": [{"qty": 1, "name": "Laptop"}], "total": 999.99, "customer": "Bob"}
+(2 rows)
+
+INSERT 0 2
+ id | customer | total  
+----+----------+--------
+  1 | Alice    | 25.50
+  2 | Bob      | 999.99
+(2 rows)
+
+ id | first_item 
+----+------------
+  1 | Book
+  2 | Laptop
+(2 rows)
+
+psql:/tmp/tipg-tests/tests/24_json_comprehensive.sql:113: NOTICE:  table "json_vs_jsonb" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+ id |     json_col     |    jsonb_col     
+----+------------------+------------------
+  1 | {"b": 2, "a": 1} | {"a": 1, "b": 2}
+(1 row)
+
+INSERT 0 1
+     json_col     |    jsonb_col     
+------------------+------------------
+ {"b": 2, "a": 1} | {"a": 1, "b": 2}
+(1 row)
+
+ id |        name        |                    properties                     
+----+--------------------+---------------------------------------------------
+  1 | Ink Fusion T-Shirt | {"size": ["S", "M", "L", "XL"], "color": "white"}
+(1 row)
+
+ id |        name         |                    properties                     
+----+---------------------+---------------------------------------------------
+  2 | ThreadVerse T-Shirt | {"size": ["S", "M", "L", "XL"], "color": "black"}
+(1 row)
+
+   json_cast   
+---------------
+ {"test": 123}
+(1 row)
+
+  jsonb_cast   
+---------------
+ {"test": 123}
+(1 row)
+
+ nested_value 
+--------------
+ value
+(1 row)
+
+psql:/tmp/tipg-tests/tests/24_json_comprehensive.sql:142: NOTICE:  table "metrics" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+ id |                            data                            
+----+------------------------------------------------------------
+  1 | {"humidity": 45, "pressure": 1013.25, "temperature": 72.5}
+  2 | {"humidity": 55, "pressure": 1015.00, "temperature": 68.0}
+(2 rows)
+
+INSERT 0 2
+ id | temp | humidity 
+----+------+----------
+  1 | 72.5 | 45
+  2 | 68.0 | 55
+(2 rows)
+
+         name          | color | smallest_size | largest_size 
+-----------------------+-------+---------------+--------------
+ Design Dynamo T-Shirt | blue  | S             | XL
+ Ink Fusion T-Shirt    | white | S             | XL
+ ThreadVerse T-Shirt   | black | S             | XL
+(3 rows)
+
+ id |        name        |                          properties                          
+----+--------------------+--------------------------------------------------------------
+  1 | Ink Fusion T-Shirt | {"size": ["XS", "S", "M", "L", "XL", "XXL"], "color": "red"}
+(1 row)
+
+UPDATE 1
+ id |        name        |                          properties                          
+----+--------------------+--------------------------------------------------------------
+  1 | Ink Fusion T-Shirt | {"size": ["XS", "S", "M", "L", "XL", "XXL"], "color": "red"}
+(1 row)
+
+ id |     name     |                          properties                           
+----+--------------+---------------------------------------------------------------
+  4 | Premium Polo | {"size": ["M", "L"], "color": "white", "premium": true}
+  5 | Basic Tee    | {"size": ["S", "M", "L"], "color": "white", "premium": false}
+(2 rows)
+
+INSERT 0 2
+     name     | color 
+--------------+-------
+ Premium Polo | white
+(1 row)
+
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+               status               
+------------------------------------
+ JSON comprehensive tests completed
+(1 row)
+

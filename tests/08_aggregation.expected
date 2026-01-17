@@ -1,0 +1,28 @@
+psql:/tmp/tipg-tests/tests/08_aggregation.sql:4: NOTICE:  table "sales" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ count 
+-------
+     4
+(1 row)
+
+ sum 
+-----
+  45
+(1 row)
+
+ max | min 
+-----+-----
+  20 |   5
+(1 row)
+
+ sum 
+-----
+  30
+(1 row)
+
+DROP TABLE

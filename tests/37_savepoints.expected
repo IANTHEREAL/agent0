@@ -1,0 +1,153 @@
+psql:/tmp/tipg-tests/tests/37_savepoints.sql:4: NOTICE:  table "t_savepoint" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+BEGIN
+SAVEPOINT
+UPDATE 1
+ROLLBACK
+COMMIT
+ val 
+-----
+ 100
+(1 row)
+
+UPDATE 1
+BEGIN
+SAVEPOINT
+UPDATE 1
+ROLLBACK
+UPDATE 1
+ROLLBACK
+COMMIT
+ val 
+-----
+ 100
+(1 row)
+
+UPDATE 1
+BEGIN
+SAVEPOINT
+UPDATE 1
+RELEASE
+COMMIT
+ val 
+-----
+ 500
+(1 row)
+
+UPDATE 1
+BEGIN
+SAVEPOINT
+UPDATE 1
+SAVEPOINT
+UPDATE 1
+ROLLBACK
+COMMIT
+ val 
+-----
+ 200
+(1 row)
+
+UPDATE 1
+BEGIN
+SAVEPOINT
+UPDATE 1
+SAVEPOINT
+UPDATE 1
+ROLLBACK
+COMMIT
+ val 
+-----
+ 100
+(1 row)
+
+UPDATE 1
+BEGIN
+SAVEPOINT
+SAVEPOINT
+UPDATE 1
+RELEASE
+ROLLBACK
+COMMIT
+ val 
+-----
+ 100
+(1 row)
+
+INSERT 0 1
+INSERT 0 1
+BEGIN
+SAVEPOINT
+UPDATE 3
+ROLLBACK
+COMMIT
+ val 
+-----
+ 100
+ 200
+ 300
+(3 rows)
+
+BEGIN
+SAVEPOINT
+DELETE 1
+ROLLBACK
+COMMIT
+ count 
+-------
+     3
+(1 row)
+
+BEGIN
+SAVEPOINT
+INSERT 0 1
+ROLLBACK
+COMMIT
+ count 
+-------
+     3
+(1 row)
+
+UPDATE 1
+BEGIN
+SAVEPOINT
+INSERT 0 1
+UPDATE 1
+DELETE 1
+ROLLBACK
+COMMIT
+ val 
+-----
+ 100
+(1 row)
+
+ count 
+-------
+     3
+(1 row)
+
+UPDATE 1
+BEGIN
+SAVEPOINT
+UPDATE 1
+ROLLBACK
+ val 
+-----
+ 100
+(1 row)
+
+UPDATE 1
+BEGIN
+SAVEPOINT
+UPDATE 1
+SAVEPOINT
+UPDATE 1
+ROLLBACK
+COMMIT
+ val 
+-----
+ 777
+(1 row)
+
+DROP TABLE

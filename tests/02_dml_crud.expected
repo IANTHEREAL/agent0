@@ -1,0 +1,53 @@
+psql:/tmp/tipg-tests/tests/02_dml_crud.sql:4: NOTICE:  table "t_dml" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+INSERT 0 1
+ id |  name   | age | score 
+----+---------+-----+-------
+  1 | Alice   |  20 |  80.5
+  2 | Bob     |  25 |    90
+  3 | Charlie |  30 |  85.5
+(3 rows)
+
+  name   | age 
+---------+-----
+ Alice   |  20
+ Bob     |  25
+ Charlie |  30
+(3 rows)
+
+ id |  name   | age | score 
+----+---------+-----+-------
+  2 | Bob     |  25 |    90
+  3 | Charlie |  30 |  85.5
+(2 rows)
+
+ id |  name   | age | score 
+----+---------+-----+-------
+  3 | Charlie |  30 |  85.5
+(1 row)
+
+UPDATE 1
+ id | name  | age | score 
+----+-------+-----+-------
+  1 | Alice |  20 |    95
+(1 row)
+
+UPDATE 3
+  name   | age 
+---------+-----
+ Bob     |  26
+ Charlie |  31
+ Alice   |  21
+(3 rows)
+
+DELETE 1
+ id |  name   | age | score 
+----+---------+-----+-------
+  3 | Charlie |  31 |  85.5
+  1 | Alice   |  21 |    95
+(2 rows)
+
+DROP TABLE

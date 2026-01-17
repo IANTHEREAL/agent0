@@ -1,0 +1,85 @@
+psql:/tmp/tipg-tests/tests/23_rbac.sql:5: NOTICE:  role "test_reader" does not exist, skipping
+DROP ROLE
+psql:/tmp/tipg-tests/tests/23_rbac.sql:6: NOTICE:  role "test_writer" does not exist, skipping
+DROP ROLE
+psql:/tmp/tipg-tests/tests/23_rbac.sql:7: NOTICE:  role "test_admin" does not exist, skipping
+DROP ROLE
+psql:/tmp/tipg-tests/tests/23_rbac.sql:8: NOTICE:  role "test_dba" does not exist, skipping
+DROP ROLE
+psql:/tmp/tipg-tests/tests/23_rbac.sql:9: NOTICE:  role "test_nologin" does not exist, skipping
+DROP ROLE
+psql:/tmp/tipg-tests/tests/23_rbac.sql:10: NOTICE:  role "new_role" does not exist, skipping
+DROP ROLE
+CREATE ROLE
+CREATE ROLE
+CREATE ROLE
+CREATE ROLE
+CREATE ROLE
+CREATE ROLE
+psql:/tmp/tipg-tests/tests/23_rbac.sql:29: ERROR:  syntax error at or near "NOT"
+LINE 1: CREATE ROLE IF NOT EXISTS test_reader WITH PASSWORD 'differe...
+                       ^
+psql:/tmp/tipg-tests/tests/23_rbac.sql:30: ERROR:  syntax error at or near "NOT"
+LINE 1: CREATE ROLE IF NOT EXISTS new_role WITH PASSWORD 'new123' LO...
+                       ^
+ALTER ROLE
+ALTER ROLE
+ALTER ROLE
+ALTER ROLE
+CREATE ROLE
+ALTER ROLE
+psql:/tmp/tipg-tests/tests/23_rbac.sql:57: NOTICE:  table "grant_test_table" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+psql:/tmp/tipg-tests/tests/23_rbac.sql:65: NOTICE:  table "another_table" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+GRANT
+GRANT
+GRANT
+GRANT
+GRANT
+REVOKE
+REVOKE
+CREATE ROLE
+GRANT
+REVOKE
+DROP ROLE
+psql:/tmp/tipg-tests/tests/23_rbac.sql:121: NOTICE:  role "nonexistent_role" does not exist, skipping
+DROP ROLE
+DROP ROLE
+ roles_test_complete 
+---------------------
+                   1
+(1 row)
+
+psql:/tmp/tipg-tests/tests/23_rbac.sql:132: ERROR:  role "test_reader" cannot be dropped because some objects depend on it
+DETAIL:  privileges for table actor
+privileges for table category
+privileges for table film
+privileges for table customer
+privileges for table rental
+privileges for table payment
+privileges for table inventory
+privileges for table film_actor
+privileges for table film_category
+privileges for table grant_test_table
+privileges for table another_table
+psql:/tmp/tipg-tests/tests/23_rbac.sql:133: ERROR:  role "test_writer" cannot be dropped because some objects depend on it
+DETAIL:  privileges for table grant_test_table
+privileges for table another_table
+psql:/tmp/tipg-tests/tests/23_rbac.sql:134: ERROR:  role "test_admin" cannot be dropped because some objects depend on it
+DETAIL:  privileges for table grant_test_table
+DROP ROLE
+DROP ROLE
+psql:/tmp/tipg-tests/tests/23_rbac.sql:137: NOTICE:  role "new_role" does not exist, skipping
+DROP ROLE
+DROP ROLE
+DROP TABLE
+DROP TABLE
+        status        
+----------------------
+ RBAC tests completed
+(1 row)
+

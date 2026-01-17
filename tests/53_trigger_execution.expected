@@ -1,0 +1,24 @@
+psql:/tmp/tipg-tests/tests/53_trigger_execution.sql:1: NOTICE:  relation "trigger_test" does not exist, skipping
+DROP TRIGGER
+psql:/tmp/tipg-tests/tests/53_trigger_execution.sql:2: NOTICE:  table "trigger_test" does not exist, skipping
+DROP TABLE
+psql:/tmp/tipg-tests/tests/53_trigger_execution.sql:3: NOTICE:  function set_updated_at() does not exist, skipping
+DROP FUNCTION
+CREATE TABLE
+CREATE FUNCTION
+CREATE TRIGGER
+INSERT 0 1
+         ?column?          
+---------------------------
+ INSERT_HAS_TIMESTAMP=true
+(1 row)
+
+UPDATE 1
+         ?column?          
+---------------------------
+ UPDATE_HAS_TIMESTAMP=true
+(1 row)
+
+DROP TRIGGER
+DROP TABLE
+DROP FUNCTION

@@ -1,0 +1,83 @@
+SET
+SET
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:4: NOTICE:  table "actor" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:12: NOTICE:  table "category" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:19: NOTICE:  table "country" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:26: NOTICE:  table "city" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:34: NOTICE:  table "address" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:46: NOTICE:  table "language" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:53: NOTICE:  table "customer" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:67: NOTICE:  table "staff" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:82: NOTICE:  table "store" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:90: NOTICE:  table "inventory" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:98: NOTICE:  table "rental" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:109: NOTICE:  table "payment" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:119: NOTICE:  table "film_actor" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:126: NOTICE:  table "film_category" does not exist, skipping
+DROP TABLE
+CREATE TABLE
+psql:/tmp/tipg-tests/tests/16_dvdrental_compat.sql:133: ERROR:  unrecognized configuration parameter "tables"
+INSERT 0 1
+INSERT 0 1
+ actor_id | first_name | last_name |        last_update         
+----------+------------+-----------+----------------------------
+        1 | PENELOPE   | GUINESS   | 2026-01-17 03:16:06.808131
+        2 | NICK       | WAHLBERG  | 2026-01-17 03:16:06.809444
+(2 rows)
+
+INSERT 0 1
+INSERT 0 1
+ category_id |   name    |        last_update         
+-------------+-----------+----------------------------
+           1 | Action    | 2026-01-17 03:16:06.810026
+           2 | Animation | 2026-01-17 03:16:06.810557
+(2 rows)
+
+INSERT 0 1
+INSERT 0 1
+ country_id |   country   |        last_update         
+------------+-------------+----------------------------
+          1 | Afghanistan | 2026-01-17 03:16:06.810972
+          2 | Algeria     | 2026-01-17 03:16:06.811478
+(2 rows)
+
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
