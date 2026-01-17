@@ -985,10 +985,35 @@ Created 5 more integration tests. Discrepancies found below - **awaiting admin d
 
 ---
 
-**Administrator Decision Needed:**
-1. Which bugs should be fixed immediately?
-2. Which missing features should be added?
-3. Should format differences be accepted as pg-tikv behavior?
+**Administrator Decision (2026-01-17):**
+- All bugs need to be fixed
+- All missing features need to be added  
+- Precision display issues deferred (will use prefix string comparison in tests)
+
+---
+
+## Work Plan: Fix Bugs and Add Missing Features
+
+### Phase A: High Priority Bugs
+- [ ] A.1 Fix COUNT(DISTINCT) - not deduplicating
+- [ ] A.2 Fix STRING_AGG(DISTINCT) - DISTINCT ignored
+- [ ] A.3 Fix array concatenation `||` operator
+- [ ] A.4 Fix UNNEST - only returns first row
+- [ ] A.5 Fix ROWS BETWEEN window frame clause
+
+### Phase B: Missing Functions
+- [ ] B.1 Add ARRAY_TO_STRING function
+- [ ] B.2 Add STRING_TO_ARRAY function
+- [ ] B.3 Add BOOL_AND / BOOL_OR aggregate functions
+- [ ] B.4 Add FIRST_VALUE / LAST_VALUE window functions
+- [ ] B.5 Add `>= ALL` / `> ANY` subquery operators
+- [ ] B.6 Add `&&` array overlap operator
+
+### Phase C: Generate .expected Files
+- [ ] C.1 Generate .expected for passing tests
+- [ ] C.2 Verify all new tests pass
+
+---
 
 ### 2026-01-17 (initial)
 - Created 6 new integration test files covering NULL handling, type casting, string/math/datetime functions, and JOINs
