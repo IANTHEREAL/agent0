@@ -1,8 +1,0 @@
-IDXDEF=ix_t_a_partial:create index ix_t_a_partial on public.ix_t using btree (a) where a is not null
-IDXDEF=ix_t_expr_lower:create index ix_t_expr_lower on public.ix_t using btree ((lower(b)))
-IDXDEF=ix_t_gin:create index ix_t_gin on public.ix_t using gin (b)
-IDXDEF=ix_t_gist:create index ix_t_gist on public.ix_t using gist (a)
-AM=783:gist
-AM=2742:gin
-PG_GET_INDEXDEF=create index ix_t_a_partial on public.ix_t using btree (a) where a is not null
-PG_GET_INDEXDEF_STANDALONE=create index ix_t_a_partial on public.ix_t using btree (a) where a is not null

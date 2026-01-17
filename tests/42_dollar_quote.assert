@@ -1,3 +1,0 @@
-ROW=1:hello
-ROW=2:world
-BODY= $1
