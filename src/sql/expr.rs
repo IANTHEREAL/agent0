@@ -299,8 +299,16 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             let val = eval_expr_join(expr, ctx)?;
             let ts = match val {
                 Value::Timestamp(t) => t,
+                Value::Date(days) => {
+                    use chrono::NaiveDate;
+                    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    let date = epoch + chrono::Duration::days(days as i64);
+                    date.and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                        .timestamp_millis()
+                }
                 Value::Text(s) => {
-                    // Parse text timestamp
                     use chrono::NaiveDateTime;
                     let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
                         .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S"))
@@ -698,7 +706,7 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
             Some(v) => Ok(Value::Text(v.to_string())),
         },
         "UNNEST" => match args.into_iter().next() {
-            Some(Value::Array(arr)) => Ok(arr.into_iter().next().unwrap_or(Value::Null)),
+            Some(Value::Array(arr)) => Ok(Value::Array(arr)),
             Some(Value::Null) | None => Ok(Value::Null),
             Some(v) => Ok(v),
         },
@@ -986,8 +994,16 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             let val = eval_expr(expr, row, schema)?;
             let ts = match val {
                 Value::Timestamp(t) => t,
+                Value::Date(days) => {
+                    use chrono::NaiveDate;
+                    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+                    let date = epoch + chrono::Duration::days(days as i64);
+                    date.and_hms_opt(0, 0, 0)
+                        .unwrap()
+                        .and_utc()
+                        .timestamp_millis()
+                }
                 Value::Text(s) => {
-                    // Parse text timestamp
                     use chrono::NaiveDateTime;
                     let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
                         .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S"))
@@ -1142,24 +1158,28 @@ fn parse_interval_from_expr(s: &str, interval: &sqlparser::ast::Interval) -> Res
 }
 
 fn interval_from_number(num: i64, interval: &sqlparser::ast::Interval) -> Result<Value> {
+    use crate::types::IntervalValue;
     if let Some(field) = &interval.leading_field {
         return interval_from_field(num, field);
     }
-    Ok(Value::Interval(num * 1000))
+    Ok(Value::Interval(IntervalValue::from_millis(num * 1000)))
 }
 
 fn interval_from_field(num: i64, field: &sqlparser::ast::DateTimeField) -> Result<Value> {
-    let ms = match field {
-        sqlparser::ast::DateTimeField::Year => num * 365 * 24 * 60 * 60 * 1000,
-        sqlparser::ast::DateTimeField::Month => num * 30 * 24 * 60 * 60 * 1000,
-        sqlparser::ast::DateTimeField::Week => num * 7 * 24 * 60 * 60 * 1000,
-        sqlparser::ast::DateTimeField::Day => num * 24 * 60 * 60 * 1000,
-        sqlparser::ast::DateTimeField::Hour => num * 60 * 60 * 1000,
-        sqlparser::ast::DateTimeField::Minute => num * 60 * 1000,
-        sqlparser::ast::DateTimeField::Second => num * 1000,
+    use crate::types::IntervalValue;
+    let iv = match field {
+        sqlparser::ast::DateTimeField::Year => IntervalValue::from_months((num * 12) as i32),
+        sqlparser::ast::DateTimeField::Month => IntervalValue::from_months(num as i32),
+        sqlparser::ast::DateTimeField::Week => {
+            IntervalValue::from_millis(num * 7 * 24 * 60 * 60 * 1000)
+        }
+        sqlparser::ast::DateTimeField::Day => IntervalValue::from_millis(num * 24 * 60 * 60 * 1000),
+        sqlparser::ast::DateTimeField::Hour => IntervalValue::from_millis(num * 60 * 60 * 1000),
+        sqlparser::ast::DateTimeField::Minute => IntervalValue::from_millis(num * 60 * 1000),
+        sqlparser::ast::DateTimeField::Second => IntervalValue::from_millis(num * 1000),
         _ => return Err(anyhow!("Unsupported interval field")),
     };
-    Ok(Value::Interval(ms))
+    Ok(Value::Interval(iv))
 }
 
 fn eval_function(
@@ -1949,6 +1969,7 @@ fn eval_function(
             }
         }
         "AGE" => {
+            use chrono::{Datelike, TimeZone, Utc};
             use std::time::{SystemTime, UNIX_EPOCH};
             let mut iter = args.into_iter();
             let ts1 = match iter.next() {
@@ -1964,32 +1985,45 @@ fn eval_function(
                     .unwrap()
                     .as_millis() as i64,
             };
-            let diff_ms = (ts2 - ts1).abs();
-            let total_days = diff_ms / (1000 * 60 * 60 * 24);
-            let years = total_days / 365;
-            let remaining_days = total_days % 365;
-            let months = remaining_days / 30;
-            let days = remaining_days % 30;
 
-            let mut parts = Vec::new();
-            if years > 0 {
-                parts.push(format!(
-                    "{} year{}",
-                    years,
-                    if years == 1 { "" } else { "s" }
-                ));
+            let dt1 = Utc
+                .timestamp_millis_opt(ts1)
+                .single()
+                .ok_or_else(|| anyhow!("Invalid timestamp"))?;
+            let dt2 = Utc
+                .timestamp_millis_opt(ts2)
+                .single()
+                .ok_or_else(|| anyhow!("Invalid timestamp"))?;
+
+            let mut years = dt1.year() - dt2.year();
+            let mut months = dt1.month() as i32 - dt2.month() as i32;
+            let mut days = dt1.day() as i32 - dt2.day() as i32;
+
+            if days < 0 {
+                months -= 1;
+                let prev_month = if dt1.month() == 1 {
+                    12
+                } else {
+                    dt1.month() - 1
+                };
+                let prev_year = if dt1.month() == 1 {
+                    dt1.year() - 1
+                } else {
+                    dt1.year()
+                };
+                days += days_in_month(prev_year, prev_month) as i32;
             }
-            if months > 0 {
-                parts.push(format!(
-                    "{} mon{}",
-                    months,
-                    if months == 1 { "" } else { "s" }
-                ));
+            if months < 0 {
+                years -= 1;
+                months += 12;
             }
-            if days > 0 || parts.is_empty() {
-                parts.push(format!("{} day{}", days, if days == 1 { "" } else { "s" }));
-            }
-            Ok(Value::Text(parts.join(" ")))
+
+            let total_months = years * 12 + months;
+
+            Ok(Value::Interval(crate::types::IntervalValue::new(
+                total_months,
+                days as i64 * 24 * 60 * 60 * 1000,
+            )))
         }
         "GENERATE_SERIES" => Err(anyhow!(
             "GENERATE_SERIES is a set-returning function, not supported in this context"
@@ -2081,7 +2115,7 @@ fn eval_function(
         "OBJ_DESCRIPTION" | "COL_DESCRIPTION" | "SHOBJ_DESCRIPTION" => Ok(Value::Null),
         "PG_CATALOG.SET_CONFIG" => Ok(Value::Text(String::new())),
         "UNNEST" => match args.into_iter().next() {
-            Some(Value::Array(arr)) => Ok(arr.into_iter().next().unwrap_or(Value::Null)),
+            Some(Value::Array(arr)) => Ok(Value::Array(arr)),
             Some(Value::Null) | None => Ok(Value::Null),
             Some(v) => Ok(v),
         },
@@ -2212,6 +2246,70 @@ fn eval_function(
                 .filter(|v| compare_values(v, &elem).unwrap_or(1) != 0)
                 .collect();
             Ok(Value::Array(result))
+        }
+        "ARRAY_TO_STRING" => {
+            let mut iter = args.into_iter();
+            let arr = match iter.next() {
+                Some(Value::Array(a)) => a,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Ok(Value::Null),
+            };
+            let delimiter = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(v) => v.to_string(),
+                None => ",".to_string(),
+            };
+            let null_str = iter.next().and_then(|v| match v {
+                Value::Text(s) => Some(s),
+                Value::Null => None,
+                v => Some(v.to_string()),
+            });
+            let parts: Vec<String> = arr
+                .into_iter()
+                .filter_map(|v| match v {
+                    Value::Null => null_str.clone(),
+                    v => Some(v.to_string()),
+                })
+                .collect();
+            Ok(Value::Text(parts.join(&delimiter)))
+        }
+        "STRING_TO_ARRAY" => {
+            let mut iter = args.into_iter();
+            let text = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.to_string(),
+                None => return Ok(Value::Null),
+            };
+            let delimiter = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => {
+                    return Ok(Value::Array(
+                        text.chars().map(|c| Value::Text(c.to_string())).collect(),
+                    ))
+                }
+                Some(v) => v.to_string(),
+                None => return Ok(Value::Array(vec![Value::Text(text)])),
+            };
+            let null_str = iter.next().and_then(|v| match v {
+                Value::Text(s) => Some(s),
+                Value::Null => None,
+                v => Some(v.to_string()),
+            });
+            let parts: Vec<Value> = if delimiter.is_empty() {
+                text.chars().map(|c| Value::Text(c.to_string())).collect()
+            } else {
+                text.split(&delimiter)
+                    .map(|s| {
+                        if null_str.as_ref().map_or(false, |ns| s == ns) {
+                            Value::Null
+                        } else {
+                            Value::Text(s.to_string())
+                        }
+                    })
+                    .collect()
+            };
+            Ok(Value::Array(parts))
         }
         "JSONB_ARRAY_LENGTH" | "JSON_ARRAY_LENGTH" => {
             let json_str = match args.into_iter().next() {
@@ -2620,7 +2718,9 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
 }
 
 fn parse_interval_string(s: &str) -> Result<Value> {
+    use crate::types::IntervalValue;
     let s = s.trim().to_lowercase();
+    let mut total_months: i32 = 0;
     let mut total_ms: i64 = 0;
 
     let parts: Vec<&str> = s.split_whitespace().collect();
@@ -2629,18 +2729,17 @@ fn parse_interval_string(s: &str) -> Result<Value> {
         if let Ok(num) = parts[i].parse::<i64>() {
             if i + 1 < parts.len() {
                 let unit = parts[i + 1].trim_end_matches('s');
-                let ms = match unit {
-                    "day" => num * 24 * 60 * 60 * 1000,
-                    "hour" => num * 60 * 60 * 1000,
-                    "minute" | "min" => num * 60 * 1000,
-                    "second" | "sec" => num * 1000,
-                    "millisecond" | "ms" => num,
-                    "week" => num * 7 * 24 * 60 * 60 * 1000,
-                    "month" => num * 30 * 24 * 60 * 60 * 1000,
-                    "year" => num * 365 * 24 * 60 * 60 * 1000,
+                match unit {
+                    "day" => total_ms += num * 24 * 60 * 60 * 1000,
+                    "hour" => total_ms += num * 60 * 60 * 1000,
+                    "minute" | "min" => total_ms += num * 60 * 1000,
+                    "second" | "sec" => total_ms += num * 1000,
+                    "millisecond" | "ms" => total_ms += num,
+                    "week" => total_ms += num * 7 * 24 * 60 * 60 * 1000,
+                    "month" | "mon" => total_months += num as i32,
+                    "year" => total_months += (num * 12) as i32,
                     _ => return Err(anyhow!("Unknown interval unit: {}", parts[i + 1])),
                 };
-                total_ms += ms;
                 i += 2;
             } else {
                 return Err(anyhow!("Interval number without unit"));
@@ -2650,7 +2749,7 @@ fn parse_interval_string(s: &str) -> Result<Value> {
         }
     }
 
-    Ok(Value::Interval(total_ms))
+    Ok(Value::Interval(IntervalValue::new(total_months, total_ms)))
 }
 
 fn parse_timestamp_string(s: &str) -> Result<Value> {
@@ -2796,26 +2895,114 @@ fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<Valu
         BinaryOperator::Divide => div_values(left, right),
         BinaryOperator::Modulo => mod_values(left, right),
 
-        // String concatenation
-        BinaryOperator::StringConcat => {
-            let left_str = match left {
-                Value::Null => return Ok(Value::Null),
-                Value::Text(s) => s,
-                v => v.to_string(),
-            };
-            let right_str = match right {
-                Value::Null => return Ok(Value::Null),
-                Value::Text(s) => s,
-                v => v.to_string(),
-            };
-            Ok(Value::Text(format!("{}{}", left_str, right_str)))
-        }
+        BinaryOperator::StringConcat => match (&left, &right) {
+            (Value::Array(l), Value::Array(r)) => {
+                let mut result = l.clone();
+                result.extend(r.iter().cloned());
+                Ok(Value::Array(result))
+            }
+            (Value::Array(arr), other) => {
+                let mut result = arr.clone();
+                result.push(other.clone());
+                Ok(Value::Array(result))
+            }
+            (other, Value::Array(arr)) => {
+                let mut result = vec![other.clone()];
+                result.extend(arr.iter().cloned());
+                Ok(Value::Array(result))
+            }
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            _ => {
+                let left_str = match left {
+                    Value::Text(s) => s,
+                    v => v.to_string(),
+                };
+                let right_str = match right {
+                    Value::Text(s) => s,
+                    v => v.to_string(),
+                };
+                Ok(Value::Text(format!("{}{}", left_str, right_str)))
+            }
+        },
+
+        BinaryOperator::PGOverlap => match (&left, &right) {
+            (Value::Array(l), Value::Array(r)) => {
+                for lv in l {
+                    for rv in r {
+                        if compare_values(lv, rv).unwrap_or(1) == 0 {
+                            return Ok(Value::Boolean(true));
+                        }
+                    }
+                }
+                Ok(Value::Boolean(false))
+            }
+            _ => Err(anyhow!("&& operator requires array operands")),
+        },
 
         _ => Err(anyhow!("Unsupported binary operator: {:?}", op)),
     }
 }
 
 // --- Arithmetic Helpers ---
+
+fn add_interval_to_timestamp(ts_millis: i64, iv: &crate::types::IntervalValue) -> Result<i64> {
+    use chrono::{Datelike, Duration, TimeZone, Utc};
+
+    let dt = Utc
+        .timestamp_millis_opt(ts_millis)
+        .single()
+        .ok_or_else(|| anyhow!("Invalid timestamp"))?;
+
+    let mut result = dt;
+
+    if iv.months != 0 {
+        let mut year = result.year();
+        let mut month = result.month() as i32 + iv.months;
+
+        while month > 12 {
+            month -= 12;
+            year += 1;
+        }
+        while month < 1 {
+            month += 12;
+            year -= 1;
+        }
+
+        let day = result.day().min(days_in_month(year, month as u32));
+
+        result = result
+            .with_year(year)
+            .and_then(|d| d.with_month(month as u32))
+            .and_then(|d| d.with_day(day))
+            .ok_or_else(|| anyhow!("Date out of range after adding months"))?;
+    }
+
+    if iv.millis != 0 {
+        result = result + Duration::milliseconds(iv.millis);
+    }
+
+    Ok(result.timestamp_millis())
+}
+
+fn sub_interval_from_timestamp(ts_millis: i64, iv: &crate::types::IntervalValue) -> Result<i64> {
+    let neg_iv = crate::types::IntervalValue::new(-iv.months, -iv.millis);
+    add_interval_to_timestamp(ts_millis, &neg_iv)
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 30,
+    }
+}
 
 fn try_coerce_text_to_numeric(v: Value) -> Value {
     match &v {
@@ -2865,15 +3052,33 @@ fn add_values(left: Value, right: Value) -> Result<Value> {
                 .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
             Ok(Value::Float64(l + rf))
         }
-        (Value::Timestamp(ts), Value::Interval(iv)) => Ok(Value::Timestamp(ts + iv)),
-        (Value::Interval(iv), Value::Timestamp(ts)) => Ok(Value::Timestamp(ts + iv)),
+        (Value::Timestamp(ts), Value::Interval(iv)) => {
+            Ok(Value::Timestamp(add_interval_to_timestamp(ts, &iv)?))
+        }
+        (Value::Interval(iv), Value::Timestamp(ts)) => {
+            Ok(Value::Timestamp(add_interval_to_timestamp(ts, &iv)?))
+        }
         (Value::Date(days), Value::Interval(iv)) => {
             let ts = crate::types::date::date_days_to_timestamp_millis(days)?;
-            Ok(Value::Timestamp(ts + iv))
+            Ok(Value::Timestamp(add_interval_to_timestamp(ts, &iv)?))
         }
         (Value::Interval(iv), Value::Date(days)) => {
             let ts = crate::types::date::date_days_to_timestamp_millis(days)?;
-            Ok(Value::Timestamp(ts + iv))
+            Ok(Value::Timestamp(add_interval_to_timestamp(ts, &iv)?))
+        }
+        (Value::Date(days), Value::Int32(n)) => Ok(Value::Date(days + n)),
+        (Value::Int32(n), Value::Date(days)) => Ok(Value::Date(days + n)),
+        (Value::Date(days), Value::Int64(n)) => {
+            let result = (days as i64) + n;
+            Ok(Value::Date(
+                i32::try_from(result).map_err(|_| anyhow!("date out of range"))?,
+            ))
+        }
+        (Value::Int64(n), Value::Date(days)) => {
+            let result = (days as i64) + n;
+            Ok(Value::Date(
+                i32::try_from(result).map_err(|_| anyhow!("date out of range"))?,
+            ))
         }
         (Value::Interval(l), Value::Interval(r)) => Ok(Value::Interval(l + r)),
         _ => Err(anyhow!("Unsupported types for addition")),
@@ -2908,16 +3113,27 @@ fn sub_values(left: Value, right: Value) -> Result<Value> {
                 .ok_or_else(|| anyhow!("numeric value out of range for double precision"))?;
             Ok(Value::Float64(l - rf))
         }
-        (Value::Timestamp(l), Value::Timestamp(r)) => Ok(Value::Interval(l - r)),
-        (Value::Timestamp(ts), Value::Interval(iv)) => Ok(Value::Timestamp(ts - iv)),
+        (Value::Timestamp(l), Value::Timestamp(r)) => Ok(Value::Interval(
+            crate::types::IntervalValue::from_millis(l - r),
+        )),
+        (Value::Timestamp(ts), Value::Interval(iv)) => {
+            Ok(Value::Timestamp(sub_interval_from_timestamp(ts, &iv)?))
+        }
         (Value::Date(days), Value::Interval(iv)) => {
             let ts = crate::types::date::date_days_to_timestamp_millis(days)?;
-            Ok(Value::Timestamp(ts - iv))
+            Ok(Value::Timestamp(sub_interval_from_timestamp(ts, &iv)?))
         }
         (Value::Date(l), Value::Date(r)) => {
             let diff = (l as i64) - (r as i64);
             let days = i32::try_from(diff).map_err(|_| anyhow!("date difference out of range"))?;
             Ok(Value::Int32(days))
+        }
+        (Value::Date(days), Value::Int32(n)) => Ok(Value::Date(days - n)),
+        (Value::Date(days), Value::Int64(n)) => {
+            let result = (days as i64) - n;
+            Ok(Value::Date(
+                i32::try_from(result).map_err(|_| anyhow!("date out of range"))?,
+            ))
         }
         (Value::Interval(l), Value::Interval(r)) => Ok(Value::Interval(l - r)),
         _ => Err(anyhow!("Unsupported types for subtraction")),
@@ -3527,7 +3743,7 @@ fn value_to_json(val: &Value) -> serde_json::Value {
         Value::Timestamp(ts) => serde_json::Value::Number(serde_json::Number::from(*ts)),
         Value::Uuid(bytes) => serde_json::Value::String(uuid::Uuid::from_bytes(*bytes).to_string()),
         Value::Bytes(b) => serde_json::Value::String(format!("\\x{}", hex::encode(b))),
-        Value::Interval(ms) => serde_json::Value::Number(serde_json::Number::from(*ms)),
+        Value::Interval(iv) => serde_json::Value::String(iv.to_string()),
         Value::Vector(vec) => serde_json::Value::Array(
             vec.iter()
                 .filter_map(|f| serde_json::Number::from_f64(*f))
@@ -4291,35 +4507,65 @@ mod tests {
 
     #[test]
     fn test_interval_parsing() {
+        use crate::types::IntervalValue;
         let result = parse_interval_string("1 day").unwrap();
-        assert_eq!(result, Value::Interval(24 * 60 * 60 * 1000));
+        assert_eq!(
+            result,
+            Value::Interval(IntervalValue::from_millis(24 * 60 * 60 * 1000))
+        );
 
         let result = parse_interval_string("2 hours").unwrap();
-        assert_eq!(result, Value::Interval(2 * 60 * 60 * 1000));
+        assert_eq!(
+            result,
+            Value::Interval(IntervalValue::from_millis(2 * 60 * 60 * 1000))
+        );
 
         let result = parse_interval_string("30 minutes").unwrap();
-        assert_eq!(result, Value::Interval(30 * 60 * 1000));
+        assert_eq!(
+            result,
+            Value::Interval(IntervalValue::from_millis(30 * 60 * 1000))
+        );
 
         let result = parse_interval_string("1 week").unwrap();
-        assert_eq!(result, Value::Interval(7 * 24 * 60 * 60 * 1000));
+        assert_eq!(
+            result,
+            Value::Interval(IntervalValue::from_millis(7 * 24 * 60 * 60 * 1000))
+        );
+
+        let result = parse_interval_string("1 month").unwrap();
+        assert_eq!(result, Value::Interval(IntervalValue::from_months(1)));
     }
 
     #[test]
     fn test_interval_expression() {
+        use crate::types::IntervalValue;
         let result = eval_expr(&parse_expr("INTERVAL '1 day'"), None, None).unwrap();
-        assert_eq!(result, Value::Interval(24 * 60 * 60 * 1000));
+        assert_eq!(
+            result,
+            Value::Interval(IntervalValue::from_millis(24 * 60 * 60 * 1000))
+        );
 
         let result = eval_expr(&parse_expr("INTERVAL '2' DAY"), None, None).unwrap();
-        assert_eq!(result, Value::Interval(2 * 24 * 60 * 60 * 1000));
+        assert_eq!(
+            result,
+            Value::Interval(IntervalValue::from_millis(2 * 24 * 60 * 60 * 1000))
+        );
 
         let result = eval_expr(&parse_expr("INTERVAL '3' HOUR"), None, None).unwrap();
-        assert_eq!(result, Value::Interval(3 * 60 * 60 * 1000));
+        assert_eq!(
+            result,
+            Value::Interval(IntervalValue::from_millis(3 * 60 * 60 * 1000))
+        );
+
+        let result = eval_expr(&parse_expr("INTERVAL '1' MONTH"), None, None).unwrap();
+        assert_eq!(result, Value::Interval(IntervalValue::from_months(1)));
     }
 
     #[test]
     fn test_timestamp_interval_arithmetic() {
+        use crate::types::IntervalValue;
         let ts = Value::Timestamp(1000 * 60 * 60 * 24);
-        let iv = Value::Interval(1000 * 60 * 60);
+        let iv = Value::Interval(IntervalValue::from_millis(1000 * 60 * 60));
 
         let result = add_values(ts.clone(), iv.clone()).unwrap();
         assert_eq!(result, Value::Timestamp(1000 * 60 * 60 * 25));
@@ -4345,8 +4591,12 @@ mod tests {
 
     #[test]
     fn test_string_concat_to_interval() {
+        use crate::types::IntervalValue;
         let result = eval_expr(&parse_expr("('1' || ' day')::interval"), None, None).unwrap();
-        assert_eq!(result, Value::Interval(24 * 60 * 60 * 1000));
+        assert_eq!(
+            result,
+            Value::Interval(IntervalValue::from_millis(24 * 60 * 60 * 1000))
+        );
     }
 
     #[test]

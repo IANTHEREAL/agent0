@@ -129,6 +129,97 @@ impl fmt::Display for DataType {
     }
 }
 
+/// Interval representation with separate months and milliseconds.
+/// This matches PostgreSQL's behavior where months are calendar-aware.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct IntervalValue {
+    /// Number of months (for calendar-aware arithmetic)
+    pub months: i32,
+    /// Milliseconds (for sub-month precision: days, hours, minutes, seconds)
+    pub millis: i64,
+}
+
+impl IntervalValue {
+    pub fn new(months: i32, millis: i64) -> Self {
+        Self { months, millis }
+    }
+
+    pub fn from_millis(millis: i64) -> Self {
+        Self { months: 0, millis }
+    }
+
+    pub fn from_months(months: i32) -> Self {
+        Self { months, millis: 0 }
+    }
+
+    /// Convert to total milliseconds (approximate, for legacy compat)
+    /// Uses 30 days per month approximation
+    pub fn to_millis_approx(&self) -> i64 {
+        (self.months as i64) * 30 * 24 * 60 * 60 * 1000 + self.millis
+    }
+}
+
+impl std::ops::Add for IntervalValue {
+    type Output = Self;
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            months: self.months + rhs.months,
+            millis: self.millis + rhs.millis,
+        }
+    }
+}
+
+impl std::ops::Sub for IntervalValue {
+    type Output = Self;
+    fn sub(self, rhs: Self) -> Self {
+        Self {
+            months: self.months - rhs.months,
+            millis: self.millis - rhs.millis,
+        }
+    }
+}
+
+impl fmt::Display for IntervalValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut parts = Vec::new();
+        if self.months != 0 {
+            let years = self.months / 12;
+            let mons = self.months % 12;
+            if years != 0 {
+                parts.push(format!(
+                    "{} year{}",
+                    years,
+                    if years.abs() != 1 { "s" } else { "" }
+                ));
+            }
+            if mons != 0 {
+                parts.push(format!(
+                    "{} mon{}",
+                    mons,
+                    if mons.abs() != 1 { "s" } else { "" }
+                ));
+            }
+        }
+        let ms = self.millis;
+        let days = ms / (1000 * 60 * 60 * 24);
+        let remaining = ms % (1000 * 60 * 60 * 24);
+        if days != 0 {
+            parts.push(format!(
+                "{} day{}",
+                days,
+                if days.abs() != 1 { "s" } else { "" }
+            ));
+        }
+        if remaining != 0 || parts.is_empty() {
+            let hours = remaining / (1000 * 60 * 60);
+            let mins = (remaining % (1000 * 60 * 60)) / (1000 * 60);
+            let secs = (remaining % (1000 * 60)) / 1000;
+            parts.push(format!("{:02}:{:02}:{:02}", hours, mins, secs));
+        }
+        write!(f, "{}", parts.join(" "))
+    }
+}
+
 /// A single value
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Value {
@@ -140,7 +231,7 @@ pub enum Value {
     Text(String),
     Bytes(Vec<u8>),
     Timestamp(i64),
-    Interval(i64),
+    Interval(IntervalValue),
     Uuid([u8; 16]),
     Array(Vec<Value>),
     Vector(Vec<f64>),
@@ -194,17 +285,7 @@ impl fmt::Display for Value {
             Value::Text(s) => write!(f, "{}", s),
             Value::Bytes(b) => write!(f, "{:?}", b),
             Value::Timestamp(ts) => write!(f, "{}", ts),
-            Value::Interval(ms) => {
-                let days = *ms / (1000 * 60 * 60 * 24);
-                let hours = (*ms % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60);
-                let mins = (*ms % (1000 * 60 * 60)) / (1000 * 60);
-                let secs = (*ms % (1000 * 60)) / 1000;
-                if days > 0 {
-                    write!(f, "{} days {:02}:{:02}:{:02}", days, hours, mins, secs)
-                } else {
-                    write!(f, "{:02}:{:02}:{:02}", hours, mins, secs)
-                }
-            }
+            Value::Interval(iv) => write!(f, "{}", iv),
             Value::Time(micros) => {
                 let total_secs = *micros / 1_000_000;
                 let hours = total_secs / 3600;

@@ -1,0 +1,29 @@
+schema_name
+information_schema
+public
+(2 rows)
+table_name|table_type
+customers|BASE TABLE
+orders|BASE TABLE
+(2 rows)
+customers|id|integer|NO
+customers|name
+customers|email
+customers|status
+orders|id|integer|NO
+orders|customer_id|integer|NO
+orders|total|double precision|NO
+orders|created_at|timestamp
+constraint_name|constraint_type
+customers_pkey|PRIMARY KEY
+customers_email_key|UNIQUE
+orders_customer_id_fkey|FOREIGN KEY
+orders_pkey|PRIMARY KEY
+constraint_name|column_name
+customers_email_key|email
+customers_pkey|id
+orders_customer_id_fkey|customer_id
+constraint_name|unique_constraint_name|delete_rule|update_rule
+orders_customer_id_fkey|customers_pkey|CASCADE|NO ACTION
+count
+0

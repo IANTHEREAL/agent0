@@ -77,18 +77,8 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
                 buf.extend_from_slice(s.as_bytes());
             }
         }
-        Value::Interval(ms) => {
-            let days = *ms / (1000 * 60 * 60 * 24);
-            let hours = (*ms % (1000 * 60 * 60 * 24)) / (1000 * 60 * 60);
-            let mins = (*ms % (1000 * 60 * 60)) / (1000 * 60);
-            let secs = (*ms % (1000 * 60)) / 1000;
-            if days > 0 {
-                let s = format!("{} days {:02}:{:02}:{:02}", days, hours, mins, secs);
-                buf.extend_from_slice(s.as_bytes());
-            } else {
-                let s = format!("{:02}:{:02}:{:02}", hours, mins, secs);
-                buf.extend_from_slice(s.as_bytes());
-            }
+        Value::Interval(iv) => {
+            buf.extend_from_slice(iv.to_string().as_bytes());
         }
         Value::Uuid(bytes) => {
             let s = format!(

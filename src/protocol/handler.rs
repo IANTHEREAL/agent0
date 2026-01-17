@@ -2622,22 +2622,7 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
                 encoder.encode_field(&ts.to_string())
             }
         }
-        Value::Interval(ms) => {
-            let days = *ms / (1000 * 60 * 60 * 24);
-            let remaining = *ms % (1000 * 60 * 60 * 24);
-            let hours = remaining / (1000 * 60 * 60);
-            let remaining = remaining % (1000 * 60 * 60);
-            let mins = remaining / (1000 * 60);
-            let secs = (remaining % (1000 * 60)) / 1000;
-            if days != 0 {
-                encoder.encode_field(&format!(
-                    "{} days {:02}:{:02}:{:02}",
-                    days, hours, mins, secs
-                ))
-            } else {
-                encoder.encode_field(&format!("{:02}:{:02}:{:02}", hours, mins, secs))
-            }
-        }
+        Value::Interval(iv) => encoder.encode_field(&iv.to_string()),
         Value::Uuid(bytes) => {
             let uuid = uuid::Uuid::from_bytes(*bytes);
             encoder.encode_field(&uuid.to_string())

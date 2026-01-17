@@ -327,7 +327,7 @@ fn value_to_sql_literal(value: &Value) -> String {
             let items: Vec<String> = v.iter().map(|f| f.to_string()).collect();
             format!("[{}]", items.join(","))
         }
-        Value::Interval(ms) => format!("INTERVAL '{} ms'", ms),
+        Value::Interval(iv) => format!("INTERVAL '{}'", iv),
         Value::Time(micros) => {
             let total_secs = micros / 1_000_000;
             let hours = total_secs / 3600;

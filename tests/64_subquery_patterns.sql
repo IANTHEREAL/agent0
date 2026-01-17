@@ -62,7 +62,7 @@ SELECT name FROM products WHERE price > (
     )
 ) ORDER BY id;
 
--- Subquery with comparison operators
+-- Subquery with ALL/ANY comparison operators
 SELECT name FROM products WHERE price >= ALL (SELECT price FROM products WHERE category = 'Fruit') ORDER BY id;
 SELECT name FROM products WHERE price > ANY (SELECT price FROM products WHERE category = 'Vegetable') ORDER BY id;
 

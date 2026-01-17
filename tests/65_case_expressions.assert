@@ -1,0 +1,51 @@
+id|score|grade
+1|95|A
+2|75|C
+3|55|Other
+4|85|B
+id|score|performance
+1|95|Excellent
+2|75|Average
+3|55|Fail
+4|85|Good
+id|score|result
+1|95|Pass
+2|75|Fail
+3|55|Fail
+4|85|Pass
+No Score
+score_group|cnt
+High|2
+Low|1
+Medium|1
+detailed_status
+Active High
+Inactive
+Active Low
+Other
+value_category
+Normal
+N/A
+High
+score_or_zero
+95
+75
+55
+85
+0
+value_or_zero
+100.00
+200.00
+150.00
+0.00
+300.00
+greatest_val
+9
+least_val
+1
+at_least_60
+95
+75
+60
+85
+CASE expression tests completed

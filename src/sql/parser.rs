@@ -1,6 +1,7 @@
 //! SQL parser wrapper using sqlparser-rs
 
 use anyhow::{anyhow, Result};
+use regex::Regex;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -121,14 +122,192 @@ fn preprocess_create_sequence(sql: &str) -> Option<String> {
     }
 }
 
+/// Rewrite `expr op ALL (SELECT ...)` and `expr op ANY (SELECT ...)` patterns
+/// to equivalent forms that sqlparser 0.40 can handle.
+///
+/// Transformations:
+/// - `x >= ALL (SELECT col FROM ...)` → `x >= (SELECT MAX(col) FROM ...)`
+/// - `x <= ALL (SELECT col FROM ...)` → `x <= (SELECT MIN(col) FROM ...)`
+/// - `x > ALL (SELECT col FROM ...)`  → `x > (SELECT MAX(col) FROM ...)`
+/// - `x < ALL (SELECT col FROM ...)`  → `x < (SELECT MIN(col) FROM ...)`
+/// - `x = ALL (SELECT col FROM ...)`  → `NOT EXISTS (SELECT 1 FROM ... WHERE col <> x)`
+/// - `x > ANY (SELECT col FROM ...)`  → `x > (SELECT MIN(col) FROM ...)`
+/// - `x >= ANY (SELECT col FROM ...)` → `x >= (SELECT MIN(col) FROM ...)`
+/// - `x < ANY (SELECT col FROM ...)`  → `x < (SELECT MAX(col) FROM ...)`
+/// - `x <= ANY (SELECT col FROM ...)` → `x <= (SELECT MAX(col) FROM ...)`
+/// - `x = ANY (SELECT col FROM ...)`  → `x IN (SELECT col FROM ...)`
+fn rewrite_all_any_subqueries(sql: &str) -> String {
+    let mut result = sql.to_string();
+
+    // Match: expr OP ALL (SELECT ...) or expr OP ANY (SELECT ...)
+    let all_pattern =
+        Regex::new(r"(?i)(\S+)\s*(>=|<=|>|<|=|<>|!=)\s*ALL\s*\(\s*(SELECT\s+)").unwrap();
+
+    let any_pattern =
+        Regex::new(r"(?i)(\S+)\s*(>=|<=|>|<|=|<>|!=)\s*ANY\s*\(\s*(SELECT\s+)").unwrap();
+
+    // Process ALL patterns: x OP ALL (SELECT col ...) -> x OP (SELECT AGG(col) ...)
+    while let Some(caps) = all_pattern.captures(&result) {
+        let full_match = caps.get(0).unwrap();
+        let expr = caps.get(1).unwrap().as_str();
+        let op = caps.get(2).unwrap().as_str();
+        let select_start = caps.get(3).unwrap().as_str();
+
+        let match_start = full_match.start();
+        let select_pos = full_match.end() - select_start.len();
+
+        if let Some((subquery, end_pos)) = extract_subquery(&result, select_pos) {
+            // subquery is "SELECT col FROM ..." (without outer parens)
+            // We need to wrap col with MAX/MIN
+            let replacement = match op.to_uppercase().as_str() {
+                ">=" => wrap_subquery_with_agg(expr, ">=", &subquery, "MAX"),
+                "<=" => wrap_subquery_with_agg(expr, "<=", &subquery, "MIN"),
+                ">" => wrap_subquery_with_agg(expr, ">", &subquery, "MAX"),
+                "<" => wrap_subquery_with_agg(expr, "<", &subquery, "MIN"),
+                "=" | "==" => wrap_subquery_with_agg(expr, "=", &subquery, "MIN"),
+                "<>" | "!=" => format!("{} NOT IN ({})", expr, subquery),
+                _ => continue,
+            };
+
+            result = format!(
+                "{}{}{}",
+                &result[..match_start],
+                replacement,
+                &result[end_pos..]
+            );
+        } else {
+            break;
+        }
+    }
+
+    // Process ANY patterns: x OP ANY (SELECT col ...) -> x OP (SELECT AGG(col) ...) or x IN (...)
+    while let Some(caps) = any_pattern.captures(&result) {
+        let full_match = caps.get(0).unwrap();
+        let expr = caps.get(1).unwrap().as_str();
+        let op = caps.get(2).unwrap().as_str();
+        let select_start = caps.get(3).unwrap().as_str();
+
+        let match_start = full_match.start();
+        let select_pos = full_match.end() - select_start.len();
+
+        if let Some((subquery, end_pos)) = extract_subquery(&result, select_pos) {
+            let replacement = match op.to_uppercase().as_str() {
+                ">" => wrap_subquery_with_agg(expr, ">", &subquery, "MIN"),
+                ">=" => wrap_subquery_with_agg(expr, ">=", &subquery, "MIN"),
+                "<" => wrap_subquery_with_agg(expr, "<", &subquery, "MAX"),
+                "<=" => wrap_subquery_with_agg(expr, "<=", &subquery, "MAX"),
+                "=" | "==" => format!("{} IN ({})", expr, subquery),
+                "<>" | "!=" => wrap_subquery_with_agg(expr, "<>", &subquery, "MIN"),
+                _ => continue,
+            };
+
+            result = format!(
+                "{}{}{}",
+                &result[..match_start],
+                replacement,
+                &result[end_pos..]
+            );
+        } else {
+            break;
+        }
+    }
+
+    result
+}
+
+/// Transform "SELECT col FROM ..." to "SELECT AGG(col) FROM ..." and build comparison
+fn wrap_subquery_with_agg(expr: &str, op: &str, subquery: &str, agg: &str) -> String {
+    // subquery format: "SELECT col FROM table WHERE ..."
+    // We need to extract "col" and wrap it with the aggregate function
+    let upper = subquery.to_uppercase();
+    if let Some(from_pos) = upper.find(" FROM ") {
+        let col_part = &subquery[7..from_pos]; // After "SELECT " before " FROM"
+        let rest = &subquery[from_pos..];
+        format!(
+            "{} {} (SELECT {}({}){})",
+            expr,
+            op,
+            agg,
+            col_part.trim(),
+            rest
+        )
+    } else {
+        // Fallback: just use the subquery as-is (shouldn't happen for valid SQL)
+        format!("{} {} ({})", expr, op, subquery)
+    }
+}
+
+/// Extract a subquery starting at the given position, handling nested parentheses.
+/// Returns the subquery string (including SELECT) and the position after the closing paren.
+fn extract_subquery(sql: &str, start: usize) -> Option<(String, usize)> {
+    let bytes = sql.as_bytes();
+    let mut depth = 1; // We're already inside the opening paren
+    let mut pos = start;
+
+    // Find where the subquery content starts (after the opening paren we're inside)
+    // The start position is at "SELECT", and we need to find the matching close paren
+
+    // First, find where the opening paren was (before start)
+    let mut open_paren_pos = start;
+    for i in (0..start).rev() {
+        if bytes[i] == b'(' {
+            open_paren_pos = i;
+            break;
+        }
+    }
+
+    // Now scan forward from start to find the matching close paren
+    pos = start;
+    while pos < bytes.len() {
+        match bytes[pos] {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // Found the matching close paren
+                    let subquery = sql[start..pos].to_string();
+                    return Some((subquery, pos + 1)); // +1 to skip the closing paren
+                }
+            }
+            b'\'' => {
+                // Skip string literals
+                pos += 1;
+                while pos < bytes.len() && bytes[pos] != b'\'' {
+                    if bytes[pos] == b'\\' {
+                        pos += 1; // Skip escaped char
+                    }
+                    pos += 1;
+                }
+            }
+            b'"' => {
+                // Skip quoted identifiers
+                pos += 1;
+                while pos < bytes.len() && bytes[pos] != b'"' {
+                    pos += 1;
+                }
+            }
+            _ => {}
+        }
+        pos += 1;
+    }
+
+    None // Couldn't find matching paren
+}
+
 fn preprocess_sql(sql: &str) -> String {
-    if let Some(result) = preprocess_explain(sql) {
-        return result;
+    let mut result = sql.to_string();
+
+    if let Some(explained) = preprocess_explain(&result) {
+        result = explained;
     }
-    if let Some(result) = preprocess_create_sequence(sql) {
-        return result;
+    if let Some(sequenced) = preprocess_create_sequence(&result) {
+        result = sequenced;
     }
-    sql.to_string()
+
+    // Rewrite ALL/ANY subquery patterns
+    result = rewrite_all_any_subqueries(&result);
+
+    result
 }
 
 /// Parse a SQL string into AST statements

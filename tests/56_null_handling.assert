@@ -1,0 +1,45 @@
+test|result
+NULL = NULL
+NULL <> NULL
+5 = NULL
+id|name
+1|Alice
+2|Bob
+4|Diana
+(3 rows)
+null_count
+2
+id|name_or_default
+1|Alice
+2|Bob
+3|Unknown
+4|Diana
+5|Unknown
+(5 rows)
+id|value_or_zero
+1|100
+2|0
+3|200
+4|150
+5|0
+first_non_null
+third
+should_be_one
+1
+count_all
+5
+count_name
+3
+count_value
+3
+sum_value
+450
+id|category
+low
+no value
+high
+id|value
+100
+150
+200
+NULL handling tests completed

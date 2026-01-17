@@ -752,53 +752,98 @@ impl Executor {
         search_path: &[String],
         select: &sqlparser::ast::Select,
     ) -> Result<ExecuteResult> {
+        fn is_unnest_call(expr: &Expr) -> bool {
+            if let Expr::Function(f) = expr {
+                if let Some(name) = f.name.0.last() {
+                    return name.value.eq_ignore_ascii_case("unnest");
+                }
+            }
+            false
+        }
+
         let resolved_projection = self
             .resolve_projection_subqueries(txn, sequence_values, search_path, &select.projection)
             .await?;
 
         let mut cols = Vec::new();
         let mut values = Vec::new();
+        let mut unnest_positions: Vec<(usize, Vec<Value>)> = Vec::new();
 
         for item in &resolved_projection {
             match item {
                 SelectItem::UnnamedExpr(expr) => {
                     cols.push(get_expr_name(expr));
-                    values.push(
-                        sequences::eval_expr_with_sequences(
-                            &self.store,
-                            txn,
-                            sequence_values,
-                            search_path,
-                            expr,
-                            None,
-                            None,
-                        )
-                        .await?,
-                    );
+                    let val = sequences::eval_expr_with_sequences(
+                        &self.store,
+                        txn,
+                        sequence_values,
+                        search_path,
+                        expr,
+                        None,
+                        None,
+                    )
+                    .await?;
+                    if is_unnest_call(expr) {
+                        if let Value::Array(arr) = val {
+                            unnest_positions.push((values.len(), arr.clone()));
+                            values.push(Value::Null);
+                        } else {
+                            values.push(val);
+                        }
+                    } else {
+                        values.push(val);
+                    }
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     cols.push(alias.value.clone());
-                    values.push(
-                        sequences::eval_expr_with_sequences(
-                            &self.store,
-                            txn,
-                            sequence_values,
-                            search_path,
-                            expr,
-                            None,
-                            None,
-                        )
-                        .await?,
-                    );
+                    let val = sequences::eval_expr_with_sequences(
+                        &self.store,
+                        txn,
+                        sequence_values,
+                        search_path,
+                        expr,
+                        None,
+                        None,
+                    )
+                    .await?;
+                    if is_unnest_call(expr) {
+                        if let Value::Array(arr) = val {
+                            unnest_positions.push((values.len(), arr.clone()));
+                            values.push(Value::Null);
+                        } else {
+                            values.push(val);
+                        }
+                    } else {
+                        values.push(val);
+                    }
                 }
                 _ => return Err(anyhow!("Unsupported select item in tableless query")),
             }
         }
 
+        let rows = if !unnest_positions.is_empty() {
+            let max_len = unnest_positions
+                .iter()
+                .map(|(_, arr)| arr.len())
+                .max()
+                .unwrap_or(0);
+            let mut result_rows = Vec::new();
+            for i in 0..max_len {
+                let mut row_values = values.clone();
+                for (col_idx, arr) in &unnest_positions {
+                    row_values[*col_idx] = arr.get(i).cloned().unwrap_or(Value::Null);
+                }
+                result_rows.push(Row::new(row_values));
+            }
+            result_rows
+        } else {
+            vec![Row::new(values)]
+        };
+
         Ok(ExecuteResult::Select {
             column_types: None,
             columns: cols,
-            rows: vec![Row::new(values)],
+            rows,
         })
     }
 

@@ -1,0 +1,27 @@
+name|price|avg_price
+Apple|1.50
+Banana|0.75
+Carrot|0.50
+Milk|2.00
+Cheese|5.00
+(5 rows)
+name|price
+Milk|2.00
+Cheese|5.00
+(2 rows)
+name
+Apple
+Banana
+Milk
+(3 rows)
+Carrot
+Cheese
+total_ordered
+15
+20
+3
+category|avg_price
+Dairy
+Fruit
+Vegetable
+Subquery patterns tests completed

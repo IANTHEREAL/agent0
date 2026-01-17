@@ -23,6 +23,8 @@ pub enum Aggregator {
     ArrayAgg {
         values: Vec<Value>,
     },
+    BoolAnd(Option<bool>),
+    BoolOr(Option<bool>),
 }
 
 impl Aggregator {
@@ -41,6 +43,8 @@ impl Aggregator {
                 delimiter: ",".to_string(),
             }),
             "ARRAY_AGG" => Ok(Aggregator::ArrayAgg { values: Vec::new() }),
+            "BOOL_AND" | "EVERY" => Ok(Aggregator::BoolAnd(None)),
+            "BOOL_OR" => Ok(Aggregator::BoolOr(None)),
             _ => Err(anyhow!("Unsupported aggregate function: {}", kind)),
         }
     }
@@ -119,8 +123,17 @@ impl Aggregator {
                 }
             }
             Aggregator::ArrayAgg { values } => {
-                // array_agg includes NULL values (unlike most aggregates)
                 values.push(val.clone());
+            }
+            Aggregator::BoolAnd(current) => {
+                if let Value::Boolean(b) = val {
+                    *current = Some(current.unwrap_or(true) && *b);
+                }
+            }
+            Aggregator::BoolOr(current) => {
+                if let Value::Boolean(b) = val {
+                    *current = Some(current.unwrap_or(false) || *b);
+                }
             }
         }
         Ok(())
@@ -153,6 +166,8 @@ impl Aggregator {
                     Value::Array(values.clone())
                 }
             }
+            Aggregator::BoolAnd(opt) => opt.map_or(Value::Null, Value::Boolean),
+            Aggregator::BoolOr(opt) => opt.map_or(Value::Null, Value::Boolean),
         }
     }
 }

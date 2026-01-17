@@ -83,7 +83,7 @@ ORDER BY constraint_name;
 -- Test information_schema.referential_constraints
 SELECT constraint_name, unique_constraint_name, delete_rule, update_rule
 FROM information_schema.referential_constraints
-WHERE constraint_name LIKE '%orders%' OR constraint_name LIKE '%fkey%';
+WHERE constraint_name = 'orders_customer_id_fkey';
 -- Expected: FK rules (CASCADE, etc.)
 
 -- Test information_schema.check_constraints

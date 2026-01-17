@@ -15,7 +15,7 @@ use sqlparser::ast::{
     Distinct, Expr, FunctionArg, FunctionArgExpr, GroupByExpr, LockType, ObjectName, Query,
     SelectItem, SetExpr, TableFactor, Value as SqlValue,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
 use tracing::debug;
 
@@ -528,6 +528,8 @@ impl Executor {
     ) -> Result<ExecuteResult> {
         let mut groups: HashMap<Vec<u8>, Vec<Aggregator>> = HashMap::new();
         let mut group_rows: HashMap<Vec<u8>, Row> = HashMap::new();
+        // Track seen values for DISTINCT aggregates: group_key -> (agg_idx -> seen_values)
+        let mut seen_distinct: HashMap<Vec<u8>, Vec<HashSet<Vec<u8>>>> = HashMap::new();
 
         for row in filtered_rows {
             let mut key = Vec::new();
@@ -586,6 +588,9 @@ impl Executor {
                         }
                     }
                 }
+                let distinct_sets: Vec<HashSet<Vec<u8>>> =
+                    agg_funcs.iter().map(|_| HashSet::new()).collect();
+                seen_distinct.insert(key_bytes.clone(), distinct_sets);
                 groups.insert(key_bytes.clone(), aggs);
                 group_rows.insert(key_bytes.clone(), row.clone());
             }
@@ -638,6 +643,16 @@ impl Executor {
                 } else {
                     Value::Int32(1)
                 };
+
+                let is_distinct = matches!(agg_expr, AggExpr::Function(f) if f.distinct);
+                if is_distinct {
+                    let val_bytes = bincode::serialize(&val).unwrap_or_default();
+                    let distinct_sets = seen_distinct.get_mut(&key_bytes).unwrap();
+                    if !distinct_sets[agg_idx].insert(val_bytes) {
+                        continue;
+                    }
+                }
+
                 aggs[agg_idx].update(&val)?;
             }
         }
@@ -1005,9 +1020,27 @@ impl Executor {
             }
         }
 
+        fn is_unnest_call(expr: &Expr) -> bool {
+            if let Expr::Function(f) = expr {
+                if let Some(name) = f.name.0.last() {
+                    return name.value.eq_ignore_ascii_case("unnest");
+                }
+            }
+            false
+        }
+
+        let has_unnest = resolved_projection.iter().any(|item| match item {
+            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                is_unnest_call(e)
+            }
+            _ => false,
+        });
+
         let mut result_rows = Vec::new();
         for (row_idx, row) in rows_for_projection.iter().enumerate() {
             let mut row_values = Vec::new();
+            let mut unnest_arrays: Vec<(usize, Vec<Value>)> = Vec::new();
+
             for (proj_idx, item) in resolved_projection.iter().enumerate() {
                 if let Some(wf_pos) = window_funcs.iter().position(|wf| wf.proj_idx == proj_idx) {
                     if let Some(wr) = window_results {
@@ -1024,32 +1057,76 @@ impl Executor {
                             continue;
                         }
                     };
-                    let value = if let Expr::Subquery(subquery) = expr {
-                        self.eval_correlated_subquery(
-                            txn,
-                            sequence_values,
-                            search_path,
-                            subquery,
-                            outer_alias,
-                            schema,
-                            row,
-                        )
-                        .await?
+
+                    if has_unnest && is_unnest_call(expr) {
+                        if let Expr::Function(f) = expr {
+                            if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
+                                f.args.first()
+                            {
+                                let arr_val = self
+                                    .eval_expr_maybe_sequence(
+                                        txn,
+                                        sequence_values,
+                                        search_path,
+                                        arg_expr,
+                                        Some(row),
+                                        Some(schema),
+                                    )
+                                    .await?;
+                                if let Value::Array(arr) = arr_val {
+                                    unnest_arrays.push((row_values.len(), arr.clone()));
+                                    row_values.push(Value::Null);
+                                } else {
+                                    row_values.push(arr_val);
+                                }
+                            } else {
+                                row_values.push(Value::Null);
+                            }
+                        }
                     } else {
-                        self.eval_expr_maybe_sequence(
-                            txn,
-                            sequence_values,
-                            search_path,
-                            expr,
-                            Some(row),
-                            Some(schema),
-                        )
-                        .await?
-                    };
-                    row_values.push(value);
+                        let value = if let Expr::Subquery(subquery) = expr {
+                            self.eval_correlated_subquery(
+                                txn,
+                                sequence_values,
+                                search_path,
+                                subquery,
+                                outer_alias,
+                                schema,
+                                row,
+                            )
+                            .await?
+                        } else {
+                            self.eval_expr_maybe_sequence(
+                                txn,
+                                sequence_values,
+                                search_path,
+                                expr,
+                                Some(row),
+                                Some(schema),
+                            )
+                            .await?
+                        };
+                        row_values.push(value);
+                    }
                 }
             }
-            result_rows.push(Row::new(row_values));
+
+            if !unnest_arrays.is_empty() {
+                let max_len = unnest_arrays
+                    .iter()
+                    .map(|(_, arr)| arr.len())
+                    .max()
+                    .unwrap_or(0);
+                for i in 0..max_len {
+                    let mut expanded_row = row_values.clone();
+                    for (col_idx, arr) in &unnest_arrays {
+                        expanded_row[*col_idx] = arr.get(i).cloned().unwrap_or(Value::Null);
+                    }
+                    result_rows.push(Row::new(expanded_row));
+                }
+            } else {
+                result_rows.push(Row::new(row_values));
+            }
         }
         Ok((cols, result_rows))
     }

@@ -291,7 +291,7 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
             hex::encode(b)
         ))),
         Value::Timestamp(ts) => Expr::Value(SqlValue::Number(ts.to_string(), false)),
-        Value::Interval(ms) => Expr::Value(SqlValue::Number(ms.to_string(), false)),
+        Value::Interval(iv) => Expr::Value(SqlValue::SingleQuotedString(iv.to_string())),
         Value::Uuid(bytes) => {
             let uuid = uuid::Uuid::from_bytes(*bytes);
             Expr::Value(SqlValue::SingleQuotedString(uuid.to_string()))
@@ -562,7 +562,16 @@ pub fn collect_having_agg_funcs(
                 .unwrap_or_default();
             if matches!(
                 func_name.as_str(),
-                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "ARRAY_AGG"
+                "COUNT"
+                    | "SUM"
+                    | "AVG"
+                    | "MIN"
+                    | "MAX"
+                    | "STRING_AGG"
+                    | "ARRAY_AGG"
+                    | "BOOL_AND"
+                    | "BOOL_OR"
+                    | "EVERY"
             ) {
                 let already_exists = agg_funcs.iter().any(|(_, existing)| {
                     if let AggExpr::Function(existing_f) = existing {
@@ -656,7 +665,16 @@ pub fn eval_having_expr(
             }
             if matches!(
                 func_name.as_str(),
-                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "ARRAY_AGG"
+                "COUNT"
+                    | "SUM"
+                    | "AVG"
+                    | "MIN"
+                    | "MAX"
+                    | "STRING_AGG"
+                    | "ARRAY_AGG"
+                    | "BOOL_AND"
+                    | "BOOL_OR"
+                    | "EVERY"
             ) {
                 let mut temp_agg = Aggregator::new(&func_name)?;
                 let arg_expr = if f.args.is_empty() {
@@ -760,7 +778,16 @@ pub fn eval_having_expr_join(
             }
             if matches!(
                 func_name.as_str(),
-                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "ARRAY_AGG"
+                "COUNT"
+                    | "SUM"
+                    | "AVG"
+                    | "MIN"
+                    | "MAX"
+                    | "STRING_AGG"
+                    | "ARRAY_AGG"
+                    | "BOOL_AND"
+                    | "BOOL_OR"
+                    | "EVERY"
             ) {
                 let mut temp_agg = Aggregator::new(&func_name)?;
                 let arg_expr = if f.args.is_empty() {
@@ -1084,6 +1111,7 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                     }
                 }
                 "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" => DataType::Int64,
+                "BOOL_AND" | "BOOL_OR" | "EVERY" => DataType::Boolean,
                 "VECTOR_DIMS" => DataType::Int32,
                 "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
                     if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =

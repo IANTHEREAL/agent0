@@ -263,9 +263,10 @@ fn encode_value_memcomparable(value: &Value, buf: &mut Vec<u8>) {
             buf.push(NOT_NULL_TAG);
             buf.extend(memcomparable::to_vec(ts).unwrap());
         }
-        Value::Interval(i) => {
+        Value::Interval(iv) => {
             buf.push(NOT_NULL_TAG);
-            buf.extend(memcomparable::to_vec(i).unwrap());
+            buf.extend(memcomparable::to_vec(&iv.months).unwrap());
+            buf.extend(memcomparable::to_vec(&iv.millis).unwrap());
         }
         Value::Time(t) => {
             buf.push(NOT_NULL_TAG);
@@ -396,8 +397,12 @@ pub fn decode_value_memcomparable(data: &[u8], data_type: &DataType) -> Result<(
             (Value::Timestamp(v), deserializer.position())
         }
         DataType::Interval => {
-            let v: i64 = serde::Deserialize::deserialize(&mut deserializer)?;
-            (Value::Interval(v), deserializer.position())
+            let months: i32 = serde::Deserialize::deserialize(&mut deserializer)?;
+            let millis: i64 = serde::Deserialize::deserialize(&mut deserializer)?;
+            (
+                Value::Interval(crate::types::IntervalValue::new(months, millis)),
+                deserializer.position(),
+            )
         }
         DataType::Time => {
             let v: i64 = serde::Deserialize::deserialize(&mut deserializer)?;

@@ -1134,8 +1134,12 @@ async fn get_table_constraints_rows(
                 ]));
             }
 
+            let mut seen_unique_constraints: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
             for idx in &table_def.indexes {
                 if idx.unique {
+                    seen_unique_constraints.insert(idx.name.clone());
                     rows.push(Row::new(vec![
                         text_val("postgres"),
                         text_val(&table_schema),
@@ -1154,6 +1158,9 @@ async fn get_table_constraints_rows(
             for col in &table_def.columns {
                 if col.unique && !col.primary_key {
                     let constraint_name = format!("{}_{}_key", table_name, col.name);
+                    if seen_unique_constraints.contains(&constraint_name) {
+                        continue;
+                    }
                     rows.push(Row::new(vec![
                         text_val("postgres"),
                         text_val(&table_schema),
