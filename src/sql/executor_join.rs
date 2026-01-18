@@ -15,6 +15,7 @@ use super::{
 };
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
+use chrono::TimeZone;
 use sqlparser::ast::{
     BinaryOperator, Distinct, Expr, FunctionArg, FunctionArgExpr, GroupByExpr, Ident,
     JoinConstraint, JoinOperator, Query, SelectItem, Statement, TableFactor,
@@ -61,7 +62,7 @@ impl Executor {
         ) {
             let result = match t_upper.as_str() {
                 "CURRENT_SCHEMA" => Value::Text(names::default_schema(search_path).to_string()),
-                "CURRENT_DATABASE" => Value::Text("postgres".to_string()),
+                "CURRENT_DATABASE" => Value::Text("testdb".to_string()),
                 "CURRENT_USER" | "SESSION_USER" | "USER" => Value::Text("postgres".to_string()),
                 _ => unreachable!(),
             };
@@ -164,7 +165,7 @@ impl Executor {
             let func_name = table_name.trim_end_matches("()").to_uppercase();
             let result = match func_name.as_str() {
                 "CURRENT_SCHEMA" => Value::Text(names::default_schema(search_path).to_string()),
-                "CURRENT_DATABASE" => Value::Text("postgres".to_string()),
+                "CURRENT_DATABASE" => Value::Text("testdb".to_string()),
                 "CURRENT_USER" | "SESSION_USER" | "USER" => Value::Text("postgres".to_string()),
                 _ => return Err(anyhow!("Function '{}' not found", func_name)),
             };
@@ -193,6 +194,68 @@ impl Executor {
             return Ok((schema, rows));
         }
         Err(anyhow!("Table '{}' not found", table_name))
+    }
+
+    pub(crate) async fn execute_generate_series(
+        &self,
+        args: &[FunctionArg],
+        alias_name: &str,
+        table_alias: Option<&sqlparser::ast::TableAlias>,
+    ) -> Result<(TableSchema, Vec<Row>)> {
+        use super::expr::eval_expr;
+
+        fn extract_expr(arg: &FunctionArg) -> Result<&Expr> {
+            match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+                _ => Err(anyhow!("generate_series requires expression arguments")),
+            }
+        }
+
+        if args.len() < 2 {
+            return Err(anyhow!("generate_series requires at least 2 arguments"));
+        }
+
+        let start_val = eval_expr(extract_expr(&args[0])?, None, None)?;
+        let stop_val = eval_expr(extract_expr(&args[1])?, None, None)?;
+        let step_val = if args.len() >= 3 {
+            eval_expr(extract_expr(&args[2])?, None, None)?
+        } else {
+            Value::Null
+        };
+
+        let (values, data_type) = generate_series_values(&start_val, &stop_val, &step_val)?;
+
+        let col_name = if let Some(ta) = table_alias {
+            if !ta.columns.is_empty() {
+                ta.columns[0].value.clone()
+            } else {
+                alias_name.to_string()
+            }
+        } else {
+            "generate_series".to_string()
+        };
+
+        let schema = TableSchema {
+            table_id: 0,
+            name: "generate_series".to_string(),
+            columns: vec![ColumnDef {
+                name: col_name,
+                data_type,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            pk_indices: vec![],
+            indexes: vec![],
+            version: 1,
+            check_constraints: vec![],
+            foreign_keys: vec![],
+        };
+
+        let rows: Vec<Row> = values.into_iter().map(|v| Row::new(vec![v])).collect();
+        Ok((schema, rows))
     }
 
     pub(crate) fn execute_view_query<'a>(
@@ -234,7 +297,7 @@ impl Executor {
             match result {
                 ExecuteResult::Select {
                     columns,
-                    column_types: _,
+                    column_types,
                     rows,
                 } => {
                     let column_names = if alias_columns.is_empty() {
@@ -248,14 +311,31 @@ impl Executor {
                     } else {
                         alias_columns.iter().map(normalize_ident).collect()
                     };
+
+                    let inferred_types = column_types.unwrap_or_else(|| {
+                        if let Some(first) = rows.first() {
+                            first
+                                .values
+                                .iter()
+                                .map(|v| v.data_type().unwrap_or(DataType::Text))
+                                .collect()
+                        } else {
+                            vec![DataType::Text; column_names.len()]
+                        }
+                    });
+
                     let schema = TableSchema {
                         table_id: 0,
                         name: alias.to_string(),
                         columns: column_names
                             .iter()
-                            .map(|n| ColumnDef {
+                            .enumerate()
+                            .map(|(i, n)| ColumnDef {
                                 name: n.clone(),
-                                data_type: DataType::Text,
+                                data_type: inferred_types
+                                    .get(i)
+                                    .cloned()
+                                    .unwrap_or(DataType::Text),
                                 nullable: true,
                                 primary_key: false,
                                 unique: false,
@@ -297,6 +377,19 @@ impl Executor {
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| obj_name.clone());
                     let tbl_upper = obj_name.to_uppercase();
+
+                    // Handle GENERATE_SERIES as a table-valued function
+                    if tbl_upper == "GENERATE_SERIES" {
+                        if let Some(func_args) = args {
+                            let (schema, rows) = self
+                                .execute_generate_series(func_args, &als, alias.as_ref())
+                                .await?;
+                            return Ok((als, schema, rows));
+                        } else {
+                            return Err(anyhow!("generate_series requires at least 2 arguments"));
+                        }
+                    }
+
                     let is_scalar_function = matches!(
                         tbl_upper.as_str(),
                         "CURRENT_SCHEMA"
@@ -555,30 +648,42 @@ impl Executor {
                     .map(|a| a.name.value.clone())
                     .unwrap_or_else(|| obj_name.clone());
 
-                // Check if this is a known scalar function that can be used as a table
                 let tbl_upper = obj_name.to_uppercase();
-                let is_scalar_function = matches!(
-                    tbl_upper.as_str(),
-                    "CURRENT_SCHEMA"
-                        | "CURRENT_DATABASE"
-                        | "CURRENT_USER"
-                        | "SESSION_USER"
-                        | "USER"
-                ) || args.is_some();
 
-                let table_name = if is_scalar_function {
-                    format!("{}()", obj_name) // Add parentheses for function detection in get_table_data
-                } else {
-                    match schema_opt {
-                        Some(schema) => format!("{}.{}", schema, obj_name),
-                        None => obj_name,
+                // Handle GENERATE_SERIES as a table-valued function
+                if tbl_upper == "GENERATE_SERIES" {
+                    if let Some(func_args) = args {
+                        let (schema, rows) = self
+                            .execute_generate_series(func_args, &als, alias.as_ref())
+                            .await?;
+                        (als, schema, rows)
+                    } else {
+                        return Err(anyhow!("generate_series requires at least 2 arguments"));
                     }
-                };
+                } else {
+                    let is_scalar_function = matches!(
+                        tbl_upper.as_str(),
+                        "CURRENT_SCHEMA"
+                            | "CURRENT_DATABASE"
+                            | "CURRENT_USER"
+                            | "SESSION_USER"
+                            | "USER"
+                    ) || args.is_some();
 
-                let (schema, rows) = self
-                    .get_table_data(txn, sequence_values, search_path, &table_name, ctes)
-                    .await?;
-                (als, schema, rows)
+                    let table_name = if is_scalar_function {
+                        format!("{}()", obj_name)
+                    } else {
+                        match schema_opt {
+                            Some(schema) => format!("{}.{}", schema, obj_name),
+                            None => obj_name,
+                        }
+                    };
+
+                    let (schema, rows) = self
+                        .get_table_data(txn, sequence_values, search_path, &table_name, ctes)
+                        .await?;
+                    (als, schema, rows)
+                }
             }
             TableFactor::Derived {
                 subquery, alias, ..
@@ -622,20 +727,35 @@ impl Executor {
 
         for from_item in select.from.iter().skip(1) {
             let (extra_alias, extra_schema, extra_rows) = match &from_item.relation {
-                TableFactor::Table { name, alias, .. } => {
+                TableFactor::Table {
+                    name, alias, args, ..
+                } => {
                     let (schema_opt, obj_name) = names::split_object_name(name)?;
-                    let tbl = match schema_opt {
-                        Some(schema) => format!("{}.{}", schema, obj_name),
-                        None => obj_name.clone(),
-                    };
                     let als = alias
                         .as_ref()
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| obj_name.clone());
-                    let (schema, rows) = self
-                        .get_table_data(txn, sequence_values, search_path, &tbl, ctes)
-                        .await?;
-                    (als, schema, rows)
+                    let tbl_upper = obj_name.to_uppercase();
+
+                    if tbl_upper == "GENERATE_SERIES" {
+                        if let Some(func_args) = args {
+                            let (schema, rows) = self
+                                .execute_generate_series(func_args, &als, alias.as_ref())
+                                .await?;
+                            (als, schema, rows)
+                        } else {
+                            return Err(anyhow!("generate_series requires at least 2 arguments"));
+                        }
+                    } else {
+                        let tbl = match schema_opt {
+                            Some(schema) => format!("{}.{}", schema, obj_name),
+                            None => obj_name.clone(),
+                        };
+                        let (schema, rows) = self
+                            .get_table_data(txn, sequence_values, search_path, &tbl, ctes)
+                            .await?;
+                        (als, schema, rows)
+                    }
                 }
                 TableFactor::Derived {
                     subquery, alias, ..
@@ -684,20 +804,37 @@ impl Executor {
 
             for extra_join in &from_item.joins {
                 let (join_alias, join_schema, join_rows) = match &extra_join.relation {
-                    TableFactor::Table { name, alias, .. } => {
+                    TableFactor::Table {
+                        name, alias, args, ..
+                    } => {
                         let (schema_opt, obj_name) = names::split_object_name(name)?;
-                        let tbl = match schema_opt {
-                            Some(schema) => format!("{}.{}", schema, obj_name),
-                            None => obj_name.clone(),
-                        };
                         let als = alias
                             .as_ref()
                             .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| obj_name.clone());
-                        let (schema, rows) = self
-                            .get_table_data(txn, sequence_values, search_path, &tbl, ctes)
-                            .await?;
-                        (als, schema, rows)
+                        let tbl_upper = obj_name.to_uppercase();
+
+                        if tbl_upper == "GENERATE_SERIES" {
+                            if let Some(func_args) = args {
+                                let (schema, rows) = self
+                                    .execute_generate_series(func_args, &als, alias.as_ref())
+                                    .await?;
+                                (als, schema, rows)
+                            } else {
+                                return Err(anyhow!(
+                                    "generate_series requires at least 2 arguments"
+                                ));
+                            }
+                        } else {
+                            let tbl = match schema_opt {
+                                Some(schema) => format!("{}.{}", schema, obj_name),
+                                None => obj_name.clone(),
+                            };
+                            let (schema, rows) = self
+                                .get_table_data(txn, sequence_values, search_path, &tbl, ctes)
+                                .await?;
+                            (als, schema, rows)
+                        }
                     }
                     TableFactor::Derived {
                         subquery, alias, ..
@@ -748,21 +885,229 @@ impl Executor {
         }
 
         for join in &select.from[0].joins {
-            let (join_alias, join_schema, join_rows) = match &join.relation {
-                TableFactor::Table { name, alias, .. } => {
-                    let (schema_opt, obj_name) = names::split_object_name(name)?;
-                    let tbl = match schema_opt {
-                        Some(schema) => format!("{}.{}", schema, obj_name),
-                        None => obj_name.clone(),
+            if let TableFactor::Derived {
+                lateral: true,
+                subquery,
+                alias,
+                ..
+            } = &join.relation
+            {
+                let join_alias = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| "subquery".to_string());
+                let alias_columns = alias.as_ref().map(|a| a.columns.as_slice()).unwrap_or(&[]);
+
+                let (join_condition, is_natural) = match &join.join_operator {
+                    JoinOperator::Inner(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
+                    JoinOperator::LeftOuter(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
+                    JoinOperator::Inner(JoinConstraint::None) => (None, false),
+                    JoinOperator::CrossJoin => (None, false),
+                    _ => return Err(anyhow!("Unsupported LATERAL JOIN type")),
+                };
+                let _ = is_natural;
+
+                let has_correlated_subquery = join_condition.as_ref().map_or(false, |cond| {
+                    combined_schemas.iter().any(|(alias, _)| {
+                        super::helpers::query_has_outer_reference_in_expr(cond, alias)
+                    })
+                });
+
+                let join_condition = if let Some(cond) = join_condition {
+                    if has_correlated_subquery {
+                        Some(cond)
+                    } else {
+                        Some(
+                            self.resolve_subqueries(txn, sequence_values, search_path, &cond, ctes)
+                                .await?,
+                        )
+                    }
+                } else {
+                    None
+                };
+
+                let is_left_join = matches!(&join.join_operator, JoinOperator::LeftOuter(_));
+
+                let mut join_schema: Option<TableSchema> = None;
+                let mut join_column_offsets: Option<HashMap<String, usize>> = None;
+                let mut join_combined_schema: Option<TableSchema> = None;
+
+                let mut new_combined_rows = Vec::new();
+                for left_row in &combined_rows {
+                    let mut substituted_query = subquery.as_ref().clone();
+                    let mut value_offset = 0;
+                    for (alias, schema) in &combined_schemas {
+                        let row_values: Vec<Value> = left_row.values
+                            [value_offset..value_offset + schema.columns.len()]
+                            .to_vec();
+                        let outer_row = Row::new(row_values);
+                        substituted_query = super::helpers::substitute_outer_values_in_query(
+                            &substituted_query,
+                            alias,
+                            schema,
+                            &outer_row,
+                        );
+                        value_offset += schema.columns.len();
+                    }
+
+                    let (this_schema, right_rows) = self
+                        .execute_derived_table(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            &substituted_query,
+                            &join_alias,
+                            alias_columns,
+                            ctes,
+                        )
+                        .await?;
+
+                    if join_schema.is_none() {
+                        join_schema = Some(this_schema.clone());
+
+                        let mut column_offsets: HashMap<String, usize> = HashMap::new();
+                        let mut offset = 0;
+                        for (alias, schema) in &combined_schemas {
+                            for col in &schema.columns {
+                                column_offsets.insert(format!("{}.{}", alias, col.name), offset);
+                                if !column_offsets.contains_key(&col.name) {
+                                    column_offsets.insert(col.name.clone(), offset);
+                                }
+                                offset += 1;
+                            }
+                        }
+                        for col in &this_schema.columns {
+                            column_offsets.insert(format!("{}.{}", join_alias, col.name), offset);
+                            if !column_offsets.contains_key(&col.name) {
+                                column_offsets.insert(col.name.clone(), offset);
+                            }
+                            if col.name.contains('.') {
+                                column_offsets.insert(col.name.clone(), offset);
+                            }
+                            offset += 1;
+                        }
+                        join_column_offsets = Some(column_offsets);
+
+                        let mut combined_col_defs: Vec<ColumnDef> = Vec::new();
+                        for (_, schema) in &combined_schemas {
+                            combined_col_defs.extend(schema.columns.clone());
+                        }
+                        combined_col_defs.extend(this_schema.columns.clone());
+                        join_combined_schema = Some(TableSchema {
+                            name: "joined".to_string(),
+                            table_id: 0,
+                            columns: combined_col_defs,
+                            version: 1,
+                            pk_indices: vec![],
+                            indexes: vec![],
+                            check_constraints: vec![],
+                            foreign_keys: vec![],
+                        });
+                    }
+
+                    let Some(ref final_schema) = join_combined_schema else {
+                        return Err(anyhow!("LATERAL join schema not initialized"));
                     };
+                    let Some(ref final_column_offsets) = join_column_offsets else {
+                        return Err(anyhow!("LATERAL join offsets not initialized"));
+                    };
+
+                    let mut matched = false;
+                    for right_row in &right_rows {
+                        let mut combined_values = left_row.values.clone();
+                        combined_values.extend(right_row.values.clone());
+                        let combined_row = Row::new(combined_values);
+
+                        let ctx = JoinContext {
+                            tables: HashMap::new(),
+                            column_offsets: final_column_offsets.clone(),
+                            combined_row: &combined_row,
+                            combined_schema: final_schema,
+                        };
+
+                        let matches = if let Some(ref cond) = join_condition {
+                            matches!(
+                                self.eval_expr_join_maybe_sequence(
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    cond,
+                                    &ctx
+                                )
+                                .await?,
+                                Value::Boolean(true)
+                            )
+                        } else {
+                            true
+                        };
+
+                        if matches {
+                            new_combined_rows.push(combined_row);
+                            matched = true;
+                        }
+                    }
+
+                    if is_left_join && !matched {
+                        let right_cols = join_schema
+                            .as_ref()
+                            .map(|s| s.columns.len())
+                            .unwrap_or(0);
+                        let mut combined_values = left_row.values.clone();
+                        combined_values.extend(std::iter::repeat(Value::Null).take(right_cols));
+                        new_combined_rows.push(Row::new(combined_values));
+                    }
+                }
+
+                if join_schema.is_none() {
+                    let (schema, _rows) = self
+                        .execute_derived_table(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            subquery,
+                            &join_alias,
+                            alias_columns,
+                            ctes,
+                        )
+                        .await?;
+                    join_schema = Some(schema);
+                }
+
+                combined_schemas.push((join_alias, join_schema.unwrap()));
+                combined_rows = new_combined_rows;
+                continue;
+            }
+
+            let (join_alias, join_schema, join_rows) = match &join.relation {
+                TableFactor::Table {
+                    name, alias, args, ..
+                } => {
+                    let (schema_opt, obj_name) = names::split_object_name(name)?;
                     let als = alias
                         .as_ref()
                         .map(|a| a.name.value.clone())
                         .unwrap_or_else(|| obj_name.clone());
-                    let (schema, rows) = self
-                        .get_table_data(txn, sequence_values, search_path, &tbl, ctes)
-                        .await?;
-                    (als, schema, rows)
+                    let tbl_upper = obj_name.to_uppercase();
+
+                    if tbl_upper == "GENERATE_SERIES" {
+                        if let Some(func_args) = args {
+                            let (schema, rows) = self
+                                .execute_generate_series(func_args, &als, alias.as_ref())
+                                .await?;
+                            (als, schema, rows)
+                        } else {
+                            return Err(anyhow!("generate_series requires at least 2 arguments"));
+                        }
+                    } else {
+                        let tbl = match schema_opt {
+                            Some(schema) => format!("{}.{}", schema, obj_name),
+                            None => obj_name.clone(),
+                        };
+                        let (schema, rows) = self
+                            .get_table_data(txn, sequence_values, search_path, &tbl, ctes)
+                            .await?;
+                        (als, schema, rows)
+                    }
                 }
                 TableFactor::Derived {
                     subquery, alias, ..
@@ -862,7 +1207,7 @@ impl Executor {
                     Some(cond)
                 } else {
                     Some(
-                        self.resolve_subqueries(txn, sequence_values, search_path, &cond)
+                        self.resolve_subqueries(txn, sequence_values, search_path, &cond, ctes)
                             .await?,
                     )
                 }
@@ -944,6 +1289,7 @@ impl Executor {
                                 sequence_values,
                                 search_path,
                                 &substituted,
+                                ctes,
                             )
                             .await?,
                         )
@@ -1043,7 +1389,7 @@ impl Executor {
         // Resolve subqueries (EXISTS, IN (SELECT ...), scalar subqueries) in WHERE clause
         let resolved_selection = if let Some(sel) = &select.selection {
             Some(
-                self.resolve_subqueries(txn, sequence_values, search_path, sel)
+                self.resolve_subqueries(txn, sequence_values, search_path, sel, ctes)
                     .await?,
             )
         } else {
@@ -1079,7 +1425,7 @@ impl Executor {
         };
 
         let resolved_projection = self
-            .resolve_projection_subqueries(txn, sequence_values, search_path, &select.projection)
+            .resolve_projection_subqueries(txn, sequence_values, search_path, &select.projection, ctes)
             .await?;
 
         let group_keys_exprs = match &select.group_by {
@@ -1256,9 +1602,11 @@ impl Executor {
             }
 
             let mut final_rows = Vec::new();
+            let mut final_rows_with_order_keys: Vec<(usize, Row, Vec<Value>)> = Vec::new();
             let col_names: Vec<String> =
                 select.projection.iter().map(get_select_item_name).collect();
 
+            let has_order_by = !query.order_by.is_empty();
             for (key_bytes, aggs) in groups {
                 let representative = &group_rows[&key_bytes];
                 let ctx = JoinContext {
@@ -1314,32 +1662,95 @@ impl Executor {
                         row_values.push(eval_having_expr_join(&expr, &ctx, &agg_funcs, &aggs)?);
                     }
                 }
-                final_rows.push(Row::new(row_values));
+                let row = Row::new(row_values);
+
+                if has_order_by {
+                    let mut keys = Vec::with_capacity(query.order_by.len());
+                    for order_expr in &query.order_by {
+                        match &order_expr.expr {
+                            Expr::Value(sqlparser::ast::Value::Number(n, _)) => {
+                                let idx = n.parse::<usize>().ok().map(|i| i.saturating_sub(1));
+                                let key = idx
+                                    .and_then(|i| row.values.get(i).cloned())
+                                    .unwrap_or(Value::Null);
+                                keys.push(key);
+                            }
+                            Expr::Identifier(ident) => {
+                                if let Some(idx) = col_names
+                                    .iter()
+                                    .position(|n| n.eq_ignore_ascii_case(&ident.value))
+                                {
+                                    keys.push(row.values.get(idx).cloned().unwrap_or(Value::Null));
+                                } else {
+                                    let expr = if sequences::expr_needs_async_eval(&order_expr.expr) {
+                                        sequences::replace_sequence_functions_join(
+                                            &self.store(),
+                                            txn,
+                                            sequence_values,
+                                            search_path,
+                                            &order_expr.expr,
+                                            &ctx,
+                                        )
+                                        .await?
+                                    } else {
+                                        order_expr.expr.clone()
+                                    };
+                                    keys.push(eval_having_expr_join(&expr, &ctx, &agg_funcs, &aggs)?);
+                                }
+                            }
+                            _ => {
+                                let expr = if sequences::expr_needs_async_eval(&order_expr.expr) {
+                                    sequences::replace_sequence_functions_join(
+                                        &self.store(),
+                                        txn,
+                                        sequence_values,
+                                        search_path,
+                                        &order_expr.expr,
+                                        &ctx,
+                                    )
+                                    .await?
+                                } else {
+                                    order_expr.expr.clone()
+                                };
+                                keys.push(eval_having_expr_join(&expr, &ctx, &agg_funcs, &aggs)?);
+                            }
+                        }
+                    }
+                    final_rows_with_order_keys.push((final_rows_with_order_keys.len(), row, keys));
+                } else {
+                    final_rows.push(row);
+                }
             }
 
-            let final_rows = if !query.order_by.is_empty() {
-                let mut indexed: Vec<(usize, Row)> = final_rows.into_iter().enumerate().collect();
-                indexed.sort_by(|(_, a), (_, b)| {
-                    for order_expr in &query.order_by {
-                        let col_idx = if let Expr::Identifier(ref ident) = order_expr.expr {
-                            col_names
-                                .iter()
-                                .position(|n| n.eq_ignore_ascii_case(&ident.value))
-                        } else {
-                            None
-                        };
+            let final_rows = if has_order_by {
+                final_rows_with_order_keys.sort_by(|(a_idx, _, a_keys), (b_idx, _, b_keys)| {
+                    for (i, order_expr) in query.order_by.iter().enumerate() {
+                        let val_a = a_keys.get(i).cloned().unwrap_or(Value::Null);
+                        let val_b = b_keys.get(i).cloned().unwrap_or(Value::Null);
+                        let asc = order_expr.asc.unwrap_or(true);
+                        let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
 
-                        let (val_a, val_b) = if let Some(idx) = col_idx {
-                            (a.values.get(idx).cloned(), b.values.get(idx).cloned())
-                        } else {
-                            (None, None)
-                        };
+                        match (&val_a, &val_b) {
+                            (Value::Null, Value::Null) => continue,
+                            (Value::Null, _) => {
+                                return if nulls_first {
+                                    std::cmp::Ordering::Less
+                                } else {
+                                    std::cmp::Ordering::Greater
+                                }
+                            }
+                            (_, Value::Null) => {
+                                return if nulls_first {
+                                    std::cmp::Ordering::Greater
+                                } else {
+                                    std::cmp::Ordering::Less
+                                }
+                            }
+                            _ => {}
+                        }
 
-                        let val_a = val_a.unwrap_or(Value::Null);
-                        let val_b = val_b.unwrap_or(Value::Null);
                         let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
                         if cmp != 0 {
-                            let asc = order_expr.asc.unwrap_or(true);
                             return if asc {
                                 if cmp > 0 {
                                     std::cmp::Ordering::Greater
@@ -1353,9 +1764,12 @@ impl Executor {
                             };
                         }
                     }
-                    std::cmp::Ordering::Equal
+                    a_idx.cmp(b_idx)
                 });
-                indexed.into_iter().map(|(_, r)| r).collect()
+                final_rows_with_order_keys
+                    .into_iter()
+                    .map(|(_, r, _)| r)
+                    .collect()
             } else {
                 final_rows
             };
@@ -1789,5 +2203,347 @@ impl Executor {
             columns: cols,
             rows: result_rows,
         })
+    }
+}
+
+fn generate_series_values(
+    start: &Value,
+    stop: &Value,
+    step: &Value,
+) -> Result<(Vec<Value>, DataType)> {
+    match (start, stop) {
+        (Value::Int32(s), Value::Int32(e)) => {
+            let step_val = match step {
+                Value::Null => 1,
+                Value::Int32(st) => *st,
+                Value::Int64(st) => i32::try_from(*st)
+                    .map_err(|_| anyhow!("step out of range for integer generate_series"))?,
+                _ => return Err(anyhow!("Invalid step type for integer generate_series")),
+            };
+            if step_val == 0 {
+                return Err(anyhow!("step size cannot equal zero"));
+            }
+            let mut values = Vec::new();
+            if step_val > 0 {
+                let mut current = *s;
+                while current <= *e {
+                    values.push(Value::Int32(current));
+                    current = match current.checked_add(step_val) {
+                        Some(next) => next,
+                        None => break,
+                    };
+                }
+            } else {
+                let mut current = *s;
+                while current >= *e {
+                    values.push(Value::Int32(current));
+                    current = match current.checked_add(step_val) {
+                        Some(next) => next,
+                        None => break,
+                    };
+                }
+            }
+            Ok((values, DataType::Int32))
+        }
+        (Value::Int64(s), Value::Int64(e)) => {
+            let step_val = match step {
+                Value::Null => 1i64,
+                Value::Int32(st) => *st as i64,
+                Value::Int64(st) => *st,
+                _ => return Err(anyhow!("Invalid step type for bigint generate_series")),
+            };
+            if step_val == 0 {
+                return Err(anyhow!("step size cannot equal zero"));
+            }
+            let mut values = Vec::new();
+            if step_val > 0 {
+                let mut current = *s;
+                while current <= *e {
+                    values.push(Value::Int64(current));
+                    current = match current.checked_add(step_val) {
+                        Some(next) => next,
+                        None => break,
+                    };
+                }
+            } else {
+                let mut current = *s;
+                while current >= *e {
+                    values.push(Value::Int64(current));
+                    current = match current.checked_add(step_val) {
+                        Some(next) => next,
+                        None => break,
+                    };
+                }
+            }
+            Ok((values, DataType::Int64))
+        }
+        (Value::Int32(_), Value::Int64(_)) | (Value::Int64(_), Value::Int32(_)) => {
+            let s64 = match start {
+                Value::Int32(v) => *v as i64,
+                Value::Int64(v) => *v,
+                _ => unreachable!(),
+            };
+            let e64 = match stop {
+                Value::Int32(v) => *v as i64,
+                Value::Int64(v) => *v,
+                _ => unreachable!(),
+            };
+            let step_val = match step {
+                Value::Null => 1i64,
+                Value::Int32(st) => *st as i64,
+                Value::Int64(st) => *st,
+                _ => return Err(anyhow!("Invalid step type for bigint generate_series")),
+            };
+            if step_val == 0 {
+                return Err(anyhow!("step size cannot equal zero"));
+            }
+            let mut values = Vec::new();
+            if step_val > 0 {
+                let mut current = s64;
+                while current <= e64 {
+                    values.push(Value::Int64(current));
+                    current = match current.checked_add(step_val) {
+                        Some(next) => next,
+                        None => break,
+                    };
+                }
+            } else {
+                let mut current = s64;
+                while current >= e64 {
+                    values.push(Value::Int64(current));
+                    current = match current.checked_add(step_val) {
+                        Some(next) => next,
+                        None => break,
+                    };
+                }
+            }
+            Ok((values, DataType::Int64))
+        }
+        (Value::Float64(s), Value::Float64(e)) => {
+            let step_val = match step {
+                Value::Null => 1.0,
+                Value::Float64(st) => *st,
+                Value::Int32(st) => *st as f64,
+                Value::Int64(st) => *st as f64,
+                _ => return Err(anyhow!("Invalid step type for numeric generate_series")),
+            };
+            if step_val == 0.0 {
+                return Err(anyhow!("step size cannot equal zero"));
+            }
+            let mut values = Vec::new();
+            if step_val > 0.0 {
+                let mut current = *s;
+                while current <= *e + f64::EPSILON {
+                    values.push(Value::Float64(current));
+                    current += step_val;
+                }
+            } else {
+                let mut current = *s;
+                while current >= *e - f64::EPSILON {
+                    values.push(Value::Float64(current));
+                    current += step_val;
+                }
+            }
+            Ok((values, DataType::Float64))
+        }
+        (Value::Timestamp(s), Value::Timestamp(e)) => {
+            let step_interval = match step {
+                Value::Interval(iv) => iv.clone(),
+                _ => {
+                    return Err(anyhow!(
+                        "generate_series with timestamps requires interval step"
+                    ))
+                }
+            };
+            let step_ms = interval_to_millis(&step_interval);
+            if step_ms == 0 {
+                return Err(anyhow!("step size cannot equal zero"));
+            }
+            let mut values = Vec::new();
+            if step_ms > 0 {
+                let mut current = *s;
+                while current <= *e {
+                    values.push(Value::Timestamp(current));
+                    current += step_ms;
+                }
+            } else {
+                let mut current = *s;
+                while current >= *e {
+                    values.push(Value::Timestamp(current));
+                    current += step_ms;
+                }
+            }
+            Ok((values, DataType::Timestamp))
+        }
+        (Value::Date(s), Value::Date(e)) => {
+            let step_interval = match step {
+                Value::Interval(iv) => iv.clone(),
+                _ => return Err(anyhow!("generate_series with dates requires interval step")),
+            };
+            let step_days = interval_to_days(&step_interval);
+            if step_days == 0 {
+                return Err(anyhow!("step size cannot equal zero"));
+            }
+            let mut values = Vec::new();
+            let tz = chrono_tz::America::Los_Angeles;
+            if step_days > 0 {
+                let mut current = *s;
+                while current <= *e {
+                    let date = crate::types::date::date_days_to_naive_date(current)?;
+                    let naive = date
+                        .and_hms_opt(0, 0, 0)
+                        .ok_or_else(|| anyhow!("Invalid date"))?;
+                    let local = tz
+                        .from_local_datetime(&naive)
+                        .single()
+                        .ok_or_else(|| anyhow!("Invalid local timestamptz"))?;
+                    values.push(Value::Timestamp(local.timestamp_millis()));
+                    current += step_days;
+                }
+            } else {
+                let mut current = *s;
+                while current >= *e {
+                    let date = crate::types::date::date_days_to_naive_date(current)?;
+                    let naive = date
+                        .and_hms_opt(0, 0, 0)
+                        .ok_or_else(|| anyhow!("Invalid date"))?;
+                    let local = tz
+                        .from_local_datetime(&naive)
+                        .single()
+                        .ok_or_else(|| anyhow!("Invalid local timestamptz"))?;
+                    values.push(Value::Timestamp(local.timestamp_millis()));
+                    current += step_days;
+                }
+            }
+            Ok((values, DataType::TimestampTz))
+        }
+        (Value::Numeric(s), Value::Numeric(e)) => {
+            use rust_decimal::prelude::ToPrimitive;
+            let _s_f64 = s
+                .to_f64()
+                .ok_or_else(|| anyhow!("Cannot convert start to f64"))?;
+            let _e_f64 = e
+                .to_f64()
+                .ok_or_else(|| anyhow!("Cannot convert end to f64"))?;
+            let step_val = match step {
+                Value::Null => rust_decimal::Decimal::ONE,
+                Value::Numeric(st) => *st,
+                Value::Float64(st) => {
+                    rust_decimal::Decimal::try_from(*st).unwrap_or(rust_decimal::Decimal::ONE)
+                }
+                Value::Int32(st) => rust_decimal::Decimal::from(*st),
+                Value::Int64(st) => rust_decimal::Decimal::from(*st),
+                _ => return Err(anyhow!("Invalid step type for numeric generate_series")),
+            };
+            if step_val.is_zero() {
+                return Err(anyhow!("step size cannot equal zero"));
+            }
+            let mut values = Vec::new();
+            if step_val > rust_decimal::Decimal::ZERO {
+                let mut current = *s;
+                while current <= *e {
+                    values.push(Value::Numeric(current));
+                    current += step_val;
+                }
+            } else {
+                let mut current = *s;
+                while current >= *e {
+                    values.push(Value::Numeric(current));
+                    current += step_val;
+                }
+            }
+            Ok((
+                values,
+                DataType::Numeric {
+                    precision: None,
+                    scale: None,
+                },
+            ))
+        }
+        _ => Err(anyhow!(
+            "generate_series requires numeric or timestamp arguments, got {:?} and {:?}",
+            start,
+            stop
+        )),
+    }
+}
+
+fn interval_to_millis(iv: &crate::types::IntervalValue) -> i64 {
+    iv.to_millis_approx()
+}
+
+fn interval_to_days(iv: &crate::types::IntervalValue) -> i32 {
+    let months_days = iv.months * 30;
+    let millis_days = (iv.millis / (1000 * 60 * 60 * 24)) as i32;
+    months_days + millis_days
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generate_series_int32_edge_overflow_does_not_loop() {
+        let (values, ty) = generate_series_values(
+            &Value::Int32(i32::MAX - 1),
+            &Value::Int32(i32::MAX),
+            &Value::Int32(1),
+        )
+        .unwrap();
+        assert_eq!(ty, DataType::Int32);
+        assert_eq!(
+            values,
+            vec![Value::Int32(i32::MAX - 1), Value::Int32(i32::MAX)]
+        );
+
+        let (values, ty) = generate_series_values(
+            &Value::Int32(i32::MIN + 1),
+            &Value::Int32(i32::MIN),
+            &Value::Int32(-1),
+        )
+        .unwrap();
+        assert_eq!(ty, DataType::Int32);
+        assert_eq!(
+            values,
+            vec![Value::Int32(i32::MIN + 1), Value::Int32(i32::MIN)]
+        );
+    }
+
+    #[test]
+    fn generate_series_int32_step_out_of_range_errors() {
+        let err = generate_series_values(
+            &Value::Int32(1),
+            &Value::Int32(2),
+            &Value::Int64(i64::from(i32::MAX) + 1),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("step out of range"));
+    }
+
+    #[test]
+    fn generate_series_int64_edge_overflow_does_not_loop() {
+        let (values, ty) = generate_series_values(
+            &Value::Int64(i64::MAX - 1),
+            &Value::Int64(i64::MAX),
+            &Value::Int64(1),
+        )
+        .unwrap();
+        assert_eq!(ty, DataType::Int64);
+        assert_eq!(
+            values,
+            vec![Value::Int64(i64::MAX - 1), Value::Int64(i64::MAX)]
+        );
+
+        let (values, ty) = generate_series_values(
+            &Value::Int64(i64::MIN + 1),
+            &Value::Int64(i64::MIN),
+            &Value::Int64(-1),
+        )
+        .unwrap();
+        assert_eq!(ty, DataType::Int64);
+        assert_eq!(
+            values,
+            vec![Value::Int64(i64::MIN + 1), Value::Int64(i64::MIN)]
+        );
     }
 }

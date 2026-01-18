@@ -71,6 +71,7 @@ pub enum DataType {
         precision: Option<u32>,
         scale: Option<u32>,
     },
+    TimestampTz,
 }
 
 impl DataType {
@@ -93,6 +94,7 @@ impl DataType {
             DataType::UserDefined(_) => 32,
             DataType::Date => 4,
             DataType::Numeric { .. } => 16,
+            DataType::TimestampTz => 8,
         }
     }
 }
@@ -125,6 +127,7 @@ impl fmt::Display for DataType {
                 scale: None,
             } => write!(f, "NUMERIC({})", p),
             DataType::Numeric { .. } => write!(f, "NUMERIC"),
+            DataType::TimestampTz => write!(f, "TIMESTAMPTZ"),
         }
     }
 }

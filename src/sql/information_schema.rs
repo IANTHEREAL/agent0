@@ -798,6 +798,7 @@ fn data_type_to_pg_type(dt: &DataType) -> &'static str {
         DataType::Text => "character varying",
         DataType::Bytes => "bytea",
         DataType::Timestamp => "timestamp without time zone",
+        DataType::TimestampTz => "timestamp with time zone",
         DataType::Date => "date",
         DataType::Interval => "interval",
         DataType::Uuid => "uuid",
@@ -1865,6 +1866,7 @@ async fn get_pg_attribute_rows(
                         DataType::Text => 25,
                         DataType::Bytes => 17,
                         DataType::Timestamp => 1114,
+                        DataType::TimestampTz => 1184,
                         DataType::Date => 1082,
                         DataType::Uuid => 2950,
                         DataType::Json => 114,
@@ -1878,6 +1880,8 @@ async fn get_pg_attribute_rows(
                         DataType::Int32 => 4,
                         DataType::Int64 => 8,
                         DataType::Float64 => 8,
+                        DataType::Timestamp => 8,
+                        DataType::TimestampTz => 8,
                         DataType::Date => 4,
                         _ => -1, // Variable length
                     };

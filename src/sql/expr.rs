@@ -99,6 +99,34 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             let val = eval_expr_join(expr, ctx)?;
             Ok(Value::Boolean(!matches!(val, Value::Null)))
         }
+        Expr::IsTrue(expr) => match eval_expr_join(expr, ctx)? {
+            Value::Boolean(b) => Ok(Value::Boolean(b)),
+            Value::Null => Ok(Value::Boolean(false)),
+            other => Err(anyhow!("IS TRUE requires boolean, got {:?}", other)),
+        },
+        Expr::IsNotTrue(expr) => match eval_expr_join(expr, ctx)? {
+            Value::Boolean(true) => Ok(Value::Boolean(false)),
+            Value::Boolean(false) | Value::Null => Ok(Value::Boolean(true)),
+            other => Err(anyhow!("IS NOT TRUE requires boolean, got {:?}", other)),
+        },
+        Expr::IsFalse(expr) => match eval_expr_join(expr, ctx)? {
+            Value::Boolean(b) => Ok(Value::Boolean(!b)),
+            Value::Null => Ok(Value::Boolean(false)),
+            other => Err(anyhow!("IS FALSE requires boolean, got {:?}", other)),
+        },
+        Expr::IsNotFalse(expr) => match eval_expr_join(expr, ctx)? {
+            Value::Boolean(false) => Ok(Value::Boolean(false)),
+            Value::Boolean(true) | Value::Null => Ok(Value::Boolean(true)),
+            other => Err(anyhow!("IS NOT FALSE requires boolean, got {:?}", other)),
+        },
+        Expr::IsUnknown(expr) => {
+            let val = eval_expr_join(expr, ctx)?;
+            Ok(Value::Boolean(matches!(val, Value::Null)))
+        }
+        Expr::IsNotUnknown(expr) => {
+            let val = eval_expr_join(expr, ctx)?;
+            Ok(Value::Boolean(!matches!(val, Value::Null)))
+        }
         Expr::InList {
             expr,
             list,
@@ -189,6 +217,23 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             let matched = like_match(s, p, &esc, true);
             Ok(Value::Boolean(if *negated { !matched } else { matched }))
         }
+        Expr::SimilarTo {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            let val = eval_expr_join(expr, ctx)?;
+            let pat = eval_expr_join(pattern, ctx)?;
+            let (Value::Text(s), Value::Text(p)) = (&val, &pat) else {
+                if matches!(val, Value::Null) || matches!(pat, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                return Ok(Value::Boolean(false));
+            };
+            let matched = similar_to_match(s, p, *escape_char)?;
+            Ok(Value::Boolean(if *negated { !matched } else { matched }))
+        }
         Expr::Case {
             operand,
             conditions,
@@ -232,19 +277,42 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             let Value::Text(s) = val else {
                 return Ok(Value::Null);
             };
-            let start = if let Some(from_expr) = substring_from {
-                match eval_expr_join(from_expr, ctx)? {
-                    Value::Int32(n) => (n - 1).max(0) as usize,
-                    Value::Int64(n) => (n - 1).max(0) as usize,
-                    _ => 0,
-                }
+            let from_val = if let Some(from_expr) = substring_from {
+                Some(eval_expr_join(from_expr, ctx)?)
             } else {
-                0
+                None
+            };
+
+            if let (Some(Value::Text(pattern)), None) = (&from_val, substring_for) {
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| anyhow!("Invalid regex pattern in SUBSTRING: {}", e))?;
+                if let Some(caps) = re.captures(&s) {
+                    if caps.len() > 1 {
+                        return Ok(caps
+                            .get(1)
+                            .map(|m| Value::Text(m.as_str().to_string()))
+                            .unwrap_or(Value::Null));
+                    }
+                    return Ok(caps
+                        .get(0)
+                        .map(|m| Value::Text(m.as_str().to_string()))
+                        .unwrap_or(Value::Null));
+                }
+                return Ok(Value::Null);
+            }
+
+            let start = match from_val {
+                Some(Value::Int32(n)) => (n - 1).max(0) as usize,
+                Some(Value::Int64(n)) => (n - 1).max(0) as usize,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(_) => 0,
+                None => 0,
             };
             let len = if let Some(for_expr) = substring_for {
                 match eval_expr_join(for_expr, ctx)? {
                     Value::Int32(n) => Some(n.max(0) as usize),
                     Value::Int64(n) => Some(n.max(0) as usize),
+                    Value::Null => return Ok(Value::Null),
                     _ => None,
                 }
             } else {
@@ -358,9 +426,58 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             }
             Ok(Value::Array(values))
         }
+        Expr::Tuple(exprs) => {
+            let mut values = Vec::with_capacity(exprs.len());
+            for e in exprs {
+                values.push(eval_expr_join(e, ctx)?);
+            }
+            Ok(Value::Array(values))
+        }
         Expr::ArrayIndex { obj, indexes } => {
             let arr_val = eval_expr_join(obj, ctx)?;
             eval_array_index_join(arr_val, indexes, ctx)
+        }
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            let base = eval_expr_join(expr, ctx)?;
+            let what = eval_expr_join(overlay_what, ctx)?;
+            let from = eval_expr_join(overlay_from, ctx)?;
+            let for_len = match overlay_for {
+                Some(e) => Some(eval_expr_join(e, ctx)?),
+                None => None,
+            };
+
+            let Value::Text(base) = base else {
+                return Ok(Value::Null);
+            };
+            let Value::Text(what) = what else {
+                return Ok(Value::Null);
+            };
+            let start = match from {
+                Value::Int32(n) => n,
+                Value::Int64(n) => n as i32,
+                _ => return Ok(Value::Null),
+            };
+            if start <= 0 {
+                return Ok(Value::Text(base));
+            }
+            let replace_len = match for_len {
+                Some(Value::Int32(n)) => n.max(0) as usize,
+                Some(Value::Int64(n)) => (n.max(0) as i32) as usize,
+                Some(_) => return Ok(Value::Null),
+                None => what.chars().count(),
+            };
+
+            let base_chars: Vec<char> = base.chars().collect();
+            let start_idx = (start - 1) as usize;
+            let prefix: String = base_chars.iter().take(start_idx).collect();
+            let suffix_start = start_idx.saturating_add(replace_len);
+            let suffix: String = base_chars.iter().skip(suffix_start).collect();
+            Ok(Value::Text(format!("{prefix}{what}{suffix}")))
         }
         Expr::AnyOp {
             left,
@@ -797,6 +914,34 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             let val = eval_expr(expr, row, schema)?;
             Ok(Value::Boolean(!matches!(val, Value::Null)))
         }
+        Expr::IsTrue(expr) => match eval_expr(expr, row, schema)? {
+            Value::Boolean(b) => Ok(Value::Boolean(b)),
+            Value::Null => Ok(Value::Boolean(false)),
+            other => Err(anyhow!("IS TRUE requires boolean, got {:?}", other)),
+        },
+        Expr::IsNotTrue(expr) => match eval_expr(expr, row, schema)? {
+            Value::Boolean(true) => Ok(Value::Boolean(false)),
+            Value::Boolean(false) | Value::Null => Ok(Value::Boolean(true)),
+            other => Err(anyhow!("IS NOT TRUE requires boolean, got {:?}", other)),
+        },
+        Expr::IsFalse(expr) => match eval_expr(expr, row, schema)? {
+            Value::Boolean(b) => Ok(Value::Boolean(!b)),
+            Value::Null => Ok(Value::Boolean(false)),
+            other => Err(anyhow!("IS FALSE requires boolean, got {:?}", other)),
+        },
+        Expr::IsNotFalse(expr) => match eval_expr(expr, row, schema)? {
+            Value::Boolean(false) => Ok(Value::Boolean(false)),
+            Value::Boolean(true) | Value::Null => Ok(Value::Boolean(true)),
+            other => Err(anyhow!("IS NOT FALSE requires boolean, got {:?}", other)),
+        },
+        Expr::IsUnknown(expr) => {
+            let val = eval_expr(expr, row, schema)?;
+            Ok(Value::Boolean(matches!(val, Value::Null)))
+        }
+        Expr::IsNotUnknown(expr) => {
+            let val = eval_expr(expr, row, schema)?;
+            Ok(Value::Boolean(!matches!(val, Value::Null)))
+        }
         Expr::InList {
             expr,
             list,
@@ -884,6 +1029,23 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             let matched = like_match(s, p, &esc, true);
             Ok(Value::Boolean(if *negated { !matched } else { matched }))
         }
+        Expr::SimilarTo {
+            negated,
+            expr,
+            pattern,
+            escape_char,
+        } => {
+            let val = eval_expr(expr, row, schema)?;
+            let pat = eval_expr(pattern, row, schema)?;
+            let (Value::Text(s), Value::Text(p)) = (&val, &pat) else {
+                if matches!(val, Value::Null) || matches!(pat, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                return Ok(Value::Boolean(false));
+            };
+            let matched = similar_to_match(s, p, *escape_char)?;
+            Ok(Value::Boolean(if *negated { !matched } else { matched }))
+        }
         Expr::Case {
             operand,
             conditions,
@@ -927,19 +1089,42 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             let Value::Text(s) = val else {
                 return Ok(Value::Null);
             };
-            let start = if let Some(from_expr) = substring_from {
-                match eval_expr(from_expr, row, schema)? {
-                    Value::Int32(n) => (n - 1).max(0) as usize,
-                    Value::Int64(n) => (n - 1).max(0) as usize,
-                    _ => 0,
-                }
+            let from_val = if let Some(from_expr) = substring_from {
+                Some(eval_expr(from_expr, row, schema)?)
             } else {
-                0
+                None
+            };
+
+            if let (Some(Value::Text(pattern)), None) = (&from_val, substring_for) {
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| anyhow!("Invalid regex pattern in SUBSTRING: {}", e))?;
+                if let Some(caps) = re.captures(&s) {
+                    if caps.len() > 1 {
+                        return Ok(caps
+                            .get(1)
+                            .map(|m| Value::Text(m.as_str().to_string()))
+                            .unwrap_or(Value::Null));
+                    }
+                    return Ok(caps
+                        .get(0)
+                        .map(|m| Value::Text(m.as_str().to_string()))
+                        .unwrap_or(Value::Null));
+                }
+                return Ok(Value::Null);
+            }
+
+            let start = match from_val {
+                Some(Value::Int32(n)) => (n - 1).max(0) as usize,
+                Some(Value::Int64(n)) => (n - 1).max(0) as usize,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(_) => 0,
+                None => 0,
             };
             let len = if let Some(for_expr) = substring_for {
                 match eval_expr(for_expr, row, schema)? {
                     Value::Int32(n) => Some(n.max(0) as usize),
                     Value::Int64(n) => Some(n.max(0) as usize),
+                    Value::Null => return Ok(Value::Null),
                     _ => None,
                 }
             } else {
@@ -1102,9 +1287,58 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             }
             Ok(Value::Array(values))
         }
+        Expr::Tuple(exprs) => {
+            let mut values = Vec::with_capacity(exprs.len());
+            for e in exprs {
+                values.push(eval_expr(e, row, schema)?);
+            }
+            Ok(Value::Array(values))
+        }
         Expr::ArrayIndex { obj, indexes } => {
             let arr_val = eval_expr(obj, row, schema)?;
             eval_array_index(arr_val, indexes, row, schema)
+        }
+        Expr::Overlay {
+            expr,
+            overlay_what,
+            overlay_from,
+            overlay_for,
+        } => {
+            let base = eval_expr(expr, row, schema)?;
+            let what = eval_expr(overlay_what, row, schema)?;
+            let from = eval_expr(overlay_from, row, schema)?;
+            let for_len = match overlay_for {
+                Some(e) => Some(eval_expr(e, row, schema)?),
+                None => None,
+            };
+
+            let Value::Text(base) = base else {
+                return Ok(Value::Null);
+            };
+            let Value::Text(what) = what else {
+                return Ok(Value::Null);
+            };
+            let start = match from {
+                Value::Int32(n) => n,
+                Value::Int64(n) => n as i32,
+                _ => return Ok(Value::Null),
+            };
+            if start <= 0 {
+                return Ok(Value::Text(base));
+            }
+            let replace_len = match for_len {
+                Some(Value::Int32(n)) => n.max(0) as usize,
+                Some(Value::Int64(n)) => (n.max(0) as i32) as usize,
+                Some(_) => return Ok(Value::Null),
+                None => what.chars().count(),
+            };
+
+            let base_chars: Vec<char> = base.chars().collect();
+            let start_idx = (start - 1) as usize;
+            let prefix: String = base_chars.iter().take(start_idx).collect();
+            let suffix_start = start_idx.saturating_add(replace_len);
+            let suffix: String = base_chars.iter().skip(suffix_start).collect();
+            Ok(Value::Text(format!("{prefix}{what}{suffix}")))
         }
         Expr::AnyOp {
             left,
@@ -1263,6 +1497,11 @@ fn eval_function(
             Some(Value::Bytes(b)) => Ok(Value::Int32(b.len() as i32)),
             _ => Ok(Value::Null),
         },
+        "BIT_LENGTH" => match args.into_iter().next() {
+            Some(Value::Text(s)) => Ok(Value::Int32((s.as_bytes().len() * 8) as i32)),
+            Some(Value::Bytes(b)) => Ok(Value::Int32((b.len() * 8) as i32)),
+            _ => Ok(Value::Null),
+        },
         "CONCAT" => {
             let mut result = String::new();
             for val in args {
@@ -1317,6 +1556,40 @@ fn eval_function(
             let chars: Vec<char> = s.chars().collect();
             let start = chars.len().saturating_sub(n);
             Ok(Value::Text(chars[start..].iter().collect()))
+        }
+        "SUBSTR" => {
+            let mut iter = args.into_iter();
+            let s = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.to_string(),
+                None => return Ok(Value::Null),
+            };
+            let start = match iter.next() {
+                Some(Value::Int32(n)) => n,
+                Some(Value::Int64(n)) => n as i32,
+                Some(Value::Null) | None => return Ok(Value::Null),
+                _ => return Ok(Value::Null),
+            };
+            let len = match iter.next() {
+                Some(Value::Int32(n)) => Some(n),
+                Some(Value::Int64(n)) => Some(n as i32),
+                Some(Value::Null) => return Ok(Value::Null),
+                None => None,
+                _ => return Ok(Value::Null),
+            };
+
+            let chars: Vec<char> = s.chars().collect();
+            let start_idx = (start.saturating_sub(1).max(0)) as usize;
+            let result: String = match len {
+                Some(n) => chars
+                    .iter()
+                    .skip(start_idx)
+                    .take(n.max(0) as usize)
+                    .collect(),
+                None => chars.iter().skip(start_idx).collect(),
+            };
+            Ok(Value::Text(result))
         }
         "LPAD" => {
             let mut iter = args.into_iter();
@@ -1396,11 +1669,37 @@ fn eval_function(
             Some(Value::Text(s)) => Ok(Value::Text(s.chars().rev().collect())),
             _ => Ok(Value::Null),
         },
-        "TRIM" | "BTRIM" => match args.into_iter().next() {
+        "TRIM" => match args.into_iter().next() {
             Some(Value::Text(s)) => Ok(Value::Text(s.trim().to_string())),
             Some(Value::Null) => Ok(Value::Null),
             _ => Err(anyhow!("trim requires text argument")),
         },
+        "BTRIM" => {
+            let mut iter = args.into_iter();
+            let s = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Err(anyhow!("btrim requires text argument")),
+            };
+            let trim_chars = match iter.next() {
+                None => None,
+                Some(Value::Text(chars)) => Some(chars),
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => Some(v.to_string()),
+            };
+            let result = match trim_chars {
+                None => s.trim().to_string(),
+                Some(chars) => {
+                    let trim_set: Vec<char> = chars.chars().collect();
+                    if trim_set.is_empty() {
+                        s
+                    } else {
+                        s.trim_matches(|c| trim_set.contains(&c)).to_string()
+                    }
+                }
+            };
+            Ok(Value::Text(result))
+        }
         "LTRIM" => match args.into_iter().next() {
             Some(Value::Text(s)) => Ok(Value::Text(s.trim_start().to_string())),
             Some(Value::Null) => Ok(Value::Null),
@@ -1505,6 +1804,60 @@ fn eval_function(
             Some(Value::Null) => Ok(Value::Null),
             _ => Err(anyhow!("chr() requires integer argument")),
         },
+        "MD5" => match args.into_iter().next() {
+            Some(Value::Text(s)) => Ok(Value::Text(format!("{:x}", md5::compute(s.as_bytes())))),
+            Some(Value::Null) => Ok(Value::Null),
+            Some(v) => Ok(Value::Text(format!("{:x}", md5::compute(v.to_string().as_bytes())))),
+            None => Ok(Value::Null),
+        },
+        "ENCODE" => {
+            use base64::Engine;
+            let mut iter = args.into_iter();
+            let data = match iter.next() {
+                Some(Value::Bytes(b)) => b,
+                Some(Value::Text(s)) => s.into_bytes(),
+                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(v) => v.to_string().into_bytes(),
+            };
+            let fmt = match iter.next() {
+                Some(Value::Text(s)) => s.to_lowercase(),
+                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(v) => v.to_string().to_lowercase(),
+            };
+            match fmt.as_str() {
+                "base64" => Ok(Value::Text(base64::engine::general_purpose::STANDARD.encode(data))),
+                "hex" => Ok(Value::Text(hex::encode(data))),
+                other => Err(anyhow!("unsupported encoding format: {}", other)),
+            }
+        }
+        "DECODE" => {
+            use base64::Engine;
+            let mut iter = args.into_iter();
+            let data = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(v) => v.to_string(),
+            };
+            let fmt = match iter.next() {
+                Some(Value::Text(s)) => s.to_lowercase(),
+                Some(Value::Null) | None => return Ok(Value::Null),
+                Some(v) => v.to_string().to_lowercase(),
+            };
+            match fmt.as_str() {
+                "base64" => {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data.as_bytes())
+                        .map_err(|e| anyhow!("invalid base64 data: {}", e))?;
+                    Ok(Value::Bytes(bytes))
+                }
+                "hex" => {
+                    let bytes =
+                        hex::decode(data.trim()).map_err(|e| anyhow!("invalid hex data: {}", e))?;
+                    Ok(Value::Bytes(bytes))
+                }
+                other => Err(anyhow!("unsupported decoding format: {}", other)),
+            }
+        }
         "FORMAT" => {
             let mut iter = args.into_iter();
             let fmt = match iter.next() {
@@ -1512,23 +1865,131 @@ fn eval_function(
                 Some(Value::Null) => return Ok(Value::Null),
                 _ => return Err(anyhow!("format() requires text format string")),
             };
-            let mut result = fmt;
-            for val in iter {
-                let replacement = match val {
-                    Value::Null => "".to_string(),
-                    Value::Text(s) => s,
-                    v => v.to_string(),
-                };
-                if let Some(pos) = result.find("%s") {
-                    result = format!("{}{}{}", &result[..pos], replacement, &result[pos + 2..]);
-                } else if let Some(pos) = result.find("%I") {
-                    result = format!("\"{}\"", replacement);
-                    let _ = pos;
-                } else if let Some(pos) = result.find("%L") {
-                    result = format!("'{}'", replacement.replace('\'', "''"));
-                    let _ = pos;
+
+            let format_args: Vec<Value> = iter.collect();
+            let mut next_arg_idx = 0usize;
+
+            let mut result = String::new();
+            let mut chars = fmt.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '%' {
+                    result.push(c);
+                    continue;
                 }
+
+                if matches!(chars.peek(), Some('%')) {
+                    chars.next();
+                    result.push('%');
+                    continue;
+                }
+
+                // Parse argument position if written as n$; otherwise treat leading digits as width.
+                let mut digits = String::new();
+                while let Some(&d) = chars.peek() {
+                    if d.is_ascii_digit() {
+                        digits.push(d);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+
+                let mut arg_pos: Option<usize> = None;
+                let mut width: Option<usize> = None;
+                if !digits.is_empty() {
+                    if matches!(chars.peek(), Some('$')) {
+                        chars.next();
+                        let pos = digits.parse::<usize>().unwrap_or(1);
+                        arg_pos = Some(pos.saturating_sub(1));
+                    } else {
+                        width = Some(digits.parse::<usize>().unwrap_or(0));
+                    }
+                }
+
+                let mut left_align = false;
+                while matches!(chars.peek(), Some('-')) {
+                    left_align = true;
+                    chars.next();
+                }
+
+                if width.is_none() {
+                    let mut width_digits = String::new();
+                    while let Some(&d) = chars.peek() {
+                        if d.is_ascii_digit() {
+                            width_digits.push(d);
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                    if !width_digits.is_empty() {
+                        width = Some(width_digits.parse::<usize>().unwrap_or(0));
+                    }
+                }
+
+                let Some(format_char) = chars.next() else {
+                    return Err(anyhow!("unterminated format() pattern"));
+                };
+
+                let arg_idx = match arg_pos {
+                    Some(pos) => pos,
+                    None => {
+                        let pos = next_arg_idx;
+                        next_arg_idx += 1;
+                        pos
+                    }
+                };
+                let arg_val = format_args
+                    .get(arg_idx)
+                    .ok_or_else(|| anyhow!("too few arguments for format()"))?;
+
+                let mut rendered = match format_char {
+                    's' => match arg_val {
+                        Value::Null => String::new(),
+                        Value::Text(s) => s.clone(),
+                        v => v.to_string(),
+                    },
+                    'I' => {
+                        if matches!(arg_val, Value::Null) {
+                            return Err(anyhow!(
+                                "null values cannot be formatted as an SQL identifier"
+                            ));
+                        }
+                        let s = match arg_val {
+                            Value::Text(s) => s.clone(),
+                            v => v.to_string(),
+                        };
+                        quote_ident_impl(&s)
+                    }
+                    'L' => {
+                        if matches!(arg_val, Value::Null) {
+                            "NULL".to_string()
+                        } else {
+                            let s = match arg_val {
+                                Value::Text(s) => s.clone(),
+                                v => v.to_string(),
+                            };
+                            quote_literal_impl(&s)
+                        }
+                    }
+                    other => return Err(anyhow!(format_unrecognized_specifier_error(other))),
+                };
+
+                if let Some(w) = width {
+                    let len = rendered.chars().count();
+                    if len < w {
+                        let padding = " ".repeat(w - len);
+                        if left_align {
+                            rendered.push_str(&padding);
+                        } else {
+                            rendered = format!("{}{}", padding, rendered);
+                        }
+                    }
+                }
+
+                result.push_str(&rendered);
             }
+
             Ok(Value::Text(result))
         }
         "TRANSLATE" => {
@@ -2364,6 +2825,103 @@ fn eval_function(
             let arr: Vec<serde_json::Value> = args.into_iter().map(|v| value_to_json(&v)).collect();
             Ok(Value::Jsonb(serde_json::Value::Array(arr).to_string()))
         }
+        "JSONB_EXISTS" => {
+            if args.len() != 2 {
+                return Err(anyhow!("jsonb_exists requires exactly 2 arguments"));
+            }
+            let json_str = match &args[0] {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let key = match &args[1] {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+
+            let exists = match json_val {
+                serde_json::Value::Object(obj) => obj.contains_key(&key),
+                serde_json::Value::Array(arr) => arr
+                    .into_iter()
+                    .any(|v| matches!(v, serde_json::Value::String(s) if s == key)),
+                _ => false,
+            };
+            Ok(Value::Boolean(exists))
+        }
+        "JSONB_EXISTS_ANY" => {
+            if args.len() != 2 {
+                return Err(anyhow!("jsonb_exists_any requires exactly 2 arguments"));
+            }
+            let json_str = match &args[0] {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let keys: Vec<String> = match &args[1] {
+                Value::Array(vals) => vals
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Null => None,
+                        Value::Text(s) => Some(s.clone()),
+                        other => Some(other.to_string()),
+                    })
+                    .collect(),
+                Value::Null => return Ok(Value::Null),
+                v => vec![v.to_string()],
+            };
+
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+
+            let exists_any = match json_val {
+                serde_json::Value::Object(obj) => keys.iter().any(|k| obj.contains_key(k)),
+                serde_json::Value::Array(arr) => keys.iter().any(|k| {
+                    arr.iter()
+                        .any(|v| matches!(v, serde_json::Value::String(s) if s == k))
+                }),
+                _ => false,
+            };
+            Ok(Value::Boolean(exists_any))
+        }
+        "JSONB_EXISTS_ALL" => {
+            if args.len() != 2 {
+                return Err(anyhow!("jsonb_exists_all requires exactly 2 arguments"));
+            }
+            let json_str = match &args[0] {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let keys: Vec<String> = match &args[1] {
+                Value::Array(vals) => vals
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Null => None,
+                        Value::Text(s) => Some(s.clone()),
+                        other => Some(other.to_string()),
+                    })
+                    .collect(),
+                Value::Null => return Ok(Value::Null),
+                v => vec![v.to_string()],
+            };
+
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+
+            let exists_all = match json_val {
+                serde_json::Value::Object(obj) => keys.iter().all(|k| obj.contains_key(k)),
+                serde_json::Value::Array(arr) => keys.iter().all(|k| {
+                    arr.iter()
+                        .any(|v| matches!(v, serde_json::Value::String(s) if s == k))
+                }),
+                _ => false,
+            };
+            Ok(Value::Boolean(exists_all))
+        }
         "JSONB_OBJECT_KEYS" | "JSON_OBJECT_KEYS" => {
             let json_str = match args.into_iter().next() {
                 Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
@@ -2442,7 +3000,72 @@ fn eval_function(
                 .map_err(|e| anyhow!("Failed to format JSON: {}", e))?;
             Ok(Value::Text(pretty))
         }
-        "TO_JSON" | "TO_JSONB" => {
+        "TO_JSON" => {
+            let val = args.into_iter().next().unwrap_or(Value::Null);
+            let json_val = value_to_json(&val);
+            Ok(Value::Json(json_val.to_string()))
+        }
+        "TO_JSONB" => {
+            fn eval_row_object(
+                expr: &Expr,
+                row: Option<&Row>,
+                schema: Option<&TableSchema>,
+            ) -> Result<Option<serde_json::Value>> {
+                fn row_values(
+                    expr: &Expr,
+                    row: Option<&Row>,
+                    schema: Option<&TableSchema>,
+                ) -> Result<Option<Vec<Value>>> {
+                    match expr {
+                        Expr::Nested(inner) => row_values(inner, row, schema),
+                        Expr::Tuple(exprs) => {
+                            let mut vals = Vec::with_capacity(exprs.len());
+                            for e in exprs {
+                                vals.push(eval_expr(e, row, schema)?);
+                            }
+                            Ok(Some(vals))
+                        }
+                        Expr::Function(func) => {
+                            let name = func.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
+                            if !name.eq_ignore_ascii_case("ROW") {
+                                return Ok(None);
+                            }
+                            let mut vals = Vec::with_capacity(func.args.len());
+                            for arg in &func.args {
+                                match arg {
+                                    sqlparser::ast::FunctionArg::Unnamed(
+                                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                                    ) => vals.push(eval_expr(e, row, schema)?),
+                                    _ => return Ok(None),
+                                }
+                            }
+                            Ok(Some(vals))
+                        }
+                        _ => Ok(None),
+                    }
+                }
+
+                let Some(values) = row_values(expr, row, schema)? else {
+                    return Ok(None);
+                };
+                let mut obj = serde_json::Map::new();
+                for (idx, v) in values.into_iter().enumerate() {
+                    obj.insert(format!("f{}", idx + 1), value_to_json(&v));
+                }
+                Ok(Some(serde_json::Value::Object(obj)))
+            }
+
+            if func.args.len() == 1 {
+                if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    expr,
+                )) = &func.args[0]
+                {
+                    if let Some(obj) = eval_row_object(expr, row, schema)? {
+                        return Ok(Value::Jsonb(obj.to_string()));
+                    }
+                }
+            }
+
             let val = args.into_iter().next().unwrap_or(Value::Null);
             let json_val = value_to_json(&val);
             Ok(Value::Jsonb(json_val.to_string()))
@@ -2488,6 +3111,463 @@ fn eval_function(
             let vec = extract_vector(&args[0])?;
             Ok(Value::Float64(vector_norm(&vec)))
         }
+
+        "REGEXP_REPLACE" => {
+            let mut iter = args.into_iter();
+            let source = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.to_string(),
+                None => return Ok(Value::Null),
+            };
+            let pattern = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.to_string(),
+                None => return Ok(Value::Text(source)),
+            };
+            let replacement = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => String::new(),
+                Some(v) => v.to_string(),
+                None => String::new(),
+            };
+            let flags = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => String::new(),
+            };
+            let global = flags.contains('g');
+            let case_insensitive = flags.contains('i');
+            let regex_pattern = if case_insensitive {
+                format!("(?i){}", pattern)
+            } else {
+                pattern
+            };
+            match regex::Regex::new(&regex_pattern) {
+                Ok(re) => {
+                    let result = if global {
+                        re.replace_all(&source, replacement.as_str()).to_string()
+                    } else {
+                        re.replace(&source, replacement.as_str()).to_string()
+                    };
+                    Ok(Value::Text(result))
+                }
+                Err(e) => Err(anyhow!("Invalid regex pattern: {}", e)),
+            }
+        }
+
+        "REGEXP_MATCHES" => {
+            let mut iter = args.into_iter();
+            let source = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.to_string(),
+                None => return Ok(Value::Null),
+            };
+            let pattern = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.to_string(),
+                None => return Ok(Value::Array(vec![])),
+            };
+            let flags = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => String::new(),
+            };
+            let case_insensitive = flags.contains('i');
+            let regex_pattern = if case_insensitive {
+                format!("(?i){}", pattern)
+            } else {
+                pattern
+            };
+            match regex::Regex::new(&regex_pattern) {
+                Ok(re) => {
+                    if let Some(caps) = re.captures(&source) {
+                        let matches: Vec<Value> = caps
+                            .iter()
+                            .skip(if caps.len() > 1 { 1 } else { 0 })
+                            .map(|m| match m {
+                                Some(m) => Value::Text(m.as_str().to_string()),
+                                None => Value::Null,
+                            })
+                            .collect();
+                        if matches.is_empty() {
+                            if let Some(m) = caps.get(0) {
+                                Ok(Value::Array(vec![Value::Text(m.as_str().to_string())]))
+                            } else {
+                                Ok(Value::Null)
+                            }
+                        } else {
+                            Ok(Value::Array(matches))
+                        }
+                    } else {
+                        Ok(Value::Null)
+                    }
+                }
+                Err(e) => Err(anyhow!("Invalid regex pattern: {}", e)),
+            }
+        }
+
+        "REGEXP_SPLIT_TO_ARRAY" => {
+            let mut iter = args.into_iter();
+            let source = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.to_string(),
+                None => return Ok(Value::Null),
+            };
+            let pattern = match iter.next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Array(vec![Value::Text(source)])),
+                Some(v) => v.to_string(),
+                None => return Ok(Value::Array(vec![Value::Text(source)])),
+            };
+            let flags = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => String::new(),
+            };
+            let case_insensitive = flags.contains('i');
+            let regex_pattern = if case_insensitive {
+                format!("(?i){}", pattern)
+            } else {
+                pattern
+            };
+            match regex::Regex::new(&regex_pattern) {
+                Ok(re) => {
+                    let parts: Vec<Value> = re
+                        .split(&source)
+                        .map(|s| Value::Text(s.to_string()))
+                        .collect();
+                    Ok(Value::Array(parts))
+                }
+                Err(e) => Err(anyhow!("Invalid regex pattern: {}", e)),
+            }
+        }
+
+        "PG_TYPEOF" => {
+            let val = args.into_iter().next().unwrap_or(Value::Null);
+            Ok(Value::Text(pg_typeof_name_impl(&val)))
+        }
+
+        "QUOTE_IDENT" => {
+            let val = match args.into_iter().next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.to_string(),
+                None => return Ok(Value::Null),
+            };
+            Ok(Value::Text(quote_ident_impl(&val)))
+        }
+
+        "QUOTE_LITERAL" => {
+            let val = match args.into_iter().next() {
+                Some(Value::Text(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(v) => v.to_string(),
+                None => return Ok(Value::Null),
+            };
+            Ok(Value::Text(format!("'{}'", val.replace('\'', "''"))))
+        }
+
+        "QUOTE_NULLABLE" => {
+            let val = match args.into_iter().next() {
+                Some(Value::Null) => return Ok(Value::Text("NULL".to_string())),
+                Some(Value::Text(s)) => s,
+                Some(v) => v.to_string(),
+                None => return Ok(Value::Text("NULL".to_string())),
+            };
+            Ok(Value::Text(format!("'{}'", val.replace('\'', "''"))))
+        }
+
+        "CLOCK_TIMESTAMP" | "STATEMENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" => {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            Ok(Value::Timestamp(ts))
+        }
+
+        "TXID_CURRENT" => Ok(Value::Int64(
+            std::process::id() as i64 * 1000000
+                + std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros() as i64
+                    % 1000000,
+        )),
+
+        "PG_COLUMN_SIZE" => {
+            let val = args.into_iter().next().unwrap_or(Value::Null);
+            let size = match &val {
+                Value::Null => 0,
+                Value::Boolean(_) => 1,
+                Value::Int32(_) => 4,
+                Value::Int64(_) => 8,
+                Value::Float64(_) => 8,
+                Value::Numeric(_) => 16,
+                Value::Text(s) => s.len() as i32 + 4,
+                Value::Bytes(b) => b.len() as i32 + 4,
+                Value::Timestamp(_) => 8,
+                Value::Date(_) => 4,
+                Value::Time(_) => 8,
+                Value::Interval(_) => 16,
+                Value::Uuid(_) => 16,
+                Value::Json(s) | Value::Jsonb(s) => s.len() as i32 + 4,
+                Value::Array(a) => a.len() as i32 * 8 + 4,
+                Value::Vector(v) => v.len() as i32 * 4 + 4,
+            };
+            Ok(Value::Int32(size))
+        }
+
+        "PG_TABLE_IS_VISIBLE" => Ok(Value::Boolean(true)),
+
+        "JSONB_SET" | "JSON_SET" => {
+            let mut iter = args.into_iter();
+            let json_str = match iter.next() {
+                Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Err(anyhow!("jsonb_set requires json/jsonb as first argument")),
+            };
+            let path = match iter.next() {
+                Some(Value::Array(arr)) => arr,
+                Some(Value::Text(s)) => {
+                    let trimmed = s.trim().trim_start_matches('{').trim_end_matches('}');
+                    trimmed
+                        .split(',')
+                        .map(|p| Value::Text(p.trim().to_string()))
+                        .collect()
+                }
+                _ => return Err(anyhow!("jsonb_set requires array path as second argument")),
+            };
+            let new_value = match iter.next() {
+                Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => {
+                    serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
+                }
+                Some(Value::Int32(n)) => serde_json::Value::Number(n.into()),
+                Some(Value::Int64(n)) => serde_json::Value::Number(n.into()),
+                Some(Value::Boolean(b)) => serde_json::Value::Bool(b),
+                Some(Value::Null) => serde_json::Value::Null,
+                Some(v) => serde_json::Value::String(v.to_string()),
+                None => return Err(anyhow!("jsonb_set requires new value as third argument")),
+            };
+            let create_missing = match iter.next() {
+                Some(Value::Boolean(b)) => b,
+                _ => true,
+            };
+
+            let mut json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+
+            fn set_at_path(
+                val: &mut serde_json::Value,
+                path: &[Value],
+                new_val: serde_json::Value,
+                create_missing: bool,
+            ) -> bool {
+                if path.is_empty() {
+                    *val = new_val;
+                    return true;
+                }
+                let key = match &path[0] {
+                    Value::Text(s) => s.clone(),
+                    v => v.to_string(),
+                };
+                match val {
+                    serde_json::Value::Object(obj) => {
+                        if path.len() == 1 {
+                            if create_missing || obj.contains_key(&key) {
+                                obj.insert(key, new_val);
+                                return true;
+                            }
+                        } else if let Some(child) = obj.get_mut(&key) {
+                            return set_at_path(child, &path[1..], new_val, create_missing);
+                        } else if create_missing {
+                            let mut child = serde_json::Value::Object(serde_json::Map::new());
+                            if set_at_path(&mut child, &path[1..], new_val, create_missing) {
+                                obj.insert(key, child);
+                                return true;
+                            }
+                        }
+                    }
+                    serde_json::Value::Array(arr) => {
+                        if let Ok(idx) = key.parse::<usize>() {
+                            if path.len() == 1 {
+                                if idx < arr.len() {
+                                    arr[idx] = new_val;
+                                    return true;
+                                } else if create_missing {
+                                    while arr.len() <= idx {
+                                        arr.push(serde_json::Value::Null);
+                                    }
+                                    arr[idx] = new_val;
+                                    return true;
+                                }
+                            } else if idx < arr.len() {
+                                return set_at_path(
+                                    &mut arr[idx],
+                                    &path[1..],
+                                    new_val,
+                                    create_missing,
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                false
+            }
+
+            set_at_path(&mut json_val, &path, new_value, create_missing);
+            Ok(Value::Jsonb(json_val.to_string()))
+        }
+
+        "JSONB_ARRAY_ELEMENTS" | "JSON_ARRAY_ELEMENTS" => {
+            let json_str = match args.into_iter().next() {
+                Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Err(anyhow!("jsonb_array_elements requires json/jsonb argument")),
+            };
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+            match json_val {
+                serde_json::Value::Array(arr) => {
+                    let elements: Vec<Value> = arr
+                        .into_iter()
+                        .map(|v| Value::Jsonb(v.to_string()))
+                        .collect();
+                    Ok(Value::Array(elements))
+                }
+                _ => Err(anyhow!("cannot extract elements from a non-array")),
+            }
+        }
+
+        "JSONB_ARRAY_ELEMENTS_TEXT" | "JSON_ARRAY_ELEMENTS_TEXT" => {
+            let json_str = match args.into_iter().next() {
+                Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => {
+                    return Err(anyhow!(
+                        "jsonb_array_elements_text requires json/jsonb argument"
+                    ))
+                }
+            };
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+            match json_val {
+                serde_json::Value::Array(arr) => {
+                    let elements: Vec<Value> = arr
+                        .into_iter()
+                        .map(|v| match v {
+                            serde_json::Value::String(s) => Value::Text(s),
+                            serde_json::Value::Null => Value::Null,
+                            other => Value::Text(other.to_string()),
+                        })
+                        .collect();
+                    Ok(Value::Array(elements))
+                }
+                _ => Err(anyhow!("cannot extract elements from a non-array")),
+            }
+        }
+
+        "JSONB_EACH" | "JSON_EACH" | "JSONB_EACH_TEXT" | "JSON_EACH_TEXT" => {
+            let json_str = match args.into_iter().next() {
+                Some(Value::Text(s)) | Some(Value::Json(s)) | Some(Value::Jsonb(s)) => s,
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => return Err(anyhow!("jsonb_each requires json/jsonb argument")),
+            };
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+            match json_val {
+                serde_json::Value::Object(obj) => {
+                    let is_text = func_name.to_uppercase().ends_with("_TEXT");
+                    let pairs: Vec<Value> = obj
+                        .into_iter()
+                        .map(|(k, v)| {
+                            let val_str = if is_text {
+                                match v {
+                                    serde_json::Value::String(s) => s,
+                                    serde_json::Value::Null => "".to_string(),
+                                    other => other.to_string(),
+                                }
+                            } else {
+                                v.to_string()
+                            };
+                            Value::Text(format!("({},{})", k, val_str))
+                        })
+                        .collect();
+                    Ok(Value::Array(pairs))
+                }
+                _ => Err(anyhow!("cannot call jsonb_each on a non-object")),
+            }
+        }
+
+        "ROW_TO_JSON" => {
+            fn eval_row_object(
+                expr: &Expr,
+                row: Option<&Row>,
+                schema: Option<&TableSchema>,
+            ) -> Result<Option<serde_json::Value>> {
+                fn row_values(
+                    expr: &Expr,
+                    row: Option<&Row>,
+                    schema: Option<&TableSchema>,
+                ) -> Result<Option<Vec<Value>>> {
+                    match expr {
+                        Expr::Nested(inner) => row_values(inner, row, schema),
+                        Expr::Tuple(exprs) => {
+                            let mut vals = Vec::with_capacity(exprs.len());
+                            for e in exprs {
+                                vals.push(eval_expr(e, row, schema)?);
+                            }
+                            Ok(Some(vals))
+                        }
+                        Expr::Function(func) => {
+                            let name = func.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
+                            if !name.eq_ignore_ascii_case("ROW") {
+                                return Ok(None);
+                            }
+                            let mut vals = Vec::with_capacity(func.args.len());
+                            for arg in &func.args {
+                                match arg {
+                                    sqlparser::ast::FunctionArg::Unnamed(
+                                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                                    ) => vals.push(eval_expr(e, row, schema)?),
+                                    _ => return Ok(None),
+                                }
+                            }
+                            Ok(Some(vals))
+                        }
+                        _ => Ok(None),
+                    }
+                }
+
+                let Some(values) = row_values(expr, row, schema)? else {
+                    return Ok(None);
+                };
+                let mut obj = serde_json::Map::new();
+                for (idx, v) in values.into_iter().enumerate() {
+                    obj.insert(format!("f{}", idx + 1), value_to_json(&v));
+                }
+                Ok(Some(serde_json::Value::Object(obj)))
+            }
+
+            if func.args.len() == 1 {
+                if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                    expr,
+                )) = &func.args[0]
+                {
+                    if let Some(obj) = eval_row_object(expr, row, schema)? {
+                        return Ok(Value::Json(obj.to_string()));
+                    }
+                }
+            }
+
+            let val = args.into_iter().next().unwrap_or(Value::Null);
+            let json_val = value_to_json(&val);
+            Ok(Value::Json(json_val.to_string()))
+        }
+
         _ => Err(anyhow!("Unsupported function: {}", func_name)),
     }
 }
@@ -2502,6 +3582,33 @@ fn like_match(s: &str, pattern: &str, _escape: &str, case_insensitive: bool) -> 
     regex::Regex::new(&format!("^{}$", regex_pattern))
         .map(|re| re.is_match(&s))
         .unwrap_or(false)
+}
+
+fn similar_to_match(s: &str, pattern: &str, escape_char: Option<char>) -> Result<bool> {
+    let escape = escape_char.unwrap_or('\\');
+    let mut regex_pattern = String::new();
+    let mut chars = pattern.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == escape {
+            // Treat escaped character as a literal.
+            if let Some(next) = chars.next() {
+                regex_pattern.push_str(&regex::escape(&next.to_string()));
+            } else {
+                regex_pattern.push_str(&regex::escape(&escape.to_string()));
+            }
+            continue;
+        }
+
+        match ch {
+            '%' => regex_pattern.push_str(".*"),
+            '_' => regex_pattern.push('.'),
+            other => regex_pattern.push(other),
+        }
+    }
+
+    let re = regex::Regex::new(&format!("^{}$", regex_pattern))
+        .map_err(|e| anyhow!("Invalid SIMILAR TO pattern: {}", e))?;
+    Ok(re.is_match(s))
 }
 
 fn round_half_away_from_zero(n: f64) -> f64 {
@@ -2684,6 +3791,20 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                             .map_err(|e| anyhow!("invalid input syntax for type json: {}", e))?;
                         Ok(Value::Json(s))
                     }
+                    "BYTEA" => match v {
+                        Value::Null => Ok(Value::Null),
+                        Value::Bytes(_) => Ok(v),
+                        Value::Text(s) => {
+                            if let Some(rest) = s.strip_prefix("\\x") {
+                                let bytes = hex::decode(rest)
+                                    .map_err(|e| anyhow!("invalid input syntax for type bytea: {}", e))?;
+                                Ok(Value::Bytes(bytes))
+                            } else {
+                                Ok(Value::Bytes(s.into_bytes()))
+                            }
+                        }
+                        other => Ok(Value::Bytes(other.to_string().into_bytes())),
+                    },
                     "JSONB" => {
                         let s = match &v {
                             Value::Text(s) => s.clone(),
@@ -2792,6 +3913,10 @@ pub fn eval_binary_op_public(left: Value, op: &BinaryOperator, right: Value) -> 
     eval_binary_op(left, op, right)
 }
 
+pub fn cast_value_public(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value> {
+    cast_value(val, data_type)
+}
+
 fn eval_value(v: &SqlValue) -> Result<Value> {
     match v {
         SqlValue::Null => Ok(Value::Null),
@@ -2813,6 +3938,9 @@ fn eval_value(v: &SqlValue) -> Result<Value> {
                 }
             }
         }
+        SqlValue::HexStringLiteral(s) => Ok(Value::Bytes(
+            hex::decode(s).map_err(|e| anyhow!("Invalid hex string literal: {}", e))?,
+        )),
         SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => {
             // Try parsing as vector if starts with [
             if s.starts_with('[') && s.ends_with(']') {
@@ -2832,6 +3960,79 @@ fn eval_value(v: &SqlValue) -> Result<Value> {
             Ok(Value::Text(body.clone()))
         }
         _ => Err(anyhow!("Unsupported value literal: {:?}", v)),
+    }
+}
+
+fn format_unrecognized_specifier_error(spec: char) -> String {
+    format!(
+        "unrecognized format() type specifier \"{}\"\nHINT:  For a single \"%\" use \"%%\".",
+        spec
+    )
+}
+
+fn quote_literal_impl(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+fn quote_ident_impl(ident: &str) -> String {
+    let needs_quote =
+        ident.is_empty() || !is_simple_unquoted_ident(ident) || is_sql_keyword(ident);
+    if needs_quote {
+        format!("\"{}\"", ident.replace('"', "\"\""))
+    } else {
+        ident.to_string()
+    }
+}
+
+fn is_simple_unquoted_ident(ident: &str) -> bool {
+    let mut chars = ident.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_lowercase() || first == '_') {
+        return false;
+    }
+    for ch in chars {
+        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '$') {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_sql_keyword(ident: &str) -> bool {
+    let upper = ident.to_ascii_uppercase();
+    sqlparser::keywords::ALL_KEYWORDS
+        .binary_search(&upper.as_str())
+        .is_ok()
+}
+
+fn pg_typeof_name_impl(val: &Value) -> String {
+    match val {
+        Value::Null => "unknown".to_string(),
+        Value::Boolean(_) => "boolean".to_string(),
+        Value::Int32(_) => "integer".to_string(),
+        Value::Int64(_) => "bigint".to_string(),
+        Value::Float64(_) => "double precision".to_string(),
+        Value::Numeric(_) => "numeric".to_string(),
+        Value::Text(_) => "text".to_string(),
+        Value::Bytes(_) => "bytea".to_string(),
+        Value::Timestamp(_) => "timestamp with time zone".to_string(),
+        Value::Date(_) => "date".to_string(),
+        Value::Time(_) => "time".to_string(),
+        Value::Interval(_) => "interval".to_string(),
+        Value::Uuid(_) => "uuid".to_string(),
+        Value::Json(_) => "json".to_string(),
+        Value::Jsonb(_) => "jsonb".to_string(),
+        Value::Array(arr) => {
+            let elem_type = arr
+                .iter()
+                .find(|v| !matches!(v, Value::Null))
+                .map(pg_typeof_name_impl)
+                .unwrap_or_else(|| "unknown".to_string());
+            format!("{}[]", elem_type)
+        }
+        Value::Vector(_) => "vector".to_string(),
     }
 }
 
@@ -2899,6 +4100,28 @@ fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<Valu
         BinaryOperator::Modulo => mod_values(left, right),
 
         BinaryOperator::StringConcat => match (&left, &right) {
+            (Value::Jsonb(l), Value::Jsonb(r)) => {
+                let left_json: serde_json::Value =
+                    serde_json::from_str(l).map_err(|e| anyhow!("Invalid JSONB: {}", e))?;
+                let right_json: serde_json::Value =
+                    serde_json::from_str(r).map_err(|e| anyhow!("Invalid JSONB: {}", e))?;
+
+                let merged = match (left_json, right_json) {
+                    (serde_json::Value::Object(mut lo), serde_json::Value::Object(ro)) => {
+                        for (k, v) in ro {
+                            lo.insert(k, v);
+                        }
+                        serde_json::Value::Object(lo)
+                    }
+                    (serde_json::Value::Array(mut la), serde_json::Value::Array(ra)) => {
+                        la.extend(ra);
+                        serde_json::Value::Array(la)
+                    }
+                    (l, r) => serde_json::Value::Array(vec![l, r]),
+                };
+
+                Ok(Value::Jsonb(merged.to_string()))
+            }
             (Value::Array(l), Value::Array(r)) => {
                 let mut result = l.clone();
                 result.extend(r.iter().cloned());
@@ -2941,6 +4164,76 @@ fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<Valu
             }
             _ => Err(anyhow!("&& operator requires array operands")),
         },
+
+        BinaryOperator::PGRegexMatch => {
+            let text = match &left {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let pattern = match &right {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            match regex::Regex::new(&pattern) {
+                Ok(re) => Ok(Value::Boolean(re.is_match(&text))),
+                Err(e) => Err(anyhow!("Invalid regex pattern: {}", e)),
+            }
+        }
+
+        BinaryOperator::PGRegexIMatch => {
+            let text = match &left {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let pattern = match &right {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let case_insensitive_pattern = format!("(?i){}", pattern);
+            match regex::Regex::new(&case_insensitive_pattern) {
+                Ok(re) => Ok(Value::Boolean(re.is_match(&text))),
+                Err(e) => Err(anyhow!("Invalid regex pattern: {}", e)),
+            }
+        }
+
+        BinaryOperator::PGRegexNotMatch => {
+            let text = match &left {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let pattern = match &right {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            match regex::Regex::new(&pattern) {
+                Ok(re) => Ok(Value::Boolean(!re.is_match(&text))),
+                Err(e) => Err(anyhow!("Invalid regex pattern: {}", e)),
+            }
+        }
+
+        BinaryOperator::PGRegexNotIMatch => {
+            let text = match &left {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let pattern = match &right {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let case_insensitive_pattern = format!("(?i){}", pattern);
+            match regex::Regex::new(&case_insensitive_pattern) {
+                Ok(re) => Ok(Value::Boolean(!re.is_match(&text))),
+                Err(e) => Err(anyhow!("Invalid regex pattern: {}", e)),
+            }
+        }
 
         _ => Err(anyhow!("Unsupported binary operator: {:?}", op)),
     }
@@ -3089,6 +4382,10 @@ fn add_values(left: Value, right: Value) -> Result<Value> {
 }
 
 fn sub_values(left: Value, right: Value) -> Result<Value> {
+    if matches!(left, Value::Jsonb(_)) {
+        return jsonb_subtract(left, right);
+    }
+
     let left = try_coerce_text_to_numeric(left);
     let right = try_coerce_text_to_numeric(right);
     match (left, right) {
@@ -3141,6 +4438,58 @@ fn sub_values(left: Value, right: Value) -> Result<Value> {
         (Value::Interval(l), Value::Interval(r)) => Ok(Value::Interval(l - r)),
         _ => Err(anyhow!("Unsupported types for subtraction")),
     }
+}
+
+fn jsonb_subtract(left: Value, right: Value) -> Result<Value> {
+    let Value::Jsonb(json_str) = left else {
+        return Err(anyhow!("jsonb subtraction requires jsonb left operand"));
+    };
+    if matches!(right, Value::Null) {
+        return Ok(Value::Null);
+    }
+
+    let mut json_val: serde_json::Value =
+        serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSONB: {}", e))?;
+
+    match right {
+        Value::Text(key) => match &mut json_val {
+            serde_json::Value::Object(obj) => {
+                obj.remove(&key);
+            }
+            serde_json::Value::Array(arr) => {
+                arr.retain(|v| v.as_str() != Some(key.as_str()));
+            }
+            _ => {}
+        },
+        Value::Int32(idx) => match &mut json_val {
+            serde_json::Value::Array(arr) => {
+                let len = arr.len() as i32;
+                let idx = if idx < 0 { len + idx } else { idx };
+                if idx >= 0 && (idx as usize) < arr.len() {
+                    arr.remove(idx as usize);
+                }
+            }
+            _ => {}
+        },
+        Value::Int64(idx) => match &mut json_val {
+            serde_json::Value::Array(arr) => {
+                let len = arr.len() as i64;
+                let idx = if idx < 0 { len + idx } else { idx };
+                if idx >= 0 && (idx as usize) < arr.len() {
+                    arr.remove(idx as usize);
+                }
+            }
+            _ => {}
+        },
+        other => {
+            return Err(anyhow!(
+                "unsupported right operand for jsonb subtraction: {:?}",
+                other
+            ))
+        }
+    }
+
+    Ok(Value::Jsonb(json_val.to_string()))
 }
 
 fn mul_values(left: Value, right: Value) -> Result<Value> {
@@ -3301,6 +4650,43 @@ fn mod_values(left: Value, right: Value) -> Result<Value> {
 /// - 1: left > right
 /// - -1: left < right
 pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
+    fn compare_text_pg(left: &str, right: &str) -> std::cmp::Ordering {
+        // Approximate PostgreSQL's default collation behavior for ASCII:
+        // compare case-insensitively first, then order lowercase before uppercase.
+        let left_fold = left.to_ascii_lowercase();
+        let right_fold = right.to_ascii_lowercase();
+        match left_fold.cmp(&right_fold) {
+            std::cmp::Ordering::Equal => {}
+            other => return other,
+        }
+
+        for (l, r) in left.as_bytes().iter().copied().zip(right.as_bytes().iter().copied()) {
+            if l == r {
+                continue;
+            }
+
+            let l_fold = l.to_ascii_lowercase();
+            let r_fold = r.to_ascii_lowercase();
+            if l_fold != r_fold {
+                return l_fold.cmp(&r_fold);
+            }
+
+            let l_is_upper = l.is_ascii_uppercase();
+            let r_is_upper = r.is_ascii_uppercase();
+            if l_is_upper != r_is_upper {
+                return if l_is_upper {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                };
+            }
+
+            return l.cmp(&r);
+        }
+
+        left.len().cmp(&right.len())
+    }
+
     match (left, right) {
         (Value::Int32(l), Value::Int32(r)) => Ok(l.cmp(r) as i8),
         (Value::Int64(l), Value::Int64(r)) => Ok(l.cmp(r) as i8),
@@ -3309,7 +4695,7 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         (Value::Float64(l), Value::Float64(r)) => {
             Ok(l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal) as i8)
         }
-        (Value::Text(l), Value::Text(r)) => Ok(l.cmp(r) as i8),
+        (Value::Text(l), Value::Text(r)) => Ok(compare_text_pg(l, r) as i8),
         (Value::Boolean(l), Value::Boolean(r)) => Ok(l.cmp(r) as i8),
         (Value::Timestamp(l), Value::Timestamp(r)) => Ok(l.cmp(r) as i8),
         (Value::Date(l), Value::Date(r)) => Ok(l.cmp(r) as i8),
@@ -3338,6 +4724,16 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
             Ok(l_days.cmp(r) as i8)
         }
         (Value::Uuid(l), Value::Uuid(r)) => Ok(l.cmp(r) as i8),
+        (Value::Array(l), Value::Array(r)) => {
+            let min_len = l.len().min(r.len());
+            for i in 0..min_len {
+                let ord = compare_values(&l[i], &r[i])?;
+                if ord != 0 {
+                    return Ok(ord);
+                }
+            }
+            Ok(l.len().cmp(&r.len()) as i8)
+        }
         (Value::Null, Value::Null) => Ok(0),
         (Value::Null, _) => Ok(-1),
         (_, Value::Null) => Ok(1),
@@ -3628,7 +5024,7 @@ fn eval_json_access(left: Value, operator: &JsonOperator, right: Value) -> Resul
         _ => return Err(anyhow!("JSON operators require json/jsonb operand")),
     };
 
-    let json_val: serde_json::Value =
+    let mut json_val: serde_json::Value =
         serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
 
     match operator {
@@ -3655,6 +5051,26 @@ fn eval_json_access(left: Value, operator: &JsonOperator, right: Value) -> Resul
             let right_json: serde_json::Value = serde_json::from_str(&right_str)
                 .map_err(|e| anyhow!("Invalid JSON on right side of <@: {}", e))?;
             Ok(Value::Boolean(json_contains(&right_json, &json_val)))
+        }
+        JsonOperator::HashArrow | JsonOperator::HashLongArrow | JsonOperator::HashMinus => {
+            let path = json_path_from_value(&right)?;
+            match operator {
+                JsonOperator::HashArrow => match json_get_path(&json_val, &path) {
+                    Some(val) => Ok(Value::Jsonb(val.to_string())),
+                    None => Ok(Value::Null),
+                },
+                JsonOperator::HashLongArrow => match json_get_path(&json_val, &path) {
+                    None => Ok(Value::Null),
+                    Some(serde_json::Value::Null) => Ok(Value::Null),
+                    Some(serde_json::Value::String(s)) => Ok(Value::Text(s.clone())),
+                    Some(other) => Ok(Value::Text(other.to_string())),
+                },
+                JsonOperator::HashMinus => {
+                    json_delete_path(&mut json_val, &path);
+                    Ok(Value::Jsonb(json_val.to_string()))
+                }
+                _ => Err(anyhow!("Unsupported JSON operator: {:?}", operator)),
+            }
         }
         _ => {
             let accessed = match right {
@@ -3704,15 +5120,114 @@ fn eval_json_access(left: Value, operator: &JsonOperator, right: Value) -> Resul
                             Ok(Value::Text(val.to_string()))
                         }
                     },
-                    JsonOperator::HashArrow => Ok(Value::Text(val.to_string())),
-                    JsonOperator::HashLongArrow => match val {
-                        serde_json::Value::Null => Ok(Value::Null),
-                        serde_json::Value::String(s) => Ok(Value::Text(s.clone())),
-                        other => Ok(Value::Text(other.to_string())),
-                    },
                     _ => Err(anyhow!("Unsupported JSON operator: {:?}", operator)),
                 },
             }
+        }
+    }
+}
+
+fn parse_pg_text_array_literal(s: &str) -> Result<Vec<String>> {
+    let trimmed = s.trim();
+    if trimmed.starts_with('{') && trimmed.ends_with('}') && trimmed.len() >= 2 {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if inner.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Ok(inner
+            .split(',')
+            .map(|p| p.trim().trim_matches('"').to_string())
+            .collect());
+    }
+    Ok(vec![trimmed.to_string()])
+}
+
+fn json_path_from_value(path: &Value) -> Result<Vec<String>> {
+    match path {
+        Value::Array(arr) => Ok(arr
+            .iter()
+            .map(|v| match v {
+                Value::Text(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .collect()),
+        Value::Text(s) => parse_pg_text_array_literal(s),
+        Value::Null => Ok(Vec::new()),
+        other => Err(anyhow!("JSON path must be text[] or array literal, got {:?}", other)),
+    }
+}
+
+fn json_get_path<'a>(
+    mut current: &'a serde_json::Value,
+    path: &[String],
+) -> Option<&'a serde_json::Value> {
+    for key in path {
+        match current {
+            serde_json::Value::Object(obj) => {
+                current = obj.get(key)?;
+            }
+            serde_json::Value::Array(arr) => {
+                let idx: i64 = key.parse().ok()?;
+                let idx = if idx < 0 {
+                    (arr.len() as i64 + idx) as usize
+                } else {
+                    idx as usize
+                };
+                current = arr.get(idx)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current)
+}
+
+fn json_delete_path(current: &mut serde_json::Value, path: &[String]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    if path.len() == 1 {
+        let key = &path[0];
+        match current {
+            serde_json::Value::Object(obj) => obj.remove(key).is_some(),
+            serde_json::Value::Array(arr) => {
+                if let Ok(idx) = key.parse::<i64>() {
+                    let idx = if idx < 0 {
+                        arr.len() as i64 + idx
+                    } else {
+                        idx
+                    };
+                    if idx >= 0 && (idx as usize) < arr.len() {
+                        arr.remove(idx as usize);
+                        return true;
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    } else {
+        let key = &path[0];
+        match current {
+            serde_json::Value::Object(obj) => match obj.get_mut(key) {
+                Some(child) => json_delete_path(child, &path[1..]),
+                None => false,
+            },
+            serde_json::Value::Array(arr) => {
+                let Ok(idx) = key.parse::<i64>() else {
+                    return false;
+                };
+                let idx = if idx < 0 {
+                    arr.len() as i64 + idx
+                } else {
+                    idx
+                };
+                if idx >= 0 && (idx as usize) < arr.len() {
+                    json_delete_path(&mut arr[idx as usize], &path[1..])
+                } else {
+                    false
+                }
+            }
+            _ => false,
         }
     }
 }
@@ -5005,5 +6520,52 @@ mod tests {
         let text_empty = Value::Text("[]".to_string());
         let extracted6 = extract_vector(&text_empty).unwrap();
         assert_eq!(extracted6, Vec::<f64>::new());
+    }
+
+    #[test]
+    fn test_format_width_and_identifier_quoting() {
+        assert_eq!(
+            eval_expr(&parse_expr("FORMAT('%10s', 'test')"), None, None).unwrap(),
+            Value::Text("      test".to_string())
+        );
+
+        assert_eq!(
+            eval_expr(&parse_expr("FORMAT('%I', 'column_name')"), None, None).unwrap(),
+            Value::Text("column_name".to_string())
+        );
+
+        assert_eq!(
+            eval_expr(&parse_expr("FORMAT('%I', 'column name')"), None, None).unwrap(),
+            Value::Text("\"column name\"".to_string())
+        );
+
+        assert_eq!(
+            eval_expr(&parse_expr("FORMAT('%L', 'value''s')"), None, None).unwrap(),
+            Value::Text("'value''s'".to_string())
+        );
+    }
+
+    #[test]
+    fn test_format_rejects_precision_like_postgres() {
+        let err = eval_expr(&parse_expr("FORMAT('%.3s', 'hello')"), None, None).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unrecognized format() type specifier \".\""),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_quote_ident_and_pg_typeof_array() {
+        assert_eq!(
+            eval_expr(&parse_expr("QUOTE_IDENT('column')"), None, None).unwrap(),
+            Value::Text("\"column\"".to_string())
+        );
+
+        assert_eq!(
+            eval_expr(&parse_expr("PG_TYPEOF(ARRAY[1,2,3])"), None, None).unwrap(),
+            Value::Text("integer[]".to_string())
+        );
     }
 }

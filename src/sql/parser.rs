@@ -122,6 +122,17 @@ fn preprocess_create_sequence(sql: &str) -> Option<String> {
     }
 }
 
+fn preprocess_cte_materialized(sql: &str) -> Option<String> {
+    let re_not = Regex::new(r"(?i)\bAS\s+NOT\s+MATERIALIZED\s*\(").ok()?;
+    let re_yes = Regex::new(r"(?i)\bAS\s+MATERIALIZED\s*\(").ok()?;
+    if !re_not.is_match(sql) && !re_yes.is_match(sql) {
+        return None;
+    }
+    let tmp = re_not.replace_all(sql, "AS (");
+    let out = re_yes.replace_all(&tmp, "AS (");
+    Some(out.into_owned())
+}
+
 /// Rewrite `expr op ALL (SELECT ...)` and `expr op ANY (SELECT ...)` patterns
 /// into equivalent forms that `sqlparser` can parse.
 ///
@@ -450,18 +461,593 @@ fn preprocess_sql(sql: &str) -> String {
     if let Some(sequenced) = preprocess_create_sequence(&result) {
         result = sequenced;
     }
+    if let Some(materialized) = preprocess_cte_materialized(&result) {
+        result = materialized;
+    }
 
     // Rewrite ALL/ANY subquery patterns
     result = rewrite_all_any_subqueries(&result);
 
+    // Rewrite PostgreSQL jsonb existence operators that sqlparser doesn't support:
+    // - `lhs ? rhs`  => JSONB_EXISTS(lhs, rhs)
+    // - `lhs ?| rhs` => JSONB_EXISTS_ANY(lhs, rhs)
+    // - `lhs ?& rhs` => JSONB_EXISTS_ALL(lhs, rhs)
+    result = rewrite_jsonb_exists_ops(&result);
+
     result
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokenKind {
+    Word,
+    Whitespace,
+    StringLiteral,
+    QuotedIdent,
+    DollarString,
+    Comment,
+    Punct,
+    Operator,
+    Other,
+}
+
+#[derive(Debug, Clone)]
+struct Token {
+    kind: TokenKind,
+    start: usize,
+    end: usize,
+    text: String,
+}
+
+fn tokenize_sql_for_rewrite(sql: &str) -> Vec<Token> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let start = i;
+
+        // Line comment: -- ...
+        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            tokens.push(Token {
+                kind: TokenKind::Comment,
+                start,
+                end: i,
+                text: sql[start..i].to_string(),
+            });
+            continue;
+        }
+
+        // Block comment: /* ... */
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            if i + 1 < bytes.len() {
+                i += 2;
+            }
+            tokens.push(Token {
+                kind: TokenKind::Comment,
+                start,
+                end: i,
+                text: sql[start..i].to_string(),
+            });
+            continue;
+        }
+
+        // Whitespace
+        if bytes[i].is_ascii_whitespace() {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+                i += 1;
+            }
+            tokens.push(Token {
+                kind: TokenKind::Whitespace,
+                start,
+                end: i,
+                text: sql[start..i].to_string(),
+            });
+            continue;
+        }
+
+        // Single-quoted string literal
+        if bytes[i] == b'\'' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            tokens.push(Token {
+                kind: TokenKind::StringLiteral,
+                start,
+                end: i,
+                text: sql[start..i].to_string(),
+            });
+            continue;
+        }
+
+        // Double-quoted identifier
+        if bytes[i] == b'"' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            tokens.push(Token {
+                kind: TokenKind::QuotedIdent,
+                start,
+                end: i,
+                text: sql[start..i].to_string(),
+            });
+            continue;
+        }
+
+        // Dollar-quoted string: $tag$...$tag$ or $$...$$
+        if bytes[i] == b'$' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'$' {
+                if !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    break;
+                }
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'$' {
+                let delim = &sql[i..=j];
+                i = j + 1;
+                if let Some(end_pos) = sql[i..].find(delim) {
+                    let end_idx = i + end_pos + delim.len();
+                    tokens.push(Token {
+                        kind: TokenKind::DollarString,
+                        start,
+                        end: end_idx,
+                        text: sql[start..end_idx].to_string(),
+                    });
+                    i = end_idx;
+                    continue;
+                }
+            }
+        }
+
+        // Words (keywords/identifiers/numbers)
+        if is_ident_char(bytes[i]) {
+            i += 1;
+            while i < bytes.len() && is_ident_char(bytes[i]) {
+                i += 1;
+            }
+            tokens.push(Token {
+                kind: TokenKind::Word,
+                start,
+                end: i,
+                text: sql[start..i].to_string(),
+            });
+            continue;
+        }
+
+        // Punctuation
+        if matches!(bytes[i], b'(' | b')' | b'[' | b']' | b',' | b';') {
+            i += 1;
+            tokens.push(Token {
+                kind: TokenKind::Punct,
+                start,
+                end: i,
+                text: sql[start..i].to_string(),
+            });
+            continue;
+        }
+
+        // Operators we care about: ?  ?|  ?&
+        if bytes[i] == b'?' {
+            if i + 1 < bytes.len() && (bytes[i + 1] == b'|' || bytes[i + 1] == b'&') {
+                i += 2;
+                tokens.push(Token {
+                    kind: TokenKind::Operator,
+                    start,
+                    end: i,
+                    text: sql[start..i].to_string(),
+                });
+                continue;
+            }
+            i += 1;
+            tokens.push(Token {
+                kind: TokenKind::Operator,
+                start,
+                end: i,
+                text: sql[start..i].to_string(),
+            });
+            continue;
+        }
+
+        // Fallback: single char
+        i += 1;
+        tokens.push(Token {
+            kind: TokenKind::Other,
+            start,
+            end: i,
+            text: sql[start..i].to_string(),
+        });
+    }
+    tokens
+}
+
+fn is_rewrite_boundary_keyword(token_upper: &str) -> bool {
+    matches!(
+        token_upper,
+        "AS"
+            | "SELECT"
+            | "FROM"
+            | "WHERE"
+            | "GROUP"
+            | "ORDER"
+            | "HAVING"
+            | "LIMIT"
+            | "OFFSET"
+            | "UNION"
+            | "INTERSECT"
+            | "EXCEPT"
+            | "AND"
+            | "OR"
+            | "WHEN"
+            | "THEN"
+            | "ELSE"
+            | "END"
+    )
+}
+
+fn find_left_expr_start(tokens: &[Token], op_idx: usize) -> usize {
+    let mut depth_paren = 0i32;
+    let mut depth_bracket = 0i32;
+    for idx in (0..op_idx).rev() {
+        let tok = &tokens[idx];
+        if matches!(tok.kind, TokenKind::Whitespace | TokenKind::Comment) {
+            continue;
+        }
+        match tok.text.as_str() {
+            ")" => depth_paren += 1,
+            "(" => {
+                if depth_paren > 0 {
+                    depth_paren -= 1;
+                } else if depth_bracket == 0 {
+                    return idx + 1;
+                }
+            }
+            "]" => depth_bracket += 1,
+            "[" => {
+                if depth_bracket > 0 {
+                    depth_bracket -= 1;
+                } else if depth_paren == 0 {
+                    return idx + 1;
+                }
+            }
+            "," | ";" => {
+                if depth_paren == 0 && depth_bracket == 0 {
+                    return idx + 1;
+                }
+            }
+            _ => {
+                if depth_paren == 0
+                    && depth_bracket == 0
+                    && tok.kind == TokenKind::Word
+                    && is_rewrite_boundary_keyword(&tok.text.to_uppercase())
+                {
+                    return idx + 1;
+                }
+            }
+        }
+    }
+    0
+}
+
+fn find_right_expr_end(tokens: &[Token], op_idx: usize) -> usize {
+    let mut depth_paren = 0i32;
+    let mut depth_bracket = 0i32;
+    for idx in op_idx + 1..tokens.len() {
+        let tok = &tokens[idx];
+        if matches!(tok.kind, TokenKind::Whitespace | TokenKind::Comment) {
+            continue;
+        }
+        match tok.text.as_str() {
+            "(" => depth_paren += 1,
+            ")" => {
+                if depth_paren > 0 {
+                    depth_paren -= 1;
+                } else if depth_bracket == 0 {
+                    return idx.saturating_sub(1);
+                }
+            }
+            "[" => depth_bracket += 1,
+            "]" => {
+                if depth_bracket > 0 {
+                    depth_bracket -= 1;
+                } else if depth_paren == 0 {
+                    return idx.saturating_sub(1);
+                }
+            }
+            "," | ";" => {
+                if depth_paren == 0 && depth_bracket == 0 {
+                    return idx.saturating_sub(1);
+                }
+            }
+            _ => {
+                if depth_paren == 0
+                    && depth_bracket == 0
+                    && tok.kind == TokenKind::Word
+                    && is_rewrite_boundary_keyword(&tok.text.to_uppercase())
+                {
+                    return idx.saturating_sub(1);
+                }
+            }
+        }
+    }
+    tokens.len().saturating_sub(1)
+}
+
+fn skip_ws_comments_forward(tokens: &[Token], mut idx: usize, stop: usize) -> usize {
+    while idx < stop && matches!(tokens[idx].kind, TokenKind::Whitespace | TokenKind::Comment) {
+        idx += 1;
+    }
+    idx
+}
+
+fn skip_ws_comments_backward(tokens: &[Token], mut idx: usize, start: usize) -> usize {
+    while idx > start && matches!(tokens[idx].kind, TokenKind::Whitespace | TokenKind::Comment) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn rewrite_jsonb_exists_ops(sql: &str) -> String {
+    let tokens = tokenize_sql_for_rewrite(sql);
+    if tokens.is_empty() {
+        return sql.to_string();
+    }
+
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    for (op_idx, tok) in tokens.iter().enumerate() {
+        if tok.kind != TokenKind::Operator {
+            continue;
+        }
+        let func = match tok.text.as_str() {
+            "?" => "JSONB_EXISTS",
+            "?|" => "JSONB_EXISTS_ANY",
+            "?&" => "JSONB_EXISTS_ALL",
+            _ => continue,
+        };
+
+        let left_start_idx = find_left_expr_start(&tokens, op_idx);
+        let left_start_idx = skip_ws_comments_forward(&tokens, left_start_idx, op_idx);
+
+        if left_start_idx >= op_idx {
+            continue;
+        }
+
+        let mut right_start_idx = op_idx + 1;
+        right_start_idx = skip_ws_comments_forward(&tokens, right_start_idx, tokens.len());
+
+        if right_start_idx >= tokens.len() {
+            continue;
+        }
+
+        let mut right_end_idx = find_right_expr_end(&tokens, op_idx);
+        right_end_idx = skip_ws_comments_backward(&tokens, right_end_idx, right_start_idx);
+
+        if right_end_idx < right_start_idx {
+            continue;
+        }
+
+        let replace_start = tokens[left_start_idx].start;
+        let replace_end = tokens[right_end_idx].end;
+
+        let left_expr = sql[replace_start..tok.start].trim();
+        let right_expr = sql[tokens[right_start_idx].start..replace_end].trim();
+
+        if left_expr.is_empty() || right_expr.is_empty() {
+            continue;
+        }
+
+        let replacement = format!("({}({}, {}))", func, left_expr, right_expr);
+        replacements.push((replace_start, replace_end, replacement));
+    }
+
+    if replacements.is_empty() {
+        return sql.to_string();
+    }
+
+    // Apply replacements from right to left so offsets remain valid.
+    replacements.sort_by_key(|(s, _, _)| *s);
+    let mut out = sql.to_string();
+    for (start, end, repl) in replacements.into_iter().rev() {
+        out.replace_range(start..end, &repl);
+    }
+    out
+}
+
+fn is_ident_char(b: u8) -> bool {
+    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+}
+
+fn find_keyword_outside_strings(query: &str, keyword: &str) -> Option<usize> {
+    let bytes = query.as_bytes();
+    let kw = keyword.as_bytes();
+    if kw.is_empty() || bytes.len() < kw.len() {
+        return None;
+    }
+
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut dollar_delim: Option<Vec<u8>> = None;
+
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(delim) = dollar_delim.as_ref() {
+            let delim_len = delim.len();
+            let matches =
+                i + delim_len <= bytes.len() && &bytes[i..i + delim_len] == delim.as_slice();
+            if matches {
+                dollar_delim = None;
+                i += delim_len;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        let b = bytes[i];
+        if b == b'\'' && !in_double_quote {
+            if in_single_quote && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            in_single_quote = !in_single_quote;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single_quote {
+            if in_double_quote && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                i += 2;
+                continue;
+            }
+            in_double_quote = !in_double_quote;
+            i += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote && b == b'$' {
+            // Skip placeholders like $1 and keep scanning.
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 {
+                i = j;
+                continue;
+            }
+
+            // Track dollar-quoted strings ($tag$...$tag$ or $$...$$)
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'$' {
+                if !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    break;
+                }
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'$' {
+                dollar_delim = Some(bytes[i..=j].to_vec());
+                i = j + 1;
+                continue;
+            }
+        }
+
+        if !in_single_quote && !in_double_quote && i + kw.len() <= bytes.len() {
+            let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+            let after_ok = i + kw.len() == bytes.len() || !is_ident_char(bytes[i + kw.len()]);
+            if before_ok && after_ok {
+                let mut matched = true;
+                for (j, kw_b) in kw.iter().enumerate() {
+                    if bytes[i + j].to_ascii_uppercase() != kw_b.to_ascii_uppercase() {
+                        matched = false;
+                        break;
+                    }
+                }
+                if matched {
+                    return Some(i);
+                }
+            }
+        }
+
+        i += 1;
+    }
+
+    None
+}
+
+fn parse_returning_items(
+    dialect: &PostgreSqlDialect,
+    clause: &str,
+) -> Result<Vec<sqlparser::ast::SelectItem>> {
+    let sql = format!("SELECT {}", clause);
+    let mut stmts = Parser::parse_sql(dialect, &sql)
+        .map_err(|e| anyhow!("Failed to parse RETURNING clause: {}", e))?;
+    if stmts.len() != 1 {
+        return Err(anyhow!("Failed to parse RETURNING clause: {}", clause));
+    }
+
+    let stmt = stmts.remove(0);
+    let Statement::Query(query) = stmt else {
+        return Err(anyhow!("Failed to parse RETURNING clause: {}", clause));
+    };
+
+    if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
+        Ok(select.projection.clone())
+    } else {
+        Err(anyhow!("Failed to parse RETURNING clause: {}", clause))
+    }
+}
+
+fn try_parse_statement_with_returning_fallback(
+    dialect: &PostgreSqlDialect,
+    sql: &str,
+) -> Option<Vec<Statement>> {
+    let pos = find_keyword_outside_strings(sql, "RETURNING")?;
+    let head = sql.get(..pos)?.trim_end();
+    let tail = sql.get(pos + "RETURNING".len()..)?.trim();
+    let clause = tail.trim_end_matches(';').trim();
+    if clause.is_empty() {
+        return None;
+    }
+
+    let returning_items = parse_returning_items(dialect, clause).ok()?;
+    let mut stmts = Parser::parse_sql(dialect, head).ok()?;
+    if stmts.len() != 1 {
+        return None;
+    }
+    match &mut stmts[0] {
+        Statement::Insert { returning, .. }
+        | Statement::Update { returning, .. }
+        | Statement::Delete { returning, .. } => {
+            *returning = Some(returning_items);
+            Some(stmts)
+        }
+        _ => None,
+    }
 }
 
 /// Parse a SQL string into AST statements
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     let dialect = PostgreSqlDialect {};
     let preprocessed = preprocess_sql(sql);
-    Parser::parse_sql(&dialect, &preprocessed).map_err(|e| anyhow!("SQL parse error: {}", e))
+    match Parser::parse_sql(&dialect, &preprocessed) {
+        Ok(stmts) => Ok(stmts),
+        Err(e) => {
+            if let Some(stmts) =
+                try_parse_statement_with_returning_fallback(&dialect, preprocessed.trim())
+            {
+                return Ok(stmts);
+            }
+            Err(anyhow!("SQL parse error: {}", e))
+        }
+    }
 }
 
 #[cfg(test)]

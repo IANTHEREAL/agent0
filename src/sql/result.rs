@@ -103,6 +103,10 @@ pub enum ExecuteResult {
     Skipped {
         message: String,
     },
+    /// Server notice message (sent as NoticeResponse on the wire)
+    Notice {
+        message: String,
+    },
 }
 
 impl ExecuteResult {

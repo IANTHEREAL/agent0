@@ -7,13 +7,72 @@ use super::helpers::normalize_ident;
 use super::names;
 use super::triggers;
 use super::ExecuteResult;
-use crate::types::{DataType, Row, Value};
+use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    Assignment, Expr, Ident, ObjectName, OnInsert, Query, SelectItem, SetExpr, Values,
+    Assignment, DataType as SqlDataType, Expr, Ident, ObjectName, OnInsert, Query, SelectItem,
+    SetExpr, TimezoneInfo, Value as SqlValue, Values,
 };
 use std::collections::HashMap;
 use tikv_client::Transaction;
+
+fn value_to_expr(val: Value, _col_name: Option<&str>) -> Result<Expr> {
+    Ok(match val {
+        Value::Null => Expr::Value(SqlValue::Null),
+        Value::Boolean(b) => Expr::Value(SqlValue::Boolean(b)),
+        Value::Int32(n) => Expr::Value(SqlValue::Number(n.to_string(), false)),
+        Value::Int64(n) => Expr::Value(SqlValue::Number(n.to_string(), false)),
+        Value::Float64(n) => Expr::Value(SqlValue::Number(n.to_string(), false)),
+        Value::Numeric(d) => Expr::Value(SqlValue::Number(d.to_string(), false)),
+        Value::Text(s) => Expr::Value(SqlValue::SingleQuotedString(s)),
+        Value::Bytes(b) => Expr::Value(SqlValue::HexStringLiteral(hex::encode(b))),
+        Value::Timestamp(ts) => {
+            use chrono::{TimeZone, Utc};
+            let dt = Utc
+                .timestamp_millis_opt(ts)
+                .single()
+                .ok_or_else(|| anyhow!("timestamp out of range: {}", ts))?;
+            Expr::TypedString {
+                data_type: SqlDataType::Timestamp(None, TimezoneInfo::WithTimeZone),
+                value: dt.to_rfc3339(),
+            }
+        }
+        Value::Date(days) => {
+            use chrono::NaiveDate;
+            let date = NaiveDate::from_num_days_from_ce_opt(days + 719163).unwrap_or_default();
+            Expr::Value(SqlValue::SingleQuotedString(
+                date.format("%Y-%m-%d").to_string(),
+            ))
+        }
+        Value::Time(t) => Expr::Value(SqlValue::SingleQuotedString(format!("{}", t))),
+        Value::Interval(iv) => Expr::Value(SqlValue::SingleQuotedString(format!(
+            "{} months {} ms",
+            iv.months, iv.millis
+        ))),
+        Value::Uuid(bytes) => {
+            let uuid = uuid::Uuid::from_bytes(bytes);
+            Expr::Value(SqlValue::SingleQuotedString(uuid.to_string()))
+        }
+        Value::Json(s) | Value::Jsonb(s) => Expr::Value(SqlValue::SingleQuotedString(s)),
+        Value::Array(arr) => {
+            let elements: Vec<Expr> = arr
+                .into_iter()
+                .map(|v| value_to_expr(v, None))
+                .collect::<Result<_>>()?;
+            Expr::Array(sqlparser::ast::Array {
+                elem: elements,
+                named: false,
+            })
+        }
+        Value::Vector(v) => Expr::Value(SqlValue::SingleQuotedString(format!(
+            "[{}]",
+            v.iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ))),
+    })
+}
 
 impl Executor {
     pub(crate) async fn execute_insert(
@@ -41,16 +100,51 @@ impl Executor {
         let source = source
             .as_ref()
             .ok_or_else(|| anyhow!("INSERT requires VALUES"))?;
-        let values = match &*source.body {
-            SetExpr::Values(Values { rows, .. }) => rows,
-            _ => return Err(anyhow!("Only VALUES supported")),
-        };
 
         let mut affected = 0;
         let mut ret_rows = Vec::new();
         let ret_cols = dml::build_returning_columns(returning, &schema)?;
 
-        for exprs in values {
+        let source_rows: Vec<Vec<Expr>> = match &*source.body {
+            SetExpr::Values(Values { rows, .. }) => rows.clone(),
+            SetExpr::Select(_) => {
+                let select_result = self
+                    .execute_query(txn, sequence_values, search_path, source)
+                    .await?;
+                match select_result {
+                    super::ExecuteResult::Select {
+                        rows,
+                        columns: select_cols,
+                        ..
+                    } => {
+                        let insert_columns: Vec<String> = if select_cols.is_empty() {
+                            schema.columns.iter().map(|c| c.name.clone()).collect()
+                        } else {
+                            select_cols.iter().map(|c| c.to_lowercase()).collect()
+                        };
+
+                        rows.into_iter()
+                            .map(|row| {
+                                row.values
+                                    .into_iter()
+                                    .enumerate()
+                                    .map(|(i, val)| {
+                                        value_to_expr(
+                                            val,
+                                            insert_columns.get(i).map(|s| s.as_str()),
+                                        )
+                                    })
+                                    .collect::<Result<Vec<Expr>>>()
+                            })
+                            .collect::<Result<Vec<Vec<Expr>>>>()?
+                    }
+                    _ => return Err(anyhow!("INSERT...SELECT source must return rows")),
+                }
+            }
+            _ => return Err(anyhow!("INSERT source must be VALUES or SELECT")),
+        };
+
+        for exprs in &source_rows {
             let (mut row_vals, indices) = dml::prepare_insert_row(
                 &self.store(),
                 txn,
@@ -121,19 +215,7 @@ impl Executor {
         }
 
         if returning.is_some() {
-            let column_types = Some(
-                ret_cols
-                    .iter()
-                    .map(|col_name| {
-                        schema
-                            .columns
-                            .iter()
-                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
-                            .map(|c| c.data_type.clone())
-                            .unwrap_or(DataType::Text)
-                    })
-                    .collect(),
-            );
+            let column_types = Some(dml::build_returning_types(returning, &schema)?);
             Ok(ExecuteResult::Select {
                 column_types,
                 columns: ret_cols,
@@ -152,11 +234,13 @@ impl Executor {
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         from: &[sqlparser::ast::TableWithJoins],
+        using: &[sqlparser::ast::TableWithJoins],
         selection: &Option<Expr>,
         returning: &Option<Vec<SelectItem>>,
     ) -> Result<ExecuteResult> {
-        let t = match &from[0].relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => {
+        let ctes_ctx: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
+        let (resolved_target, table_alias) = match &from[0].relation {
+            sqlparser::ast::TableFactor::Table { name, alias, .. } => {
                 let resolved = names::resolve_existing_table_name(
                     self.store().as_ref(),
                     txn,
@@ -165,10 +249,15 @@ impl Executor {
                 )
                 .await?
                 .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?;
-                resolved.full
+                let alias = alias
+                    .as_ref()
+                    .map(|a| normalize_ident(&a.name))
+                    .unwrap_or_else(|| resolved.name.clone());
+                (resolved, alias)
             }
-            _ => return Err(anyhow!("Unsupported")),
+            _ => return Err(anyhow!("Unsupported DELETE target")),
         };
+        let t = resolved_target.full.clone();
         let schema = self
             .store()
             .get_schema(txn, &t)
@@ -179,7 +268,7 @@ impl Executor {
         }
         let resolved_selection = if let Some(sel) = selection {
             Some(
-                self.resolve_subqueries(txn, sequence_values, search_path, sel)
+                self.resolve_subqueries(txn, sequence_values, search_path, sel, &ctes_ctx)
                     .await?,
             )
         } else {
@@ -189,23 +278,100 @@ impl Executor {
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
         let ret_cols = dml::build_returning_columns(returning, &schema)?;
+        let using_data = if using.is_empty() {
+            None
+        } else {
+            if using.len() != 1 {
+                return Err(anyhow!("DELETE ... USING multiple tables not supported"));
+            }
+            let using_table = &using[0];
+            let (using_resolved, using_alias) = match &using_table.relation {
+                sqlparser::ast::TableFactor::Table { name, alias, .. } => {
+                    let resolved = names::resolve_existing_table_name(
+                        self.store().as_ref(),
+                        txn,
+                        name,
+                        search_path,
+                    )
+                    .await?
+                    .ok_or_else(|| anyhow!("USING table '{}' does not exist", name))?;
+                    let alias = alias
+                        .as_ref()
+                        .map(|a| normalize_ident(&a.name))
+                        .unwrap_or_else(|| resolved.name.clone());
+                    (resolved, alias)
+                }
+                _ => return Err(anyhow!("Unsupported USING table")),
+            };
+            let using_schema = self
+                .store()
+                .get_schema(txn, &using_resolved.full)
+                .await?
+                .ok_or_else(|| anyhow!("USING table not found"))?;
+            let using_rows = self.scan_and_fill(txn, &using_resolved.full, &using_schema).await?;
+            Some((using_schema, using_rows, using_alias))
+        };
 
         for r in rows {
-            if let Some(ref e) = resolved_selection {
-                if !matches!(
-                    self.eval_expr_maybe_sequence(
-                        txn,
-                        sequence_values,
-                        search_path,
-                        e,
-                        Some(&r),
-                        Some(&schema)
+            let should_delete = if let Some(ref e) = resolved_selection {
+                if let Some((ref using_schema, ref using_rows, ref using_alias)) = using_data {
+                    let mut matched = false;
+                    for using_row in using_rows {
+                        let (combined_schema, combined_row, column_offsets) =
+                            dml::build_update_join_context(
+                                &schema,
+                                &table_alias,
+                                using_schema,
+                                using_alias,
+                                &r,
+                                using_row,
+                            );
+                        let ctx = JoinContext {
+                            tables: HashMap::new(),
+                            column_offsets,
+                            combined_row: &combined_row,
+                            combined_schema: &combined_schema,
+                        };
+                        if matches!(
+                            self.eval_expr_join_maybe_sequence(
+                                txn,
+                                sequence_values,
+                                search_path,
+                                e,
+                                &ctx
+                            )
+                            .await?,
+                            Value::Boolean(true)
+                        ) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    matched
+                } else {
+                    matches!(
+                        self.eval_expr_maybe_sequence(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            e,
+                            Some(&r),
+                            Some(&schema)
+                        )
+                        .await?,
+                        Value::Boolean(true)
                     )
-                    .await?,
-                    Value::Boolean(true)
-                ) {
-                    continue;
                 }
+            } else {
+                if let Some((_, ref using_rows, _)) = using_data {
+                    !using_rows.is_empty()
+                } else {
+                    true
+                }
+            };
+
+            if !should_delete {
+                continue;
             }
             if let Some(ret_row) = dml::eval_returning_row(
                 &self.store(),
@@ -225,19 +391,7 @@ impl Executor {
         }
 
         if returning.is_some() {
-            let column_types = Some(
-                ret_cols
-                    .iter()
-                    .map(|col_name| {
-                        schema
-                            .columns
-                            .iter()
-                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
-                            .map(|c| c.data_type.clone())
-                            .unwrap_or(DataType::Text)
-                    })
-                    .collect(),
-            );
+            let column_types = Some(dml::build_returning_types(returning, &schema)?);
             Ok(ExecuteResult::Select {
                 column_types,
                 columns: ret_cols,
@@ -259,6 +413,7 @@ impl Executor {
         selection: &Option<Expr>,
         returning: &Option<Vec<SelectItem>>,
     ) -> Result<ExecuteResult> {
+        let ctes_ctx: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let resolved_target = match &table.relation {
             sqlparser::ast::TableFactor::Table { name, .. } => {
                 names::resolve_existing_table_name(self.store().as_ref(), txn, name, search_path)
@@ -286,7 +441,7 @@ impl Executor {
         }
         let resolved_selection = if let Some(sel) = selection {
             Some(
-                self.resolve_subqueries(txn, sequence_values, search_path, sel)
+                self.resolve_subqueries(txn, sequence_values, search_path, sel, &ctes_ctx)
                     .await?,
             )
         } else {
@@ -485,19 +640,7 @@ impl Executor {
         }
 
         if returning.is_some() {
-            let column_types = Some(
-                ret_cols
-                    .iter()
-                    .map(|col_name| {
-                        schema
-                            .columns
-                            .iter()
-                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
-                            .map(|c| c.data_type.clone())
-                            .unwrap_or(DataType::Text)
-                    })
-                    .collect(),
-            );
+            let column_types = Some(dml::build_returning_types(returning, &schema)?);
 
             Ok(ExecuteResult::Select {
                 column_types,
@@ -507,5 +650,24 @@ impl Executor {
         } else {
             Ok(ExecuteResult::Update { affected_rows: cnt })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_to_expr_roundtrips_bytes() {
+        let expr = value_to_expr(Value::Bytes(vec![0, 1, 2, 255]), None).unwrap();
+        let val = crate::sql::expr::eval_expr(&expr, None, None).unwrap();
+        assert_eq!(val, Value::Bytes(vec![0, 1, 2, 255]));
+    }
+
+    #[test]
+    fn value_to_expr_roundtrips_timestamp() {
+        let expr = value_to_expr(Value::Timestamp(0), None).unwrap();
+        let val = crate::sql::expr::eval_expr(&expr, None, None).unwrap();
+        assert_eq!(val, Value::Timestamp(0));
     }
 }

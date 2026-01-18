@@ -8,7 +8,7 @@ TiKV Cluster Administration Tool for pg-tikv Testing
 Manages TiKV test clusters using tiup playground with API v2 (keyspace support).
 
 Usage:
-    tikv_admin.py start [--name NAME] [--persistent] [--pd-port PORT]
+    tikv_admin.py start [--name NAME] [--persistent] [--pd-port PORT] [--host HOST]
     tikv_admin.py stop [--name NAME] [--all]
     tikv_admin.py list
     tikv_admin.py status [--name NAME]
@@ -22,6 +22,7 @@ Examples:
     tikv_admin.py start                           # Start default cluster (one-time mode)
     tikv_admin.py start --name dev --persistent   # Start persistent dev cluster
     tikv_admin.py start --name ci                 # Start one-time CI cluster
+    tikv_admin.py start --host 0.0.0.0            # Start with PD/TiKV listening on all interfaces
     tikv_admin.py list                            # List all managed clusters
     tikv_admin.py stop --name dev                 # Stop specific cluster
     tikv_admin.py stop --all                      # Stop all clusters
@@ -73,6 +74,7 @@ class ClusterInfo:
     created_at: str
     data_dir: str
     log_file: str
+    host: str = "127.0.0.1"
     status: str = "running"
 
     def to_dict(self) -> dict:
@@ -204,8 +206,8 @@ def check_cluster_process(info: ClusterInfo) -> str:
 
 def extract_ports_from_log(log_file: Path, timeout: int = 120) -> Optional[Dict[str, int]]:
     """Extract PD and TiKV ports from tiup playground log."""
-    pd_pattern = re.compile(r"PD (?:Endpoints|client).*?127\.0\.0\.1:(\d+)")
-    tikv_pattern = re.compile(r"TiKV.*?127\.0\.0\.1:(\d+)")
+    pd_pattern = re.compile(r"PD (?:Endpoints|client).*?[\d\.]+:(\d+)")
+    tikv_pattern = re.compile(r"TiKV.*?[\d\.]+:(\d+)")
     
     ports = {}
     start_time = time.time()
@@ -236,6 +238,7 @@ def start_cluster(
     name: str = DEFAULT_CLUSTER_NAME,
     mode: ClusterMode = ClusterMode.ONE_TIME,
     pd_port: Optional[int] = None,
+    host: str = "127.0.0.1",
     verbose: bool = False,
 ) -> Optional[ClusterInfo]:
     """Start a new TiKV cluster."""
@@ -268,6 +271,8 @@ enable-ttl = true
         "--mode", "tikv-slim",
         "--kv.config", str(tikv_config),
         "--tag", f"pg-tikv-{name}",
+        "--pd.host", host,
+        "--kv.host", host,
     ]
     
     if pd_port:
@@ -297,14 +302,15 @@ enable-ttl = true
     pd_port_actual = ports["pd"]
     tikv_port_actual = ports.get("tikv", 20160)
     
-    if not wait_for_port("127.0.0.1", pd_port_actual, 60):
+    check_host = "127.0.0.1" if host == "0.0.0.0" else host
+    if not wait_for_port(check_host, pd_port_actual, 60):
         log_error(f"PD port {pd_port_actual} is not accessible")
         proc.terminate()
         return None
     
     log_info(f"Cluster '{name}' is ready!")
-    log_info(f"  PD endpoint: 127.0.0.1:{pd_port_actual}")
-    log_info(f"  TiKV: 127.0.0.1:{tikv_port_actual}")
+    log_info(f"  PD endpoint: {host}:{pd_port_actual}")
+    log_info(f"  TiKV: {host}:{tikv_port_actual}")
     
     info = ClusterInfo(
         name=name,
@@ -315,6 +321,7 @@ enable-ttl = true
         created_at=datetime.now().isoformat(),
         data_dir=str(data_dir),
         log_file=str(log_file),
+        host=host,
         status="running",
     )
     save_cluster_info(info)
@@ -408,10 +415,11 @@ def print_cluster_status(info: ClusterInfo, detailed: bool = False):
     """Print cluster status."""
     status_color = GREEN if info.status == "running" else YELLOW if info.status == "starting" else RED
     mode_str = f"[{info.mode}]"
+    host = getattr(info, 'host', '127.0.0.1')
     
     print(f"  {CYAN}{info.name}{NC} {status_color}({info.status}){NC} {mode_str}")
-    print(f"    PD: 127.0.0.1:{info.pd_port}")
-    print(f"    TiKV: 127.0.0.1:{info.tikv_port}")
+    print(f"    PD: {host}:{info.pd_port}")
+    print(f"    TiKV: {host}:{info.tikv_port}")
     print(f"    PID: {info.pid}")
     
     if detailed:
@@ -427,12 +435,13 @@ def cmd_start(args):
         name=args.name,
         mode=mode,
         pd_port=args.pd_port,
+        host=args.host,
         verbose=args.verbose,
     )
     if info:
         print()
         print(f"Cluster '{args.name}' is ready.")
-        print(f"  PD_ENDPOINTS=127.0.0.1:{info.pd_port}")
+        print(f"  PD_ENDPOINTS={info.host}:{info.pd_port}")
         print()
         if mode == ClusterMode.ONE_TIME:
             print(f"Mode: {YELLOW}one-time{NC} - cluster will be managed by caller")
@@ -515,6 +524,7 @@ def main():
     start_parser.add_argument("--name", default=DEFAULT_CLUSTER_NAME, help="Cluster name")
     start_parser.add_argument("--persistent", action="store_true", help="Keep cluster running (persistent mode)")
     start_parser.add_argument("--pd-port", type=int, help="PD port (auto-assigned if not specified)")
+    start_parser.add_argument("--host", default="127.0.0.1", help="Host for PD and TiKV to bind (default: 127.0.0.1, use 0.0.0.0 for all interfaces)")
     start_parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     
     stop_parser = subparsers.add_parser("stop", help="Stop a TiKV cluster")

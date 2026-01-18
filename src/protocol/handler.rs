@@ -20,7 +20,7 @@ use pgwire::api::{
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::DataRow;
-use pgwire::messages::response::{CommandComplete, ErrorResponse};
+use pgwire::messages::response::{CommandComplete, ErrorResponse, NoticeResponse};
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use sqlparser::ast::{Expr, ObjectName, SelectItem, Statement, TableFactor};
@@ -1121,12 +1121,22 @@ impl SimpleQueryHandler for DynamicPgHandler {
 
         match executor.execute(session, query).await {
             Ok(results) => {
-                let responses: PgWireResult<Vec<Response<'a>>> = results
-                    .into_vec()
-                    .into_iter()
-                    .map(result_to_response)
-                    .collect();
-                responses
+                let mut responses: Vec<Response<'a>> = Vec::new();
+                for result in results.into_vec() {
+                    if let ExecuteResult::Notice { message } = result {
+                        let notice = NoticeResponse::from(ErrorInfo::new(
+                            "NOTICE".to_string(),
+                            "00000".to_string(),
+                            message,
+                        ));
+                        client
+                            .send(PgWireBackendMessage::NoticeResponse(notice))
+                            .await?;
+                        continue;
+                    }
+                    responses.push(result_to_response(result)?);
+                }
+                Ok(responses)
             }
             Err(e) => {
                 error!("Query execution error: {}", e);
@@ -1978,7 +1988,7 @@ impl StartupHandler for PgHandler {
 impl SimpleQueryHandler for PgHandler {
     async fn do_query<'a, C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         query: &'a str,
     ) -> PgWireResult<Vec<Response<'a>>>
     where
@@ -2033,12 +2043,22 @@ impl SimpleQueryHandler for PgHandler {
 
         match self.executor.execute(&mut session, query).await {
             Ok(results) => {
-                let responses: PgWireResult<Vec<Response<'a>>> = results
-                    .into_vec()
-                    .into_iter()
-                    .map(result_to_response)
-                    .collect();
-                responses
+                let mut responses: Vec<Response<'a>> = Vec::new();
+                for result in results.into_vec() {
+                    if let ExecuteResult::Notice { message } = result {
+                        let notice = NoticeResponse::from(ErrorInfo::new(
+                            "NOTICE".to_string(),
+                            "00000".to_string(),
+                            message,
+                        ));
+                        client
+                            .send(PgWireBackendMessage::NoticeResponse(notice))
+                            .await?;
+                        continue;
+                    }
+                    responses.push(result_to_response(result)?);
+                }
+                Ok(responses)
             }
             Err(e) => {
                 error!("Query execution error: {}", e);
@@ -2329,7 +2349,8 @@ fn datatype_to_pgtype(dt: Option<&DataType>) -> Type {
         Some(DataType::Int32) => Type::INT4,
         Some(DataType::Int64) => Type::INT8,
         Some(DataType::Float64) => Type::FLOAT8,
-        Some(DataType::Timestamp) => Type::TIMESTAMPTZ,
+        Some(DataType::Timestamp) => Type::TIMESTAMP,
+        Some(DataType::TimestampTz) => Type::TIMESTAMPTZ,
         Some(DataType::Date) => Type::DATE,
         Some(DataType::Interval) => Type::INTERVAL,
         Some(DataType::Uuid) => Type::UUID,
@@ -2404,11 +2425,24 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
 
             let fields = Arc::new(fields);
 
+            let internal_types: Vec<DataType> = if let Some(types) = column_types.as_ref() {
+                types.clone()
+            } else if let Some(first) = rows.first() {
+                first
+                    .values
+                    .iter()
+                    .map(|v| v.data_type().unwrap_or(DataType::Text))
+                    .collect()
+            } else {
+                vec![DataType::Text; fixed_columns.len()]
+            };
+
             let mut data_rows: Vec<PgWireResult<DataRow>> = Vec::new();
             for row in rows {
                 let mut encoder = DataRowEncoder::new(fields.clone());
-                for value in &row.values {
-                    encode_value(&mut encoder, value)?;
+                for (i, value) in row.values.iter().enumerate() {
+                    let col_type = internal_types.get(i);
+                    encode_value(&mut encoder, value, col_type)?;
                 }
                 data_rows.push(encoder.finish());
             }
@@ -2568,6 +2602,8 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
 
         ExecuteResult::Empty => Ok(Response::EmptyQuery),
 
+        ExecuteResult::Notice { .. } => Ok(Response::EmptyQuery),
+
         ExecuteResult::CreateRole => Ok(Response::Execution(Tag::new("CREATE ROLE"))),
 
         ExecuteResult::AlterRole => Ok(Response::Execution(Tag::new("ALTER ROLE"))),
@@ -2597,7 +2633,11 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
     }
 }
 
-fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()> {
+fn encode_value(
+    encoder: &mut DataRowEncoder,
+    value: &Value,
+    col_type: Option<&DataType>,
+) -> PgWireResult<()> {
     match value {
         Value::Null => encoder.encode_field(&None::<String>),
         Value::Boolean(b) => encoder.encode_field(b),
@@ -2607,13 +2647,33 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
         Value::Text(s) => encoder.encode_field(s),
         Value::Bytes(b) => encoder.encode_field(&format!("\\x{}", hex::encode(b))),
         Value::Timestamp(ts) => {
-            use chrono::{DateTime, Utc};
+            use chrono::{DateTime, Offset, Utc};
             let seconds = ts / 1000;
             let millis = (ts % 1000).unsigned_abs() as u32;
             let nanos = millis * 1_000_000;
             if let Some(dt) = DateTime::<Utc>::from_timestamp(seconds, nanos) {
                 let micros = nanos / 1000;
-                if micros == 0 {
+                let is_timestamptz = matches!(col_type, Some(DataType::TimestampTz));
+
+                if is_timestamptz {
+                    let local = dt.with_timezone(&chrono_tz::America::Los_Angeles);
+                    let base = if micros == 0 {
+                        local.format("%Y-%m-%d %H:%M:%S").to_string()
+                    } else {
+                        local.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+                    };
+                    let offset_secs = local.offset().fix().local_minus_utc();
+                    let sign = if offset_secs >= 0 { '+' } else { '-' };
+                    let abs = offset_secs.unsigned_abs();
+                    let hours = abs / 3600;
+                    let minutes = (abs % 3600) / 60;
+                    let tz = if minutes == 0 {
+                        format!("{sign}{:02}", hours)
+                    } else {
+                        format!("{sign}{:02}:{:02}", hours, minutes)
+                    };
+                    encoder.encode_field(&format!("{base}{tz}"))
+                } else if micros == 0 {
                     encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S").to_string())
                 } else {
                     encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
@@ -2628,18 +2688,104 @@ fn encode_value(encoder: &mut DataRowEncoder, value: &Value) -> PgWireResult<()>
             encoder.encode_field(&uuid.to_string())
         }
         Value::Array(elems) => {
-            let mut parts = Vec::new();
-            for elem in elems {
-                match elem {
-                    Value::Null => parts.push("NULL".to_string()),
-                    Value::Text(s) => parts.push(format!("\"{}\"", s.replace('"', "\\\""))),
-                    v => parts.push(v.to_string()),
-                }
+            fn needs_array_quotes(s: &str) -> bool {
+                s.is_empty()
+                    || s.eq_ignore_ascii_case("NULL")
+                    || s.chars().any(|c| {
+                        c.is_whitespace() || matches!(c, '{' | '}' | ',' | '"' | '\\')
+                    })
             }
-            encoder.encode_field(&format!("{{{}}}", parts.join(",")))
+
+            fn escape_array_element(s: &str) -> String {
+                let mut out = String::with_capacity(s.len());
+                for ch in s.chars() {
+                    match ch {
+                        '\\' => out.push_str("\\\\"),
+                        '"' => out.push_str("\\\""),
+                        other => out.push(other),
+                    }
+                }
+                out
+            }
+
+            fn encode_array(elems: &[Value]) -> String {
+                let mut parts = Vec::with_capacity(elems.len());
+                for elem in elems {
+                    let part = match elem {
+                        Value::Null => "NULL".to_string(),
+                        Value::Array(nested) => encode_array(nested),
+                        other => {
+                            let s = match other {
+                                Value::Text(t) => t.clone(),
+                                v => v.to_string(),
+                            };
+                            if needs_array_quotes(&s) {
+                                format!("\"{}\"", escape_array_element(&s))
+                            } else {
+                                s
+                            }
+                        }
+                    };
+                    parts.push(part);
+                }
+                format!("{{{}}}", parts.join(","))
+            }
+
+            encoder.encode_field(&encode_array(elems))
         }
         Value::Json(s) => encoder.encode_field(s),
-        Value::Jsonb(s) => encoder.encode_field(s),
+        Value::Jsonb(s) => {
+            use serde::Serialize;
+
+            struct PgJsonbFormatter;
+
+            impl serde_json::ser::Formatter for PgJsonbFormatter {
+                fn begin_array_value<W: ?Sized + std::io::Write>(
+                    &mut self,
+                    writer: &mut W,
+                    first: bool,
+                ) -> std::io::Result<()> {
+                    if first {
+                        Ok(())
+                    } else {
+                        writer.write_all(b", ")
+                    }
+                }
+
+                fn begin_object_key<W: ?Sized + std::io::Write>(
+                    &mut self,
+                    writer: &mut W,
+                    first: bool,
+                ) -> std::io::Result<()> {
+                    if first {
+                        Ok(())
+                    } else {
+                        writer.write_all(b", ")
+                    }
+                }
+
+                fn begin_object_value<W: ?Sized + std::io::Write>(
+                    &mut self,
+                    writer: &mut W,
+                ) -> std::io::Result<()> {
+                    writer.write_all(b": ")
+                }
+            }
+
+            match serde_json::from_str::<serde_json::Value>(s) {
+                Ok(val) => {
+                    let mut buf = Vec::new();
+                    let mut ser = serde_json::Serializer::with_formatter(&mut buf, PgJsonbFormatter);
+                    if val.serialize(&mut ser).is_ok() {
+                        if let Ok(formatted) = String::from_utf8(buf) {
+                            return encoder.encode_field(&formatted);
+                        }
+                    }
+                    encoder.encode_field(s)
+                }
+                Err(_) => encoder.encode_field(s),
+            }
+        }
         Value::Vector(vec) => {
             // Encode as text: [1,2,3] (compact format for integers, decimals for floats)
             let vec_str = format!(

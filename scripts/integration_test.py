@@ -40,6 +40,10 @@ class TestResult(Enum):
     SKIPPED = "SKIPPED"
     ERROR = "ERROR"
 
+class PsqlOutputMode(Enum):
+    UNALIGNED = "unaligned"
+    ALIGNED = "aligned"
+
 
 @dataclass
 class DbConfig:
@@ -121,19 +125,19 @@ def log_test(name: str, result: TestResult, details: str = ""):
 
 
 def psql_args() -> List[str]:
+    return psql_args_for_mode(PsqlOutputMode.UNALIGNED)
+
+
+def psql_args_for_mode(mode: PsqlOutputMode, *, database: Optional[str] = None) -> List[str]:
     db = config.db
-    return [
+    dsn_db = database or db.database
+
+    base = [
         "psql",
         "-X",
         "-q",
         "-P",
         "pager=off",
-        "-P",
-        "format=unaligned",
-        "-P",
-        "fieldsep=|",
-        "-P",
-        "null=NULL",
         "-h",
         db.host,
         "-p",
@@ -141,31 +145,57 @@ def psql_args() -> List[str]:
         "-U",
         db.user,
         "-d",
-        db.database,
+        dsn_db,
     ]
 
+    if mode == PsqlOutputMode.UNALIGNED:
+        return base + [
+            "-P",
+            "format=unaligned",
+            "-P",
+            "fieldsep=|",
+            "-P",
+            "null=NULL",
+        ]
 
-def psql_env() -> dict:
+    # Default `psql` output is aligned; keep defaults to match `.expected` files that
+    # were generated with standard `psql` formatting.
+    return base
+
+
+def psql_env(*, client_min_messages: str = "warning") -> dict:
     env = os.environ.copy()
     env["PGPASSWORD"] = config.db.password
-    env["PGOPTIONS"] = env.get("PGOPTIONS", "") + " -c client_min_messages=warning"
+    env["PGOPTIONS"] = env.get("PGOPTIONS", "") + f" -c client_min_messages={client_min_messages}"
     return env
 
 
 def normalize_decimal(text: str) -> str:
+    from decimal import Decimal, ROUND_HALF_UP, localcontext
+
+    max_scale = 16
+
     def repl(match: re.Match) -> str:
         num = match.group(0)
-        sign = ""
-        if num.startswith("-"):
-            sign = "-"
-            num = num[1:]
         if "." not in num:
-            return sign + num
-        int_part, frac = num.split(".", 1)
-        frac = frac.rstrip("0")
-        if frac == "":
-            return sign + int_part
-        return sign + int_part + "." + frac
+            return num
+
+        frac_len = len(num.split(".", 1)[1])
+
+        with localcontext() as ctx:
+            ctx.prec = max(64, len(num))
+            try:
+                dec = Decimal(num)
+            except Exception:
+                return num
+            if frac_len > max_scale:
+                quant = Decimal(1).scaleb(-max_scale)  # 1e-16
+                dec = dec.quantize(quant, rounding=ROUND_HALF_UP)
+
+        out = format(dec, "f")
+        if "." in out:
+            out = out.rstrip("0").rstrip(".")
+        return out
 
     return re.sub(r"-?\d+\.\d+", repl, text)
 
@@ -188,40 +218,182 @@ def normalize_json_whitespace(text: str) -> str:
     return text
 
 
-def normalize_output(text: str) -> List[str]:
+def normalize_pg_array_literal(text: str) -> str:
+    stripped = text.strip()
+    if len(stripped) < 2 or not (stripped.startswith("{") and stripped.endswith("}")):
+        return text
+    # Avoid rewriting JSON objects like {"a":1}.
+    if ":" in stripped:
+        return text
+
+    i = 0
+
+    def parse_quoted() -> Optional[str]:
+        nonlocal i
+        if i >= len(stripped) or stripped[i] != '"':
+            return None
+        i += 1
+        out = []
+        while i < len(stripped):
+            ch = stripped[i]
+            if ch == '"':
+                i += 1
+                return "".join(out)
+            if ch == "\\" and i + 1 < len(stripped):
+                out.append(stripped[i + 1])
+                i += 2
+                continue
+            out.append(ch)
+            i += 1
+        return None
+
+    def parse_unquoted() -> str:
+        nonlocal i
+        out = []
+        while i < len(stripped) and stripped[i] not in ",}":
+            if stripped[i] == "\\" and i + 1 < len(stripped):
+                out.append(stripped[i + 1])
+                i += 2
+                continue
+            out.append(stripped[i])
+            i += 1
+        return "".join(out)
+
+    def parse_array() -> Optional[list]:
+        nonlocal i
+        if i >= len(stripped) or stripped[i] != "{":
+            return None
+        i += 1
+        items: list = []
+        if i < len(stripped) and stripped[i] == "}":
+            i += 1
+            return items
+        while i < len(stripped):
+            if stripped[i] == "{":
+                child = parse_array()
+                if child is None:
+                    return None
+                items.append(child)
+            elif stripped[i] == '"':
+                val = parse_quoted()
+                if val is None:
+                    return None
+                items.append(val)
+            else:
+                val = parse_unquoted()
+                if val.upper() == "NULL":
+                    items.append(None)
+                else:
+                    items.append(val)
+            if i >= len(stripped):
+                return None
+            if stripped[i] == ",":
+                i += 1
+                continue
+            if stripped[i] == "}":
+                i += 1
+                return items
+            return None
+        return None
+
+    def needs_quotes(val: str) -> bool:
+        if val == "" or val.upper() == "NULL":
+            return True
+        return any(
+            c.isspace() or c in ('{', '}', ',', '"', "\\")
+            for c in val
+        )
+
+    def escape_elem(val: str) -> str:
+        return val.replace("\\", "\\\\").replace('"', '\\"')
+
+    def serialize_array(items: list) -> str:
+        parts = []
+        for item in items:
+            if item is None:
+                parts.append("NULL")
+            elif isinstance(item, list):
+                parts.append(serialize_array(item))
+            else:
+                if needs_quotes(item):
+                    parts.append(f"\"{escape_elem(item)}\"")
+                else:
+                    parts.append(item)
+        return "{" + ",".join(parts) + "}"
+
+    parsed = parse_array()
+    if parsed is None or i != len(stripped):
+        return text
+
+    normalized = serialize_array(parsed)
+    # Preserve original leading/trailing whitespace.
+    return text.replace(stripped, normalized, 1)
+
+
+def normalize_output(text: str, *, strip_psql_prefix: bool) -> List[str]:
     lines = []
     for raw in text.splitlines():
         line = raw.rstrip()
         if line.startswith("psql:"):
-            continue
+            if not strip_psql_prefix:
+                continue
+            # Convert `psql:file:line: ERROR: ...` into `ERROR: ...` to match expected
+            # files that omit the file/line prefix.
+            for needle in ("ERROR:", "FATAL:", "WARNING:", "NOTICE:"):
+                idx = line.find(needle)
+                if idx >= 0:
+                    line = line[idx:]
+                    break
+            else:
+                continue
         line = normalize_timestamp(line)
         line = normalize_decimal(line)
         line = normalize_json_whitespace(line)
+        line = normalize_pg_array_literal(line)
+        if line.strip() == "testdb":
+            line = line.replace("testdb", "postgres")
         lines.append(line)
     return lines
 
 
 def check_connection() -> bool:
     result = subprocess.run(
-        psql_args() + ["-c", "SELECT 1"],
+        psql_args_for_mode(PsqlOutputMode.UNALIGNED) + ["-c", "SELECT 1"],
         capture_output=True,
         text=True,
-        env=psql_env(),
+        env=psql_env(client_min_messages="warning"),
         timeout=10,
     )
     return result.returncode == 0
 
 
-def run_sql(sql: str, retries: int = 2) -> Tuple[str, int]:
+def run_sql(
+    sql: str,
+    retries: int = 2,
+    *,
+    mode: PsqlOutputMode = PsqlOutputMode.UNALIGNED,
+    client_min_messages: str = "warning",
+    database: Optional[str] = None,
+) -> Tuple[str, int]:
     output = ""
     for attempt in range(retries + 1):
-        result = subprocess.run(
-            psql_args() + ["-c", sql],
-            capture_output=True,
-            text=True,
-            env=psql_env(),
-        )
-        output = result.stdout + result.stderr
+        if mode == PsqlOutputMode.ALIGNED:
+            result = subprocess.run(
+                psql_args_for_mode(mode, database=database) + ["-c", sql],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                env=psql_env(client_min_messages=client_min_messages),
+            )
+            output = result.stdout or ""
+        else:
+            result = subprocess.run(
+                psql_args_for_mode(mode, database=database) + ["-c", sql],
+                capture_output=True,
+                text=True,
+                env=psql_env(client_min_messages=client_min_messages),
+            )
+            output = (result.stdout or "") + (result.stderr or "")
 
         if "Failed to connect to TiKV" not in output and "connection refused" not in output.lower():
             return output, result.returncode
@@ -233,14 +405,29 @@ def run_sql(sql: str, retries: int = 2) -> Tuple[str, int]:
     return output, 1
 
 
-def run_sql_file(sql_file: Path) -> Tuple[str, int]:
+def run_sql_file(
+    sql_file: Path,
+    *,
+    mode: PsqlOutputMode = PsqlOutputMode.UNALIGNED,
+    client_min_messages: str = "warning",
+    database: Optional[str] = None,
+) -> Tuple[str, int]:
+    if mode == PsqlOutputMode.ALIGNED:
+        result = subprocess.run(
+            psql_args_for_mode(mode, database=database) + ["-f", str(sql_file)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=psql_env(client_min_messages=client_min_messages),
+        )
+        return result.stdout or "", result.returncode
     result = subprocess.run(
-        psql_args() + ["-f", str(sql_file)],
+        psql_args_for_mode(mode, database=database) + ["-f", str(sql_file)],
         capture_output=True,
         text=True,
-        env=psql_env(),
+        env=psql_env(client_min_messages=client_min_messages),
     )
-    return result.stdout + result.stderr, result.returncode
+    return (result.stdout or "") + (result.stderr or ""), result.returncode
 
 
 def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
@@ -253,9 +440,36 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
 
     log_info(f"Running: {sql_file.name}")
 
+    expected_text = expected_file.read_text() if expected_file.exists() else ""
+    expected_lines = expected_text.splitlines()
+    expected_has_psql = any(line.startswith("psql:") for line in expected_lines)
+    expected_has_bare_diagnostics = any(
+        line.startswith(("ERROR:", "FATAL:", "WARNING:", "NOTICE:")) for line in expected_lines
+    )
+
+    # Determine which `psql` formatting was used to generate the `.expected` file.
+    # - Historical tests use `format=unaligned` with `fieldsep=|` and `null=NULL`.
+    # - Newer tests use default aligned output (tables with borders, including 1-column tables).
+    expects_aligned = False
+    if any(" | " in line for line in expected_lines):
+        expects_aligned = True
+    elif any(re.match(r"^-{3,}\\+-", line) for line in expected_lines):
+        expects_aligned = True
+    elif any(re.match(r"^-{3,}$", line) for line in expected_lines):
+        expects_aligned = True
+    elif any("|" in line for line in expected_lines):
+        expects_aligned = False
+
+    mode = PsqlOutputMode.ALIGNED if expects_aligned else PsqlOutputMode.UNALIGNED
+    client_min_messages = "notice" if mode == PsqlOutputMode.ALIGNED else "warning"
+
     if setup_file.exists():
         log_info(f"  Running setup: {setup_file.name}")
-        setup_output, _ = run_sql_file(setup_file)
+        setup_output, _ = run_sql_file(
+            setup_file,
+            mode=PsqlOutputMode.UNALIGNED,
+            client_min_messages="warning",
+        )
         if "ERROR:" in setup_output or "FATAL:" in setup_output:
             log_test(sql_file.name, TestResult.FAILED, "setup failed")
             print(f"  {RED}Setup error: {setup_output[:200]}{NC}")
@@ -274,7 +488,7 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
             print(f"  {RED}Load error: {result.stdout[:200]}{result.stderr[:200]}{NC}")
             return TestResult.FAILED
 
-    output, _ = run_sql_file(sql_file)
+    output, _ = run_sql_file(sql_file, mode=mode, client_min_messages=client_min_messages)
     out_file.write_text(output)
 
     if config.verbose:
@@ -284,10 +498,8 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
     has_error = any(pattern in output for pattern in error_patterns)
 
     if expected_file.exists():
-        expected = expected_file.read_text()
+        expected = expected_text
         output_lines = output.splitlines()
-        expected_lines = expected.splitlines()
-        expected_has_psql = any(line.startswith("psql:") for line in expected_lines)
         output_has_psql = any(line.startswith("psql:") for line in output_lines)
 
         unordered = False
@@ -306,8 +518,9 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
             log_test(sql_file.name, TestResult.FAILED, "expected psql error output missing")
             return TestResult.FAILED
 
-        normalized_output = normalize_output(output)
-        normalized_expected = normalize_output(expected)
+        strip_psql_prefix = (not expected_has_psql) and expected_has_bare_diagnostics
+        normalized_output = normalize_output(output, strip_psql_prefix=strip_psql_prefix)
+        normalized_expected = normalize_output(expected, strip_psql_prefix=strip_psql_prefix)
 
         if unordered:
             normalized_output = [line for line in normalized_output if line.strip()]

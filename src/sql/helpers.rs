@@ -456,7 +456,12 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
         | SqlDataType::Character(_)
         | SqlDataType::CharacterVarying(_) => Ok(DataType::Text),
         SqlDataType::Bytea => Ok(DataType::Bytes),
-        SqlDataType::Timestamp(_, _) => Ok(DataType::Timestamp),
+        SqlDataType::Timestamp(_, tz) => match tz {
+            sqlparser::ast::TimezoneInfo::WithTimeZone | sqlparser::ast::TimezoneInfo::Tz => {
+                Ok(DataType::TimestampTz)
+            }
+            _ => Ok(DataType::Timestamp),
+        },
         SqlDataType::Date => Ok(DataType::Date),
         SqlDataType::Time(_, _) => Ok(DataType::Time),
         SqlDataType::Uuid => Ok(DataType::Uuid),
@@ -469,6 +474,7 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
                     "BIGSERIAL" => Ok(DataType::Int64),
                     "JSON" => Ok(DataType::Json),
                     "JSONB" => Ok(DataType::Jsonb),
+                    "TIMESTAMPTZ" => Ok(DataType::TimestampTz),
                     "VECTOR" => {
                         // Extract dimension from type modifiers if available
                         // sqlparser parses vector(3) as Custom type with Vec<String> modifiers
@@ -625,6 +631,7 @@ pub fn collect_having_agg_funcs(
             collect_having_agg_funcs(right, agg_funcs, extra_start);
         }
         Expr::Nested(e) => collect_having_agg_funcs(e, agg_funcs, extra_start),
+        Expr::Cast { expr, .. } => collect_having_agg_funcs(expr, agg_funcs, extra_start),
         _ => {}
     }
 }
@@ -642,6 +649,19 @@ pub fn eval_having_expr(
             let left_val = eval_having_expr(left, row, schema, agg_funcs, aggs)?;
             let right_val = eval_having_expr(right, row, schema, agg_funcs, aggs)?;
             super::expr::eval_binary_op_public(left_val, op, right_val)
+        }
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            format,
+        } => {
+            let inner_val = eval_having_expr(inner, row, schema, agg_funcs, aggs)?;
+            let cast_expr = Expr::Cast {
+                expr: Box::new(value_to_sql_expr(&inner_val)),
+                data_type: data_type.clone(),
+                format: format.clone(),
+            };
+            eval_expr(&cast_expr, Some(row), Some(schema))
         }
         Expr::Function(f) => {
             let func_name = f
@@ -755,6 +775,14 @@ pub fn eval_having_expr_join(
             let left_val = eval_having_expr_join(left, ctx, agg_funcs, aggs)?;
             let right_val = eval_having_expr_join(right, ctx, agg_funcs, aggs)?;
             super::expr::eval_binary_op_public(left_val, op, right_val)
+        }
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            let inner_val = eval_having_expr_join(inner, ctx, agg_funcs, aggs)?;
+            super::expr::cast_value_public(inner_val, data_type)
         }
         Expr::Function(f) => {
             let func_name = f
@@ -1075,6 +1103,7 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
         Expr::Cast { data_type, .. } => sql_datatype_to_internal(data_type),
         Expr::TypedString { data_type, .. } => sql_datatype_to_internal(data_type),
         Expr::Interval(_) => DataType::Interval,
+        Expr::Extract { .. } => DataType::Float64,
         Expr::JsonAccess { operator, .. } => match operator {
             sqlparser::ast::JsonOperator::Arrow => DataType::Jsonb,
             sqlparser::ast::JsonOperator::LongArrow => DataType::Text,
@@ -1100,7 +1129,26 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                         DataType::Text
                     }
                 }
-                "AVG" => DataType::Float64,
+                "AVG" => {
+                    let arg_type =
+                        if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
+                            f.args.first()
+                        {
+                            infer_expr_type(arg_expr, schema)
+                        } else {
+                            DataType::Text
+                        };
+                    match arg_type {
+                        DataType::Float64 => DataType::Float64,
+                        DataType::Numeric { .. } | DataType::Int32 | DataType::Int64 => {
+                            DataType::Numeric {
+                                precision: None,
+                                scale: None,
+                            }
+                        }
+                        _ => DataType::Float64,
+                    }
+                }
                 "MIN" | "MAX" => {
                     if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
                         f.args.first()
@@ -1122,13 +1170,23 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                         DataType::Text
                     }
                 }
-                "NOW" | "CURRENT_TIMESTAMP" => DataType::Timestamp,
+                "NOW" | "CURRENT_TIMESTAMP" => DataType::TimestampTz,
                 "CURRENT_DATE" => DataType::Date,
                 "DATE" => DataType::Date,
                 "NEXTVAL" | "CURRVAL" | "SETVAL" => DataType::Int64,
                 "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => DataType::Uuid,
-                "JSONB_BUILD_OBJECT" | "JSONB_AGG" | "TO_JSONB" => DataType::Jsonb,
-                "JSON_BUILD_OBJECT" | "JSON_AGG" | "TO_JSON" => DataType::Json,
+                "JSONB_BUILD_OBJECT" | "JSONB_BUILD_ARRAY" | "JSONB_SET" | "JSONB_AGG" | "TO_JSONB" => {
+                    DataType::Jsonb
+                }
+                "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "JSON_SET" | "JSON_AGG" | "TO_JSON" => {
+                    DataType::Json
+                }
+                "JSONB_ARRAY_LENGTH" | "JSON_ARRAY_LENGTH" => DataType::Int32,
+                "JSONB_TYPEOF" | "JSON_TYPEOF" => DataType::Text,
+                "JSONB_EXISTS" | "JSONB_EXISTS_ANY" | "JSONB_EXISTS_ALL" => DataType::Boolean,
+                "ROW_TO_JSON" => DataType::Json,
+                "DECODE" => DataType::Bytes,
+                "BIT_LENGTH" | "OCTET_LENGTH" => DataType::Int32,
                 "COALESCE" | "NULLIF" | "GREATEST" | "LEAST" => {
                     if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
                         f.args.first()
@@ -1313,7 +1371,12 @@ fn sql_datatype_to_internal(dt: &SqlDataType) -> DataType {
             };
             DataType::Numeric { precision, scale }
         }
-        SqlDataType::Timestamp(_, _) => DataType::Timestamp,
+        SqlDataType::Timestamp(_, tz) => match tz {
+            sqlparser::ast::TimezoneInfo::WithTimeZone | sqlparser::ast::TimezoneInfo::Tz => {
+                DataType::TimestampTz
+            }
+            _ => DataType::Timestamp,
+        },
         SqlDataType::Date => DataType::Date,
         SqlDataType::Time(_, _) => DataType::Time,
         SqlDataType::Interval => DataType::Interval,
@@ -1326,7 +1389,7 @@ fn sql_datatype_to_internal(dt: &SqlDataType) -> DataType {
                 match type_name.as_str() {
                     "JSONB" => DataType::Jsonb,
                     "JSON" => DataType::Json,
-                    "TIMESTAMPTZ" => DataType::Timestamp,
+                    "TIMESTAMPTZ" => DataType::TimestampTz,
                     _ => DataType::Text,
                 }
             } else {
@@ -1553,7 +1616,7 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
             .parse::<f64>()
             .map(Value::Float64)
             .unwrap_or(Value::Text(unescaped)),
-        DataType::Timestamp => {
+        DataType::Timestamp | DataType::TimestampTz => {
             if let Ok(ts) =
                 chrono::NaiveDateTime::parse_from_str(&unescaped, "%Y-%m-%d %H:%M:%S%.f")
             {

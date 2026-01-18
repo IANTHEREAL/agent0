@@ -35,7 +35,7 @@ impl Executor {
             right,
         } = &*query.body
         {
-            return self
+            let result = self
                 .execute_set_operation(
                     txn,
                     sequence_values,
@@ -46,7 +46,28 @@ impl Executor {
                     right,
                     ctes,
                 )
-                .await;
+                .await?;
+
+            // ORDER BY / LIMIT / OFFSET apply to the full set-operation result.
+            if let ExecuteResult::Select {
+                columns,
+                column_types,
+                rows,
+            } = result
+            {
+                let mut rows = rows;
+                if !query.order_by.is_empty() {
+                    rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns);
+                }
+                rows = apply_offset_limit_fetch(rows, query);
+                return Ok(ExecuteResult::Select {
+                    columns,
+                    column_types,
+                    rows,
+                });
+            }
+
+            return Ok(result);
         }
 
         let select = match &*query.body {
@@ -61,7 +82,7 @@ impl Executor {
 
         if select.from.is_empty() {
             let result = self
-                .execute_tableless_query(txn, sequence_values, search_path, select)
+                .execute_tableless_query(txn, sequence_values, search_path, select, ctes)
                 .await?;
             if let Some((target_name, _temp)) = select_into_target {
                 return self
@@ -93,21 +114,41 @@ impl Executor {
         }
 
         let (t, outer_alias, schema, all_rows_base, is_virtual) = match &select.from[0].relation {
-            TableFactor::Table { name, alias, .. } => {
+            TableFactor::Table {
+                name, alias, args, ..
+            } => {
                 let (schema_opt, obj_name) = names::split_object_name(name)?;
-                let lookup_name = match schema_opt {
-                    Some(schema) => format!("{}.{}", schema, obj_name),
-                    None => obj_name.clone(),
-                };
-                let (schema, rows) = self
-                    .get_table_data(txn, sequence_values, search_path, &lookup_name, ctes)
-                    .await?;
-                let is_virtual = schema.table_id == 0;
-                let alias_str = alias
-                    .as_ref()
-                    .map(|a| a.name.value.clone())
-                    .unwrap_or_else(|| obj_name.clone());
-                (schema.name.clone(), alias_str, schema, rows, is_virtual)
+                let tbl_upper = obj_name.to_uppercase();
+
+                // Handle GENERATE_SERIES as a table-valued function
+                if tbl_upper == "GENERATE_SERIES" {
+                    if let Some(func_args) = args {
+                        let als = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| obj_name.clone());
+                        let (schema, rows) = self
+                            .execute_generate_series(func_args, &als, alias.as_ref())
+                            .await?;
+                        (schema.name.clone(), als, schema, rows, true)
+                    } else {
+                        return Err(anyhow!("generate_series requires at least 2 arguments"));
+                    }
+                } else {
+                    let lookup_name = match schema_opt {
+                        Some(schema) => format!("{}.{}", schema, obj_name),
+                        None => obj_name.clone(),
+                    };
+                    let (schema, rows) = self
+                        .get_table_data(txn, sequence_values, search_path, &lookup_name, ctes)
+                        .await?;
+                    let is_virtual = schema.table_id == 0;
+                    let alias_str = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| obj_name.clone());
+                    (schema.name.clone(), alias_str, schema, rows, is_virtual)
+                }
             }
             TableFactor::Derived {
                 subquery, alias, ..
@@ -144,7 +185,7 @@ impl Executor {
                 Some(sel.clone())
             } else {
                 Some(
-                    self.resolve_subqueries(txn, sequence_values, search_path, sel)
+                    self.resolve_subqueries(txn, sequence_values, search_path, sel, ctes)
                         .await?,
                 )
             }
@@ -159,6 +200,7 @@ impl Executor {
                 search_path,
                 &select.projection,
                 &outer_alias,
+                ctes,
             )
             .await?;
 
@@ -322,6 +364,9 @@ impl Executor {
             GroupByExpr::All => return Err(anyhow!("GROUP BY ALL not supported")),
         };
 
+        let grouping_sets = extract_grouping_sets(group_keys_exprs);
+        let has_grouping_sets = grouping_sets.is_some();
+
         let window_funcs = extract_window_functions(&select.projection);
 
         let mut agg_funcs: Vec<(usize, AggExpr)> = Vec::new();
@@ -376,6 +421,23 @@ impl Executor {
         let is_agg = !group_keys_exprs.is_empty() || !agg_funcs.is_empty();
 
         if is_agg {
+            if has_grouping_sets {
+                return self
+                    .execute_grouping_sets_query(
+                        txn,
+                        sequence_values,
+                        search_path,
+                        query,
+                        select,
+                        &schema,
+                        filtered_rows,
+                        grouping_sets.unwrap(),
+                        agg_funcs,
+                        &resolved_projection,
+                        select_into_target,
+                    )
+                    .await;
+            }
             return self
                 .execute_aggregate_query(
                     txn,
@@ -787,6 +849,293 @@ impl Executor {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_grouping_sets_query(
+        &self,
+        txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        query: &Query,
+        select: &sqlparser::ast::Select,
+        schema: &TableSchema,
+        filtered_rows: Vec<Row>,
+        grouping_sets: Vec<Vec<Expr>>,
+        agg_funcs: Vec<(usize, AggExpr)>,
+        resolved_projection: &[SelectItem],
+        select_into_target: Option<(ObjectName, bool)>,
+    ) -> Result<ExecuteResult> {
+        let col_names: Vec<String> = resolved_projection
+            .iter()
+            .map(get_select_item_name)
+            .collect();
+
+        let all_group_cols: Vec<Expr> = grouping_sets
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        let mut all_final_rows = Vec::new();
+
+        for grouping_set in &grouping_sets {
+            let mut groups: HashMap<Vec<u8>, Vec<Aggregator>> = HashMap::new();
+            let mut group_rows: HashMap<Vec<u8>, Row> = HashMap::new();
+
+            for row in &filtered_rows {
+                let mut key = Vec::new();
+                for expr in grouping_set {
+                    key.push(
+                        self.eval_expr_maybe_sequence(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            expr,
+                            Some(row),
+                            Some(schema),
+                        )
+                        .await?,
+                    );
+                }
+                let key_bytes = bincode::serialize(&key).unwrap();
+
+                if !groups.contains_key(&key_bytes) {
+                    let mut aggs = Vec::new();
+                    for (_, agg_expr) in &agg_funcs {
+                        match agg_expr {
+                            AggExpr::Function(f) => {
+                                let name = f.name.0.last().unwrap().value.to_uppercase();
+                                if name == "STRING_AGG" {
+                                    let delimiter = if f.args.len() >= 2 {
+                                        match &f.args[1] {
+                                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                                match self
+                                                    .eval_expr_maybe_sequence(
+                                                        txn,
+                                                        sequence_values,
+                                                        search_path,
+                                                        e,
+                                                        Some(row),
+                                                        Some(schema),
+                                                    )
+                                                    .await?
+                                                {
+                                                    Value::Text(s) => s,
+                                                    _ => ",".to_string(),
+                                                }
+                                            }
+                                            _ => ",".to_string(),
+                                        }
+                                    } else {
+                                        ",".to_string()
+                                    };
+                                    aggs.push(Aggregator::new_string_agg(delimiter));
+                                } else {
+                                    aggs.push(Aggregator::new(&name)?);
+                                }
+                            }
+                            AggExpr::ArrayAgg(_) => {
+                                aggs.push(Aggregator::new_array_agg());
+                            }
+                        }
+                    }
+                    groups.insert(key_bytes.clone(), aggs);
+                    group_rows.insert(key_bytes.clone(), row.clone());
+                }
+
+                let aggs = groups.get_mut(&key_bytes).unwrap();
+                for (agg_idx, (_, agg_expr)) in agg_funcs.iter().enumerate() {
+                    let (filter_expr, arg_expr) = match agg_expr {
+                        AggExpr::Function(f) => {
+                            let filter = f.filter.as_ref().map(|e| e.as_ref());
+                            let arg = if f.args.is_empty() {
+                                None
+                            } else {
+                                match &f.args[0] {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => None,
+                                    _ => return Err(anyhow!("Unsupported arg")),
+                                }
+                            };
+                            (filter, arg)
+                        }
+                        AggExpr::ArrayAgg(arr) => (None, Some(arr.expr.as_ref())),
+                    };
+
+                    if let Some(filter) = filter_expr {
+                        let filter_val = self
+                            .eval_expr_maybe_sequence(
+                                txn,
+                                sequence_values,
+                                search_path,
+                                filter,
+                                Some(row),
+                                Some(schema),
+                            )
+                            .await?;
+                        if !matches!(filter_val, Value::Boolean(true)) {
+                            continue;
+                        }
+                    }
+
+                    let val = if let Some(e) = arg_expr {
+                        self.eval_expr_maybe_sequence(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            e,
+                            Some(row),
+                            Some(schema),
+                        )
+                        .await?
+                    } else {
+                        Value::Int32(1)
+                    };
+                    aggs[agg_idx].update(&val)?;
+                }
+            }
+
+            for (key_bytes, aggs) in groups {
+                let representative = &group_rows[&key_bytes];
+
+                let mut group_eval_row = representative.clone();
+                for group_expr in &all_group_cols {
+                    let is_in_current_set = grouping_set
+                        .iter()
+                        .any(|gs_expr| expr_matches(gs_expr, group_expr));
+                    if is_in_current_set {
+                        continue;
+                    }
+
+                    let col_name = match group_expr {
+                        Expr::Identifier(ident) => Some(ident.value.as_str()),
+                        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.as_str()),
+                        _ => None,
+                    };
+                    if let Some(col_name) = col_name {
+                        if let Some(idx) = schema
+                            .columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                        {
+                            if idx < group_eval_row.values.len() {
+                                group_eval_row.values[idx] = Value::Null;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(having_expr) = &select.having {
+                    let having_expr = if sequences::expr_needs_async_eval(having_expr) {
+                        sequences::replace_sequence_functions(
+                            &self.store(),
+                            txn,
+                            sequence_values,
+                            search_path,
+                            having_expr,
+                            Some(&group_eval_row),
+                            Some(schema),
+                        )
+                        .await?
+                    } else {
+                        having_expr.clone()
+                    };
+                    let having_val =
+                        eval_having_expr(&having_expr, &group_eval_row, schema, &agg_funcs, &aggs)?;
+                    if !matches!(having_val, Value::Boolean(true)) {
+                        continue;
+                    }
+                }
+
+                let mut row_values = Vec::new();
+
+                for (i, item) in resolved_projection.iter().enumerate() {
+                    if let Some(agg_pos) = agg_funcs.iter().position(|(idx, _)| *idx == i) {
+                        row_values.push(aggs[agg_pos].result());
+                    } else {
+                        let expr = match item {
+                            SelectItem::UnnamedExpr(e)
+                            | SelectItem::ExprWithAlias { expr: e, .. } => e,
+                            _ => return Err(anyhow!("Unsupported item")),
+                        };
+
+                        if let Expr::Function(func) = expr {
+                            let func_name = func
+                                .name
+                                .0
+                                .last()
+                                .map(|i| i.value.to_uppercase())
+                                .unwrap_or_default();
+                            if func_name == "GROUPING" && func.args.len() == 1 {
+                                let arg_expr = match &func.args[0] {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                };
+                                if let Some(arg_expr) = arg_expr {
+                                    let is_in_current_set = grouping_set
+                                        .iter()
+                                        .any(|gs_expr| expr_matches(gs_expr, arg_expr));
+                                    row_values.push(Value::Int32(if is_in_current_set { 0 } else { 1 }));
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let is_in_current_set =
+                            grouping_set.iter().any(|gs_expr| expr_matches(gs_expr, expr));
+                        if is_in_current_set {
+                            let expr = if sequences::expr_needs_async_eval(expr) {
+                                sequences::replace_sequence_functions(
+                                    &self.store(),
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    expr,
+                                    Some(&group_eval_row),
+                                    Some(schema),
+                                )
+                                .await?
+                            } else {
+                                expr.clone()
+                            };
+                            row_values.push(super::helpers::eval_having_expr(
+                                &expr,
+                                &group_eval_row,
+                                schema,
+                                &agg_funcs,
+                                &aggs,
+                            )?);
+                        } else {
+                            row_values.push(Value::Null);
+                        }
+                    }
+                }
+                all_final_rows.push(Row::new(row_values));
+            }
+        }
+
+        let final_rows = if !query.order_by.is_empty() {
+            self.apply_order_by_for_aggregate(all_final_rows, &query.order_by, &col_names)
+        } else {
+            all_final_rows
+        };
+
+        let final_rows = apply_offset_limit_fetch(final_rows, query);
+
+        let result = ExecuteResult::Select {
+            column_types: None,
+            columns: col_names,
+            rows: final_rows,
+        };
+        if let Some((target_name, _temp)) = select_into_target {
+            return self
+                .create_table_from_result(txn, search_path, &target_name, result)
+                .await;
+        }
+        Ok(result)
+    }
+
     fn apply_order_by_for_aggregate(
         &self,
         rows: Vec<Row>,
@@ -794,14 +1143,17 @@ impl Executor {
         col_names: &[String],
     ) -> Vec<Row> {
         let mut indexed: Vec<(usize, Row)> = rows.into_iter().enumerate().collect();
-        indexed.sort_by(|(_, a), (_, b)| {
+        indexed.sort_by(|(idx_a, a), (idx_b, b)| {
             for order_expr in order_by {
-                let col_idx = if let Expr::Identifier(ref ident) = order_expr.expr {
-                    col_names
+                let col_idx = match &order_expr.expr {
+                    Expr::Identifier(ident) => col_names
                         .iter()
-                        .position(|n| n.eq_ignore_ascii_case(&ident.value))
-                } else {
-                    None
+                        .position(|n| n.eq_ignore_ascii_case(&ident.value)),
+                    Expr::CompoundIdentifier(parts) => parts
+                        .last()
+                        .and_then(|ident| col_names.iter().position(|n| n.eq_ignore_ascii_case(&ident.value))),
+                    Expr::Value(SqlValue::Number(n, _)) => n.parse::<usize>().ok().map(|i| i.saturating_sub(1)),
+                    _ => None,
                 };
 
                 let (val_a, val_b) = if let Some(idx) = col_idx {
@@ -812,9 +1164,31 @@ impl Executor {
 
                 let val_a = val_a.unwrap_or(Value::Null);
                 let val_b = val_b.unwrap_or(Value::Null);
+
+                let asc = order_expr.asc.unwrap_or(true);
+                let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+
+                match (&val_a, &val_b) {
+                    (Value::Null, Value::Null) => continue,
+                    (Value::Null, _) => {
+                        return if nulls_first {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Greater
+                        }
+                    }
+                    (_, Value::Null) => {
+                        return if nulls_first {
+                            std::cmp::Ordering::Greater
+                        } else {
+                            std::cmp::Ordering::Less
+                        }
+                    }
+                    _ => {}
+                }
+
                 let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
                 if cmp != 0 {
-                    let asc = order_expr.asc.unwrap_or(true);
                     return if asc {
                         if cmp > 0 {
                             std::cmp::Ordering::Greater
@@ -828,7 +1202,24 @@ impl Executor {
                     };
                 }
             }
-            std::cmp::Ordering::Equal
+
+            // Deterministic tie-breaker to match PostgreSQL's stable-looking output:
+            // compare full output rows when ORDER BY keys are equal.
+            let max_cols = a.values.len().max(b.values.len());
+            for i in 0..max_cols {
+                let va = a.values.get(i).unwrap_or(&Value::Null);
+                let vb = b.values.get(i).unwrap_or(&Value::Null);
+                let cmp = super::expr::compare_values(va, vb).unwrap_or(0);
+                if cmp != 0 {
+                    return if cmp > 0 {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Less
+                    };
+                }
+            }
+
+            idx_a.cmp(idx_b)
         });
         indexed.into_iter().map(|(_, r)| r).collect()
     }
@@ -1022,18 +1413,52 @@ impl Executor {
             }
         }
 
-        fn is_unnest_call(expr: &Expr) -> bool {
-            if let Expr::Function(f) = expr {
-                if let Some(name) = f.name.0.last() {
-                    return name.value.eq_ignore_ascii_case("unnest");
-                }
-            }
-            false
+        #[derive(Copy, Clone)]
+        enum SrfKind {
+            Unnest,
+            RegexpSplitToTable,
+            RegexpMatches,
+            EvalFunctionArray,
         }
 
-        let has_unnest = resolved_projection.iter().any(|item| match item {
+        fn srf_kind(expr: &Expr) -> Option<SrfKind> {
+            let Expr::Function(f) = expr else {
+                return None;
+            };
+            let Some(name) = f.name.0.last() else {
+                return None;
+            };
+            match name.value.to_ascii_uppercase().as_str() {
+                "UNNEST" => Some(SrfKind::Unnest),
+                "REGEXP_SPLIT_TO_TABLE" => Some(SrfKind::RegexpSplitToTable),
+                "REGEXP_MATCHES" => Some(SrfKind::RegexpMatches),
+                "JSONB_OBJECT_KEYS"
+                | "JSONB_ARRAY_ELEMENTS"
+                | "JSONB_ARRAY_ELEMENTS_TEXT"
+                | "JSONB_EACH"
+                | "JSONB_EACH_TEXT" => Some(SrfKind::EvalFunctionArray),
+                _ => None,
+            }
+        }
+
+        fn regexp_captures_to_values(caps: &regex::Captures<'_>) -> Vec<Value> {
+            if caps.len() > 1 {
+                (1..caps.len())
+                    .map(|idx| match caps.get(idx) {
+                        Some(m) => Value::Text(m.as_str().to_string()),
+                        None => Value::Null,
+                    })
+                    .collect()
+            } else {
+                caps.get(0)
+                    .map(|m| vec![Value::Text(m.as_str().to_string())])
+                    .unwrap_or_default()
+            }
+        }
+
+        let has_srf = resolved_projection.iter().any(|item| match item {
             SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                is_unnest_call(e)
+                srf_kind(e).is_some()
             }
             _ => false,
         });
@@ -1041,7 +1466,7 @@ impl Executor {
         let mut result_rows = Vec::new();
         for (row_idx, row) in rows_for_projection.iter().enumerate() {
             let mut row_values = Vec::new();
-            let mut unnest_arrays: Vec<(usize, Vec<Value>)> = Vec::new();
+            let mut srf_outputs: Vec<(usize, Vec<Value>)> = Vec::new();
 
             for (proj_idx, item) in resolved_projection.iter().enumerate() {
                 if let Some(wf_pos) = window_funcs.iter().position(|wf| wf.proj_idx == proj_idx) {
@@ -1060,30 +1485,251 @@ impl Executor {
                         }
                     };
 
-                    if has_unnest && is_unnest_call(expr) {
-                        if let Expr::Function(f) = expr {
-                            if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
-                                f.args.first()
-                            {
-                                let arr_val = self
-                                    .eval_expr_maybe_sequence(
-                                        txn,
-                                        sequence_values,
-                                        search_path,
-                                        arg_expr,
-                                        Some(row),
-                                        Some(schema),
-                                    )
-                                    .await?;
-                                if let Value::Array(arr) = arr_val {
-                                    unnest_arrays.push((row_values.len(), arr.clone()));
-                                    row_values.push(Value::Null);
-                                } else {
-                                    row_values.push(arr_val);
-                                }
-                            } else {
+                    if has_srf {
+                        if let Some(kind) = srf_kind(expr) {
+                            let Expr::Function(f) = expr else {
                                 row_values.push(Value::Null);
-                            }
+                                continue;
+                            };
+
+                            let outputs = match kind {
+                                SrfKind::Unnest => {
+                                    let arg_expr = f.args.first().and_then(|arg| match arg {
+                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                        _ => None,
+                                    });
+                                    if let Some(arg_expr) = arg_expr {
+                                        match self
+                                            .eval_expr_maybe_sequence(
+                                                txn,
+                                                sequence_values,
+                                                search_path,
+                                                arg_expr,
+                                                Some(row),
+                                                Some(schema),
+                                            )
+                                            .await?
+                                        {
+                                            Value::Array(arr) => arr,
+                                            Value::Null => Vec::new(),
+                                            other => vec![other],
+                                        }
+                                    } else {
+                                        Vec::new()
+                                    }
+                                }
+                                SrfKind::RegexpSplitToTable => {
+                                    let arg0 = f.args.get(0).and_then(|arg| match arg {
+                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                        _ => None,
+                                    });
+                                    let arg1 = f.args.get(1).and_then(|arg| match arg {
+                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                        _ => None,
+                                    });
+                                    let arg2 = f.args.get(2).and_then(|arg| match arg {
+                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                        _ => None,
+                                    });
+                                    let (Some(arg0), Some(arg1)) = (arg0, arg1) else {
+                                        return Err(anyhow!(
+                                            "regexp_split_to_table requires at least 2 arguments"
+                                        ));
+                                    };
+
+                                    let source_val = self
+                                        .eval_expr_maybe_sequence(
+                                            txn,
+                                            sequence_values,
+                                            search_path,
+                                            arg0,
+                                            Some(row),
+                                            Some(schema),
+                                        )
+                                        .await?;
+                                    let source = match source_val {
+                                        Value::Text(s) => Some(s),
+                                        Value::Null => None,
+                                        v => Some(v.to_string()),
+                                    };
+
+                                    let pattern_val = self
+                                        .eval_expr_maybe_sequence(
+                                            txn,
+                                            sequence_values,
+                                            search_path,
+                                            arg1,
+                                            Some(row),
+                                            Some(schema),
+                                        )
+                                        .await?;
+                                    let pattern = match pattern_val {
+                                        Value::Text(s) => Some(s),
+                                        Value::Null => None,
+                                        v => Some(v.to_string()),
+                                    };
+
+                                    match (source, pattern) {
+                                        (Some(source), Some(pattern)) => {
+                                        let flags = if let Some(arg2) = arg2 {
+                                            match self
+                                                .eval_expr_maybe_sequence(
+                                                    txn,
+                                                    sequence_values,
+                                                    search_path,
+                                                    arg2,
+                                                    Some(row),
+                                                    Some(schema),
+                                                )
+                                                .await?
+                                            {
+                                                Value::Text(s) => s,
+                                                Value::Null => String::new(),
+                                                v => v.to_string(),
+                                            }
+                                        } else {
+                                            String::new()
+                                        };
+                                        let case_insensitive =
+                                            flags.to_ascii_lowercase().contains('i');
+                                        let regex_pattern = if case_insensitive {
+                                            format!("(?i){}", pattern)
+                                        } else {
+                                            pattern
+                                        };
+                                        let re = regex::Regex::new(&regex_pattern)
+                                            .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+
+                                        let mut parts = Vec::new();
+                                        let mut last_end = 0usize;
+                                        for m in re.find_iter(&source) {
+                                            parts.push(Value::Text(
+                                                source[last_end..m.start()].to_string(),
+                                            ));
+                                            last_end = m.end();
+                                        }
+                                        parts.push(Value::Text(source[last_end..].to_string()));
+                                        parts
+                                        }
+                                        _ => Vec::new(),
+                                    }
+                                }
+                                SrfKind::RegexpMatches => {
+                                    let arg0 = f.args.get(0).and_then(|arg| match arg {
+                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                        _ => None,
+                                    });
+                                    let arg1 = f.args.get(1).and_then(|arg| match arg {
+                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                        _ => None,
+                                    });
+                                    let arg2 = f.args.get(2).and_then(|arg| match arg {
+                                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                        _ => None,
+                                    });
+                                    let (Some(arg0), Some(arg1)) = (arg0, arg1) else {
+                                        return Err(anyhow!(
+                                            "regexp_matches requires at least 2 arguments"
+                                        ));
+                                    };
+                                    let source_val = self
+                                        .eval_expr_maybe_sequence(
+                                            txn,
+                                            sequence_values,
+                                            search_path,
+                                            arg0,
+                                            Some(row),
+                                            Some(schema),
+                                        )
+                                        .await?;
+                                    let source = match source_val {
+                                        Value::Text(s) => Some(s),
+                                        Value::Null => None,
+                                        v => Some(v.to_string()),
+                                    };
+
+                                    let pattern_val = self
+                                        .eval_expr_maybe_sequence(
+                                            txn,
+                                            sequence_values,
+                                            search_path,
+                                            arg1,
+                                            Some(row),
+                                            Some(schema),
+                                        )
+                                        .await?;
+                                    let pattern = match pattern_val {
+                                        Value::Text(s) => Some(s),
+                                        Value::Null => None,
+                                        v => Some(v.to_string()),
+                                    };
+
+                                    match (source, pattern) {
+                                        (Some(source), Some(pattern)) => {
+                                    let flags = if let Some(arg2) = arg2 {
+                                        match self
+                                            .eval_expr_maybe_sequence(
+                                                txn,
+                                                sequence_values,
+                                                search_path,
+                                                arg2,
+                                                Some(row),
+                                                Some(schema),
+                                            )
+                                            .await?
+                                        {
+                                            Value::Text(s) => s,
+                                            Value::Null => String::new(),
+                                            v => v.to_string(),
+                                        }
+                                    } else {
+                                        String::new()
+                                    };
+                                    let global = flags.to_ascii_lowercase().contains('g');
+                                    let case_insensitive = flags.to_ascii_lowercase().contains('i');
+                                    let regex_pattern = if case_insensitive {
+                                        format!("(?i){}", pattern)
+                                    } else {
+                                        pattern
+                                    };
+                                    let re = regex::Regex::new(&regex_pattern)
+                                        .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+
+                                    let mut out = Vec::new();
+                                    if global {
+                                        for caps in re.captures_iter(&source) {
+                                            out.push(Value::Array(regexp_captures_to_values(&caps)));
+                                        }
+                                    } else if let Some(caps) = re.captures(&source) {
+                                        out.push(Value::Array(regexp_captures_to_values(&caps)));
+                                    }
+                                    out
+                                        }
+                                        _ => Vec::new(),
+                                    }
+                                }
+                                SrfKind::EvalFunctionArray => {
+                                    match self
+                                        .eval_expr_maybe_sequence(
+                                            txn,
+                                            sequence_values,
+                                            search_path,
+                                            expr,
+                                            Some(row),
+                                            Some(schema),
+                                        )
+                                        .await?
+                                    {
+                                        Value::Array(arr) => arr,
+                                        Value::Null => Vec::new(),
+                                        other => vec![other],
+                                    }
+                                }
+                            };
+
+                            srf_outputs.push((row_values.len(), outputs));
+                            row_values.push(Value::Null);
+                            continue;
                         }
                     } else {
                         let value = if let Expr::Subquery(subquery) = expr {
@@ -1113,16 +1759,16 @@ impl Executor {
                 }
             }
 
-            if !unnest_arrays.is_empty() {
-                let max_len = unnest_arrays
+            if !srf_outputs.is_empty() {
+                let max_len = srf_outputs
                     .iter()
-                    .map(|(_, arr)| arr.len())
+                    .map(|(_, out)| out.len())
                     .max()
                     .unwrap_or(0);
                 for i in 0..max_len {
                     let mut expanded_row = row_values.clone();
-                    for (col_idx, arr) in &unnest_arrays {
-                        expanded_row[*col_idx] = arr.get(i).cloned().unwrap_or(Value::Null);
+                    for (col_idx, out) in &srf_outputs {
+                        expanded_row[*col_idx] = out.get(i).cloned().unwrap_or(Value::Null);
                     }
                     result_rows.push(Row::new(expanded_row));
                 }
@@ -1172,5 +1818,123 @@ impl Executor {
             }
             std::cmp::Ordering::Equal
         });
+    }
+}
+
+fn extract_grouping_sets(exprs: &[Expr]) -> Option<Vec<Vec<Expr>>> {
+    for expr in exprs {
+        match expr {
+            Expr::GroupingSets(sets) => {
+                return Some(sets.iter().map(|s| s.clone()).collect());
+            }
+            Expr::Rollup(cols) => {
+                let mut sets = Vec::new();
+                for i in 0..=cols.len() {
+                    let mut subset = Vec::new();
+                    for group in cols.iter().take(cols.len() - i) {
+                        subset.extend(group.iter().cloned());
+                    }
+                    sets.push(subset);
+                }
+                return Some(sets);
+            }
+            Expr::Cube(cols) => {
+                let n = cols.len();
+                let mut sets = Vec::new();
+                for mask in 0..(1usize << n) {
+                    let mut subset = Vec::new();
+                    for (i, group) in cols.iter().enumerate() {
+                        if (mask & (1usize << i)) != 0 {
+                            subset.extend(group.iter().cloned());
+                        }
+                    }
+                    sets.push(subset);
+                }
+                return Some(sets);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn expr_matches(pattern: &Expr, target: &Expr) -> bool {
+    match (pattern, target) {
+        (Expr::Identifier(a), Expr::Identifier(b)) => a.value.eq_ignore_ascii_case(&b.value),
+        (Expr::CompoundIdentifier(a), Expr::CompoundIdentifier(b)) => {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b.iter())
+                    .all(|(x, y)| x.value.eq_ignore_ascii_case(&y.value))
+        }
+        (Expr::Identifier(a), Expr::CompoundIdentifier(b)) => b
+            .last()
+            .map(|i| i.value.eq_ignore_ascii_case(&a.value))
+            .unwrap_or(false),
+        (Expr::CompoundIdentifier(a), Expr::Identifier(b)) => a
+            .last()
+            .map(|i| i.value.eq_ignore_ascii_case(&b.value))
+            .unwrap_or(false),
+        _ => format!("{}", pattern) == format!("{}", target),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ident(name: &str) -> Expr {
+        Expr::Identifier(sqlparser::ast::Ident::new(name))
+    }
+
+    #[test]
+    fn cube_treats_grouped_items_as_units() {
+        let a = ident("a");
+        let b = ident("b");
+        let c = ident("c");
+        let cube = Expr::Cube(vec![vec![a.clone(), b.clone()], vec![c.clone()]]);
+
+        let sets = extract_grouping_sets(&[cube]).unwrap();
+        assert_eq!(sets.len(), 4);
+
+        for set in &sets {
+            let has_a = set
+                .iter()
+                .any(|e| matches!(e, Expr::Identifier(id) if id.value == "a"));
+            let has_b = set
+                .iter()
+                .any(|e| matches!(e, Expr::Identifier(id) if id.value == "b"));
+            assert_eq!(has_a, has_b, "unexpected set: {:?}", set);
+        }
+
+        assert!(sets.iter().any(|s| s.is_empty()));
+        assert!(sets.iter().any(|s| s.len() == 1 && matches!(&s[0], Expr::Identifier(id) if id.value == "c")));
+        assert!(sets.iter().any(|s| s.len() == 2));
+        assert!(sets.iter().any(|s| s.len() == 3));
+    }
+
+    #[test]
+    fn rollup_treats_grouped_items_as_units() {
+        let a = ident("a");
+        let b = ident("b");
+        let c = ident("c");
+        let rollup = Expr::Rollup(vec![vec![a.clone(), b.clone()], vec![c.clone()]]);
+
+        let sets = extract_grouping_sets(&[rollup]).unwrap();
+        assert_eq!(sets.len(), 3);
+
+        for set in &sets {
+            let has_a = set
+                .iter()
+                .any(|e| matches!(e, Expr::Identifier(id) if id.value == "a"));
+            let has_b = set
+                .iter()
+                .any(|e| matches!(e, Expr::Identifier(id) if id.value == "b"));
+            assert_eq!(has_a, has_b, "unexpected set: {:?}", set);
+        }
+
+        assert!(sets.iter().any(|s| s.is_empty()));
+        assert!(sets.iter().any(|s| s.len() == 2));
+        assert!(sets.iter().any(|s| s.len() == 3));
     }
 }

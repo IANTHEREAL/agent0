@@ -17,7 +17,10 @@ use crate::auth::AuthManager;
 use crate::storage::TikvStore;
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{Expr, Query, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement};
+use sqlparser::ast::{
+    Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, SetOperator, SetQuantifier,
+    Statement,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -173,24 +176,26 @@ impl Executor {
             for stmt in &statements {
                 debug!("Executing statement: {:?}", stmt);
 
-                let result = match stmt {
+                let mut stmt_results: Vec<ExecuteResult> = Vec::new();
+
+                match stmt {
                     // Transaction Control
                     Statement::StartTransaction { .. } => {
                         session.begin().await?;
-                        ExecuteResult::Empty
+                        stmt_results.push(ExecuteResult::Empty);
                     }
                     Statement::Commit { .. } => {
                         session.commit().await?;
-                        ExecuteResult::Empty
+                        stmt_results.push(ExecuteResult::Empty);
                     }
                     Statement::Savepoint { name } => {
                         session.create_savepoint(normalize_ident(name))?;
-                        ExecuteResult::Empty
+                        stmt_results.push(ExecuteResult::Empty);
                     }
                     Statement::ReleaseSavepoint { name } => {
                         let sp = normalize_ident(name);
                         session.release_savepoint(&sp)?;
-                        ExecuteResult::Empty
+                        stmt_results.push(ExecuteResult::Empty);
                     }
                     Statement::Rollback {
                         savepoint: Some(name),
@@ -198,13 +203,13 @@ impl Executor {
                     } => {
                         let sp = normalize_ident(name);
                         session.rollback_to_savepoint(&sp).await?;
-                        ExecuteResult::Empty
+                        stmt_results.push(ExecuteResult::Empty);
                     }
                     Statement::Rollback {
                         savepoint: None, ..
                     } => {
                         session.rollback().await?;
-                        ExecuteResult::Empty
+                        stmt_results.push(ExecuteResult::Empty);
                     }
                     Statement::SetVariable {
                         variable, value, ..
@@ -269,7 +274,7 @@ impl Executor {
                             }
                             session.set_search_path(new_search_path);
                         }
-                        ExecuteResult::Empty
+                        stmt_results.push(ExecuteResult::Empty);
                     }
                     // DDL/DML - delegated to session transaction management
                     _ => {
@@ -283,8 +288,15 @@ impl Executor {
                             let (txn, sequence_values, search_path) = session
                                 .get_mut_txn_sequence_values_and_search_path()
                                 .expect("Transaction must be active");
-                            self.execute_statement_on_txn(txn, sequence_values, search_path, stmt)
-                                .await
+                            let notices = self
+                                .collect_notices_before_statement(txn, search_path, stmt)
+                                .await?;
+                            let result = self
+                                .execute_statement_on_txn(txn, sequence_values, search_path, stmt)
+                                .await?;
+                            Ok::<(Vec<ExecuteResult>, ExecuteResult), anyhow::Error>((
+                                notices, result,
+                            ))
                         }
                         .await;
 
@@ -296,15 +308,62 @@ impl Executor {
                             }
                         }
 
-                        res?
+                        let (notices, result) = res?;
+                        stmt_results.extend(notices);
+                        stmt_results.push(result);
                     }
-                };
-                results.push(result);
+                }
+                results.extend(stmt_results);
             }
 
             Ok(ExecuteResults(results))
         })
         .await
+    }
+
+    async fn collect_notices_before_statement(
+        &self,
+        txn: &mut Transaction,
+        search_path: &[String],
+        stmt: &Statement,
+    ) -> Result<Vec<ExecuteResult>> {
+        use sqlparser::ast::ObjectType;
+
+        match stmt {
+            Statement::Drop {
+                object_type: ObjectType::Table,
+                names: drop_names,
+                if_exists: true,
+                ..
+            } => {
+                let mut notices = Vec::new();
+                for name in drop_names {
+                    let exists = super::names::resolve_existing_table_name(
+                        self.store.as_ref(),
+                        txn,
+                        name,
+                        search_path,
+                    )
+                    .await?
+                    .is_some();
+
+                    if exists {
+                        continue;
+                    }
+
+                    let base = name
+                        .0
+                        .last()
+                        .map(|ident| ident.value.as_str())
+                        .unwrap_or("?");
+                    notices.push(ExecuteResult::Notice {
+                        message: format!("table \"{}\" does not exist, skipping", base),
+                    });
+                }
+                Ok(notices)
+            }
+            _ => Ok(Vec::new()),
+        }
     }
 
     /// Execute a parsed SQL statement on a given transaction
@@ -451,15 +510,18 @@ impl Executor {
             }
             Statement::Delete {
                 from,
+                using,
                 selection,
                 returning,
                 ..
             } => {
+                let using = using.as_deref().unwrap_or(&[]);
                 self.execute_delete(
                     txn,
                     sequence_values,
                     search_path,
                     from,
+                    using,
                     selection,
                     returning,
                 )
@@ -751,69 +813,562 @@ impl Executor {
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         select: &sqlparser::ast::Select,
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
-        fn is_unnest_call(expr: &Expr) -> bool {
-            if let Expr::Function(f) = expr {
-                if let Some(name) = f.name.0.last() {
-                    return name.value.eq_ignore_ascii_case("unnest");
-                }
+        #[derive(Copy, Clone)]
+        enum SrfKind {
+            Unnest,
+            RegexpSplitToTable,
+            RegexpMatches,
+            EvalFunctionArray,
+        }
+
+        fn srf_kind(expr: &Expr) -> Option<SrfKind> {
+            let Expr::Function(f) = expr else {
+                return None;
+            };
+            let Some(name) = f.name.0.last() else {
+                return None;
+            };
+            match name.value.to_ascii_uppercase().as_str() {
+                "UNNEST" => Some(SrfKind::Unnest),
+                "REGEXP_SPLIT_TO_TABLE" => Some(SrfKind::RegexpSplitToTable),
+                "REGEXP_MATCHES" => Some(SrfKind::RegexpMatches),
+                "JSONB_OBJECT_KEYS"
+                | "JSONB_ARRAY_ELEMENTS"
+                | "JSONB_ARRAY_ELEMENTS_TEXT"
+                | "JSONB_EACH"
+                | "JSONB_EACH_TEXT" => Some(SrfKind::EvalFunctionArray),
+                _ => None,
             }
-            false
+        }
+
+        fn regexp_captures_to_values(caps: &regex::Captures<'_>) -> Vec<Value> {
+            if caps.len() > 1 {
+                (1..caps.len())
+                    .map(|idx| match caps.get(idx) {
+                        Some(m) => Value::Text(m.as_str().to_string()),
+                        None => Value::Null,
+                    })
+                    .collect()
+            } else {
+                caps.get(0)
+                    .map(|m| vec![Value::Text(m.as_str().to_string())])
+                    .unwrap_or_default()
+            }
         }
 
         let resolved_projection = self
-            .resolve_projection_subqueries(txn, sequence_values, search_path, &select.projection)
+            .resolve_projection_subqueries(txn, sequence_values, search_path, &select.projection, ctes)
             .await?;
 
         let mut cols = Vec::new();
         let mut values = Vec::new();
-        let mut unnest_positions: Vec<(usize, Vec<Value>)> = Vec::new();
+        let mut srf_positions: Vec<(usize, Vec<Value>)> = Vec::new();
 
         for item in &resolved_projection {
             match item {
                 SelectItem::UnnamedExpr(expr) => {
                     cols.push(get_expr_name(expr));
-                    let val = sequences::eval_expr_with_sequences(
-                        &self.store,
-                        txn,
-                        sequence_values,
-                        search_path,
-                        expr,
-                        None,
-                        None,
-                    )
-                    .await?;
-                    if is_unnest_call(expr) {
-                        if let Value::Array(arr) = val {
-                            unnest_positions.push((values.len(), arr.clone()));
+                    if let Some(kind) = srf_kind(expr) {
+                        let Expr::Function(f) = expr else {
                             values.push(Value::Null);
-                        } else {
-                            values.push(val);
-                        }
+                            continue;
+                        };
+                        let output_values = match kind {
+                            SrfKind::Unnest => {
+                                let arg_expr = f.args.first().and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                if let Some(arg_expr) = arg_expr {
+                                    match sequences::eval_expr_with_sequences(
+                                        &self.store,
+                                        txn,
+                                        sequence_values,
+                                        search_path,
+                                        arg_expr,
+                                        None,
+                                        None,
+                                    )
+                                    .await?
+                                    {
+                                        Value::Array(arr) => arr,
+                                        Value::Null => Vec::new(),
+                                        other => vec![other],
+                                    }
+                                } else {
+                                    Vec::new()
+                                }
+                            }
+                            SrfKind::RegexpSplitToTable => {
+                                let arg0 = f.args.get(0).and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                let arg1 = f.args.get(1).and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                let arg2 = f.args.get(2).and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                let (Some(arg0), Some(arg1)) = (arg0, arg1) else {
+                                    return Err(anyhow!(
+                                        "regexp_split_to_table requires at least 2 arguments"
+                                    ));
+                                };
+                                let source_val = sequences::eval_expr_with_sequences(
+                                    &self.store,
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    arg0,
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                                let source = match source_val {
+                                    Value::Text(s) => Some(s),
+                                    Value::Null => None,
+                                    v => Some(v.to_string()),
+                                };
+                                let pattern_val = sequences::eval_expr_with_sequences(
+                                    &self.store,
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    arg1,
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                                let pattern = match pattern_val {
+                                    Value::Text(s) => Some(s),
+                                    Value::Null => None,
+                                    v => Some(v.to_string()),
+                                };
+                                match (source, pattern) {
+                                    (Some(source), Some(pattern)) => {
+                                    let flags = if let Some(arg2) = arg2 {
+                                        match sequences::eval_expr_with_sequences(
+                                            &self.store,
+                                            txn,
+                                            sequence_values,
+                                            search_path,
+                                            arg2,
+                                            None,
+                                            None,
+                                        )
+                                        .await?
+                                        {
+                                            Value::Text(s) => s,
+                                            Value::Null => String::new(),
+                                            v => v.to_string(),
+                                        }
+                                    } else {
+                                        String::new()
+                                    };
+                                    let case_insensitive =
+                                        flags.to_ascii_lowercase().contains('i');
+                                    let regex_pattern = if case_insensitive {
+                                        format!("(?i){}", pattern)
+                                    } else {
+                                        pattern
+                                    };
+                                    let re = regex::Regex::new(&regex_pattern)
+                                        .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+                                    let mut parts = Vec::new();
+                                    let mut last_end = 0usize;
+                                    for m in re.find_iter(&source) {
+                                        parts.push(Value::Text(
+                                            source[last_end..m.start()].to_string(),
+                                        ));
+                                        last_end = m.end();
+                                    }
+                                    parts.push(Value::Text(source[last_end..].to_string()));
+                                    parts
+                                    }
+                                    _ => Vec::new(),
+                                }
+                            }
+                            SrfKind::RegexpMatches => {
+                                let arg0 = f.args.get(0).and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                let arg1 = f.args.get(1).and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                let arg2 = f.args.get(2).and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                let (Some(arg0), Some(arg1)) = (arg0, arg1) else {
+                                    return Err(anyhow!(
+                                        "regexp_matches requires at least 2 arguments"
+                                    ));
+                                };
+                                let source_val = sequences::eval_expr_with_sequences(
+                                    &self.store,
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    arg0,
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                                let source = match source_val {
+                                    Value::Text(s) => Some(s),
+                                    Value::Null => None,
+                                    v => Some(v.to_string()),
+                                };
+                                let pattern_val = sequences::eval_expr_with_sequences(
+                                    &self.store,
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    arg1,
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                                let pattern = match pattern_val {
+                                    Value::Text(s) => Some(s),
+                                    Value::Null => None,
+                                    v => Some(v.to_string()),
+                                };
+                                match (source, pattern) {
+                                    (Some(source), Some(pattern)) => {
+                                    let flags = if let Some(arg2) = arg2 {
+                                        match sequences::eval_expr_with_sequences(
+                                            &self.store,
+                                            txn,
+                                            sequence_values,
+                                            search_path,
+                                            arg2,
+                                            None,
+                                            None,
+                                        )
+                                        .await?
+                                        {
+                                            Value::Text(s) => s,
+                                            Value::Null => String::new(),
+                                            v => v.to_string(),
+                                        }
+                                    } else {
+                                        String::new()
+                                    };
+                                    let global = flags.to_ascii_lowercase().contains('g');
+                                    let case_insensitive =
+                                        flags.to_ascii_lowercase().contains('i');
+                                    let regex_pattern = if case_insensitive {
+                                        format!("(?i){}", pattern)
+                                    } else {
+                                        pattern
+                                    };
+                                    let re = regex::Regex::new(&regex_pattern)
+                                        .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+                                    let mut out = Vec::new();
+                                    if global {
+                                        for caps in re.captures_iter(&source) {
+                                            out.push(Value::Array(regexp_captures_to_values(&caps)));
+                                        }
+                                    } else if let Some(caps) = re.captures(&source) {
+                                        out.push(Value::Array(regexp_captures_to_values(&caps)));
+                                    }
+                                    out
+                                    }
+                                    _ => Vec::new(),
+                                }
+                            }
+                            SrfKind::EvalFunctionArray => {
+                                match sequences::eval_expr_with_sequences(
+                                    &self.store,
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    expr,
+                                    None,
+                                    None,
+                                )
+                                .await?
+                                {
+                                    Value::Array(arr) => arr,
+                                    Value::Null => Vec::new(),
+                                    other => vec![other],
+                                }
+                            }
+                        };
+
+                        srf_positions.push((values.len(), output_values));
+                        values.push(Value::Null);
                     } else {
+                        let val = sequences::eval_expr_with_sequences(
+                            &self.store,
+                            txn,
+                            sequence_values,
+                            search_path,
+                            expr,
+                            None,
+                            None,
+                        )
+                        .await?;
                         values.push(val);
                     }
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     cols.push(alias.value.clone());
-                    let val = sequences::eval_expr_with_sequences(
-                        &self.store,
-                        txn,
-                        sequence_values,
-                        search_path,
-                        expr,
-                        None,
-                        None,
-                    )
-                    .await?;
-                    if is_unnest_call(expr) {
-                        if let Value::Array(arr) = val {
-                            unnest_positions.push((values.len(), arr.clone()));
+                    if let Some(kind) = srf_kind(expr) {
+                        let Expr::Function(f) = expr else {
                             values.push(Value::Null);
-                        } else {
-                            values.push(val);
-                        }
+                            continue;
+                        };
+                        let output_values = match kind {
+                            SrfKind::Unnest => {
+                                let arg_expr = f.args.first().and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                if let Some(arg_expr) = arg_expr {
+                                    match sequences::eval_expr_with_sequences(
+                                        &self.store,
+                                        txn,
+                                        sequence_values,
+                                        search_path,
+                                        arg_expr,
+                                        None,
+                                        None,
+                                    )
+                                    .await?
+                                    {
+                                        Value::Array(arr) => arr,
+                                        Value::Null => Vec::new(),
+                                        other => vec![other],
+                                    }
+                                } else {
+                                    Vec::new()
+                                }
+                            }
+                            SrfKind::RegexpSplitToTable => {
+                                let arg0 = f.args.get(0).and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                let arg1 = f.args.get(1).and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                let arg2 = f.args.get(2).and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                let (Some(arg0), Some(arg1)) = (arg0, arg1) else {
+                                    return Err(anyhow!(
+                                        "regexp_split_to_table requires at least 2 arguments"
+                                    ));
+                                };
+                                let source_val = sequences::eval_expr_with_sequences(
+                                    &self.store,
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    arg0,
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                                let source = match source_val {
+                                    Value::Text(s) => Some(s),
+                                    Value::Null => None,
+                                    v => Some(v.to_string()),
+                                };
+                                let pattern_val = sequences::eval_expr_with_sequences(
+                                    &self.store,
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    arg1,
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                                let pattern = match pattern_val {
+                                    Value::Text(s) => Some(s),
+                                    Value::Null => None,
+                                    v => Some(v.to_string()),
+                                };
+                                match (source, pattern) {
+                                    (Some(source), Some(pattern)) => {
+                                    let flags = if let Some(arg2) = arg2 {
+                                        match sequences::eval_expr_with_sequences(
+                                            &self.store,
+                                            txn,
+                                            sequence_values,
+                                            search_path,
+                                            arg2,
+                                            None,
+                                            None,
+                                        )
+                                        .await?
+                                        {
+                                            Value::Text(s) => s,
+                                            Value::Null => String::new(),
+                                            v => v.to_string(),
+                                        }
+                                    } else {
+                                        String::new()
+                                    };
+                                    let case_insensitive =
+                                        flags.to_ascii_lowercase().contains('i');
+                                    let regex_pattern = if case_insensitive {
+                                        format!("(?i){}", pattern)
+                                    } else {
+                                        pattern
+                                    };
+                                    let re = regex::Regex::new(&regex_pattern)
+                                        .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+                                    let mut parts = Vec::new();
+                                    let mut last_end = 0usize;
+                                    for m in re.find_iter(&source) {
+                                        parts.push(Value::Text(
+                                            source[last_end..m.start()].to_string(),
+                                        ));
+                                        last_end = m.end();
+                                    }
+                                    parts.push(Value::Text(source[last_end..].to_string()));
+                                    parts
+                                    }
+                                    _ => Vec::new(),
+                                }
+                            }
+                            SrfKind::RegexpMatches => {
+                                let arg0 = f.args.get(0).and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                let arg1 = f.args.get(1).and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                let arg2 = f.args.get(2).and_then(|arg| match arg {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                    _ => None,
+                                });
+                                let (Some(arg0), Some(arg1)) = (arg0, arg1) else {
+                                    return Err(anyhow!(
+                                        "regexp_matches requires at least 2 arguments"
+                                    ));
+                                };
+                                let source_val = sequences::eval_expr_with_sequences(
+                                    &self.store,
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    arg0,
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                                let source = match source_val {
+                                    Value::Text(s) => Some(s),
+                                    Value::Null => None,
+                                    v => Some(v.to_string()),
+                                };
+                                let pattern_val = sequences::eval_expr_with_sequences(
+                                    &self.store,
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    arg1,
+                                    None,
+                                    None,
+                                )
+                                .await?;
+                                let pattern = match pattern_val {
+                                    Value::Text(s) => Some(s),
+                                    Value::Null => None,
+                                    v => Some(v.to_string()),
+                                };
+                                match (source, pattern) {
+                                    (Some(source), Some(pattern)) => {
+                                    let flags = if let Some(arg2) = arg2 {
+                                        match sequences::eval_expr_with_sequences(
+                                            &self.store,
+                                            txn,
+                                            sequence_values,
+                                            search_path,
+                                            arg2,
+                                            None,
+                                            None,
+                                        )
+                                        .await?
+                                        {
+                                            Value::Text(s) => s,
+                                            Value::Null => String::new(),
+                                            v => v.to_string(),
+                                        }
+                                    } else {
+                                        String::new()
+                                    };
+                                    let global = flags.to_ascii_lowercase().contains('g');
+                                    let case_insensitive =
+                                        flags.to_ascii_lowercase().contains('i');
+                                    let regex_pattern = if case_insensitive {
+                                        format!("(?i){}", pattern)
+                                    } else {
+                                        pattern
+                                    };
+                                    let re = regex::Regex::new(&regex_pattern)
+                                        .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+                                    let mut out = Vec::new();
+                                    if global {
+                                        for caps in re.captures_iter(&source) {
+                                            out.push(Value::Array(regexp_captures_to_values(&caps)));
+                                        }
+                                    } else if let Some(caps) = re.captures(&source) {
+                                        out.push(Value::Array(regexp_captures_to_values(&caps)));
+                                    }
+                                    out
+                                    }
+                                    _ => Vec::new(),
+                                }
+                            }
+                            SrfKind::EvalFunctionArray => {
+                                match sequences::eval_expr_with_sequences(
+                                    &self.store,
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    expr,
+                                    None,
+                                    None,
+                                )
+                                .await?
+                                {
+                                    Value::Array(arr) => arr,
+                                    Value::Null => Vec::new(),
+                                    other => vec![other],
+                                }
+                            }
+                        };
+
+                        srf_positions.push((values.len(), output_values));
+                        values.push(Value::Null);
                     } else {
+                        let val = sequences::eval_expr_with_sequences(
+                            &self.store,
+                            txn,
+                            sequence_values,
+                            search_path,
+                            expr,
+                            None,
+                            None,
+                        )
+                        .await?;
                         values.push(val);
                     }
                 }
@@ -821,8 +1376,8 @@ impl Executor {
             }
         }
 
-        let rows = if !unnest_positions.is_empty() {
-            let max_len = unnest_positions
+        let rows = if !srf_positions.is_empty() {
+            let max_len = srf_positions
                 .iter()
                 .map(|(_, arr)| arr.len())
                 .max()
@@ -830,7 +1385,7 @@ impl Executor {
             let mut result_rows = Vec::new();
             for i in 0..max_len {
                 let mut row_values = values.clone();
-                for (col_idx, arr) in &unnest_positions {
+                for (col_idx, arr) in &srf_positions {
                     row_values[*col_idx] = arr.get(i).cloned().unwrap_or(Value::Null);
                 }
                 result_rows.push(Row::new(row_values));

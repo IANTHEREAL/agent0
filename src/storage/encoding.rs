@@ -392,7 +392,7 @@ pub fn decode_value_memcomparable(data: &[u8], data_type: &DataType) -> Result<(
             let v: Vec<u8> = serde::Deserialize::deserialize(&mut deserializer)?;
             (Value::Bytes(v), deserializer.position())
         }
-        DataType::Timestamp => {
+        DataType::Timestamp | DataType::TimestampTz => {
             let v: i64 = serde::Deserialize::deserialize(&mut deserializer)?;
             (Value::Timestamp(v), deserializer.position())
         }

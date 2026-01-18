@@ -18,6 +18,7 @@ impl Executor {
         sequence_values: &'a mut HashMap<String, i64>,
         search_path: &'a [String],
         expr: &'a Expr,
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Expr>> + Send + 'a>> {
         Box::pin(async move {
             match expr {
@@ -27,7 +28,7 @@ impl Executor {
                     negated,
                 } => {
                     let result = self
-                        .execute_query(txn, sequence_values, search_path, subquery)
+                        .execute_query_with_ctes(txn, sequence_values, search_path, subquery, ctes)
                         .await?;
                     let values = match result {
                         ExecuteResult::Select { rows, .. } => rows
@@ -38,7 +39,7 @@ impl Executor {
                         _ => return Err(anyhow!("Subquery must return a SELECT result")),
                     };
                     let resolved_inner = Box::new(
-                        self.resolve_subqueries(txn, sequence_values, search_path, inner_expr)
+                        self.resolve_subqueries(txn, sequence_values, search_path, inner_expr, ctes)
                             .await?,
                     );
                     Ok(Expr::InList {
@@ -49,11 +50,11 @@ impl Executor {
                 }
                 Expr::BinaryOp { left, op, right } => {
                     let resolved_left = Box::new(
-                        self.resolve_subqueries(txn, sequence_values, search_path, left)
+                        self.resolve_subqueries(txn, sequence_values, search_path, left, ctes)
                             .await?,
                     );
                     let resolved_right = Box::new(
-                        self.resolve_subqueries(txn, sequence_values, search_path, right)
+                        self.resolve_subqueries(txn, sequence_values, search_path, right, ctes)
                             .await?,
                     );
                     Ok(Expr::BinaryOp {
@@ -64,7 +65,7 @@ impl Executor {
                 }
                 Expr::UnaryOp { op, expr: inner } => {
                     let resolved = Box::new(
-                        self.resolve_subqueries(txn, sequence_values, search_path, inner)
+                        self.resolve_subqueries(txn, sequence_values, search_path, inner, ctes)
                             .await?,
                     );
                     Ok(Expr::UnaryOp {
@@ -74,14 +75,29 @@ impl Executor {
                 }
                 Expr::Nested(inner) => {
                     let resolved = Box::new(
-                        self.resolve_subqueries(txn, sequence_values, search_path, inner)
+                        self.resolve_subqueries(txn, sequence_values, search_path, inner, ctes)
                             .await?,
                     );
                     Ok(Expr::Nested(resolved))
                 }
+                Expr::Cast {
+                    expr: inner,
+                    data_type,
+                    format,
+                } => {
+                    let resolved = Box::new(
+                        self.resolve_subqueries(txn, sequence_values, search_path, inner, ctes)
+                            .await?,
+                    );
+                    Ok(Expr::Cast {
+                        expr: resolved,
+                        data_type: data_type.clone(),
+                        format: format.clone(),
+                    })
+                }
                 Expr::Subquery(subquery) => {
                     let result = self
-                        .execute_query(txn, sequence_values, search_path, subquery)
+                        .execute_query_with_ctes(txn, sequence_values, search_path, subquery, ctes)
                         .await?;
                     match result {
                         ExecuteResult::Select { rows, .. } => {
@@ -99,7 +115,7 @@ impl Executor {
                 }
                 Expr::Exists { subquery, negated } => {
                     let result = self
-                        .execute_query(txn, sequence_values, search_path, subquery)
+                        .execute_query_with_ctes(txn, sequence_values, search_path, subquery, ctes)
                         .await?;
                     let exists = match result {
                         ExecuteResult::Select { rows, .. } => !rows.is_empty(),
@@ -116,7 +132,7 @@ impl Executor {
                 } => {
                     let resolved_operand = if let Some(op) = operand {
                         Some(Box::new(
-                            self.resolve_subqueries(txn, sequence_values, search_path, op)
+                            self.resolve_subqueries(txn, sequence_values, search_path, op, ctes)
                                 .await?,
                         ))
                     } else {
@@ -125,20 +141,20 @@ impl Executor {
                     let mut resolved_conditions = Vec::with_capacity(conditions.len());
                     for cond in conditions {
                         resolved_conditions.push(
-                            self.resolve_subqueries(txn, sequence_values, search_path, cond)
+                            self.resolve_subqueries(txn, sequence_values, search_path, cond, ctes)
                                 .await?,
                         );
                     }
                     let mut resolved_results = Vec::with_capacity(results.len());
                     for res in results {
                         resolved_results.push(
-                            self.resolve_subqueries(txn, sequence_values, search_path, res)
+                            self.resolve_subqueries(txn, sequence_values, search_path, res, ctes)
                                 .await?,
                         );
                     }
                     let resolved_else = if let Some(else_expr) = else_result {
                         Some(Box::new(
-                            self.resolve_subqueries(txn, sequence_values, search_path, else_expr)
+                            self.resolve_subqueries(txn, sequence_values, search_path, else_expr, ctes)
                                 .await?,
                         ))
                     } else {
@@ -159,7 +175,7 @@ impl Executor {
                                 sqlparser::ast::FunctionArgExpr::Expr(e),
                             ) => sqlparser::ast::FunctionArg::Unnamed(
                                 sqlparser::ast::FunctionArgExpr::Expr(
-                                    self.resolve_subqueries(txn, sequence_values, search_path, e)
+                                    self.resolve_subqueries(txn, sequence_values, search_path, e, ctes)
                                         .await?,
                                 ),
                             ),
@@ -189,17 +205,18 @@ impl Executor {
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         projection: &[SelectItem],
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<Vec<SelectItem>> {
         let mut resolved = Vec::with_capacity(projection.len());
         for item in projection {
             let resolved_item = match item {
                 SelectItem::UnnamedExpr(e) => SelectItem::UnnamedExpr(
-                    self.resolve_subqueries(txn, sequence_values, search_path, e)
+                    self.resolve_subqueries(txn, sequence_values, search_path, e, ctes)
                         .await?,
                 ),
                 SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias {
                     expr: self
-                        .resolve_subqueries(txn, sequence_values, search_path, expr)
+                        .resolve_subqueries(txn, sequence_values, search_path, expr, ctes)
                         .await?,
                     alias: alias.clone(),
                 },
@@ -218,6 +235,7 @@ impl Executor {
         search_path: &[String],
         projection: &[SelectItem],
         outer_alias: &str,
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<Vec<SelectItem>> {
         let mut resolved = Vec::with_capacity(projection.len());
         for item in projection {
@@ -227,7 +245,7 @@ impl Executor {
                         SelectItem::UnnamedExpr(e.clone())
                     } else {
                         SelectItem::UnnamedExpr(
-                            self.resolve_subqueries(txn, sequence_values, search_path, e)
+                            self.resolve_subqueries(txn, sequence_values, search_path, e, ctes)
                                 .await?,
                         )
                     }
@@ -241,7 +259,7 @@ impl Executor {
                     } else {
                         SelectItem::ExprWithAlias {
                             expr: self
-                                .resolve_subqueries(txn, sequence_values, search_path, expr)
+                                .resolve_subqueries(txn, sequence_values, search_path, expr, ctes)
                                 .await?,
                             alias: alias.clone(),
                         }

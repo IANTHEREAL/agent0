@@ -8,7 +8,7 @@ use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
 use super::expr::eval_expr;
-use super::helpers::{coerce_value_for_column, eval_default_expr};
+use super::helpers::{coerce_value_for_column, eval_default_expr, infer_expr_type};
 use super::index_helpers;
 use super::sequences;
 use crate::storage::TikvStore;
@@ -175,6 +175,28 @@ pub fn build_returning_columns(
         }
     }
     Ok(ret_cols)
+}
+
+pub fn build_returning_types(
+    returning: &Option<Vec<SelectItem>>,
+    schema: &TableSchema,
+) -> Result<Vec<DataType>> {
+    let mut types = Vec::new();
+    if let Some(items) = returning {
+        for item in items {
+            match item {
+                SelectItem::UnnamedExpr(expr) => types.push(infer_expr_type(expr, schema)),
+                SelectItem::ExprWithAlias { expr, .. } => types.push(infer_expr_type(expr, schema)),
+                SelectItem::Wildcard(_) => {
+                    types.extend(schema.columns.iter().map(|c| c.data_type.clone()));
+                }
+                SelectItem::QualifiedWildcard(_, _) => {
+                    types.extend(schema.columns.iter().map(|c| c.data_type.clone()));
+                }
+            }
+        }
+    }
+    Ok(types)
 }
 
 pub async fn eval_returning_row(
