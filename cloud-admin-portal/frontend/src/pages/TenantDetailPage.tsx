@@ -132,19 +132,19 @@ export function TenantDetailPage() {
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       <div>
-        <Button variant="ghost" asChild className="mb-4">
+        <Button variant="ghost" size="sm" asChild className="mb-3 h-8 text-xs">
           <Link to="/tenants">
-            <ArrowLeft className="w-4 h-4 mr-2" />
+            <ArrowLeft className="w-3.5 h-3.5 mr-1.5" />
             Back to Tenants
           </Link>
         </Button>
-        <div className="flex items-center gap-4">
-          <h1 className="text-3xl font-bold">{name}</h1>
+        <div className="flex items-center gap-3">
+          <h1 className="text-2xl font-semibold">{name}</h1>
           <span
             className={cn(
-              "inline-flex items-center gap-2 px-3 py-1 rounded-full text-sm",
+              "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs",
               tenant.state === "ENABLED"
                 ? "bg-green-500/10 text-green-600"
                 : "bg-red-500/10 text-red-600"
@@ -152,7 +152,7 @@ export function TenantDetailPage() {
           >
             <span
               className={cn(
-                "w-2 h-2 rounded-full",
+                "w-1.5 h-1.5 rounded-full",
                 tenant.state === "ENABLED" ? "bg-green-500" : "bg-red-500"
               )}
             />
@@ -163,28 +163,28 @@ export function TenantDetailPage() {
 
       {/* Connection Info */}
       <Card>
-        <CardHeader>
-          <CardTitle>Connection Info</CardTitle>
-          <CardDescription>Connect to this tenant using psql or any PostgreSQL client</CardDescription>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">Connection Info</CardTitle>
+          <CardDescription className="text-xs">Connect to this tenant using psql or any PostgreSQL client</CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-2 gap-4 text-sm">
+          <div className="grid grid-cols-2 gap-3 text-sm">
             <div>
-              <p className="text-muted-foreground">Host</p>
-              <p className="font-medium">{tenant.host || '127.0.0.1'}</p>
+              <p className="text-xs text-muted-foreground mb-1">Host</p>
+              <p className="text-sm font-medium">{tenant.host || '127.0.0.1'}</p>
             </div>
             <div>
-              <p className="text-muted-foreground">Port</p>
-              <p className="font-medium">{tenant.port || 5433}</p>
+              <p className="text-xs text-muted-foreground mb-1">Port</p>
+              <p className="text-sm font-medium">{tenant.port || 5433}</p>
             </div>
             <div className="col-span-2">
-              <p className="text-muted-foreground mb-2">Connection Command</p>
+              <p className="text-xs text-muted-foreground mb-1.5">Connection Command</p>
               <div className="flex items-center gap-2">
-                <code className="flex-1 bg-muted px-3 py-2 rounded text-sm">
+                <code className="flex-1 bg-muted px-2.5 py-1.5 rounded text-xs">
                   psql -h {tenant.host || '127.0.0.1'} -p {tenant.port || 5433} -U {name}.admin
                 </code>
-                <Button variant="outline" size="sm" onClick={copyConnectionString}>
-                  {copied ? <Check className="w-4 h-4" /> : <Copy className="w-4 h-4" />}
+                <Button variant="outline" size="sm" className="h-7 w-7 p-0" onClick={copyConnectionString}>
+                  {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
                 </Button>
               </div>
             </div>
@@ -194,18 +194,18 @@ export function TenantDetailPage() {
 
       {/* User Management */}
       <Card>
-        <CardHeader className="flex flex-row items-center justify-between">
+        <CardHeader className="flex flex-row items-center justify-between pb-3">
           <div>
-            <CardTitle>Users</CardTitle>
-            <CardDescription>Manage database users for this tenant</CardDescription>
+            <CardTitle className="text-base">Users</CardTitle>
+            <CardDescription className="text-xs">Manage database users for this tenant</CardDescription>
           </div>
           {isConnected && (
             <div className="flex gap-2">
-              <Button size="sm" onClick={() => setShowCreateUser(true)}>
-                <Plus className="w-4 h-4 mr-1" />
+              <Button size="sm" className="h-7 text-xs" onClick={() => setShowCreateUser(true)}>
+                <Plus className="w-3.5 h-3.5 mr-1" />
                 Add User
               </Button>
-              <Button variant="outline" size="sm" onClick={disconnect}>
+              <Button variant="outline" size="sm" className="h-7 text-xs" onClick={disconnect}>
                 Disconnect
               </Button>
             </div>
@@ -213,72 +213,75 @@ export function TenantDetailPage() {
         </CardHeader>
         <CardContent>
           {!isConnected ? (
-            <form onSubmit={handleConnect} className="space-y-4">
-              <p className="text-sm text-muted-foreground">
+            <form onSubmit={handleConnect} className="space-y-3">
+              <p className="text-xs text-muted-foreground">
                 Connect with admin credentials to manage users
               </p>
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label htmlFor="admin_user">Admin User</Label>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1.5">
+                  <Label htmlFor="admin_user" className="text-xs">Admin User</Label>
                   <Input
                     id="admin_user"
+                    className="h-8 text-sm"
                     value={adminUser}
                     onChange={(e) => setAdminUser(e.target.value)}
                   />
                 </div>
-                <div className="space-y-2">
-                  <Label htmlFor="admin_password">Admin Password</Label>
+                <div className="space-y-1.5">
+                  <Label htmlFor="admin_password" className="text-xs">Admin Password</Label>
                   <Input
                     id="admin_password"
                     type="password"
+                    className="h-8 text-sm"
                     value={adminPassword}
                     onChange={(e) => setAdminPassword(e.target.value)}
                     placeholder="Enter password"
                   />
                 </div>
               </div>
-              <Button type="submit" disabled={isConnecting}>
+              <Button type="submit" size="sm" className="h-8 text-xs" disabled={isConnecting}>
                 {isConnecting ? "Connecting..." : "Connect"}
               </Button>
             </form>
           ) : usersLoading ? (
-            <div className="flex items-center justify-center py-8">
-              <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-primary"></div>
+            <div className="flex items-center justify-center py-6">
+              <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-primary"></div>
             </div>
           ) : (
             <div className="border rounded-lg">
               <table className="w-full">
                 <thead>
                   <tr className="border-b bg-muted/50">
-                    <th className="text-left p-4 text-sm font-medium text-muted-foreground">Name</th>
-                    <th className="text-left p-4 text-sm font-medium text-muted-foreground">Superuser</th>
-                    <th className="text-left p-4 text-sm font-medium text-muted-foreground">Login</th>
-                    <th className="text-right p-4 text-sm font-medium text-muted-foreground">Actions</th>
+                    <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">Name</th>
+                    <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">Superuser</th>
+                    <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">Login</th>
+                    <th className="text-right px-3 py-2 text-xs font-medium text-muted-foreground">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
                   {users?.map((user) => (
                     <tr key={user.name} className="border-b last:border-0 hover:bg-muted/50">
-                      <td className="p-4 font-medium">{user.name}</td>
-                      <td className="p-4">{user.is_superuser ? "Yes" : "No"}</td>
-                      <td className="p-4">{user.can_login ? "Yes" : "No"}</td>
-                      <td className="p-4">
-                        <div className="flex justify-end gap-2">
+                      <td className="px-3 py-2.5 text-sm font-medium">{user.name}</td>
+                      <td className="px-3 py-2.5 text-xs">{user.is_superuser ? "Yes" : "No"}</td>
+                      <td className="px-3 py-2.5 text-xs">{user.can_login ? "Yes" : "No"}</td>
+                      <td className="px-3 py-2.5">
+                        <div className="flex justify-end gap-1">
                           <Button
                             variant="ghost"
                             size="sm"
+                            className="h-7 text-xs"
                             onClick={() => handleResetPassword(user.name)}
                           >
-                            <Key className="w-4 h-4 mr-1" />
+                            <Key className="w-3.5 h-3.5 mr-1" />
                             Reset
                           </Button>
                           <Button
                             variant="ghost"
                             size="sm"
-                            className="text-destructive hover:text-destructive"
+                            className="h-7 w-7 p-0 text-destructive hover:text-destructive"
                             onClick={() => setConfirmDeleteUser(user.name)}
                           >
-                            <Trash2 className="w-4 h-4" />
+                            <Trash2 className="w-3.5 h-3.5" />
                           </Button>
                         </div>
                       </td>
