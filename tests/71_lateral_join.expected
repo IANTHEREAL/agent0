@@ -1,0 +1,37 @@
+NOTICE:  table "departments" does not exist, skipping
+NOTICE:  table "employees" does not exist, skipping
+    dept     |  emp  | salary 
+-------------+-------+--------
+ Engineering | Alice |  90000
+ Engineering | Bob   |  85000
+ HR          | Frank |  60000
+ Sales       | Diana |  80000
+ Sales       | Eve   |  70000
+(5 rows)
+
+    dept     | top_earner | salary 
+-------------+------------+--------
+ Engineering | Alice      |  90000
+ HR          | Frank      |  60000
+ Sales       | Diana      |  80000
+(3 rows)
+
+    dept     | emp_count | avg_salary 
+-------------+-----------+------------
+ Engineering |         3 |      83333
+ HR          |         1 |      60000
+ Sales       |         2 |      75000
+(3 rows)
+
+    dept     |  emp  | salary | avg_dept_salary 
+-------------+-------+--------+-----------------
+ Engineering | Alice |  90000 |           83333
+ Engineering | Bob   |  85000 |           83333
+ Sales       | Diana |  80000 |           75000
+(3 rows)
+
+            result            
+------------------------------
+ LATERAL JOIN tests completed
+(1 row)
+

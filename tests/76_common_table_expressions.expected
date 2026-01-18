@@ -1,0 +1,48 @@
+NOTICE:  table "employees" does not exist, skipping
+ id |      name      | level |                      path                       
+----+----------------+-------+-------------------------------------------------
+  1 | CEO            |     1 | CEO
+  2 | VP Engineering |     2 | CEO > VP Engineering
+  4 | Dev Manager    |     3 | CEO > VP Engineering > Dev Manager
+  7 | Junior Dev     |     4 | CEO > VP Engineering > Dev Manager > Junior Dev
+  6 | Senior Dev     |     4 | CEO > VP Engineering > Dev Manager > Senior Dev
+  3 | VP Sales       |     2 | CEO > VP Sales
+  5 | Sales Manager  |     3 | CEO > VP Sales > Sales Manager
+  8 | Sales Rep      |     4 | CEO > VP Sales > Sales Manager > Sales Rep
+(8 rows)
+
+ id |      name      
+----+----------------
+  2 | VP Engineering
+  4 | Dev Manager
+  6 | Senior Dev
+  7 | Junior Dev
+(4 rows)
+
+      name      | salary 
+----------------+--------
+ CEO            | 200000
+ VP Engineering | 150000
+ VP Sales       | 140000
+ Dev Manager    | 120000
+(4 rows)
+
+      name      | salary | rank 
+----------------+--------+------
+ CEO            | 200000 |    1
+ VP Engineering | 150000 |    2
+ VP Sales       | 140000 |    3
+(3 rows)
+
+NOTICE:  table "products" does not exist, skipping
+ category | avg_price | cnt 
+----------+-----------+-----
+ Gadgets  |       190 |   2
+ Widgets  |       110 |   2
+(2 rows)
+
+            result            
+------------------------------
+ Advanced CTE tests completed
+(1 row)
+

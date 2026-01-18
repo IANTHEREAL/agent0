@@ -1,0 +1,40 @@
+NOTICE:  table "sales" does not exist, skipping
+ product | region | amount 
+---------+--------+--------
+ Gadget  | North  |    300
+ Widget  | South  |    200
+(2 rows)
+
+ region | product | amount 
+--------+---------+--------
+ North  | Gadget  |    300
+ South  | Widget  |    200
+(2 rows)
+
+ product | region | amount | sale_date  
+---------+--------+--------+------------
+ Gadget  | North  |    250 | 2024-01-25
+ Gadget  | South  |    175 | 2024-01-22
+ Widget  | North  |    150 | 2024-01-20
+ Widget  | South  |    200 | 2024-01-18
+(4 rows)
+
+ product 
+---------
+ Gadget
+ Widget
+(2 rows)
+
+ product | region 
+---------+--------
+ Gadget  | North
+ Gadget  | South
+ Widget  | North
+ Widget  | South
+(4 rows)
+
+           result            
+-----------------------------
+ DISTINCT ON tests completed
+(1 row)
+

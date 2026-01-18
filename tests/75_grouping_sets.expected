@@ -1,0 +1,58 @@
+NOTICE:  table "sales" does not exist, skipping
+ region | product | total 
+--------+---------+-------
+ North  |         |  3950
+ South  |         |  3950
+        | Gadget  |  3300
+        | Widget  |  4600
+        |         |  7900
+(5 rows)
+
+ region | product | total 
+--------+---------+-------
+ North  | Gadget  |  1750
+ North  | Widget  |  2200
+ North  |         |  3950
+ South  | Gadget  |  1550
+ South  | Widget  |  2400
+ South  |         |  3950
+        |         |  7900
+(7 rows)
+
+ region | product | total 
+--------+---------+-------
+ North  | Gadget  |  1750
+ North  | Widget  |  2200
+ North  |         |  3950
+ South  | Gadget  |  1550
+ South  | Widget  |  2400
+ South  |         |  3950
+        | Gadget  |  3300
+        | Widget  |  4600
+        |         |  7900
+(9 rows)
+
+ region | product | year | total | grp_region | grp_product | grp_year 
+--------+---------+------+-------+------------+-------------+----------
+ North  |         | 2023 |  1800 |          0 |           1 |        0
+ North  |         | 2024 |  2150 |          0 |           1 |        0
+ North  |         |      |  3950 |          0 |           1 |        1
+ South  |         | 2023 |  1800 |          0 |           1 |        0
+ South  |         | 2024 |  2150 |          0 |           1 |        0
+ South  |         |      |  3950 |          0 |           1 |        1
+        | Gadget  | 2023 |  1500 |          1 |           0 |        0
+        | Gadget  | 2024 |  1800 |          1 |           0 |        0
+        | Gadget  |      |  3300 |          1 |           0 |        1
+        | Widget  | 2023 |  2100 |          1 |           0 |        0
+        | Widget  | 2024 |  2500 |          1 |           0 |        0
+        | Widget  |      |  4600 |          1 |           0 |        1
+        |         | 2023 |  3600 |          1 |           1 |        0
+        |         | 2024 |  4300 |          1 |           1 |        0
+        |         |      |  7900 |          1 |           1 |        1
+(15 rows)
+
+            result             
+-------------------------------
+ Grouping sets tests completed
+(1 row)
+

@@ -1,0 +1,173 @@
+ current_user 
+--------------
+ postgres
+(1 row)
+
+ session_user 
+--------------
+ postgres
+(1 row)
+
+ current_database 
+------------------
+ testdb
+(1 row)
+
+ current_schema 
+----------------
+ public
+(1 row)
+
+ has_version 
+-------------
+ t
+(1 row)
+
+ int_type 
+----------
+ integer
+(1 row)
+
+ numeric_type 
+--------------
+ numeric
+(1 row)
+
+ text_type 
+-----------
+ text
+(1 row)
+
+ bool_type 
+-----------
+ boolean
+(1 row)
+
+ array_type 
+------------
+ integer[]
+(1 row)
+
+ jsonb_type 
+------------
+ jsonb
+(1 row)
+
+ int_size 
+----------
+        4
+(1 row)
+
+ text_size 
+-----------
+         9
+(1 row)
+
+ normal_ident 
+--------------
+ "column"
+(1 row)
+
+ spaced_ident  
+---------------
+ "Column Name"
+(1 row)
+
+ reserved_ident 
+----------------
+ "select"
+(1 row)
+
+ normal_literal 
+----------------
+ 'hello'
+(1 row)
+
+ escaped_literal 
+-----------------
+ 'it''s'
+(1 row)
+
+ null_literal 
+--------------
+ 
+(1 row)
+
+ normal_nullable 
+-----------------
+ 'hello'
+(1 row)
+
+ null_nullable 
+---------------
+ NULL
+(1 row)
+
+ no_desc 
+---------
+ t
+(1 row)
+
+ pg_class_visible 
+------------------
+ t
+(1 row)
+
+   formatted   
+---------------
+ Hello, World!
+(1 row)
+
+ positional 
+------------
+ A B A
+(1 row)
+
+   padded   
+------------
+       test
+(1 row)
+
+ERROR:  unrecognized format() type specifier "."
+HINT:  For a single "%" use "%%".
+ identifier  
+-------------
+ column_name
+(1 row)
+
+  literal   
+------------
+ 'value''s'
+(1 row)
+
+ has_txid 
+----------
+ t
+(1 row)
+
+ has_clock_timestamp 
+---------------------
+ t
+(1 row)
+
+ has_statement_timestamp 
+-------------------------
+ t
+(1 row)
+
+ has_transaction_timestamp 
+---------------------------
+ t
+(1 row)
+
+NOTICE:  table "sys_test" does not exist, skipping
+ can_select 
+------------
+ t
+(1 row)
+
+              result              
+----------------------------------
+ System functions tests completed
+(1 row)
+

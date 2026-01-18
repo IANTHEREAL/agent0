@@ -1,0 +1,238 @@
+        jsonb_literal         
+------------------------------
+ {"age": 30, "name": "Alice"}
+(1 row)
+
+   jsonb_array   
+-----------------
+ ["a", "b", "c"]
+(1 row)
+
+         nested_json          
+------------------------------
+ {"nested": {"key": "value"}}
+(1 row)
+
+ get_key 
+---------
+ 1
+(1 row)
+
+ get_key_text 
+--------------
+ 1
+(1 row)
+
+ get_index 
+-----------
+ "x"
+(1 row)
+
+ get_index_text 
+----------------
+ y
+(1 row)
+
+ nested_access 
+---------------
+ "value"
+(1 row)
+
+ path_access 
+-------------
+ "value"
+(1 row)
+
+ path_access_text 
+------------------
+ value
+(1 row)
+
+ keys 
+------
+ a
+ b
+ c
+(3 rows)
+
+ elements 
+----------
+ "a"
+ "b"
+ "c"
+(3 rows)
+
+ text_elements 
+---------------
+ 1
+ 2
+ 3
+(3 rows)
+
+ each_pair 
+-----------
+ (a,1)
+ (b,2)
+(2 rows)
+
+ each_text 
+-----------
+ (a,1)
+ (b,2)
+(2 rows)
+
+ number_type 
+-------------
+ number
+(1 row)
+
+ string_type 
+-------------
+ string
+(1 row)
+
+ boolean_type 
+--------------
+ boolean
+(1 row)
+
+ null_type 
+-----------
+ null
+(1 row)
+
+ object_type 
+-------------
+ object
+(1 row)
+
+ array_type 
+------------
+ array
+(1 row)
+
+ arr_len 
+---------
+       5
+(1 row)
+
+      merged      
+------------------
+ {"a": 1, "b": 2}
+(1 row)
+
+     override     
+------------------
+ {"a": 1, "b": 3}
+(1 row)
+
+ removed_key 
+-------------
+ {"b": 2}
+(1 row)
+
+  removed_index  
+-----------------
+ ["a", "c", "d"]
+(1 row)
+
+ removed_path 
+--------------
+ {"a": {}}
+(1 row)
+
+    added_key     
+------------------
+ {"a": 1, "b": 2}
+(1 row)
+
+  updated_nested  
+------------------
+ {"a": {"b": 99}}
+(1 row)
+
+  create_missing  
+------------------
+ {"a": 1, "c": 3}
+(1 row)
+
+         built_object         
+------------------------------
+ {"age": 30, "name": "Alice"}
+(1 row)
+
+      built_array      
+-----------------------
+ [1, 2, "three", true]
+(1 row)
+
+ has_key 
+---------
+ t
+(1 row)
+
+ missing_key 
+-------------
+ f
+(1 row)
+
+ has_any 
+---------
+ t
+(1 row)
+
+ has_all 
+---------
+ t
+(1 row)
+
+ contains 
+----------
+ t
+(1 row)
+
+ contains_subset 
+-----------------
+ t
+(1 row)
+
+ contained_by 
+--------------
+ t
+(1 row)
+
+      row_to_jsonb       
+-------------------------
+ {"f1": 1, "f2": "test"}
+(1 row)
+
+     row_to_json      
+----------------------
+ {"f1":1,"f2":"test"}
+(1 row)
+
+NOTICE:  table "products" does not exist, skipping
+ id |  name  | price 
+----+--------+-------
+  1 | Widget |  9.99
+  3 | Gizmo  | 14.99
+(2 rows)
+
+ id |  name  
+----+--------
+  1 | Widget
+  3 | Gizmo
+(2 rows)
+
+ id | tag_count 
+----+-----------
+  1 |         2
+  2 |         1
+  3 |         2
+(3 rows)
+
+            result             
+-------------------------------
+ Advanced JSON tests completed
+(1 row)
+

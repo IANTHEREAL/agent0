@@ -1,0 +1,71 @@
+NOTICE:  table "insert_test" does not exist, skipping
+NOTICE:  table "insert_source" does not exist, skipping
+ id |  name  | value |     created_at      
+----+--------+-------+---------------------
+  1 | first  |     0 | 2024-01-15 10:00:00
+  2 | second |   100 | 2024-01-15 10:00:00
+  3 | third  |   200 | 2024-01-16 12:00:00
+(3 rows)
+
+ id |  name  | value |     created_at      
+----+--------+-------+---------------------
+  1 | first  |     0 | 2024-01-15 10:00:00
+  2 | second |   100 | 2024-01-15 10:00:00
+  3 | third  |   200 | 2024-01-16 12:00:00
+  4 | fourth |   300 | 2024-01-15 10:00:00
+  5 | fifth  |   400 | 2024-01-15 10:00:00
+  6 | sixth  |   500 | 2024-01-15 10:00:00
+(6 rows)
+
+ id | name  | value |     created_at      
+----+-------+-------+---------------------
+ 10 | tenth |  1000 | 2024-01-15 10:00:00
+(1 row)
+
+ id |   name   
+----+----------
+ 11 | eleventh
+(1 row)
+
+ new_id | new_name 
+--------+----------
+     12 | twelfth
+(1 row)
+
+ id |   name   | value |     created_at      
+----+----------+-------+---------------------
+ 20 | source_a |  2000 | 2024-01-15 10:00:00
+ 21 | source_b |  2100 | 2024-01-15 10:00:00
+(2 rows)
+
+ id  |   name   | value |     created_at      
+-----+----------+-------+---------------------
+ 120 | SOURCE_A |  4000 | 2024-01-15 10:00:00
+ 121 | SOURCE_B |  4200 | 2024-01-15 10:00:00
+(2 rows)
+
+ id |   name   | value |     created_at      
+----+----------+-------+---------------------
+  7 | conflict |   700 | 2024-01-15 10:00:00
+(1 row)
+
+ id |  name   | value |     created_at      
+----+---------+-------+---------------------
+  8 | updated |   888 | 2024-01-15 10:00:00
+(1 row)
+
+ id |  name  | value |     created_at      
+----+--------+-------+---------------------
+  9 | upsert |   900 | 2024-01-15 10:00:00
+(1 row)
+
+ id |  name  | value |     created_at      
+----+--------+-------+---------------------
+  9 | upsert |  1000 | 2024-01-15 10:00:00
+(1 row)
+
+             result              
+---------------------------------
+ INSERT variants tests completed
+(1 row)
+

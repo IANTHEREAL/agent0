@@ -1,0 +1,60 @@
+NOTICE:  table "orders" does not exist, skipping
+NOTICE:  table "customers" does not exist, skipping
+ id | customer_id | amount |   status   
+----+-------------+--------+------------
+  1 |           1 |    100 | processing
+(1 row)
+
+ id | customer_id | amount | status  
+----+-------------+--------+---------
+  1 |           1 |    110 | shipped
+  2 |           1 |    210 | shipped
+(2 rows)
+
+ id | customer_id | amount |  status   
+----+-------------+--------+-----------
+  3 |           2 |    150 | confirmed
+(1 row)
+
+ id | new_amount 
+----+------------
+  4 |        600
+(1 row)
+
+ id | customer_id | amount |  status   
+----+-------------+--------+-----------
+  1 |           1 |    110 | vip_order
+  2 |           1 |    210 | vip_order
+(2 rows)
+
+ id | name  | credit 
+----+-------+--------
+  1 | Alice |   1100
+  2 | Bob   |    600
+(2 rows)
+
+ remaining 
+-----------
+         4
+(1 row)
+
+ id | customer_id | amount | status  
+----+-------------+--------+---------
+  4 |           2 |    600 | pending
+(1 row)
+
+ id | customer_id | amount |  status   
+----+-------------+--------+-----------
+  3 |           2 |    150 | confirmed
+(1 row)
+
+ id 
+----
+  3
+(1 row)
+
+                 result                 
+----------------------------------------
+ UPDATE/DELETE variants tests completed
+(1 row)
+

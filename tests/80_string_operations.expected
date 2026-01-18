@@ -1,0 +1,280 @@
+  concat_op  
+-------------
+ hello world
+(1 row)
+
+ concat_func 
+-------------
+ abcd
+(1 row)
+
+ concat_ws 
+-----------
+ a-b-c
+(1 row)
+
+ concat_ws_nulls 
+-----------------
+ a,b,c
+(1 row)
+
+ len 
+-----
+   5
+(1 row)
+
+ char_len 
+----------
+        5
+(1 row)
+
+ character_len 
+---------------
+             5
+(1 row)
+
+ octet_len 
+-----------
+         5
+(1 row)
+
+ bit_len 
+---------
+      40
+(1 row)
+
+  upper_val  
+-------------
+ HELLO WORLD
+(1 row)
+
+  lower_val  
+-------------
+ hello world
+(1 row)
+
+ initcap_val 
+-------------
+ Hello World
+(1 row)
+
+ trim_both 
+-----------
+ hello
+(1 row)
+
+ ltrim_val 
+-----------
+ hello  
+(1 row)
+
+ rtrim_val 
+-----------
+   hello
+(1 row)
+
+ trim_leading 
+--------------
+ hello
+(1 row)
+
+ trim_trailing 
+---------------
+ hell
+(1 row)
+
+ trim_both_char 
+----------------
+ hello
+(1 row)
+
+ btrim_val 
+-----------
+ hello
+(1 row)
+
+ left_val 
+----------
+ hello
+(1 row)
+
+ right_val 
+-----------
+ world
+(1 row)
+
+ substr_from_for 
+-----------------
+ world
+(1 row)
+
+ substr_from 
+-------------
+ world
+(1 row)
+
+ substr_func 
+-------------
+ world
+(1 row)
+
+ pos 
+-----
+   7
+(1 row)
+
+ strpos 
+--------
+      7
+(1 row)
+
+ replace_val 
+-------------
+ hello there
+(1 row)
+
+ translate_val 
+---------------
+ hippo
+(1 row)
+
+ overlay_val 
+-------------
+ heXXo
+(1 row)
+
+ repeat_val 
+------------
+ ababab
+(1 row)
+
+ reverse_val 
+-------------
+ olleh
+(1 row)
+
+  lpad_val  
+------------
+ *****hello
+(1 row)
+
+  rpad_val  
+------------
+ hello*****
+(1 row)
+
+ lpad_trunc 
+------------
+ hel
+(1 row)
+
+ split_part 
+------------
+ b
+(1 row)
+
+ split_part_empty 
+------------------
+ 
+(1 row)
+
+ ascii_val 
+-----------
+        65
+(1 row)
+
+ chr_val 
+---------
+ A
+(1 row)
+
+             md5_hash             
+----------------------------------
+ 5d41402abc4b2a76b9719d911017c592
+(1 row)
+
+  base64  
+----------
+ aGVsbG8=
+(1 row)
+
+   decoded    
+--------------
+ \x68656c6c6f
+(1 row)
+
+  hex_val   
+------------
+ 68656c6c6f
+(1 row)
+
+  format_s   
+-------------
+ hello world
+(1 row)
+
+   format_i    
+---------------
+ "column name"
+(1 row)
+
+    format_l    
+----------------
+ 'it''s a test'
+(1 row)
+
+ normal_ident 
+--------------
+ hello
+(1 row)
+
+ needs_quotes  
+---------------
+ "Hello World"
+(1 row)
+
+ normal_lit 
+------------
+ 'hello'
+(1 row)
+
+ escaped_lit 
+-------------
+ 'it''s'
+(1 row)
+
+ like_prefix 
+-------------
+ t
+(1 row)
+
+ like_suffix 
+-------------
+ t
+(1 row)
+
+ like_contains 
+---------------
+ t
+(1 row)
+
+ like_single 
+-------------
+ t
+(1 row)
+
+ like_case 
+-----------
+ f
+(1 row)
+
+ ilike_case 
+------------
+ t
+(1 row)
+
+           result           
+----------------------------
+ PostgreSQL tests completed
+(1 row)
+

@@ -1,0 +1,68 @@
+NOTICE:  table "set_a" does not exist, skipping
+NOTICE:  table "set_b" does not exist, skipping
+ id |  val   
+----+--------
+  1 | apple
+  2 | banana
+  3 | cherry
+  4 | date
+(4 rows)
+
+ id |  val   
+----+--------
+  1 | apple
+  2 | banana
+  2 | banana
+  3 | cherry
+  3 | cherry
+  4 | date
+(6 rows)
+
+ id |  val   
+----+--------
+  2 | banana
+  3 | cherry
+(2 rows)
+
+ id |  val  
+----+-------
+  1 | apple
+(1 row)
+
+ id |  val   
+----+--------
+  1 | apple
+  2 | banana
+  4 | date
+(3 rows)
+
+ item_id | item_val 
+---------+----------
+       1 | apple
+       2 | banana
+       3 | cherry
+       4 | date
+(4 rows)
+
+ id |  val   
+----+--------
+  1 | APPLE
+  2 | banana
+  2 | BANANA
+  3 | cherry
+  3 | CHERRY
+  4 | date
+(6 rows)
+
+ id |  val   
+----+--------
+  2 | banana
+  3 | cherry
+  4 | date
+(3 rows)
+
+             result             
+--------------------------------
+ Set operations tests completed
+(1 row)
+

@@ -1,0 +1,35 @@
+NOTICE:  table "orders" does not exist, skipping
+ total_orders | completed_orders | cancelled_orders | pending_orders 
+--------------+------------------+------------------+----------------
+            7 |                4 |                2 |              1
+(1 row)
+
+ total_amount | completed_amount | non_cancelled_amount 
+--------------+------------------+----------------------
+         1000 |              675 |                  825
+(1 row)
+
+     overall_avg      |    completed_avg     
+----------------------+----------------------
+ 142.8571428571428571 | 168.7500000000000000
+(1 row)
+
+ customer_id | total | completed | completed_sum 
+-------------+-------+-----------+---------------
+           1 |     3 |         2 |           300
+           2 |     2 |         1 |           300
+           3 |     2 |         1 |            75
+(3 rows)
+
+ customer_id | large_orders | small_orders 
+-------------+--------------+--------------
+           1 |            1 |            2
+           2 |            2 |            0
+           3 |            1 |            1
+(3 rows)
+
+            result             
+-------------------------------
+ FILTER clause tests completed
+(1 row)
+

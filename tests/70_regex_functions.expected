@@ -1,0 +1,143 @@
+ matches 
+---------
+ t
+(1 row)
+
+ case_sensitive_no_match 
+-------------------------
+ f
+(1 row)
+
+ case_insensitive_match 
+------------------------
+ t
+(1 row)
+
+ not_matches 
+-------------
+ t
+(1 row)
+
+ not_matches_insensitive 
+-------------------------
+ t
+(1 row)
+
+ starts_with_letters_then_numbers 
+----------------------------------
+ t
+(1 row)
+
+ contains_whitespace 
+---------------------
+ t
+(1 row)
+
+ email_pattern 
+---------------
+ t
+(1 row)
+
+ basic_replace 
+---------------
+ hello there
+(1 row)
+
+ replace_first 
+---------------
+ baz bar foo
+(1 row)
+
+ replace_all 
+-------------
+ baz bar baz
+(1 row)
+
+ vowels_replaced 
+-----------------
+ H*ll* W*rld
+(1 row)
+
+ numbers_replaced 
+------------------
+ abcNUMdefNUM
+(1 row)
+
+ first_match 
+-------------
+ {123}
+(1 row)
+
+ all_matches 
+-------------
+ {123}
+ {456}
+(2 rows)
+
+ all_words 
+-----------
+ {foo}
+ {bar}
+ {baz}
+(3 rows)
+
+ extract_word_starting_w 
+-------------------------
+ world
+(1 row)
+
+ extract_numbers 
+-----------------
+ 123
+(1 row)
+
+ extract_domain 
+----------------
+ example.com
+(1 row)
+
+ split_result 
+--------------
+ one
+ two
+ three
+(3 rows)
+
+ split_by_numbers 
+------------------
+ a
+ b
+ c
+ 
+(4 rows)
+
+   split_array   
+-----------------
+ {one,two,three}
+(1 row)
+
+ split_whitespace 
+------------------
+ {hello,world}
+(1 row)
+
+NOTICE:  table "log_entries" does not exist, skipping
+ id |                 log_line                  
+----+-------------------------------------------
+  1 | ERROR: Connection failed at 10.0.0.1:5432
+  4 | ERROR: Timeout after 30s
+(2 rows)
+
+ id |              message               
+----+------------------------------------
+  1 | Connection failed at 10.0.0.1:5432
+  2 | User admin logged in
+  3 | High memory usage: 85%
+  4 | Timeout after 30s
+(4 rows)
+
+               result               
+------------------------------------
+ Regular expression tests completed
+(1 row)
+
