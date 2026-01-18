@@ -20,7 +20,7 @@ use sqlparser::ast::{
     BinaryOperator, Distinct, Expr, FunctionArg, FunctionArgExpr, GroupByExpr, Ident,
     JoinConstraint, JoinOperator, Query, SelectItem, Statement, TableFactor,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
 
 impl Executor {
@@ -270,7 +270,7 @@ impl Executor {
         Box::pin(async move {
             let ast = parse_sql(view_query)?;
             if let Some(Statement::Query(q)) = ast.into_iter().next() {
-                self.execute_query_with_ctes(txn, sequence_values, search_path, &q, ctes)
+                self.execute_query_with_outer_ctes(txn, sequence_values, search_path, &q, ctes)
                     .await
             } else {
                 Err(anyhow!("Invalid view query"))
@@ -292,7 +292,7 @@ impl Executor {
     > {
         Box::pin(async move {
             let result = self
-                .execute_query_with_ctes(txn, sequence_values, search_path, subquery, ctes)
+                .execute_query_with_outer_ctes(txn, sequence_values, search_path, subquery, ctes)
                 .await?;
             match result {
                 ExecuteResult::Select {
@@ -1484,6 +1484,8 @@ impl Executor {
         if is_agg {
             let mut groups: HashMap<Vec<u8>, Vec<Aggregator>> = HashMap::new();
             let mut group_rows: HashMap<Vec<u8>, Row> = HashMap::new();
+            // Track seen values for DISTINCT aggregates: group_key -> (agg_idx -> seen_values)
+            let mut seen_distinct: HashMap<Vec<u8>, Vec<HashSet<Vec<u8>>>> = HashMap::new();
 
             for row in filtered_rows {
                 let ctx = JoinContext {
@@ -1549,6 +1551,9 @@ impl Executor {
                     }
                     groups.insert(key_bytes.clone(), aggs);
                     group_rows.insert(key_bytes.clone(), row.clone());
+                    let distinct_sets: Vec<HashSet<Vec<u8>>> =
+                        agg_funcs.iter().map(|_| HashSet::new()).collect();
+                    seen_distinct.insert(key_bytes.clone(), distinct_sets);
                 }
 
                 let aggs = groups.get_mut(&key_bytes).unwrap();
@@ -1597,6 +1602,15 @@ impl Executor {
                     } else {
                         Value::Int32(1)
                     };
+
+                    let is_distinct = matches!(agg_expr, AggExpr::Function(f) if f.distinct);
+                    if is_distinct {
+                        let val_bytes = bincode::serialize(&val).unwrap_or_default();
+                        let distinct_sets = seen_distinct.get_mut(&key_bytes).unwrap();
+                        if !distinct_sets[agg_idx].insert(val_bytes) {
+                            continue;
+                        }
+                    }
                     aggs[agg_idx].update(&val)?;
                 }
             }

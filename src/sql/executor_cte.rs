@@ -10,14 +10,15 @@ use std::collections::HashMap;
 use tikv_client::Transaction;
 
 impl Executor {
-    pub(crate) async fn build_cte_context(
+    pub(crate) async fn build_cte_context_with_base(
         &self,
         txn: &mut Transaction,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         query: &Query,
+        base_ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<HashMap<String, (TableSchema, Vec<Row>)>> {
-        let mut ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
+        let mut ctes: HashMap<String, (TableSchema, Vec<Row>)> = base_ctes.clone();
         if let Some(with) = &query.with {
             for cte in &with.cte_tables {
                 let cte_name = cte.alias.name.value.to_lowercase();
@@ -37,7 +38,7 @@ impl Executor {
                     ctes.insert(cte_name, (schema, rows));
                 } else {
                     let cte_result = self
-                        .execute_query_with_ctes(
+                        .execute_query_with_outer_ctes(
                             txn,
                             sequence_values,
                             search_path,
@@ -100,6 +101,18 @@ impl Executor {
             }
         }
         Ok(ctes)
+    }
+
+    pub(crate) async fn build_cte_context(
+        &self,
+        txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        query: &Query,
+    ) -> Result<HashMap<String, (TableSchema, Vec<Row>)>> {
+        let base = HashMap::new();
+        self.build_cte_context_with_base(txn, sequence_values, search_path, query, &base)
+            .await
     }
 
     pub(crate) async fn execute_recursive_cte(

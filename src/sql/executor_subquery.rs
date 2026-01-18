@@ -28,7 +28,7 @@ impl Executor {
                     negated,
                 } => {
                     let result = self
-                        .execute_query_with_ctes(txn, sequence_values, search_path, subquery, ctes)
+                        .execute_query_with_outer_ctes(txn, sequence_values, search_path, subquery, ctes)
                         .await?;
                     let values = match result {
                         ExecuteResult::Select { rows, .. } => rows
@@ -97,7 +97,7 @@ impl Executor {
                 }
                 Expr::Subquery(subquery) => {
                     let result = self
-                        .execute_query_with_ctes(txn, sequence_values, search_path, subquery, ctes)
+                        .execute_query_with_outer_ctes(txn, sequence_values, search_path, subquery, ctes)
                         .await?;
                     match result {
                         ExecuteResult::Select { rows, .. } => {
@@ -115,7 +115,7 @@ impl Executor {
                 }
                 Expr::Exists { subquery, negated } => {
                     let result = self
-                        .execute_query_with_ctes(txn, sequence_values, search_path, subquery, ctes)
+                        .execute_query_with_outer_ctes(txn, sequence_values, search_path, subquery, ctes)
                         .await?;
                     let exists = match result {
                         ExecuteResult::Select { rows, .. } => !rows.is_empty(),

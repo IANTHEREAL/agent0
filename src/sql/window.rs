@@ -7,7 +7,7 @@ use sqlparser::ast::{
     WindowFrameBound, WindowType,
 };
 
-use super::expr::{compare_values, eval_expr, eval_expr_join, JoinContext};
+use super::expr::{compare_order_by_values, compare_values, eval_expr, eval_expr_join, JoinContext};
 use crate::types::{Row, TableSchema, Value};
 
 pub(crate) struct WindowFuncInfo {
@@ -91,22 +91,11 @@ pub(crate) fn compute_window_functions(
                             .unwrap_or(Value::Null);
                         let val_b = eval_expr(&order_expr.expr, Some(&rows[b]), Some(schema))
                             .unwrap_or(Value::Null);
-                        let cmp = compare_values(&val_a, &val_b).unwrap_or(0);
-                        if cmp != 0 {
-                            let asc = order_expr.asc.unwrap_or(true);
-                            return if asc {
-                                if cmp > 0 {
-                                    std::cmp::Ordering::Greater
-                                } else {
-                                    std::cmp::Ordering::Less
-                                }
-                            } else {
-                                if cmp > 0 {
-                                    std::cmp::Ordering::Less
-                                } else {
-                                    std::cmp::Ordering::Greater
-                                }
-                            };
+                        let asc = order_expr.asc.unwrap_or(true);
+                        let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+                        let ord = compare_order_by_values(&val_a, &val_b, asc, nulls_first);
+                        if !matches!(ord, std::cmp::Ordering::Equal) {
+                            return ord;
                         }
                     }
                     std::cmp::Ordering::Equal
@@ -615,22 +604,11 @@ pub(crate) fn compute_window_functions_join(
                         };
                         let val_a = eval_expr_join(&order_expr.expr, &ctx_a).unwrap_or(Value::Null);
                         let val_b = eval_expr_join(&order_expr.expr, &ctx_b).unwrap_or(Value::Null);
-                        let cmp = compare_values(&val_a, &val_b).unwrap_or(0);
-                        if cmp != 0 {
-                            let asc = order_expr.asc.unwrap_or(true);
-                            return if asc {
-                                if cmp > 0 {
-                                    std::cmp::Ordering::Greater
-                                } else {
-                                    std::cmp::Ordering::Less
-                                }
-                            } else {
-                                if cmp > 0 {
-                                    std::cmp::Ordering::Less
-                                } else {
-                                    std::cmp::Ordering::Greater
-                                }
-                            };
+                        let asc = order_expr.asc.unwrap_or(true);
+                        let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+                        let ord = compare_order_by_values(&val_a, &val_b, asc, nulls_first);
+                        if !matches!(ord, std::cmp::Ordering::Equal) {
+                            return ord;
                         }
                     }
                     std::cmp::Ordering::Equal

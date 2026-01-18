@@ -20,6 +20,30 @@ use tikv_client::Transaction;
 use tracing::debug;
 
 impl Executor {
+    pub(crate) fn execute_query_with_outer_ctes<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        query: &'a Query,
+        outer_ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecuteResult>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if query.with.is_none() {
+                return self
+                    .execute_query_with_ctes(txn, sequence_values, search_path, query, outer_ctes)
+                    .await;
+            }
+
+            let merged_ctes = self
+                .build_cte_context_with_base(txn, sequence_values, search_path, query, outer_ctes)
+                .await?;
+            self.execute_query_with_ctes(txn, sequence_values, search_path, query, &merged_ctes)
+                .await
+        })
+    }
+
     pub(crate) async fn execute_query_with_ctes(
         &self,
         txn: &mut Transaction,
@@ -1283,20 +1307,16 @@ impl Executor {
                 for (idx, order_expr) in order_by.iter().enumerate() {
                     let val_a = a_keys.get(idx).cloned().unwrap_or(Value::Null);
                     let val_b = b_keys.get(idx).cloned().unwrap_or(Value::Null);
-                    let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
-                    if cmp != 0 {
-                        let asc = order_expr.asc.unwrap_or(true);
-                        return if asc {
-                            if cmp > 0 {
-                                std::cmp::Ordering::Greater
-                            } else {
-                                std::cmp::Ordering::Less
-                            }
-                        } else if cmp > 0 {
-                            std::cmp::Ordering::Less
-                        } else {
-                            std::cmp::Ordering::Greater
-                        };
+                    let asc = order_expr.asc.unwrap_or(true);
+                    let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+                    let ord = super::expr::compare_order_by_values(
+                        &val_a,
+                        &val_b,
+                        asc,
+                        nulls_first,
+                    );
+                    if !matches!(ord, std::cmp::Ordering::Equal) {
+                        return ord;
                     }
                 }
                 std::cmp::Ordering::Equal
@@ -1319,20 +1339,16 @@ impl Executor {
                         eval_expr(actual_expr, Some(a), Some(schema)).unwrap_or(Value::Null);
                     let val_b =
                         eval_expr(actual_expr, Some(b), Some(schema)).unwrap_or(Value::Null);
-                    let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
-                    if cmp != 0 {
-                        let asc = order_expr.asc.unwrap_or(true);
-                        return if asc {
-                            if cmp > 0 {
-                                std::cmp::Ordering::Greater
-                            } else {
-                                std::cmp::Ordering::Less
-                            }
-                        } else if cmp > 0 {
-                            std::cmp::Ordering::Less
-                        } else {
-                            std::cmp::Ordering::Greater
-                        };
+                    let asc = order_expr.asc.unwrap_or(true);
+                    let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+                    let ord = super::expr::compare_order_by_values(
+                        &val_a,
+                        &val_b,
+                        asc,
+                        nulls_first,
+                    );
+                    if !matches!(ord, std::cmp::Ordering::Equal) {
+                        return ord;
                     }
                 }
                 std::cmp::Ordering::Equal

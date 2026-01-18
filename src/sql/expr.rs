@@ -181,6 +181,23 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             Ok(Value::Boolean(if *negated { !in_range } else { in_range }))
         }
         Expr::Function(func) => eval_function_join(func, ctx),
+        Expr::Interval(interval) => {
+            let val = eval_expr_join(&interval.value, ctx)?;
+            match val {
+                Value::Text(s) => parse_interval_from_expr(&s, interval),
+                Value::Int32(n) => interval_from_number(n as i64, interval),
+                Value::Int64(n) => interval_from_number(n, interval),
+                _ => Err(anyhow!("Invalid interval value")),
+            }
+        }
+        Expr::TypedString { data_type, value } => match data_type {
+            sqlparser::ast::DataType::Interval => parse_interval_string(value),
+            sqlparser::ast::DataType::Timestamp(_, _) => parse_timestamp_string(value),
+            sqlparser::ast::DataType::Date => {
+                crate::types::date::parse_date_days(value).map(Value::Date)
+            }
+            _ => Ok(Value::Text(value.clone())),
+        },
         Expr::Like {
             negated,
             expr,
@@ -732,6 +749,71 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
                 .as_millis() as i64;
             Ok(Value::Timestamp(ts))
         }
+        "CURRENT_DATE" => {
+            use chrono::Utc;
+            let today = Utc::now().date_naive();
+            let days = crate::types::date::naive_date_to_days(today)?;
+            Ok(Value::Date(days))
+        }
+        "DATE_TRUNC" => eval_date_trunc_from_args(args),
+        "TO_CHAR" => eval_to_char_from_args(args),
+        "AGE" => {
+            use chrono::{Datelike, TimeZone, Utc};
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let mut iter = args.into_iter();
+            let ts1 = match iter.next() {
+                Some(Value::Timestamp(t)) => t,
+                Some(Value::Date(days)) => crate::types::date::date_days_to_timestamp_millis(days)?,
+                _ => return Ok(Value::Null),
+            };
+            let ts2 = match iter.next() {
+                Some(Value::Timestamp(t)) => t,
+                Some(Value::Date(days)) => crate::types::date::date_days_to_timestamp_millis(days)?,
+                _ => SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as i64,
+            };
+
+            let dt1 = Utc
+                .timestamp_millis_opt(ts1)
+                .single()
+                .ok_or_else(|| anyhow!("Invalid timestamp"))?;
+            let dt2 = Utc
+                .timestamp_millis_opt(ts2)
+                .single()
+                .ok_or_else(|| anyhow!("Invalid timestamp"))?;
+
+            let mut years = dt1.year() - dt2.year();
+            let mut months = dt1.month() as i32 - dt2.month() as i32;
+            let mut days = dt1.day() as i32 - dt2.day() as i32;
+
+            if days < 0 {
+                months -= 1;
+                let prev_month = if dt1.month() == 1 {
+                    12
+                } else {
+                    dt1.month() - 1
+                };
+                let prev_year = if dt1.month() == 1 {
+                    dt1.year() - 1
+                } else {
+                    dt1.year()
+                };
+                days += days_in_month(prev_year, prev_month) as i32;
+            }
+            if months < 0 {
+                years -= 1;
+                months += 12;
+            }
+
+            let total_months = years * 12 + months;
+
+            Ok(Value::Interval(crate::types::IntervalValue::new(
+                total_months,
+                days as i64 * 24 * 60 * 60 * 1000,
+            )))
+        }
         "DATE" => {
             let days = match args.into_iter().next() {
                 Some(Value::Date(days)) => days,
@@ -754,6 +836,103 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
         "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => {
             let uuid = uuid::Uuid::new_v4();
             Ok(Value::Uuid(*uuid.as_bytes()))
+        }
+        "JSONB_EXISTS" => {
+            if args.len() != 2 {
+                return Err(anyhow!("jsonb_exists requires exactly 2 arguments"));
+            }
+            let json_str = match &args[0] {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let key = match &args[1] {
+                Value::Text(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+
+            let exists = match json_val {
+                serde_json::Value::Object(obj) => obj.contains_key(&key),
+                serde_json::Value::Array(arr) => arr
+                    .into_iter()
+                    .any(|v| matches!(v, serde_json::Value::String(s) if s == key)),
+                _ => false,
+            };
+            Ok(Value::Boolean(exists))
+        }
+        "JSONB_EXISTS_ANY" => {
+            if args.len() != 2 {
+                return Err(anyhow!("jsonb_exists_any requires exactly 2 arguments"));
+            }
+            let json_str = match &args[0] {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let keys: Vec<String> = match &args[1] {
+                Value::Array(vals) => vals
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Null => None,
+                        Value::Text(s) => Some(s.clone()),
+                        other => Some(other.to_string()),
+                    })
+                    .collect(),
+                Value::Null => return Ok(Value::Null),
+                v => vec![v.to_string()],
+            };
+
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+
+            let exists_any = match json_val {
+                serde_json::Value::Object(obj) => keys.iter().any(|k| obj.contains_key(k)),
+                serde_json::Value::Array(arr) => keys.iter().any(|k| {
+                    arr.iter()
+                        .any(|v| matches!(v, serde_json::Value::String(s) if s == k))
+                }),
+                _ => false,
+            };
+            Ok(Value::Boolean(exists_any))
+        }
+        "JSONB_EXISTS_ALL" => {
+            if args.len() != 2 {
+                return Err(anyhow!("jsonb_exists_all requires exactly 2 arguments"));
+            }
+            let json_str = match &args[0] {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s.clone(),
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let keys: Vec<String> = match &args[1] {
+                Value::Array(vals) => vals
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Null => None,
+                        Value::Text(s) => Some(s.clone()),
+                        other => Some(other.to_string()),
+                    })
+                    .collect(),
+                Value::Null => return Ok(Value::Null),
+                v => vec![v.to_string()],
+            };
+
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+
+            let exists_all = match json_val {
+                serde_json::Value::Object(obj) => keys.iter().all(|k| obj.contains_key(k)),
+                serde_json::Value::Array(arr) => keys.iter().all(|k| {
+                    arr.iter()
+                        .any(|v| matches!(v, serde_json::Value::String(s) if s == k))
+                }),
+                _ => false,
+            };
+            Ok(Value::Boolean(exists_all))
         }
         "JSONB_ARRAY_LENGTH"
         | "JSON_ARRAY_LENGTH"
@@ -2338,63 +2517,7 @@ fn eval_function(
             Ok(Value::Date(days))
         }
         "DATE_TRUNC" => {
-            let mut iter = args.into_iter();
-            let field = match iter.next() {
-                Some(Value::Text(s)) => s.to_lowercase(),
-                _ => return Ok(Value::Null),
-            };
-            let ts = match iter.next() {
-                Some(Value::Timestamp(t)) => t,
-                Some(Value::Text(s)) => {
-                    // Parse text timestamp
-                    use chrono::NaiveDateTime;
-                    let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S"))
-                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f"))
-                        .or_else(|_| {
-                            // Try date only, add time component
-                            chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
-                                .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
-                        })
-                        .map_err(|e| anyhow!("Invalid timestamp format: {}", e))?;
-                    dt.and_utc().timestamp_millis()
-                }
-                _ => return Ok(Value::Null),
-            };
-            use chrono::{Datelike, TimeZone, Timelike, Utc};
-            let dt = Utc
-                .timestamp_millis_opt(ts)
-                .single()
-                .ok_or_else(|| anyhow!("Invalid timestamp"))?;
-            let truncated = match field.as_str() {
-                "year" => chrono::NaiveDate::from_ymd_opt(dt.year(), 1, 1)
-                    .unwrap()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap()
-                    .and_utc(),
-                "month" => chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
-                    .unwrap()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap()
-                    .and_utc(),
-                "day" => chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day())
-                    .unwrap()
-                    .and_hms_opt(0, 0, 0)
-                    .unwrap()
-                    .and_utc(),
-                "hour" => chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day())
-                    .unwrap()
-                    .and_hms_opt(dt.hour(), 0, 0)
-                    .unwrap()
-                    .and_utc(),
-                "minute" => chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day())
-                    .unwrap()
-                    .and_hms_opt(dt.hour(), dt.minute(), 0)
-                    .unwrap()
-                    .and_utc(),
-                _ => return Err(anyhow!("Unsupported DATE_TRUNC field: {}", field)),
-            };
-            Ok(Value::Timestamp(truncated.timestamp_millis()))
+            eval_date_trunc_from_args(args)
         }
         "DATE" => {
             let days = match args.into_iter().next() {
@@ -2416,21 +2539,7 @@ fn eval_function(
             Ok(Value::Date(days))
         }
         "TO_CHAR" => {
-            let mut iter = args.into_iter();
-            let val = iter.next();
-            let _fmt = iter.next();
-            match val {
-                Some(Value::Timestamp(ts)) => {
-                    use chrono::{TimeZone, Utc};
-                    let dt = Utc
-                        .timestamp_millis_opt(ts)
-                        .single()
-                        .ok_or_else(|| anyhow!("Invalid timestamp"))?;
-                    Ok(Value::Text(dt.format("%Y-%m-%d %H:%M:%S").to_string()))
-                }
-                Some(v) => Ok(Value::Text(v.to_string())),
-                None => Ok(Value::Null),
-            }
+            eval_to_char_from_args(args)
         }
         "AGE" => {
             use chrono::{Datelike, TimeZone, Utc};
@@ -3905,6 +4014,145 @@ fn parse_timestamp_string(s: &str) -> Result<Value> {
     Err(anyhow!("Cannot parse timestamp: {}", s))
 }
 
+fn pg_to_chrono_format(fmt: &str) -> String {
+    let upper = fmt.to_ascii_uppercase();
+    let mut out = String::with_capacity(fmt.len());
+    let mut i = 0;
+    while i < fmt.len() {
+        let rest_upper = &upper[i..];
+        if rest_upper.starts_with("HH24") {
+            out.push_str("%H");
+            i += 4;
+            continue;
+        }
+        if rest_upper.starts_with("YYYY") {
+            out.push_str("%Y");
+            i += 4;
+            continue;
+        }
+        if rest_upper.starts_with("YY") {
+            out.push_str("%y");
+            i += 2;
+            continue;
+        }
+        if rest_upper.starts_with("MM") {
+            out.push_str("%m");
+            i += 2;
+            continue;
+        }
+        if rest_upper.starts_with("DD") {
+            out.push_str("%d");
+            i += 2;
+            continue;
+        }
+        if rest_upper.starts_with("MI") {
+            out.push_str("%M");
+            i += 2;
+            continue;
+        }
+        if rest_upper.starts_with("SS") {
+            out.push_str("%S");
+            i += 2;
+            continue;
+        }
+
+        let ch = fmt[i..].chars().next().unwrap();
+        if ch == '%' {
+            // chrono uses '%' for specifiers; escape literal '%' from to_char formats.
+            out.push_str("%%");
+        } else {
+            out.push(ch);
+        }
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn eval_to_char_from_args(args: Vec<Value>) -> Result<Value> {
+    let mut iter = args.into_iter();
+    let val = iter.next().unwrap_or(Value::Null);
+    let fmt = iter.next().unwrap_or(Value::Null);
+
+    let fmt = match fmt {
+        Value::Text(s) => s,
+        Value::Null => return Ok(Value::Null),
+        v => v.to_string(),
+    };
+    let chrono_fmt = pg_to_chrono_format(&fmt);
+
+    match val {
+        Value::Null => Ok(Value::Null),
+        Value::Timestamp(ts) => {
+            use chrono::{TimeZone, Utc};
+            let dt = Utc
+                .timestamp_millis_opt(ts)
+                .single()
+                .ok_or_else(|| anyhow!("Invalid timestamp"))?;
+            Ok(Value::Text(dt.format(&chrono_fmt).to_string()))
+        }
+        Value::Date(days) => {
+            let date = crate::types::date::date_days_to_naive_date(days)?;
+            let dt = date
+                .and_hms_opt(0, 0, 0)
+                .ok_or_else(|| anyhow!("Invalid date"))?;
+            Ok(Value::Text(dt.format(&chrono_fmt).to_string()))
+        }
+        other => Ok(Value::Text(other.to_string())),
+    }
+}
+
+fn eval_date_trunc_from_args(args: Vec<Value>) -> Result<Value> {
+    let mut iter = args.into_iter();
+    let field = match iter.next() {
+        Some(Value::Text(s)) => s.to_lowercase(),
+        _ => return Ok(Value::Null),
+    };
+    let ts = match iter.next() {
+        Some(Value::Timestamp(t)) => t,
+        Some(Value::Date(days)) => crate::types::date::date_days_to_timestamp_millis(days)?,
+        Some(Value::Text(s)) => match parse_timestamp_string(&s)? {
+            Value::Timestamp(ts) => ts,
+            _ => return Ok(Value::Null),
+        },
+        _ => return Ok(Value::Null),
+    };
+
+    use chrono::{Datelike, TimeZone, Timelike, Utc};
+    let dt = Utc
+        .timestamp_millis_opt(ts)
+        .single()
+        .ok_or_else(|| anyhow!("Invalid timestamp"))?;
+    let truncated = match field.as_str() {
+        "year" => chrono::NaiveDate::from_ymd_opt(dt.year(), 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc(),
+        "month" => chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc(),
+        "day" => chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day())
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc(),
+        "hour" => chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day())
+            .unwrap()
+            .and_hms_opt(dt.hour(), 0, 0)
+            .unwrap()
+            .and_utc(),
+        "minute" => chrono::NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day())
+            .unwrap()
+            .and_hms_opt(dt.hour(), dt.minute(), 0)
+            .unwrap()
+            .and_utc(),
+        _ => return Err(anyhow!("Unsupported DATE_TRUNC field: {}", field)),
+    };
+    Ok(Value::Timestamp(truncated.timestamp_millis()))
+}
+
 pub fn eval_value_public(v: &SqlValue) -> Result<Value> {
     eval_value(v)
 }
@@ -4233,6 +4481,59 @@ fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<Valu
                 Ok(re) => Ok(Value::Boolean(!re.is_match(&text))),
                 Err(e) => Err(anyhow!("Invalid regex pattern: {}", e)),
             }
+        }
+
+        // PostgreSQL JSONB existence operator: `jsonb ? text`
+        // - For objects: key exists
+        // - For arrays: string element exists at top-level
+        // sqlparser 0.40 parses `?` as a custom operator.
+        BinaryOperator::Custom(op) if op == "?" => {
+            let json_str = match left {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let key = match right {
+                Value::Text(s) => s,
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+
+            let exists = match json_val {
+                serde_json::Value::Object(obj) => obj.contains_key(&key),
+                serde_json::Value::Array(arr) => arr
+                    .into_iter()
+                    .any(|v| matches!(v, serde_json::Value::String(s) if s == key)),
+                _ => false,
+            };
+            Ok(Value::Boolean(exists))
+        }
+        BinaryOperator::PGCustomBinaryOperator(op) if op.len() == 1 && op[0] == "?" => {
+            let json_str = match left {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+            let key = match right {
+                Value::Text(s) => s,
+                Value::Null => return Ok(Value::Null),
+                v => v.to_string(),
+            };
+
+            let json_val: serde_json::Value =
+                serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
+
+            let exists = match json_val {
+                serde_json::Value::Object(obj) => obj.contains_key(&key),
+                serde_json::Value::Array(arr) => arr
+                    .into_iter()
+                    .any(|v| matches!(v, serde_json::Value::String(s) if s == key)),
+                _ => false,
+            };
+            Ok(Value::Boolean(exists))
         }
 
         _ => Err(anyhow!("Unsupported binary operator: {:?}", op)),
@@ -4848,6 +5149,48 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
             left,
             right
         )),
+    }
+}
+
+/// ORDER BY comparator with PostgreSQL-like NULLS FIRST/LAST semantics.
+pub fn compare_order_by_values(
+    left: &Value,
+    right: &Value,
+    asc: bool,
+    nulls_first: bool,
+) -> std::cmp::Ordering {
+    match (left, right) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => {
+            if nulls_first {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }
+        (_, Value::Null) => {
+            if nulls_first {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            }
+        }
+        _ => {
+            let cmp = compare_values(left, right).unwrap_or(0);
+            if cmp == 0 {
+                std::cmp::Ordering::Equal
+            } else if asc {
+                if cmp > 0 {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Less
+                }
+            } else if cmp > 0 {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }
     }
 }
 
@@ -5730,6 +6073,88 @@ mod tests {
         );
         assert_eq!(compare_values(&Value::Null, &Value::Int32(5)).unwrap(), -1);
         assert_eq!(compare_values(&Value::Int32(5), &Value::Null).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_compare_order_by_values_nulls() {
+        use std::cmp::Ordering;
+
+        // ASC defaults to NULLS LAST.
+        assert_eq!(
+            compare_order_by_values(&Value::Null, &Value::Date(0), true, false),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_order_by_values(&Value::Date(0), &Value::Null, true, false),
+            Ordering::Less
+        );
+
+        // DESC defaults to NULLS FIRST.
+        assert_eq!(
+            compare_order_by_values(&Value::Null, &Value::Date(0), false, true),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_order_by_values(&Value::Date(0), &Value::Null, false, true),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_jsonb_exists_function() {
+        assert_eq!(
+            eval_expr(
+                &parse_expr("JSONB_EXISTS('{\"a\": 1, \"b\": 2}'::jsonb, 'a')"),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval_expr(
+                &parse_expr("JSONB_EXISTS('{\"a\": 1}'::jsonb, 'c')"),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            eval_expr(
+                &parse_expr("JSONB_EXISTS('[\"a\", \"b\"]'::jsonb, 'b')"),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn test_to_char_format_tokens() {
+        assert_eq!(
+            eval_expr(
+                &parse_expr("TO_CHAR(TIMESTAMP '2024-01-15 14:30:45', 'YYYY-MM')"),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Text("2024-01".to_string())
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("TO_CHAR(DATE '2024-01-15', 'YYYY-MM')"), None, None).unwrap(),
+            Value::Text("2024-01".to_string())
+        );
+        assert_eq!(
+            eval_expr(
+                &parse_expr("TO_CHAR(TIMESTAMP '2024-01-15 14:30:45', 'YYYY-MM-DD HH24:MI:SS')"),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Text("2024-01-15 14:30:45".to_string())
+        );
     }
 
     #[test]

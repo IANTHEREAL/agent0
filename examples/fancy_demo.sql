@@ -8,6 +8,7 @@
 -- ============================================================================
 
 -- Setup: Create a mini e-commerce schema
+DROP VIEW IF EXISTS executive_summary;
 DROP TABLE IF EXISTS order_items CASCADE;
 DROP TABLE IF EXISTS orders CASCADE;
 DROP TABLE IF EXISTS products CASCADE;
@@ -142,20 +143,34 @@ INSERT INTO order_items (order_id, product_id, quantity, unit_price, discount) V
 SELECT 
     '=== Customer Purchase Rankings ===' as section;
 
-SELECT 
-    c.name as customer,
-    c.tier,
-    COUNT(o.id) as order_count,
-    COALESCE(SUM(o.total), 0) as total_spent,
-    RANK() OVER (ORDER BY COALESCE(SUM(o.total), 0) DESC) as spending_rank,
-    ROUND(
-        100.0 * COALESCE(SUM(o.total), 0) / 
-        SUM(COALESCE(SUM(o.total), 0)) OVER (), 
-        2
-    ) as pct_of_revenue
-FROM customers c
-LEFT JOIN orders o ON c.id = o.customer_id AND o.status != 'cancelled'
-GROUP BY c.id, c.name, c.tier
+WITH customer_metrics AS (
+    SELECT 
+        c.name as customer,
+        c.tier,
+        COUNT(o.id) as order_count,
+        COALESCE(SUM(o.total), 0) as total_spent
+    FROM customers c
+    LEFT JOIN orders o ON c.id = o.customer_id AND o.status != 'cancelled'
+    GROUP BY c.id, c.name, c.tier
+),
+ranked AS (
+    SELECT
+        customer,
+        tier,
+        order_count,
+        total_spent,
+        RANK() OVER (ORDER BY total_spent DESC) as spending_rank,
+        SUM(total_spent) OVER () as total_revenue
+    FROM customer_metrics
+)
+SELECT
+    customer,
+    tier,
+    order_count,
+    total_spent,
+    spending_rank,
+    ROUND(100.0 * total_spent / NULLIF(total_revenue, 0), 2) as pct_of_revenue
+FROM ranked
 ORDER BY total_spent DESC;
 
 -- ---------------------------------------------------------------------------
@@ -216,8 +231,7 @@ monthly_growth AS (
         orders,
         unique_customers,
         revenue,
-        LAG(revenue) OVER (ORDER BY month) as prev_revenue,
-        revenue - LAG(revenue) OVER (ORDER BY month) as revenue_change
+        LAG(revenue) OVER (ORDER BY month) as prev_revenue
     FROM monthly_sales
 )
 SELECT 
@@ -252,7 +266,7 @@ SELECT
     END as tier
 FROM products p
 JOIN categories c ON p.category_id = c.id
-WHERE p.attributes ? 'rating'
+WHERE JSONB_EXISTS(p.attributes, 'rating')
 ORDER BY (p.attributes->>'rating')::float DESC;
 
 -- ---------------------------------------------------------------------------
@@ -288,23 +302,31 @@ ORDER BY stats.revenue DESC;
 SELECT 
     '=== Order Timeline Analysis ===' as section;
 
-SELECT 
-    o.id as order_id,
-    c.name as customer,
-    o.created_at::date as order_date,
-    o.total,
-    SUM(o.total) OVER (ORDER BY o.created_at) as running_total,
-    ROUND(
+WITH order_timeline AS (
+    SELECT 
+        o.id as order_id,
+        c.name as customer,
+        o.created_at as created_at,
+        o.created_at::date as order_date,
+        o.total,
+        SUM(o.total) OVER (ORDER BY o.created_at) as running_total,
         AVG(o.total) OVER (
             ORDER BY o.created_at 
             ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
-        )::numeric, 
-        2
-    ) as moving_avg_3
-FROM orders o
-JOIN customers c ON o.customer_id = c.id
-WHERE o.status != 'cancelled'
-ORDER BY o.created_at;
+        ) as moving_avg_3
+    FROM orders o
+    JOIN customers c ON o.customer_id = c.id
+    WHERE o.status != 'cancelled'
+)
+SELECT
+    order_id,
+    customer,
+    order_date,
+    total,
+    running_total,
+    ROUND(moving_avg_3::numeric, 2) as moving_avg_3
+FROM order_timeline
+ORDER BY created_at;
 
 -- ---------------------------------------------------------------------------
 -- 3.7 Advanced Aggregation: Customer Cohort Analysis
@@ -397,7 +419,7 @@ ORDER BY total_spent DESC;
 SELECT 
     '=== Executive Summary ===' as section;
 
-CREATE VIEW executive_summary AS
+CREATE OR REPLACE VIEW executive_summary AS
 WITH metrics AS (
     SELECT 
         COUNT(DISTINCT c.id) as total_customers,
