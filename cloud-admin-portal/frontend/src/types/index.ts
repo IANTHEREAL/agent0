@@ -1,10 +1,26 @@
 // API Response Types
 
+export type EndpointType = "primary" | "replica" | "load_balancer"
+
+export interface Endpoint {
+  host: string
+  port: number
+  type: EndpointType
+  region?: string | null
+  priority: number
+  description?: string | null
+  enabled: boolean
+  connection_string: string
+}
+
 export interface Tenant {
   name: string
   state: string
+  endpoints: Endpoint[]
+  // Legacy fields for backwards compatibility
   host?: string
   port?: number
+  // Extended fields
   is_deleted?: boolean
   created_at?: string
   created_by?: string | null

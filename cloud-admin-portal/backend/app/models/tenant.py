@@ -5,6 +5,8 @@ from typing import Optional
 
 from pydantic import BaseModel, Field
 
+from .endpoint import Endpoint
+
 
 class TenantCreate(BaseModel):
     """Request body for creating a tenant."""
@@ -28,11 +30,13 @@ class TenantCreate(BaseModel):
 
 class TenantResponse(BaseModel):
     """Response with tenant information."""
-    
+
     name: str
     state: str
-    host: Optional[str] = None
-    port: Optional[int] = None
+    endpoints: list[Endpoint] = Field(
+        default_factory=list,
+        description="List of available pg-tikv endpoints for client connections"
+    )
 
 
 class TenantCreateResponse(BaseModel):

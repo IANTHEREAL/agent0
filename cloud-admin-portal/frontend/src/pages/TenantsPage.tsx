@@ -139,9 +139,20 @@ export function TenantsPage() {
                         )}
                       </td>
                       <td className="px-3 py-2.5">
-                        <code className="text-xs bg-muted px-2 py-0.5 rounded">
-                          {tenant.name}.&lt;user&gt;
-                        </code>
+                        {tenant.endpoints && tenant.endpoints.length > 0 ? (
+                          <div className="flex flex-col gap-0.5">
+                            <code className="text-xs bg-muted px-2 py-0.5 rounded">
+                              {tenant.endpoints[0].host}:{tenant.endpoints[0].port}
+                            </code>
+                            {tenant.endpoints.length > 1 && (
+                              <span className="text-xs text-muted-foreground">
+                                +{tenant.endpoints.length - 1} more
+                              </span>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">-</span>
+                        )}
                       </td>
                       <td className="px-3 py-2.5">
                         <div className="flex justify-end gap-1">

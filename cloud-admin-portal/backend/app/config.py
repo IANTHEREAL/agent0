@@ -20,14 +20,20 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices('PD_ENDPOINTS', 'pd_endpoints')  # Read from PD_ENDPOINTS env var
     )
     
-    # pg-tikv Server Configuration
+    # pg-tikv Server Configuration (Internal)
     pg_host: str = Field(
         default="127.0.0.1",
-        description="pg-tikv server host"
+        description="pg-tikv server host for backend connections"
     )
     pg_port: int = Field(
         default=5433,
-        description="pg-tikv server port"
+        description="pg-tikv server port for backend connections"
+    )
+
+    # pg-tikv Public Endpoints (for end users - supports multiple endpoints for load balancing)
+    pg_public_endpoints: str = Field(
+        default="127.0.0.1:5433",
+        description="Comma-separated pg-tikv public endpoints (host:port) for client connections"
     )
     
     # API Server Configuration
@@ -67,6 +73,35 @@ class Settings(BaseSettings):
     class Config:
         env_prefix = "PGTIKV_"
         case_sensitive = False
+
+    def parse_public_endpoints(self) -> list[tuple[str, int]]:
+        """Parse pg_public_endpoints into list of (host, port) tuples.
+
+        Format: "host1:port1,host2:port2,..."
+        Example: "pg1.example.com:5433,pg2.example.com:5433"
+
+        Returns:
+            List of (host, port) tuples
+        """
+        endpoints = []
+        for endpoint in self.pg_public_endpoints.split(","):
+            endpoint = endpoint.strip()
+            if not endpoint:
+                continue
+
+            if ":" in endpoint:
+                host, port_str = endpoint.rsplit(":", 1)
+                try:
+                    port = int(port_str)
+                    endpoints.append((host.strip(), port))
+                except ValueError:
+                    # Invalid port, skip this endpoint
+                    continue
+            else:
+                # No port specified, use default
+                endpoints.append((endpoint, 5433))
+
+        return endpoints
 
 
 @lru_cache()

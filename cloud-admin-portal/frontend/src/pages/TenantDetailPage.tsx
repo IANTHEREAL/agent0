@@ -105,8 +105,10 @@ export function TenantDetailPage() {
     }
   }
 
-  const copyConnectionString = () => {
-    const connStr = `psql -h ${tenant?.host || '127.0.0.1'} -p ${tenant?.port || 5433} -U ${name}.admin`
+  const copyConnectionString = (endpoint?: { host: string; port: number }) => {
+    const host = endpoint?.host || tenant?.endpoints?.[0]?.host || '127.0.0.1'
+    const port = endpoint?.port || tenant?.endpoints?.[0]?.port || 5433
+    const connStr = `psql -h ${host} -p ${port} -U ${name}.admin`
     navigator.clipboard.writeText(connStr)
     setCopied(true)
     setTimeout(() => setCopied(false), 2000)
@@ -164,31 +166,72 @@ export function TenantDetailPage() {
       {/* Connection Info */}
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">Connection Info</CardTitle>
-          <CardDescription className="text-xs">Connect to this tenant using psql or any PostgreSQL client</CardDescription>
+          <CardTitle className="text-base">Connection Endpoints</CardTitle>
+          <CardDescription className="text-xs">
+            {tenant.endpoints && tenant.endpoints.length > 1
+              ? "Multiple endpoints available for load balancing"
+              : "Connect to this tenant using psql or any PostgreSQL client"}
+          </CardDescription>
         </CardHeader>
         <CardContent>
-          <div className="grid grid-cols-2 gap-3 text-sm">
-            <div>
-              <p className="text-xs text-muted-foreground mb-1">Host</p>
-              <p className="text-sm font-medium">{tenant.host || '127.0.0.1'}</p>
+          {tenant.endpoints && tenant.endpoints.length > 0 ? (
+            <div className="space-y-3">
+              {tenant.endpoints.map((endpoint, idx) => (
+                <div key={idx} className="border rounded-lg p-3">
+                  <div className="flex items-start justify-between mb-2">
+                    <div className="flex items-center gap-2">
+                      <span className="text-sm font-medium">
+                        {endpoint.description || `Endpoint ${idx + 1}`}
+                      </span>
+                      <span className={cn(
+                        "inline-flex items-center px-1.5 py-0.5 rounded text-xs",
+                        endpoint.type === "primary" && "bg-blue-100 text-blue-700",
+                        endpoint.type === "replica" && "bg-green-100 text-green-700",
+                        endpoint.type === "load_balancer" && "bg-purple-100 text-purple-700"
+                      )}>
+                        {endpoint.type}
+                      </span>
+                      {endpoint.region && (
+                        <span className="text-xs text-muted-foreground">
+                          {endpoint.region}
+                        </span>
+                      )}
+                    </div>
+                    {!endpoint.enabled && (
+                      <span className="text-xs text-red-600">Disabled</span>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-2 gap-2 mb-2 text-xs">
+                    <div>
+                      <span className="text-muted-foreground">Host:</span>{" "}
+                      <span className="font-mono">{endpoint.host}</span>
+                    </div>
+                    <div>
+                      <span className="text-muted-foreground">Port:</span>{" "}
+                      <span className="font-mono">{endpoint.port}</span>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <code className="flex-1 bg-muted px-2 py-1 rounded text-xs">
+                      psql -h {endpoint.host} -p {endpoint.port} -U {name}.admin
+                    </code>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-7 w-7 p-0"
+                      onClick={() => copyConnectionString(endpoint)}
+                    >
+                      {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    </Button>
+                  </div>
+                </div>
+              ))}
             </div>
-            <div>
-              <p className="text-xs text-muted-foreground mb-1">Port</p>
-              <p className="text-sm font-medium">{tenant.port || 5433}</p>
+          ) : (
+            <div className="text-center py-4 text-sm text-muted-foreground">
+              No connection endpoints configured
             </div>
-            <div className="col-span-2">
-              <p className="text-xs text-muted-foreground mb-1.5">Connection Command</p>
-              <div className="flex items-center gap-2">
-                <code className="flex-1 bg-muted px-2.5 py-1.5 rounded text-xs">
-                  psql -h {tenant.host || '127.0.0.1'} -p {tenant.port || 5433} -U {name}.admin
-                </code>
-                <Button variant="outline" size="sm" className="h-7 w-7 p-0" onClick={copyConnectionString}>
-                  {copied ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                </Button>
-              </div>
-            </div>
-          </div>
+          )}
         </CardContent>
       </Card>
 

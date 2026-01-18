@@ -1,6 +1,7 @@
 """Pydantic models for request/response validation."""
 
 from .auth import LoginRequest, LoginResponse, UserInfoResponse
+from .endpoint import Endpoint, EndpointType
 from .tenant import (
     TenantCreate,
     TenantResponse,
@@ -27,6 +28,9 @@ __all__ = [
     "LoginRequest",
     "LoginResponse",
     "UserInfoResponse",
+    # Endpoint
+    "Endpoint",
+    "EndpointType",
     # Tenant
     "TenantCreate",
     "TenantResponse",

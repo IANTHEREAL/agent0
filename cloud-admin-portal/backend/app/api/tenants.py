@@ -11,6 +11,8 @@ from sqlalchemy.orm import Session
 from ..config import get_settings, Settings
 from ..database import get_db
 from ..models import (
+    Endpoint,
+    EndpointType,
     TenantCreate,
     TenantResponse,
     TenantCreateResponse,
@@ -159,13 +161,21 @@ async def create_tenant(
 
         audit.log_tenant_created(request.name, success=True)
 
+        # Use first configured endpoint for connection string
+        endpoint_tuples = settings.parse_public_endpoints()
+        if endpoint_tuples:
+            primary_host, primary_port = endpoint_tuples[0]
+        else:
+            # Fallback to default if no endpoints configured
+            primary_host, primary_port = "127.0.0.1", 5433
+
         return TenantCreateResponse(
             name=request.name,
             admin_user=request.admin_user,
             admin_password=password,
             connection_string=(
                 f"postgresql://{request.name}.{request.admin_user}:{password}"
-                f"@{settings.pg_host}:{settings.pg_port}/postgres"
+                f"@{primary_host}:{primary_port}/postgres"
             ),
             created_at=tenant_db.created_at,
         )
@@ -202,11 +212,23 @@ async def get_tenant(
             detail=f"Tenant '{name}' not found",
         )
     
+    # Parse configured endpoints
+    endpoint_tuples = settings.parse_public_endpoints()
+    endpoints = [
+        Endpoint(
+            host=host,
+            port=port,
+            type=EndpointType.LOAD_BALANCER if len(endpoint_tuples) > 1 else EndpointType.PRIMARY,
+            priority=100 - i * 10,  # Descending priority based on config order
+            description=f"pg-tikv endpoint {i+1}" if len(endpoint_tuples) > 1 else "pg-tikv primary endpoint",
+        )
+        for i, (host, port) in enumerate(endpoint_tuples)
+    ]
+
     return TenantResponse(
         name=name,
         state=ks.get("state", "ENABLED") if isinstance(ks, dict) else "ENABLED",
-        host=settings.pg_host,
-        port=settings.pg_port,
+        endpoints=endpoints,
     )
 
 

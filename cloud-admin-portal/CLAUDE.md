@@ -159,12 +159,31 @@ Each tenant maps to a TiKV keyspace:
 
 **Backend Environment Variables (prefix: `PGTIKV_`):**
 - `PD_ENDPOINTS`: TiKV PD addresses (default: `127.0.0.1:2379`)
-- `PG_HOST`: pg-tikv server host (default: `127.0.0.1`)
-- `PG_PORT`: pg-tikv server port (default: `5433`)
+- `PG_HOST`: pg-tikv server host for internal backend connections (default: `127.0.0.1`)
+- `PG_PORT`: pg-tikv server port for internal backend connections (default: `5433`)
+- `PG_PUBLIC_ENDPOINTS`: Public pg-tikv endpoints for end-user connections, comma-separated (default: `127.0.0.1:5433`)
+  - Single endpoint: `pg.example.com:5433`
+  - Multiple endpoints for load balancing: `pg1.example.com:5433,pg2.example.com:5433,pg3.example.com:5433`
 - `API_PORT`: Backend API port (default: `8080`)
 - `CORS_ORIGINS`: Allowed CORS origins (default: `["http://localhost:5173", "http://localhost:3000"]`)
 - `SESSION_TTL_HOURS`: Session validity period (default: `1`)
 - `DEBUG`: Enable debug mode (default: `false`)
+
+**Public Endpoints Model:**
+
+The portal supports an extensible endpoint model for displaying connection information to users:
+
+- **Endpoint**: Structured model with host, port, type, region, priority, description, and enabled status
+- **Endpoint Types**: `primary`, `replica`, `load_balancer`
+- **Priority**: Higher values are displayed first (default: 100, decreasing by 10 for each additional endpoint)
+- **Region**: Optional geographic region/availability zone for routing
+- **Load Balancing**: Multiple endpoints are automatically tagged as `load_balancer` type
+
+The frontend displays all configured endpoints with:
+- Visual type badges (primary/replica/load_balancer)
+- Individual connection commands for each endpoint
+- Priority-based ordering
+- Copy-to-clipboard functionality
 
 **Frontend Environment Variables:**
 - `VITE_API_URL`: Backend API base URL (default: `/api`)

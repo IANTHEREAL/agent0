@@ -78,10 +78,32 @@ docker-compose up -d
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PGTIKV_PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD addresses |
-| `PGTIKV_PG_HOST` | `127.0.0.1` | pg-tikv server host |
-| `PGTIKV_PG_PORT` | `5433` | pg-tikv server port |
+| `PGTIKV_PG_HOST` | `127.0.0.1` | pg-tikv server host (internal) |
+| `PGTIKV_PG_PORT` | `5433` | pg-tikv server port (internal) |
+| `PGTIKV_PG_PUBLIC_ENDPOINTS` | `127.0.0.1:5433` | Public pg-tikv endpoints for clients (comma-separated) |
 | `PGTIKV_API_PORT` | `8080` | API server port |
 | `PGTIKV_CORS_ORIGINS` | `["http://localhost:5173"]` | Allowed CORS origins |
+
+**Multi-Endpoint Configuration for Load Balancing:**
+
+The portal supports multiple public endpoints for load balancing scenarios:
+
+```bash
+# Single endpoint (default)
+PGTIKV_PG_PUBLIC_ENDPOINTS=pg.example.com:5433
+
+# Multiple endpoints for load balancing
+PGTIKV_PG_PUBLIC_ENDPOINTS=pg1.example.com:5433,pg2.example.com:5433,pg3.example.com:5433
+
+# With regions (configure in production deployment)
+# Endpoints can be tagged with region info for geographic routing
+```
+
+The portal will display all configured endpoints to users with:
+- Endpoint type (primary/replica/load_balancer)
+- Priority ranking
+- Connection commands for each endpoint
+- Region information (if configured)
 
 ### Frontend Environment Variables
 
