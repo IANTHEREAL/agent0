@@ -1,8 +1,5 @@
-/**
- * Create tenant dialog
- */
-
 import { useState } from "react"
+import { Database, User, Key, Sparkles, Loader2 } from "lucide-react"
 import { useCreateTenant } from "@/api/tenants"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -25,6 +22,15 @@ interface CreateTenantDialogProps {
   onOpenChange: (open: boolean) => void
 }
 
+function generateRandomName(): string {
+  const chars = 'abcdefghijklmnopqrstuvwxyz'
+  let result = ''
+  for (let i = 0; i < 10; i++) {
+    result += chars.charAt(Math.floor(Math.random() * chars.length))
+  }
+  return result
+}
+
 export function CreateTenantDialog({ open, onOpenChange }: CreateTenantDialogProps) {
   const [name, setName] = useState("")
   const [adminUser, setAdminUser] = useState("admin")
@@ -38,27 +44,24 @@ export function CreateTenantDialog({ open, onOpenChange }: CreateTenantDialogPro
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
 
+    const tenantName = name.trim() || generateRandomName()
+
     try {
       const result = await mutation.mutateAsync({
-        name,
+        name: tenantName,
         admin_user: adminUser,
         admin_password: adminPassword || undefined,
       })
 
-      // Save result and show credentials modal
       setCreatedTenant(result)
       setShowCredentials(true)
-
-      // Close creation dialog
       onOpenChange(false)
 
-      // Show simple success toast
       toast({
         title: "Tenant Created",
         description: `Tenant "${result.name}" has been created successfully.`,
       })
 
-      // Reset form
       setName("")
       setAdminUser("admin")
       setAdminPassword("")
@@ -75,70 +78,117 @@ export function CreateTenantDialog({ open, onOpenChange }: CreateTenantDialogPro
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="sm:max-w-md">
-          <DialogHeader>
-            <DialogTitle>Create Tenant</DialogTitle>
-            <DialogDescription>
-              Create a new isolated database tenant with its own keyspace.
-            </DialogDescription>
+        <DialogContent className="sm:max-w-[440px]">
+          <DialogHeader className="pb-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center">
+                <Database className="w-5 h-5 text-primary" />
+              </div>
+              <div>
+                <DialogTitle>Create Tenant</DialogTitle>
+                <DialogDescription className="text-xs mt-0.5">
+                  Set up a new isolated database environment
+                </DialogDescription>
+              </div>
+            </div>
           </DialogHeader>
 
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div className="space-y-2">
-              <Label htmlFor="tenant_name">Tenant Name</Label>
-              <Input
-                id="tenant_name"
-                value={name}
-                onChange={(e) => setName(e.target.value.toLowerCase())}
-                placeholder="acme_corp"
-                pattern="[a-z0-9_]+"
-                minLength={3}
-                maxLength={64}
-                required
-              />
-              <p className="text-xs text-muted-foreground">
-                Lowercase letters, numbers, and underscores (3-64 chars)
-              </p>
+          <form onSubmit={handleSubmit} className="space-y-5">
+            <div className="space-y-4">
+              <div className="space-y-2">
+                <Label htmlFor="tenant_name" className="text-sm font-medium flex items-center gap-2">
+                  <Database className="w-3.5 h-3.5 text-muted-foreground" />
+                  Tenant Name
+                </Label>
+                <div className="relative">
+                  <Input
+                    id="tenant_name"
+                    value={name}
+                    onChange={(e) => setName(e.target.value.toLowerCase())}
+                    placeholder="my_project"
+                    pattern="[a-z0-9_]*"
+                    maxLength={64}
+                    className="h-10 pr-20"
+                  />
+                  {!name && (
+                    <span className="absolute right-3 top-1/2 -translate-y-1/2 flex items-center gap-1 text-[10px] text-muted-foreground bg-muted px-2 py-1 rounded">
+                      <Sparkles className="w-3 h-3" />
+                      Auto
+                    </span>
+                  )}
+                </div>
+                <p className="text-[11px] text-muted-foreground leading-relaxed">
+                  Use lowercase letters, numbers, and underscores. Leave empty to auto-generate.
+                </p>
+              </div>
+
+              <div className="h-px bg-border/60" />
+
+              <div className="space-y-3">
+                <p className="text-xs font-medium text-muted-foreground flex items-center gap-2">
+                  <User className="w-3.5 h-3.5" />
+                  Admin Credentials
+                </p>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-2">
+                    <div className="h-4 flex items-center">
+                      <Label htmlFor="admin_user" className="text-xs">Username</Label>
+                    </div>
+                    <Input
+                      id="admin_user"
+                      value={adminUser}
+                      onChange={(e) => setAdminUser(e.target.value)}
+                      className="h-9"
+                      placeholder="admin"
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <div className="h-4 flex items-center justify-between">
+                      <Label htmlFor="admin_password" className="text-xs">Password</Label>
+                      {!adminPassword && (
+                        <span className="text-[10px] text-muted-foreground font-normal flex items-center gap-1">
+                          <Key className="w-2.5 h-2.5" />
+                          Auto
+                        </span>
+                      )}
+                    </div>
+                    <Input
+                      id="admin_password"
+                      type="password"
+                      value={adminPassword}
+                      onChange={(e) => setAdminPassword(e.target.value)}
+                      className="h-9"
+                      placeholder="••••••••"
+                    />
+                  </div>
+                </div>
+              </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-4">
-              <div className="space-y-2">
-                <Label htmlFor="admin_user">Admin User</Label>
-                <Input
-                  id="admin_user"
-                  value={adminUser}
-                  onChange={(e) => setAdminUser(e.target.value)}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label htmlFor="admin_password">Password</Label>
-                <Input
-                  id="admin_password"
-                  type="password"
-                  value={adminPassword}
-                  onChange={(e) => setAdminPassword(e.target.value)}
-                  placeholder="Auto-generate"
-                />
-              </div>
-            </div>
-
-            <DialogFooter>
+            <DialogFooter className="gap-2 sm:gap-2">
               <Button
                 type="button"
-                variant="outline"
+                variant="ghost"
                 onClick={() => onOpenChange(false)}
+                className="text-muted-foreground"
               >
                 Cancel
               </Button>
-              <Button type="submit" disabled={mutation.isPending}>
-                {mutation.isPending ? "Creating..." : "Create Tenant"}
+              <Button type="submit" disabled={mutation.isPending} className="gap-2 min-w-[120px]">
+                {mutation.isPending ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    Creating...
+                  </>
+                ) : (
+                  "Create Tenant"
+                )}
               </Button>
             </DialogFooter>
           </form>
         </DialogContent>
       </Dialog>
 
-      {/* Credentials Display Modal */}
       {createdTenant && (
         <CredentialsModal
           open={showCredentials}

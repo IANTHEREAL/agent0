@@ -3,9 +3,9 @@
 import secrets
 import string
 from datetime import datetime, timezone
-from typing import List
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session
 
 from ..config import get_settings, Settings
@@ -21,11 +21,13 @@ from ..models import (
     TenantUpdate,
     TenantResponseExtended,
     MessageResponse,
+    SqlQueryRequest,
+    SqlQueryResponse,
 )
 from ..models.db import TenantDB
 from ..services import PDClient, PgTikvClient
 from ..services.audit import get_audit_service
-from ..session import session_manager
+from ..session import session_manager, TenantSession
 
 
 router = APIRouter()
@@ -438,3 +440,52 @@ async def update_tenant(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update tenant: {str(e)}",
         )
+
+
+async def get_tenant_session(
+    name: str,
+    x_tenant_session: Optional[str] = Header(None, alias="X-Tenant-Session"),
+) -> TenantSession:
+    if not x_tenant_session:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Tenant session required. Use POST /api/tenants/{name}/connect first.",
+        )
+    
+    session = session_manager.validate_session(x_tenant_session, name)
+    if not session:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired session",
+        )
+    
+    return session
+
+
+@router.post(
+    "/{name}/query",
+    response_model=SqlQueryResponse,
+    summary="Execute SQL query",
+    description="Execute a SQL query on the tenant database. Requires a valid session.",
+)
+async def execute_query(
+    name: str,
+    request: SqlQueryRequest,
+    session: TenantSession = Depends(get_tenant_session),
+    pg: PgTikvClient = Depends(get_pg_client),
+):
+    sql = request.sql.strip()
+    if not sql:
+        return SqlQueryResponse(success=False, error="Empty SQL query")
+    
+    stdout, stderr, rc = pg._run_sql(
+        session.tenant_name,
+        session.admin_user,
+        session.admin_password,
+        sql,
+    )
+    
+    if rc != 0:
+        return SqlQueryResponse(success=False, error=stderr or "Query execution failed")
+    
+    return SqlQueryResponse(success=True, result=stdout)

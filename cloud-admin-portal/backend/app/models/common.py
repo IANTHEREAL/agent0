@@ -24,3 +24,18 @@ class ErrorResponse(BaseModel):
     error: str
     message: str
     details: Optional[Any] = None
+
+
+class SqlQueryRequest(BaseModel):
+    """SQL query request."""
+    
+    sql: str
+
+
+class SqlQueryResponse(BaseModel):
+    """SQL query response."""
+    
+    success: bool
+    result: Optional[str] = None
+    error: Optional[str] = None
+    rows_affected: Optional[int] = None

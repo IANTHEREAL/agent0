@@ -21,7 +21,7 @@ from .user import (
     UserCreateResponse,
     PasswordResetResponse,
 )
-from .common import MessageResponse, HealthResponse, ErrorResponse
+from .common import MessageResponse, HealthResponse, ErrorResponse, SqlQueryRequest, SqlQueryResponse
 
 __all__ = [
     # Auth
@@ -51,4 +51,7 @@ __all__ = [
     "MessageResponse",
     "HealthResponse",
     "ErrorResponse",
+    # SQL
+    "SqlQueryRequest",
+    "SqlQueryResponse",
 ]

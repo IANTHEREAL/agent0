@@ -11,6 +11,7 @@ import type {
   TenantConnectRequest,
   TenantConnectResponse,
   MessageResponse,
+  SqlQueryResponse,
 } from "@/types"
 
 export function useTenants() {
@@ -91,8 +92,17 @@ export function useConnectTenant(name: string) {
         body: JSON.stringify(data),
       }),
     onSuccess: (data) => {
-      // Store session ID for subsequent user management requests
       sessionStorage.setItem("tenant_session", data.session_id)
     },
+  })
+}
+
+export function useExecuteQuery(name: string) {
+  return useMutation({
+    mutationFn: (sql: string) =>
+      apiRequest<SqlQueryResponse>(`/tenants/${name}/query`, {
+        method: "POST",
+        body: JSON.stringify({ sql }),
+      }),
   })
 }

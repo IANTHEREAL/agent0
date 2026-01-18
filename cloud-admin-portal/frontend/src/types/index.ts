@@ -98,3 +98,14 @@ export interface ApiError {
   message: string
   details?: Record<string, unknown>
 }
+
+export interface SqlQueryRequest {
+  sql: string
+}
+
+export interface SqlQueryResponse {
+  success: boolean
+  result?: string | null
+  error?: string | null
+  rows_affected?: number | null
+}
