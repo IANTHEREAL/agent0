@@ -169,7 +169,7 @@ export function TenantDetailPage() {
           </Link>
         </Button>
         <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-semibold font-mono">{tenantId}</h1>
+          <h1 className="text-2xl font-semibold font-mono">t{tenantId}</h1>
           <span
             className={cn(
               "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs",

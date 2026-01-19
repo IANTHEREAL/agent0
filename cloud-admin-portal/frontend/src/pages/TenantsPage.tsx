@@ -81,6 +81,9 @@ export function TenantsPage() {
                       Status
                     </th>
                     <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">
+                      Created
+                    </th>
+                    <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">
                       Tags
                     </th>
                     <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">
@@ -99,7 +102,7 @@ export function TenantsPage() {
                           to={`/tenants/${tenant.id}`}
                           className="text-sm font-medium hover:underline font-mono"
                         >
-                          {tenant.id}
+                          t{tenant.id}
                         </Link>
                       </td>
                       <td className="px-3 py-2.5">
@@ -120,6 +123,13 @@ export function TenantsPage() {
                             )}
                           />
                           {tenant.state}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2.5">
+                        <span className="text-xs text-muted-foreground">
+                          {tenant.created_at
+                            ? new Date(tenant.created_at).toLocaleDateString()
+                            : "-"}
                         </span>
                       </td>
                       <td className="px-3 py-2.5">
