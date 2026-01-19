@@ -4,7 +4,7 @@
 
 import { useState } from "react"
 import { useParams } from "react-router-dom"
-import { Key, Trash2, Copy, Check, Plus, Network, Users, Shield, LogIn, Lock, Loader2 } from "lucide-react"
+import { Key, Trash2, Copy, Check, Plus, Network, Users, Shield, LogIn, Lock, Loader2, Tag } from "lucide-react"
 import { useTenant } from "@/api/tenants"
 import { useUsers, useDeleteUser, useResetPassword } from "@/api/users"
 import { useTenantSession } from "@/hooks/useTenantSession"
@@ -153,6 +153,30 @@ export function TenantDetailPage() {
 
   return (
     <div className="space-y-4">
+
+      {/* Tags */}
+      {tenant.tags && tenant.tags.length > 0 && (
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex items-center gap-2">
+              <Tag className="h-4 w-4 text-muted-foreground" />
+              <CardTitle className="text-base">Tags</CardTitle>
+            </div>
+          </CardHeader>
+          <CardContent>
+            <div className="flex flex-wrap gap-1.5">
+              {tenant.tags.map((tag) => (
+                <span
+                  key={tag}
+                  className="inline-flex items-center px-2 py-0.5 rounded-md text-xs bg-blue-500/10 text-blue-600 ring-1 ring-blue-500/20"
+                >
+                  {tag}
+                </span>
+              ))}
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       {/* Connection Endpoints */}
       <Card>
