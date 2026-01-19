@@ -136,6 +136,9 @@ uv run pytest tests/test_tenants.py::TestListTenants::test_list_tenants -v
 3. Include `X-Tenant-Session` header for user management APIs
 4. Sessions expire after 1 hour (in-memory, lost on restart)
 
+**Implementation detail**
+- `session_id` is stored per-tenant as `sessionStorage["tenant_session:<tenant>"]` to avoid cross-tenant session mixups.
+
 ### API Client Pattern (Frontend)
 
 ```typescript
@@ -151,7 +154,7 @@ export function useTenants() {
 ### Service Layer (Backend)
 
 - `PDClient`: TiKV Placement Driver HTTP API (keyspace management)
-- `PgTikvClient`: PostgreSQL client via `psql` subprocess
+- `PgTikvClient`: PostgreSQL client via `pg8000`
 - `AuditService`: Logs tenant operations to database
 
 ## Environment Variables
@@ -167,7 +170,7 @@ export function useTenants() {
 ## Anti-Patterns
 
 - **Session persistence**: Current in-memory sessions lost on restart. For production multi-instance, use Redis.
-- **psql subprocess**: `pg_client.py` uses subprocess, not psycopg2, due to pg-tikv auth quirks.
+- **PostgreSQL client**: `backend/app/services/pg_client.py` uses pure-Python `pg8000` (no native deps, no interactive password prompts).
 - **Keyspace deletion**: TiKV keyspaces can only be DISABLED, not deleted. Data remains.
 - **Empty catch blocks**: Never `except: pass` - always handle or re-raise.
 - **Type suppression**: Never use `# type: ignore` or `as any` without comment.

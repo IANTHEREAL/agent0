@@ -17,45 +17,32 @@ class TenantSession:
     """Stores validated tenant credentials for user management operations."""
     
     session_id: str
-    tenant_name: str
+    tenant_id: str
+    keyspace: str
     admin_user: str
     admin_password: str
     created_at: datetime
     expires_at: datetime
     
     def is_expired(self) -> bool:
-        """Check if session has expired."""
         return datetime.now(timezone.utc) > self.expires_at
 
 
 class SessionManager:
-    """Manages tenant sessions with automatic cleanup.
-    
-    In production, this should be replaced with Redis for horizontal scaling.
-    """
+    """Manages tenant sessions with automatic cleanup."""
     
     def __init__(self):
         self._sessions: Dict[str, TenantSession] = {}
     
     def create_session(
         self,
-        tenant_name: str,
+        tenant_id: str,
+        keyspace: str,
         admin_user: str,
         admin_password: str
     ) -> TenantSession:
-        """Create a new tenant session.
-        
-        Args:
-            tenant_name: Name of the tenant
-            admin_user: Admin username for the tenant
-            admin_password: Admin password for the tenant
-        
-        Returns:
-            Created TenantSession
-        """
         settings = get_settings()
         
-        # Generate unique session ID
         session_id = f"ts_{secrets.token_hex(16)}"
         
         now = datetime.now(timezone.utc)
@@ -63,7 +50,8 @@ class SessionManager:
         
         session = TenantSession(
             session_id=session_id,
-            tenant_name=tenant_name,
+            tenant_id=tenant_id,
+            keyspace=keyspace,
             admin_user=admin_user,
             admin_password=admin_password,
             created_at=now,
@@ -71,21 +59,11 @@ class SessionManager:
         )
         
         self._sessions[session_id] = session
-        
-        # Cleanup expired sessions periodically
         self._cleanup_expired()
         
         return session
     
     def get_session(self, session_id: str) -> Optional[TenantSession]:
-        """Get a session by ID.
-        
-        Args:
-            session_id: Session ID
-        
-        Returns:
-            TenantSession if found and not expired, None otherwise
-        """
         session = self._sessions.get(session_id)
         
         if session is None:
@@ -97,22 +75,13 @@ class SessionManager:
         
         return session
     
-    def validate_session(self, session_id: str, tenant_name: str) -> Optional[TenantSession]:
-        """Validate a session belongs to the specified tenant.
-        
-        Args:
-            session_id: Session ID
-            tenant_name: Expected tenant name
-        
-        Returns:
-            TenantSession if valid, None otherwise
-        """
+    def validate_session(self, session_id: str, tenant_id: str) -> Optional[TenantSession]:
         session = self.get_session(session_id)
         
         if session is None:
             return None
         
-        if session.tenant_name != tenant_name:
+        if session.tenant_id != tenant_id:
             return None
         
         return session

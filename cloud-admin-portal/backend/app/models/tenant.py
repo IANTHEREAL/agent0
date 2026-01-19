@@ -11,13 +11,6 @@ from .endpoint import Endpoint
 class TenantCreate(BaseModel):
     """Request body for creating a tenant."""
     
-    name: str = Field(
-        ...,
-        min_length=3,
-        max_length=64,
-        pattern=r'^[a-z0-9_]+$',
-        description="Tenant name (lowercase alphanumeric with underscores)"
-    )
     admin_user: str = Field(
         default="admin",
         description="Admin username"
@@ -31,7 +24,7 @@ class TenantCreate(BaseModel):
 class TenantResponse(BaseModel):
     """Response with tenant information."""
 
-    name: str
+    id: str = Field(description="12-char tenant identifier")
     state: str
     endpoints: list[Endpoint] = Field(
         default_factory=list,
@@ -42,7 +35,7 @@ class TenantResponse(BaseModel):
 class TenantCreateResponse(BaseModel):
     """Response after creating a tenant."""
     
-    name: str
+    id: str = Field(description="12-char tenant identifier")
     admin_user: str
     admin_password: str
     connection_string: str

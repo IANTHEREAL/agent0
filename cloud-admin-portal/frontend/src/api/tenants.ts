@@ -1,9 +1,5 @@
-/**
- * Tenant API hooks
- */
-
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
-import { apiRequest } from "./client"
+import { ApiError, apiRequest } from "./client"
 import type {
   Tenant,
   CreateTenantRequest,
@@ -12,6 +8,7 @@ import type {
   TenantConnectResponse,
   MessageResponse,
   SqlQueryResponse,
+  TenantObservabilityResponse,
 } from "@/types"
 
 export function useTenants() {
@@ -21,17 +18,17 @@ export function useTenants() {
   })
 }
 
-export function useTenant(name: string) {
+export function useTenant(tenantId: string) {
   return useQuery({
-    queryKey: ["tenants", name],
-    queryFn: () => apiRequest<Tenant>(`/tenants/${name}`),
-    enabled: !!name,
+    queryKey: ["tenants", tenantId],
+    queryFn: () => apiRequest<Tenant>(`/tenants/${tenantId}`),
+    enabled: !!tenantId,
   })
 }
 
 export function useCreateTenant() {
   const queryClient = useQueryClient()
-  
+
   return useMutation({
     mutationFn: (data: CreateTenantRequest) =>
       apiRequest<CreateTenantResponse>("/tenants", {
@@ -48,8 +45,8 @@ export function useDeleteTenant() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: (name: string) =>
-      apiRequest<MessageResponse>(`/tenants/${name}`, { method: "DELETE" }),
+    mutationFn: (tenantId: string) =>
+      apiRequest<MessageResponse>(`/tenants/${tenantId}`, { method: "DELETE" }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["tenants"] })
     },
@@ -60,49 +57,82 @@ export function useRemoveTenant() {
   const queryClient = useQueryClient()
 
   return useMutation({
-    mutationFn: (name: string) =>
-      apiRequest<MessageResponse>(`/tenants/${name}/remove`, { method: "POST" }),
+    mutationFn: (tenantId: string) =>
+      apiRequest<MessageResponse>(`/tenants/${tenantId}/remove`, { method: "POST" }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["tenants"] })
     },
   })
 }
 
-export function useUpdateTenant(name: string) {
+export function useUpdateTenant(tenantId: string) {
   const queryClient = useQueryClient()
 
   return useMutation({
     mutationFn: (data: { notes?: string | null; tags?: string[] | null }) =>
-      apiRequest<Tenant>(`/tenants/${name}`, {
+      apiRequest<Tenant>(`/tenants/${tenantId}`, {
         method: "PUT",
         body: JSON.stringify(data),
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["tenants"] })
-      queryClient.invalidateQueries({ queryKey: ["tenants", name] })
+      queryClient.invalidateQueries({ queryKey: ["tenants", tenantId] })
     },
   })
 }
 
-export function useConnectTenant(name: string) {
+export function useConnectTenant(tenantId: string) {
   return useMutation({
     mutationFn: (data: TenantConnectRequest) =>
-      apiRequest<TenantConnectResponse>(`/tenants/${name}/connect`, {
+      apiRequest<TenantConnectResponse>(`/tenants/${tenantId}/connect`, {
         method: "POST",
         body: JSON.stringify(data),
       }),
-    onSuccess: (data) => {
-      sessionStorage.setItem("tenant_session", data.session_id)
+  })
+}
+
+export function useExecuteQuery(tenantId: string) {
+  return useMutation({
+    mutationFn: (sql: string) =>
+      apiRequest<SqlQueryResponse>(`/tenants/${tenantId}/query`, {
+        method: "POST",
+        body: JSON.stringify({ sql }),
+      }),
+  })
+}
+
+export function useTenantObservability(tenantId: string) {
+  return useQuery({
+    queryKey: ["tenants", tenantId, "observability"],
+    queryFn: () =>
+      apiRequest<TenantObservabilityResponse>(`/tenants/${tenantId}/observability`),
+    enabled: !!tenantId,
+    retry: (failureCount, error) => {
+      if (error instanceof ApiError && error.status === 409) {
+        return false
+      }
+      return failureCount < 2
+    },
+    refetchInterval: (query) => {
+      const error = query.state.error
+      if (error instanceof ApiError && error.status === 409) {
+        return false
+      }
+      return 5000
     },
   })
 }
 
-export function useExecuteQuery(name: string) {
-  return useMutation({
-    mutationFn: (sql: string) =>
-      apiRequest<SqlQueryResponse>(`/tenants/${name}/query`, {
-        method: "POST",
-        body: JSON.stringify({ sql }),
-      }),
+export function bootstrapTenantObservabilityUser(
+  tenantId: string,
+  adminUser: string,
+  adminPassword: string
+) {
+  return apiRequest<MessageResponse>(`/tenants/${tenantId}/observability/bootstrap`, {
+    method: "POST",
+    body: JSON.stringify({
+      admin_user: adminUser,
+      admin_password: adminPassword,
+    }),
   })
 }

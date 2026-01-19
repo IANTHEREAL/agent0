@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from typing import Generator
 
+from sqlalchemy import text
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session
 
@@ -67,6 +68,55 @@ class DatabaseManager:
             raise RuntimeError("Database not initialized. Call init_db() first.")
 
         Base.metadata.create_all(bind=self._engine)
+        self._migrate_schema()
+
+    def _migrate_schema(self):
+        """Apply lightweight, idempotent schema migrations (SQLite-first)."""
+        if self._engine is None:
+            return
+
+        try:
+            dialect = self._engine.dialect.name
+        except Exception:
+            return
+
+        if dialect != "sqlite":
+            return
+
+        with self._engine.begin() as conn:
+            rows = conn.execute(text("PRAGMA table_info(tenants)")).fetchall()
+            existing_cols = set()
+            for r in rows:
+                try:
+                    existing_cols.add(r._mapping["name"])
+                except Exception:
+                    existing_cols.add(r[1])
+
+            if "observability_user" not in existing_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE tenants ADD COLUMN observability_user VARCHAR(255)"
+                )
+            if "observability_password" not in existing_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE tenants ADD COLUMN observability_password VARCHAR(255)"
+                )
+            if "keyspace" not in existing_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE tenants ADD COLUMN keyspace VARCHAR(64)"
+                )
+
+            audit_rows = conn.execute(text("PRAGMA table_info(audit_logs)")).fetchall()
+            audit_cols = set()
+            for r in audit_rows:
+                try:
+                    audit_cols.add(r._mapping["name"])
+                except Exception:
+                    audit_cols.add(r[1])
+
+            if "tenant_id" not in audit_cols:
+                conn.exec_driver_sql(
+                    "ALTER TABLE audit_logs ADD COLUMN tenant_id VARCHAR(14)"
+                )
 
     def get_session(self) -> Session:
         """Create a new database session."""

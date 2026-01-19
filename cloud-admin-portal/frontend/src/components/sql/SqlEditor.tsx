@@ -5,17 +5,17 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { useExecuteQuery } from "@/api/tenants"
 
 interface SqlEditorProps {
-  tenantName: string
+  tenantId: string
 }
 
-export function SqlEditor({ tenantName }: SqlEditorProps) {
+export function SqlEditor({ tenantId }: SqlEditorProps) {
   const [sql, setSql] = useState("")
   const [result, setResult] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [executionTime, setExecutionTime] = useState<number | null>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
-  
-  const mutation = useExecuteQuery(tenantName)
+
+  const mutation = useExecuteQuery(tenantId)
 
   useEffect(() => {
     if (textareaRef.current) {

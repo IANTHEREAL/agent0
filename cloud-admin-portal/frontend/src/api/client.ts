@@ -15,7 +15,9 @@ export async function apiRequest<T>(
   endpoint: string,
   options: RequestInit = {}
 ): Promise<T> {
-  const tenantSession = sessionStorage.getItem("tenant_session")
+  const tenantMatch = endpoint.match(/^\/tenants\/([^/]+)/)
+  const tenantName = tenantMatch ? tenantMatch[1] : null
+  const tenantSession = tenantName ? sessionStorage.getItem(`tenant_session:${tenantName}`) : null
   
   const headers: Record<string, string> = {
     "Content-Type": "application/json",

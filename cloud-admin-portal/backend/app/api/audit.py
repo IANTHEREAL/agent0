@@ -1,5 +1,3 @@
-"""Audit log API endpoints."""
-
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -17,14 +15,9 @@ router = APIRouter()
     "",
     response_model=List[AuditLogResponse],
     summary="Query audit logs",
-    description="""
-    Query audit logs with optional filters.
-
-    Logs are returned in reverse chronological order (newest first).
-    """
 )
 async def query_audit_logs(
-    tenant_name: Optional[str] = Query(None, description="Filter by tenant name"),
+    tenant_id: Optional[str] = Query(None, description="Filter by tenant ID"),
     operation_type: Optional[str] = Query(None, description="Filter by operation type"),
     resource_type: Optional[str] = Query(None, description="Filter by resource type"),
     success: Optional[bool] = Query(None, description="Filter by success status"),
@@ -32,12 +25,10 @@ async def query_audit_logs(
     offset: int = Query(0, ge=0, description="Number of logs to skip"),
     db: Session = Depends(get_db),
 ):
-    """Query audit logs with filters."""
     query = db.query(AuditLogDB)
 
-    # Apply filters
-    if tenant_name is not None:
-        query = query.filter(AuditLogDB.tenant_name == tenant_name)
+    if tenant_id is not None:
+        query = query.filter(AuditLogDB.tenant_id == tenant_id)
 
     if operation_type is not None:
         query = query.filter(AuditLogDB.operation_type == operation_type)
@@ -48,10 +39,8 @@ async def query_audit_logs(
     if success is not None:
         query = query.filter(AuditLogDB.success == success)
 
-    # Order by newest first
     query = query.order_by(AuditLogDB.timestamp.desc())
 
-    # Apply pagination
     logs = query.offset(offset).limit(limit).all()
 
     return [
@@ -61,11 +50,11 @@ async def query_audit_logs(
             operation_type=log.operation_type,
             resource_type=log.resource_type,
             resource_name=log.resource_name,
-            tenant_name=log.tenant_name,
+            tenant_id=log.tenant_id,
             operator=log.operator,
             success=log.success,
             error_message=log.error_message,
-            metadata=log.metadata,
+            extra_metadata=log.extra_metadata,
         )
         for log in logs
     ]

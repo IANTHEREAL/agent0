@@ -4,7 +4,7 @@ use super::executor::Executor;
 use super::helpers::{
     apply_offset_limit_fetch, collect_having_agg_funcs, dedup_rows,
     distinct_on_rows_join_with_indices, eval_having_expr_join, get_select_item_name,
-    normalize_ident, AggExpr,
+    infer_expr_type, normalize_ident, AggExpr,
 };
 use super::names;
 use super::sequences;
@@ -56,6 +56,210 @@ impl Executor {
 
         // Check if this is a known scalar function (with or without parentheses)
         let t_upper = table_name.trim_end_matches("()").to_uppercase();
+        if t_upper == "_PGTIKV_SYS_OBSERVABILITY"
+            || t_upper.ends_with("._PGTIKV_SYS_OBSERVABILITY")
+        {
+            let snap = self.observability().snapshot_summary();
+            let schema = TableSchema {
+                table_id: 0,
+                name: table_name.to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "window_seconds".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "statement_count".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "txn_commit_count".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "error_count".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "qps".to_string(),
+                        data_type: DataType::Float64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "tps".to_string(),
+                        data_type: DataType::Float64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "latency_avg_ms".to_string(),
+                        data_type: DataType::Float64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "latency_p99_ms".to_string(),
+                        data_type: DataType::Float64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "active_connections".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                ],
+                pk_indices: vec![],
+                indexes: vec![],
+                version: 1,
+                check_constraints: vec![],
+                foreign_keys: vec![],
+            };
+
+            let row = Row::new(vec![
+                Value::Int64(i64::try_from(snap.window_seconds).unwrap_or(i64::MAX)),
+                Value::Int64(i64::try_from(snap.statement_count).unwrap_or(i64::MAX)),
+                Value::Int64(i64::try_from(snap.txn_commit_count).unwrap_or(i64::MAX)),
+                Value::Int64(i64::try_from(snap.error_count).unwrap_or(i64::MAX)),
+                Value::Float64(snap.qps),
+                Value::Float64(snap.tps),
+                Value::Float64(snap.latency_avg_ms),
+                Value::Float64(snap.latency_p99_ms),
+                Value::Int64(i64::try_from(snap.active_connections).unwrap_or(i64::MAX)),
+            ]);
+            return Ok((schema, vec![row]));
+        }
+        if t_upper == "_PGTIKV_SYS_QUERY_SAMPLES" || t_upper.ends_with("._PGTIKV_SYS_QUERY_SAMPLES")
+        {
+            let groups = self.observability().snapshot_query_samples();
+            let schema = TableSchema {
+                table_id: 0,
+                name: table_name.to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "query".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "sample_count".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "error_count".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "latency_avg_ms".to_string(),
+                        data_type: DataType::Float64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "latency_p99_ms".to_string(),
+                        data_type: DataType::Float64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "latency_max_ms".to_string(),
+                        data_type: DataType::Float64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "last_seen_ms_ago".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                ],
+                pk_indices: vec![],
+                indexes: vec![],
+                version: 1,
+                check_constraints: vec![],
+                foreign_keys: vec![],
+            };
+
+            let rows = groups
+                .into_iter()
+                .map(|g| {
+                    Row::new(vec![
+                        Value::Text(g.query),
+                        Value::Int64(i64::try_from(g.sample_count).unwrap_or(i64::MAX)),
+                        Value::Int64(i64::try_from(g.error_count).unwrap_or(i64::MAX)),
+                        Value::Float64(g.latency_avg_ms),
+                        Value::Float64(g.latency_p99_ms),
+                        Value::Float64(g.latency_max_ms),
+                        Value::Int64(i64::try_from(g.last_seen_ms_ago).unwrap_or(i64::MAX)),
+                    ])
+                })
+                .collect();
+            return Ok((schema, rows));
+        }
         if matches!(
             t_upper.as_str(),
             "CURRENT_SCHEMA" | "CURRENT_DATABASE" | "CURRENT_USER" | "SESSION_USER" | "USER"
@@ -1791,7 +1995,18 @@ impl Executor {
             let final_rows = apply_offset_limit_fetch(final_rows, query);
 
             return Ok(ExecuteResult::Select {
-                column_types: None,
+                column_types: Some(
+                    resolved_projection
+                        .iter()
+                        .map(|item| match item {
+                            SelectItem::UnnamedExpr(expr)
+                            | SelectItem::ExprWithAlias { expr, .. } => {
+                                infer_expr_type(expr, &final_schema)
+                            }
+                            _ => DataType::Text,
+                        })
+                        .collect(),
+                ),
                 columns: col_names,
                 rows: final_rows,
             });

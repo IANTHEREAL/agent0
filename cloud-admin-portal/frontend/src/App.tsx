@@ -11,7 +11,7 @@ function App() {
         <Route element={<AppLayout />}>
           <Route path="/" element={<Navigate to="/tenants" replace />} />
           <Route path="/tenants" element={<TenantsPage />} />
-          <Route path="/tenants/:name" element={<TenantDetailPage />} />
+          <Route path="/tenants/:id" element={<TenantDetailPage />} />
         </Route>
       </Routes>
       <Toaster />

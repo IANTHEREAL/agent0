@@ -1,4 +1,5 @@
 mod auth;
+mod observability;
 mod pool;
 mod protocol;
 mod sql;

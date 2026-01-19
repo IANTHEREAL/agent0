@@ -14,35 +14,156 @@ use super::sequences;
 use super::udt;
 use super::{parse_sql, ExecuteResult, ExecuteResults, Session};
 use crate::auth::AuthManager;
+use crate::observability::TenantObservability;
 use crate::storage::TikvStore;
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, SetOperator, SetQuantifier,
-    Statement,
+    Statement, TableFactor, Visit, Visitor,
 };
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use std::{ops::ControlFlow};
 use tikv_client::Transaction;
 use tracing::debug;
+
+const OBSERVABILITY_USER: &str = "_pgtikv_sys_observer";
+
+fn query_has_nested_queries(query: &Query) -> bool {
+    struct NestedQueryVisitor {
+        seen: bool,
+        has_nested: bool,
+    }
+
+    impl Visitor for NestedQueryVisitor {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+            if self.seen {
+                self.has_nested = true;
+                return ControlFlow::Break(());
+            }
+            self.seen = true;
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = NestedQueryVisitor {
+        seen: false,
+        has_nested: false,
+    };
+    let _ = query.visit(&mut visitor);
+    visitor.has_nested
+}
+
+fn is_observability_system_query(stmt: &Statement) -> bool {
+    let Statement::Query(query) = stmt else {
+        return false;
+    };
+
+    if query.with.is_some() {
+        return false;
+    };
+    if !query.locks.is_empty() || query.for_clause.is_some() {
+        return false;
+    }
+    if query_has_nested_queries(query) {
+        return false;
+    }
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    if select.into.is_some() {
+        return false;
+    }
+    if !select.lateral_views.is_empty() {
+        return false;
+    }
+    if select.from.len() != 1 {
+        return false;
+    }
+    if !select.from[0].joins.is_empty() {
+        return false;
+    }
+    let TableFactor::Table { name, .. } = &select.from[0].relation else {
+        return false;
+    };
+
+    let Some(base) = name.0.last() else {
+        return false;
+    };
+    let base_upper = base.value.to_ascii_uppercase();
+    if base_upper != "_PGTIKV_SYS_OBSERVABILITY" && base_upper != "_PGTIKV_SYS_QUERY_SAMPLES" {
+        return false;
+    }
+
+    true
+}
+
+fn is_observability_tableless_query(stmt: &Statement) -> bool {
+    let Statement::Query(query) = stmt else {
+        return false;
+    };
+
+    if query.with.is_some() {
+        return false;
+    }
+    if !query.locks.is_empty() || query.for_clause.is_some() {
+        return false;
+    }
+    if query_has_nested_queries(query) {
+        return false;
+    }
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    if select.into.is_some() {
+        return false;
+    }
+    if !select.lateral_views.is_empty() {
+        return false;
+    }
+    select.from.is_empty()
+}
 
 pub struct Executor {
     store: Arc<TikvStore>,
     auth_manager: AuthManager,
+    #[allow(dead_code)]
+    tenant_keyspace: String,
+    observability: Arc<TenantObservability>,
 }
 
 impl Executor {
-    pub fn new(store: Arc<TikvStore>) -> Self {
+    pub fn new(
+        store: Arc<TikvStore>,
+        tenant_keyspace: String,
+        observability: Arc<TenantObservability>,
+    ) -> Self {
         Self {
             store,
             auth_manager: AuthManager::new(),
+            tenant_keyspace,
+            observability,
         }
     }
 
     pub fn store(&self) -> Arc<TikvStore> {
         self.store.clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn tenant_keyspace(&self) -> &str {
+        &self.tenant_keyspace
+    }
+
+    pub fn observability(&self) -> &Arc<TenantObservability> {
+        &self.observability
     }
 
     #[allow(dead_code)]
@@ -58,110 +179,148 @@ impl Executor {
         crate::txn::with_savepoints(savepoints, async {
             let sql_stripped = strip_leading_sql_comments(sql);
             let sql_trimmed = sql_stripped.trim_start();
+            let is_observability_user =
+                session.current_user() == Some(OBSERVABILITY_USER) && !session.is_superuser();
             let starts_with = |prefix: &str| {
                 sql_trimmed.len() >= prefix.len()
                     && sql_trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
             };
 
-            if starts_with("CREATE OR REPLACE FUNCTION") || starts_with("CREATE FUNCTION") {
-                return self
-                    .execute_create_function_cmd(session, sql)
-                    .await
-                    .map(ExecuteResults::single);
-            }
-            if starts_with("DROP FUNCTION") {
-                return self
-                    .execute_drop_function_cmd(session, sql)
-                    .await
-                    .map(ExecuteResults::single);
-            }
-            if starts_with("CREATE CONSTRAINT TRIGGER") || starts_with("CREATE TRIGGER") {
-                return self
-                    .execute_create_trigger_cmd(session, sql)
-                    .await
-                    .map(ExecuteResults::single);
-            }
-            if starts_with("DROP TRIGGER") {
-                return self
-                    .execute_drop_trigger_cmd(session, sql)
-                    .await
-                    .map(ExecuteResults::single);
+            if !is_observability_user {
+                if starts_with("CREATE OR REPLACE FUNCTION") || starts_with("CREATE FUNCTION") {
+                    let start = Instant::now();
+                    let res = self.execute_create_function_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
+                if starts_with("DROP FUNCTION") {
+                    let start = Instant::now();
+                    let res = self.execute_drop_function_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
+                if starts_with("CREATE CONSTRAINT TRIGGER") || starts_with("CREATE TRIGGER") {
+                    let start = Instant::now();
+                    let res = self.execute_create_trigger_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
+                if starts_with("DROP TRIGGER") {
+                    let start = Instant::now();
+                    let res = self.execute_drop_trigger_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
             }
 
             let sql_upper = sql_trimmed.trim().to_uppercase();
-            if let Some(reason) = get_skip_reason(&sql_upper) {
-                return Ok(ExecuteResults::single(ExecuteResult::Skipped {
-                    message: reason,
-                }));
+            if !is_observability_user {
+                if let Some(reason) = get_skip_reason(&sql_upper) {
+                    return Ok(ExecuteResults::single(ExecuteResult::Skipped {
+                        message: reason,
+                    }));
+                }
             }
 
-            if sql_upper.starts_with("REFRESH MATERIALIZED VIEW") {
-                return self
-                    .execute_refresh_materialized_view_cmd(session, sql)
-                    .await
-                    .map(ExecuteResults::single);
-            }
+            if !is_observability_user {
+                if sql_upper.starts_with("REFRESH MATERIALIZED VIEW") {
+                    let start = Instant::now();
+                    let res = self.execute_refresh_materialized_view_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
 
-            if sql_upper.starts_with("DROP MATERIALIZED VIEW") {
-                return self
-                    .execute_drop_materialized_view_cmd(session, sql)
-                    .await
-                    .map(ExecuteResults::single);
-            }
+                if sql_upper.starts_with("DROP MATERIALIZED VIEW") {
+                    let start = Instant::now();
+                    let res = self.execute_drop_materialized_view_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
 
-            if sql_upper.starts_with("CALL ") {
-                return self
-                    .execute_call_cmd(session, sql)
-                    .await
-                    .map(ExecuteResults::single);
-            }
+                if sql_upper.starts_with("CALL ") {
+                    let start = Instant::now();
+                    let res = self.execute_call_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
 
-            if sql_upper.starts_with("DROP PROCEDURE") {
-                return self
-                    .execute_drop_procedure_cmd(session, sql)
-                    .await
-                    .map(ExecuteResults::single);
-            }
+                if sql_upper.starts_with("DROP PROCEDURE") {
+                    let start = Instant::now();
+                    let res = self.execute_drop_procedure_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
 
-            if sql_upper.starts_with("CREATE PROCEDURE") {
-                return self
-                    .execute_create_procedure_cmd(session, sql)
-                    .await
-                    .map(ExecuteResults::single);
-            }
+                if sql_upper.starts_with("CREATE PROCEDURE") {
+                    let start = Instant::now();
+                    let res = self.execute_create_procedure_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
 
-            if sql_upper.starts_with("CREATE TYPE") {
-                let mut prev = "";
-                let mut is_enum = false;
-                for token in sql_upper.split_whitespace() {
-                    if prev == "AS" && token.starts_with("ENUM") {
-                        is_enum = true;
-                        break;
+                if sql_upper.starts_with("CREATE TYPE") {
+                    let mut prev = "";
+                    let mut is_enum = false;
+                    for token in sql_upper.split_whitespace() {
+                        if prev == "AS" && token.starts_with("ENUM") {
+                            is_enum = true;
+                            break;
+                        }
+                        prev = token;
                     }
-                    prev = token;
+                    if is_enum {
+                        let start = Instant::now();
+                        let res = self.execute_create_type_enum_cmd(session, sql).await;
+                        self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                            sql_trimmed.to_string()
+                        });
+                        return res.map(ExecuteResults::single);
+                    }
                 }
-                if is_enum {
-                    return self
-                        .execute_create_type_enum_cmd(session, sql)
-                        .await
-                        .map(ExecuteResults::single);
-                }
-            }
 
-            if sql_upper.starts_with("DROP TYPE") {
-                return self
-                    .execute_drop_type_cmd(session, sql)
-                    .await
-                    .map(ExecuteResults::single);
+                if sql_upper.starts_with("DROP TYPE") {
+                    let start = Instant::now();
+                    let res = self.execute_drop_type_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
             }
 
             let statements = match parse_sql(sql) {
                 Ok(stmts) => stmts,
                 Err(e) => {
-                    if let Some(reason) = get_unsupported_reason(&sql_upper) {
-                        return Ok(ExecuteResults::single(ExecuteResult::Skipped {
-                            message: reason,
-                        }));
+                    if !is_observability_user {
+                        if let Some(reason) = get_unsupported_reason(&sql_upper) {
+                            return Ok(ExecuteResults::single(ExecuteResult::Skipped {
+                                message: reason,
+                            }));
+                        }
+                        // Parse error counts as a statement attempt (for error rate / p99, etc).
+                        self.observability.record_statement(
+                            Duration::from_millis(0),
+                            false,
+                            || sql_trimmed.to_string(),
+                        );
                     }
                     return Err(e);
                 }
@@ -175,27 +334,57 @@ impl Executor {
 
             for stmt in &statements {
                 debug!("Executing statement: {:?}", stmt);
-
-                let mut stmt_results: Vec<ExecuteResult> = Vec::new();
-
-                match stmt {
+                let is_observability_query = is_observability_user
+                    && (is_observability_system_query(stmt) || is_observability_tableless_query(stmt));
+                if is_observability_user {
+                    match stmt {
+                        Statement::StartTransaction { .. }
+                        | Statement::Commit { .. }
+                        | Statement::Savepoint { .. }
+                        | Statement::ReleaseSavepoint { .. }
+                        | Statement::Rollback { .. }
+                        | Statement::SetVariable { .. }
+                        | Statement::SetTimeZone { .. }
+                        | Statement::SetNames { .. }
+                        | Statement::SetTransaction { .. } => {
+                            results.push(ExecuteResult::Empty);
+                            continue;
+                        }
+                        Statement::Query(_) => {
+                            if !is_observability_query {
+                                return Err(anyhow!(
+                                    "permission denied for role '{}'",
+                                    OBSERVABILITY_USER
+                                ));
+                            }
+                        }
+                        _ => {
+                            return Err(anyhow!(
+                                "permission denied for role '{}'",
+                                OBSERVABILITY_USER
+                            ));
+                        }
+                    }
+                }
+                let start = Instant::now();
+                let stmt_exec: Result<Vec<ExecuteResult>> = match stmt {
                     // Transaction Control
                     Statement::StartTransaction { .. } => {
                         session.begin().await?;
-                        stmt_results.push(ExecuteResult::Empty);
+                        Ok(vec![ExecuteResult::Empty])
                     }
                     Statement::Commit { .. } => {
                         session.commit().await?;
-                        stmt_results.push(ExecuteResult::Empty);
+                        Ok(vec![ExecuteResult::Empty])
                     }
                     Statement::Savepoint { name } => {
                         session.create_savepoint(normalize_ident(name))?;
-                        stmt_results.push(ExecuteResult::Empty);
+                        Ok(vec![ExecuteResult::Empty])
                     }
                     Statement::ReleaseSavepoint { name } => {
                         let sp = normalize_ident(name);
                         session.release_savepoint(&sp)?;
-                        stmt_results.push(ExecuteResult::Empty);
+                        Ok(vec![ExecuteResult::Empty])
                     }
                     Statement::Rollback {
                         savepoint: Some(name),
@@ -203,13 +392,13 @@ impl Executor {
                     } => {
                         let sp = normalize_ident(name);
                         session.rollback_to_savepoint(&sp).await?;
-                        stmt_results.push(ExecuteResult::Empty);
+                        Ok(vec![ExecuteResult::Empty])
                     }
                     Statement::Rollback {
                         savepoint: None, ..
                     } => {
                         session.rollback().await?;
-                        stmt_results.push(ExecuteResult::Empty);
+                        Ok(vec![ExecuteResult::Empty])
                     }
                     Statement::SetVariable {
                         variable, value, ..
@@ -274,7 +463,7 @@ impl Executor {
                             }
                             session.set_search_path(new_search_path);
                         }
-                        stmt_results.push(ExecuteResult::Empty);
+                        Ok(vec![ExecuteResult::Empty])
                     }
                     // DDL/DML - delegated to session transaction management
                     _ => {
@@ -302,18 +491,29 @@ impl Executor {
 
                         if is_autocommit {
                             if res.is_ok() {
-                                session.commit().await?;
+                                if is_observability_query {
+                                    session.rollback().await?;
+                                } else {
+                                    session.commit().await?;
+                                }
                             } else {
                                 session.rollback().await?;
                             }
                         }
 
                         let (notices, result) = res?;
-                        stmt_results.extend(notices);
+                        let mut stmt_results = notices;
                         stmt_results.push(result);
+                        Ok(stmt_results)
                     }
+                };
+
+                if !is_observability_query {
+                    self.observability
+                        .record_statement(start.elapsed(), stmt_exec.is_ok(), || stmt.to_string());
                 }
-                results.extend(stmt_results);
+
+                results.extend(stmt_exec?);
             }
 
             Ok(ExecuteResults(results))

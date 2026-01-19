@@ -14,13 +14,9 @@ export interface Endpoint {
 }
 
 export interface Tenant {
-  name: string
+  id: string
   state: string
   endpoints: Endpoint[]
-  // Legacy fields for backwards compatibility
-  host?: string
-  port?: number
-  // Extended fields
   is_deleted?: boolean
   created_at?: string
   created_by?: string | null
@@ -30,13 +26,12 @@ export interface Tenant {
 }
 
 export interface CreateTenantRequest {
-  name: string
   admin_user?: string
   admin_password?: string
 }
 
 export interface CreateTenantResponse {
-  name: string
+  id: string
   admin_user: string
   admin_password: string
   connection_string: string
@@ -108,4 +103,31 @@ export interface SqlQueryResponse {
   result?: string | null
   error?: string | null
   rows_affected?: number | null
+}
+
+export interface ObservabilitySummary {
+  window_seconds: number
+  statement_count: number
+  txn_commit_count: number
+  error_count: number
+  qps: number
+  tps: number
+  latency_avg_ms: number
+  latency_p99_ms: number
+  active_connections: number
+}
+
+export interface QuerySample {
+  query: string
+  sample_count: number
+  error_count: number
+  latency_avg_ms: number
+  latency_p99_ms: number
+  latency_max_ms: number
+  last_seen_ms_ago: number
+}
+
+export interface TenantObservabilityResponse {
+  summary: ObservabilitySummary
+  samples: QuerySample[]
 }

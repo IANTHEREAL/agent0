@@ -1,5 +1,3 @@
-"""User management API endpoints."""
-
 import secrets
 import string
 from typing import List, Optional
@@ -16,6 +14,7 @@ from ..models import (
     PasswordResetResponse,
     MessageResponse,
 )
+from ..models.db import TenantDB
 from ..services import PgTikvClient
 from ..services.audit import get_audit_service
 from ..session import session_manager, TenantSession
@@ -25,61 +24,60 @@ router = APIRouter()
 
 
 def get_pg_client(settings: Settings = Depends(get_settings)) -> PgTikvClient:
-    """Get pg-tikv client instance."""
     return PgTikvClient(settings.pg_host, settings.pg_port)
 
 
 def generate_password(length: int = 16) -> str:
-    """Generate a random password."""
     alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def get_tenant_or_404(tenant_id: str, db: Session) -> TenantDB:
+    tenant = db.query(TenantDB).filter(
+        TenantDB.id == tenant_id,
+        TenantDB.is_deleted == False
+    ).first()
+    if not tenant:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Tenant '{tenant_id}' not found",
+        )
+    return tenant
+
+
 async def get_tenant_session(
-    name: str,
+    tenant_id: str,
     x_tenant_session: Optional[str] = Header(None, alias="X-Tenant-Session"),
 ) -> TenantSession:
-    """Validate tenant session for user management operations.
-    
-    Args:
-        name: Tenant name from path
-        x_tenant_session: Session ID from header
-    
-    Returns:
-        Valid TenantSession
-    
-    Raises:
-        HTTPException: If session is missing, invalid, or for wrong tenant
-    """
     if not x_tenant_session:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Tenant session required. Use POST /api/tenants/{name}/connect first.",
+            detail="Tenant session required. Use POST /api/tenants/{id}/connect first.",
         )
-    
-    session = session_manager.validate_session(x_tenant_session, name)
+
+    session = session_manager.validate_session(x_tenant_session, tenant_id)
     if not session:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or expired tenant session",
         )
-    
+
     return session
 
 
 @router.get(
-    "/tenants/{name}/users",
+    "/tenants/{tenant_id}/users",
     response_model=List[UserResponse],
     summary="List users in tenant",
-    description="List all users in the tenant. Requires tenant session."
 )
 async def list_users(
-    name: str,
+    tenant_id: str,
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
+    db: Session = Depends(get_db),
 ):
-    """List all users in the tenant."""
-    users = pg.list_users(name, session.admin_user, session.admin_password)
+    tenant = get_tenant_or_404(tenant_id, db)
+    users = pg.list_users(tenant.keyspace, session.admin_user, session.admin_password)
     return [
         UserResponse(
             name=u.name,
@@ -93,27 +91,26 @@ async def list_users(
 
 
 @router.post(
-    "/tenants/{name}/users",
+    "/tenants/{tenant_id}/users",
     response_model=UserCreateResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Create user in tenant",
-    description="Create a new user in the tenant. Requires tenant session."
 )
 async def create_user(
-    name: str,
+    tenant_id: str,
     request: UserCreate,
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
     settings: Settings = Depends(get_settings),
     db: Session = Depends(get_db),
 ):
-    """Create a new user in the tenant."""
+    tenant = get_tenant_or_404(tenant_id, db)
     password = request.password or generate_password()
     audit = get_audit_service(db)
 
     try:
         success = pg.create_user(
-            name,
+            tenant.keyspace,
             session.admin_user,
             session.admin_password,
             request.username,
@@ -122,25 +119,24 @@ async def create_user(
         )
 
         if not success:
-            audit.log_user_created(name, request.username, success=False, error="PG client returned failure")
+            audit.log_user_created(tenant_id, request.username, success=False, error="PG client returned failure")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to create user",
             )
 
-        # Log successful creation
-        audit.log_user_created(name, request.username, success=True, operator=session.admin_user)
+        audit.log_user_created(tenant_id, request.username, success=True, operator=session.admin_user)
 
         return UserCreateResponse(
             username=request.username,
             password=password,
-            connection=f"psql -h {settings.pg_host} -p {settings.pg_port} -U {name}.{request.username}",
+            connection=f"psql -h {settings.pg_host} -p {settings.pg_port} -U {tenant.keyspace}.{request.username}",
         )
 
     except HTTPException:
         raise
     except Exception as e:
-        audit.log_user_created(name, request.username, success=False, error=str(e))
+        audit.log_user_created(tenant_id, request.username, success=False, error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to create user: {str(e)}",
@@ -148,40 +144,38 @@ async def create_user(
 
 
 @router.delete(
-    "/tenants/{name}/users/{username}",
+    "/tenants/{tenant_id}/users/{username}",
     response_model=MessageResponse,
     summary="Delete user from tenant",
-    description="Delete a user from the tenant. Requires tenant session."
 )
 async def delete_user(
-    name: str,
+    tenant_id: str,
     username: str,
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
     db: Session = Depends(get_db),
 ):
-    """Delete a user from the tenant."""
+    tenant = get_tenant_or_404(tenant_id, db)
     audit = get_audit_service(db)
 
     try:
-        success = pg.drop_user(name, session.admin_user, session.admin_password, username)
+        success = pg.drop_user(tenant.keyspace, session.admin_user, session.admin_password, username)
 
         if not success:
-            audit.log_user_deleted(name, username, success=False, error="PG client returned failure")
+            audit.log_user_deleted(tenant_id, username, success=False, error="PG client returned failure")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to delete user",
             )
 
-        # Log successful deletion
-        audit.log_user_deleted(name, username, success=True, operator=session.admin_user)
+        audit.log_user_deleted(tenant_id, username, success=True, operator=session.admin_user)
 
         return MessageResponse(message=f"User '{username}' deleted")
 
     except HTTPException:
         raise
     except Exception as e:
-        audit.log_user_deleted(name, username, success=False, error=str(e))
+        audit.log_user_deleted(tenant_id, username, success=False, error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete user: {str(e)}",
@@ -189,25 +183,24 @@ async def delete_user(
 
 
 @router.post(
-    "/tenants/{name}/users/{username}/password",
+    "/tenants/{tenant_id}/users/{username}/password",
     response_model=PasswordResetResponse,
     summary="Reset user password",
-    description="Reset a user's password. Requires tenant session."
 )
 async def reset_password(
-    name: str,
+    tenant_id: str,
     username: str,
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
     db: Session = Depends(get_db),
 ):
-    """Reset a user's password."""
+    tenant = get_tenant_or_404(tenant_id, db)
     new_password = generate_password()
     audit = get_audit_service(db)
 
     try:
         success = pg.reset_password(
-            name,
+            tenant.keyspace,
             session.admin_user,
             session.admin_password,
             username,
@@ -215,21 +208,20 @@ async def reset_password(
         )
 
         if not success:
-            audit.log_password_reset(name, username, success=False, error="PG client returned failure")
+            audit.log_password_reset(tenant_id, username, success=False, error="PG client returned failure")
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to reset password",
             )
 
-        # Log successful password reset
-        audit.log_password_reset(name, username, success=True, operator=session.admin_user)
+        audit.log_password_reset(tenant_id, username, success=True, operator=session.admin_user)
 
         return PasswordResetResponse(username=username, password=new_password)
 
     except HTTPException:
         raise
     except Exception as e:
-        audit.log_password_reset(name, username, success=False, error=str(e))
+        audit.log_password_reset(tenant_id, username, success=False, error=str(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to reset password: {str(e)}",

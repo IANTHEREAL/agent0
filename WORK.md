@@ -1,3 +1,100 @@
+# Work: Observability v1 (Per-tenant SQL sampling + key metrics)
+
+## Feature Request
+
+Design and implement an observability方案 for pg-tikv with phased evolution.
+
+### Phase 1 (P0) Requirements
+- Only keep **last 1 hour** of data (in-memory ok for v1).
+- Per-tenant (keyspace) isolation: tenant must only read its own metrics; no cross-tenant writes.
+- SQL statement sampling including execution latency + execution count; derive:
+  - QPS / TPS
+  - p99 latency / avg latency
+  - active connections
+- Low-intrusion probes; easy to use/understand; minimal code touch points.
+- High-performance: low overhead on hot paths.
+- Expose in `cloud-admin-portal` tenant detail page.
+
+### Phase Roadmap (for future extensibility)
+- Phase 2: Prometheus/OpenMetrics export + per-node/system gauges (CPU/mem/GC), configurable retention.
+- Phase 3: OpenTelemetry traces (pgwire → SQL executor → TiKV RPC spans), log correlation IDs.
+- Phase 4: Slow query log + plan capture + per-table/index stats (still tenant-isolated).
+
+## Agent Work Plan (Phase 1)
+
+### 0) Work tracking
+- [x] Add this phase plan + TODOs (keep updating here).
+
+### 1) pg-tikv: Observability core (low overhead)
+- [x] `src/observability.rs`: per-tenant registry + rolling 1h window counters/hist + sampled statements ring.
+- [x] Ensure updates are mostly atomic/lock-free; locks only on sampling path (rare).
+
+### 2) pg-tikv: Probes (minimal intrusion)
+- [x] Increment/decrement per-tenant active connection gauge at auth success / connection close.
+- [x] Record per-statement latency + count (include errors) and transaction commits (TPS).
+
+### 3) pg-tikv: Query surface for portal
+- [x] Add table functions:
+  - [x] `SELECT * FROM _pgtikv_sys_observability();` (summary metrics, last 1h)
+  - [x] `SELECT * FROM _pgtikv_sys_query_samples();` (top sampled statements, last 1h)
+
+### 4) cloud-admin-portal: Backend API
+- [x] `GET /api/tenants/{name}/observability` (no tenant session; queries pg-tikv via per-tenant observer account)
+- [x] Add minimal tests (endpoint does not require tenant session).
+
+### 5) cloud-admin-portal: Frontend
+- [x] Add “Observability” section in tenant detail page (cards + sampled query table, auto refresh).
+
+### 6) Knowledge base updates (after Phase 1 done)
+- [x] Update root `AGENTS.md` with lessons learned for observability integration points.
+- [x] Add/update `.codex/knowledge/observability.md` with API + code locations + ops knobs.
+
+### Progress Notes
+- (keep notes per step; don’t edit expected outputs to hide compatibility issues)
+- Portal: backend 已切换到 `pg8000`（无 `psql` subprocess），避免任何交互式密码提示导致的阻塞。
+- Portal: 若 tenant 未 bootstrap observability 账号（API 返回 409），前端会停止轮询避免刷屏日志。
+- Portal: tenant session 改为按 tenant 存储（`tenant_session:<tenant>`），避免跨 tenant 切换导致 “Invalid or expired session”。
+
+### Follow-ups (after Phase 1)
+- [x] Rename system observability “tables” to `_pgtikv_sys_*`.
+
+## Enhancement: Observability Readonly Account (Portal Bootstrap)
+
+### Goal
+- Create a dedicated **readonly** DB account for observability queries during `new tenant` creation flow in `cloud-admin-portal`.
+- Portal uses this account (not tenant admin) to query `_pgtikv_sys_*` metrics for UI display.
+
+### Plan
+- [x] Persist observability account per tenant in portal DB (schema migration included).
+- [x] Backend bootstrap endpoint: create/rotate the observability account using admin credentials.
+- [x] Frontend: after `create tenant`, automatically call the bootstrap endpoint.
+- [x] Observability API: use stored observability account (no tenant-session required for metrics).
+- [x] pg-tikv: enforce the observability account can only query `_pgtikv_sys_*` metrics.
+
+## Enhancement: Portal DB Client Uses pg8000 (No psql Subprocess)
+
+### Goal
+- Use a pure-Python PostgreSQL client (`pg8000`) in `cloud-admin-portal` backend to avoid spawning `psql` subprocesses (performance + no interactive password prompts).
+- `psql` 不作为 fallback：portal backend 强制使用 `pg8000`。
+
+### Plan
+- [x] Add `pg8000` dependency to backend.
+- [x] Refactor `PgTikvClient` to use `pg8000` only (no `psql` subprocess, no custom splitter/pool).
+- [x] Remove `psql` fallback code path entirely.
+- [x] Ensure `_pgtikv_sys_observer` remains compatible (no unexpected BEGIN/COMMIT required; allow harmless tx/SET no-op on server).
+
+---
+
+## Enhancement: Simplify Portal `PgTikvClient` (Keep pg8000 Code Small)
+
+### Goal
+- Keep `cloud-admin-portal` backend DB client minimal and easy to understand.
+
+### Plan
+- [x] Remove hand-rolled SQL statement splitter (pg8000 already uses simple-query mode for no-arg `execute()`).
+- [x] Remove custom connection pool (portal opens a short-lived pg8000 connection per request).
+- [x] Run backend tests.
+
 # Work: DATE Type (`DATE` without time zone)
 
 ## Feature Request

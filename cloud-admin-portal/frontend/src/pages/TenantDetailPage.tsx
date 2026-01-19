@@ -18,10 +18,11 @@ import { CreateUserDialog } from "@/components/users/CreateUserDialog"
 import { CredentialsModal } from "@/components/common/CredentialsModal"
 import { ConfirmDialog } from "@/components/common/ConfirmDialog"
 import { SqlEditor } from "@/components/sql/SqlEditor"
+import { TenantObservabilityCard } from "@/components/observability/TenantObservabilityCard"
 
 export function TenantDetailPage() {
-  const { name } = useParams<{ name: string }>()
-  const { data: tenant, isLoading: tenantLoading } = useTenant(name!)
+  const { id: tenantId } = useParams<{ id: string }>()
+  const { data: tenant, isLoading: tenantLoading } = useTenant(tenantId!)
   const { toast } = useToast()
 
   // Connection state
@@ -32,12 +33,12 @@ export function TenantDetailPage() {
     connect,
     disconnect,
     isConnecting,
-  } = useTenantSession(name!)
+  } = useTenantSession(tenantId!)
 
   // User management
-  const { data: users, isLoading: usersLoading } = useUsers(name!, isConnected)
-  const deleteUserMutation = useDeleteUser(name!)
-  const resetPasswordMutation = useResetPassword(name!)
+  const { data: users, isLoading: usersLoading } = useUsers(tenantId!, isConnected)
+  const deleteUserMutation = useDeleteUser(tenantId!)
+  const resetPasswordMutation = useResetPassword(tenantId!)
 
   const [copied, setCopied] = useState(false)
   const [showCreateUser, setShowCreateUser] = useState(false)
@@ -109,7 +110,7 @@ export function TenantDetailPage() {
   const copyConnectionString = async (endpoint?: { host: string; port: number }) => {
     const host = endpoint?.host || tenant?.endpoints?.[0]?.host || '127.0.0.1'
     const port = endpoint?.port || tenant?.endpoints?.[0]?.port || 5433
-    const connStr = `psql -h ${host} -p ${port} -U ${name}.admin`
+    const connStr = `psql -h ${host} -p ${port} -U t${tenantId}.admin`
     
     try {
       await navigator.clipboard.writeText(connStr)
@@ -168,7 +169,7 @@ export function TenantDetailPage() {
           </Link>
         </Button>
         <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-semibold">{name}</h1>
+          <h1 className="text-2xl font-semibold font-mono">{tenantId}</h1>
           <span
             className={cn(
               "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs",
@@ -242,7 +243,7 @@ export function TenantDetailPage() {
                     </div>
                     <div className="flex items-center gap-2">
                       <code className="flex-1 bg-background/60 border border-border/30 px-3 py-2 rounded-md text-xs font-mono text-muted-foreground">
-                        psql -h {endpoint.host} -p {endpoint.port} -U {name}.admin
+                        psql -h {endpoint.host} -p {endpoint.port} -U t{tenantId}.admin
                       </code>
                       <Button
                         variant="ghost"
@@ -439,10 +440,12 @@ export function TenantDetailPage() {
         </CardContent>
       </Card>
 
-      {isConnected && <SqlEditor tenantName={name!} />}
+      <TenantObservabilityCard tenantId={tenantId!} />
+
+      {isConnected && <SqlEditor tenantId={tenantId!} />}
 
       <CreateUserDialog
-        tenantName={name!}
+        tenantId={tenantId!}
         open={showCreateUser}
         onOpenChange={setShowCreateUser}
       />

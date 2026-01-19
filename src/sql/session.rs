@@ -1,6 +1,7 @@
 //! Session management for transactions
 
 use crate::storage::TikvStore;
+use crate::observability::TenantObservability;
 use crate::txn::SavepointState;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -14,6 +15,7 @@ pub enum TransactionState {
 
 pub struct Session {
     store: Arc<TikvStore>,
+    observability: Arc<TenantObservability>,
     state: TransactionState,
     savepoints: Arc<SavepointState>,
     last_sequence_values: HashMap<String, i64>,
@@ -25,9 +27,10 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(store: Arc<TikvStore>) -> Self {
+    pub fn new(store: Arc<TikvStore>, observability: Arc<TenantObservability>) -> Self {
         Self {
             store,
+            observability,
             state: TransactionState::Idle,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
@@ -37,9 +40,15 @@ impl Session {
         }
     }
 
-    pub fn new_with_user(store: Arc<TikvStore>, username: String, is_superuser: bool) -> Self {
+    pub fn new_with_user(
+        store: Arc<TikvStore>,
+        observability: Arc<TenantObservability>,
+        username: String,
+        is_superuser: bool,
+    ) -> Self {
         Self {
             store,
+            observability,
             state: TransactionState::Idle,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
@@ -188,7 +197,9 @@ impl Session {
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset()?;
-                txn.commit().await.map(|_| ()).map_err(|e| anyhow!(e))
+                txn.commit().await.map(|_| ()).map_err(|e| anyhow!(e))?;
+                self.observability.record_commit();
+                Ok(())
             }
             TransactionState::Idle => {
                 Ok(()) // No-op

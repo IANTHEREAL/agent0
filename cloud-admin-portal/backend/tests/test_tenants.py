@@ -1,7 +1,5 @@
 """Tests for tenant management endpoints."""
 
-import pytest
-
 
 class TestListTenants:
 
@@ -15,22 +13,34 @@ class TestListTenants:
 class TestGetTenant:
 
     def test_get_tenant_not_found(self, client):
-        response = client.get("/api/tenants/nonexistent_tenant_xyz")
+        response = client.get("/api/tenants/nonexistent12")
         assert response.status_code == 404
 
 
 class TestCreateTenant:
 
-    def test_create_tenant_invalid_name(self, client):
+    def test_create_tenant_basic(self, client):
         response = client.post(
             "/api/tenants",
-            json={"name": "INVALID NAME!"}
+            json={"admin_user": "admin"}
         )
-        assert response.status_code in [400, 422, 500]
+        # May fail with 500 if TiKV not running, but should not fail validation
+        assert response.status_code in [201, 500]
+        if response.status_code == 201:
+            data = response.json()
+            assert "id" in data
+            assert len(data["id"]) == 12
 
 
 class TestDeleteTenant:
 
     def test_delete_tenant_not_found(self, client):
-        response = client.delete("/api/tenants/nonexistent_tenant_xyz")
+        response = client.delete("/api/tenants/nonexistent12")
         assert response.status_code in [200, 404]
+
+
+class TestTenantObservability:
+
+    def test_observability_does_not_require_tenant_session(self, client):
+        response = client.get("/api/tenants/testtenantid/observability")
+        assert response.status_code != 401

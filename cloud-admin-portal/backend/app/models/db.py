@@ -35,17 +35,20 @@ class TenantDB(Base):
 
     __tablename__ = "tenants"
 
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    name = Column(String(255), unique=True, nullable=False, index=True)
+    _pk = Column("pk", Integer, primary_key=True, autoincrement=True)
+    id = Column(String(14), unique=True, nullable=False, index=True)
+    keyspace = Column(String(64), unique=True, nullable=False, index=True)
     is_deleted = Column(Boolean, default=False, nullable=False, index=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     created_by = Column(String(255), nullable=True)
     notes = Column(Text, nullable=True)
     tags = Column(JSONType, nullable=True)  # List[str] stored as JSON
     updated_at = Column(DateTime, nullable=True)
+    observability_user = Column(String(255), nullable=True)
+    observability_password = Column(String(255), nullable=True)
 
     def __repr__(self):
-        return f"<TenantDB(name='{self.name}', is_deleted={self.is_deleted})>"
+        return f"<TenantDB(id='{self.id}', keyspace='{self.keyspace}', is_deleted={self.is_deleted})>"
 
 
 class AuditLogDB(Base):
@@ -55,14 +58,14 @@ class AuditLogDB(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
-    operation_type = Column(String(50), nullable=False, index=True)  # create_tenant, delete_tenant, etc.
-    resource_type = Column(String(50), nullable=False)  # tenant or user
+    operation_type = Column(String(50), nullable=False, index=True)
+    resource_type = Column(String(50), nullable=False)
     resource_name = Column(String(255), nullable=False, index=True)
-    tenant_name = Column(String(255), nullable=True, index=True)  # Context for user operations
-    operator = Column(String(255), nullable=True)  # Who performed the operation
+    tenant_id = Column(String(14), nullable=True, index=True)
+    operator = Column(String(255), nullable=True)
     success = Column(Boolean, nullable=False, index=True)
     error_message = Column(Text, nullable=True)
-    extra_metadata = Column(JSONType, nullable=True)  # Additional context as JSON
+    extra_metadata = Column(JSONType, nullable=True)
 
     def __repr__(self):
         return f"<AuditLogDB(operation='{self.operation_type}', resource='{self.resource_name}', success={self.success})>"

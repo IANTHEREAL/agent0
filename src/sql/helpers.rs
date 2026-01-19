@@ -1080,22 +1080,72 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
     match expr {
         Expr::Identifier(ident) => {
             let col_name = normalize_ident(ident);
-            schema
+            if let Some(col) = schema
                 .columns
                 .iter()
                 .find(|c| c.name.eq_ignore_ascii_case(&col_name))
-                .map(|c| c.data_type.clone())
-                .unwrap_or(DataType::Text)
+            {
+                return col.data_type.clone();
+            }
+
+            let suffix = format!(".{col_name}");
+            let mut matched: Option<&ColumnDef> = None;
+            for col in &schema.columns {
+                if col.name.len() >= suffix.len()
+                    && col.name[col.name.len() - suffix.len()..].eq_ignore_ascii_case(&suffix)
+                {
+                    if matched.is_some() {
+                        matched = None;
+                        break;
+                    }
+                    matched = Some(col);
+                }
+            }
+            matched.map(|c| c.data_type.clone()).unwrap_or(DataType::Text)
         }
         Expr::CompoundIdentifier(parts) => {
+            if parts.is_empty() {
+                return DataType::Text;
+            }
+
+            let mut full_name = String::new();
+            for (idx, part) in parts.iter().enumerate() {
+                if idx > 0 {
+                    full_name.push('.');
+                }
+                full_name.push_str(&normalize_ident(part));
+            }
+            if let Some(col) = schema
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(&full_name))
+            {
+                return col.data_type.clone();
+            }
+
             if let Some(last) = parts.last() {
                 let col_name = normalize_ident(last);
-                schema
+                if let Some(col) = schema
                     .columns
                     .iter()
                     .find(|c| c.name.eq_ignore_ascii_case(&col_name))
-                    .map(|c| c.data_type.clone())
-                    .unwrap_or(DataType::Text)
+                {
+                    return col.data_type.clone();
+                }
+                let suffix = format!(".{col_name}");
+                let mut matched: Option<&ColumnDef> = None;
+                for col in &schema.columns {
+                    if col.name.len() >= suffix.len()
+                        && col.name[col.name.len() - suffix.len()..].eq_ignore_ascii_case(&suffix)
+                    {
+                        if matched.is_some() {
+                            matched = None;
+                            break;
+                        }
+                        matched = Some(col);
+                    }
+                }
+                matched.map(|c| c.data_type.clone()).unwrap_or(DataType::Text)
             } else {
                 DataType::Text
             }
@@ -1124,7 +1174,19 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                     if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
                         f.args.first()
                     {
-                        infer_expr_type(arg_expr, schema)
+                        match infer_expr_type(arg_expr, schema) {
+                            DataType::Int32 => DataType::Int64,
+                            DataType::Int64 => DataType::Numeric {
+                                precision: None,
+                                scale: None,
+                            },
+                            DataType::Numeric { .. } => DataType::Numeric {
+                                precision: None,
+                                scale: None,
+                            },
+                            DataType::Float64 => DataType::Float64,
+                            _ => DataType::Text,
+                        }
                     } else {
                         DataType::Text
                     }
@@ -1160,6 +1222,7 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                 }
                 "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" => DataType::Int64,
                 "BOOL_AND" | "BOOL_OR" | "EVERY" => DataType::Boolean,
+                "GROUPING" => DataType::Int32,
                 "VECTOR_DIMS" => DataType::Int32,
                 "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
                     if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
@@ -1456,6 +1519,192 @@ mod tests {
     fn test_parse_pg_array_empty() {
         let result = parse_pg_array("{}").unwrap();
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_infer_expr_type_compound_identifier_prefers_full_name() {
+        let schema = TableSchema {
+            name: "joined".to_string(),
+            table_id: 0,
+            columns: vec![ColumnDef {
+                name: "o.total".to_string(),
+                data_type: DataType::Float64,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+        };
+
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, "SELECT o.total").unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+            panic!("expected unnamed expr");
+        };
+
+        assert_eq!(infer_expr_type(expr, &schema), DataType::Float64);
+    }
+
+    #[test]
+    fn test_infer_expr_type_coalesce_sum_float() {
+        let schema = TableSchema {
+            name: "joined".to_string(),
+            table_id: 0,
+            columns: vec![ColumnDef {
+                name: "o.total".to_string(),
+                data_type: DataType::Float64,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+        };
+
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, "SELECT COALESCE(SUM(o.total), 0)").unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+            panic!("expected unnamed expr");
+        };
+
+        assert_eq!(infer_expr_type(expr, &schema), DataType::Float64);
+    }
+
+    #[test]
+    fn test_infer_expr_type_sum_int32_returns_int64() {
+        let schema = TableSchema {
+            name: "t".to_string(),
+            table_id: 0,
+            columns: vec![ColumnDef {
+                name: "x".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+        };
+
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, "SELECT SUM(x)").unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+            panic!("expected unnamed expr");
+        };
+
+        assert_eq!(infer_expr_type(expr, &schema), DataType::Int64);
+    }
+
+    #[test]
+    fn test_infer_expr_type_sum_int64_returns_numeric() {
+        let schema = TableSchema {
+            name: "t".to_string(),
+            table_id: 0,
+            columns: vec![ColumnDef {
+                name: "x".to_string(),
+                data_type: DataType::Int64,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+        };
+
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, "SELECT SUM(x)").unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+            panic!("expected unnamed expr");
+        };
+
+        assert_eq!(
+            infer_expr_type(expr, &schema),
+            DataType::Numeric {
+                precision: None,
+                scale: None
+            }
+        );
+    }
+
+    #[test]
+    fn test_infer_expr_type_grouping_returns_int32() {
+        let schema = TableSchema {
+            name: "t".to_string(),
+            table_id: 0,
+            columns: vec![ColumnDef {
+                name: "x".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+        };
+
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, "SELECT GROUPING(x)").unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+            panic!("expected unnamed expr");
+        };
+
+        assert_eq!(infer_expr_type(expr, &schema), DataType::Int32);
     }
 
     #[test]

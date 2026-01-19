@@ -1,4 +1,5 @@
 use crate::auth::AuthManager;
+use crate::observability;
 use crate::pool::TikvClientPool;
 use crate::sql::{ExecuteResult, Executor, Session};
 use crate::storage::TikvStore;
@@ -435,6 +436,7 @@ pub struct DynamicPgHandler {
     default_keyspace: Option<String>,
     executor: OnceCell<Arc<Executor>>,
     session: Mutex<Option<Session>>,
+    connection_guard: OnceCell<observability::ConnectionGuard>,
     copy_context: Mutex<Option<CopyContext>>,
     query_parser: Arc<NoopQueryParser>,
 }
@@ -448,6 +450,7 @@ impl DynamicPgHandler {
             default_keyspace,
             executor: OnceCell::new(),
             session: Mutex::new(None),
+            connection_guard: OnceCell::new(),
             copy_context: Mutex::new(None),
             query_parser: Arc::new(NoopQueryParser::new()),
         }
@@ -463,6 +466,7 @@ impl DynamicPgHandler {
             default_keyspace,
             executor: OnceCell::new(),
             session: Mutex::new(None),
+            connection_guard: OnceCell::new(),
             copy_context: Mutex::new(None),
             query_parser: Arc::new(NoopQueryParser::new()),
         }
@@ -634,25 +638,36 @@ impl DynamicPgHandler {
     ) -> Result<(), String> {
         let effective_keyspace = keyspace
             .or_else(|| self.default_keyspace.clone())
-            .or_else(|| Some("default".to_string()));
+            .unwrap_or_else(|| "default".to_string());
+
+        let tenant_obs = observability::registry().tenant(&effective_keyspace);
+        if self.connection_guard.get().is_none() {
+            let _ = self.connection_guard.set(tenant_obs.connection_open());
+        }
 
         let store = if let Some(pool) = &self.client_pool {
-            pool.get_client(effective_keyspace.clone())
+            pool.get_client(Some(effective_keyspace.clone()))
                 .await
                 .map_err(|e| format!("Failed to get client from pool: {}", e))?
         } else {
-            let s =
-                TikvStore::new_with_keyspace(self.pd_endpoints.clone(), effective_keyspace.clone())
+            let s = TikvStore::new_with_keyspace(
+                self.pd_endpoints.clone(),
+                Some(effective_keyspace.clone()),
+            )
                     .await
                     .map_err(|e| format!("Failed to connect to TiKV: {}", e))?;
             Arc::new(s)
         };
 
-        let executor = Arc::new(Executor::new(store.clone()));
+        let executor = Arc::new(Executor::new(
+            store.clone(),
+            effective_keyspace.clone(),
+            tenant_obs.clone(),
+        ));
 
         let session = match username {
-            Some(user) => Session::new_with_user(store, user, is_superuser),
-            None => Session::new(store),
+            Some(user) => Session::new_with_user(store, tenant_obs, user, is_superuser),
+            None => Session::new(store, tenant_obs),
         };
 
         let _ = self.executor.set(executor);
@@ -1793,9 +1808,10 @@ impl PgHandler {
     #[allow(dead_code)]
     pub fn new(executor: Arc<Executor>) -> Self {
         let store = executor.store();
+        let observability = executor.observability().clone();
         Self {
             executor,
-            session: Mutex::new(Session::new(store)),
+            session: Mutex::new(Session::new(store, observability)),
             copy_context: Mutex::new(None),
             query_parser: Arc::new(NoopQueryParser::new()),
         }

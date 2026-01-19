@@ -22,7 +22,7 @@ class TenantUpdate(BaseModel):
 class TenantResponseExtended(BaseModel):
     """Extended response with tenant information including metadata."""
 
-    name: str
+    id: str
     state: str
     is_deleted: bool = False
     created_at: Optional[datetime] = None
@@ -43,7 +43,7 @@ class AuditLogResponse(BaseModel):
     operation_type: str
     resource_type: str
     resource_name: str
-    tenant_name: Optional[str] = None
+    tenant_id: Optional[str] = None
     operator: Optional[str] = None
     success: bool
     error_message: Optional[str] = None
@@ -56,9 +56,9 @@ class AuditLogResponse(BaseModel):
 class AuditLogFilter(BaseModel):
     """Query parameters for filtering audit logs."""
 
-    tenant_name: Optional[str] = Field(
+    tenant_id: Optional[str] = Field(
         default=None,
-        description="Filter by tenant name"
+        description="Filter by tenant ID"
     )
     operation_type: Optional[str] = Field(
         default=None,

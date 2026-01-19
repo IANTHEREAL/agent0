@@ -2,17 +2,13 @@
 
 FROM python:3.11-slim
 
-# Install psql for database operations
-RUN apt-get update && apt-get install -y postgresql-client && rm -rf /var/lib/apt/lists/*
-
 WORKDIR /app
 
-# Install Python dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copy application code
+# Install Python dependencies (from pyproject.toml)
+COPY pyproject.toml .
+COPY uv.lock .
 COPY app/ ./app/
+RUN pip install --no-cache-dir .
 
 # Create non-root user
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app

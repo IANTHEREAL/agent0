@@ -23,12 +23,12 @@ export function TenantsPage() {
   const removeMutation = useRemoveTenant()
   const { toast } = useToast()
 
-  const handleRemove = async (name: string) => {
+  const handleRemove = async (tenantId: string) => {
     try {
-      await removeMutation.mutateAsync(name)
+      await removeMutation.mutateAsync(tenantId)
       toast({
         title: "Tenant Removed",
-        description: `Tenant "${name}" has been removed from the portal.`,
+        description: `Tenant "${tenantId}" has been removed from the portal.`,
       })
     } catch (error) {
       toast({
@@ -75,7 +75,7 @@ export function TenantsPage() {
                 <thead>
                   <tr className="border-b bg-muted/50">
                     <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">
-                      Name
+                      ID
                     </th>
                     <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">
                       Status
@@ -93,13 +93,13 @@ export function TenantsPage() {
                 </thead>
                 <tbody>
                   {tenants.map((tenant) => (
-                    <tr key={tenant.name} className="border-b last:border-0 hover:bg-muted/50">
+                    <tr key={tenant.id} className="border-b last:border-0 hover:bg-muted/50">
                       <td className="px-3 py-2.5">
                         <Link
-                          to={`/tenants/${tenant.name}`}
-                          className="text-sm font-medium hover:underline"
+                          to={`/tenants/${tenant.id}`}
+                          className="text-sm font-medium hover:underline font-mono"
                         >
-                          {tenant.name}
+                          {tenant.id}
                         </Link>
                       </td>
                       <td className="px-3 py-2.5">
@@ -162,7 +162,7 @@ export function TenantsPage() {
                             asChild
                             className="h-7 text-xs"
                           >
-                            <Link to={`/tenants/${tenant.name}`}>
+                            <Link to={`/tenants/${tenant.id}`}>
                               <Users className="w-3.5 h-3.5 mr-1" />
                               Users
                             </Link>
@@ -179,7 +179,7 @@ export function TenantsPage() {
                             variant="ghost"
                             size="sm"
                             className="h-7 w-7 p-0 text-destructive hover:text-destructive"
-                            onClick={() => setConfirmRemove(tenant.name)}
+                            onClick={() => setConfirmRemove(tenant.id)}
                           >
                             <Ban className="w-3.5 h-3.5" />
                           </Button>

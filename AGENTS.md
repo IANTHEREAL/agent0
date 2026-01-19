@@ -377,9 +377,26 @@ cd orm-tests && npm test -- --grep "TypeORM"
 | `PD_ENDPOINTS` | 127.0.0.1:2379 | TiKV PD address |
 | `PG_PORT` | 5433 | Listen port |
 | `PG_KEYSPACE` | (none) | Default TiKV keyspace |
+| `PGTIKV_OBS_ENABLED` | true | Enable in-memory observability |
+| `PGTIKV_OBS_SAMPLE_EVERY` | 1000 | Sample 1 out of N statements (plus always sample slow/errors) |
+| `PGTIKV_OBS_SLOW_MS` | 200 | Always sample statements slower than this |
+| `PGTIKV_OBS_MAX_SAMPLE_EVENTS` | 20000 | Max sampled events kept per tenant (still pruned to last 1h) |
+| `PGTIKV_OBS_MAX_SAMPLE_GROUPS` | 50 | Max grouped sampled statements returned |
+| `PGTIKV_OBS_MAX_SQL_LEN` | 512 | Max SQL length stored in samples (after normalization) |
 
 ## Child AGENTS.md
 
 - `src/sql/AGENTS.md` - SQL execution details
 - `src/protocol/AGENTS.md` - Wire protocol details
 - `src/storage/AGENTS.md` - Storage layer details
+
+## Lessons Learned (Observability v1)
+
+- Lowest-intrusion hooks: `src/sql/executor.rs` per-statement timing + `src/sql/session.rs::commit()` for TPS (actual TiKV commits).
+- Per-tenant active connections works best as a `Drop`-based guard stored in the per-connection `DynamicPgHandler` (`src/protocol/handler.rs`).
+- Expose to tooling via table functions in `src/sql/executor_join.rs` (`_pgtikv_sys_observability` / `_pgtikv_sys_query_samples`), avoiding new wire-protocol/admin endpoints.
+- Admin portal parsing constraint: avoid `|` and newlines in sampled SQL (portal parses pipe-delimited rows); normalize/truncate at sample time.
+- Portal UX/security: bootstrap a per-tenant low-privilege observability account (`_pgtikv_sys_observer`) during tenant creation and use it for metrics queries (avoid storing/typing admin password for dashboards).
+- Server-side guardrail: enforce `_pgtikv_sys_observer` can only query `_pgtikv_sys_observability()` / `_pgtikv_sys_query_samples()` in `src/sql/executor.rs`, and exclude these queries from sampling + autocommit commit counting.
+- Portal backend DB client: use `pg8000` (pure Python) with a minimal wrapper (no `psql` subprocess, no custom splitter/pool) to avoid interactive password prompts and keep the portal code easy to maintain.
+- Portal frontend: stop polling `/observability` on HTTP 409 (not bootstrapped) to avoid access-log spam; show a clear “need bootstrap” message instead.

@@ -1,7 +1,3 @@
-/**
- * User management API hooks
- */
-
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { apiRequest } from "./client"
 import type {
@@ -12,48 +8,48 @@ import type {
   MessageResponse,
 } from "@/types"
 
-export function useUsers(tenantName: string, enabled: boolean = true) {
+export function useUsers(tenantId: string, enabled: boolean = true) {
   return useQuery({
-    queryKey: ["tenants", tenantName, "users"],
-    queryFn: () => apiRequest<User[]>(`/tenants/${tenantName}/users`),
-    enabled: enabled && !!tenantName,
+    queryKey: ["tenants", tenantId, "users"],
+    queryFn: () => apiRequest<User[]>(`/tenants/${tenantId}/users`),
+    enabled: enabled && !!tenantId,
   })
 }
 
-export function useCreateUser(tenantName: string) {
+export function useCreateUser(tenantId: string) {
   const queryClient = useQueryClient()
-  
+
   return useMutation({
     mutationFn: (data: CreateUserRequest) =>
-      apiRequest<CreateUserResponse>(`/tenants/${tenantName}/users`, {
+      apiRequest<CreateUserResponse>(`/tenants/${tenantId}/users`, {
         method: "POST",
         body: JSON.stringify(data),
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["tenants", tenantName, "users"] })
+      queryClient.invalidateQueries({ queryKey: ["tenants", tenantId, "users"] })
     },
   })
 }
 
-export function useDeleteUser(tenantName: string) {
+export function useDeleteUser(tenantId: string) {
   const queryClient = useQueryClient()
-  
+
   return useMutation({
     mutationFn: (username: string) =>
-      apiRequest<MessageResponse>(`/tenants/${tenantName}/users/${username}`, {
+      apiRequest<MessageResponse>(`/tenants/${tenantId}/users/${username}`, {
         method: "DELETE",
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["tenants", tenantName, "users"] })
+      queryClient.invalidateQueries({ queryKey: ["tenants", tenantId, "users"] })
     },
   })
 }
 
-export function useResetPassword(tenantName: string) {
+export function useResetPassword(tenantId: string) {
   return useMutation({
     mutationFn: (username: string) =>
       apiRequest<PasswordResetResponse>(
-        `/tenants/${tenantName}/users/${username}/password`,
+        `/tenants/${tenantId}/users/${username}/password`,
         { method: "POST" }
       ),
   })

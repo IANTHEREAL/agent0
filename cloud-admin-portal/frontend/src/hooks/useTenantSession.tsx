@@ -1,7 +1,3 @@
-/**
- * Tenant session management hook
- */
-
 import { useState, useCallback } from "react"
 import { useConnectTenant } from "@/api/tenants"
 
@@ -11,10 +7,13 @@ interface TenantSessionState {
   expiresAt: string | null
 }
 
-export function useTenantSession(tenantName: string) {
+function sessionKey(tenantId: string) {
+  return `tenant_session:${tenantId}`
+}
+
+export function useTenantSession(tenantId: string) {
   const [state, setState] = useState<TenantSessionState>(() => {
-    // Check for existing session
-    const sessionId = sessionStorage.getItem("tenant_session")
+    const sessionId = sessionStorage.getItem(sessionKey(tenantId))
     return {
       isConnected: !!sessionId,
       sessionId,
@@ -22,7 +21,7 @@ export function useTenantSession(tenantName: string) {
     }
   })
 
-  const connectMutation = useConnectTenant(tenantName)
+  const connectMutation = useConnectTenant(tenantId)
 
   const connect = useCallback(
     async (adminUser: string, adminPassword: string) => {
@@ -30,6 +29,8 @@ export function useTenantSession(tenantName: string) {
         admin_user: adminUser,
         admin_password: adminPassword,
       })
+
+      sessionStorage.setItem(sessionKey(tenantId), result.session_id)
 
       setState({
         isConnected: true,
@@ -39,17 +40,17 @@ export function useTenantSession(tenantName: string) {
 
       return result
     },
-    [connectMutation]
+    [connectMutation, tenantId]
   )
 
   const disconnect = useCallback(() => {
-    sessionStorage.removeItem("tenant_session")
+    sessionStorage.removeItem(sessionKey(tenantId))
     setState({
       isConnected: false,
       sessionId: null,
       expiresAt: null,
     })
-  }, [])
+  }, [tenantId])
 
   return {
     ...state,

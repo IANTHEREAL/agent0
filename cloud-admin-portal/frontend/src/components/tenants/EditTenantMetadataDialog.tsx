@@ -33,7 +33,7 @@ export function EditTenantMetadataDialog({
   const [notes, setNotes] = useState("")
   const [tags, setTags] = useState("")
 
-  const mutation = useUpdateTenant(tenant?.name || "")
+  const mutation = useUpdateTenant(tenant?.id || "")
   const { toast } = useToast()
 
   // Update form when tenant changes
@@ -88,7 +88,7 @@ export function EditTenantMetadataDialog({
         <DialogHeader>
           <DialogTitle>Edit Tenant Metadata</DialogTitle>
           <DialogDescription>
-            Update notes and tags for tenant "{tenant.name}"
+            Update notes and tags for tenant "{tenant.id}"
           </DialogDescription>
         </DialogHeader>
 

@@ -614,7 +614,7 @@ describe('pg client - Window Functions', () => {
     `);
 
     expect(result.rows.length).toBe(5);
-    expect(result.rows[result.rows.length - 1].running_total).toBe(750);
+    expect(Number(result.rows[result.rows.length - 1].running_total)).toBe(750);
   });
 
   it('should support partition aggregates', async () => {
@@ -627,7 +627,7 @@ describe('pg client - Window Functions', () => {
 
     expect(result.rows.length).toBe(5);
     const eastRow = result.rows.find((r: { region: string }) => r.region === 'East');
-    expect(eastRow.region_total).toBe(180);
+    expect(Number(eastRow.region_total)).toBe(180);
   });
 });
 

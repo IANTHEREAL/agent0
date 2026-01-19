@@ -22,6 +22,7 @@ from .user import (
     PasswordResetResponse,
 )
 from .common import MessageResponse, HealthResponse, ErrorResponse, SqlQueryRequest, SqlQueryResponse
+from .observability import ObservabilitySummary, QuerySample, TenantObservabilityResponse
 
 __all__ = [
     # Auth
@@ -54,4 +55,8 @@ __all__ = [
     # SQL
     "SqlQueryRequest",
     "SqlQueryResponse",
+    # Observability
+    "ObservabilitySummary",
+    "QuerySample",
+    "TenantObservabilityResponse",
 ]

@@ -861,7 +861,16 @@ impl Executor {
         let final_rows = apply_offset_limit_fetch(final_rows, query);
 
         let result = ExecuteResult::Select {
-            column_types: None,
+            column_types: Some(
+                resolved_projection
+                    .iter()
+                    .map(|item| match item {
+                        SelectItem::UnnamedExpr(expr)
+                        | SelectItem::ExprWithAlias { expr, .. } => infer_expr_type(expr, schema),
+                        _ => DataType::Text,
+                    })
+                    .collect(),
+            ),
             columns: col_names,
             rows: final_rows,
         };
@@ -1148,7 +1157,16 @@ impl Executor {
         let final_rows = apply_offset_limit_fetch(final_rows, query);
 
         let result = ExecuteResult::Select {
-            column_types: None,
+            column_types: Some(
+                resolved_projection
+                    .iter()
+                    .map(|item| match item {
+                        SelectItem::UnnamedExpr(expr)
+                        | SelectItem::ExprWithAlias { expr, .. } => infer_expr_type(expr, schema),
+                        _ => DataType::Text,
+                    })
+                    .collect(),
+            ),
             columns: col_names,
             rows: final_rows,
         };
