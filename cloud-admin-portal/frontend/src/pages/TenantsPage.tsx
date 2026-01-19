@@ -128,7 +128,7 @@ export function TenantsPage() {
                       <td className="px-3 py-2.5">
                         <span className="text-xs text-muted-foreground">
                           {tenant.created_at
-                            ? new Date(tenant.created_at).toLocaleString()
+                            ? new Date(tenant.created_at.endsWith("Z") ? tenant.created_at : tenant.created_at + "Z").toLocaleString()
                             : "-"}
                         </span>
                       </td>
