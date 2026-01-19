@@ -3,8 +3,8 @@
  */
 
 import { useState } from "react"
-import { useParams, Link } from "react-router-dom"
-import { ArrowLeft, Key, Trash2, Copy, Check, Plus, Network, Users, Shield, LogIn, Lock, Loader2 } from "lucide-react"
+import { useParams } from "react-router-dom"
+import { Key, Trash2, Copy, Check, Plus, Network, Users, Shield, LogIn, Lock, Loader2 } from "lucide-react"
 import { useTenant } from "@/api/tenants"
 import { useUsers, useDeleteUser, useResetPassword } from "@/api/users"
 import { useTenantSession } from "@/hooks/useTenantSession"
@@ -17,7 +17,6 @@ import { cn } from "@/lib/utils"
 import { CreateUserDialog } from "@/components/users/CreateUserDialog"
 import { CredentialsModal } from "@/components/common/CredentialsModal"
 import { ConfirmDialog } from "@/components/common/ConfirmDialog"
-import { SqlEditor } from "@/components/sql/SqlEditor"
 import { TenantObservabilityCard } from "@/components/observability/TenantObservabilityCard"
 
 export function TenantDetailPage() {
@@ -149,45 +148,11 @@ export function TenantDetailPage() {
   }
 
   if (!tenant) {
-    return (
-      <div className="text-center py-12">
-        <p className="text-lg font-medium">Tenant not found</p>
-        <Button variant="link" asChild className="mt-2">
-          <Link to="/tenants">Back to tenants</Link>
-        </Button>
-      </div>
-    )
+    return null
   }
 
   return (
     <div className="space-y-4">
-      <div>
-        <Button variant="ghost" size="sm" asChild className="mb-3 h-8 text-xs">
-          <Link to="/tenants">
-            <ArrowLeft className="w-3.5 h-3.5 mr-1.5" />
-            Back to Tenants
-          </Link>
-        </Button>
-        <div className="flex items-center gap-3">
-          <h1 className="text-2xl font-semibold font-mono">t{tenantId}</h1>
-          <span
-            className={cn(
-              "inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs",
-              tenant.state === "ENABLED"
-                ? "bg-green-500/10 text-green-600"
-                : "bg-red-500/10 text-red-600"
-            )}
-          >
-            <span
-              className={cn(
-                "w-1.5 h-1.5 rounded-full",
-                tenant.state === "ENABLED" ? "bg-green-500" : "bg-red-500"
-              )}
-            />
-            {tenant.state}
-          </span>
-        </div>
-      </div>
 
       {/* Connection Endpoints */}
       <Card>
@@ -441,8 +406,6 @@ export function TenantDetailPage() {
       </Card>
 
       <TenantObservabilityCard tenantId={tenantId!} />
-
-      {isConnected && <SqlEditor tenantId={tenantId!} />}
 
       <CreateUserDialog
         tenantId={tenantId!}
