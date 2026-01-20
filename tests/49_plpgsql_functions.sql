@@ -71,6 +71,7 @@ SELECT double_it(7);
 SELECT 'The answer is: ' || get_answer()::text;
 
 -- Function in WHERE clause
+DROP TABLE IF EXISTS test_plpgsql_nums;
 CREATE TABLE test_plpgsql_nums (val integer);
 INSERT INTO test_plpgsql_nums VALUES (10), (20), (30), (40), (50);
 SELECT * FROM test_plpgsql_nums WHERE val > add_numbers(10, 15) ORDER BY val;

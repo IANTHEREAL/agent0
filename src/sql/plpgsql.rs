@@ -252,13 +252,23 @@ fn parse_statements(content: &str) -> Result<Vec<PlpgsqlStatement>> {
     while !remaining.trim().is_empty() {
         remaining = remaining.trim();
 
-        if remaining.to_uppercase().starts_with("IF ")
-            || remaining.to_uppercase().starts_with("IF\n")
+        let remaining_upper = remaining.to_uppercase();
+        if remaining_upper.starts_with("IF ")
+            || remaining_upper.starts_with("IF\n")
         {
             let (if_stmt, rest) = parse_if_statement(remaining)?;
             statements.push(if_stmt);
             remaining = rest;
             continue;
+        }
+
+        if remaining_upper.starts_with("ELSIF ")
+            || remaining_upper.starts_with("ELSIF\n")
+        {
+            let synthetic_if = format!("IF{} END IF", &remaining[5..]);
+            let (if_stmt, _rest) = parse_if_statement(&synthetic_if)?;
+            statements.push(if_stmt);
+            break;
         }
 
         if let Some(semi_pos) = find_statement_end(remaining) {
@@ -370,12 +380,17 @@ fn parse_if_statement(s: &str) -> Result<(PlpgsqlStatement, &str)> {
     ))
 }
 
+enum ElseBranchType {
+    Elsif(usize),
+    Else(usize),
+}
+
 fn find_if_blocks(s: &str) -> Result<(&str, &str, &str)> {
     let s_upper = s.to_uppercase();
     let mut depth = 1;
     let mut i = 0;
     let bytes = s_upper.as_bytes();
-    let mut else_pos: Option<usize> = None;
+    let mut else_branch: Option<ElseBranchType> = None;
     let mut end_if_pos: Option<usize> = None;
 
     while i < bytes.len() {
@@ -394,8 +409,8 @@ fn find_if_blocks(s: &str) -> Result<(&str, &str, &str)> {
             && &s_upper[i..i + 5] == "ELSIF"
             && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
         {
-            if else_pos.is_none() {
-                else_pos = Some(i);
+            if else_branch.is_none() {
+                else_branch = Some(ElseBranchType::Elsif(i));
             }
             i += 5;
             continue;
@@ -407,8 +422,8 @@ fn find_if_blocks(s: &str) -> Result<(&str, &str, &str)> {
             && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
             && (i + 4 == bytes.len() || !bytes[i + 4].is_ascii_alphanumeric())
         {
-            if else_pos.is_none() {
-                else_pos = Some(i);
+            if else_branch.is_none() {
+                else_branch = Some(ElseBranchType::Else(i));
             }
             i += 4;
             continue;
@@ -431,10 +446,14 @@ fn find_if_blocks(s: &str) -> Result<(&str, &str, &str)> {
 
     let end_if_pos = end_if_pos.ok_or_else(|| anyhow!("IF without END IF"))?;
 
-    let (then_block, else_block) = if let Some(else_p) = else_pos {
-        (&s[..else_p], &s[else_p + 4..end_if_pos])
-    } else {
-        (&s[..end_if_pos], "")
+    let (then_block, else_block) = match else_branch {
+        Some(ElseBranchType::Elsif(pos)) => {
+            let then_block = &s[..pos];
+            let elsif_rest = &s[pos..end_if_pos];
+            (then_block, elsif_rest)
+        }
+        Some(ElseBranchType::Else(pos)) => (&s[..pos], &s[pos + 4..end_if_pos]),
+        None => (&s[..end_if_pos], ""),
     };
 
     let rest_start = end_if_pos + 6;
@@ -669,9 +688,44 @@ fn substitute_variables(ctx: &PlpgsqlContext, s: &str) -> String {
             Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
             v => v.to_string(),
         };
-        result = result.replace(name, &value_str);
+        result = replace_identifier(&result, name, &value_str);
     }
     result
+}
+
+fn replace_identifier(s: &str, name: &str, replacement: &str) -> String {
+    if name.is_empty() {
+        return s.to_string();
+    }
+
+    let bytes = s.as_bytes();
+    let name_bytes = name.as_bytes();
+    let mut i = 0;
+
+    let mut result = Vec::with_capacity(bytes.len());
+    while i < bytes.len() {
+        if i + name_bytes.len() <= bytes.len()
+            && bytes[i..i + name_bytes.len()].eq_ignore_ascii_case(name_bytes)
+        {
+            let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+            let after_ok = i + name_bytes.len() == bytes.len()
+                || !is_ident_char(bytes[i + name_bytes.len()]);
+
+            if before_ok && after_ok {
+                result.extend_from_slice(replacement.as_bytes());
+                i += name_bytes.len();
+                continue;
+            }
+        }
+        result.push(bytes[i]);
+        i += 1;
+    }
+
+    String::from_utf8(result).unwrap_or_else(|_| s.to_string())
+}
+
+fn is_ident_char(b: u8) -> bool {
+    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
 }
 
 async fn evaluate_expression(
@@ -805,7 +859,7 @@ async fn execute_sql_function(
             Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
             v => v.to_string(),
         };
-        sql = sql.replace(name, &value_str);
+        sql = replace_identifier(&sql, name, &value_str);
     }
 
     let stmts = parse_sql(&sql)?;
@@ -831,4 +885,22 @@ async fn execute_sql_function(
     }
 
     Ok(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_replace_identifier_respects_word_boundaries() {
+        assert_eq!(replace_identifier("n + 1", "n", "5"), "5 + 1");
+        assert_eq!(replace_identifier("nn + n", "n", "5"), "nn + 5");
+    }
+
+    #[test]
+    fn test_replace_identifier_preserves_utf8() {
+        let input = "'你好' || n";
+        let output = replace_identifier(input, "n", "5");
+        assert_eq!(output, "'你好' || 5");
+    }
 }

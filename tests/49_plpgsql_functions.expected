@@ -11,10 +11,10 @@ check_sign
 positive
 (1 row)
 check_sign
-NULL
+negative
 (1 row)
 check_sign
-NULL
+zero
 (1 row)
 must_be_positive
 10
@@ -34,16 +34,16 @@ grade_score
 A
 (1 row)
 grade_score
-NULL
+B
 (1 row)
 grade_score
-NULL
+C
 (1 row)
 grade_score
-NULL
+D
 (1 row)
 grade_score
-NULL
+F
 (1 row)
 swap_and_sum
 10
@@ -114,8 +114,8 @@ simple_factorial
 1
 (1 row)
 simple_factorial
-NULL
+6
 (1 row)
 simple_factorial
-NULL
+120
 (1 row)

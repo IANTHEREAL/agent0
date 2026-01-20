@@ -1,0 +1,50 @@
+basic_sum
+30
+basic_product
+42
+version1
+1
+version2
+2
+version3
+3
+id|doubled
+1|20
+2|40
+3|60
+4|80
+5|100
+id|val
+3|30
+4|40
+5|50
+quad_10
+40
+greeting
+Hello, World!
+Hello, PostgreSQL!
+sql_sum
+300
+Hello SQL
+pos_check
+positive
+var_result
+start:done:1
+size_label
+large
+small
+id|dval
+3|60
+4|80
+5|100
+four_even
+t
+seven_even
+f
+5|50
+4|40
+3|30
+2|20
+1|10
+upper_greet
+HELLO, WORLD!
