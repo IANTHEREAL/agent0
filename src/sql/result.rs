@@ -70,6 +70,12 @@ pub enum ExecuteResult {
         trigger_name: String,
         table_name: String,
     },
+    CreateExtension {
+        ext_name: String,
+    },
+    DropExtension {
+        ext_name: String,
+    },
     Call,
     CreateRole,
     AlterRole,

@@ -130,6 +130,18 @@ CREATE INDEX idx_users_email ON users (email);
 SHOW TABLES;
 ```
 
+## Extensions (HTTP)
+
+pg-tikv supports built-in extensions that can be enabled per-tenant. The `http` extension provides Supabase-style HTTP table functions under the `extensions` schema:
+
+```sql
+-- Requires SUPERUSER
+CREATE EXTENSION http;
+
+SELECT status, content_type, content
+FROM extensions.http_get('https://example.com');
+```
+
 ## Using Transactions
 
 ```sql
@@ -170,6 +182,7 @@ pg_restore -h 127.0.0.1 -p 5433 -U admin -d postgres \
 ## Next Steps
 
 - [SQL Reference](./sql-reference.md) - Complete SQL syntax reference
+- [Extensions](./extensions.md) - Built-in extensions and the HTTP extension
 - [Multi-Tenancy](./multi-tenancy.md) - Keyspace isolation and routing
 - [Authentication](./authentication.md) - User management and RBAC
 - [Configuration](./configuration.md) - Environment variables and options

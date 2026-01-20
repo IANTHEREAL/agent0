@@ -39,7 +39,7 @@ A DATABASE FOR AI BY AI
 
 | Category | Features |
 |----------|----------|
-| **DDL** | `CREATE TABLE`, `DROP TABLE`, `TRUNCATE`, `ALTER TABLE`, `CREATE INDEX`, `CREATE VIEW`, `DROP VIEW`, `CREATE MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, `CREATE SCHEMA`, `DROP SCHEMA`, `CREATE SEQUENCE`, `DROP SEQUENCE`, `CREATE TYPE`, `DROP TYPE`, `SHOW TABLES` |
+| **DDL** | `CREATE TABLE`, `DROP TABLE`, `TRUNCATE`, `ALTER TABLE`, `CREATE INDEX`, `CREATE VIEW`, `DROP VIEW`, `CREATE MATERIALIZED VIEW`, `DROP MATERIALIZED VIEW`, `REFRESH MATERIALIZED VIEW`, `CREATE SCHEMA`, `DROP SCHEMA`, `CREATE SEQUENCE`, `DROP SEQUENCE`, `CREATE TYPE`, `DROP TYPE`, `CREATE EXTENSION`, `DROP EXTENSION`, `SHOW TABLES` |
 | **DML** | `INSERT`, `UPDATE`, `DELETE` with `RETURNING`, `SELECT` with full `WHERE` support |
 | **Queries** | `ORDER BY`, `LIMIT`, `OFFSET`, `DISTINCT`, `GROUP BY`, `HAVING`, `WITH ... AS` (CTEs), `WITH RECURSIVE` (Recursive CTEs) |
 | **Joins** | `INNER JOIN`, `LEFT JOIN`, `RIGHT JOIN`, `FULL OUTER JOIN`, `CROSS JOIN`, `NATURAL JOIN` |
@@ -88,6 +88,21 @@ nextval, currval, setval
 -- Other
 COALESCE, NULLIF, GREATEST, LEAST, gen_random_uuid()
 ```
+
+### Extensions
+
+pg-tikv supports built-in extensions (compiled into the server binary) that can be enabled per-tenant:
+
+```sql
+-- Requires SUPERUSER
+CREATE EXTENSION http;
+
+-- Supabase-style table functions under the `extensions` schema
+SELECT status, content_type, content
+FROM extensions.http_get('https://example.com');
+```
+
+See `docs/extensions.md` for details and security restrictions.
 
 ## Quick Start
 

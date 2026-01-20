@@ -4,6 +4,7 @@ use crate::types::{
     DataType, FunctionDef, Row, SequenceBacking, SequenceDef, SequenceState, TableSchema,
     TriggerDef, UserTypeDef, Value, ViewDef,
 };
+use crate::extensions::InstalledExtension;
 use anyhow::{anyhow, Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -167,7 +168,7 @@ impl TikvStore {
     }
 
     fn is_builtin_schema(schema: &str) -> bool {
-        matches!(schema, "public" | "pg_catalog" | "information_schema")
+        matches!(schema, "public" | "pg_catalog" | "information_schema" | "extensions")
     }
 
     pub async fn schema_exists(&self, txn: &mut Transaction, schema: &str) -> Result<bool> {
@@ -221,6 +222,7 @@ impl TikvStore {
         oids.insert("public".to_string(), 2200);
         oids.insert("information_schema".to_string(), 13222);
         oids.insert("pg_catalog".to_string(), 11);
+        oids.insert("extensions".to_string(), 2201);
 
         for pair in pairs {
             let key: &[u8] = pair.key().as_ref().into();
@@ -382,6 +384,7 @@ impl TikvStore {
             "public".to_string(),
             "information_schema".to_string(),
             "pg_catalog".to_string(),
+            "extensions".to_string(),
         ];
         for pair in pairs {
             let key: &[u8] = pair.key().as_ref().into();
@@ -395,6 +398,60 @@ impl TikvStore {
         schemas.sort();
         schemas.dedup();
         Ok(schemas)
+    }
+
+    pub async fn get_extension(
+        &self,
+        txn: &mut Transaction,
+        ext_name: &str,
+    ) -> Result<Option<InstalledExtension>> {
+        let key = self.key(&encode_extension_key(ext_name));
+        match txn.get(key).await? {
+            Some(data) => Ok(Some(
+                bincode::deserialize(&data).context("Failed to deserialize extension")?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn put_extension(&self, txn: &mut Transaction, ext: &InstalledExtension) -> Result<()> {
+        let key = self.key(&encode_extension_key(&ext.name));
+        let data = bincode::serialize(ext).context("Failed to serialize extension")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
+    pub async fn drop_extension(&self, txn: &mut Transaction, ext_name: &str) -> Result<bool> {
+        let key = self.key(&encode_extension_key(ext_name));
+        let existed = txn.get(key.clone()).await?.is_some();
+        if !existed {
+            return Ok(false);
+        }
+
+        txn_delete(txn, key).await?;
+        let cfg_key = self.key(&encode_extension_config_key(ext_name));
+        let _ = txn_delete(txn, cfg_key).await;
+        Ok(true)
+    }
+
+    pub async fn list_extensions(&self, txn: &mut Transaction) -> Result<Vec<InstalledExtension>> {
+        let prefix = encode_extension_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut exts = Vec::new();
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let ext: InstalledExtension =
+                bincode::deserialize(pair.value()).context("Failed to deserialize extension")?;
+            exts.push(ext);
+        }
+        Ok(exts)
     }
 
     pub async fn next_schema_oid(&self, txn: &mut Transaction) -> Result<u32> {

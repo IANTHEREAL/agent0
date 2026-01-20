@@ -113,6 +113,28 @@ DROP VIEW view_name;
 DROP VIEW IF EXISTS view_name;
 ```
 
+### CREATE EXTENSION
+
+```sql
+CREATE EXTENSION extname;
+CREATE EXTENSION IF NOT EXISTS extname;
+```
+
+Notes:
+- Extensions are built-in (compiled into the server binary) and are enabled per-tenant.
+- Only SUPERUSER can run `CREATE EXTENSION`.
+- Currently supported: `http` (see `docs/extensions.md`).
+
+### DROP EXTENSION
+
+```sql
+DROP EXTENSION extname;
+DROP EXTENSION IF EXISTS extname;
+```
+
+Notes:
+- Only SUPERUSER can run `DROP EXTENSION`.
+
 ## DML Statements
 
 ### INSERT

@@ -1,4 +1,5 @@
 mod auth;
+mod extensions;
 mod observability;
 mod pool;
 mod protocol;

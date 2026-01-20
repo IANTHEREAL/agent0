@@ -7,6 +7,7 @@ mod executor;
 mod executor_cte;
 mod executor_ddl_ops;
 mod executor_dml_ops;
+mod executor_extensions;
 mod executor_functions_triggers;
 mod executor_join;
 mod executor_procedure;

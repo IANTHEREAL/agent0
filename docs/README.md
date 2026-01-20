@@ -6,6 +6,7 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
 
 - [Quick Start](./quickstart.md)
 - [SQL Reference](./sql-reference.md)
+- [Extensions](./extensions.md)
 - [Multi-Tenancy](./multi-tenancy.md)
 - [Authentication & RBAC](./authentication.md)
 - [Configuration](./configuration.md)

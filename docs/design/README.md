@@ -25,7 +25,7 @@
 
 ## P2/P3（非迁移硬依赖，按需增强）
 
+- `docs/design/17_extensions_framework_http.md`：扩展机制 + HTTP 扩展（Supabase 风格）
 - `docs/design/16_set_returning_functions.md`：generate_series / unnest（FROM 子句）
 - `docs/design/15_explain_analyze.md`：EXPLAIN ANALYZE
 - `docs/design/13_listen_notify.md`：LISTEN/NOTIFY
-

@@ -29,6 +29,7 @@ pub fn is_information_schema_table(table_name: &str) -> bool {
                 | "pg_attribute"
                 | "pg_namespace"
                 | "pg_proc"
+                | "pg_extension"
                 | "pg_trigger"
                 | "pg_description"
                 | "pg_constraint"
@@ -68,6 +69,7 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
             "pg_attribute" => "pg_attribute",
             "pg_namespace" => "pg_namespace",
             "pg_proc" => "pg_proc",
+            "pg_extension" => "pg_extension",
             "pg_trigger" => "pg_trigger",
             "pg_description" => "pg_description",
             "pg_constraint" => "pg_constraint",
@@ -89,6 +91,7 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
         "pg_attribute" => Some("pg_attribute"),
         "pg_namespace" => Some("pg_namespace"),
         "pg_proc" => Some("pg_proc"),
+        "pg_extension" => Some("pg_extension"),
         "pg_trigger" => Some("pg_trigger"),
         "pg_description" => Some("pg_description"),
         "pg_constraint" => Some("pg_constraint"),
@@ -156,6 +159,18 @@ fn int_array_col(name: &str) -> ColumnDef {
     ColumnDef {
         name: name.to_string(),
         data_type: DataType::Array(Box::new(DataType::Int64)),
+        nullable: true,
+        primary_key: false,
+        unique: false,
+        is_serial: false,
+        default_expr: None,
+    }
+}
+
+fn text_array_col(name: &str) -> ColumnDef {
+    ColumnDef {
+        name: name.to_string(),
+        data_type: DataType::Array(Box::new(DataType::Text)),
         nullable: true,
         primary_key: false,
         unique: false,
@@ -553,6 +568,28 @@ fn pg_proc_schema() -> TableSchema {
     }
 }
 
+fn pg_extension_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_extension".to_string(),
+        columns: vec![
+            int_col("oid"),
+            text_col("extname"),
+            int_col("extowner"),
+            int_col("extnamespace"),
+            bool_col("extrelocatable"),
+            text_col("extversion"),
+            int_array_col("extconfig"),
+            text_array_col("extcondition"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+    }
+}
+
 fn pg_trigger_schema() -> TableSchema {
     TableSchema {
         table_id: 0,
@@ -775,6 +812,7 @@ pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
         "pg_attribute" => Some(pg_attribute_schema()),
         "pg_namespace" => Some(pg_namespace_schema()),
         "pg_proc" => Some(pg_proc_schema()),
+        "pg_extension" => Some(pg_extension_schema()),
         "pg_trigger" => Some(pg_trigger_schema()),
         "pg_description" => Some(pg_description_schema()),
         "pg_constraint" => Some(pg_constraint_schema()),
@@ -924,6 +962,7 @@ pub async fn get_information_schema_data(
         "pg_index" => get_pg_index_rows(store, txn, &user_tables, &schema_oids).await?,
         "pg_attribute" => get_pg_attribute_rows(store, txn, &user_tables).await?,
         "pg_proc" => get_pg_proc_rows(store, txn, &schema_oids).await?,
+        "pg_extension" => get_pg_extension_rows(store, txn, &schema_oids).await?,
         "pg_trigger" => get_pg_trigger_rows(store, txn, &user_tables).await?,
         "pg_description" => get_pg_description_rows(),
         "pg_constraint" => get_pg_constraint_rows(store, txn, &user_tables, &schema_oids).await?,
@@ -2225,6 +2264,7 @@ async fn get_pg_proc_rows(
     schema_oids: &HashMap<String, u32>,
 ) -> Result<Vec<Row>> {
     let pg_catalog_oid = schema_oid(schema_oids, "pg_catalog");
+    let extensions_oid = schema_oid(schema_oids, crate::extensions::EXTENSIONS_SCHEMA);
 
     let mut funcs = store.list_functions(txn).await?;
     funcs.sort_by_key(|f| f.oid);
@@ -2253,6 +2293,27 @@ async fn get_pg_proc_rows(
             int_val(prorettype),
             text_val("f"),
         ]));
+    }
+
+    if let Some(ext) = store.get_extension(txn, "http").await? {
+        if ext.enabled {
+            for (oid, name) in [
+                (1101_i64, "http_get"),
+                (1102_i64, "http_post"),
+                (1103_i64, "http_put"),
+                (1104_i64, "http_delete"),
+                (1105_i64, "http_head"),
+            ] {
+                rows.push(Row::new(vec![
+                    int_val(oid),
+                    text_val(name),
+                    int_val(extensions_oid),
+                    int_val(10),
+                    int_val(25),
+                    text_val("f"),
+                ]));
+            }
+        }
     }
 
     for f in funcs {
@@ -2295,6 +2356,36 @@ async fn get_pg_proc_rows(
             int_val(10),
             int_val(prorettype),
             text_val("f"),
+        ]));
+    }
+
+    Ok(rows)
+}
+
+async fn get_pg_extension_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    schema_oids: &HashMap<String, u32>,
+) -> Result<Vec<Row>> {
+    let mut exts = store.list_extensions(txn).await?;
+    exts.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut rows = Vec::new();
+    for ext in exts {
+        let oid = crate::extensions::descriptor(&ext.name)
+            .map(|d| d.oid)
+            .unwrap_or(0);
+        let namespace_oid = schema_oid(schema_oids, &ext.schema);
+
+        rows.push(Row::new(vec![
+            int_val(oid),
+            text_val(&ext.name),
+            int_val(10),
+            int_val(namespace_oid),
+            Value::Boolean(false),
+            text_val(&ext.version),
+            null_val(),
+            null_val(),
         ]));
     }
 

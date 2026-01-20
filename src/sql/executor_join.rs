@@ -594,6 +594,21 @@ impl Executor {
                         }
                     }
 
+                    if let Some(func_args) = args {
+                        if let Some((schema, rows)) = self
+                            .try_execute_extension_table_function(
+                                txn,
+                                search_path,
+                                name,
+                                func_args,
+                                alias.as_ref(),
+                            )
+                            .await?
+                        {
+                            return Ok((als, schema, rows));
+                        }
+                    }
+
                     let is_scalar_function = matches!(
                         tbl_upper.as_str(),
                         "CURRENT_SCHEMA"
@@ -601,7 +616,8 @@ impl Executor {
                             | "CURRENT_USER"
                             | "SESSION_USER"
                             | "USER"
-                    ) || args.is_some();
+                    );
+
                     let table_name = if is_scalar_function {
                         format!("{}()", obj_name)
                     } else {
@@ -842,86 +858,15 @@ impl Executor {
         select: &sqlparser::ast::Select,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
-        let (base_alias, base_schema, base_rows) = match &select.from[0].relation {
-            TableFactor::Table {
-                name, alias, args, ..
-            } => {
-                let (schema_opt, obj_name) = names::split_object_name(name)?;
-                let als = alias
-                    .as_ref()
-                    .map(|a| a.name.value.clone())
-                    .unwrap_or_else(|| obj_name.clone());
-
-                let tbl_upper = obj_name.to_uppercase();
-
-                // Handle GENERATE_SERIES as a table-valued function
-                if tbl_upper == "GENERATE_SERIES" {
-                    if let Some(func_args) = args {
-                        let (schema, rows) = self
-                            .execute_generate_series(func_args, &als, alias.as_ref())
-                            .await?;
-                        (als, schema, rows)
-                    } else {
-                        return Err(anyhow!("generate_series requires at least 2 arguments"));
-                    }
-                } else {
-                    let is_scalar_function = matches!(
-                        tbl_upper.as_str(),
-                        "CURRENT_SCHEMA"
-                            | "CURRENT_DATABASE"
-                            | "CURRENT_USER"
-                            | "SESSION_USER"
-                            | "USER"
-                    ) || args.is_some();
-
-                    let table_name = if is_scalar_function {
-                        format!("{}()", obj_name)
-                    } else {
-                        match schema_opt {
-                            Some(schema) => format!("{}.{}", schema, obj_name),
-                            None => obj_name,
-                        }
-                    };
-
-                    let (schema, rows) = self
-                        .get_table_data(txn, sequence_values, search_path, &table_name, ctes)
-                        .await?;
-                    (als, schema, rows)
-                }
-            }
-            TableFactor::Derived {
-                subquery, alias, ..
-            } => {
-                let alias_name = alias
-                    .as_ref()
-                    .map(|a| a.name.value.clone())
-                    .unwrap_or_else(|| "subquery".to_string());
-                let alias_columns = alias.as_ref().map(|a| a.columns.as_slice()).unwrap_or(&[]);
-                let (schema, rows) = self
-                    .execute_derived_table(
-                        txn,
-                        sequence_values,
-                        search_path,
-                        subquery,
-                        &alias_name,
-                        alias_columns,
-                        ctes,
-                    )
-                    .await?;
-                (alias_name, schema, rows)
-            }
-            TableFactor::NestedJoin { .. } => {
-                self.resolve_table_factor(
-                    txn,
-                    sequence_values,
-                    search_path,
-                    &select.from[0].relation,
-                    ctes,
-                )
-                .await?
-            }
-            _ => return Err(anyhow!("Unsupported base table")),
-        };
+        let (base_alias, base_schema, base_rows) = self
+            .resolve_table_factor(
+                txn,
+                sequence_values,
+                search_path,
+                &select.from[0].relation,
+                ctes,
+            )
+            .await?;
 
         let mut combined_schemas: Vec<(String, TableSchema)> =
             vec![(base_alias.clone(), base_schema.clone())];

@@ -187,6 +187,22 @@ impl Executor {
             };
 
             if !is_observability_user {
+                if starts_with("CREATE EXTENSION") {
+                    let start = Instant::now();
+                    let res = self.execute_create_extension_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
+                if starts_with("DROP EXTENSION") {
+                    let start = Instant::now();
+                    let res = self.execute_drop_extension_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
                 if starts_with("CREATE OR REPLACE FUNCTION") || starts_with("CREATE FUNCTION") {
                     let start = Instant::now();
                     let res = self.execute_create_function_cmd(session, sql).await;
@@ -367,146 +383,160 @@ impl Executor {
                     }
                 }
                 let start = Instant::now();
-                let stmt_exec: Result<Vec<ExecuteResult>> = match stmt {
-                    // Transaction Control
-                    Statement::StartTransaction { .. } => {
-                        session.begin().await?;
-                        Ok(vec![ExecuteResult::Empty])
-                    }
-                    Statement::Commit { .. } => {
-                        session.commit().await?;
-                        Ok(vec![ExecuteResult::Empty])
-                    }
-                    Statement::Savepoint { name } => {
-                        session.create_savepoint(normalize_ident(name))?;
-                        Ok(vec![ExecuteResult::Empty])
-                    }
-                    Statement::ReleaseSavepoint { name } => {
-                        let sp = normalize_ident(name);
-                        session.release_savepoint(&sp)?;
-                        Ok(vec![ExecuteResult::Empty])
-                    }
-                    Statement::Rollback {
-                        savepoint: Some(name),
-                        ..
-                    } => {
-                        let sp = normalize_ident(name);
-                        session.rollback_to_savepoint(&sp).await?;
-                        Ok(vec![ExecuteResult::Empty])
-                    }
-                    Statement::Rollback {
-                        savepoint: None, ..
-                    } => {
-                        session.rollback().await?;
-                        Ok(vec![ExecuteResult::Empty])
-                    }
-                    Statement::SetVariable {
-                        variable, value, ..
-                    } => {
-                        let var_name = variable
-                            .0
-                            .iter()
-                            .map(normalize_ident)
-                            .collect::<Vec<_>>()
-                            .join(".")
-                            .to_lowercase();
-                        if var_name == "search_path" {
-                            let mut new_search_path = Vec::new();
-                            for expr in value {
-                                match expr {
-                                    Expr::Identifier(ident) => {
-                                        new_search_path.push(normalize_ident(ident));
-                                    }
-                                    Expr::CompoundIdentifier(idents) if idents.len() == 1 => {
-                                        new_search_path.push(normalize_ident(&idents[0]));
-                                    }
-                                    Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
-                                        for token in s.split(',') {
-                                            let token = token.trim();
-                                            if token.is_empty() {
-                                                continue;
+                let is_superuser = session.is_superuser();
+                let stmt_exec: Result<Vec<ExecuteResult>> =
+                    crate::extensions::context::with_context(is_superuser, async {
+                        match stmt {
+                            // Transaction Control
+                            Statement::StartTransaction { .. } => {
+                                session.begin().await?;
+                                Ok(vec![ExecuteResult::Empty])
+                            }
+                            Statement::Commit { .. } => {
+                                session.commit().await?;
+                                Ok(vec![ExecuteResult::Empty])
+                            }
+                            Statement::Savepoint { name } => {
+                                session.create_savepoint(normalize_ident(name))?;
+                                Ok(vec![ExecuteResult::Empty])
+                            }
+                            Statement::ReleaseSavepoint { name } => {
+                                let sp = normalize_ident(name);
+                                session.release_savepoint(&sp)?;
+                                Ok(vec![ExecuteResult::Empty])
+                            }
+                            Statement::Rollback {
+                                savepoint: Some(name),
+                                ..
+                            } => {
+                                let sp = normalize_ident(name);
+                                session.rollback_to_savepoint(&sp).await?;
+                                Ok(vec![ExecuteResult::Empty])
+                            }
+                            Statement::Rollback {
+                                savepoint: None, ..
+                            } => {
+                                session.rollback().await?;
+                                Ok(vec![ExecuteResult::Empty])
+                            }
+                            Statement::SetVariable {
+                                variable, value, ..
+                            } => {
+                                let var_name = variable
+                                    .0
+                                    .iter()
+                                    .map(normalize_ident)
+                                    .collect::<Vec<_>>()
+                                    .join(".")
+                                    .to_lowercase();
+                                if var_name == "search_path" {
+                                    let mut new_search_path = Vec::new();
+                                    for expr in value {
+                                        match expr {
+                                            Expr::Identifier(ident) => {
+                                                new_search_path.push(normalize_ident(ident));
                                             }
-                                            let schema = if token.starts_with('"')
-                                                && token.ends_with('"')
-                                                && token.len() >= 2
-                                            {
-                                                token[1..token.len() - 1].to_string()
-                                            } else {
-                                                token.to_lowercase()
-                                            };
-                                            new_search_path.push(schema);
+                                            Expr::CompoundIdentifier(idents) if idents.len() == 1 => {
+                                                new_search_path.push(normalize_ident(&idents[0]));
+                                            }
+                                            Expr::Value(sqlparser::ast::Value::SingleQuotedString(
+                                                s,
+                                            )) => {
+                                                for token in s.split(',') {
+                                                    let token = token.trim();
+                                                    if token.is_empty() {
+                                                        continue;
+                                                    }
+                                                    let schema = if token.starts_with('"')
+                                                        && token.ends_with('"')
+                                                        && token.len() >= 2
+                                                    {
+                                                        token[1..token.len() - 1].to_string()
+                                                    } else {
+                                                        token.to_lowercase()
+                                                    };
+                                                    new_search_path.push(schema);
+                                                }
+                                            }
+                                            _ => {
+                                                return Err(anyhow!(
+                                                    "Unsupported search_path value: {}",
+                                                    expr
+                                                ));
+                                            }
                                         }
                                     }
-                                    _ => {
-                                        return Err(anyhow!(
-                                            "Unsupported search_path value: {}",
-                                            expr
-                                        ));
+
+                                    new_search_path.retain(|s| !s.is_empty() && s != "$user");
+                                    if new_search_path.len() == 1
+                                        && new_search_path[0] == "default"
+                                    {
+                                        new_search_path = vec!["public".to_string()];
+                                    }
+                                    for schema in &new_search_path {
+                                        if schema.contains('.') {
+                                            return Err(anyhow!(
+                                                "schema name '{}' must not contain '.'",
+                                                schema
+                                            ));
+                                        }
+                                    }
+                                    if new_search_path.is_empty() {
+                                        new_search_path.push("public".to_string());
+                                    }
+                                    session.set_search_path(new_search_path);
+                                }
+                                Ok(vec![ExecuteResult::Empty])
+                            }
+                            // DDL/DML - delegated to session transaction management
+                            _ => {
+                                let is_autocommit = !session.is_in_transaction();
+
+                                if is_autocommit {
+                                    session.begin().await?;
+                                }
+
+                                let res = async {
+                                    let (txn, sequence_values, search_path) = session
+                                        .get_mut_txn_sequence_values_and_search_path()
+                                        .expect("Transaction must be active");
+                                    let notices = self
+                                        .collect_notices_before_statement(txn, search_path, stmt)
+                                        .await?;
+                                    let result = self
+                                        .execute_statement_on_txn(
+                                            txn,
+                                            sequence_values,
+                                            search_path,
+                                            stmt,
+                                        )
+                                        .await?;
+                                    Ok::<(Vec<ExecuteResult>, ExecuteResult), anyhow::Error>((
+                                        notices, result,
+                                    ))
+                                }
+                                .await;
+
+                                if is_autocommit {
+                                    if res.is_ok() {
+                                        if is_observability_query {
+                                            session.rollback().await?;
+                                        } else {
+                                            session.commit().await?;
+                                        }
+                                    } else {
+                                        session.rollback().await?;
                                     }
                                 }
-                            }
 
-                            new_search_path.retain(|s| !s.is_empty() && s != "$user");
-                            if new_search_path.len() == 1 && new_search_path[0] == "default" {
-                                new_search_path = vec!["public".to_string()];
-                            }
-                            for schema in &new_search_path {
-                                if schema.contains('.') {
-                                    return Err(anyhow!(
-                                        "schema name '{}' must not contain '.'",
-                                        schema
-                                    ));
-                                }
-                            }
-                            if new_search_path.is_empty() {
-                                new_search_path.push("public".to_string());
-                            }
-                            session.set_search_path(new_search_path);
-                        }
-                        Ok(vec![ExecuteResult::Empty])
-                    }
-                    // DDL/DML - delegated to session transaction management
-                    _ => {
-                        let is_autocommit = !session.is_in_transaction();
-
-                        if is_autocommit {
-                            session.begin().await?;
-                        }
-
-                        let res = async {
-                            let (txn, sequence_values, search_path) = session
-                                .get_mut_txn_sequence_values_and_search_path()
-                                .expect("Transaction must be active");
-                            let notices = self
-                                .collect_notices_before_statement(txn, search_path, stmt)
-                                .await?;
-                            let result = self
-                                .execute_statement_on_txn(txn, sequence_values, search_path, stmt)
-                                .await?;
-                            Ok::<(Vec<ExecuteResult>, ExecuteResult), anyhow::Error>((
-                                notices, result,
-                            ))
-                        }
-                        .await;
-
-                        if is_autocommit {
-                            if res.is_ok() {
-                                if is_observability_query {
-                                    session.rollback().await?;
-                                } else {
-                                    session.commit().await?;
-                                }
-                            } else {
-                                session.rollback().await?;
+                                let (notices, result) = res?;
+                                let mut stmt_results = notices;
+                                stmt_results.push(result);
+                                Ok(stmt_results)
                             }
                         }
-
-                        let (notices, result) = res?;
-                        let mut stmt_results = notices;
-                        stmt_results.push(result);
-                        Ok(stmt_results)
-                    }
-                };
+                    })
+                    .await;
 
                 if !is_observability_query {
                     self.observability

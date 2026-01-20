@@ -1,0 +1,10 @@
+extname|extversion
+http|1.0.0
+(1 row)
+proname
+http_delete
+http_get
+http_head
+http_post
+http_put
+(5 rows)

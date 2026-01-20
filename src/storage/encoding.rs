@@ -4,6 +4,8 @@
 //! - `_sys_next_table_id` -> u64 (auto-incrementing table ID)
 //! - `_sys_schema_{table_name}` -> TableSchema (serialized)
 //! - `_sys_schemadef_{schema_name}` -> u32 schema OID (big-endian)
+//! - `_sys_ext_{extname}` -> InstalledExtension (bincode)
+//! - `_sys_extcfg_{extname}` -> ExtensionConfig (reserved, bincode/json)
 //! - `t_{table_id}_{row_key}` -> Row (serialized)
 //! - `i_{table_id}_{index_id}_{index_values}` -> PK (Unique Index)
 //! - `i_{table_id}_{index_id}_{index_values}_{pk}` -> Empty (Non-Unique Index)
@@ -32,6 +34,8 @@ const SYS_FUNCTION_PREFIX: &[u8] = b"_sys_func_";
 const SYS_TRIGGER_PREFIX: &[u8] = b"_sys_trigger_";
 const SYS_TYPE_PREFIX: &[u8] = b"_sys_type_";
 const SYS_SEQUENCE_PREFIX: &[u8] = b"_sys_seqdef_";
+const SYS_EXTENSION_PREFIX: &[u8] = b"_sys_ext_";
+const SYS_EXTENSIONCFG_PREFIX: &[u8] = b"_sys_extcfg_";
 const TABLE_DATA_PREFIX: &[u8] = b"t_";
 const TABLE_INDEX_PREFIX: &[u8] = b"i_";
 
@@ -111,6 +115,24 @@ pub fn encode_sequence_key(full_name: &str) -> Vec<u8> {
 
 pub fn encode_sequence_prefix() -> Vec<u8> {
     SYS_SEQUENCE_PREFIX.to_vec()
+}
+
+/// Encode the key for an installed extension.
+pub fn encode_extension_key(ext_name: &str) -> Vec<u8> {
+    let mut key = SYS_EXTENSION_PREFIX.to_vec();
+    key.extend_from_slice(ext_name.as_bytes());
+    key
+}
+
+pub fn encode_extension_prefix() -> Vec<u8> {
+    SYS_EXTENSION_PREFIX.to_vec()
+}
+
+/// Encode the key for an extension config blob.
+pub fn encode_extension_config_key(ext_name: &str) -> Vec<u8> {
+    let mut key = SYS_EXTENSIONCFG_PREFIX.to_vec();
+    key.extend_from_slice(ext_name.as_bytes());
+    key
 }
 
 pub fn encode_view_key(view_name: &str) -> Vec<u8> {
@@ -586,6 +608,15 @@ mod tests {
         let pk = encode_pk_values(&[Value::Int32(42)]);
         let key = encode_data_key(1, &pk);
         assert!(key.starts_with(b"t_"));
+    }
+
+    #[test]
+    fn test_encode_extension_keys() {
+        let key = encode_extension_key("http");
+        assert_eq!(key, b"_sys_ext_http".to_vec());
+
+        let cfg_key = encode_extension_config_key("http");
+        assert_eq!(cfg_key, b"_sys_extcfg_http".to_vec());
     }
 
     #[test]
