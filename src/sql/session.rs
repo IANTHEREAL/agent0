@@ -24,10 +24,12 @@ pub struct Session {
     current_user: Option<String>,
     #[allow(dead_code)]
     is_superuser: bool,
+    /// Connection ID for pg_backend_pid() support
+    connection_id: i32,
 }
 
 impl Session {
-    pub fn new(store: Arc<TikvStore>, observability: Arc<TenantObservability>) -> Self {
+    pub fn new(store: Arc<TikvStore>, observability: Arc<TenantObservability>, connection_id: i32) -> Self {
         Self {
             store,
             observability,
@@ -37,6 +39,7 @@ impl Session {
             search_path: vec!["public".to_string()],
             current_user: None,
             is_superuser: false,
+            connection_id,
         }
     }
 
@@ -45,6 +48,7 @@ impl Session {
         observability: Arc<TenantObservability>,
         username: String,
         is_superuser: bool,
+        connection_id: i32,
     ) -> Self {
         Self {
             store,
@@ -55,6 +59,7 @@ impl Session {
             search_path: vec!["public".to_string()],
             current_user: Some(username),
             is_superuser,
+            connection_id,
         }
     }
 
@@ -77,6 +82,10 @@ impl Session {
     pub fn set_user(&mut self, username: String, is_superuser: bool) {
         self.current_user = Some(username);
         self.is_superuser = is_superuser;
+    }
+
+    pub fn connection_id(&self) -> i32 {
+        self.connection_id
     }
 
     /// Check if currently in a transaction block

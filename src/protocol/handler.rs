@@ -677,8 +677,8 @@ impl DynamicPgHandler {
         ));
 
         let session = match username {
-            Some(user) => Session::new_with_user(store, tenant_obs, user, is_superuser),
-            None => Session::new(store, tenant_obs),
+            Some(user) => Session::new_with_user(store, tenant_obs, user, is_superuser, self.connection_id),
+            None => Session::new(store, tenant_obs, self.connection_id),
         };
 
         let _ = self.executor.set(executor);
@@ -1791,6 +1791,7 @@ pub struct PgHandler {
     session: Mutex<Session>,
     copy_context: Mutex<Option<CopyContext>>,
     query_parser: Arc<NoopQueryParser>,
+    connection_id: i32,
 }
 
 impl PgHandler {
@@ -1798,11 +1799,13 @@ impl PgHandler {
     pub fn new(executor: Arc<Executor>) -> Self {
         let store = executor.store();
         let observability = executor.observability().clone();
+        let connection_id = CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         Self {
             executor,
-            session: Mutex::new(Session::new(store, observability)),
+            session: Mutex::new(Session::new(store, observability, connection_id)),
             copy_context: Mutex::new(None),
             query_parser: Arc::new(NoopQueryParser::new()),
+            connection_id,
         }
     }
 
