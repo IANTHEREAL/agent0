@@ -5,6 +5,8 @@ from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
+from .endpoint import Endpoint
+
 
 class TenantUpdate(BaseModel):
     """Request body for updating tenant metadata."""
@@ -24,6 +26,10 @@ class TenantResponseExtended(BaseModel):
 
     id: str
     state: str
+    endpoints: List[Endpoint] = Field(
+        default_factory=list,
+        description="List of available pg-tikv endpoints for client connections"
+    )
     is_deleted: bool = False
     created_at: Optional[datetime] = None
     created_by: Optional[str] = None
