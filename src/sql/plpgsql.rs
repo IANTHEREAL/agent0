@@ -701,9 +701,33 @@ fn replace_identifier(s: &str, name: &str, replacement: &str) -> String {
     let bytes = s.as_bytes();
     let name_bytes = name.as_bytes();
     let mut i = 0;
+    let mut in_string = false;
 
     let mut result = Vec::with_capacity(bytes.len());
     while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if in_string {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    result.push(bytes[i]);
+                    result.push(bytes[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            } else {
+                in_string = true;
+            }
+            result.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+
+        if in_string {
+            result.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+
         if i + name_bytes.len() <= bytes.len()
             && bytes[i..i + name_bytes.len()].eq_ignore_ascii_case(name_bytes)
         {
@@ -902,5 +926,21 @@ mod tests {
         let input = "'你好' || n";
         let output = replace_identifier(input, "n", "5");
         assert_eq!(output, "'你好' || 5");
+    }
+
+    #[test]
+    fn test_replace_identifier_skips_string_literals() {
+        assert_eq!(
+            replace_identifier("'negative' || n", "n", "5"),
+            "'negative' || 5"
+        );
+        assert_eq!(
+            replace_identifier("CASE WHEN n < 0 THEN 'negative' END", "n", "-5"),
+            "CASE WHEN -5 < 0 THEN 'negative' END"
+        );
+        assert_eq!(
+            replace_identifier("'it''s a test' || n", "n", "5"),
+            "'it''s a test' || 5"
+        );
     }
 }

@@ -1,0 +1,95 @@
+valid_result
+10
+ok_result
+OK
+both_pos
+both positive
+a_pos
+a positive, b non-positive
+b_pos
+a non-positive, b positive
+both_neg
+both non-positive
+very_high
+very high
+high
+high
+medium_high
+medium high
+low
+low
+multi_result
+11,22,33
+chain_result
+9
+swapped
+swapped: 20, 10
+int_text
+Number: 42
+float_int
+4
+bool_yes
+yes
+bool_no
+no
+not_null
+not null: 5
+is_null
+is null
+first
+10
+second
+20
+zero
+0
+null_return
+var_str
+The number n is: 42
+similar_vars
+n=1, nn=11
+boundaries
+x=5, xx=10, xxx=15
+underscore_result
+val=7, doubled=14
+complex_expr
+91
+concat_str
+Hello World!
+sql_expr
+30
+sql_pos
+positive
+sql_neg
+negative
+sql_zero
+zero
+sql_val
+10
+sql_null
+0
+both_true
+t
+one_false
+f
+both_false
+f
+one_true
+t
+none_true
+f
+not_false
+t
+not_true
+f
+arith_result
+22,12,85,3,2
+eq
+equal
+gt
+greater
+lt
+less
+in_range
+in range
+out_range
+out of range
