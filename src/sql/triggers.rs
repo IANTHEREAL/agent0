@@ -12,14 +12,12 @@ pub async fn apply_before_triggers(
     txn: &mut Transaction,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
-    table_full_name: &str,
+    triggers: &[TriggerDef],
     schema: &TableSchema,
     event: &str,
     new_row: Row,
     old_row: Option<&Row>,
 ) -> Result<Option<Row>> {
-    let triggers = store.list_triggers_for_table(txn, table_full_name).await?;
-
     let before_triggers: Vec<&TriggerDef> = triggers
         .iter()
         .filter(|t| {

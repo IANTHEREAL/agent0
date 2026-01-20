@@ -260,6 +260,342 @@ impl Executor {
                 .collect();
             return Ok((schema, rows));
         }
+
+        if t_upper == "_PGTIKV_SYS_TRIGGER_QUEUE_STATS"
+            || t_upper.ends_with("._PGTIKV_SYS_TRIGGER_QUEUE_STATS")
+        {
+            use super::trigger_queue::{encode_trigger_dlq_prefix, encode_trigger_queue_prefix};
+            use super::trigger_queue::{now_ms_i64, EventStatus, TriggerEvent};
+            use std::ops::Bound;
+            use tikv_client::BoundRange;
+
+            let now_ms = now_ms_i64();
+            let cutoff_recent_ms = now_ms.saturating_sub(60_000);
+
+            let mut pending = 0i64;
+            let mut processing = 0i64;
+            let mut failed = 0i64;
+            let mut latency_sum_ms: u64 = 0;
+            let mut latency_cnt: u64 = 0;
+            let mut events_last_min = 0i64;
+
+            let prefix = encode_trigger_queue_prefix();
+            let mut end = prefix.clone();
+            end.push(0xFF);
+
+            let mut start: Option<Vec<u8>> = None;
+            loop {
+                let range: BoundRange = match start.as_ref() {
+                    None => (prefix.clone()..end.clone()).into(),
+                    Some(last) => BoundRange::new(
+                        Bound::Excluded(last.clone().into()),
+                        Bound::Excluded(end.clone().into()),
+                    ),
+                };
+
+                let mut batch_last = None;
+                let mut scanned = 0usize;
+                for pair in txn.scan(range, 256).await? {
+                    scanned += 1;
+                    let key_slice: &[u8] = pair.key().as_ref().into();
+                    let key_vec = key_slice.to_vec();
+                    batch_last = Some(key_vec);
+
+                    let ev: TriggerEvent = match bincode::deserialize(pair.value()) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    match ev.status {
+                        EventStatus::Pending => pending += 1,
+                        EventStatus::Processing => processing += 1,
+                        EventStatus::Failed => failed += 1,
+                        EventStatus::Done => {}
+                    }
+
+                    if now_ms >= ev.created_at_ms {
+                        latency_sum_ms += (now_ms - ev.created_at_ms) as u64;
+                        latency_cnt += 1;
+                    }
+
+                    // `id >> 22` is the event timestamp in ms.
+                    if (ev.id >> 22) as i64 >= cutoff_recent_ms {
+                        events_last_min += 1;
+                    }
+                }
+
+                if scanned < 256 {
+                    break;
+                }
+                start = batch_last;
+                if start.is_none() {
+                    break;
+                }
+            }
+
+            // DLQ count (keys only; values not needed).
+            let dlq_prefix = encode_trigger_dlq_prefix();
+            let mut dlq_end = dlq_prefix.clone();
+            dlq_end.push(0xFF);
+            let mut dlq_count = 0i64;
+            let mut dlq_start: Option<Vec<u8>> = None;
+            loop {
+                let range: BoundRange = match dlq_start.as_ref() {
+                    None => (dlq_prefix.clone()..dlq_end.clone()).into(),
+                    Some(last) => BoundRange::new(
+                        Bound::Excluded(last.clone().into()),
+                        Bound::Excluded(dlq_end.clone().into()),
+                    ),
+                };
+
+                let mut batch_last = None;
+                let mut scanned = 0usize;
+                for pair in txn.scan(range, 256).await? {
+                    scanned += 1;
+                    let key_slice: &[u8] = pair.key().as_ref().into();
+                    let key_vec = key_slice.to_vec();
+                    batch_last = Some(key_vec);
+                    dlq_count += 1;
+                }
+
+                if scanned < 256 {
+                    break;
+                }
+                dlq_start = batch_last;
+                if dlq_start.is_none() {
+                    break;
+                }
+            }
+
+            let avg_latency_ms = if latency_cnt == 0 {
+                0.0
+            } else {
+                (latency_sum_ms as f64) / (latency_cnt as f64)
+            };
+
+            let schema = TableSchema {
+                table_id: 0,
+                name: table_name.to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "keyspace".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "pending".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "processing".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "failed".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "dlq_count".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "avg_latency_ms".to_string(),
+                        data_type: DataType::Float64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "events_per_min".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                ],
+                pk_indices: vec![],
+                indexes: vec![],
+                version: 1,
+                check_constraints: vec![],
+                foreign_keys: vec![],
+            };
+
+            let row = Row::new(vec![
+                Value::Text(self.tenant_keyspace().to_string()),
+                Value::Int64(pending),
+                Value::Int64(processing),
+                Value::Int64(failed),
+                Value::Int64(dlq_count),
+                Value::Float64(avg_latency_ms),
+                Value::Int64(events_last_min),
+            ]);
+            return Ok((schema, vec![row]));
+        }
+
+        if t_upper == "_PGTIKV_SYS_TRIGGER_DLQ" || t_upper.ends_with("._PGTIKV_SYS_TRIGGER_DLQ") {
+            use super::trigger_queue::{encode_trigger_dlq_prefix, TriggerEvent, TriggerOp};
+            use std::ops::Bound;
+            use tikv_client::BoundRange;
+
+            let prefix = encode_trigger_dlq_prefix();
+            let mut end = prefix.clone();
+            end.push(0xFF);
+
+            let mut rows = Vec::new();
+            let mut start: Option<Vec<u8>> = None;
+            loop {
+                let range: BoundRange = match start.as_ref() {
+                    None => (prefix.clone()..end.clone()).into(),
+                    Some(last) => BoundRange::new(
+                        Bound::Excluded(last.clone().into()),
+                        Bound::Excluded(end.clone().into()),
+                    ),
+                };
+
+                let mut batch_last = None;
+                let mut scanned = 0usize;
+                for pair in txn.scan(range, 256).await? {
+                    scanned += 1;
+                    let key_slice: &[u8] = pair.key().as_ref().into();
+                    let key_vec = key_slice.to_vec();
+                    batch_last = Some(key_vec);
+
+                    let ev: TriggerEvent = match bincode::deserialize(pair.value()) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    let op = match ev.operation {
+                        TriggerOp::Insert => "INSERT",
+                        TriggerOp::Update => "UPDATE",
+                        TriggerOp::Delete => "DELETE",
+                    };
+
+                    rows.push(Row::new(vec![
+                        Value::Int64(i64::try_from(ev.id).unwrap_or(i64::MAX)),
+                        Value::Text(ev.trigger_name),
+                        Value::Text(ev.table_name),
+                        Value::Text(op.to_string()),
+                        ev.error_msg.map(Value::Text).unwrap_or(Value::Null),
+                        Value::Int64(i64::from(ev.retry_count)),
+                        Value::Int64(ev.created_at_ms),
+                    ]));
+                }
+
+                if scanned < 256 {
+                    break;
+                }
+                start = batch_last;
+                if start.is_none() {
+                    break;
+                }
+            }
+
+            let schema = TableSchema {
+                table_id: 0,
+                name: table_name.to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "id".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "trigger_name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "table_name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "operation".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "error_msg".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "retry_count".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "created_at_ms".to_string(),
+                        data_type: DataType::Int64,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                ],
+                pk_indices: vec![],
+                indexes: vec![],
+                version: 1,
+                check_constraints: vec![],
+                foreign_keys: vec![],
+            };
+
+            return Ok((schema, rows));
+        }
         if matches!(
             t_upper.as_str(),
             "CURRENT_SCHEMA" | "CURRENT_DATABASE" | "CURRENT_USER" | "SESSION_USER" | "USER"

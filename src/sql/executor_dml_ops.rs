@@ -5,6 +5,8 @@ use super::executor::Executor;
 use super::expr::JoinContext;
 use super::helpers::normalize_ident;
 use super::names;
+use super::trigger_queue::TriggerOp;
+use super::trigger_worker;
 use super::triggers;
 use super::ExecuteResult;
 use crate::types::{Row, TableSchema, Value};
@@ -97,6 +99,7 @@ impl Executor {
             .await?
             .ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, &schema).await?;
+        let trigger_defs = self.store().list_triggers_for_table(txn, &t).await?;
         let source = source
             .as_ref()
             .ok_or_else(|| anyhow!("INSERT requires VALUES"))?;
@@ -174,7 +177,7 @@ impl Executor {
                 txn,
                 sequence_values,
                 search_path,
-                &t,
+                &trigger_defs,
                 &schema,
                 "INSERT",
                 row,
@@ -197,6 +200,16 @@ impl Executor {
             )
             .await?;
             if let Some(final_row) = result {
+                trigger_worker::enqueue_after_triggers(
+                    txn,
+                    self.tenant_keyspace(),
+                    &t,
+                    TriggerOp::Insert,
+                    None,
+                    Some(&final_row),
+                    &trigger_defs,
+                )
+                .await?;
                 affected += 1;
                 if let Some(ret_row) = dml::eval_returning_row(
                     &self.store(),
@@ -263,6 +276,7 @@ impl Executor {
             .get_schema(txn, &t)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
+        let trigger_defs = self.store().list_triggers_for_table(txn, &t).await?;
         if schema.pk_indices.is_empty() {
             return Err(anyhow!("No PK"));
         }
@@ -387,6 +401,16 @@ impl Executor {
                 ret_rows.push(ret_row);
             }
             dml::execute_delete_row(&self.store(), txn, &t, &schema, &r).await?;
+            trigger_worker::enqueue_after_triggers(
+                txn,
+                self.tenant_keyspace(),
+                &t,
+                TriggerOp::Delete,
+                Some(&r),
+                None,
+                &trigger_defs,
+            )
+            .await?;
             cnt += 1;
         }
 
@@ -436,6 +460,7 @@ impl Executor {
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, &schema).await?;
+        let trigger_defs = self.store().list_triggers_for_table(txn, &t).await?;
         if schema.pk_indices.is_empty() {
             return Err(anyhow!("No PK"));
         }
@@ -607,7 +632,7 @@ impl Executor {
                 txn,
                 sequence_values,
                 search_path,
-                &t,
+                &trigger_defs,
                 &schema,
                 "UPDATE",
                 new_row,
@@ -622,6 +647,17 @@ impl Executor {
             let updated_row =
                 dml::execute_update_row(&self.store(), txn, &t, &schema, r, new_row, &enum_cache)
                     .await?;
+
+            trigger_worker::enqueue_after_triggers(
+                txn,
+                self.tenant_keyspace(),
+                &t,
+                TriggerOp::Update,
+                Some(r),
+                Some(&updated_row),
+                &trigger_defs,
+            )
+            .await?;
 
             if let Some(ret_row) = dml::eval_returning_row(
                 &self.store(),

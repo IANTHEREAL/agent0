@@ -18,6 +18,7 @@ use crate::observability::TenantObservability;
 use crate::storage::TikvStore;
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
+use rust_decimal::prelude::ToPrimitive;
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, SetOperator, SetQuantifier,
     Statement, TableFactor, Visit, Visitor,
@@ -1088,6 +1089,60 @@ impl Executor {
             }
         }
 
+        async fn try_pg_sleep(
+            store: &Arc<TikvStore>,
+            txn: &mut Transaction,
+            sequence_values: &mut HashMap<String, i64>,
+            search_path: &[String],
+            expr: &Expr,
+        ) -> Result<Option<Value>> {
+            let Expr::Function(f) = expr else {
+                return Ok(None);
+            };
+            let Some(name) = f.name.0.last() else {
+                return Ok(None);
+            };
+            if !name.value.eq_ignore_ascii_case("pg_sleep") {
+                return Ok(None);
+            }
+
+            let arg_expr = f.args.first().and_then(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                _ => None,
+            });
+            let seconds_val = if let Some(arg_expr) = arg_expr {
+                sequences::eval_expr_with_sequences(
+                    store,
+                    txn,
+                    sequence_values,
+                    search_path,
+                    arg_expr,
+                    None,
+                    None,
+                )
+                .await?
+            } else {
+                Value::Float64(0.0)
+            };
+
+            let seconds = match seconds_val {
+                Value::Int32(n) => n as f64,
+                Value::Int64(n) => n as f64,
+                Value::Float64(f) => f,
+                Value::Numeric(d) => d.to_f64().unwrap_or(0.0),
+                Value::Text(s) => s.parse::<f64>().unwrap_or(0.0),
+                _ => 0.0,
+            }
+            .max(0.0);
+
+            if seconds > 0.0 {
+                tokio::time::sleep(Duration::from_secs_f64(seconds)).await;
+            }
+
+            // Match PostgreSQL's void-like output: an empty field.
+            Ok(Some(Value::Text(String::new())))
+        }
+
         let resolved_projection = self
             .resolve_projection_subqueries(txn, sequence_values, search_path, &select.projection, ctes)
             .await?;
@@ -1100,6 +1155,12 @@ impl Executor {
             match item {
                 SelectItem::UnnamedExpr(expr) => {
                     cols.push(get_expr_name(expr));
+                    if let Some(val) =
+                        try_pg_sleep(&self.store, txn, sequence_values, search_path, expr).await?
+                    {
+                        values.push(val);
+                        continue;
+                    }
                     if let Some(kind) = srf_kind(expr) {
                         let Expr::Function(f) = expr else {
                             values.push(Value::Null);
@@ -1352,6 +1413,12 @@ impl Executor {
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     cols.push(alias.value.clone());
+                    if let Some(val) =
+                        try_pg_sleep(&self.store, txn, sequence_values, search_path, expr).await?
+                    {
+                        values.push(val);
+                        continue;
+                    }
                     if let Some(kind) = srf_kind(expr) {
                         let Expr::Function(f) = expr else {
                             values.push(Value::Null);

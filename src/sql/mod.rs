@@ -28,6 +28,8 @@ mod rbac;
 mod result;
 mod sequences;
 mod triggers;
+mod trigger_queue;
+pub(crate) mod trigger_worker;
 mod udt;
 mod window;
 

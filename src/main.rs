@@ -152,6 +152,9 @@ async fn main() -> Result<()> {
 
     info!("TiKV connection verified");
 
+    // Background async AFTER-trigger queue worker (enabled by default).
+    sql::trigger_worker::spawn_trigger_worker(client_pool.clone());
+
     let addr = format!("0.0.0.0:{}", pg_port);
     let listener = TcpListener::bind(&addr).await?;
     info!("PostgreSQL server listening on {}", addr);
