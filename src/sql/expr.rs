@@ -4,8 +4,23 @@ use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Context, Result};
 use rust_decimal::Decimal;
 use sqlparser::ast::{BinaryOperator, Expr, JsonOperator, Value as SqlValue};
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::str::FromStr;
+
+// Thread-local storage for connection_id used by pg_backend_pid()
+thread_local! {
+    static CONNECTION_ID: Cell<i32> = const { Cell::new(0) };
+}
+
+/// Set the connection_id for the current thread (call before query execution)
+pub fn set_connection_id(id: i32) {
+    CONNECTION_ID.with(|c| c.set(id));
+}
+
+fn get_connection_id() -> i32 {
+    CONNECTION_ID.with(|c| c.get())
+}
 
 pub struct JoinContext<'a> {
     #[allow(dead_code)]
@@ -1986,7 +2001,10 @@ fn eval_function(
         "MD5" => match args.into_iter().next() {
             Some(Value::Text(s)) => Ok(Value::Text(format!("{:x}", md5::compute(s.as_bytes())))),
             Some(Value::Null) => Ok(Value::Null),
-            Some(v) => Ok(Value::Text(format!("{:x}", md5::compute(v.to_string().as_bytes())))),
+            Some(v) => Ok(Value::Text(format!(
+                "{:x}",
+                md5::compute(v.to_string().as_bytes())
+            ))),
             None => Ok(Value::Null),
         },
         "ENCODE" => {
@@ -2004,7 +2022,9 @@ fn eval_function(
                 Some(v) => v.to_string().to_lowercase(),
             };
             match fmt.as_str() {
-                "base64" => Ok(Value::Text(base64::engine::general_purpose::STANDARD.encode(data))),
+                "base64" => Ok(Value::Text(
+                    base64::engine::general_purpose::STANDARD.encode(data),
+                )),
                 "hex" => Ok(Value::Text(hex::encode(data))),
                 other => Err(anyhow!("unsupported encoding format: {}", other)),
             }
@@ -2516,9 +2536,7 @@ fn eval_function(
             let days = crate::types::date::naive_date_to_days(today)?;
             Ok(Value::Date(days))
         }
-        "DATE_TRUNC" => {
-            eval_date_trunc_from_args(args)
-        }
+        "DATE_TRUNC" => eval_date_trunc_from_args(args),
         "DATE" => {
             let days = match args.into_iter().next() {
                 Some(Value::Date(days)) => days,
@@ -2538,9 +2556,7 @@ fn eval_function(
             };
             Ok(Value::Date(days))
         }
-        "TO_CHAR" => {
-            eval_to_char_from_args(args)
-        }
+        "TO_CHAR" => eval_to_char_from_args(args),
         "AGE" => {
             use chrono::{Datelike, TimeZone, Utc};
             use std::time::{SystemTime, UNIX_EPOCH};
@@ -2611,7 +2627,7 @@ fn eval_function(
         )),
         "SET_CONFIG" => Ok(Value::Text(String::new())),
         "PG_IS_IN_RECOVERY" => Ok(Value::Boolean(false)),
-        "PG_BACKEND_PID" => Ok(Value::Int32(std::process::id() as i32)),
+        "PG_BACKEND_PID" => Ok(Value::Int32(get_connection_id())),
         "VERSION" => Ok(Value::Text(
             "PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit".to_string(),
         )),
@@ -3165,9 +3181,9 @@ fn eval_function(
             }
 
             if func.args.len() == 1 {
-                if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-                    expr,
-                )) = &func.args[0]
+                if let sqlparser::ast::FunctionArg::Unnamed(
+                    sqlparser::ast::FunctionArgExpr::Expr(expr),
+                ) = &func.args[0]
                 {
                     if let Some(obj) = eval_row_object(expr, row, schema)? {
                         return Ok(Value::Jsonb(obj.to_string()));
@@ -3662,9 +3678,9 @@ fn eval_function(
             }
 
             if func.args.len() == 1 {
-                if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
-                    expr,
-                )) = &func.args[0]
+                if let sqlparser::ast::FunctionArg::Unnamed(
+                    sqlparser::ast::FunctionArgExpr::Expr(expr),
+                ) = &func.args[0]
                 {
                     if let Some(obj) = eval_row_object(expr, row, schema)? {
                         return Ok(Value::Json(obj.to_string()));
@@ -3905,8 +3921,9 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                         Value::Bytes(_) => Ok(v),
                         Value::Text(s) => {
                             if let Some(rest) = s.strip_prefix("\\x") {
-                                let bytes = hex::decode(rest)
-                                    .map_err(|e| anyhow!("invalid input syntax for type bytea: {}", e))?;
+                                let bytes = hex::decode(rest).map_err(|e| {
+                                    anyhow!("invalid input syntax for type bytea: {}", e)
+                                })?;
                                 Ok(Value::Bytes(bytes))
                             } else {
                                 Ok(Value::Bytes(s.into_bytes()))
@@ -4186,9 +4203,11 @@ fn eval_value(v: &SqlValue) -> Result<Value> {
                 }
             }
         }
-        SqlValue::HexStringLiteral(s) => Ok(Value::Bytes(
-            hex::decode(s).map_err(|e| anyhow!("Invalid hex string literal: {}", e))?,
-        )),
+        SqlValue::HexStringLiteral(s) => {
+            Ok(Value::Bytes(hex::decode(s).map_err(|e| {
+                anyhow!("Invalid hex string literal: {}", e)
+            })?))
+        }
         SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => {
             // Try parsing as vector if starts with [
             if s.starts_with('[') && s.ends_with(']') {
@@ -4223,8 +4242,7 @@ fn quote_literal_impl(s: &str) -> String {
 }
 
 fn quote_ident_impl(ident: &str) -> String {
-    let needs_quote =
-        ident.is_empty() || !is_simple_unquoted_ident(ident) || is_sql_keyword(ident);
+    let needs_quote = ident.is_empty() || !is_simple_unquoted_ident(ident) || is_sql_keyword(ident);
     if needs_quote {
         format!("\"{}\"", ident.replace('"', "\"\""))
     } else {
@@ -4961,7 +4979,12 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
             other => return other,
         }
 
-        for (l, r) in left.as_bytes().iter().copied().zip(right.as_bytes().iter().copied()) {
+        for (l, r) in left
+            .as_bytes()
+            .iter()
+            .copied()
+            .zip(right.as_bytes().iter().copied())
+        {
             if l == r {
                 continue;
             }
@@ -5496,7 +5519,10 @@ fn json_path_from_value(path: &Value) -> Result<Vec<String>> {
             .collect()),
         Value::Text(s) => parse_pg_text_array_literal(s),
         Value::Null => Ok(Vec::new()),
-        other => Err(anyhow!("JSON path must be text[] or array literal, got {:?}", other)),
+        other => Err(anyhow!(
+            "JSON path must be text[] or array literal, got {:?}",
+            other
+        )),
     }
 }
 
@@ -5534,11 +5560,7 @@ fn json_delete_path(current: &mut serde_json::Value, path: &[String]) -> bool {
             serde_json::Value::Object(obj) => obj.remove(key).is_some(),
             serde_json::Value::Array(arr) => {
                 if let Ok(idx) = key.parse::<i64>() {
-                    let idx = if idx < 0 {
-                        arr.len() as i64 + idx
-                    } else {
-                        idx
-                    };
+                    let idx = if idx < 0 { arr.len() as i64 + idx } else { idx };
                     if idx >= 0 && (idx as usize) < arr.len() {
                         arr.remove(idx as usize);
                         return true;
@@ -5559,11 +5581,7 @@ fn json_delete_path(current: &mut serde_json::Value, path: &[String]) -> bool {
                 let Ok(idx) = key.parse::<i64>() else {
                     return false;
                 };
-                let idx = if idx < 0 {
-                    arr.len() as i64 + idx
-                } else {
-                    idx
-                };
+                let idx = if idx < 0 { arr.len() as i64 + idx } else { idx };
                 if idx >= 0 && (idx as usize) < arr.len() {
                     json_delete_path(&mut arr[idx as usize], &path[1..])
                 } else {
@@ -6143,7 +6161,12 @@ mod tests {
             Value::Text("2024-01".to_string())
         );
         assert_eq!(
-            eval_expr(&parse_expr("TO_CHAR(DATE '2024-01-15', 'YYYY-MM')"), None, None).unwrap(),
+            eval_expr(
+                &parse_expr("TO_CHAR(DATE '2024-01-15', 'YYYY-MM')"),
+                None,
+                None
+            )
+            .unwrap(),
             Value::Text("2024-01".to_string())
         );
         assert_eq!(

@@ -1,6 +1,7 @@
 use crate::auth::AuthManager;
 use crate::observability;
 use crate::pool::TikvClientPool;
+use crate::sql::expr::set_connection_id;
 use crate::sql::{ExecuteResult, Executor, Session};
 use crate::storage::TikvStore;
 use crate::types::{DataType, Value};
@@ -1144,6 +1145,8 @@ impl SimpleQueryHandler for DynamicPgHandler {
             )))
         })?;
 
+        set_connection_id(session.connection_id());
+
         match executor.execute(session, query).await {
             Ok(results) => {
                 let mut responses: Vec<Response<'a>> = Vec::new();
@@ -1368,6 +1371,8 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                 "Session not initialized".to_string(),
             )))
         })?;
+
+        set_connection_id(session.connection_id());
 
         match executor.execute(session, &final_query).await {
             Ok(results) => result_to_response(results.last()),
@@ -2049,6 +2054,8 @@ impl SimpleQueryHandler for PgHandler {
 
         let mut session = self.session.lock().await;
 
+        set_connection_id(session.connection_id());
+
         match self.executor.execute(&mut session, query).await {
             Ok(results) => {
                 let mut responses: Vec<Response<'a>> = Vec::new();
@@ -2256,6 +2263,9 @@ impl ExtendedQueryHandler for PgHandler {
         debug!("Final query after substitution: {}", final_query);
 
         let mut session = self.session.lock().await;
+
+        set_connection_id(session.connection_id());
+
         match self.executor.execute(&mut session, &final_query).await {
             Ok(results) => result_to_response(results.last()),
             Err(e) => {

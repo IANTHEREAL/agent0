@@ -15,7 +15,7 @@ mod executor_select;
 mod executor_subquery;
 mod executor_udt_cmd;
 mod explain;
-mod expr;
+pub mod expr;
 mod helpers;
 mod index_helpers;
 mod information_schema;
