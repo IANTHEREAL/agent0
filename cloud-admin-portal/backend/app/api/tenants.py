@@ -186,7 +186,7 @@ async def create_tenant(
 
 @router.get(
     "/{tenant_id}",
-    response_model=TenantResponse,
+    response_model=TenantResponseExtended,
     summary="Get tenant details",
 )
 async def get_tenant(
@@ -215,10 +215,16 @@ async def get_tenant(
         for i, (host, port) in enumerate(endpoint_tuples)
     ]
 
-    return TenantResponse(
+    return TenantResponseExtended(
         id=tenant_id,
         state=ks.get("state", "ENABLED") if isinstance(ks, dict) else "ENABLED",
         endpoints=endpoints,
+        is_deleted=tenant.is_deleted,
+        created_at=tenant.created_at,
+        created_by=tenant.created_by,
+        notes=tenant.notes,
+        tags=tenant.tags,
+        updated_at=tenant.updated_at,
     )
 
 
