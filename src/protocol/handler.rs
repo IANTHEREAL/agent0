@@ -675,7 +675,7 @@ impl DynamicPgHandler {
         let mut session_guard = self.session.lock().await;
         *session_guard = Some(session);
 
-        info!(
+        debug!(
             "Initialized executor with keyspace: {:?}",
             effective_keyspace
         );
@@ -958,12 +958,12 @@ impl StartupHandler for DynamicPgHandler {
                         client
                             .metadata_mut()
                             .insert(METADATA_KEYSPACE.to_string(), ks.clone());
-                        info!("Extracted keyspace '{}' from username '{}'", ks, raw_user);
+                        debug!("Extracted keyspace '{}' from username '{}'", ks, raw_user);
                     }
                     client
                         .metadata_mut()
                         .insert(METADATA_ACTUAL_USER.to_string(), actual_user.clone());
-                    info!("Actual user: {}", actual_user);
+                    debug!("Actual user: {}", actual_user);
                 }
 
                 client.set_state(PgWireConnectionState::AuthenticationInProgress);
@@ -1014,7 +1014,7 @@ impl StartupHandler for DynamicPgHandler {
                                 &PgServerParameterProvider,
                             )
                             .await?;
-                            info!(
+                            debug!(
                                 "Authentication successful for user '{}' with keyspace {:?}",
                                 actual_user, keyspace
                             );
@@ -1064,13 +1064,12 @@ impl SimpleQueryHandler for DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        info!("Received query: {}", query);
-        info!("==== BINARY VERSION: 2026-01-09-11:20 UTC ====");
+        debug!("Received query: {}", query);
 
         let executor = self.get_executor()?;
 
         if let Some((table_name, columns)) = Self::parse_copy_to_command(query) {
-            info!(
+            debug!(
                 "COPY TO STDOUT: table={}, columns={:?}",
                 table_name, columns
             );
@@ -1080,7 +1079,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
         }
 
         if let Some((table_name, columns)) = Self::parse_copy_command(query) {
-            info!(
+            debug!(
                 "COPY FROM STDIN: table={}, columns={:?}",
                 table_name, columns
             );
@@ -1194,12 +1193,6 @@ impl CopyHandler for DynamicPgHandler {
         };
 
         let row_count = if let Some(ctx) = ctx_opt {
-            info!(
-                "COPY done for table {}, processing {} data chunks",
-                ctx.table_name,
-                ctx.data_buffer.len()
-            );
-
             let mut session_guard = self.session.lock().await;
             let session = session_guard.as_mut().ok_or_else(|| {
                 PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -1260,23 +1253,12 @@ impl CopyHandler for DynamicPgHandler {
             let data_str = String::from_utf8_lossy(&all_data);
             let lines: Vec<&str> = data_str.lines().filter(|l| !l.is_empty()).collect();
 
-            info!(
-                "Processing {} rows for COPY into {}",
-                lines.len(),
-                ctx.table_name
-            );
-
             let mut count = 0usize;
 
             for line in lines {
                 let values: Vec<&str> = line.split('\t').collect();
 
                 if values.len() != columns.len() {
-                    warn!(
-                        "COPY row has {} values but expected {} columns, skipping",
-                        values.len(),
-                        columns.len()
-                    );
                     continue;
                 }
 
@@ -1309,10 +1291,6 @@ impl CopyHandler for DynamicPgHandler {
                 count += 1;
             }
 
-            info!(
-                "COPY completed: {} rows inserted into {}",
-                count, ctx.table_name
-            );
             count
         } else {
             0
@@ -1366,10 +1344,10 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     {
         let executor = self.get_executor()?;
         let query = &portal.statement.statement;
-        info!("Extended query: {}", query);
+        debug!("Extended query: {}", query);
 
         let final_query = substitute_parameters(query, portal);
-        info!("Final query after substitution: {}", final_query);
+        debug!("Final query after substitution: {}", final_query);
 
         let mut session_guard = self.session.lock().await;
         let session = session_guard.as_mut().ok_or_else(|| {
@@ -2012,10 +1990,10 @@ impl SimpleQueryHandler for PgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        info!("Received query: {}", query);
+        debug!("Received query: {}", query);
 
         if let Some((table_name, columns)) = Self::parse_copy_command(query) {
-            info!(
+            debug!(
                 "COPY command detected: table={}, columns={:?}",
                 table_name, columns
             );
@@ -2115,12 +2093,6 @@ impl CopyHandler for PgHandler {
         };
 
         let row_count = if let Some(ctx) = ctx_opt {
-            info!(
-                "COPY done for table {}, processing {} data chunks",
-                ctx.table_name,
-                ctx.data_buffer.len()
-            );
-
             let mut session = self.session.lock().await;
             session.begin().await.map_err(|e| {
                 PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -2173,23 +2145,12 @@ impl CopyHandler for PgHandler {
             let data_str = String::from_utf8_lossy(&all_data);
             let lines: Vec<&str> = data_str.lines().filter(|l| !l.is_empty()).collect();
 
-            info!(
-                "Processing {} rows for COPY into {}",
-                lines.len(),
-                ctx.table_name
-            );
-
             let mut count = 0usize;
 
             for line in lines {
                 let values: Vec<&str> = line.split('\t').collect();
 
                 if values.len() != columns.len() {
-                    warn!(
-                        "COPY row has {} values but expected {} columns, skipping",
-                        values.len(),
-                        columns.len()
-                    );
                     continue;
                 }
 
@@ -2223,10 +2184,6 @@ impl CopyHandler for PgHandler {
                 count += 1;
             }
 
-            info!(
-                "COPY completed: {} rows inserted into {}",
-                count, ctx.table_name
-            );
             count
         } else {
             0

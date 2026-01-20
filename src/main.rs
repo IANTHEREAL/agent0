@@ -160,8 +160,7 @@ async fn main() -> Result<()> {
     );
 
     loop {
-        let (socket, peer_addr) = listener.accept().await?;
-        info!("New connection from {}", peer_addr);
+        let (socket, _peer_addr) = listener.accept().await?;
 
         let tls_acceptor = tls_acceptor.clone();
         let client_pool = client_pool.clone();
@@ -173,7 +172,6 @@ async fn main() -> Result<()> {
             if let Err(e) = process_socket(socket, tls_acceptor, factory).await {
                 tracing::error!("Connection error: {}", e);
             }
-            info!("Connection closed: {}", peer_addr);
         });
     }
 }
