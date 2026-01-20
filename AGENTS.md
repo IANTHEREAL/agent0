@@ -377,6 +377,7 @@ cd orm-tests && npm test -- --grep "TypeORM"
 | `PD_ENDPOINTS` | 127.0.0.1:2379 | TiKV PD address |
 | `PG_PORT` | 5433 | Listen port |
 | `PG_KEYSPACE` | (none) | Default TiKV keyspace |
+| `PGTIKV_HTTP_ALLOW_INSECURE` | false | Allow HTTP extension to make insecure http:// requests (port 80) |
 | `PGTIKV_OBS_ENABLED` | true | Enable in-memory observability |
 | `PGTIKV_OBS_SAMPLE_EVERY` | 1000 | Sample 1 out of N statements (plus always sample slow/errors) |
 | `PGTIKV_OBS_SLOW_MS` | 200 | Always sample statements slower than this |

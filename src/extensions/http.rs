@@ -13,6 +13,18 @@ use std::time::Duration;
 use tokio::net::lookup_host;
 use tokio::sync::Semaphore;
 
+/// Check if insecure HTTP (non-HTTPS) requests are allowed.
+/// Controlled by `PGTIKV_HTTP_ALLOW_INSECURE` environment variable.
+/// Default: false (only HTTPS allowed).
+fn allow_insecure_http() -> bool {
+    static ALLOW_INSECURE: OnceLock<bool> = OnceLock::new();
+    *ALLOW_INSECURE.get_or_init(|| {
+        std::env::var("PGTIKV_HTTP_ALLOW_INSECURE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
 const MAX_REQUESTS_PER_STATEMENT: u32 = 5;
 const MAX_INFLIGHT_REQUESTS_PER_TENANT_PER_NODE: usize = 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -171,8 +183,18 @@ fn is_ip_forbidden(ip: IpAddr) -> bool {
 }
 
 async fn validate_url(url: &Url) -> Result<()> {
-    if url.scheme() != "https" {
-        return Err(anyhow!("http: only https scheme is allowed"));
+    let scheme = url.scheme();
+    let is_https = scheme == "https";
+    let is_http = scheme == "http";
+
+    if !is_https && !is_http {
+        return Err(anyhow!("http: only http and https schemes are allowed"));
+    }
+
+    if is_http && !allow_insecure_http() {
+        return Err(anyhow!(
+            "http: insecure http requests are disabled (set PGTIKV_HTTP_ALLOW_INSECURE=true to enable)"
+        ));
     }
 
     if !url.username().is_empty() || url.password().is_some() {
@@ -182,8 +204,14 @@ async fn validate_url(url: &Url) -> Result<()> {
     let port = url
         .port_or_known_default()
         .ok_or_else(|| anyhow!("http: url port is missing"))?;
-    if port != 443 {
-        return Err(anyhow!("http: only port 443 is allowed"));
+
+    let default_port = if is_https { 443 } else { 80 };
+    if port != default_port {
+        return Err(anyhow!(
+            "http: only port {} is allowed for {} scheme",
+            default_port,
+            scheme
+        ));
     }
 
     let host = url
@@ -392,5 +420,57 @@ mod tests {
         assert!(is_ip_forbidden(
             "::ffff:127.0.0.1".parse::<IpAddr>().unwrap()
         ));
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_https_allowed() {
+        let url = Url::parse("https://example.com/api").unwrap();
+        assert!(validate_url(&url).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_https_port_443_only() {
+        let url = Url::parse("https://example.com:8443/api").unwrap();
+        let result = validate_url(&url).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("only port 443"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_http_blocked_by_default() {
+        let url = Url::parse("http://example.com/api").unwrap();
+        let result = validate_url(&url).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("insecure http requests are disabled"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_invalid_scheme() {
+        let url = Url::parse("ftp://example.com/file").unwrap();
+        let result = validate_url(&url).await;
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("only http and https schemes are allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_userinfo_not_allowed() {
+        let url = Url::parse("https://user:pass@example.com/api").unwrap();
+        let result = validate_url(&url).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("userinfo"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_localhost_blocked() {
+        let url = Url::parse("https://localhost/api").unwrap();
+        let result = validate_url(&url).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("host is not allowed"));
     }
 }
