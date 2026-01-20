@@ -53,4 +53,9 @@ SELECT HAS_TABLE_PRIVILEGE(CURRENT_USER, 'sys_test', 'SELECT') AS can_select;
 
 DROP TABLE sys_test;
 
+-- pg_backend_pid() tests
+SELECT pg_backend_pid() IS NOT NULL AS has_pid;
+SELECT pg_typeof(pg_backend_pid()) AS pid_type;
+SELECT pg_backend_pid() = pg_backend_pid() AS pid_stable;
+
 SELECT 'System functions tests completed' AS result;

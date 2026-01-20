@@ -166,6 +166,21 @@ NOTICE:  table "sys_test" does not exist, skipping
  t
 (1 row)
 
+ has_pid 
+---------
+ t
+(1 row)
+
+ pid_type 
+----------
+ integer
+(1 row)
+
+ pid_stable 
+------------
+ t
+(1 row)
+
               result              
 ----------------------------------
  System functions tests completed
