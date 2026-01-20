@@ -27,15 +27,19 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use sqlparser::ast::{Expr, ObjectName, SelectItem, Statement, TableFactor};
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use tikv_client::Transaction;
 use tokio::sync::{Mutex, OnceCell};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 /// Custom metadata key for storing the extracted keyspace
 const METADATA_KEYSPACE: &str = "keyspace";
 /// Custom metadata key for storing the actual username (after parsing tenant.user)
 const METADATA_ACTUAL_USER: &str = "actual_user";
+
+/// Global atomic counter for generating unique connection IDs
+static CONNECTION_ID_COUNTER: AtomicI32 = AtomicI32::new(1);
 
 pub struct PgServerParameterProvider;
 
@@ -439,6 +443,7 @@ pub struct DynamicPgHandler {
     connection_guard: OnceCell<observability::ConnectionGuard>,
     copy_context: Mutex<Option<CopyContext>>,
     query_parser: Arc<NoopQueryParser>,
+    connection_id: i32,
 }
 
 impl DynamicPgHandler {
@@ -453,6 +458,7 @@ impl DynamicPgHandler {
             connection_guard: OnceCell::new(),
             copy_context: Mutex::new(None),
             query_parser: Arc::new(NoopQueryParser::new()),
+            connection_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
     }
 
@@ -469,7 +475,12 @@ impl DynamicPgHandler {
             connection_guard: OnceCell::new(),
             copy_context: Mutex::new(None),
             query_parser: Arc::new(NoopQueryParser::new()),
+            connection_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
+    }
+
+    pub fn connection_id(&self) -> i32 {
+        self.connection_id
     }
 
     async fn infer_result_fields_from_query(&self, query: &str) -> Vec<FieldInfo> {
@@ -2467,6 +2478,12 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
         ExecuteResult::CreateTrigger { .. } => Ok(Response::Execution(Tag::new("CREATE TRIGGER"))),
 
         ExecuteResult::DropTrigger { .. } => Ok(Response::Execution(Tag::new("DROP TRIGGER"))),
+
+        ExecuteResult::CreateExtension { .. } => {
+            Ok(Response::Execution(Tag::new("CREATE EXTENSION")))
+        }
+
+        ExecuteResult::DropExtension { .. } => Ok(Response::Execution(Tag::new("DROP EXTENSION"))),
 
         ExecuteResult::Call => Ok(Response::Execution(Tag::new("CALL"))),
 
