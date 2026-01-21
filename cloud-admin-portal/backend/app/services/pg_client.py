@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Sequence, Tuple
 
 import pg8000.dbapi as pg_dbapi
+import sqlparse
 
 from ..models import ObservabilitySummary, QuerySample
 
@@ -90,24 +91,43 @@ class PgTikvClient:
     ) -> Tuple[str, str, int]:
         """Execute SQL and return a `psql -t -A`-compatible output string.
         
+        Supports multi-statement SQL scripts by splitting on semicolons
+        using sqlparse for proper handling of strings and comments.
+        
         Args:
             tenant: Tenant name
             user: Username
             password: Password
-            sql: SQL to execute
+            sql: SQL to execute (can contain multiple statements)
         
         Returns:
             Tuple of (stdout, stderr, return_code)
         """
+        statements = sqlparse.split(sql)
+        statements = [s.strip() for s in statements if s.strip()]
+        
+        if not statements:
+            return "", "", 0
+        
         out_lines: List[str] = []
         try:
             with self._connect(tenant, user, password) as conn:
                 cursor = conn.cursor()  # type: ignore[attr-defined]
-                cursor.execute(sql)  # type: ignore[attr-defined]
-                if getattr(cursor, "description", None) is not None:
-                    rows = cursor.fetchall()  # type: ignore[attr-defined]
-                    for row in rows:
-                        out_lines.append(_format_row_pipe(row))
+                
+                for stmt in statements:
+                    if not stmt or stmt.startswith("--"):
+                        continue
+                    
+                    cursor.execute(stmt)  # type: ignore[attr-defined]
+                    
+                    if getattr(cursor, "description", None) is not None:
+                        rows = cursor.fetchall()  # type: ignore[attr-defined]
+                        for row in rows:
+                            out_lines.append(_format_row_pipe(row))
+                        
+                        if out_lines and statements.index(stmt) < len(statements) - 1:
+                            out_lines.append("")
+                
                 try:
                     cursor.close()  # type: ignore[attr-defined]
                 except Exception:
