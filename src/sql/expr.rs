@@ -446,82 +446,7 @@ fn eval_expr_join_inner(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             substring_from,
             substring_for,
             ..
-        } => {
-            let val = eval_expr_join(expr, ctx)?;
-            let from_val = if let Some(from_expr) = substring_from {
-                Some(eval_expr_join(from_expr, ctx)?)
-            } else {
-                None
-            };
-
-            match val {
-                Value::Text(s) => {
-                    if let (Some(Value::Text(pattern)), None) = (&from_val, substring_for) {
-                        let re = regex::Regex::new(pattern)
-                            .map_err(|e| anyhow!("Invalid regex pattern in SUBSTRING: {}", e))?;
-                        if let Some(caps) = re.captures(&s) {
-                            if caps.len() > 1 {
-                                return Ok(caps
-                                    .get(1)
-                                    .map(|m| Value::Text(m.as_str().to_string()))
-                                    .unwrap_or(Value::Null));
-                            }
-                            return Ok(caps
-                                .get(0)
-                                .map(|m| Value::Text(m.as_str().to_string()))
-                                .unwrap_or(Value::Null));
-                        }
-                        return Ok(Value::Null);
-                    }
-
-                    let start = match &from_val {
-                        Some(Value::Int32(n)) => (n - 1).max(0) as usize,
-                        Some(Value::Int64(n)) => (n - 1).max(0) as usize,
-                        Some(Value::Null) => return Ok(Value::Null),
-                        Some(_) => 0,
-                        None => 0,
-                    };
-                    let len = if let Some(for_expr) = substring_for {
-                        match eval_expr_join(for_expr, ctx)? {
-                            Value::Int32(n) => Some(n.max(0) as usize),
-                            Value::Int64(n) => Some(n.max(0) as usize),
-                            Value::Null => return Ok(Value::Null),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    let chars: Vec<char> = s.chars().collect();
-                    let result: String = if let Some(l) = len {
-                        chars.iter().skip(start).take(l).collect()
-                    } else {
-                        chars.iter().skip(start).collect()
-                    };
-                    Ok(Value::Text(result))
-                }
-                Value::Bytes(bytes) => {
-                    let start = match &from_val {
-                        Some(Value::Int32(n)) => i64::from(*n),
-                        Some(Value::Int64(n)) => *n,
-                        Some(Value::Null) => return Ok(Value::Null),
-                        Some(_) => return Ok(Value::Null),
-                        None => 0,
-                    };
-                    let count = if let Some(for_expr) = substring_for {
-                        match eval_expr_join(for_expr, ctx)? {
-                            Value::Int32(n) => Some(i64::from(n.max(0))),
-                            Value::Int64(n) => Some(n.max(0)),
-                            Value::Null => return Ok(Value::Null),
-                            _ => return Ok(Value::Null),
-                        }
-                    } else {
-                        None
-                    };
-                    Ok(Value::Bytes(super::bytea::substring(bytes, start, count)))
-                }
-                _ => Ok(Value::Null),
-            }
-        }
+        } => eval_substring_join(expr, substring_from, substring_for, ctx),
         Expr::Trim {
             expr,
             trim_what,
@@ -562,54 +487,7 @@ fn eval_expr_join_inner(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             let pos = s.find(&sub).map(|i| i as i32 + 1).unwrap_or(0);
             Ok(Value::Int32(pos))
         }
-        Expr::Extract { field, expr } => {
-            let val = eval_expr_join(expr, ctx)?;
-            let ts = match val {
-                Value::Timestamp(t) => t,
-                Value::Date(days) => {
-                    use chrono::NaiveDate;
-                    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                    let date = epoch + chrono::Duration::days(days as i64);
-                    date.and_hms_opt(0, 0, 0)
-                        .unwrap()
-                        .and_utc()
-                        .timestamp_millis()
-                }
-                Value::Text(s) => {
-                    use chrono::NaiveDateTime;
-                    let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S"))
-                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f"))
-                        .or_else(|_| {
-                            chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
-                                .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
-                        })
-                        .map_err(|e| anyhow!("Invalid timestamp format: {}", e))?;
-                    dt.and_utc().timestamp_millis()
-                }
-                _ => return Ok(Value::Null),
-            };
-            use chrono::{Datelike, TimeZone, Timelike, Utc};
-            let dt = Utc
-                .timestamp_millis_opt(ts)
-                .single()
-                .ok_or_else(|| anyhow!("Invalid timestamp"))?;
-            let result = match field {
-                sqlparser::ast::DateTimeField::Year => dt.year() as f64,
-                sqlparser::ast::DateTimeField::Month => dt.month() as f64,
-                sqlparser::ast::DateTimeField::Day => dt.day() as f64,
-                sqlparser::ast::DateTimeField::Hour => dt.hour() as f64,
-                sqlparser::ast::DateTimeField::Minute => dt.minute() as f64,
-                sqlparser::ast::DateTimeField::Second => dt.second() as f64,
-                sqlparser::ast::DateTimeField::Dow => dt.weekday().num_days_from_sunday() as f64,
-                sqlparser::ast::DateTimeField::Doy => dt.ordinal() as f64,
-                sqlparser::ast::DateTimeField::Week => dt.iso_week().week() as f64,
-                sqlparser::ast::DateTimeField::Quarter => ((dt.month() - 1) / 3 + 1) as f64,
-                sqlparser::ast::DateTimeField::Epoch => ts as f64 / 1000.0,
-                _ => return Err(anyhow!("Unsupported EXTRACT field")),
-            };
-            Ok(Value::Float64(result))
-        }
+        Expr::Extract { field, expr } => eval_extract_join(field, expr, ctx),
         Expr::JsonAccess {
             left,
             operator,
@@ -638,54 +516,7 @@ fn eval_expr_join_inner(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             overlay_what,
             overlay_from,
             overlay_for,
-        } => {
-            let base = eval_expr_join(expr, ctx)?;
-            let what = eval_expr_join(overlay_what, ctx)?;
-            let from = eval_expr_join(overlay_from, ctx)?;
-            let for_len = match overlay_for {
-                Some(e) => Some(eval_expr_join(e, ctx)?),
-                None => None,
-            };
-            let start = match from {
-                Value::Int32(n) => i64::from(n),
-                Value::Int64(n) => n,
-                Value::Null => return Ok(Value::Null),
-                _ => return Ok(Value::Null),
-            };
-            let replace_len = match for_len {
-                Some(Value::Int32(n)) => Some(i64::from(n.max(0))),
-                Some(Value::Int64(n)) => Some(n.max(0)),
-                Some(Value::Null) => return Ok(Value::Null),
-                Some(_) => return Ok(Value::Null),
-                None => None,
-            };
-
-            match (base, what) {
-                (Value::Text(base), Value::Text(what)) => {
-                    if start <= 0 {
-                        return Ok(Value::Text(base));
-                    }
-                    let replace_len = match replace_len {
-                        Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
-                        None => what.chars().count(),
-                    };
-
-                    let base_chars: Vec<char> = base.chars().collect();
-                    let start_idx = usize::try_from(start - 1).unwrap_or(usize::MAX);
-                    let prefix: String = base_chars.iter().take(start_idx).collect();
-                    let suffix_start = start_idx.saturating_add(replace_len);
-                    let suffix: String = base_chars.iter().skip(suffix_start).collect();
-                    Ok(Value::Text(format!("{prefix}{what}{suffix}")))
-                }
-                (Value::Bytes(base), Value::Bytes(what)) => Ok(Value::Bytes(super::bytea::overlay(
-                    base,
-                    &what,
-                    start,
-                    replace_len,
-                ))),
-                _ => Ok(Value::Null),
-            }
-        }
+        } => eval_overlay_join(expr, overlay_what, overlay_from, overlay_for, ctx),
         Expr::AnyOp {
             left,
             compare_op,
@@ -1498,82 +1329,7 @@ fn eval_expr_inner(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>)
             substring_from,
             substring_for,
             ..
-        } => {
-            let val = eval_expr(expr, row, schema)?;
-            let from_val = if let Some(from_expr) = substring_from {
-                Some(eval_expr(from_expr, row, schema)?)
-            } else {
-                None
-            };
-
-            match val {
-                Value::Text(s) => {
-                    if let (Some(Value::Text(pattern)), None) = (&from_val, substring_for) {
-                        let re = regex::Regex::new(pattern)
-                            .map_err(|e| anyhow!("Invalid regex pattern in SUBSTRING: {}", e))?;
-                        if let Some(caps) = re.captures(&s) {
-                            if caps.len() > 1 {
-                                return Ok(caps
-                                    .get(1)
-                                    .map(|m| Value::Text(m.as_str().to_string()))
-                                    .unwrap_or(Value::Null));
-                            }
-                            return Ok(caps
-                                .get(0)
-                                .map(|m| Value::Text(m.as_str().to_string()))
-                                .unwrap_or(Value::Null));
-                        }
-                        return Ok(Value::Null);
-                    }
-
-                    let start = match &from_val {
-                        Some(Value::Int32(n)) => (n - 1).max(0) as usize,
-                        Some(Value::Int64(n)) => (n - 1).max(0) as usize,
-                        Some(Value::Null) => return Ok(Value::Null),
-                        Some(_) => 0,
-                        None => 0,
-                    };
-                    let len = if let Some(for_expr) = substring_for {
-                        match eval_expr(for_expr, row, schema)? {
-                            Value::Int32(n) => Some(n.max(0) as usize),
-                            Value::Int64(n) => Some(n.max(0) as usize),
-                            Value::Null => return Ok(Value::Null),
-                            _ => None,
-                        }
-                    } else {
-                        None
-                    };
-                    let chars: Vec<char> = s.chars().collect();
-                    let result: String = if let Some(l) = len {
-                        chars.iter().skip(start).take(l).collect()
-                    } else {
-                        chars.iter().skip(start).collect()
-                    };
-                    Ok(Value::Text(result))
-                }
-                Value::Bytes(bytes) => {
-                    let start = match &from_val {
-                        Some(Value::Int32(n)) => i64::from(*n),
-                        Some(Value::Int64(n)) => *n,
-                        Some(Value::Null) => return Ok(Value::Null),
-                        Some(_) => return Ok(Value::Null),
-                        None => 0,
-                    };
-                    let count = if let Some(for_expr) = substring_for {
-                        match eval_expr(for_expr, row, schema)? {
-                            Value::Int32(n) => Some(i64::from(n.max(0))),
-                            Value::Int64(n) => Some(n.max(0)),
-                            Value::Null => return Ok(Value::Null),
-                            _ => return Ok(Value::Null),
-                        }
-                    } else {
-                        None
-                    };
-                    Ok(Value::Bytes(super::bytea::substring(bytes, start, count)))
-                }
-                _ => Ok(Value::Null),
-            }
-        }
+        } => eval_substring(expr, substring_from, substring_for, row, schema),
         Expr::Trim {
             expr,
             trim_what,
@@ -1614,54 +1370,7 @@ fn eval_expr_inner(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>)
             let pos = s.find(&sub).map(|i| i as i32 + 1).unwrap_or(0);
             Ok(Value::Int32(pos))
         }
-        Expr::Extract { field, expr } => {
-            let val = eval_expr(expr, row, schema)?;
-            let ts = match val {
-                Value::Timestamp(t) => t,
-                Value::Date(days) => {
-                    use chrono::NaiveDate;
-                    let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-                    let date = epoch + chrono::Duration::days(days as i64);
-                    date.and_hms_opt(0, 0, 0)
-                        .unwrap()
-                        .and_utc()
-                        .timestamp_millis()
-                }
-                Value::Text(s) => {
-                    use chrono::NaiveDateTime;
-                    let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
-                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S"))
-                        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f"))
-                        .or_else(|_| {
-                            chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
-                                .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
-                        })
-                        .map_err(|e| anyhow!("Invalid timestamp format: {}", e))?;
-                    dt.and_utc().timestamp_millis()
-                }
-                _ => return Ok(Value::Null),
-            };
-            use chrono::{Datelike, TimeZone, Timelike, Utc};
-            let dt = Utc
-                .timestamp_millis_opt(ts)
-                .single()
-                .ok_or_else(|| anyhow!("Invalid timestamp"))?;
-            let result = match field {
-                sqlparser::ast::DateTimeField::Year => dt.year() as f64,
-                sqlparser::ast::DateTimeField::Month => dt.month() as f64,
-                sqlparser::ast::DateTimeField::Day => dt.day() as f64,
-                sqlparser::ast::DateTimeField::Hour => dt.hour() as f64,
-                sqlparser::ast::DateTimeField::Minute => dt.minute() as f64,
-                sqlparser::ast::DateTimeField::Second => dt.second() as f64,
-                sqlparser::ast::DateTimeField::Dow => dt.weekday().num_days_from_sunday() as f64,
-                sqlparser::ast::DateTimeField::Doy => dt.ordinal() as f64,
-                sqlparser::ast::DateTimeField::Week => dt.iso_week().week() as f64,
-                sqlparser::ast::DateTimeField::Quarter => ((dt.month() - 1) / 3 + 1) as f64,
-                sqlparser::ast::DateTimeField::Epoch => ts as f64 / 1000.0,
-                _ => return Err(anyhow!("Unsupported EXTRACT field")),
-            };
-            Ok(Value::Float64(result))
-        }
+        Expr::Extract { field, expr } => eval_extract(field, expr, row, schema),
         Expr::Ceil { expr, .. } => {
             let val = eval_expr(expr, row, schema)?;
             match val {
@@ -1757,54 +1466,7 @@ fn eval_expr_inner(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>)
             overlay_what,
             overlay_from,
             overlay_for,
-        } => {
-            let base = eval_expr(expr, row, schema)?;
-            let what = eval_expr(overlay_what, row, schema)?;
-            let from = eval_expr(overlay_from, row, schema)?;
-            let for_len = match overlay_for {
-                Some(e) => Some(eval_expr(e, row, schema)?),
-                None => None,
-            };
-            let start = match from {
-                Value::Int32(n) => i64::from(n),
-                Value::Int64(n) => n,
-                Value::Null => return Ok(Value::Null),
-                _ => return Ok(Value::Null),
-            };
-            let replace_len = match for_len {
-                Some(Value::Int32(n)) => Some(i64::from(n.max(0))),
-                Some(Value::Int64(n)) => Some(n.max(0)),
-                Some(Value::Null) => return Ok(Value::Null),
-                Some(_) => return Ok(Value::Null),
-                None => None,
-            };
-
-            match (base, what) {
-                (Value::Text(base), Value::Text(what)) => {
-                    if start <= 0 {
-                        return Ok(Value::Text(base));
-                    }
-                    let replace_len = match replace_len {
-                        Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
-                        None => what.chars().count(),
-                    };
-
-                    let base_chars: Vec<char> = base.chars().collect();
-                    let start_idx = usize::try_from(start - 1).unwrap_or(usize::MAX);
-                    let prefix: String = base_chars.iter().take(start_idx).collect();
-                    let suffix_start = start_idx.saturating_add(replace_len);
-                    let suffix: String = base_chars.iter().skip(suffix_start).collect();
-                    Ok(Value::Text(format!("{prefix}{what}{suffix}")))
-                }
-                (Value::Bytes(base), Value::Bytes(what)) => Ok(Value::Bytes(super::bytea::overlay(
-                    base,
-                    &what,
-                    start,
-                    replace_len,
-                ))),
-                _ => Ok(Value::Null),
-            }
-        }
+        } => eval_overlay(expr, overlay_what, overlay_from, overlay_for, row, schema),
         Expr::AnyOp {
             left,
             compare_op,
@@ -1848,6 +1510,381 @@ fn eval_expr_inner(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>)
             Ok(Value::Boolean(true))
         }
         _ => Err(anyhow!("Unsupported expression: {:?}", expr)),
+    }
+}
+
+#[inline(never)]
+fn eval_substring(
+    expr: &Expr,
+    substring_from: &Option<Box<Expr>>,
+    substring_for: &Option<Box<Expr>>,
+    row: Option<&Row>,
+    schema: Option<&TableSchema>,
+) -> Result<Value> {
+    let val = eval_expr(expr, row, schema)?;
+    let from_val = if let Some(from_expr) = substring_from {
+        Some(eval_expr(from_expr, row, schema)?)
+    } else {
+        None
+    };
+
+    match val {
+        Value::Text(s) => {
+            if let (Some(Value::Text(pattern)), None) = (&from_val, substring_for) {
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| anyhow!("Invalid regex pattern in SUBSTRING: {}", e))?;
+                if let Some(caps) = re.captures(&s) {
+                    if caps.len() > 1 {
+                        return Ok(caps
+                            .get(1)
+                            .map(|m| Value::Text(m.as_str().to_string()))
+                            .unwrap_or(Value::Null));
+                    }
+                    return Ok(caps
+                        .get(0)
+                        .map(|m| Value::Text(m.as_str().to_string()))
+                        .unwrap_or(Value::Null));
+                }
+                return Ok(Value::Null);
+            }
+
+            let start = match &from_val {
+                Some(Value::Int32(n)) => (n - 1).max(0) as usize,
+                Some(Value::Int64(n)) => (n - 1).max(0) as usize,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(_) => 0,
+                None => 0,
+            };
+            let len = if let Some(for_expr) = substring_for {
+                match eval_expr(for_expr, row, schema)? {
+                    Value::Int32(n) => Some(n.max(0) as usize),
+                    Value::Int64(n) => Some(n.max(0) as usize),
+                    Value::Null => return Ok(Value::Null),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let result: String = if let Some(l) = len {
+                chars.iter().skip(start).take(l).collect()
+            } else {
+                chars.iter().skip(start).collect()
+            };
+            Ok(Value::Text(result))
+        }
+        Value::Bytes(bytes) => {
+            let start = match &from_val {
+                Some(Value::Int32(n)) => i64::from(*n),
+                Some(Value::Int64(n)) => *n,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(_) => return Ok(Value::Null),
+                None => 0,
+            };
+            let count = if let Some(for_expr) = substring_for {
+                match eval_expr(for_expr, row, schema)? {
+                    Value::Int32(n) => Some(i64::from(n.max(0))),
+                    Value::Int64(n) => Some(n.max(0)),
+                    Value::Null => return Ok(Value::Null),
+                    _ => return Ok(Value::Null),
+                }
+            } else {
+                None
+            };
+            Ok(Value::Bytes(super::bytea::substring(bytes, start, count)))
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
+#[inline(never)]
+fn eval_extract(
+    field: &sqlparser::ast::DateTimeField,
+    expr: &Expr,
+    row: Option<&Row>,
+    schema: Option<&TableSchema>,
+) -> Result<Value> {
+    let val = eval_expr(expr, row, schema)?;
+    let ts = match val {
+        Value::Timestamp(t) => t,
+        Value::Date(days) => {
+            use chrono::NaiveDate;
+            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            let date = epoch + chrono::Duration::days(days as i64);
+            date.and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis()
+        }
+        Value::Text(s) => {
+            use chrono::NaiveDateTime;
+            let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S"))
+                .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f"))
+                .or_else(|_| {
+                    chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                        .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                })
+                .map_err(|e| anyhow!("Invalid timestamp format: {}", e))?;
+            dt.and_utc().timestamp_millis()
+        }
+        _ => return Ok(Value::Null),
+    };
+    use chrono::{Datelike, TimeZone, Timelike, Utc};
+    let dt = Utc
+        .timestamp_millis_opt(ts)
+        .single()
+        .ok_or_else(|| anyhow!("Invalid timestamp"))?;
+    let result = match field {
+        sqlparser::ast::DateTimeField::Year => dt.year() as f64,
+        sqlparser::ast::DateTimeField::Month => dt.month() as f64,
+        sqlparser::ast::DateTimeField::Day => dt.day() as f64,
+        sqlparser::ast::DateTimeField::Hour => dt.hour() as f64,
+        sqlparser::ast::DateTimeField::Minute => dt.minute() as f64,
+        sqlparser::ast::DateTimeField::Second => dt.second() as f64,
+        sqlparser::ast::DateTimeField::Dow => dt.weekday().num_days_from_sunday() as f64,
+        sqlparser::ast::DateTimeField::Doy => dt.ordinal() as f64,
+        sqlparser::ast::DateTimeField::Week => dt.iso_week().week() as f64,
+        sqlparser::ast::DateTimeField::Quarter => ((dt.month() - 1) / 3 + 1) as f64,
+        sqlparser::ast::DateTimeField::Epoch => ts as f64 / 1000.0,
+        _ => return Err(anyhow!("Unsupported EXTRACT field")),
+    };
+    Ok(Value::Float64(result))
+}
+
+#[inline(never)]
+fn eval_overlay(
+    expr: &Expr,
+    overlay_what: &Expr,
+    overlay_from: &Expr,
+    overlay_for: &Option<Box<Expr>>,
+    row: Option<&Row>,
+    schema: Option<&TableSchema>,
+) -> Result<Value> {
+    let base = eval_expr(expr, row, schema)?;
+    let what = eval_expr(overlay_what, row, schema)?;
+    let from = eval_expr(overlay_from, row, schema)?;
+    let for_len = match overlay_for {
+        Some(e) => Some(eval_expr(e, row, schema)?),
+        None => None,
+    };
+    let start = match from {
+        Value::Int32(n) => i64::from(n),
+        Value::Int64(n) => n,
+        Value::Null => return Ok(Value::Null),
+        _ => return Ok(Value::Null),
+    };
+    let replace_len = match for_len {
+        Some(Value::Int32(n)) => Some(i64::from(n.max(0))),
+        Some(Value::Int64(n)) => Some(n.max(0)),
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(_) => return Ok(Value::Null),
+        None => None,
+    };
+
+    match (base, what) {
+        (Value::Text(base), Value::Text(what)) => {
+            if start <= 0 {
+                return Ok(Value::Text(base));
+            }
+            let replace_len = match replace_len {
+                Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
+                None => what.chars().count(),
+            };
+
+            let base_chars: Vec<char> = base.chars().collect();
+            let start_idx = usize::try_from(start - 1).unwrap_or(usize::MAX);
+            let prefix: String = base_chars.iter().take(start_idx).collect();
+            let suffix_start = start_idx.saturating_add(replace_len);
+            let suffix: String = base_chars.iter().skip(suffix_start).collect();
+            Ok(Value::Text(format!("{prefix}{what}{suffix}")))
+        }
+        (Value::Bytes(base), Value::Bytes(what)) => Ok(Value::Bytes(super::bytea::overlay(
+            base,
+            &what,
+            start,
+            replace_len,
+        ))),
+        _ => Ok(Value::Null),
+    }
+}
+
+#[inline(never)]
+fn eval_substring_join(
+    expr: &Expr,
+    substring_from: &Option<Box<Expr>>,
+    substring_for: &Option<Box<Expr>>,
+    ctx: &JoinContext,
+) -> Result<Value> {
+    let val = eval_expr_join(expr, ctx)?;
+    let from_val = if let Some(from_expr) = substring_from {
+        Some(eval_expr_join(from_expr, ctx)?)
+    } else {
+        None
+    };
+
+    match val {
+        Value::Text(s) => {
+            if let (Some(Value::Text(pattern)), None) = (&from_val, substring_for) {
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| anyhow!("Invalid regex pattern in SUBSTRING: {}", e))?;
+                if let Some(caps) = re.captures(&s) {
+                    if caps.len() > 1 {
+                        return Ok(caps
+                            .get(1)
+                            .map(|m| Value::Text(m.as_str().to_string()))
+                            .unwrap_or(Value::Null));
+                    }
+                    return Ok(caps
+                        .get(0)
+                        .map(|m| Value::Text(m.as_str().to_string()))
+                        .unwrap_or(Value::Null));
+                }
+                return Ok(Value::Null);
+            }
+
+            let start = match &from_val {
+                Some(Value::Int32(n)) => (n - 1).max(0) as usize,
+                Some(Value::Int64(n)) => (n - 1).max(0) as usize,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(_) => 0,
+                None => 0,
+            };
+            let len = if let Some(for_expr) = substring_for {
+                match eval_expr_join(for_expr, ctx)? {
+                    Value::Int32(n) => Some(n.max(0) as usize),
+                    Value::Int64(n) => Some(n.max(0) as usize),
+                    Value::Null => return Ok(Value::Null),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let result: String = if let Some(l) = len {
+                chars.iter().skip(start).take(l).collect()
+            } else {
+                chars.iter().skip(start).collect()
+            };
+            Ok(Value::Text(result))
+        }
+        Value::Bytes(bytes) => {
+            let start = match &from_val {
+                Some(Value::Int32(n)) => i64::from(*n),
+                Some(Value::Int64(n)) => *n,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(_) => return Ok(Value::Null),
+                None => 0,
+            };
+            let count = if let Some(for_expr) = substring_for {
+                match eval_expr_join(for_expr, ctx)? {
+                    Value::Int32(n) => Some(i64::from(n.max(0))),
+                    Value::Int64(n) => Some(n.max(0)),
+                    Value::Null => return Ok(Value::Null),
+                    _ => return Ok(Value::Null),
+                }
+            } else {
+                None
+            };
+            Ok(Value::Bytes(super::bytea::substring(bytes, start, count)))
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
+#[inline(never)]
+fn eval_extract_join(field: &sqlparser::ast::DateTimeField, expr: &Expr, ctx: &JoinContext) -> Result<Value> {
+    let val = eval_expr_join(expr, ctx)?;
+    let ts = match val {
+        Value::Timestamp(t) => t,
+        Value::Date(days) => {
+            use chrono::NaiveDate;
+            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            let date = epoch + chrono::Duration::days(days as i64);
+            date.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis()
+        }
+        Value::Text(s) => {
+            use chrono::NaiveDateTime;
+            let dt = NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S")
+                .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S"))
+                .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f"))
+                .or_else(|_| {
+                    chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                        .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+                })
+                .map_err(|e| anyhow!("Invalid timestamp format: {}", e))?;
+            dt.and_utc().timestamp_millis()
+        }
+        _ => return Ok(Value::Null),
+    };
+    use chrono::{Datelike, TimeZone, Timelike, Utc};
+    let dt = Utc.timestamp_millis_opt(ts).single().ok_or_else(|| anyhow!("Invalid timestamp"))?;
+    let result = match field {
+        sqlparser::ast::DateTimeField::Year => dt.year() as f64,
+        sqlparser::ast::DateTimeField::Month => dt.month() as f64,
+        sqlparser::ast::DateTimeField::Day => dt.day() as f64,
+        sqlparser::ast::DateTimeField::Hour => dt.hour() as f64,
+        sqlparser::ast::DateTimeField::Minute => dt.minute() as f64,
+        sqlparser::ast::DateTimeField::Second => dt.second() as f64,
+        sqlparser::ast::DateTimeField::Dow => dt.weekday().num_days_from_sunday() as f64,
+        sqlparser::ast::DateTimeField::Doy => dt.ordinal() as f64,
+        sqlparser::ast::DateTimeField::Week => dt.iso_week().week() as f64,
+        sqlparser::ast::DateTimeField::Quarter => ((dt.month() - 1) / 3 + 1) as f64,
+        sqlparser::ast::DateTimeField::Epoch => ts as f64 / 1000.0,
+        _ => return Err(anyhow!("Unsupported EXTRACT field")),
+    };
+    Ok(Value::Float64(result))
+}
+
+#[inline(never)]
+fn eval_overlay_join(
+    expr: &Expr,
+    overlay_what: &Expr,
+    overlay_from: &Expr,
+    overlay_for: &Option<Box<Expr>>,
+    ctx: &JoinContext,
+) -> Result<Value> {
+    let base = eval_expr_join(expr, ctx)?;
+    let what = eval_expr_join(overlay_what, ctx)?;
+    let from = eval_expr_join(overlay_from, ctx)?;
+    let for_len = match overlay_for {
+        Some(e) => Some(eval_expr_join(e, ctx)?),
+        None => None,
+    };
+    let start = match from {
+        Value::Int32(n) => i64::from(n),
+        Value::Int64(n) => n,
+        Value::Null => return Ok(Value::Null),
+        _ => return Ok(Value::Null),
+    };
+    let replace_len = match for_len {
+        Some(Value::Int32(n)) => Some(i64::from(n.max(0))),
+        Some(Value::Int64(n)) => Some(n.max(0)),
+        Some(Value::Null) => return Ok(Value::Null),
+        Some(_) => return Ok(Value::Null),
+        None => None,
+    };
+
+    match (base, what) {
+        (Value::Text(base), Value::Text(what)) => {
+            if start <= 0 {
+                return Ok(Value::Text(base));
+            }
+            let replace_len = match replace_len {
+                Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
+                None => what.chars().count(),
+            };
+            let base_chars: Vec<char> = base.chars().collect();
+            let start_idx = usize::try_from(start - 1).unwrap_or(usize::MAX);
+            let prefix: String = base_chars.iter().take(start_idx).collect();
+            let suffix_start = start_idx.saturating_add(replace_len);
+            let suffix: String = base_chars.iter().skip(suffix_start).collect();
+            Ok(Value::Text(format!("{prefix}{what}{suffix}")))
+        }
+        (Value::Bytes(base), Value::Bytes(what)) => Ok(Value::Bytes(super::bytea::overlay(
+            base, &what, start, replace_len,
+        ))),
+        _ => Ok(Value::Null),
     }
 }
 
