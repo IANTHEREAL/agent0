@@ -53,7 +53,7 @@ async fn create_keyspace(pd_endpoint: &str, keyspace_name: &str) -> Result<()> {
 fn main() -> Result<()> {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(3 * 1024 * 1024)
+        .thread_stack_size(4 * 1024 * 1024)
         .build()
         .unwrap()
         .block_on(async_main())

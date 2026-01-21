@@ -134,10 +134,10 @@ fn expr_is_timestamptz_join(expr: &Expr, ctx: &JoinContext) -> bool {
 }
 
 pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
-    stacker::maybe_grow(128 * 1024, 1024 * 1024, || eval_expr_join_inner(expr, ctx))
+    stacker::maybe_grow(32 * 1024, 1024 * 1024, || eval_expr_join_impl(expr, ctx))
 }
 
-fn eval_expr_join_inner(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
+fn eval_expr_join_impl(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
     match expr {
         Expr::Value(v) => eval_value(v),
         Expr::Identifier(ident) => {
@@ -1068,13 +1068,11 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
     }
 }
 
-/// Evaluate an expression against a row
 pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -> Result<Value> {
-    // Ensure sufficient stack space for deep recursion (128KB red zone, grow by 1MB if needed)
-    stacker::maybe_grow(128 * 1024, 1024 * 1024, || eval_expr_inner(expr, row, schema))
+    stacker::maybe_grow(32 * 1024, 1024 * 1024, || eval_expr_impl(expr, row, schema))
 }
 
-fn eval_expr_inner(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -> Result<Value> {
+fn eval_expr_impl(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -> Result<Value> {
     match expr {
         Expr::Value(v) => eval_value(v),
         Expr::Identifier(ident) => {
