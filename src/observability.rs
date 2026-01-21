@@ -49,7 +49,11 @@ impl ObservabilityConfig {
             cfg.enabled = parse_bool(&v).unwrap_or(cfg.enabled);
         }
         if let Ok(v) = env::var("PGTIKV_OBS_SAMPLE_EVERY") {
-            cfg.sample_every = v.parse::<u64>().ok().filter(|n| *n > 0).unwrap_or(cfg.sample_every);
+            cfg.sample_every = v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0)
+                .unwrap_or(cfg.sample_every);
         }
         if let Ok(v) = env::var("PGTIKV_OBS_SLOW_MS") {
             cfg.slow_query_threshold_us = v
@@ -165,7 +169,8 @@ pub struct QuerySampleGroup {
 pub struct TenantObservability {
     config: ObservabilityConfig,
     active_connections: AtomicU64,
-    window: RollingWindow,
+    // Box to avoid stack overflow: RollingWindow is ~130KB (60 buckets × 264 AtomicU64 bins each)
+    window: Box<RollingWindow>,
     samples: Mutex<VecDeque<SampleEvent>>,
 }
 
@@ -174,14 +179,16 @@ impl TenantObservability {
         Self {
             config,
             active_connections: AtomicU64::new(0),
-            window: RollingWindow::new(),
+            window: Box::new(RollingWindow::new()),
             samples: Mutex::new(VecDeque::new()),
         }
     }
 
     pub fn connection_open(self: &Arc<Self>) -> ConnectionGuard {
         self.active_connections.fetch_add(1, Ordering::Relaxed);
-        ConnectionGuard { tenant: self.clone() }
+        ConnectionGuard {
+            tenant: self.clone(),
+        }
     }
 
     pub fn record_commit(&self) {
@@ -372,8 +379,7 @@ impl RollingWindow {
         let b = &self.buckets[(minute as usize) % NUM_BUCKETS];
         b.ensure_minute(minute);
         b.statement_count.fetch_add(1, Ordering::Relaxed);
-        b.latency_sum_us
-            .fetch_add(latency_us, Ordering::Relaxed);
+        b.latency_sum_us.fetch_add(latency_us, Ordering::Relaxed);
         if !ok {
             b.error_count.fetch_add(1, Ordering::Relaxed);
         }
@@ -401,10 +407,13 @@ impl RollingWindow {
             if m < oldest || m > now_minute {
                 continue;
             }
-            statement_count = statement_count.saturating_add(b.statement_count.load(Ordering::Relaxed));
-            txn_commit_count = txn_commit_count.saturating_add(b.txn_commit_count.load(Ordering::Relaxed));
+            statement_count =
+                statement_count.saturating_add(b.statement_count.load(Ordering::Relaxed));
+            txn_commit_count =
+                txn_commit_count.saturating_add(b.txn_commit_count.load(Ordering::Relaxed));
             error_count = error_count.saturating_add(b.error_count.load(Ordering::Relaxed));
-            latency_sum_us = latency_sum_us.saturating_add(b.latency_sum_us.load(Ordering::Relaxed));
+            latency_sum_us =
+                latency_sum_us.saturating_add(b.latency_sum_us.load(Ordering::Relaxed));
             for (i, bin) in b.latency_bins.iter().enumerate() {
                 bins[i] = bins[i].saturating_add(bin.load(Ordering::Relaxed));
             }
