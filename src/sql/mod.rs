@@ -1,6 +1,7 @@
 //! SQL parsing and execution
 
 mod catalog_oids;
+mod bytea;
 mod ddl;
 mod dml;
 mod executor;
@@ -19,6 +20,7 @@ pub mod expr;
 mod helpers;
 mod index_helpers;
 mod information_schema;
+mod jsonb;
 mod names;
 mod parser;
 mod planner;
@@ -27,6 +29,8 @@ mod query;
 mod rbac;
 mod result;
 mod sequences;
+mod statement_time;
+mod timezone;
 mod triggers;
 mod trigger_queue;
 pub(crate) mod trigger_worker;

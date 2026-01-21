@@ -2025,6 +2025,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn create_table_default_current_timestamp_precision_is_preserved() {
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        let dialect = PostgreSqlDialect {};
+        let ast = Parser::parse_sql(
+            &dialect,
+            "CREATE TABLE ts_precision (id INT PRIMARY KEY, ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP(0));",
+        )
+        .unwrap();
+
+        let sqlparser::ast::Statement::CreateTable { columns, .. } = &ast[0] else {
+            panic!("expected CREATE TABLE");
+        };
+
+        let ts_col = columns
+            .iter()
+            .find(|c| c.name.value.eq_ignore_ascii_case("ts"))
+            .expect("ts column must exist");
+
+        let mut default_expr = None;
+        for opt in &ts_col.options {
+            if let sqlparser::ast::ColumnOption::Default(expr) = &opt.option {
+                if let sqlparser::ast::Expr::Function(func) = expr {
+                    assert_eq!(func.args.len(), 1);
+                }
+                default_expr = Some(expr.to_string());
+            }
+        }
+
+        assert_eq!(default_expr.unwrap(), "CURRENT_TIMESTAMP(0)");
+    }
+
+    #[test]
     fn check_expr_reference_ignores_string_literals() {
         assert!(!check_expr_references_column("note = 'age'", "age").unwrap());
         assert!(check_expr_references_column("age > 0 AND note = 'age'", "age").unwrap());

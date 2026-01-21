@@ -828,8 +828,23 @@ impl Executor {
 
             let table_resolved =
                 names::resolve_existing_table_name(self.store().as_ref(), txn, &table, search_path)
-                    .await?
-                    .ok_or_else(|| anyhow!("Table '{}' not found", table))?;
+                    .await?;
+            let table_resolved = match table_resolved {
+                Some(resolved) => resolved,
+                None => {
+                    if if_exists {
+                        // PostgreSQL requires the relation to exist for DROP TRIGGER, but pg-tikv
+                        // treats `IF EXISTS` as a fully idempotent no-op to support common
+                        // migration patterns and keep scripts deterministic.
+                        let resolved = names::resolve_ddl_object_name(&table, search_path)?;
+                        return Ok(ExecuteResult::DropTrigger {
+                            trigger_name,
+                            table_name: resolved.full,
+                        });
+                    }
+                    return Err(anyhow!("Table '{}' not found", table));
+                }
+            };
 
             let dropped = self
                 .store()

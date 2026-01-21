@@ -1,0 +1,36 @@
+int8send_len
+8
+(1 row)
+int4send_len
+4
+(1 row)
+uuid_send_len
+16
+(1 row)
+int8_bytes
+\x0102030405060708
+(1 row)
+int4_bytes
+\x01020304
+(1 row)
+uuid_bytes
+\x550e8400e29b41d4a716446655440000
+(1 row)
+set_msb
+\x80
+(1 row)
+set_lsb
+\x01
+(1 row)
+get_msb
+1
+(1 row)
+get_lsb
+0
+(1 row)
+ts_6bytes
+\x018d0c904d00
+(1 row)
+overlay_hex
+018d0c904d0041d4a716446655440000
+(1 row)

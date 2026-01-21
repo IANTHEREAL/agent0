@@ -1152,6 +1152,10 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
         }
         Expr::Cast { data_type, .. } => sql_datatype_to_internal(data_type),
         Expr::TypedString { data_type, .. } => sql_datatype_to_internal(data_type),
+        Expr::AtTimeZone { timestamp, .. } => match infer_expr_type(timestamp, schema) {
+            DataType::TimestampTz => DataType::Timestamp,
+            _ => DataType::TimestampTz,
+        },
         Expr::Interval(_) => DataType::Interval,
         Expr::Extract { .. } => DataType::Float64,
         Expr::JsonAccess { operator, .. } => match operator {
@@ -1159,6 +1163,18 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
             sqlparser::ast::JsonOperator::LongArrow => DataType::Text,
             sqlparser::ast::JsonOperator::HashArrow => DataType::Jsonb,
             sqlparser::ast::JsonOperator::HashLongArrow => DataType::Text,
+            sqlparser::ast::JsonOperator::HashMinus => DataType::Jsonb,
+            sqlparser::ast::JsonOperator::AtArrow | sqlparser::ast::JsonOperator::ArrowAt => {
+                DataType::Boolean
+            }
+            _ => DataType::Text,
+        },
+        Expr::Substring { expr, .. } => match infer_expr_type(expr, schema) {
+            DataType::Bytes => DataType::Bytes,
+            _ => DataType::Text,
+        },
+        Expr::Overlay { expr, .. } => match infer_expr_type(expr, schema) {
+            DataType::Bytes => DataType::Bytes,
             _ => DataType::Text,
         },
         Expr::Function(f) => {
@@ -1249,6 +1265,8 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                 "JSONB_EXISTS" | "JSONB_EXISTS_ANY" | "JSONB_EXISTS_ALL" => DataType::Boolean,
                 "ROW_TO_JSON" => DataType::Json,
                 "DECODE" => DataType::Bytes,
+                "GET_BIT" => DataType::Int32,
+                "SET_BIT" | "INT8SEND" | "INT4SEND" | "UUID_SEND" => DataType::Bytes,
                 "BIT_LENGTH" | "OCTET_LENGTH" => DataType::Int32,
                 "COALESCE" | "NULLIF" | "GREATEST" | "LEAST" => {
                     if let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(arg_expr))) =
@@ -1708,11 +1726,92 @@ mod tests {
     }
 
     #[test]
+    fn test_infer_expr_type_at_time_zone_timestamp_to_timestamptz() {
+        let schema = TableSchema::default();
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "SELECT TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'UTC'",
+        )
+        .unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+            panic!("expected unnamed expr");
+        };
+        assert_eq!(infer_expr_type(expr, &schema), DataType::TimestampTz);
+    }
+
+    #[test]
+    fn test_infer_expr_type_at_time_zone_chain_returns_timestamp() {
+        let schema = TableSchema::default();
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "SELECT TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York'",
+        )
+        .unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+            panic!("expected unnamed expr");
+        };
+        assert_eq!(infer_expr_type(expr, &schema), DataType::Timestamp);
+    }
+
+    #[test]
+    fn test_infer_expr_type_at_time_zone_now_returns_timestamp() {
+        let schema = TableSchema::default();
+        let dialect = PostgreSqlDialect {};
+        let statements =
+            Parser::parse_sql(&dialect, "SELECT NOW() AT TIME ZONE 'America/New_York'").unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+            panic!("expected unnamed expr");
+        };
+        assert_eq!(infer_expr_type(expr, &schema), DataType::Timestamp);
+    }
+
+    #[test]
     fn test_parse_pg_array_strings() {
         let result = parse_pg_array("{hello,world}").unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], Value::Text("hello".to_string()));
         assert_eq!(result[1], Value::Text("world".to_string()));
+    }
+
+    #[test]
+    fn test_infer_expr_type_json_access_contains_returns_boolean() {
+        let schema = TableSchema::default();
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "SELECT '{\"a\":1}'::jsonb @> '{\"a\":1}'::jsonb",
+        )
+        .unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+            panic!("expected unnamed expr");
+        };
+        assert_eq!(infer_expr_type(expr, &schema), DataType::Boolean);
     }
 
     #[test]
@@ -1837,6 +1936,44 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].values[0], Value::Int32(11));
         assert_eq!(result[1].values[0], Value::Int32(12));
+    }
+
+    fn infer_first_expr(sql: &str) -> DataType {
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
+            panic!("expected unnamed expr");
+        };
+        infer_expr_type(expr, &TableSchema::default())
+    }
+
+    #[test]
+    fn test_infer_expr_type_bytea_builtins() {
+        assert_eq!(infer_first_expr("SELECT int8send(0::bigint)"), DataType::Bytes);
+        assert_eq!(
+            infer_first_expr(r"SELECT get_bit(E'\\x80'::bytea, 0)"),
+            DataType::Int32
+        );
+        assert_eq!(
+            infer_first_expr(r"SELECT set_bit(E'\\x00'::bytea, 0, 1)"),
+            DataType::Bytes
+        );
+        assert_eq!(
+            infer_first_expr(r"SELECT substring(E'\\x0102030405060708'::bytea from 3)"),
+            DataType::Bytes
+        );
+        assert_eq!(
+            infer_first_expr(
+                r"SELECT overlay('\x00001122'::bytea placing '\xaabb'::bytea from 2 for 2)"
+            ),
+            DataType::Bytes
+        );
     }
 }
 

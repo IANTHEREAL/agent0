@@ -1,12 +1,14 @@
 //! Expression evaluation logic
 
-use crate::types::{Row, TableSchema, Value};
+use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Context, Result};
 use rust_decimal::Decimal;
 use sqlparser::ast::{BinaryOperator, Expr, JsonOperator, Value as SqlValue};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::str::FromStr;
+
+use super::timezone::parse_timezone_offset_seconds;
 
 // Thread-local storage for connection_id used by pg_backend_pid()
 thread_local! {
@@ -29,6 +31,106 @@ pub struct JoinContext<'a> {
     pub combined_row: &'a Row,
     #[allow(dead_code)]
     pub combined_schema: &'a TableSchema,
+}
+
+fn sql_datatype_is_timestamptz(dt: &sqlparser::ast::DataType) -> Option<bool> {
+    match dt {
+        sqlparser::ast::DataType::Timestamp(_, tz) => match tz {
+            sqlparser::ast::TimezoneInfo::WithTimeZone | sqlparser::ast::TimezoneInfo::Tz => {
+                Some(true)
+            }
+            _ => Some(false),
+        },
+        sqlparser::ast::DataType::Custom(name, _) => name
+            .0
+            .last()
+            .map(|ident| ident.value.eq_ignore_ascii_case("TIMESTAMPTZ")),
+        _ => None,
+    }
+}
+
+fn expr_is_timestamptz(expr: &Expr, schema: Option<&TableSchema>) -> bool {
+    match expr {
+        Expr::Identifier(ident) => schema
+            .and_then(|s| s.column_index(&ident.value).map(|idx| &s.columns[idx].data_type))
+            .is_some_and(|dt| matches!(dt, DataType::TimestampTz)),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .and_then(|ident| {
+                schema.and_then(|s| s.column_index(&ident.value).map(|idx| &s.columns[idx].data_type))
+            })
+            .is_some_and(|dt| matches!(dt, DataType::TimestampTz)),
+        Expr::Function(func) => func.name.0.last().is_some_and(|ident| {
+            ident.value.eq_ignore_ascii_case("NOW")
+                || ident.value.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+        }),
+        Expr::Cast { data_type, .. } | Expr::TypedString { data_type, .. } => {
+            sql_datatype_is_timestamptz(data_type).unwrap_or(false)
+        }
+        Expr::AtTimeZone { timestamp, .. } => !expr_is_timestamptz(timestamp, schema),
+        Expr::Nested(inner) => expr_is_timestamptz(inner, schema),
+        _ => false,
+    }
+}
+
+fn join_expr_column_type<'a>(expr: &Expr, ctx: &'a JoinContext<'a>) -> Option<&'a DataType> {
+    match expr {
+        Expr::Identifier(ident) => ctx
+            .column_offsets
+            .get(&ident.value)
+            .and_then(|&offset| ctx.combined_schema.columns.get(offset))
+            .map(|col| &col.data_type),
+        Expr::CompoundIdentifier(parts) => {
+            if parts.len() != 2 {
+                return None;
+            }
+            let table_alias = &parts[0].value;
+            let col_name = &parts[1].value;
+
+            let mut key = String::with_capacity(table_alias.len() + 1 + col_name.len());
+            key.push_str(table_alias);
+            key.push('.');
+            key.push_str(col_name);
+
+            if let Some(&offset) = ctx.column_offsets.get(key.as_str()) {
+                return ctx
+                    .combined_schema
+                    .columns
+                    .get(offset)
+                    .map(|col| &col.data_type);
+            }
+
+            for (k, &offset) in &ctx.column_offsets {
+                if k.eq_ignore_ascii_case(&key) {
+                    return ctx
+                        .combined_schema
+                        .columns
+                        .get(offset)
+                        .map(|col| &col.data_type);
+                }
+            }
+
+            None
+        }
+        _ => None,
+    }
+}
+
+fn expr_is_timestamptz_join(expr: &Expr, ctx: &JoinContext) -> bool {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => join_expr_column_type(expr, ctx)
+            .is_some_and(|dt| matches!(dt, DataType::TimestampTz)),
+        Expr::Function(func) => func.name.0.last().is_some_and(|ident| {
+            ident.value.eq_ignore_ascii_case("NOW")
+                || ident.value.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+        }),
+        Expr::Cast { data_type, .. } | Expr::TypedString { data_type, .. } => {
+            sql_datatype_is_timestamptz(data_type).unwrap_or(false)
+        }
+        Expr::AtTimeZone { timestamp, .. } => !expr_is_timestamptz_join(timestamp, ctx),
+        Expr::Nested(inner) => expr_is_timestamptz_join(inner, ctx),
+        _ => false,
+    }
 }
 
 pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
@@ -213,6 +315,24 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             }
             _ => Ok(Value::Text(value.clone())),
         },
+        Expr::AtTimeZone { timestamp, time_zone } => {
+            let ts = eval_expr_join(timestamp, ctx)?;
+            if matches!(ts, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let offset_secs = parse_timezone_offset_seconds(time_zone)?;
+
+            let Value::Timestamp(ts_millis) = ts else {
+                return Err(anyhow!("AT TIME ZONE requires timestamp"));
+            };
+
+            let offset_ms = i64::from(offset_secs) * 1000;
+            if expr_is_timestamptz_join(timestamp, ctx) {
+                Ok(Value::Timestamp(ts_millis + offset_ms))
+            } else {
+                Ok(Value::Timestamp(ts_millis - offset_ms))
+            }
+        }
         Expr::Like {
             negated,
             expr,
@@ -224,11 +344,7 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             let (Value::Text(s), Value::Text(p)) = (&val, &pat) else {
                 return Ok(Value::Boolean(false));
             };
-            let esc = escape_char
-                .as_ref()
-                .map(|c| c.to_string())
-                .unwrap_or_default();
-            let matched = like_match(s, p, &esc, false);
+            let matched = like_match(s, p, *escape_char, false);
             Ok(Value::Boolean(if *negated { !matched } else { matched }))
         }
         Expr::ILike {
@@ -242,11 +358,7 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             let (Value::Text(s), Value::Text(p)) = (&val, &pat) else {
                 return Ok(Value::Boolean(false));
             };
-            let esc = escape_char
-                .as_ref()
-                .map(|c| c.to_string())
-                .unwrap_or_default();
-            let matched = like_match(s, p, &esc, true);
+            let matched = like_match(s, p, *escape_char, true);
             Ok(Value::Boolean(if *negated { !matched } else { matched }))
         }
         Expr::SimilarTo {
@@ -297,6 +409,32 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             expr, data_type, ..
         } => {
             let val = eval_expr_join(expr, ctx)?;
+            use sqlparser::ast::DataType as SqlType;
+            if matches!(data_type, SqlType::Text | SqlType::Varchar(_) | SqlType::String(_)) {
+                if let Value::Timestamp(ts) = val {
+                    let is_timestamptz = expr_is_timestamptz_join(expr, ctx);
+                    let mut s = crate::types::timestamp::format_timestamp_millis(ts, is_timestamptz)?;
+                    match data_type {
+                        SqlType::Varchar(Some(sqlparser::ast::CharacterLength::IntegerLength {
+                            length,
+                            ..
+                        })) => {
+                            let max_len = *length as usize;
+                            if s.chars().count() > max_len {
+                                s = s.chars().take(max_len).collect();
+                            }
+                        }
+                        SqlType::String(Some(n)) => {
+                            let max_len = *n as usize;
+                            if s.chars().count() > max_len {
+                                s = s.chars().take(max_len).collect();
+                            }
+                        }
+                        _ => {}
+                    }
+                    return Ok(Value::Text(s));
+                }
+            }
             cast_value(val, data_type)
         }
         Expr::Substring {
@@ -306,57 +444,79 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             ..
         } => {
             let val = eval_expr_join(expr, ctx)?;
-            let Value::Text(s) = val else {
-                return Ok(Value::Null);
-            };
             let from_val = if let Some(from_expr) = substring_from {
                 Some(eval_expr_join(from_expr, ctx)?)
             } else {
                 None
             };
 
-            if let (Some(Value::Text(pattern)), None) = (&from_val, substring_for) {
-                let re = regex::Regex::new(pattern)
-                    .map_err(|e| anyhow!("Invalid regex pattern in SUBSTRING: {}", e))?;
-                if let Some(caps) = re.captures(&s) {
-                    if caps.len() > 1 {
-                        return Ok(caps
-                            .get(1)
-                            .map(|m| Value::Text(m.as_str().to_string()))
-                            .unwrap_or(Value::Null));
+            match val {
+                Value::Text(s) => {
+                    if let (Some(Value::Text(pattern)), None) = (&from_val, substring_for) {
+                        let re = regex::Regex::new(pattern)
+                            .map_err(|e| anyhow!("Invalid regex pattern in SUBSTRING: {}", e))?;
+                        if let Some(caps) = re.captures(&s) {
+                            if caps.len() > 1 {
+                                return Ok(caps
+                                    .get(1)
+                                    .map(|m| Value::Text(m.as_str().to_string()))
+                                    .unwrap_or(Value::Null));
+                            }
+                            return Ok(caps
+                                .get(0)
+                                .map(|m| Value::Text(m.as_str().to_string()))
+                                .unwrap_or(Value::Null));
+                        }
+                        return Ok(Value::Null);
                     }
-                    return Ok(caps
-                        .get(0)
-                        .map(|m| Value::Text(m.as_str().to_string()))
-                        .unwrap_or(Value::Null));
-                }
-                return Ok(Value::Null);
-            }
 
-            let start = match from_val {
-                Some(Value::Int32(n)) => (n - 1).max(0) as usize,
-                Some(Value::Int64(n)) => (n - 1).max(0) as usize,
-                Some(Value::Null) => return Ok(Value::Null),
-                Some(_) => 0,
-                None => 0,
-            };
-            let len = if let Some(for_expr) = substring_for {
-                match eval_expr_join(for_expr, ctx)? {
-                    Value::Int32(n) => Some(n.max(0) as usize),
-                    Value::Int64(n) => Some(n.max(0) as usize),
-                    Value::Null => return Ok(Value::Null),
-                    _ => None,
+                    let start = match &from_val {
+                        Some(Value::Int32(n)) => (n - 1).max(0) as usize,
+                        Some(Value::Int64(n)) => (n - 1).max(0) as usize,
+                        Some(Value::Null) => return Ok(Value::Null),
+                        Some(_) => 0,
+                        None => 0,
+                    };
+                    let len = if let Some(for_expr) = substring_for {
+                        match eval_expr_join(for_expr, ctx)? {
+                            Value::Int32(n) => Some(n.max(0) as usize),
+                            Value::Int64(n) => Some(n.max(0) as usize),
+                            Value::Null => return Ok(Value::Null),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let chars: Vec<char> = s.chars().collect();
+                    let result: String = if let Some(l) = len {
+                        chars.iter().skip(start).take(l).collect()
+                    } else {
+                        chars.iter().skip(start).collect()
+                    };
+                    Ok(Value::Text(result))
                 }
-            } else {
-                None
-            };
-            let chars: Vec<char> = s.chars().collect();
-            let result: String = if let Some(l) = len {
-                chars.iter().skip(start).take(l).collect()
-            } else {
-                chars.iter().skip(start).collect()
-            };
-            Ok(Value::Text(result))
+                Value::Bytes(bytes) => {
+                    let start = match &from_val {
+                        Some(Value::Int32(n)) => i64::from(*n),
+                        Some(Value::Int64(n)) => *n,
+                        Some(Value::Null) => return Ok(Value::Null),
+                        Some(_) => return Ok(Value::Null),
+                        None => 0,
+                    };
+                    let count = if let Some(for_expr) = substring_for {
+                        match eval_expr_join(for_expr, ctx)? {
+                            Value::Int32(n) => Some(i64::from(n.max(0))),
+                            Value::Int64(n) => Some(n.max(0)),
+                            Value::Null => return Ok(Value::Null),
+                            _ => return Ok(Value::Null),
+                        }
+                    } else {
+                        None
+                    };
+                    Ok(Value::Bytes(super::bytea::substring(bytes, start, count)))
+                }
+                _ => Ok(Value::Null),
+            }
         }
         Expr::Trim {
             expr,
@@ -482,34 +642,45 @@ pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
                 Some(e) => Some(eval_expr_join(e, ctx)?),
                 None => None,
             };
-
-            let Value::Text(base) = base else {
-                return Ok(Value::Null);
-            };
-            let Value::Text(what) = what else {
-                return Ok(Value::Null);
-            };
             let start = match from {
-                Value::Int32(n) => n,
-                Value::Int64(n) => n as i32,
+                Value::Int32(n) => i64::from(n),
+                Value::Int64(n) => n,
+                Value::Null => return Ok(Value::Null),
                 _ => return Ok(Value::Null),
             };
-            if start <= 0 {
-                return Ok(Value::Text(base));
-            }
             let replace_len = match for_len {
-                Some(Value::Int32(n)) => n.max(0) as usize,
-                Some(Value::Int64(n)) => (n.max(0) as i32) as usize,
+                Some(Value::Int32(n)) => Some(i64::from(n.max(0))),
+                Some(Value::Int64(n)) => Some(n.max(0)),
+                Some(Value::Null) => return Ok(Value::Null),
                 Some(_) => return Ok(Value::Null),
-                None => what.chars().count(),
+                None => None,
             };
 
-            let base_chars: Vec<char> = base.chars().collect();
-            let start_idx = (start - 1) as usize;
-            let prefix: String = base_chars.iter().take(start_idx).collect();
-            let suffix_start = start_idx.saturating_add(replace_len);
-            let suffix: String = base_chars.iter().skip(suffix_start).collect();
-            Ok(Value::Text(format!("{prefix}{what}{suffix}")))
+            match (base, what) {
+                (Value::Text(base), Value::Text(what)) => {
+                    if start <= 0 {
+                        return Ok(Value::Text(base));
+                    }
+                    let replace_len = match replace_len {
+                        Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
+                        None => what.chars().count(),
+                    };
+
+                    let base_chars: Vec<char> = base.chars().collect();
+                    let start_idx = usize::try_from(start - 1).unwrap_or(usize::MAX);
+                    let prefix: String = base_chars.iter().take(start_idx).collect();
+                    let suffix_start = start_idx.saturating_add(replace_len);
+                    let suffix: String = base_chars.iter().skip(suffix_start).collect();
+                    Ok(Value::Text(format!("{prefix}{what}{suffix}")))
+                }
+                (Value::Bytes(base), Value::Bytes(what)) => Ok(Value::Bytes(super::bytea::overlay(
+                    base,
+                    &what,
+                    start,
+                    replace_len,
+                ))),
+                _ => Ok(Value::Null),
+            }
         }
         Expr::AnyOp {
             left,
@@ -629,6 +800,11 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
             Some(Value::Bytes(b)) => Ok(Value::Int32(b.len() as i32)),
             _ => Ok(Value::Null),
         },
+        "GET_BIT" => eval_get_bit_from_args(args),
+        "SET_BIT" => eval_set_bit_from_args(args),
+        "INT8SEND" => eval_int8send_from_args(args),
+        "INT4SEND" => eval_int4send_from_args(args),
+        "UUID_SEND" => eval_uuid_send_from_args(args),
         "CONCAT" => {
             let mut result = String::new();
             for val in args {
@@ -757,11 +933,17 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
             _ => Ok(Value::Null),
         },
         "NOW" | "CURRENT_TIMESTAMP" => {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
+            if args.len() > 1 {
+                return Err(anyhow!("{} expects 0 or 1 argument", func_name));
+            }
+            let precision = match args.first() {
+                None => 6_u32,
+                Some(Value::Int32(p)) => (*p).clamp(0, 6) as u32,
+                Some(Value::Int64(p)) => (*p).clamp(0, 6) as u32,
+                _ => 6_u32,
+            };
+            let ts = super::statement_time::statement_timestamp_millis_or_now();
+            let ts = crate::types::timestamp::truncate_timestamp_millis(ts, precision);
             Ok(Value::Timestamp(ts))
         }
         "CURRENT_DATE" => {
@@ -856,97 +1038,106 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
             if args.len() != 2 {
                 return Err(anyhow!("jsonb_exists requires exactly 2 arguments"));
             }
-            let json_str = match &args[0] {
-                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s.clone(),
+            let mut iter = args.into_iter();
+            let json_str = match iter.next().unwrap_or(Value::Null) {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
                 Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
-            let key = match &args[1] {
-                Value::Text(s) => s.clone(),
+            let key = match iter.next().unwrap_or(Value::Null) {
+                Value::Text(s) => s,
                 Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
 
             let json_val: serde_json::Value =
                 serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
-
-            let exists = match json_val {
-                serde_json::Value::Object(obj) => obj.contains_key(&key),
-                serde_json::Value::Array(arr) => arr
-                    .into_iter()
-                    .any(|v| matches!(v, serde_json::Value::String(s) if s == key)),
-                _ => false,
-            };
-            Ok(Value::Boolean(exists))
+            Ok(Value::Boolean(super::jsonb::exists(&json_val, &key)))
         }
         "JSONB_EXISTS_ANY" => {
             if args.len() != 2 {
                 return Err(anyhow!("jsonb_exists_any requires exactly 2 arguments"));
             }
-            let json_str = match &args[0] {
-                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s.clone(),
+            let mut iter = args.into_iter();
+            let json_str = match iter.next().unwrap_or(Value::Null) {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
                 Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
-            let keys: Vec<String> = match &args[1] {
-                Value::Array(vals) => vals
-                    .iter()
-                    .filter_map(|v| match v {
-                        Value::Null => None,
-                        Value::Text(s) => Some(s.clone()),
-                        other => Some(other.to_string()),
-                    })
-                    .collect(),
-                Value::Null => return Ok(Value::Null),
-                v => vec![v.to_string()],
-            };
+            let keys_val = iter.next().unwrap_or(Value::Null);
 
             let json_val: serde_json::Value =
                 serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
 
-            let exists_any = match json_val {
-                serde_json::Value::Object(obj) => keys.iter().any(|k| obj.contains_key(k)),
-                serde_json::Value::Array(arr) => keys.iter().any(|k| {
-                    arr.iter()
-                        .any(|v| matches!(v, serde_json::Value::String(s) if s == k))
-                }),
-                _ => false,
+            let exists_any = match keys_val {
+                Value::Array(keys) => {
+                    if keys.iter().all(|k| matches!(k, Value::Null | Value::Text(_))) {
+                        super::jsonb::exists_any(
+                            &json_val,
+                            keys.iter().filter_map(|k| match k {
+                                Value::Text(s) => Some(s.as_str()),
+                                _ => None,
+                            }),
+                        )
+                    } else {
+                        keys.iter().any(|k| {
+                            if let Value::Null = k {
+                                return false;
+                            }
+                            match k {
+                                Value::Text(s) => super::jsonb::exists(&json_val, s),
+                                other => super::jsonb::exists(&json_val, &other.to_string()),
+                            }
+                        })
+                    }
+                }
+                Value::Null => return Ok(Value::Null),
+                other => super::jsonb::exists(&json_val, &other.to_string()),
             };
+
             Ok(Value::Boolean(exists_any))
         }
         "JSONB_EXISTS_ALL" => {
             if args.len() != 2 {
                 return Err(anyhow!("jsonb_exists_all requires exactly 2 arguments"));
             }
-            let json_str = match &args[0] {
-                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s.clone(),
+            let mut iter = args.into_iter();
+            let json_str = match iter.next().unwrap_or(Value::Null) {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
                 Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
-            let keys: Vec<String> = match &args[1] {
-                Value::Array(vals) => vals
-                    .iter()
-                    .filter_map(|v| match v {
-                        Value::Null => None,
-                        Value::Text(s) => Some(s.clone()),
-                        other => Some(other.to_string()),
-                    })
-                    .collect(),
-                Value::Null => return Ok(Value::Null),
-                v => vec![v.to_string()],
-            };
+            let keys_val = iter.next().unwrap_or(Value::Null);
 
             let json_val: serde_json::Value =
                 serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
 
-            let exists_all = match json_val {
-                serde_json::Value::Object(obj) => keys.iter().all(|k| obj.contains_key(k)),
-                serde_json::Value::Array(arr) => keys.iter().all(|k| {
-                    arr.iter()
-                        .any(|v| matches!(v, serde_json::Value::String(s) if s == k))
-                }),
-                _ => false,
+            let exists_all = match keys_val {
+                Value::Array(keys) => {
+                    if keys.iter().all(|k| matches!(k, Value::Null | Value::Text(_))) {
+                        super::jsonb::exists_all(
+                            &json_val,
+                            keys.iter().filter_map(|k| match k {
+                                Value::Text(s) => Some(s.as_str()),
+                                _ => None,
+                            }),
+                        )
+                    } else {
+                        keys.iter().all(|k| {
+                            if let Value::Null = k {
+                                return true;
+                            }
+                            match k {
+                                Value::Text(s) => super::jsonb::exists(&json_val, s),
+                                other => super::jsonb::exists(&json_val, &other.to_string()),
+                            }
+                        })
+                    }
+                }
+                Value::Null => return Ok(Value::Null),
+                other => super::jsonb::exists(&json_val, &other.to_string()),
             };
+
             Ok(Value::Boolean(exists_all))
         }
         "JSONB_ARRAY_LENGTH"
@@ -1198,11 +1389,7 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             let (Value::Text(s), Value::Text(p)) = (&val, &pat) else {
                 return Ok(Value::Boolean(false));
             };
-            let esc = escape_char
-                .as_ref()
-                .map(|c| c.to_string())
-                .unwrap_or_default();
-            let matched = like_match(s, p, &esc, false);
+            let matched = like_match(s, p, *escape_char, false);
             Ok(Value::Boolean(if *negated { !matched } else { matched }))
         }
         Expr::ILike {
@@ -1216,11 +1403,7 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             let (Value::Text(s), Value::Text(p)) = (&val, &pat) else {
                 return Ok(Value::Boolean(false));
             };
-            let esc = escape_char
-                .as_ref()
-                .map(|c| c.to_string())
-                .unwrap_or_default();
-            let matched = like_match(s, p, &esc, true);
+            let matched = like_match(s, p, *escape_char, true);
             Ok(Value::Boolean(if *negated { !matched } else { matched }))
         }
         Expr::SimilarTo {
@@ -1271,6 +1454,32 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             expr, data_type, ..
         } => {
             let val = eval_expr(expr, row, schema)?;
+            use sqlparser::ast::DataType as SqlType;
+            if matches!(data_type, SqlType::Text | SqlType::Varchar(_) | SqlType::String(_)) {
+                if let Value::Timestamp(ts) = val {
+                    let is_timestamptz = expr_is_timestamptz(expr, schema);
+                    let mut s = crate::types::timestamp::format_timestamp_millis(ts, is_timestamptz)?;
+                    match data_type {
+                        SqlType::Varchar(Some(sqlparser::ast::CharacterLength::IntegerLength {
+                            length,
+                            ..
+                        })) => {
+                            let max_len = *length as usize;
+                            if s.chars().count() > max_len {
+                                s = s.chars().take(max_len).collect();
+                            }
+                        }
+                        SqlType::String(Some(n)) => {
+                            let max_len = *n as usize;
+                            if s.chars().count() > max_len {
+                                s = s.chars().take(max_len).collect();
+                            }
+                        }
+                        _ => {}
+                    }
+                    return Ok(Value::Text(s));
+                }
+            }
             cast_value(val, data_type)
         }
         Expr::Substring {
@@ -1280,57 +1489,79 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             ..
         } => {
             let val = eval_expr(expr, row, schema)?;
-            let Value::Text(s) = val else {
-                return Ok(Value::Null);
-            };
             let from_val = if let Some(from_expr) = substring_from {
                 Some(eval_expr(from_expr, row, schema)?)
             } else {
                 None
             };
 
-            if let (Some(Value::Text(pattern)), None) = (&from_val, substring_for) {
-                let re = regex::Regex::new(pattern)
-                    .map_err(|e| anyhow!("Invalid regex pattern in SUBSTRING: {}", e))?;
-                if let Some(caps) = re.captures(&s) {
-                    if caps.len() > 1 {
-                        return Ok(caps
-                            .get(1)
-                            .map(|m| Value::Text(m.as_str().to_string()))
-                            .unwrap_or(Value::Null));
+            match val {
+                Value::Text(s) => {
+                    if let (Some(Value::Text(pattern)), None) = (&from_val, substring_for) {
+                        let re = regex::Regex::new(pattern)
+                            .map_err(|e| anyhow!("Invalid regex pattern in SUBSTRING: {}", e))?;
+                        if let Some(caps) = re.captures(&s) {
+                            if caps.len() > 1 {
+                                return Ok(caps
+                                    .get(1)
+                                    .map(|m| Value::Text(m.as_str().to_string()))
+                                    .unwrap_or(Value::Null));
+                            }
+                            return Ok(caps
+                                .get(0)
+                                .map(|m| Value::Text(m.as_str().to_string()))
+                                .unwrap_or(Value::Null));
+                        }
+                        return Ok(Value::Null);
                     }
-                    return Ok(caps
-                        .get(0)
-                        .map(|m| Value::Text(m.as_str().to_string()))
-                        .unwrap_or(Value::Null));
-                }
-                return Ok(Value::Null);
-            }
 
-            let start = match from_val {
-                Some(Value::Int32(n)) => (n - 1).max(0) as usize,
-                Some(Value::Int64(n)) => (n - 1).max(0) as usize,
-                Some(Value::Null) => return Ok(Value::Null),
-                Some(_) => 0,
-                None => 0,
-            };
-            let len = if let Some(for_expr) = substring_for {
-                match eval_expr(for_expr, row, schema)? {
-                    Value::Int32(n) => Some(n.max(0) as usize),
-                    Value::Int64(n) => Some(n.max(0) as usize),
-                    Value::Null => return Ok(Value::Null),
-                    _ => None,
+                    let start = match &from_val {
+                        Some(Value::Int32(n)) => (n - 1).max(0) as usize,
+                        Some(Value::Int64(n)) => (n - 1).max(0) as usize,
+                        Some(Value::Null) => return Ok(Value::Null),
+                        Some(_) => 0,
+                        None => 0,
+                    };
+                    let len = if let Some(for_expr) = substring_for {
+                        match eval_expr(for_expr, row, schema)? {
+                            Value::Int32(n) => Some(n.max(0) as usize),
+                            Value::Int64(n) => Some(n.max(0) as usize),
+                            Value::Null => return Ok(Value::Null),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let chars: Vec<char> = s.chars().collect();
+                    let result: String = if let Some(l) = len {
+                        chars.iter().skip(start).take(l).collect()
+                    } else {
+                        chars.iter().skip(start).collect()
+                    };
+                    Ok(Value::Text(result))
                 }
-            } else {
-                None
-            };
-            let chars: Vec<char> = s.chars().collect();
-            let result: String = if let Some(l) = len {
-                chars.iter().skip(start).take(l).collect()
-            } else {
-                chars.iter().skip(start).collect()
-            };
-            Ok(Value::Text(result))
+                Value::Bytes(bytes) => {
+                    let start = match &from_val {
+                        Some(Value::Int32(n)) => i64::from(*n),
+                        Some(Value::Int64(n)) => *n,
+                        Some(Value::Null) => return Ok(Value::Null),
+                        Some(_) => return Ok(Value::Null),
+                        None => 0,
+                    };
+                    let count = if let Some(for_expr) = substring_for {
+                        match eval_expr(for_expr, row, schema)? {
+                            Value::Int32(n) => Some(i64::from(n.max(0))),
+                            Value::Int64(n) => Some(n.max(0)),
+                            Value::Null => return Ok(Value::Null),
+                            _ => return Ok(Value::Null),
+                        }
+                    } else {
+                        None
+                    };
+                    Ok(Value::Bytes(super::bytea::substring(bytes, start, count)))
+                }
+                _ => Ok(Value::Null),
+            }
         }
         Expr::Trim {
             expr,
@@ -1469,6 +1700,24 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
             }
             _ => Ok(Value::Text(value.clone())),
         },
+        Expr::AtTimeZone { timestamp, time_zone } => {
+            let ts = eval_expr(timestamp, row, schema)?;
+            if matches!(ts, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let offset_secs = parse_timezone_offset_seconds(time_zone)?;
+
+            let Value::Timestamp(ts_millis) = ts else {
+                return Err(anyhow!("AT TIME ZONE requires timestamp"));
+            };
+
+            let offset_ms = i64::from(offset_secs) * 1000;
+            if expr_is_timestamptz(timestamp, schema) {
+                Ok(Value::Timestamp(ts_millis + offset_ms))
+            } else {
+                Ok(Value::Timestamp(ts_millis - offset_ms))
+            }
+        }
         Expr::JsonAccess {
             left,
             operator,
@@ -1505,34 +1754,45 @@ pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -
                 Some(e) => Some(eval_expr(e, row, schema)?),
                 None => None,
             };
-
-            let Value::Text(base) = base else {
-                return Ok(Value::Null);
-            };
-            let Value::Text(what) = what else {
-                return Ok(Value::Null);
-            };
             let start = match from {
-                Value::Int32(n) => n,
-                Value::Int64(n) => n as i32,
+                Value::Int32(n) => i64::from(n),
+                Value::Int64(n) => n,
+                Value::Null => return Ok(Value::Null),
                 _ => return Ok(Value::Null),
             };
-            if start <= 0 {
-                return Ok(Value::Text(base));
-            }
             let replace_len = match for_len {
-                Some(Value::Int32(n)) => n.max(0) as usize,
-                Some(Value::Int64(n)) => (n.max(0) as i32) as usize,
+                Some(Value::Int32(n)) => Some(i64::from(n.max(0))),
+                Some(Value::Int64(n)) => Some(n.max(0)),
+                Some(Value::Null) => return Ok(Value::Null),
                 Some(_) => return Ok(Value::Null),
-                None => what.chars().count(),
+                None => None,
             };
 
-            let base_chars: Vec<char> = base.chars().collect();
-            let start_idx = (start - 1) as usize;
-            let prefix: String = base_chars.iter().take(start_idx).collect();
-            let suffix_start = start_idx.saturating_add(replace_len);
-            let suffix: String = base_chars.iter().skip(suffix_start).collect();
-            Ok(Value::Text(format!("{prefix}{what}{suffix}")))
+            match (base, what) {
+                (Value::Text(base), Value::Text(what)) => {
+                    if start <= 0 {
+                        return Ok(Value::Text(base));
+                    }
+                    let replace_len = match replace_len {
+                        Some(n) => usize::try_from(n).unwrap_or(usize::MAX),
+                        None => what.chars().count(),
+                    };
+
+                    let base_chars: Vec<char> = base.chars().collect();
+                    let start_idx = usize::try_from(start - 1).unwrap_or(usize::MAX);
+                    let prefix: String = base_chars.iter().take(start_idx).collect();
+                    let suffix_start = start_idx.saturating_add(replace_len);
+                    let suffix: String = base_chars.iter().skip(suffix_start).collect();
+                    Ok(Value::Text(format!("{prefix}{what}{suffix}")))
+                }
+                (Value::Bytes(base), Value::Bytes(what)) => Ok(Value::Bytes(super::bytea::overlay(
+                    base,
+                    &what,
+                    start,
+                    replace_len,
+                ))),
+                _ => Ok(Value::Null),
+            }
         }
         Expr::AnyOp {
             left,
@@ -1696,6 +1956,11 @@ fn eval_function(
             Some(Value::Bytes(b)) => Ok(Value::Int32((b.len() * 8) as i32)),
             _ => Ok(Value::Null),
         },
+        "GET_BIT" => eval_get_bit_from_args(args),
+        "SET_BIT" => eval_set_bit_from_args(args),
+        "INT8SEND" => eval_int8send_from_args(args),
+        "INT4SEND" => eval_int4send_from_args(args),
+        "UUID_SEND" => eval_uuid_send_from_args(args),
         "CONCAT" => {
             let mut result = String::new();
             for val in args {
@@ -2523,11 +2788,17 @@ fn eval_function(
         "PI" => Ok(Value::Float64(std::f64::consts::PI)),
         "RANDOM" => Ok(Value::Float64(rand::random::<f64>())),
         "NOW" | "CURRENT_TIMESTAMP" => {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_millis() as i64;
+            if args.len() > 1 {
+                return Err(anyhow!("{} expects 0 or 1 argument", func_name));
+            }
+            let precision = match args.first() {
+                None => 6_u32,
+                Some(Value::Int32(p)) => (*p).clamp(0, 6) as u32,
+                Some(Value::Int64(p)) => (*p).clamp(0, 6) as u32,
+                _ => 6_u32,
+            };
+            let ts = super::statement_time::statement_timestamp_millis_or_now();
+            let ts = crate::types::timestamp::truncate_timestamp_millis(ts, precision);
             Ok(Value::Timestamp(ts))
         }
         "CURRENT_DATE" => {
@@ -2954,97 +3225,106 @@ fn eval_function(
             if args.len() != 2 {
                 return Err(anyhow!("jsonb_exists requires exactly 2 arguments"));
             }
-            let json_str = match &args[0] {
-                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s.clone(),
+            let mut iter = args.into_iter();
+            let json_str = match iter.next().unwrap_or(Value::Null) {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
                 Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
-            let key = match &args[1] {
-                Value::Text(s) => s.clone(),
+            let key = match iter.next().unwrap_or(Value::Null) {
+                Value::Text(s) => s,
                 Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
 
             let json_val: serde_json::Value =
                 serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
-
-            let exists = match json_val {
-                serde_json::Value::Object(obj) => obj.contains_key(&key),
-                serde_json::Value::Array(arr) => arr
-                    .into_iter()
-                    .any(|v| matches!(v, serde_json::Value::String(s) if s == key)),
-                _ => false,
-            };
-            Ok(Value::Boolean(exists))
+            Ok(Value::Boolean(super::jsonb::exists(&json_val, &key)))
         }
         "JSONB_EXISTS_ANY" => {
             if args.len() != 2 {
                 return Err(anyhow!("jsonb_exists_any requires exactly 2 arguments"));
             }
-            let json_str = match &args[0] {
-                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s.clone(),
+            let mut iter = args.into_iter();
+            let json_str = match iter.next().unwrap_or(Value::Null) {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
                 Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
-            let keys: Vec<String> = match &args[1] {
-                Value::Array(vals) => vals
-                    .iter()
-                    .filter_map(|v| match v {
-                        Value::Null => None,
-                        Value::Text(s) => Some(s.clone()),
-                        other => Some(other.to_string()),
-                    })
-                    .collect(),
-                Value::Null => return Ok(Value::Null),
-                v => vec![v.to_string()],
-            };
+            let keys_val = iter.next().unwrap_or(Value::Null);
 
             let json_val: serde_json::Value =
                 serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
 
-            let exists_any = match json_val {
-                serde_json::Value::Object(obj) => keys.iter().any(|k| obj.contains_key(k)),
-                serde_json::Value::Array(arr) => keys.iter().any(|k| {
-                    arr.iter()
-                        .any(|v| matches!(v, serde_json::Value::String(s) if s == k))
-                }),
-                _ => false,
+            let exists_any = match keys_val {
+                Value::Array(keys) => {
+                    if keys.iter().all(|k| matches!(k, Value::Null | Value::Text(_))) {
+                        super::jsonb::exists_any(
+                            &json_val,
+                            keys.iter().filter_map(|k| match k {
+                                Value::Text(s) => Some(s.as_str()),
+                                _ => None,
+                            }),
+                        )
+                    } else {
+                        keys.iter().any(|k| {
+                            if let Value::Null = k {
+                                return false;
+                            }
+                            match k {
+                                Value::Text(s) => super::jsonb::exists(&json_val, s),
+                                other => super::jsonb::exists(&json_val, &other.to_string()),
+                            }
+                        })
+                    }
+                }
+                Value::Null => return Ok(Value::Null),
+                other => super::jsonb::exists(&json_val, &other.to_string()),
             };
+
             Ok(Value::Boolean(exists_any))
         }
         "JSONB_EXISTS_ALL" => {
             if args.len() != 2 {
                 return Err(anyhow!("jsonb_exists_all requires exactly 2 arguments"));
             }
-            let json_str = match &args[0] {
-                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s.clone(),
+            let mut iter = args.into_iter();
+            let json_str = match iter.next().unwrap_or(Value::Null) {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
                 Value::Null => return Ok(Value::Null),
                 v => v.to_string(),
             };
-            let keys: Vec<String> = match &args[1] {
-                Value::Array(vals) => vals
-                    .iter()
-                    .filter_map(|v| match v {
-                        Value::Null => None,
-                        Value::Text(s) => Some(s.clone()),
-                        other => Some(other.to_string()),
-                    })
-                    .collect(),
-                Value::Null => return Ok(Value::Null),
-                v => vec![v.to_string()],
-            };
+            let keys_val = iter.next().unwrap_or(Value::Null);
 
             let json_val: serde_json::Value =
                 serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
 
-            let exists_all = match json_val {
-                serde_json::Value::Object(obj) => keys.iter().all(|k| obj.contains_key(k)),
-                serde_json::Value::Array(arr) => keys.iter().all(|k| {
-                    arr.iter()
-                        .any(|v| matches!(v, serde_json::Value::String(s) if s == k))
-                }),
-                _ => false,
+            let exists_all = match keys_val {
+                Value::Array(keys) => {
+                    if keys.iter().all(|k| matches!(k, Value::Null | Value::Text(_))) {
+                        super::jsonb::exists_all(
+                            &json_val,
+                            keys.iter().filter_map(|k| match k {
+                                Value::Text(s) => Some(s.as_str()),
+                                _ => None,
+                            }),
+                        )
+                    } else {
+                        keys.iter().all(|k| {
+                            if let Value::Null = k {
+                                return true;
+                            }
+                            match k {
+                                Value::Text(s) => super::jsonb::exists(&json_val, s),
+                                other => super::jsonb::exists(&json_val, &other.to_string()),
+                            }
+                        })
+                    }
+                }
+                Value::Null => return Ok(Value::Null),
+                other => super::jsonb::exists(&json_val, &other.to_string()),
             };
+
             Ok(Value::Boolean(exists_all))
         }
         "JSONB_OBJECT_KEYS" | "JSON_OBJECT_KEYS" => {
@@ -3697,16 +3977,112 @@ fn eval_function(
     }
 }
 
-fn like_match(s: &str, pattern: &str, _escape: &str, case_insensitive: bool) -> bool {
-    let (s, pattern) = if case_insensitive {
-        (s.to_lowercase(), pattern.to_lowercase())
-    } else {
-        (s.to_string(), pattern.to_string())
-    };
-    let regex_pattern = pattern.replace('%', ".*").replace('_', ".");
-    regex::Regex::new(&format!("^{}$", regex_pattern))
-        .map(|re| re.is_match(&s))
-        .unwrap_or(false)
+fn like_match(s: &str, pattern: &str, escape_char: Option<char>, case_insensitive: bool) -> bool {
+    if case_insensitive {
+        return like_match_impl(
+            &s.to_lowercase(),
+            &pattern.to_lowercase(),
+            escape_char,
+        );
+    }
+    like_match_impl(s, pattern, escape_char)
+}
+
+fn like_match_impl(s: &str, pattern: &str, escape_char: Option<char>) -> bool {
+    #[inline]
+    fn next_char_at(s: &str, idx: usize) -> Option<(char, usize)> {
+        let ch = s[idx..].chars().next()?;
+        Some((ch, idx + ch.len_utf8()))
+    }
+
+    let mut s_idx = 0usize;
+    let mut p_idx = 0usize;
+
+    // Backtracking positions for the most recent '%'.
+    let mut backtrack_p: Option<usize> = None;
+    let mut backtrack_s: usize = 0;
+
+    while s_idx < s.len() {
+        if p_idx < pattern.len() {
+            let (pc, p_next) = next_char_at(pattern, p_idx).expect("p_idx < len");
+
+            if escape_char.is_some_and(|esc| pc == esc) {
+                // Escape: treat the next pattern character as a literal.
+                if let Some((lit, p_after)) = next_char_at(pattern, p_next) {
+                    if let Some((sc, s_next)) = next_char_at(s, s_idx) {
+                        if sc == lit {
+                            s_idx = s_next;
+                            p_idx = p_after;
+                            continue;
+                        }
+                    }
+                } else if let Some((sc, s_next)) = next_char_at(s, s_idx) {
+                    // Trailing escape char: match it literally.
+                    let esc = escape_char.expect("checked is_some");
+                    if sc == esc {
+                        s_idx = s_next;
+                        p_idx = p_next;
+                        continue;
+                    }
+                }
+            } else if pc == '%' {
+                // Collapse consecutive '%' and record the backtracking point.
+                let mut p_after = p_next;
+                while p_after < pattern.len() {
+                    let (next_pc, next_next) =
+                        next_char_at(pattern, p_after).expect("p_after < len");
+                    if next_pc != '%' {
+                        break;
+                    }
+                    p_after = next_next;
+                }
+                backtrack_p = Some(p_after);
+                backtrack_s = s_idx;
+                p_idx = p_after;
+                continue;
+            } else if pc == '_' {
+                // Match any single character.
+                if let Some((_sc, s_next)) = next_char_at(s, s_idx) {
+                    s_idx = s_next;
+                    p_idx = p_next;
+                    continue;
+                }
+            } else if let Some((sc, s_next)) = next_char_at(s, s_idx) {
+                if sc == pc {
+                    s_idx = s_next;
+                    p_idx = p_next;
+                    continue;
+                }
+            }
+        }
+
+        // Mismatch: if we have a previous '%', backtrack and let it consume one more character.
+        if let Some(p_after_percent) = backtrack_p {
+            if backtrack_s < s.len() {
+                let (_sc, s_next) = next_char_at(s, backtrack_s).expect("backtrack_s < len");
+                backtrack_s = s_next;
+                s_idx = backtrack_s;
+                p_idx = p_after_percent;
+                continue;
+            }
+        }
+
+        return false;
+    }
+
+    // String is consumed; the remaining pattern must be empty or all '%'.
+    while p_idx < pattern.len() {
+        let (pc, p_next) = next_char_at(pattern, p_idx).expect("p_idx < len");
+        if escape_char.is_some_and(|esc| pc == esc) {
+            return false;
+        }
+        if pc != '%' {
+            return false;
+        }
+        p_idx = p_next;
+    }
+
+    true
 }
 
 fn similar_to_match(s: &str, pattern: &str, escape_char: Option<char>) -> Result<bool> {
@@ -3741,6 +4117,23 @@ fn round_half_away_from_zero(n: f64) -> f64 {
         (n + 0.5).floor()
     } else {
         (n - 0.5).ceil()
+    }
+}
+
+fn cast_to_bytea(v: Value) -> Result<Value> {
+    match v {
+        Value::Null => Ok(Value::Null),
+        Value::Bytes(_) => Ok(v),
+        Value::Text(s) => {
+            if let Some(rest) = s.strip_prefix("\\x") {
+                let bytes = hex::decode(rest)
+                    .map_err(|e| anyhow!("invalid input syntax for type bytea: {}", e))?;
+                Ok(Value::Bytes(bytes))
+            } else {
+                Ok(Value::Bytes(s.into_bytes()))
+            }
+        }
+        other => Ok(Value::Bytes(other.to_string().into_bytes())),
     }
 }
 
@@ -3901,6 +4294,7 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
             Ok(Value::Uuid(*uuid.as_bytes()))
         }
         (Value::Uuid(bytes), SqlType::Uuid) => Ok(Value::Uuid(bytes)),
+        (v, SqlType::Bytea) => cast_to_bytea(v),
         (v, SqlType::Custom(name, _)) => {
             if let Some(ident) = name.0.last() {
                 let type_name = ident.value.to_uppercase();
@@ -3916,21 +4310,7 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                             .map_err(|e| anyhow!("invalid input syntax for type json: {}", e))?;
                         Ok(Value::Json(s))
                     }
-                    "BYTEA" => match v {
-                        Value::Null => Ok(Value::Null),
-                        Value::Bytes(_) => Ok(v),
-                        Value::Text(s) => {
-                            if let Some(rest) = s.strip_prefix("\\x") {
-                                let bytes = hex::decode(rest).map_err(|e| {
-                                    anyhow!("invalid input syntax for type bytea: {}", e)
-                                })?;
-                                Ok(Value::Bytes(bytes))
-                            } else {
-                                Ok(Value::Bytes(s.into_bytes()))
-                            }
-                        }
-                        other => Ok(Value::Bytes(other.to_string().into_bytes())),
-                    },
+                    "BYTEA" => cast_to_bytea(v),
                     "JSONB" => {
                         let s = match &v {
                             Value::Text(s) => s.clone(),
@@ -4085,6 +4465,94 @@ fn pg_to_chrono_format(fmt: &str) -> String {
     out
 }
 
+fn eval_get_bit_from_args(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(anyhow!("get_bit requires exactly 2 arguments"));
+    }
+    let mut iter = args.into_iter();
+    let bytes = match iter.next().unwrap_or(Value::Null) {
+        Value::Bytes(b) => b,
+        Value::Null => return Ok(Value::Null),
+        _ => return Err(anyhow!("get_bit requires bytea as first argument")),
+    };
+    let bit_index = match iter.next().unwrap_or(Value::Null) {
+        Value::Int32(n) => i64::from(n),
+        Value::Int64(n) => n,
+        Value::Null => return Ok(Value::Null),
+        _ => return Err(anyhow!("get_bit requires integer bit index")),
+    };
+    let bit = super::bytea::get_bit(&bytes, bit_index)?;
+    Ok(Value::Int32(bit))
+}
+
+fn eval_set_bit_from_args(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 3 {
+        return Err(anyhow!("set_bit requires exactly 3 arguments"));
+    }
+    let mut iter = args.into_iter();
+    let bytes = match iter.next().unwrap_or(Value::Null) {
+        Value::Bytes(b) => b,
+        Value::Null => return Ok(Value::Null),
+        _ => return Err(anyhow!("set_bit requires bytea as first argument")),
+    };
+    let bit_index = match iter.next().unwrap_or(Value::Null) {
+        Value::Int32(n) => i64::from(n),
+        Value::Int64(n) => n,
+        Value::Null => return Ok(Value::Null),
+        _ => return Err(anyhow!("set_bit requires integer bit index")),
+    };
+    let new_value = match iter.next().unwrap_or(Value::Null) {
+        Value::Int32(n) => i64::from(n),
+        Value::Int64(n) => n,
+        Value::Null => return Ok(Value::Null),
+        _ => return Err(anyhow!("set_bit requires integer new value")),
+    };
+    let bytes = super::bytea::set_bit(bytes, bit_index, new_value)?;
+    Ok(Value::Bytes(bytes))
+}
+
+fn eval_int8send_from_args(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(anyhow!("int8send requires exactly 1 argument"));
+    }
+    match args.into_iter().next().unwrap_or(Value::Null) {
+        Value::Int64(n) => Ok(Value::Bytes(super::bytea::int8send(n))),
+        Value::Int32(n) => Ok(Value::Bytes(super::bytea::int8send(i64::from(n)))),
+        Value::Null => Ok(Value::Null),
+        _ => Err(anyhow!("int8send requires bigint argument")),
+    }
+}
+
+fn eval_int4send_from_args(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(anyhow!("int4send requires exactly 1 argument"));
+    }
+    match args.into_iter().next().unwrap_or(Value::Null) {
+        Value::Int32(n) => Ok(Value::Bytes(super::bytea::int4send(n))),
+        Value::Int64(n) => Ok(Value::Bytes(super::bytea::int4send(
+            i32::try_from(n).map_err(|_| anyhow!("int4send requires int4 argument"))?,
+        ))),
+        Value::Null => Ok(Value::Null),
+        _ => Err(anyhow!("int4send requires int4 argument")),
+    }
+}
+
+fn eval_uuid_send_from_args(args: Vec<Value>) -> Result<Value> {
+    if args.len() != 1 {
+        return Err(anyhow!("uuid_send requires exactly 1 argument"));
+    }
+    match args.into_iter().next().unwrap_or(Value::Null) {
+        Value::Uuid(bytes) => Ok(Value::Bytes(super::bytea::uuid_send(bytes))),
+        Value::Text(s) => {
+            let uuid =
+                uuid::Uuid::parse_str(s.trim()).map_err(|e| anyhow!("Invalid UUID: {}", e))?;
+            Ok(Value::Bytes(super::bytea::uuid_send(*uuid.as_bytes())))
+        }
+        Value::Null => Ok(Value::Null),
+        _ => Err(anyhow!("uuid_send requires uuid argument")),
+    }
+}
+
 fn eval_to_char_from_args(args: Vec<Value>) -> Result<Value> {
     let mut iter = args.into_iter();
     let val = iter.next().unwrap_or(Value::Null);
@@ -4133,6 +4601,10 @@ fn eval_date_trunc_from_args(args: Vec<Value>) -> Result<Value> {
         },
         _ => return Ok(Value::Null),
     };
+
+    if field == "second" {
+        return Ok(Value::Timestamp(ts.div_euclid(1000) * 1000));
+    }
 
     use chrono::{Datelike, TimeZone, Timelike, Utc};
     let dt = Utc
@@ -4519,15 +4991,7 @@ fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<Valu
 
             let json_val: serde_json::Value =
                 serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
-
-            let exists = match json_val {
-                serde_json::Value::Object(obj) => obj.contains_key(&key),
-                serde_json::Value::Array(arr) => arr
-                    .into_iter()
-                    .any(|v| matches!(v, serde_json::Value::String(s) if s == key)),
-                _ => false,
-            };
-            Ok(Value::Boolean(exists))
+            Ok(Value::Boolean(super::jsonb::exists(&json_val, &key)))
         }
         BinaryOperator::PGCustomBinaryOperator(op) if op.len() == 1 && op[0] == "?" => {
             let json_str = match left {
@@ -4543,15 +5007,7 @@ fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<Valu
 
             let json_val: serde_json::Value =
                 serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
-
-            let exists = match json_val {
-                serde_json::Value::Object(obj) => obj.contains_key(&key),
-                serde_json::Value::Array(arr) => arr
-                    .into_iter()
-                    .any(|v| matches!(v, serde_json::Value::String(s) if s == key)),
-                _ => false,
-            };
-            Ok(Value::Boolean(exists))
+            Ok(Value::Boolean(super::jsonb::exists(&json_val, &key)))
         }
 
         _ => Err(anyhow!("Unsupported binary operator: {:?}", op)),
@@ -5329,41 +5785,26 @@ fn collect_json_ops<'a>(
 }
 
 fn eval_json_access(left: Value, operator: &JsonOperator, right: Value) -> Result<Value> {
+    // `@>`/`<@` are overloaded by PostgreSQL for both SQL arrays and JSONB.
     if let Value::Array(left_arr) = &left {
         match operator {
             JsonOperator::AtArrow => {
-                let right_arr = match &right {
-                    Value::Array(arr) => arr,
-                    _ => return Err(anyhow!("@> on arrays requires array operand on right")),
+                let Value::Array(right_arr) = &right else {
+                    return Err(anyhow!("@> on arrays requires array operand on right"));
                 };
                 for r in right_arr {
-                    let mut found = false;
-                    for l in left_arr {
-                        if compare_values(l, r).unwrap_or(1) == 0 {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
+                    if !left_arr.iter().any(|l| compare_values(l, r).unwrap_or(1) == 0) {
                         return Ok(Value::Boolean(false));
                     }
                 }
                 return Ok(Value::Boolean(true));
             }
             JsonOperator::ArrowAt => {
-                let right_arr = match &right {
-                    Value::Array(arr) => arr,
-                    _ => return Err(anyhow!("<@ on arrays requires array operand on right")),
+                let Value::Array(right_arr) = &right else {
+                    return Err(anyhow!("<@ on arrays requires array operand on right"));
                 };
                 for l in left_arr {
-                    let mut found = false;
-                    for r in right_arr {
-                        if compare_values(l, r).unwrap_or(1) == 0 {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if !found {
+                    if !right_arr.iter().any(|r| compare_values(l, r).unwrap_or(1) == 0) {
                         return Ok(Value::Boolean(false));
                     }
                 }
@@ -5373,20 +5814,16 @@ fn eval_json_access(left: Value, operator: &JsonOperator, right: Value) -> Resul
         }
     }
 
-    let json_str = match &left {
-        Value::Text(s) => s.clone(),
-        Value::Json(s) => s.clone(),
-        Value::Jsonb(s) => s.clone(),
+    let json_str = match left {
+        Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
         Value::Null => return Ok(Value::Null),
-        Value::Vector(v) => {
-            format!(
-                "[{}]",
-                v.iter()
-                    .map(|f| f.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            )
-        }
+        Value::Vector(v) => format!(
+            "[{}]",
+            v.iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
         _ => return Err(anyhow!("JSON operators require json/jsonb operand")),
     };
 
@@ -5395,28 +5832,30 @@ fn eval_json_access(left: Value, operator: &JsonOperator, right: Value) -> Resul
 
     match operator {
         JsonOperator::AtArrow => {
-            let right_str = match &right {
-                Value::Text(s) => s.clone(),
-                Value::Json(s) => s.clone(),
-                Value::Jsonb(s) => s.clone(),
+            let right_str = match right {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
                 Value::Null => return Ok(Value::Null),
                 _ => return Err(anyhow!("@> requires json/jsonb operand on right")),
             };
             let right_json: serde_json::Value = serde_json::from_str(&right_str)
                 .map_err(|e| anyhow!("Invalid JSON on right side of @>: {}", e))?;
-            Ok(Value::Boolean(json_contains(&json_val, &right_json)))
+            Ok(Value::Boolean(super::jsonb::contains(
+                &json_val,
+                &right_json,
+            )))
         }
         JsonOperator::ArrowAt => {
-            let right_str = match &right {
-                Value::Text(s) => s.clone(),
-                Value::Json(s) => s.clone(),
-                Value::Jsonb(s) => s.clone(),
+            let right_str = match right {
+                Value::Text(s) | Value::Json(s) | Value::Jsonb(s) => s,
                 Value::Null => return Ok(Value::Null),
                 _ => return Err(anyhow!("<@ requires json/jsonb operand on right")),
             };
             let right_json: serde_json::Value = serde_json::from_str(&right_str)
                 .map_err(|e| anyhow!("Invalid JSON on right side of <@: {}", e))?;
-            Ok(Value::Boolean(json_contains(&right_json, &json_val)))
+            Ok(Value::Boolean(super::jsonb::contains(
+                &right_json,
+                &json_val,
+            )))
         }
         JsonOperator::HashArrow | JsonOperator::HashLongArrow | JsonOperator::HashMinus => {
             let path = json_path_from_value(&right)?;
@@ -5590,18 +6029,6 @@ fn json_delete_path(current: &mut serde_json::Value, path: &[String]) -> bool {
             }
             _ => false,
         }
-    }
-}
-
-fn json_contains(a: &serde_json::Value, b: &serde_json::Value) -> bool {
-    match (a, b) {
-        (serde_json::Value::Object(obj_a), serde_json::Value::Object(obj_b)) => obj_b
-            .iter()
-            .all(|(k, v)| obj_a.get(k).map_or(false, |av| json_contains(av, v))),
-        (serde_json::Value::Array(arr_a), serde_json::Value::Array(arr_b)) => {
-            arr_b.iter().all(|bv| arr_a.iter().any(|av| av == bv))
-        }
-        _ => a == b,
     }
 }
 
@@ -5848,6 +6275,7 @@ fn vector_norm(vec: &[f64]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::statement_time;
     use rust_decimal::Decimal;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
@@ -5905,6 +6333,37 @@ mod tests {
             eval_expr(&parse_expr("false"), None, None).unwrap(),
             Value::Boolean(false)
         );
+    }
+
+    #[test]
+    fn test_at_time_zone_timestamp_to_timestamptz() {
+        let expr = parse_expr("TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'UTC'");
+        let val = eval_expr(&expr, None, None).unwrap();
+        assert_eq!(val, parse_timestamp_string("2024-01-15 10:00:00").unwrap());
+    }
+
+    #[test]
+    fn test_at_time_zone_timestamp_to_timestamptz_with_offset() {
+        let expr = parse_expr("TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'Asia/Shanghai'");
+        let val = eval_expr(&expr, None, None).unwrap();
+        assert_eq!(val, parse_timestamp_string("2024-01-15 02:00:00").unwrap());
+    }
+
+    #[test]
+    fn test_at_time_zone_chain_conversion() {
+        let expr = parse_expr(
+            "TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York'",
+        );
+        let val = eval_expr(&expr, None, None).unwrap();
+        assert_eq!(val, parse_timestamp_string("2024-01-15 05:00:00").unwrap());
+    }
+
+    #[test]
+    fn test_at_time_zone_timestamptz_to_timestamp() {
+        let expr =
+            parse_expr("TIMESTAMPTZ '2024-01-15T10:00:00Z' AT TIME ZONE 'America/New_York'");
+        let val = eval_expr(&expr, None, None).unwrap();
+        assert_eq!(val, parse_timestamp_string("2024-01-15 05:00:00").unwrap());
     }
 
     #[test]
@@ -6397,6 +6856,14 @@ mod tests {
             eval_expr(&parse_expr("'hello' NOT LIKE 'world'"), None, None).unwrap(),
             Value::Boolean(true)
         );
+        assert_eq!(
+            eval_expr(&parse_expr("'hello' LIKE '%.%'"), None, None).unwrap(),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("'a.b' LIKE '%.%'"), None, None).unwrap(),
+            Value::Boolean(true)
+        );
     }
 
     #[test]
@@ -6612,6 +7079,83 @@ mod tests {
         } else {
             panic!("Expected UUID value");
         }
+    }
+
+    #[test]
+    fn test_bytea_send_functions() {
+        assert_eq!(
+            eval_expr(&parse_expr("int8send(72623859790382856::bigint)"), None, None).unwrap(),
+            Value::Bytes(vec![1, 2, 3, 4, 5, 6, 7, 8])
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("int4send(16909060)"), None, None).unwrap(),
+            Value::Bytes(vec![1, 2, 3, 4])
+        );
+
+        let uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        assert_eq!(
+            eval_expr(
+                &parse_expr("uuid_send('550e8400-e29b-41d4-a716-446655440000'::uuid)"),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Bytes(uuid.as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn test_set_bit_get_bit_bytea() {
+        assert_eq!(
+            eval_expr(&parse_expr(r"set_bit('\x00'::bytea, 0, 1)"), None, None).unwrap(),
+            Value::Bytes(vec![0x80])
+        );
+        assert_eq!(
+            eval_expr(&parse_expr(r"set_bit('\x00'::bytea, 7, 1)"), None, None).unwrap(),
+            Value::Bytes(vec![0x01])
+        );
+        assert_eq!(
+            eval_expr(&parse_expr(r"get_bit('\x80'::bytea, 0)"), None, None).unwrap(),
+            Value::Int32(1)
+        );
+        assert_eq!(
+            eval_expr(&parse_expr(r"get_bit('\x80'::bytea, 7)"), None, None).unwrap(),
+            Value::Int32(0)
+        );
+    }
+
+    #[test]
+    fn test_uuidv7_expression_components() {
+        let expr = r#"encode(
+            set_bit(
+                set_bit(
+                    overlay(
+                        uuid_send('550e8400-e29b-41d4-a716-446655440000'::uuid)
+                        placing substring(int8send(1705312800000::bigint) from 3)
+                        from 1 for 6
+                    ),
+                    52, 1
+                ),
+                53, 1
+            ),
+            'hex'
+        )::uuid"#;
+
+        let result = eval_expr(&parse_expr(expr), None, None).unwrap();
+        let Value::Uuid(bytes) = result else {
+            panic!("expected UUID result");
+        };
+
+        let base_uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let mut expected = base_uuid.as_bytes().to_vec();
+
+        let ts: i64 = 1705312800000;
+        let ts_bytes = ts.to_be_bytes();
+        expected[..6].copy_from_slice(&ts_bytes[2..]);
+        // uuidv7 sets version bits (52/53) to 1.
+        expected[6] |= 0x0c;
+
+        assert_eq!(bytes.as_slice(), expected.as_slice());
     }
 
     #[test]
@@ -6852,6 +7396,24 @@ mod tests {
             .unwrap(),
             Value::Boolean(false)
         );
+        assert_eq!(
+            eval_expr(
+                &parse_expr(r#"'{"a":1}'::jsonb @> '{"a":1.0}'::jsonb"#),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval_expr(
+                &parse_expr(r#"'[{"a":1,"b":2}]'::jsonb @> '[{"a":1}]'::jsonb"#),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
     }
 
     #[test]
@@ -7015,5 +7577,59 @@ mod tests {
             eval_expr(&parse_expr("PG_TYPEOF(ARRAY[1,2,3])"), None, None).unwrap(),
             Value::Text("integer[]".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_current_timestamp_precision_truncates_to_second() {
+        let fixed = 1_700_000_001_234_i64;
+        let expr = parse_expr("CURRENT_TIMESTAMP(0)");
+        let val = statement_time::with_statement_timestamp_millis(fixed, async {
+            eval_expr(&expr, None, None).unwrap()
+        })
+        .await;
+        assert_eq!(val, Value::Timestamp(1_700_000_001_000));
+    }
+
+    #[tokio::test]
+    async fn test_now_precision_matches_current_timestamp_precision() {
+        let fixed = 1_700_000_001_234_i64;
+        let expr = parse_expr("NOW(0) = CURRENT_TIMESTAMP(0)");
+        let val = statement_time::with_statement_timestamp_millis(fixed, async {
+            eval_expr(&expr, None, None).unwrap()
+        })
+        .await;
+        assert_eq!(val, Value::Boolean(true));
+    }
+
+    #[tokio::test]
+    async fn test_current_timestamp_equals_date_trunc_second_within_statement() {
+        let fixed = 1_700_000_001_234_i64;
+        let expr = parse_expr("CURRENT_TIMESTAMP(0) = DATE_TRUNC('second', CURRENT_TIMESTAMP)");
+        let val = statement_time::with_statement_timestamp_millis(fixed, async {
+            eval_expr(&expr, None, None).unwrap()
+        })
+        .await;
+        assert_eq!(val, Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_date_trunc_second_handles_negative_timestamps() {
+        let expr = parse_expr("DATE_TRUNC('second', TIMESTAMP '1969-12-31 23:59:58.766')");
+        let val = eval_expr(&expr, None, None).unwrap();
+        assert_eq!(val, parse_timestamp_string("1969-12-31 23:59:58").unwrap());
+    }
+
+    #[test]
+    fn test_cast_timestamp_to_text_formats_timestamp() {
+        let expr = parse_expr("TIMESTAMP '2024-01-15 10:30:00'::text");
+        let val = eval_expr(&expr, None, None).unwrap();
+        assert_eq!(val, Value::Text("2024-01-15 10:30:00".to_string()));
+    }
+
+    #[test]
+    fn test_cast_timestamptz_to_text_includes_offset() {
+        let expr = parse_expr("TIMESTAMPTZ '2024-01-15T10:00:00Z'::text");
+        let val = eval_expr(&expr, None, None).unwrap();
+        assert_eq!(val, Value::Text("2024-01-15 02:00:00-08".to_string()));
     }
 }

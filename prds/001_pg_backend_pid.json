@@ -1,0 +1,84 @@
+{
+  "name": "pg_backend_pid() Implementation",
+  "description": "Implement pg_backend_pid() function to return a unique connection identifier for ORM compatibility and connection health checks",
+  "branchName": "ralph/pg-backend-pid",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Add connection ID to DynamicPgHandler",
+      "description": "As a developer, I need a unique connection ID generated per connection so that pg_backend_pid() can return it.",
+      "acceptanceCriteria": [
+        "Generate connection ID in DynamicPgHandler::new() using atomic counter",
+        "Store connection_id as i32 field in DynamicPgHandler struct",
+        "Connection ID remains stable for the lifetime of the connection",
+        "Different connections get different IDs",
+        "cargo build succeeds",
+        "cargo test passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-002",
+      "title": "Pass connection ID to executor context",
+      "description": "As a developer, I need the connection ID accessible in the SQL executor so that pg_backend_pid() can retrieve it.",
+      "acceptanceCriteria": [
+        "Add connection_id field to SqlSession or execution context",
+        "Pass connection_id from handler to executor when executing queries",
+        "cargo build succeeds",
+        "cargo test passes"
+      ],
+      "priority": 2,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [
+        "US-001"
+      ],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-003",
+      "title": "Implement pg_backend_pid() function",
+      "description": "As a user, I want SELECT pg_backend_pid() to return my connection ID so that ORMs and tools can use it for health checks and logging.",
+      "acceptanceCriteria": [
+        "Add match case for 'pg_backend_pid' in expr.rs eval_function()",
+        "Returns Value::Int32 with the session's connection_id",
+        "No TiKV round-trip - pure in-memory operation",
+        "cargo build succeeds",
+        "cargo test passes"
+      ],
+      "priority": 3,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [
+        "US-002"
+      ],
+      "completionNotes": "Completed by agent"
+    },
+    {
+      "id": "US-004",
+      "title": "Add integration tests for pg_backend_pid()",
+      "description": "As a developer, I need tests to verify pg_backend_pid() works correctly.",
+      "acceptanceCriteria": [
+        "Add tests to tests/73_system_functions.sql (extend existing)",
+        "Test: SELECT pg_backend_pid() returns an integer",
+        "Test: SELECT pg_backend_pid() = pg_backend_pid() returns true (stable within session)",
+        "Create corresponding .expected file",
+        "./run_tests.sh passes (full integration + ORM tests)"
+      ],
+      "priority": 4,
+      "passes": true,
+      "notes": "",
+      "dependsOn": [
+        "US-003"
+      ],
+      "completionNotes": "Completed by agent"
+    }
+  ],
+  "metadata": {
+    "updatedAt": "2026-01-20T20:28:37.667Z"
+  }
+}

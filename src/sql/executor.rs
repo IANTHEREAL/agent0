@@ -5,12 +5,13 @@ use super::executor_functions_triggers::strip_leading_sql_comments;
 use super::explain;
 use super::helpers::{
     eval_default_expr, fill_row_defaults, get_expr_name, get_skip_reason, get_unsupported_reason,
-    normalize_ident, parse_value_for_copy,
+    infer_expr_type, normalize_ident, parse_value_for_copy,
 };
 use super::names;
 use super::query;
 use super::rbac;
 use super::sequences;
+use super::statement_time;
 use super::udt;
 use super::{parse_sql, ExecuteResult, ExecuteResults, Session};
 use crate::auth::AuthManager;
@@ -176,9 +177,12 @@ impl Executor {
     /// Supports multiple statements separated by semicolons (e.g., "BEGIN; UPDATE...; COMMIT;")
     /// Returns all results for proper PostgreSQL Simple Query Protocol compliance.
     pub async fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecuteResults> {
+        let statement_ts = statement_time::now_timestamp_millis();
         let savepoints = session.savepoints();
-        crate::txn::with_savepoints(savepoints, async {
-            let sql_stripped = strip_leading_sql_comments(sql);
+        statement_time::with_statement_timestamp_millis(
+            statement_ts,
+            crate::txn::with_savepoints(savepoints, async {
+                let sql_stripped = strip_leading_sql_comments(sql);
             let sql_trimmed = sql_stripped.trim_start();
             let is_observability_user =
                 session.current_user() == Some(OBSERVABILITY_USER) && !session.is_superuser();
@@ -548,7 +552,8 @@ impl Executor {
             }
 
             Ok(ExecuteResults(results))
-        })
+            }),
+        )
         .await
     }
 
@@ -1692,8 +1697,33 @@ impl Executor {
             vec![Row::new(values)]
         };
 
+        let empty_schema = TableSchema::default();
+        let mut column_types: Vec<DataType> = rows
+            .first()
+            .map(|row| {
+                row.values
+                    .iter()
+                    .map(|v| v.data_type().unwrap_or(DataType::Text))
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![DataType::Text; cols.len()]);
+
+        // Refine timestamp-typed values that are actually `timestamptz` per SQL semantics.
+        for (idx, item) in select.projection.iter().enumerate() {
+            if !matches!(column_types.get(idx), Some(DataType::Timestamp)) {
+                continue;
+            }
+            let expr = match item {
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+                _ => continue,
+            };
+            if matches!(infer_expr_type(expr, &empty_schema), DataType::TimestampTz) {
+                column_types[idx] = DataType::TimestampTz;
+            }
+        }
+
         Ok(ExecuteResult::Select {
-            column_types: None,
+            column_types: Some(column_types),
             columns: cols,
             rows,
         })

@@ -4,7 +4,10 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+use anyhow::{anyhow, Result};
+
 pub mod date;
+pub mod timestamp;
 
 mod decimal_serde {
     use rust_decimal::Decimal;
@@ -273,6 +276,26 @@ impl Value {
                 precision: None,
                 scale: Some(d.scale()),
             }),
+        }
+    }
+
+    /// Returns the underlying `BYTEA` contents as a borrowed byte slice.
+    ///
+    /// This is a zero-copy accessor; it does not allocate.
+    pub fn as_bytea(&self) -> Result<&[u8]> {
+        match self {
+            Value::Bytes(bytes) => Ok(bytes),
+            _ => Err(anyhow!("expected bytea")),
+        }
+    }
+
+    /// Returns the value as a `uuid::Uuid`.
+    ///
+    /// This is a cheap conversion (16 bytes); it does not allocate.
+    pub fn as_uuid(&self) -> Result<uuid::Uuid> {
+        match self {
+            Value::Uuid(bytes) => Ok(uuid::Uuid::from_bytes(*bytes)),
+            _ => Err(anyhow!("expected uuid")),
         }
     }
 }
@@ -569,5 +592,25 @@ pub struct ViewDef {
 impl ViewDef {
     pub fn full_name(&self) -> String {
         format!("{}.{}", self.schema, self.name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_as_bytea() {
+        let v = Value::Bytes(vec![1, 2, 3]);
+        assert_eq!(v.as_bytea().unwrap(), &[1, 2, 3]);
+        assert!(Value::Int32(1).as_bytea().is_err());
+    }
+
+    #[test]
+    fn value_as_uuid() {
+        let uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+        let v = Value::Uuid(*uuid.as_bytes());
+        assert_eq!(v.as_uuid().unwrap(), uuid);
+        assert!(Value::Text("x".into()).as_uuid().is_err());
     }
 }
