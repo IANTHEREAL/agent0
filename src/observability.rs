@@ -460,16 +460,32 @@ impl Bucket {
     }
 
     fn ensure_minute(&self, minute: u64) {
-        if self.minute.load(Ordering::Acquire) == minute {
-            return;
-        }
+        // NOTE: This is intentionally a loop (not recursion). Under high contention,
+        // recursion here can overflow the stack on a Tokio worker thread.
+        loop {
+            let current = self.minute.load(Ordering::Acquire);
+            if current == minute {
+                return;
+            }
 
-        if self
-            .resetting
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_ok()
-        {
-            if self.minute.load(Ordering::Acquire) != minute {
+            // Observability is approximate: never move a bucket "backwards" in time.
+            // This avoids oscillation when some callers computed an older minute around
+            // a boundary while other threads already advanced the bucket.
+            if current > minute {
+                return;
+            }
+
+            if self
+                .resetting
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                let current = self.minute.load(Ordering::Acquire);
+                if current >= minute {
+                    self.resetting.store(false, Ordering::Release);
+                    return;
+                }
+
                 self.statement_count.store(0, Ordering::Relaxed);
                 self.txn_commit_count.store(0, Ordering::Relaxed);
                 self.error_count.store(0, Ordering::Relaxed);
@@ -478,17 +494,13 @@ impl Bucket {
                     b.store(0, Ordering::Relaxed);
                 }
                 self.minute.store(minute, Ordering::Release);
+                self.resetting.store(false, Ordering::Release);
+                return;
             }
-            self.resetting.store(false, Ordering::Release);
-            return;
-        }
 
-        while self.resetting.load(Ordering::Acquire) {
-            std::hint::spin_loop();
-        }
-
-        if self.minute.load(Ordering::Acquire) != minute {
-            self.ensure_minute(minute);
+            while self.resetting.load(Ordering::Acquire) {
+                std::hint::spin_loop();
+            }
         }
     }
 }
@@ -636,6 +648,16 @@ fn fnv1a_64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_bucket_ensure_minute_never_moves_backwards() {
+        let b = Bucket::new();
+        b.ensure_minute(10);
+        b.statement_count.store(123, Ordering::Relaxed);
+        b.ensure_minute(9);
+        assert_eq!(b.minute.load(Ordering::Acquire), 10);
+        assert_eq!(b.statement_count.load(Ordering::Relaxed), 123);
+    }
 
     #[test]
     fn test_latency_us_to_bin_monotonic() {
