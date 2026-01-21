@@ -11,6 +11,26 @@ use sqlparser::ast::{BinaryOperator, Expr, Query, SelectItem, Value as SqlValue}
 use std::collections::HashMap;
 use tikv_client::Transaction;
 
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    use core::ops::ControlFlow;
+    use sqlparser::ast::visit_expressions;
+
+    let mut found = false;
+    let _ = visit_expressions(expr, |e| {
+        if found {
+            return ControlFlow::Break(());
+        }
+        match e {
+            Expr::Subquery(_) | Expr::InSubquery { .. } | Expr::Exists { .. } => {
+                found = true;
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        }
+    });
+    found
+}
+
 impl Executor {
     pub(crate) fn resolve_subqueries<'a>(
         &'a self,
@@ -21,6 +41,9 @@ impl Executor {
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Expr>> + Send + 'a>> {
         Box::pin(async move {
+            if !expr_contains_subquery(expr) {
+                return Ok(expr.clone());
+            }
             match expr {
                 Expr::InSubquery {
                     expr: inner_expr,

@@ -548,6 +548,9 @@ pub(crate) async fn eval_expr_with_sequences(
     row: Option<&crate::types::Row>,
     schema: Option<&crate::types::TableSchema>,
 ) -> Result<crate::types::Value> {
+    if !expr_needs_async_eval(expr) {
+        return eval_expr(expr, row, schema);
+    }
     let rewritten = replace_sequence_functions(
         store,
         txn,
@@ -569,6 +572,9 @@ pub(crate) async fn eval_expr_join_with_sequences(
     expr: &Expr,
     join_ctx: &JoinContext<'_>,
 ) -> Result<crate::types::Value> {
+    if !expr_needs_async_eval(expr) {
+        return eval_expr_join(expr, join_ctx);
+    }
     let rewritten = replace_sequence_functions_join(
         store,
         txn,

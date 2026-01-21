@@ -50,3 +50,4 @@ ryu = "1.0"
 rust_decimal = { version = "1.33", features = ["serde"] }
 base64 = "0.22"
 md5 = "0.7"
+stacker = "0.1"
