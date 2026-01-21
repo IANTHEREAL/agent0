@@ -8,16 +8,27 @@ import { Key, Trash2, Copy, Check, Plus, Network, Users, Shield, LogIn, Lock, Lo
 import { useTenant } from "@/api/tenants"
 import { useUsers, useDeleteUser, useResetPassword } from "@/api/users"
 import { useTenantSession } from "@/hooks/useTenantSession"
+import { useSortableData } from "@/hooks/useSortableData"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { SortableHeader } from "@/components/ui/sortable-header"
 import { useToast } from "@/components/ui/use-toast"
 import { cn } from "@/lib/utils"
 import { CreateUserDialog } from "@/components/users/CreateUserDialog"
 import { CredentialsModal } from "@/components/common/CredentialsModal"
 import { ConfirmDialog } from "@/components/common/ConfirmDialog"
 import { TenantObservabilityCard } from "@/components/observability/TenantObservabilityCard"
+import type { User } from "@/types"
+
+type UserSortKey = "name" | "is_superuser" | "can_login"
+
+const userSortColumns = [
+  { key: "name" as const, getValue: (u: User) => u.name },
+  { key: "is_superuser" as const, getValue: (u: User) => u.is_superuser },
+  { key: "can_login" as const, getValue: (u: User) => u.can_login },
+]
 
 export function TenantDetailPage() {
   const { id: tenantId } = useParams<{ id: string }>()
@@ -38,6 +49,11 @@ export function TenantDetailPage() {
   const { data: users, isLoading: usersLoading } = useUsers(tenantId!, isConnected)
   const deleteUserMutation = useDeleteUser(tenantId!)
   const resetPasswordMutation = useResetPassword(tenantId!)
+
+  const { sortedData: sortedUsers, requestSort, getSortDirection } = useSortableData<User, UserSortKey>(
+    users,
+    userSortColumns
+  )
 
   const [copied, setCopied] = useState(false)
   const [showCreateUser, setShowCreateUser] = useState(false)
@@ -346,22 +362,42 @@ export function TenantDetailPage() {
               <Loader2 className="w-6 h-6 animate-spin text-primary mb-2" />
               <p className="text-xs text-muted-foreground">Loading users...</p>
             </div>
-          ) : users && users.length > 0 ? (
+          ) : sortedUsers && sortedUsers.length > 0 ? (
             <div className="rounded-lg border border-border/50 overflow-hidden">
               <table className="w-full">
                 <thead>
                   <tr className="border-b bg-muted/30">
-                    <th className="text-left px-4 py-2.5 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">User</th>
-                    <th className="text-center px-4 py-2.5 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Superuser</th>
-                    <th className="text-center px-4 py-2.5 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Can Login</th>
+                    <SortableHeader
+                      direction={getSortDirection("name")}
+                      onSort={() => requestSort("name")}
+                      className="px-4 py-2.5 text-[11px] font-semibold uppercase tracking-wider"
+                    >
+                      User
+                    </SortableHeader>
+                    <SortableHeader
+                      direction={getSortDirection("is_superuser")}
+                      onSort={() => requestSort("is_superuser")}
+                      className="px-4 py-2.5 text-[11px] font-semibold uppercase tracking-wider"
+                      align="center"
+                    >
+                      Superuser
+                    </SortableHeader>
+                    <SortableHeader
+                      direction={getSortDirection("can_login")}
+                      onSort={() => requestSort("can_login")}
+                      className="px-4 py-2.5 text-[11px] font-semibold uppercase tracking-wider"
+                      align="center"
+                    >
+                      Can Login
+                    </SortableHeader>
                     <th className="text-right px-4 py-2.5 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">Actions</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {users.map((user, idx) => (
+                  {sortedUsers.map((user, idx) => (
                     <tr key={user.name} className={cn(
                       "hover:bg-muted/40 transition-colors",
-                      idx !== users.length - 1 && "border-b border-border/30"
+                      idx !== sortedUsers.length - 1 && "border-b border-border/30"
                     )}>
                       <td className="px-4 py-3">
                         <div className="flex items-center gap-2">

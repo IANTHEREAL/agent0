@@ -1,12 +1,25 @@
 import { Activity, AlertTriangle, Clock, Gauge, Users } from "lucide-react"
 import { useTenantObservability } from "@/api/tenants"
 import { ApiError } from "@/api/client"
+import { useSortableData } from "@/hooks/useSortableData"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { SortableHeader } from "@/components/ui/sortable-header"
 import { cn } from "@/lib/utils"
+import type { QuerySample } from "@/types"
 
 type Props = {
   tenantId: string
 }
+
+type SampleSortKey = "query" | "sample_count" | "latency_p99_ms" | "latency_avg_ms" | "last_seen_ms_ago"
+
+const sampleSortColumns = [
+  { key: "query" as const, getValue: (s: QuerySample) => s.query },
+  { key: "sample_count" as const, getValue: (s: QuerySample) => s.sample_count },
+  { key: "latency_p99_ms" as const, getValue: (s: QuerySample) => s.latency_p99_ms },
+  { key: "latency_avg_ms" as const, getValue: (s: QuerySample) => s.latency_avg_ms },
+  { key: "last_seen_ms_ago" as const, getValue: (s: QuerySample) => s.last_seen_ms_ago },
+]
 
 function formatNumber(n: number) {
   return Number.isFinite(n) ? n.toLocaleString() : "-"
@@ -37,6 +50,11 @@ function formatAge(ms: number) {
 export function TenantObservabilityCard({ tenantId }: Props) {
   const { data, isLoading, error } = useTenantObservability(tenantId)
   const apiError = error instanceof ApiError ? error : null
+
+  const { sortedData: sortedSamples, requestSort, getSortDirection } = useSortableData<QuerySample, SampleSortKey>(
+    data?.samples,
+    sampleSortColumns
+  )
 
   return (
     <Card>
@@ -124,7 +142,7 @@ export function TenantObservabilityCard({ tenantId }: Props) {
                   Sampled Statements (last 1h)
                 </div>
               </div>
-              {data.samples.length === 0 ? (
+              {sortedSamples.length === 0 ? (
                 <div className="px-4 py-4 text-xs text-muted-foreground">
                   No samples yet. Slow queries and errors are sampled first.
                 </div>
@@ -132,30 +150,54 @@ export function TenantObservabilityCard({ tenantId }: Props) {
                 <table className="w-full">
                   <thead>
                     <tr className="border-b bg-muted/10">
-                      <th className="text-left px-4 py-2 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
+                      <SortableHeader
+                        direction={getSortDirection("query")}
+                        onSort={() => requestSort("query")}
+                        className="px-4 py-2 text-[11px] font-semibold uppercase tracking-wider"
+                      >
                         Query
-                      </th>
-                      <th className="text-right px-3 py-2 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
+                      </SortableHeader>
+                      <SortableHeader
+                        direction={getSortDirection("sample_count")}
+                        onSort={() => requestSort("sample_count")}
+                        className="px-3 py-2 text-[11px] font-semibold uppercase tracking-wider"
+                        align="right"
+                      >
                         Count
-                      </th>
-                      <th className="text-right px-3 py-2 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
+                      </SortableHeader>
+                      <SortableHeader
+                        direction={getSortDirection("latency_p99_ms")}
+                        onSort={() => requestSort("latency_p99_ms")}
+                        className="px-3 py-2 text-[11px] font-semibold uppercase tracking-wider"
+                        align="right"
+                      >
                         p99
-                      </th>
-                      <th className="text-right px-3 py-2 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
+                      </SortableHeader>
+                      <SortableHeader
+                        direction={getSortDirection("latency_avg_ms")}
+                        onSort={() => requestSort("latency_avg_ms")}
+                        className="px-3 py-2 text-[11px] font-semibold uppercase tracking-wider"
+                        align="right"
+                      >
                         avg
-                      </th>
-                      <th className="text-right px-4 py-2 text-[11px] font-semibold text-muted-foreground uppercase tracking-wider">
+                      </SortableHeader>
+                      <SortableHeader
+                        direction={getSortDirection("last_seen_ms_ago")}
+                        onSort={() => requestSort("last_seen_ms_ago")}
+                        className="px-4 py-2 text-[11px] font-semibold uppercase tracking-wider"
+                        align="right"
+                      >
                         Last Seen
-                      </th>
+                      </SortableHeader>
                     </tr>
                   </thead>
                   <tbody>
-                    {data.samples.map((s, idx) => (
+                    {sortedSamples.map((s, idx) => (
                       <tr
                         key={`${idx}-${s.query.slice(0, 32)}`}
                         className={cn(
                           "hover:bg-muted/40 transition-colors",
-                          idx !== data.samples.length - 1 && "border-b border-border/30"
+                          idx !== sortedSamples.length - 1 && "border-b border-border/30"
                         )}
                       >
                         <td className="px-4 py-2.5">
