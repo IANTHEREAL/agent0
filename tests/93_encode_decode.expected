@@ -1,0 +1,36 @@
+hex_hello
+48656c6c6f
+(1 row)
+hex_decoded
+\x48656c6c6f
+(1 row)
+base64_hello
+SGVsbG8=
+(1 row)
+base64_decoded
+\x48656c6c6f
+(1 row)
+escape_hello
+Hello
+(1 row)
+escape_mixed
+\\\000\037 \177\377
+(1 row)
+escape_decoded
+\x5c001f207fff
+(1 row)
+roundtrip_hex
+t
+(1 row)
+roundtrip_escape
+t
+(1 row)
+roundtrip_base64
+t
+(1 row)
+uuid_cast
+01891234-5678-1234-5678-90abcdef1234
+(1 row)
+uuid_not_null
+t
+(1 row)

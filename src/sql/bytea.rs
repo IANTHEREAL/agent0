@@ -66,6 +66,100 @@ pub(crate) fn uuid_send(value: [u8; 16]) -> Vec<u8> {
     Vec::from(value)
 }
 
+/// PostgreSQL `encode(data, 'escape')`: convert `BYTEA` to the legacy escape format.
+///
+/// Behavior matches PostgreSQL:
+/// - Printable ASCII bytes (`0x20..=0x7e`) are emitted as-is, except `\\`.
+/// - `\\` is escaped as `\\\\`.
+/// - All other bytes are emitted as a backslash followed by a 3-digit octal code (`\\000`-`\\377`).
+pub(crate) fn encode_escape(bytes: &[u8]) -> String {
+    // Fast path: everything is printable ASCII and not a backslash.
+    if bytes
+        .iter()
+        .all(|&b| matches!(b, 0x20..=0x7e) && b != b'\\')
+    {
+        let mut out = Vec::with_capacity(bytes.len());
+        out.extend_from_slice(bytes);
+        // SAFETY: the allowed range is ASCII, which is valid UTF-8.
+        return unsafe { String::from_utf8_unchecked(out) };
+    }
+
+    let mut out = Vec::with_capacity(bytes.len().saturating_mul(4));
+    for &b in bytes {
+        match b {
+            b'\\' => out.extend_from_slice(b"\\\\"),
+            0x20..=0x7e => out.push(b),
+            _ => {
+                out.push(b'\\');
+                out.push(b'0' + ((b >> 6) & 0x07));
+                out.push(b'0' + ((b >> 3) & 0x07));
+                out.push(b'0' + (b & 0x07));
+            }
+        }
+    }
+    // SAFETY: output is ASCII (printable bytes, backslash, digits), which is valid UTF-8.
+    unsafe { String::from_utf8_unchecked(out) }
+}
+
+/// PostgreSQL `decode(string, 'escape')`: parse the legacy escape format into raw bytes.
+pub(crate) fn decode_escape(s: &str) -> Result<Vec<u8>> {
+    let input = s.as_bytes();
+    let mut out = Vec::with_capacity(input.len());
+    let mut i = 0usize;
+
+    while i < input.len() {
+        if input[i] != b'\\' {
+            out.push(input[i]);
+            i += 1;
+            continue;
+        }
+
+        // Backslash escape.
+        if i + 1 >= input.len() {
+            out.push(b'\\');
+            break;
+        }
+
+        match input[i + 1] {
+            b'\\' => {
+                out.push(b'\\');
+                i += 2;
+            }
+            b'0'..=b'9' => {
+                // Octal escape sequence. PostgreSQL produces 3 digits; accept 1-3 digits for
+                // leniency (matching many client expectations).
+                let mut oct = 0u16;
+                let mut digits = 0u8;
+                let mut j = i + 1;
+                while j < input.len() && digits < 3 {
+                    let d = input[j];
+                    if !(b'0'..=b'9').contains(&d) {
+                        break;
+                    }
+                    if d > b'7' {
+                        return Err(anyhow!("invalid escape sequence"));
+                    }
+                    oct = (oct << 3) | u16::from(d - b'0');
+                    digits += 1;
+                    j += 1;
+                }
+                if digits == 0 || oct > 0xff {
+                    return Err(anyhow!("invalid escape sequence"));
+                }
+                out.push(oct as u8);
+                i = j;
+            }
+            _ => {
+                // Unknown escape: treat the backslash as a literal (best-effort decoding).
+                out.push(b'\\');
+                i += 1;
+            }
+        }
+    }
+
+    Ok(out)
+}
+
 /// PostgreSQL `substring(bytea from start [for count])`.
 ///
 /// `start` is 1-based. Values <= 0 behave like 1. Negative/zero lengths are treated as 0.
@@ -191,5 +285,26 @@ mod tests {
             overlay(vec![0x00, 0x11], &[0xaa], 10, Some(1)),
             vec![0x00, 0x11, 0xaa]
         );
+    }
+
+    #[test]
+    fn escape_encode_decode_roundtrip() {
+        let bytes = vec![b'H', b'i', b'\\', 0, 0xff];
+        let encoded = encode_escape(&bytes);
+        let decoded = decode_escape(&encoded).unwrap();
+        assert_eq!(decoded, bytes);
+    }
+
+    #[test]
+    fn escape_encode_matches_postgres_conventions() {
+        let bytes = vec![b'\\', 0, 0x1f, b' ', 0x7f, 0xff];
+        let encoded = encode_escape(&bytes);
+        assert_eq!(encoded, r"\\\000\037 \177\377");
+    }
+
+    #[test]
+    fn escape_decode_rejects_invalid_octal() {
+        assert!(decode_escape(r"\8").is_err());
+        assert!(decode_escape(r"\999").is_err());
     }
 }

@@ -805,6 +805,8 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
         "INT8SEND" => eval_int8send_from_args(args),
         "INT4SEND" => eval_int4send_from_args(args),
         "UUID_SEND" => eval_uuid_send_from_args(args),
+        "ENCODE" => eval_encode_from_args(args),
+        "DECODE" => eval_decode_from_args(args),
         "CONCAT" => {
             let mut result = String::new();
             for val in args {
@@ -2272,56 +2274,8 @@ fn eval_function(
             ))),
             None => Ok(Value::Null),
         },
-        "ENCODE" => {
-            use base64::Engine;
-            let mut iter = args.into_iter();
-            let data = match iter.next() {
-                Some(Value::Bytes(b)) => b,
-                Some(Value::Text(s)) => s.into_bytes(),
-                Some(Value::Null) | None => return Ok(Value::Null),
-                Some(v) => v.to_string().into_bytes(),
-            };
-            let fmt = match iter.next() {
-                Some(Value::Text(s)) => s.to_lowercase(),
-                Some(Value::Null) | None => return Ok(Value::Null),
-                Some(v) => v.to_string().to_lowercase(),
-            };
-            match fmt.as_str() {
-                "base64" => Ok(Value::Text(
-                    base64::engine::general_purpose::STANDARD.encode(data),
-                )),
-                "hex" => Ok(Value::Text(hex::encode(data))),
-                other => Err(anyhow!("unsupported encoding format: {}", other)),
-            }
-        }
-        "DECODE" => {
-            use base64::Engine;
-            let mut iter = args.into_iter();
-            let data = match iter.next() {
-                Some(Value::Text(s)) => s,
-                Some(Value::Null) | None => return Ok(Value::Null),
-                Some(v) => v.to_string(),
-            };
-            let fmt = match iter.next() {
-                Some(Value::Text(s)) => s.to_lowercase(),
-                Some(Value::Null) | None => return Ok(Value::Null),
-                Some(v) => v.to_string().to_lowercase(),
-            };
-            match fmt.as_str() {
-                "base64" => {
-                    let bytes = base64::engine::general_purpose::STANDARD
-                        .decode(data.as_bytes())
-                        .map_err(|e| anyhow!("invalid base64 data: {}", e))?;
-                    Ok(Value::Bytes(bytes))
-                }
-                "hex" => {
-                    let bytes =
-                        hex::decode(data.trim()).map_err(|e| anyhow!("invalid hex data: {}", e))?;
-                    Ok(Value::Bytes(bytes))
-                }
-                other => Err(anyhow!("unsupported decoding format: {}", other)),
-            }
-        }
+        "ENCODE" => eval_encode_from_args(args),
+        "DECODE" => eval_decode_from_args(args),
         "FORMAT" => {
             let mut iter = args.into_iter();
             let fmt = match iter.next() {
@@ -4553,6 +4507,81 @@ fn eval_uuid_send_from_args(args: Vec<Value>) -> Result<Value> {
     }
 }
 
+fn eval_encode_from_args(args: Vec<Value>) -> Result<Value> {
+    use base64::Engine;
+
+    if args.len() != 2 {
+        return Err(anyhow!("encode requires exactly 2 arguments"));
+    }
+
+    let mut iter = args.into_iter();
+    let data = match iter.next().unwrap_or(Value::Null) {
+        Value::Bytes(b) => b,
+        Value::Text(s) => s.into_bytes(),
+        Value::Null => return Ok(Value::Null),
+        v => v.to_string().into_bytes(),
+    };
+    let fmt = match iter.next().unwrap_or(Value::Null) {
+        Value::Text(s) => s,
+        Value::Null => return Ok(Value::Null),
+        v => v.to_string(),
+    };
+    let fmt = fmt.trim();
+
+    if fmt.eq_ignore_ascii_case("base64") {
+        return Ok(Value::Text(
+            base64::engine::general_purpose::STANDARD.encode(&data),
+        ));
+    }
+    if fmt.eq_ignore_ascii_case("hex") {
+        return Ok(Value::Text(hex::encode(&data)));
+    }
+    if fmt.eq_ignore_ascii_case("escape") {
+        return Ok(Value::Text(super::bytea::encode_escape(&data)));
+    }
+
+    Err(anyhow!("unrecognized encoding: {}", fmt))
+}
+
+fn eval_decode_from_args(args: Vec<Value>) -> Result<Value> {
+    use base64::Engine;
+
+    if args.len() != 2 {
+        return Err(anyhow!("decode requires exactly 2 arguments"));
+    }
+
+    let mut iter = args.into_iter();
+    let data = match iter.next().unwrap_or(Value::Null) {
+        Value::Text(s) => s,
+        Value::Null => return Ok(Value::Null),
+        v => v.to_string(),
+    };
+    let fmt = match iter.next().unwrap_or(Value::Null) {
+        Value::Text(s) => s,
+        Value::Null => return Ok(Value::Null),
+        v => v.to_string(),
+    };
+    let fmt = fmt.trim();
+
+    if fmt.eq_ignore_ascii_case("base64") {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data.as_bytes())
+            .map_err(|e| anyhow!("invalid base64 data: {}", e))?;
+        return Ok(Value::Bytes(bytes));
+    }
+    if fmt.eq_ignore_ascii_case("hex") {
+        let s = data.trim();
+        let s = s.strip_prefix("\\x").unwrap_or(s);
+        let bytes = hex::decode(s).map_err(|e| anyhow!("invalid hex data: {}", e))?;
+        return Ok(Value::Bytes(bytes));
+    }
+    if fmt.eq_ignore_ascii_case("escape") {
+        return Ok(Value::Bytes(super::bytea::decode_escape(&data)?));
+    }
+
+    Err(anyhow!("unrecognized encoding: {}", fmt))
+}
+
 fn eval_to_char_from_args(args: Vec<Value>) -> Result<Value> {
     let mut iter = args.into_iter();
     let val = iter.next().unwrap_or(Value::Null);
@@ -5504,6 +5533,7 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
             Ok(l_days.cmp(r) as i8)
         }
         (Value::Uuid(l), Value::Uuid(r)) => Ok(l.cmp(r) as i8),
+        (Value::Bytes(l), Value::Bytes(r)) => Ok(l.cmp(r) as i8),
         (Value::Array(l), Value::Array(r)) => {
             let min_len = l.len().min(r.len());
             for i in 0..min_len {
@@ -6548,6 +6578,22 @@ mod tests {
             compare_values(&Value::Text("b".to_string()), &Value::Text("a".to_string())).unwrap(),
             1
         );
+        assert_eq!(
+            compare_values(&Value::Bytes(vec![0x00]), &Value::Bytes(vec![0x01])).unwrap(),
+            -1
+        );
+        assert_eq!(
+            compare_values(&Value::Bytes(vec![0x01, 0x00]), &Value::Bytes(vec![0x01])).unwrap(),
+            1
+        );
+        assert_eq!(
+            compare_values(
+                &Value::Bytes(vec![0xde, 0xad]),
+                &Value::Bytes(vec![0xde, 0xad])
+            )
+            .unwrap(),
+            0
+        );
         assert_eq!(compare_values(&Value::Null, &Value::Int32(5)).unwrap(), -1);
         assert_eq!(compare_values(&Value::Int32(5), &Value::Null).unwrap(), 1);
     }
@@ -7156,6 +7202,35 @@ mod tests {
         expected[6] |= 0x0c;
 
         assert_eq!(bytes.as_slice(), expected.as_slice());
+    }
+
+    #[test]
+    fn test_encode_decode_escape() {
+        assert_eq!(
+            eval_expr(
+                &parse_expr(r"encode('\x48656c6c6f'::bytea, 'escape')"),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Text("Hello".to_string())
+        );
+
+        assert_eq!(
+            eval_expr(&parse_expr("decode('Hello', 'escape')"), None, None).unwrap(),
+            Value::Bytes(b"Hello".to_vec())
+        );
+
+        assert_eq!(
+            eval_expr(&parse_expr(r"decode('\000', 'escape')"), None, None).unwrap(),
+            Value::Bytes(vec![0])
+        );
+    }
+
+    #[test]
+    fn test_decode_escape_invalid_sequence_errors() {
+        assert!(eval_expr(&parse_expr(r"decode('\8', 'escape')"), None, None).is_err());
+        assert!(eval_expr(&parse_expr(r"decode('\999', 'escape')"), None, None).is_err());
     }
 
     #[test]
