@@ -189,6 +189,7 @@ dependencies = [
     { name = "pydantic-settings" },
     { name = "requests" },
     { name = "sqlalchemy" },
+    { name = "sqlparse" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -218,6 +219,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
     { name = "requests", specifier = ">=2.31.0" },
     { name = "sqlalchemy", specifier = ">=2.0.0" },
+    { name = "sqlparse", specifier = ">=0.5.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.27.0" },
 ]
 provides-extras = ["dev"]
@@ -902,6 +904,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/42/39/f05f0ed54d451156bbed0e23eb0516bcad7cbb9f18b3bf219c786371b3f0/sqlalchemy-2.0.45-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:cd337d3526ec5298f67d6a30bbbe4ed7e5e68862f0bf6dd21d289f8d37b7d60b", size = 3522029, upload-time = "2025-12-09T22:13:32.09Z" },
     { url = "https://files.pythonhosted.org/packages/54/0f/d15398b98b65c2bce288d5ee3f7d0a81f77ab89d9456994d5c7cc8b2a9db/sqlalchemy-2.0.45-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:9a62b446b7d86a3909abbcd1cd3cc550a832f99c2bc37c5b22e1925438b9367b", size = 3475142, upload-time = "2025-12-09T22:13:33.739Z" },
     { url = "https://files.pythonhosted.org/packages/bf/e1/3ccb13c643399d22289c6a9786c1a91e3dcbb68bce4beb44926ac2c557bf/sqlalchemy-2.0.45-py3-none-any.whl", hash = "sha256:5225a288e4c8cc2308dbdd874edad6e7d0fd38eac1e9e5f23503425c8eee20d0", size = 1936672, upload-time = "2025-12-09T21:54:52.608Z" },
+]
+
+[[package]]
+name = "sqlparse"
+version = "0.5.5"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/90/76/437d71068094df0726366574cf3432a4ed754217b436eb7429415cf2d480/sqlparse-0.5.5.tar.gz", hash = "sha256:e20d4a9b0b8585fdf63b10d30066c7c94c5d7a7ec47c889a2d83a3caa93ff28e", size = 120815, upload-time = "2025-12-19T07:17:45.073Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/49/4b/359f28a903c13438ef59ebeee215fb25da53066db67b305c125f1c6d2a25/sqlparse-0.5.5-py3-none-any.whl", hash = "sha256:12a08b3bf3eec877c519589833aed092e2444e68240a3577e8e26148acc7b1ba", size = 46138, upload-time = "2025-12-19T07:17:46.573Z" },
 ]
 
 [[package]]

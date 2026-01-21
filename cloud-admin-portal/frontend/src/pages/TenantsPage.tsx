@@ -8,12 +8,23 @@ import { Plus, Ban, Users, Edit } from "lucide-react"
 import { useTenants, useRemoveTenant } from "@/api/tenants"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { SortableHeader } from "@/components/ui/sortable-header"
 import { useToast } from "@/components/ui/use-toast"
 import { cn } from "@/lib/utils"
+import { useSortableData } from "@/hooks/useSortableData"
 import { CreateTenantDialog } from "@/components/tenants/CreateTenantDialog"
 import { EditTenantMetadataDialog } from "@/components/tenants/EditTenantMetadataDialog"
 import { ConfirmDialog } from "@/components/common/ConfirmDialog"
 import type { Tenant } from "@/types"
+
+type TenantSortKey = "id" | "state" | "created_at" | "tags"
+
+const tenantSortColumns = [
+  { key: "id" as const, getValue: (t: Tenant) => parseInt(t.id, 10) },
+  { key: "state" as const, getValue: (t: Tenant) => t.state },
+  { key: "created_at" as const, getValue: (t: Tenant) => t.created_at ? new Date(t.created_at) : null },
+  { key: "tags" as const, getValue: (t: Tenant) => t.tags ?? [] },
+]
 
 export function TenantsPage() {
   const [showCreateDialog, setShowCreateDialog] = useState(false)
@@ -22,6 +33,11 @@ export function TenantsPage() {
   const { data: tenants, isLoading } = useTenants()
   const removeMutation = useRemoveTenant()
   const { toast } = useToast()
+
+  const { sortedData: sortedTenants, requestSort, getSortDirection } = useSortableData<Tenant, TenantSortKey>(
+    tenants,
+    tenantSortColumns
+  )
 
   const handleRemove = async (tenantId: string) => {
     try {
@@ -64,7 +80,7 @@ export function TenantsPage() {
             <div className="flex items-center justify-center py-8">
               <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-primary"></div>
             </div>
-          ) : !tenants?.length ? (
+          ) : !sortedTenants?.length ? (
             <div className="text-center py-8 text-muted-foreground">
               <p className="text-sm font-medium">No tenants yet</p>
               <p className="text-xs mt-1">Create your first tenant to get started</p>
@@ -74,18 +90,30 @@ export function TenantsPage() {
               <table className="w-full">
                 <thead>
                   <tr className="border-b bg-muted/50">
-                    <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">
+                    <SortableHeader
+                      direction={getSortDirection("id")}
+                      onSort={() => requestSort("id")}
+                    >
                       ID
-                    </th>
-                    <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">
+                    </SortableHeader>
+                    <SortableHeader
+                      direction={getSortDirection("state")}
+                      onSort={() => requestSort("state")}
+                    >
                       Status
-                    </th>
-                    <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">
+                    </SortableHeader>
+                    <SortableHeader
+                      direction={getSortDirection("created_at")}
+                      onSort={() => requestSort("created_at")}
+                    >
                       Created
-                    </th>
-                    <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">
+                    </SortableHeader>
+                    <SortableHeader
+                      direction={getSortDirection("tags")}
+                      onSort={() => requestSort("tags")}
+                    >
                       Tags
-                    </th>
+                    </SortableHeader>
                     <th className="text-left px-3 py-2 text-xs font-medium text-muted-foreground">
                       Connection
                     </th>
@@ -95,7 +123,7 @@ export function TenantsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {tenants.map((tenant) => (
+                  {sortedTenants.map((tenant) => (
                     <tr key={tenant.id} className="border-b last:border-0 hover:bg-muted/50">
                       <td className="px-3 py-2.5">
                         <Link

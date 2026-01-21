@@ -1,0 +1,15 @@
+{
+  "id": "61f0eac1-1b4c-4569-a2a8-90a66ff72818",
+  "status": "completed",
+  "startedAt": "2026-01-20T20:14:11.803Z",
+  "updatedAt": "2026-01-20T21:08:28.450Z",
+  "agentPlugin": "opencode",
+  "trackerPlugin": "json",
+  "prdPath": "prds/001_pg_backend_pid.json",
+  "currentIteration": 4,
+  "maxIterations": 10,
+  "totalTasks": 0,
+  "tasksCompleted": 4,
+  "cwd": "/home/dongxu/lab/pg-tikv",
+  "endedAt": "2026-01-20T21:08:28.450Z"
+}
