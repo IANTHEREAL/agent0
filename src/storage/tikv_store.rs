@@ -1563,6 +1563,71 @@ impl TikvStore {
         }
     }
 
+    /// Scan index by a prefix of the index values to get PKs.
+    ///
+    /// This is used for composite indexes when only the leading columns are constrained.
+    /// For unique indexes, the PK is stored in the value. For non-unique indexes, the PK is
+    /// stored as a suffix in the key after all index values and a separator byte.
+    pub async fn scan_index_prefix(
+        &self,
+        txn: &mut Transaction,
+        table_id: u64,
+        index_id: u64,
+        prefix_values: &[Value],
+        unique: bool,
+        index_column_types: &[DataType],
+        pk_types: &[DataType],
+    ) -> Result<Vec<Vec<Value>>> {
+        if pk_types.is_empty() {
+            return Err(anyhow!("PK types required for index scan"));
+        }
+
+        let prefix = encode_index_key(table_id, index_id, prefix_values, None);
+        let start_key = self.key(&prefix);
+
+        let mut end_raw = prefix;
+        end_raw.push(0xFF);
+        let end_key = self.key(&end_raw);
+
+        let range: BoundRange = (start_key..end_key).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut pks = Vec::new();
+        if unique {
+            for pair in pairs {
+                let pk_bytes: &[u8] = pair.value().as_ref();
+                let pk = decode_pk_from_index_suffix(pk_bytes, pk_types)?;
+                pks.push(pk);
+            }
+            return Ok(pks);
+        }
+
+        let fixed_prefix_len = encode_index_key(table_id, index_id, &[], None).len();
+        for pair in pairs {
+            let full_key: &[u8] = pair.key().as_ref().into();
+            if full_key.len() <= fixed_prefix_len {
+                continue;
+            }
+
+            let mut offset = fixed_prefix_len;
+            for data_type in index_column_types {
+                let (_, consumed) = decode_value_memcomparable(&full_key[offset..], data_type)?;
+                offset += consumed;
+            }
+
+            if full_key.get(offset) != Some(&0x01) {
+                return Err(anyhow!("Non-unique index key missing PK separator"));
+            }
+            offset += 1;
+
+            let pk_bytes = &full_key[offset..];
+            let pk = decode_pk_from_index_suffix(pk_bytes, pk_types)?;
+            pks.push(pk);
+        }
+
+        Ok(pks)
+    }
+
     /// Create GIN-like inverted index entries for a row.
     ///
     /// Each `token_hash` is stored as a separate key that points to `pk_values` via the

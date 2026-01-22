@@ -109,6 +109,9 @@ id|name|properties
 4|Premium Polo|{"color":"white","premium":true,"size":["M","L"]}
 5|Basic Tee|{"color":"white","premium":false,"size":["S","M","L"]}
 (2 rows)
+name|color
+Premium Polo|white
+(1 row)
 status
 JSON comprehensive tests completed
 (1 row)

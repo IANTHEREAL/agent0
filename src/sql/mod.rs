@@ -3,6 +3,8 @@
 mod catalog_oids;
 mod bytea;
 mod alter_owner;
+
+pub mod operators;
 mod alter_sequence_owned_by;
 mod comment_on;
 mod ddl;
@@ -14,6 +16,7 @@ mod executor_dml_ops;
 mod executor_extensions;
 mod executor_functions_triggers;
 mod executor_join;
+mod executor_operators;
 mod executor_procedure;
 mod executor_select;
 mod executor_subquery;

@@ -1,5 +1,6 @@
 //! SELECT query execution
 
+use super::executor_operators::use_operator_execution;
 use super::helpers::{
     apply_offset_limit_fetch, collect_having_agg_funcs, dedup_rows, distinct_on_rows_with_indices,
     eval_having_expr, fill_row_defaults, get_select_item_name, infer_expr_type, AggExpr,
@@ -303,6 +304,107 @@ impl Executor {
                 ctes,
             )
             .await?;
+
+        let has_for_update = query
+            .locks
+            .iter()
+            .any(|l| matches!(l.lock_type, LockType::Update));
+
+        if use_operator_execution()
+            && !is_virtual
+            && !rows_loaded
+            && !has_correlated_exists
+            && select_into_target.is_none()
+            && Self::is_simple_operator_query(query, select)
+        {
+            debug!("Using operator execution path for simple query");
+            if has_for_update {
+                let planner =
+                    super::operators::PhysicalPlanner::new(self.store(), search_path.to_vec());
+                let estimated_rows = 1000;
+                let mut lock_operator = planner.plan_simple_select(
+                    schema.clone(),
+                    resolved_selection.as_ref(),
+                    Vec::new(),
+                    None,
+                    0,
+                    estimated_rows,
+                )?;
+                let lock_rows = super::operators::execute_operator_tree(
+                    &mut lock_operator,
+                    txn,
+                    self.store(),
+                    search_path,
+                    sequence_values,
+                )
+                .await?;
+                if !lock_rows.is_empty() {
+                    self.store().lock_rows(txn, &t, &lock_rows).await?;
+                }
+            }
+            return self
+                .execute_with_operators(
+                    txn,
+                    sequence_values,
+                    search_path,
+                    schema,
+                    resolved_selection.as_ref(),
+                    &query.order_by,
+                    super::executor_operators::extract_limit(query),
+                    super::executor_operators::extract_offset(query),
+                    &resolved_projection,
+                )
+                .await;
+        }
+
+        if use_operator_execution()
+            && !is_virtual
+            && !rows_loaded
+            && !has_correlated_exists
+            && select_into_target.is_none()
+            && select.having.is_none()
+            && Self::is_aggregate_operator_query(query, select)
+        {
+            debug!("Using operator execution path for aggregate query");
+            if has_for_update {
+                let planner =
+                    super::operators::PhysicalPlanner::new(self.store(), search_path.to_vec());
+                let estimated_rows = 1000;
+                let mut lock_operator = planner.plan_simple_select(
+                    schema.clone(),
+                    resolved_selection.as_ref(),
+                    Vec::new(),
+                    None,
+                    0,
+                    estimated_rows,
+                )?;
+                let lock_rows = super::operators::execute_operator_tree(
+                    &mut lock_operator,
+                    txn,
+                    self.store(),
+                    search_path,
+                    sequence_values,
+                )
+                .await?;
+                if !lock_rows.is_empty() {
+                    self.store().lock_rows(txn, &t, &lock_rows).await?;
+                }
+            }
+            return self
+                .execute_aggregate_with_operators(
+                    txn,
+                    sequence_values,
+                    search_path,
+                    schema,
+                    resolved_selection.as_ref(),
+                    &select.group_by,
+                    &query.order_by,
+                    super::executor_operators::extract_limit(query),
+                    super::executor_operators::extract_offset(query),
+                    &resolved_projection,
+                )
+                .await;
+        }
 
         let all_rows = if is_virtual {
             all_rows_base

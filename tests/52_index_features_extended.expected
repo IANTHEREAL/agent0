@@ -51,5 +51,3 @@ DROP_ALL:success
 ?column?
 TEST_COMPLETE
 (1 row)
-psql:/home/dongxu/lab/pg-tikv/tests/52_index_features_extended.sql:73: ERROR:  AND requires boolean operands
-psql:/home/dongxu/lab/pg-tikv/tests/52_index_features_extended.sql:85: ERROR:  Index 'idx_ext_complex' does not exist
