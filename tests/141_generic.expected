@@ -1,0 +1,607 @@
+SET
+SET
+DEALLOCATE ALL
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE TABLE
+CREATE INDEX
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+CREATE INDEX
+INSERT 0 6
+INSERT 0 6
+INSERT 0 6
+SET
+PREPARE
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Index Scan using t_a_c_idx on t (actual rows=1 loops=1)
+   Index Cond: ((a = 1) AND (c = 3))
+   Filter: (b = 2)
+(3 rows)
+
+SET
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Index Scan using t_a_c_idx on t (actual rows=1 loops=1)
+   Index Cond: ((a = 1) AND (c = 3))
+   Filter: (b = 2)
+(3 rows)
+
+DEALLOCATE
+PREPARE
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Index Scan using t_a_c_idx on t (actual rows=1 loops=1)
+   Index Cond: ((a = 1) AND (c = 3))
+   Filter: (b = 2)
+(3 rows)
+
+SET
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Index Scan using t_a_c_idx on t (actual rows=1 loops=1)
+   Index Cond: ((a = 1) AND (c = 3))
+   Filter: (b = 2)
+(3 rows)
+
+DEALLOCATE
+PREPARE
+                      QUERY PLAN                      
+------------------------------------------------------
+ Index Scan using t_pkey on t (actual rows=1 loops=1)
+   Index Cond: (k = $1)
+(2 rows)
+
+SET
+                      QUERY PLAN                      
+------------------------------------------------------
+ Index Scan using t_pkey on t (actual rows=1 loops=1)
+   Index Cond: (k = 33)
+(2 rows)
+
+SET
+DEALLOCATE
+PREPARE
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Index Scan using t_a_c_idx on t (actual rows=0 loops=1)
+   Index Cond: ((a = $1) AND (c = $2))
+(2 rows)
+
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Index Scan using t_a_c_idx on t (actual rows=0 loops=1)
+   Index Cond: ((a = $1) AND (c = $2))
+(2 rows)
+
+SET
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Index Scan using t_a_c_idx on t (actual rows=0 loops=1)
+   Index Cond: ((a = 1) AND (c = 2))
+(2 rows)
+
+SET
+DEALLOCATE
+PREPARE
+              QUERY PLAN               
+---------------------------------------
+ Seq Scan on t (actual rows=0 loops=1)
+   Filter: (t = now())
+   Rows Removed by Filter: 6
+(3 rows)
+
+              QUERY PLAN               
+---------------------------------------
+ Seq Scan on t (actual rows=0 loops=1)
+   Filter: (t = now())
+   Rows Removed by Filter: 6
+(3 rows)
+
+DEALLOCATE
+PREPARE
+              QUERY PLAN               
+---------------------------------------
+ Seq Scan on t (actual rows=6 loops=1)
+   Filter: (s ~~ $1)
+(2 rows)
+
+DEALLOCATE
+PREPARE
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Bitmap Heap Scan on t (actual rows=0 loops=1)
+   Recheck Cond: (c = $1)
+   ->  Bitmap Index Scan on t_c_idx (actual rows=0 loops=1)
+         Index Cond: (c = $1)
+(4 rows)
+
+ALTER TABLE
+                         QUERY PLAN                         
+------------------------------------------------------------
+ Bitmap Heap Scan on t (actual rows=0 loops=1)
+   Recheck Cond: (c = $1)
+   ->  Bitmap Index Scan on t_c_idx (actual rows=0 loops=1)
+         Index Cond: (c = $1)
+(4 rows)
+
+DEALLOCATE
+ALTER TABLE
+SET
+PREPARE
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Index Scan using t_a_c_idx on t (actual rows=1 loops=1)
+   Index Cond: ((a = 1) AND (c = 3))
+   Filter: (b = 2)
+(3 rows)
+
+DEALLOCATE
+PREPARE
+ k | a | b | c | s | t 
+---+---+---+---+---+---
+(0 rows)
+
+ k | a | b | c | s | t 
+---+---+---+---+---+---
+(0 rows)
+
+ k | a | b | c | s | t 
+---+---+---+---+---+---
+(0 rows)
+
+ k | a | b | c | s | t 
+---+---+---+---+---+---
+(0 rows)
+
+ k | a | b | c | s | t 
+---+---+---+---+---+---
+(0 rows)
+
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Index Scan using t_a_c_idx on t (actual rows=0 loops=1)
+   Index Cond: ((a = $1) AND (c = $2))
+(2 rows)
+
+DEALLOCATE
+PREPARE
+ k | k | k 
+---+---+---
+(0 rows)
+
+ k | k | k 
+---+---+---
+(0 rows)
+
+ k | k | k 
+---+---+---
+(0 rows)
+
+ k | k | k 
+---+---+---
+(0 rows)
+
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Nested Loop (actual rows=0 loops=1)
+   ->  Nested Loop (actual rows=0 loops=1)
+         ->  Index Scan using t_a_c_idx on t (actual rows=0 loops=1)
+               Index Cond: ((a = 10000) AND (c = 20000))
+         ->  Bitmap Heap Scan on c (never executed)
+               Recheck Cond: (t.k = a)
+               ->  Bitmap Index Scan on c_a_idx (never executed)
+                     Index Cond: (a = t.k)
+   ->  Index Scan using g_a_b_idx on g (never executed)
+         Index Cond: (a = c.k)
+(10 rows)
+
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Nested Loop (actual rows=0 loops=1)
+   ->  Nested Loop (actual rows=0 loops=1)
+         ->  Index Scan using t_a_c_idx on t (actual rows=0 loops=1)
+               Index Cond: ((a = $1) AND (c = $2))
+         ->  Bitmap Heap Scan on c (never executed)
+               Recheck Cond: (t.k = a)
+               ->  Bitmap Index Scan on c_a_idx (never executed)
+                     Index Cond: (a = t.k)
+   ->  Index Scan using g_a_b_idx on g (never executed)
+         Index Cond: (a = c.k)
+(10 rows)
+
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Nested Loop (actual rows=0 loops=1)
+   ->  Nested Loop (actual rows=0 loops=1)
+         ->  Index Scan using t_a_c_idx on t (actual rows=0 loops=1)
+               Index Cond: ((a = $1) AND (c = $2))
+         ->  Bitmap Heap Scan on c (never executed)
+               Recheck Cond: (t.k = a)
+               ->  Bitmap Index Scan on c_a_idx (never executed)
+                     Index Cond: (a = t.k)
+   ->  Index Scan using g_a_b_idx on g (never executed)
+         Index Cond: (a = c.k)
+(10 rows)
+
+ALTER TABLE
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Nested Loop (actual rows=0 loops=1)
+   ->  Nested Loop (actual rows=0 loops=1)
+         ->  Index Scan using t_a_c_idx on t (actual rows=0 loops=1)
+               Index Cond: ((a = $1) AND (c = $2))
+         ->  Bitmap Heap Scan on c (never executed)
+               Recheck Cond: (t.k = a)
+               ->  Bitmap Index Scan on c_a_idx (never executed)
+                     Index Cond: (a = t.k)
+   ->  Index Scan using g_a_b_idx on g (never executed)
+         Index Cond: (a = c.k)
+(10 rows)
+
+ k | k | k 
+---+---+---
+(0 rows)
+
+ k | k | k 
+---+---+---
+(0 rows)
+
+ k | k | k 
+---+---+---
+(0 rows)
+
+ k | k | k 
+---+---+---
+(0 rows)
+
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Nested Loop (actual rows=0 loops=1)
+   ->  Nested Loop (actual rows=0 loops=1)
+         ->  Index Scan using t_a_c_idx on t (actual rows=0 loops=1)
+               Index Cond: ((a = $1) AND (c = $2))
+         ->  Bitmap Heap Scan on c (never executed)
+               Recheck Cond: (t.k = a)
+               ->  Bitmap Index Scan on c_a_idx (never executed)
+                     Index Cond: (a = t.k)
+   ->  Index Scan using g_a_b_idx on g (never executed)
+         Index Cond: (a = c.k)
+(10 rows)
+
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Nested Loop (actual rows=0 loops=1)
+   ->  Nested Loop (actual rows=0 loops=1)
+         ->  Index Scan using t_a_c_idx on t (actual rows=0 loops=1)
+               Index Cond: ((a = $1) AND (c = $2))
+         ->  Bitmap Heap Scan on c (never executed)
+               Recheck Cond: (t.k = a)
+               ->  Bitmap Index Scan on c_a_idx (never executed)
+                     Index Cond: (a = t.k)
+   ->  Index Scan using g_a_b_idx on g (never executed)
+         Index Cond: (a = c.k)
+(10 rows)
+
+DEALLOCATE
+PREPARE
+ k | a | b 
+---+---+---
+ 1 | 1 | 2
+(1 row)
+
+ k  | a  | b  
+----+----+----
+ 10 | 10 | 20
+(1 row)
+
+  k  |  a  |  b  
+-----+-----+-----
+ 100 | 100 | 200
+(1 row)
+
+  k   |  a   |  b   
+------+------+------
+ 1000 | 1000 | 2000
+(1 row)
+
+   k   |   a   |   b   
+-------+-------+-------
+ 10000 | 10000 | 20000
+(1 row)
+
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Limit (actual rows=1 loops=1)
+   ->  Sort (actual rows=1 loops=1)
+         Sort Key: b
+         Sort Method: quicksort  Memory: 25kB
+         ->  Bitmap Heap Scan on g (actual rows=1 loops=1)
+               Recheck Cond: (a = $1)
+               Heap Blocks: exact=1
+               ->  Bitmap Index Scan on g_a_b_idx (actual rows=1 loops=1)
+                     Index Cond: (a = $1)
+(9 rows)
+
+SET
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Limit (actual rows=1 loops=1)
+   ->  Sort (actual rows=1 loops=1)
+         Sort Key: b
+         Sort Method: quicksort  Memory: 25kB
+         ->  Bitmap Heap Scan on g (actual rows=1 loops=1)
+               Recheck Cond: (a = $1)
+               Heap Blocks: exact=1
+               ->  Bitmap Index Scan on g_a_b_idx (actual rows=1 loops=1)
+                     Index Cond: (a = $1)
+(9 rows)
+
+DEALLOCATE
+SET
+ANALYZE
+PREPARE
+UPDATE 0
+UPDATE 0
+UPDATE 0
+UPDATE 0
+UPDATE 0
+                              QUERY PLAN                              
+----------------------------------------------------------------------
+ Update on t (actual rows=0 loops=1)
+   ->  Bitmap Heap Scan on t (actual rows=0 loops=1)
+         Recheck Cond: ((a = ANY (ARRAY[$1, $2])) AND (b > $3))
+         ->  Bitmap Index Scan on t_a_b_c_idx (actual rows=0 loops=1)
+               Index Cond: ((a = ANY (ARRAY[$1, $2])) AND (b > $3))
+(5 rows)
+
+DEALLOCATE
+PREPARE
+ k | a | b 
+---+---+---
+(0 rows)
+
+ k | a | b 
+---+---+---
+(0 rows)
+
+ k | a | b 
+---+---+---
+(0 rows)
+
+ k | a | b 
+---+---+---
+(0 rows)
+
+ k | a | b 
+---+---+---
+(0 rows)
+
+                     QUERY PLAN                     
+----------------------------------------------------
+ Seq Scan on g (actual rows=0 loops=1)
+   Filter: ((a = ANY (ARRAY[$1, $2])) AND (b > $3))
+   Rows Removed by Filter: 6
+(3 rows)
+
+DEALLOCATE
+PREPARE
+   k   |   a   |   b   
+-------+-------+-------
+     1 |     1 |     2
+    10 |    10 |    20
+    33 |    33 |    44
+   100 |   100 |   200
+  1000 |  1000 |  2000
+ 10000 | 10000 | 20000
+(6 rows)
+
+   k   |   a   |   b   
+-------+-------+-------
+     1 |     1 |     2
+    10 |    10 |    20
+    33 |    33 |    44
+   100 |   100 |   200
+  1000 |  1000 |  2000
+ 10000 | 10000 | 20000
+(6 rows)
+
+   k   |   a   |   b   
+-------+-------+-------
+     1 |     1 |     2
+    10 |    10 |    20
+    33 |    33 |    44
+   100 |   100 |   200
+  1000 |  1000 |  2000
+ 10000 | 10000 | 20000
+(6 rows)
+
+   k   |   a   |   b   
+-------+-------+-------
+     1 |     1 |     2
+    10 |    10 |    20
+    33 |    33 |    44
+   100 |   100 |   200
+  1000 |  1000 |  2000
+ 10000 | 10000 | 20000
+(6 rows)
+
+   k   |   a   |   b   
+-------+-------+-------
+     1 |     1 |     2
+    10 |    10 |    20
+    33 |    33 |    44
+   100 |   100 |   200
+  1000 |  1000 |  2000
+ 10000 | 10000 | 20000
+(6 rows)
+
+                        QUERY PLAN                        
+----------------------------------------------------------
+ Append (actual rows=6 loops=1)
+   ->  Seq Scan on g (actual rows=6 loops=1)
+   ->  Seq Scan on g g_1 (actual rows=0 loops=1)
+         Filter: ((a = ANY (ARRAY[$1, $2])) AND (b > $3))
+         Rows Removed by Filter: 6
+(5 rows)
+
+DEALLOCATE
+SET
+CREATE TABLE
+PREPARE
+ create_statement 
+------------------
+ a
+(1 row)
+
+ALTER TABLE
+ create_statement 
+------------------
+ b
+(1 row)
+
+DEALLOCATE
+CREATE TABLE
+CREATE INDEX
+SET
+PREPARE
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Index Scan using t135151_a_b_idx on t135151 (actual rows=0 loops=1)
+   Index Cond: ((a = 1) AND (b = 2))
+(2 rows)
+
+ANALYZE
+                 QUERY PLAN                  
+---------------------------------------------
+ Seq Scan on t135151 (actual rows=0 loops=1)
+   Filter: ((a = 1) AND (b = 2))
+(2 rows)
+
+DEALLOCATE
+CREATE TABLE
+CREATE INDEX
+SET
+PREPARE
+ id 
+----
+(0 rows)
+
+ id 
+----
+(0 rows)
+
+ id 
+----
+(0 rows)
+
+ id 
+----
+(0 rows)
+
+ id 
+----
+(0 rows)
+
+                                   QUERY PLAN                                   
+--------------------------------------------------------------------------------
+ Limit (actual rows=0 loops=1)
+   ->  Sort (actual rows=0 loops=1)
+         Sort Key: b, id
+         Sort Method: quicksort  Memory: 25kB
+         ->  Bitmap Heap Scan on t155159 (actual rows=0 loops=1)
+               Recheck Cond: ((a = $1) AND (b >= $2))
+               ->  Bitmap Index Scan on t155159_a_b_idx (actual rows=0 loops=1)
+                     Index Cond: ((a = $1) AND (b >= $2))
+(8 rows)
+
+DEALLOCATE
+PREPARE
+ id 
+----
+(0 rows)
+
+ id 
+----
+(0 rows)
+
+ id 
+----
+(0 rows)
+
+ id 
+----
+(0 rows)
+
+ id 
+----
+(0 rows)
+
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
+ HashAggregate (actual rows=0 loops=1)
+   Group Key: unnamed_subquery.id
+   Batches: 1  Memory Usage: 24kB
+   ->  Append (actual rows=0 loops=1)
+         ->  Subquery Scan on unnamed_subquery (actual rows=0 loops=1)
+               ->  Limit (actual rows=0 loops=1)
+                     ->  Sort (actual rows=0 loops=1)
+                           Sort Key: t155159.b, t155159.id
+                           Sort Method: quicksort  Memory: 25kB
+                           ->  Bitmap Heap Scan on t155159 (actual rows=0 loops=1)
+                                 Recheck Cond: ((a = $1) AND (b >= $2))
+                                 ->  Bitmap Index Scan on t155159_a_b_idx (actual rows=0 loops=1)
+                                       Index Cond: ((a = $1) AND (b >= $2))
+         ->  Bitmap Heap Scan on t155159 t155159_1 (actual rows=0 loops=1)
+               Recheck Cond: ((a = $3) AND (b >= $4))
+               ->  Bitmap Index Scan on t155159_a_b_idx (actual rows=0 loops=1)
+                     Index Cond: ((a = $3) AND (b >= $4))
+(17 rows)
+
+DEALLOCATE
+CREATE TABLE
+CREATE INDEX
+INSERT 0 1
+PREPARE
+ k 
+---
+(0 rows)
+
+           QUERY PLAN           
+--------------------------------
+ Result (actual rows=0 loops=1)
+   One-Time Filter: false
+(2 rows)
+
+PREPARE
+ k 
+---
+(0 rows)
+
+           QUERY PLAN           
+--------------------------------
+ Result (actual rows=0 loops=1)
+   One-Time Filter: false
+(2 rows)
+
+SET
+CREATE TABLE
+INSERT 0 1
+PREPARE
+ k 
+---
+ 1
+(1 row)
+
+RESET

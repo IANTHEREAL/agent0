@@ -1,0 +1,78 @@
+SET
+DROP ROLE
+DROP ROLE
+CREATE ROLE
+DROP DATABASE
+CREATE DATABASE
+GRANT
+SET
+ grantee | privilege_type 
+---------+----------------
+ PUBLIC  | USAGE
+(1 row)
+
+CREATE SCHEMA
+ grantee | privilege_type 
+---------+----------------
+(0 rows)
+
+ALTER DEFAULT PRIVILEGES
+CREATE SCHEMA
+ grantee | privilege_type 
+---------+----------------
+(0 rows)
+
+SET
+CREATE ROLE
+ALTER DEFAULT PRIVILEGES
+CREATE SCHEMA
+  grantee  | privilege_type 
+-----------+----------------
+ testuser  | CREATE
+ testuser  | USAGE
+ testuser2 | CREATE
+ testuser2 | USAGE
+(4 rows)
+
+ALTER DEFAULT PRIVILEGES
+CREATE SCHEMA
+  grantee  | privilege_type 
+-----------+----------------
+ testuser  | CREATE
+ testuser2 | CREATE
+(2 rows)
+
+ALTER DEFAULT PRIVILEGES
+CREATE SCHEMA
+ grantee | privilege_type 
+---------+----------------
+(0 rows)
+
+GRANT
+SET
+SET
+ALTER DEFAULT PRIVILEGES
+CREATE SCHEMA
+ grantee | privilege_type 
+---------+----------------
+(0 rows)
+
+ALTER DEFAULT PRIVILEGES
+CREATE SCHEMA
+ grantee | privilege_type 
+---------+----------------
+(0 rows)
+
+RESET
+ALTER DEFAULT PRIVILEGES
+CREATE SCHEMA
+  grantee  | privilege_type 
+-----------+----------------
+ testuser  | CREATE
+ testuser  | USAGE
+ testuser2 | CREATE
+ testuser2 | USAGE
+(4 rows)
+
+DROP DATABASE
+RESET

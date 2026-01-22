@@ -1,0 +1,26 @@
+CREATE SCHEMA
+CREATE VIEW
+GRANT
+              database_name              |  schema_name  | table_name | grantee | privilege_type | is_grantable 
+-----------------------------------------+---------------+------------+---------+----------------+--------------
+ crdb_tests_show_grants_on_virtual_table | crdb_internal | tables     | public  | SELECT         | false
+(1 row)
+
+DO
+GRANT
+              database_name              |  schema_name  | table_name | grantee  | privilege_type | is_grantable 
+-----------------------------------------+---------------+------------+----------+----------------+--------------
+ crdb_tests_show_grants_on_virtual_table | crdb_internal | tables     | public   | SELECT         | false
+ crdb_tests_show_grants_on_virtual_table | crdb_internal | tables     | testuser | SELECT         | false
+(2 rows)
+
+GRANT
+DO
+GRANT
+              database_name              |  schema_name  | table_name |  grantee  | privilege_type | is_grantable 
+-----------------------------------------+---------------+------------+-----------+----------------+--------------
+ crdb_tests_show_grants_on_virtual_table | crdb_internal | tables     | public    | SELECT         | false
+ crdb_tests_show_grants_on_virtual_table | crdb_internal | tables     | testuser  | ALL            | false
+ crdb_tests_show_grants_on_virtual_table | crdb_internal | tables     | testuser2 | SELECT         | true
+(3 rows)
+

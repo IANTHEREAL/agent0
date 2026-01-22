@@ -1,0 +1,13 @@
+CREATE TABLE
+INSERT 0 1
+ count |            job_type             | status  
+-------+---------------------------------+---------
+     1 | AUTO SPAN CONFIG RECONCILIATION | running
+(1 row)
+
+UPDATE 1
+  status  
+----------
+ canceled
+(1 row)
+

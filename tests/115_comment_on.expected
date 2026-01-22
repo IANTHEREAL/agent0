@@ -1,0 +1,223 @@
+SET
+COMMENT
+     database_name     | comment 
+-----------------------+---------
+ crdb_tests_comment_on | A
+(1 row)
+
+COMMENT
+     database_name     | comment 
+-----------------------+---------
+ crdb_tests_comment_on | AAA
+(1 row)
+
+COMMENT
+     database_name     | comment 
+-----------------------+---------
+ crdb_tests_comment_on | 
+(1 row)
+
+CREATE SCHEMA
+COMMENT
+ comment 
+---------
+ SC
+(1 row)
+
+COMMENT
+ comment  
+----------
+ SC_AGAIN
+(1 row)
+
+ schema_name |        comment         
+-------------+------------------------
+ public      | standard public schema
+ sc          | SC_AGAIN
+(2 rows)
+
+CREATE SCHEMA
+COMMENT
+ schema_name |     comment     
+-------------+-----------------
+ db.schema1  | Database_Schema
+(1 row)
+
+CREATE TABLE
+CREATE INDEX
+CREATE VIEW
+COMMENT
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+ table t       |                  |               | 
+(1 row)
+
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+ table t       |                  |               | 
+(1 row)
+
+COMMENT
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+ table t AGAIN |                  |               | 
+(1 row)
+
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+ table t AGAIN |                  |               | 
+(1 row)
+
+COMMENT
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  |               | 
+(1 row)
+
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  |               | 
+(1 row)
+
+COMMENT
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               | column b         |               | 
+(1 row)
+
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               | column b         |               | 
+(1 row)
+
+COMMENT
+COMMENT
+ table_comment |   column_b_comment   | index_comment | constraint_comment 
+---------------+----------------------+---------------+--------------------
+               | unqualified column b |               | 
+(1 row)
+
+ table_comment |   column_b_comment   | index_comment | constraint_comment 
+---------------+----------------------+---------------+--------------------
+               | unqualified column b |               | 
+(1 row)
+
+COMMENT
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  |               | 
+(1 row)
+
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  |               | 
+(1 row)
+
+COMMENT
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  | index b       | 
+(1 row)
+
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  | index b       | 
+(1 row)
+
+COMMENT
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  | index b AGAIN | 
+(1 row)
+
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  | index b AGAIN | 
+(1 row)
+
+COMMENT
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  |               | 
+(1 row)
+
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  |               | 
+(1 row)
+
+COMMENT
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  |               | cst b
+(1 row)
+
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  |               | cst b
+(1 row)
+
+COMMENT
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  |               | cst b AGAIN
+(1 row)
+
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  |               | cst b AGAIN
+(1 row)
+
+COMMENT
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  |               | 
+(1 row)
+
+ table_comment | column_b_comment | index_comment | constraint_comment 
+---------------+------------------+---------------+--------------------
+               |                  |               | 
+(1 row)
+
+COMMENT
+ comment 
+---------
+ 
+(1 row)
+
+CREATE TYPE
+CREATE TYPE
+COMMENT
+COMMENT
+COMMENT
+COMMENT
+ schema_name |    type_name    |              comment               
+-------------+-----------------+------------------------------------
+ public      | roach_dwellings | First-CRDB-comment-on-types-again
+ public      | roach_legs      | Second-CRDB-comment-on-types-again
+(2 rows)
+
+COMMENT
+COMMENT
+ schema_name |    type_name    | comment 
+-------------+-----------------+---------
+ public      | roach_dwellings | 
+ public      | roach_legs      | 
+(2 rows)
+
+CREATE SCHEMA
+SET
+CREATE TYPE
+COMMENT
+ schema_name | type_name  |             comment              
+-------------+------------+----------------------------------
+ test_db     | roach_type | This is a test comment on a type
+(1 row)
+
+SET
+DROP SCHEMA
+ schema_name 
+-------------
+(0 rows)
+
+RESET

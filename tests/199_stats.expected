@@ -1,0 +1,49 @@
+CREATE TABLE
+INSERT 0 10000
+INSERT 0 10001
+ALTER TABLE
+ANALYZE
+ ?column? 
+----------
+ t
+(1 row)
+
+CREATE TYPE
+CREATE TABLE
+ANALYZE
+INSERT 0 1
+ANALYZE
+BEGIN
+ALTER TYPE
+ g  
+----
+ hi
+(1 row)
+
+COMMIT
+CREATE TABLE
+ALTER TABLE
+INSERT 0 300
+ANALYZE
+ column_names |          case          
+--------------+------------------------
+ {i}          | histogram_collected
+ {j}          | no_histogram_collected
+(2 rows)
+
+ALTER TABLE
+ANALYZE
+ column_names |        case         
+--------------+---------------------
+ {i}          | histogram_collected
+ {j}          | histogram_collected
+(2 rows)
+
+CREATE TABLE
+INSERT 0 3
+ANALYZE
+ row_count | distinct_count 
+-----------+----------------
+         3 |              1
+(1 row)
+

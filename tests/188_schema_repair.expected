@@ -1,0 +1,7 @@
+SET
+                                    notice                                     
+-------------------------------------------------------------------------------
+ skipped: schema_repair requires CockroachDB crdb_internal/system catalog APIs
+(1 row)
+
+RESET

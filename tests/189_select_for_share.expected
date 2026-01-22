@@ -1,0 +1,82 @@
+SET
+CREATE EXTENSION
+CREATE EXTENSION
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+BEGIN
+ a 
+---
+ 1
+(1 row)
+
+UPDATE 1
+COMMIT
+ a 
+---
+ 2
+(1 row)
+
+BEGIN
+ a 
+---
+ 2
+(1 row)
+
+COMMIT
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+ dblink_connect 
+----------------
+ OK
+(1 row)
+
+ dblink_exec 
+-------------
+ BEGIN
+(1 row)
+
+ a 
+---
+ 1
+(1 row)
+
+ locked_rows 
+-------------
+           1
+(1 row)
+
+ a 
+---
+ 2
+(1 row)
+
+ a 
+---
+ 2
+(1 row)
+
+ dblink_exec 
+-------------
+ COMMIT
+(1 row)
+
+ dblink_disconnect 
+-------------------
+ OK
+(1 row)
+
+ a 
+---
+ 1
+ 2
+(2 rows)
+
+ a 
+---
+ 1
+ 2
+(2 rows)
+
+RESET

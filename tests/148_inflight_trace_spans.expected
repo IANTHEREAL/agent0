@@ -1,0 +1,22 @@
+DO
+CREATE TABLE
+ k | v 
+---+---
+(0 rows)
+
+CREATE TABLE
+BEGIN
+INSERT 0 1
+CREATE VIEW
+ ?column? 
+----------
+ t
+(1 row)
+
+INSERT 0 1
+COMMIT
+ ?column? 
+----------
+ t
+(1 row)
+

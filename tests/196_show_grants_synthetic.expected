@@ -1,0 +1,80 @@
+SET
+RESET
+DROP ROLE
+DROP ROLE
+DROP ROLE
+DROP ROLE
+DROP ROLE
+DROP ROLE
+DROP ROLE
+CREATE ROLE
+CREATE ROLE
+CREATE ROLE
+CREATE ROLE
+CREATE ROLE
+CREATE ROLE
+CREATE FUNCTION
+GRANT ROLE
+GRANT ROLE
+GRANT ROLE
+ grantee  |      privilege       | grantor  | grantable 
+----------+----------------------+----------+-----------
+ testuser | externalconnection   | postgres | t
+ testuser | modifyclustersetting | postgres | f
+ testuser | viewactivity         | postgres | f
+(3 rows)
+
+ grantee  |      privilege       | grantor  | grantable 
+----------+----------------------+----------+-----------
+ testuser | externalconnection   | postgres | t
+ testuser | modifyclustersetting | postgres | f
+ testuser | viewactivity         | postgres | f
+(3 rows)
+
+REVOKE ROLE
+ grantee  |      privilege       | grantor  | grantable 
+----------+----------------------+----------+-----------
+ testuser | externalconnection   | postgres | t
+ testuser | modifyclustersetting | postgres | f
+(2 rows)
+
+CREATE ROLE
+GRANT ROLE
+GRANT ROLE
+GRANT ROLE
+GRANT ROLE
+  grantee  |       privilege       | grantor  | grantable 
+-----------+-----------------------+----------+-----------
+ testuser  | externalconnection    | postgres | t
+ testuser  | modifyclustersetting  | postgres | f
+ testuser  | repairclustermetadata | postgres | f
+ testuser2 | externalconnection    | postgres | f
+ testuser2 | repaircluster         | postgres | f
+ testuser2 | viewactivity          | postgres | t
+(6 rows)
+
+  grantee  |     privilege      | grantor  | grantable 
+-----------+--------------------+----------+-----------
+ testuser2 | externalconnection | postgres | f
+ testuser2 | repaircluster      | postgres | f
+ testuser2 | viewactivity       | postgres | t
+(3 rows)
+
+  grantee  |       privilege       | grantor  | grantable 
+-----------+-----------------------+----------+-----------
+ testuser  | externalconnection    | postgres | t
+ testuser  | modifyclustersetting  | postgres | f
+ testuser  | repairclustermetadata | postgres | f
+ testuser2 | externalconnection    | postgres | f
+ testuser2 | repaircluster         | postgres | f
+ testuser2 | viewactivity          | postgres | t
+(6 rows)
+
+ grantee  |       privilege       | grantor  | grantable 
+----------+-----------------------+----------+-----------
+ testuser | externalconnection    | postgres | t
+ testuser | modifyclustersetting  | postgres | f
+ testuser | repairclustermetadata | postgres | f
+(3 rows)
+
+RESET

@@ -1,0 +1,161 @@
+CREATE SCHEMA
+CREATE FUNCTION
+ count 
+-------
+    10
+(1 row)
+
+  gen_rand_ident   
+-------------------
+ oelwlloohr_4cd335
+ lredrollle_586197
+ lhoorlleoo_e928ba
+ orrrddlroh_24611b
+ hlwhledooe_0a7a4b
+ rewdldhwwr_7f010f
+ lrldohlold_12a721
+ deeorlhlrl_9f5bd3
+ llhleworre_a8e85a
+ oohrldhooe_9a1078
+(10 rows)
+
+ gen_rand_ident 
+----------------
+ oelwlloohr35
+ lredrollle97
+ lhoorlleooba
+ orrrddlroh1b
+ hlwhledooe4b
+ rewdldhwwr0f
+ lrldohlold21
+ deeorlhlrld3
+ llhleworre5a
+ oohrldhooe78
+(10 rows)
+
+   gen_rand_ident    
+---------------------
+ 😀oelwlloohr_4cd335
+ 😀lredrollle_586197
+ 😀lhoorlleoo_e928ba
+ 😀orrrddlroh_24611b
+ 😀hlwhledooe_0a7a4b
+ 😀rewdldhwwr_7f010f
+ 😀lrldohlold_12a721
+ 😀deeorlhlrl_9f5bd3
+ 😀llhleworre_a8e85a
+ 😀oohrldhooe_9a1078
+(10 rows)
+
+ gen_rand_ident  
+-----------------
+ oelwlloohr_4cd3
+ lredrollle_5861
+ lhoorlleoo_e928
+ orrrddlroh_2461
+ hlwhledooe_0a7a
+ rewdldhwwr_7f01
+ lrldohlold_12a7
+ deeorlhlrl_9f5b
+ llhleworre_a8e8
+ oohrldhooe_9a10
+(10 rows)
+
+  gen_rand_ident  
+------------------
+ oe-lwlloohr_4cd3
+ lr-edrollle_5861
+ lh-oorlleoo_e928
+ or-rrddlroh_2461
+ hl-whledooe_0a7a
+ re-wdldhwwr_7f01
+ lr-ldohlold_12a7
+ de-eorlhlrl_9f5b
+ ll-hleworre_a8e8
+ oo-hrldhooe_9a10
+(10 rows)
+
+  gen_rand_ident  
+------------------
+ o"elwlloohr_4cd3
+ l"redrollle_5861
+ l"hoorlleoo_e928
+ o"rrrddlroh_2461
+ h"lwhledooe_0a7a
+ r"ewdldhwwr_7f01
+ l"rldohlold_12a7
+ d"eeorlhlrl_9f5b
+ l"lhleworre_a8e8
+ o"ohrldhooe_9a10
+(10 rows)
+
+  gen_rand_ident  
+------------------
+ oel wlloohr_4cd3
+ lre drollle_5861
+ lho orlleoo_e928
+ orr rddlroh_2461
+ hlw hledooe_0a7a
+ rew dldhwwr_7f01
+ lrl dohlold_12a7
+ dee orlhlrl_9f5b
+ llh leworre_a8e8
+ ooh rldhooe_9a10
+(10 rows)
+
+     quote_ident      
+----------------------
+ "oelw   lloohr_4cd3"
+ "lred   rollle_5861"
+ "lhoo   rlleoo_e928"
+ "orrr   ddlroh_2461"
+ "hlwh   ledooe_0a7a"
+ "rewd   ldhwwr_7f01"
+ "lrld   ohlold_12a7"
+ "deeo   rlhlrl_9f5b"
+ "llhl   eworre_a8e8"
+ "oohr   ldhooe_9a10"
+(10 rows)
+
+  gen_rand_ident   
+-------------------
+ oelwlloohr_4cd3😀
+ lredrollle_5861😀
+ lhoorlleoo_e928😀
+ orrrddlroh_2461😀
+ hlwhledooe_0a7a😀
+ rewdldhwwr_7f01😀
+ lrldohlold_12a7😀
+ deeorlhlrl_9f5b😀
+ llhleworre_a8e8😀
+ oohrldhooe_9a10😀
+(10 rows)
+
+ gen_rand_ident 
+----------------
+ é̀̈́á̀̈́ó̀̈́á̀̈́á̀̈́é̀̈́é̀̈́_1d́̀̈́87
+ é̀̈́á̀̈́á̀̈́á̀̈́á̀̈́á̀̈́ó̀̈́_32f́̀̈́á̀̈́
+ á̀̈́á̀̈́á̀̈́é̀̈́é̀̈́á̀̈́á̀̈́_9f́̀̈́é̀̈́7
+ ó̀̈́á̀̈́á̀̈́é̀̈́á̀̈́á̀̈́é̀̈́_á̀̈́é̀̈́80
+ á̀̈́á̀̈́á̀̈́á̀̈́í̀̈́ó̀̈́ó̀̈́_1é̀̈́ć̀̈́2
+ á̀̈́í̀̈́á̀̈́é̀̈́á̀̈́ó̀̈́á̀̈́_f́̀̈́7b́̀̈́3
+ ó̀̈́á̀̈́á̀̈́á̀̈́ó̀̈́ó̀̈́á̀̈́_149f́̀̈́
+ á̀̈́í̀̈́é̀̈́á̀̈́í̀̈́á̀̈́á̀̈́_936d́̀̈́
+ á̀̈́ó̀̈́á̀̈́á̀̈́á̀̈́á̀̈́ó̀̈́_9853
+ á̀̈́á̀̈́í̀̈́á̀̈́é̀̈́ó̀̈́é̀̈́_ć̀̈́970
+(10 rows)
+
+ gen_rand_ident 
+----------------
+ é̶̈á̶̈ó̶̈á̶̈á̶̈é̶̈é̶̈_1d̶́̈87
+ é̶̈á̶̈á̶̈á̶̈á̶̈á̶̈ó̶̈_32f̶́̈á̶̈
+ á̶̈á̶̈á̶̈é̶̈é̶̈á̶̈á̶̈_9f̶́̈é̶̈7
+ ó̶̈á̶̈á̶̈é̶̈á̶̈á̶̈é̶̈_á̶̈é̶̈80
+ á̶̈á̶̈á̶̈á̶̈í̶̈ó̶̈ó̶̈_1é̶̈ć̶̈2
+ á̶̈í̶̈á̶̈é̶̈á̶̈ó̶̈á̶̈_f̶́̈7b̶́̈3
+ ó̶̈á̶̈á̶̈á̶̈ó̶̈ó̶̈á̶̈_149f̶́̈
+ á̶̈í̶̈é̶̈á̶̈í̶̈á̶̈á̶̈_936d̶́̈
+ á̶̈ó̶̈á̶̈á̶̈á̶̈á̶̈ó̶̈_9853
+ á̶̈á̶̈í̶̈á̶̈é̶̈ó̶̈é̶̈_ć̶̈970
+(10 rows)
+

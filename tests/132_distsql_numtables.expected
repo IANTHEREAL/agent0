@@ -1,0 +1,450 @@
+SET
+CREATE FUNCTION
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 100
+INSERT 0 10000
+ ?column? | ?column? | y  |  str  
+----------+----------+----+-------
+        5 |       10 |  8 | eight
+        5 |        7 |  5 | five
+        5 |        6 |  4 | four
+        5 |       11 |  9 | nine
+        5 |        3 |  1 | one
+        5 |        9 |  7 | seven
+        5 |        8 |  6 | six
+        5 |       12 | 10 | ten
+        5 |        5 |  3 | three
+        5 |        4 |  2 | two
+(10 rows)
+
+ ?column? | ?column? |   y   |      str       
+----------+----------+-------+----------------
+        5 |     8002 |  8000 | eight thousand
+        5 |     5002 |  5000 | five thousand
+        5 |     4002 |  4000 | four thousand
+        5 |     9002 |  9000 | nine thousand
+        5 |     1002 |  1000 | one thousand
+        5 |     7002 |  7000 | seven thousand
+        5 |     6002 |  6000 | six thousand
+        5 |    10002 | 10000 | ten thousand
+        5 |     3002 |  3000 | three thousand
+        5 |     2002 |  2000 | two thousand
+(10 rows)
+
+  str  
+-------
+ one
+ three
+ five
+ seven
+ eight
+ nine
+(6 rows)
+
+      str       
+----------------
+ five thousand
+ six thousand
+ eight thousand
+ nine thousand
+(4 rows)
+
+  i  |               to_english                
+-----+-----------------------------------------
+   1 | one
+   2 | four
+   3 | nine
+   4 | sixteen
+   5 | twenty-five
+   6 | thirty-six
+   7 | forty-nine
+   8 | sixty-four
+   9 | eighty-one
+  10 | one hundred
+  11 | one hundred twenty-one
+  12 | one hundred forty-four
+  13 | one hundred sixty-nine
+  14 | one hundred ninety-six
+  15 | two hundred twenty-five
+  16 | two hundred fifty-six
+  17 | two hundred eighty-nine
+  18 | three hundred twenty-four
+  19 | three hundred sixty-one
+  20 | four hundred
+  21 | four hundred forty-one
+  22 | four hundred eighty-four
+  23 | five hundred twenty-nine
+  24 | five hundred seventy-six
+  25 | six hundred twenty-five
+  26 | six hundred seventy-six
+  27 | seven hundred twenty-nine
+  28 | seven hundred eighty-four
+  29 | eight hundred forty-one
+  30 | nine hundred
+  31 | nine hundred sixty-one
+  32 | one thousand twenty-four
+  33 | one thousand eighty-nine
+  34 | one thousand one hundred fifty-six
+  35 | one thousand two hundred twenty-five
+  36 | one thousand two hundred ninety-six
+  37 | one thousand three hundred sixty-nine
+  38 | one thousand four hundred forty-four
+  39 | one thousand five hundred twenty-one
+  40 | one thousand six hundred
+  41 | one thousand six hundred eighty-one
+  42 | one thousand seven hundred sixty-four
+  43 | one thousand eight hundred forty-nine
+  44 | one thousand nine hundred thirty-six
+  45 | two thousand twenty-five
+  46 | two thousand one hundred sixteen
+  47 | two thousand two hundred nine
+  48 | two thousand three hundred four
+  49 | two thousand four hundred one
+  50 | two thousand five hundred
+  51 | two thousand six hundred one
+  52 | two thousand seven hundred four
+  53 | two thousand eight hundred nine
+  54 | two thousand nine hundred sixteen
+  55 | three thousand twenty-five
+  56 | three thousand one hundred thirty-six
+  57 | three thousand two hundred forty-nine
+  58 | three thousand three hundred sixty-four
+  59 | three thousand four hundred eighty-one
+  60 | three thousand six hundred
+  61 | three thousand seven hundred twenty-one
+  62 | three thousand eight hundred forty-four
+  63 | three thousand nine hundred sixty-nine
+  64 | four thousand ninety-six
+  65 | four thousand two hundred twenty-five
+  66 | four thousand three hundred fifty-six
+  67 | four thousand four hundred eighty-nine
+  68 | four thousand six hundred twenty-four
+  69 | four thousand seven hundred sixty-one
+  70 | four thousand nine hundred
+  71 | five thousand forty-one
+  72 | five thousand one hundred eighty-four
+  73 | five thousand three hundred twenty-nine
+  74 | five thousand four hundred seventy-six
+  75 | five thousand six hundred twenty-five
+  76 | five thousand seven hundred seventy-six
+  77 | five thousand nine hundred twenty-nine
+  78 | six thousand eighty-four
+  79 | six thousand two hundred forty-one
+  80 | six thousand four hundred
+  81 | six thousand five hundred sixty-one
+  82 | six thousand seven hundred twenty-four
+  83 | six thousand eight hundred eighty-nine
+  84 | seven thousand fifty-six
+  85 | seven thousand two hundred twenty-five
+  86 | seven thousand three hundred ninety-six
+  87 | seven thousand five hundred sixty-nine
+  88 | seven thousand seven hundred forty-four
+  89 | seven thousand nine hundred twenty-one
+  90 | eight thousand one hundred
+  91 | eight thousand two hundred eighty-one
+  92 | eight thousand four hundred sixty-four
+  93 | eight thousand six hundred forty-nine
+  94 | eight thousand eight hundred thirty-six
+  95 | nine thousand twenty-five
+  96 | nine thousand two hundred sixteen
+  97 | nine thousand four hundred nine
+  98 | nine thousand six hundred four
+  99 | nine thousand eight hundred one
+ 100 | ten thousand
+(100 rows)
+
+  x  |                   str                   
+-----+-----------------------------------------
+   1 | one
+   2 | four
+   3 | nine
+   4 | sixteen
+   5 | twenty-five
+   6 | thirty-six
+   7 | forty-nine
+   8 | sixty-four
+   9 | eighty-one
+  10 | one hundred
+  11 | one hundred twenty-one
+  12 | one hundred forty-four
+  13 | one hundred sixty-nine
+  14 | one hundred ninety-six
+  15 | two hundred twenty-five
+  16 | two hundred fifty-six
+  17 | two hundred eighty-nine
+  18 | three hundred twenty-four
+  19 | three hundred sixty-one
+  20 | four hundred
+  21 | four hundred forty-one
+  22 | four hundred eighty-four
+  23 | five hundred twenty-nine
+  24 | five hundred seventy-six
+  25 | six hundred twenty-five
+  26 | six hundred seventy-six
+  27 | seven hundred twenty-nine
+  28 | seven hundred eighty-four
+  29 | eight hundred forty-one
+  30 | nine hundred
+  31 | nine hundred sixty-one
+  32 | one thousand twenty-four
+  33 | one thousand eighty-nine
+  34 | one thousand one hundred fifty-six
+  35 | one thousand two hundred twenty-five
+  36 | one thousand two hundred ninety-six
+  37 | one thousand three hundred sixty-nine
+  38 | one thousand four hundred forty-four
+  39 | one thousand five hundred twenty-one
+  40 | one thousand six hundred
+  41 | one thousand six hundred eighty-one
+  42 | one thousand seven hundred sixty-four
+  43 | one thousand eight hundred forty-nine
+  44 | one thousand nine hundred thirty-six
+  45 | two thousand twenty-five
+  46 | two thousand one hundred sixteen
+  47 | two thousand two hundred nine
+  48 | two thousand three hundred four
+  49 | two thousand four hundred one
+  50 | two thousand five hundred
+  51 | two thousand six hundred one
+  52 | two thousand seven hundred four
+  53 | two thousand eight hundred nine
+  54 | two thousand nine hundred sixteen
+  55 | three thousand twenty-five
+  56 | three thousand one hundred thirty-six
+  57 | three thousand two hundred forty-nine
+  58 | three thousand three hundred sixty-four
+  59 | three thousand four hundred eighty-one
+  60 | three thousand six hundred
+  61 | three thousand seven hundred twenty-one
+  62 | three thousand eight hundred forty-four
+  63 | three thousand nine hundred sixty-nine
+  64 | four thousand ninety-six
+  65 | four thousand two hundred twenty-five
+  66 | four thousand three hundred fifty-six
+  67 | four thousand four hundred eighty-nine
+  68 | four thousand six hundred twenty-four
+  69 | four thousand seven hundred sixty-one
+  70 | four thousand nine hundred
+  71 | five thousand forty-one
+  72 | five thousand one hundred eighty-four
+  73 | five thousand three hundred twenty-nine
+  74 | five thousand four hundred seventy-six
+  75 | five thousand six hundred twenty-five
+  76 | five thousand seven hundred seventy-six
+  77 | five thousand nine hundred twenty-nine
+  78 | six thousand eighty-four
+  79 | six thousand two hundred forty-one
+  80 | six thousand four hundred
+  81 | six thousand five hundred sixty-one
+  82 | six thousand seven hundred twenty-four
+  83 | six thousand eight hundred eighty-nine
+  84 | seven thousand fifty-six
+  85 | seven thousand two hundred twenty-five
+  86 | seven thousand three hundred ninety-six
+  87 | seven thousand five hundred sixty-nine
+  88 | seven thousand seven hundred forty-four
+  89 | seven thousand nine hundred twenty-one
+  90 | eight thousand one hundred
+  91 | eight thousand two hundred eighty-one
+  92 | eight thousand four hundred sixty-four
+  93 | eight thousand six hundred forty-nine
+  94 | eight thousand eight hundred thirty-six
+  95 | nine thousand twenty-five
+  96 | nine thousand two hundred sixteen
+  97 | nine thousand four hundred nine
+  98 | nine thousand six hundred four
+  99 | nine thousand eight hundred one
+ 100 | ten thousand
+(100 rows)
+
+ matches 
+---------
+ t
+(1 row)
+
+ ?column? |  to_english   
+----------+---------------
+        2 | two
+        4 | four
+        6 | six
+        8 | eight
+       10 | ten
+       12 | twelve
+       14 | fourteen
+       16 | sixteen
+       18 | eighteen
+       20 | twenty
+       22 | twenty-two
+       24 | twenty-four
+       26 | twenty-six
+       28 | twenty-eight
+       30 | thirty
+       32 | thirty-two
+       34 | thirty-four
+       36 | thirty-six
+       38 | thirty-eight
+       40 | forty
+       42 | forty-two
+       44 | forty-four
+       46 | forty-six
+       48 | forty-eight
+       50 | fifty
+       52 | fifty-two
+       54 | fifty-four
+       56 | fifty-six
+       58 | fifty-eight
+       60 | sixty
+       62 | sixty-two
+       64 | sixty-four
+       66 | sixty-six
+       68 | sixty-eight
+       70 | seventy
+       72 | seventy-two
+       74 | seventy-four
+       76 | seventy-six
+       78 | seventy-eight
+       80 | eighty
+       82 | eighty-two
+       84 | eighty-four
+       86 | eighty-six
+       88 | eighty-eight
+       90 | ninety
+       92 | ninety-two
+       94 | ninety-four
+       96 | ninety-six
+       98 | ninety-eight
+      100 | one hundred
+(50 rows)
+
+  x  |      str      
+-----+---------------
+   2 | two
+   4 | four
+   6 | six
+   8 | eight
+  10 | ten
+  12 | twelve
+  14 | fourteen
+  16 | sixteen
+  18 | eighteen
+  20 | twenty
+  22 | twenty-two
+  24 | twenty-four
+  26 | twenty-six
+  28 | twenty-eight
+  30 | thirty
+  32 | thirty-two
+  34 | thirty-four
+  36 | thirty-six
+  38 | thirty-eight
+  40 | forty
+  42 | forty-two
+  44 | forty-four
+  46 | forty-six
+  48 | forty-eight
+  50 | fifty
+  52 | fifty-two
+  54 | fifty-four
+  56 | fifty-six
+  58 | fifty-eight
+  60 | sixty
+  62 | sixty-two
+  64 | sixty-four
+  66 | sixty-six
+  68 | sixty-eight
+  70 | seventy
+  72 | seventy-two
+  74 | seventy-four
+  76 | seventy-six
+  78 | seventy-eight
+  80 | eighty
+  82 | eighty-two
+  84 | eighty-four
+  86 | eighty-six
+  88 | eighty-eight
+  90 | ninety
+  92 | ninety-two
+  94 | ninety-four
+  96 | ninety-six
+  98 | ninety-eight
+ 100 | one hundred
+(50 rows)
+
+ matches 
+---------
+ t
+(1 row)
+
+   sum    
+----------
+ 50005000
+(1 row)
+
+ count 
+-------
+ 10000
+(1 row)
+
+ count 
+-------
+  2629
+(1 row)
+
+ y 
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+(5 rows)
+
+   y   
+-------
+ 10000
+  9999
+  9998
+  9997
+  9996
+(5 rows)
+
+ y 
+---
+ 6
+ 7
+(2 rows)
+
+ y 
+---
+(0 rows)
+
+ y 
+---
+(0 rows)
+
+  y  
+-----
+   8
+ 800
+ 808
+ 818
+ 880
+(5 rows)
+
+ y 
+---
+ 1
+ 3
+ 4
+ 5
+(4 rows)
+
+ count 
+-------
+    10
+(1 row)
+
+RESET

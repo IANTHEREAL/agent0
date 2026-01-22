@@ -1,0 +1,15 @@
+CREATE COLLATION
+CREATE TABLE
+INSERT 0 1
+   a    
+--------
+ Amélie
+(1 row)
+
+DELETE 1
+INSERT 0 1
+   a    
+--------
+ Amélie
+(1 row)
+

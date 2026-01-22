@@ -1,0 +1,2573 @@
+SET
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+ min | max | count | sum | avg | sum | stddev | stddev_samp | stddev_pop | var_samp | variance | var_pop | bool_and | bool_and | bit_xor | bit_and | bit_or | corr | covar_pop | covar_samp | variance | regr_intercept | regr_r2 | regr_slope | regr_sxx | regr_sxy | regr_syy | regr_count | regr_avgx | regr_avgy 
+-----+-----+-------+-----+-----+-----+--------+-------------+------------+----------+----------+---------+----------+----------+---------+---------+--------+------+-----------+------------+----------+----------------+---------+------------+----------+----------+----------+------------+-----------+-----------
+     |     |     0 |     |     |     |        |             |            |          |          |         |          |          |         |         |        |      |           |            |          |                |         |            |          |          |          |          0 |           |          
+(1 row)
+
+ min 
+-----
+ 
+(1 row)
+
+ array_agg 
+-----------
+ 
+(1 row)
+
+ array_agg 
+-----------
+ 
+(1 row)
+
+ json_agg 
+----------
+ 
+(1 row)
+
+ jsonb_agg 
+-----------
+ 
+(1 row)
+
+ min | avg | max | sum 
+-----+-----+-----+-----
+     |     |     | 
+(1 row)
+
+ min | max | count | sum | avg | sum | stddev | stddev_pop | variance | var_pop | var_samp | bool_and | bool_and | bit_xor | corr | variance | covar_pop | covar_samp | regr_intercept | regr_r2 | regr_slope | regr_sxx | regr_sxy | regr_syy | regr_count | regr_avgx | regr_avgy 
+-----+-----+-------+-----+-----+-----+--------+------------+----------+---------+----------+----------+----------+---------+------+----------+-----------+------------+----------------+---------+------------+----------+----------+----------+------------+-----------+-----------
+     |     |     0 |     |     |     |        |            |          |         |          |          |          |         |      |          |           |            |                |         |            |          |          |          |          0 |           |          
+(1 row)
+
+ array_agg 
+-----------
+ 
+(1 row)
+
+ array_agg 
+-----------
+ 
+(1 row)
+
+ json_agg 
+----------
+ 
+(1 row)
+
+ jsonb_agg 
+-----------
+ 
+(1 row)
+
+ min | count | max | sum | avg | sum | stddev_samp | stddev_pop | variance | var_pop | var_samp | bool_and | bool_or | to_hex | corr | variance | covar_pop | covar_samp | regr_intercept | regr_r2 | regr_slope | regr_sxx | regr_sxy | regr_syy | regr_count | regr_avgx | regr_avgy 
+-----+-------+-----+-----+-----+-----+-------------+------------+----------+---------+----------+----------+---------+--------+------+----------+-----------+------------+----------------+---------+------------+----------+----------+----------+------------+-----------+-----------
+   1 |     1 |   1 |   1 |   1 |   1 |             |          0 |          |       0 |          | t        | t       | 1      |      |          |         0 |            |                |         |            |        0 |        0 |        0 |          1 |         1 |         1
+(1 row)
+
+ array_agg 
+-----------
+ {1}
+(1 row)
+
+ array_agg 
+-----------
+ {{1}}
+(1 row)
+
+   array_agg   
+---------------
+ {{1},{1},{1}}
+(1 row)
+
+ json_agg 
+----------
+ [1]
+(1 row)
+
+ jsonb_agg 
+-----------
+ [1]
+(1 row)
+
+ count 
+-------
+     0
+(1 row)
+
+ json_agg 
+----------
+ [null]
+(1 row)
+
+ jsonb_agg 
+-----------
+ [null]
+(1 row)
+
+ array_agg 
+-----------
+ {NULL}
+(1 row)
+
+ array_agg 
+-----------
+ {NULL}
+(1 row)
+
+ array_agg 
+-----------
+ {NULL}
+(1 row)
+
+ coalesce 
+----------
+        0
+(1 row)
+
+ count 
+-------
+   100
+(1 row)
+
+ ?column? 
+----------
+        1
+(1 row)
+
+ count | coalesce 
+-------+----------
+     0 |        1
+(1 row)
+
+ coalesce 
+----------
+        0
+(1 row)
+
+INSERT 0 6
+ min | count | max | sum | avg | sum | stddev | stddev_pop | variance | var_pop | var_samp | bool_and | bool_or | to_hex | variance 
+-----+-------+-----+-----+-----+-----+--------+------------+----------+---------+----------+----------+---------+--------+----------
+   1 |     6 |   1 |   6 |   1 |   6 |      0 |          0 |        0 |       0 |        0 | t        | t       | 0      |        0
+(1 row)
+
+   array_agg   
+---------------
+ {1,1,1,1,1,1}
+(1 row)
+
+               array_agg               
+---------------------------------------
+ {{1,2},{1,2},{1,2},{1,2},{1,2},{1,2}}
+(1 row)
+
+      json_agg      
+--------------------
+ [1, 1, 1, 1, 1, 1]
+(1 row)
+
+     jsonb_agg      
+--------------------
+ [1, 1, 1, 1, 1, 1]
+(1 row)
+
+ ?column? 
+----------
+        1
+        1
+        1
+(3 rows)
+
+ ?column? 
+----------
+        3
+(1 row)
+
+ count | k 
+-------+---
+     1 | 6
+     1 | 3
+     1 | 5
+     1 | 7
+     1 | 1
+     1 | 8
+(6 rows)
+
+ count | s 
+-------+---
+     1 | 
+     2 | a
+     2 | b
+     1 | A
+(4 rows)
+
+ count | s 
+-------+---
+     1 | 
+     2 | a
+     2 | b
+     1 | A
+(4 rows)
+
+ count | s 
+-------+---
+     1 | 
+     2 | a
+     2 | b
+     1 | A
+(4 rows)
+
+ count | s 
+-------+---
+     1 | 
+     2 | a
+     2 | b
+     1 | A
+(4 rows)
+
+ v | count | w 
+---+-------+---
+ 2 |     2 | 3
+ 4 |     1 | 2
+ 2 |     1 | 2
+ 4 |     1 | 5
+   |     1 | 5
+(5 rows)
+
+ v | count | w 
+---+-------+---
+ 2 |     2 | 3
+ 4 |     1 | 2
+ 2 |     1 | 2
+ 4 |     1 | 5
+   |     1 | 5
+(5 rows)
+
+ count | upper 
+-------+-------
+     2 | B
+     1 | 
+     3 | A
+(3 rows)
+
+ count 
+-------
+     6
+(1 row)
+
+ count 
+-------
+     6
+(1 row)
+
+ count | upper 
+-------+-------
+     1 | 
+     2 | A
+     2 | B
+     1 | A
+(4 rows)
+
+ count | upper 
+-------+-------
+     2 | B
+     1 | 
+     3 | A
+(3 rows)
+
+ count | ?column? 
+-------+----------
+     1 |         
+     1 |        9
+     1 |        3
+     1 |       12
+     1 |        7
+     1 |        8
+(6 rows)
+
+ count | ?column? 
+-------+----------
+     1 |        8
+     1 |        7
+     1 |         
+     1 |        9
+     1 |        3
+     1 |       12
+(6 rows)
+
+ count_1 | lx 
+---------+----
+       1 |   
+       1 |  9
+       2 |  5
+       1 |  4
+       1 |  6
+(5 rows)
+
+ s | count 
+---+-------
+ a |     2
+ b |     2
+(2 rows)
+
+ upper | count | count 
+-------+-------+-------
+ A     |     2 |     1
+(1 row)
+
+ max | min 
+-----+-----
+(0 rows)
+
+ max | min 
+-----+-----
+   8 |   2
+(1 row)
+
+ ?column? 
+----------
+        3
+        3
+(2 rows)
+
+ k 
+---
+ 8
+(1 row)
+
+ count 
+-------
+     1
+(1 row)
+
+ count 
+-------
+     6
+(1 row)
+
+ count 
+-------
+     1
+(1 row)
+
+ count 
+-------
+     6
+(1 row)
+
+ count 
+-------
+     6
+(1 row)
+
+ v | count 
+---+-------
+ 2 |     3
+ 4 |     2
+   |     1
+(3 rows)
+
+ v | count 
+---+-------
+   |     1
+ 4 |     2
+ 2 |     3
+(3 rows)
+
+ v | count 
+---+-------
+ 2 |     3
+ 4 |     2
+   |     1
+(3 rows)
+
+ v | count 
+---+-------
+ 2 |     3
+ 4 |     2
+   |     1
+(3 rows)
+
+ v | count 
+---+-------
+   |     1
+ 4 |     2
+ 2 |     3
+(3 rows)
+
+ count | count | count 
+-------+-------+-------
+     6 |     6 |     5
+(1 row)
+
+ count 
+-------
+     6
+(1 row)
+
+ count | count | count 
+-------+-------+-------
+     6 |     2 |     2
+(1 row)
+
+ upper | count | count | count 
+-------+-------+-------+-------
+ A     |     3 |     2 |     2
+ B     |     2 |     1 |     1
+       |     1 |     0 |     0
+(3 rows)
+
+ count 
+-------
+     6
+(1 row)
+
+ count 
+-------
+     6
+(1 row)
+
+ count 
+-------
+     6
+(1 row)
+
+ count 
+-------
+    36
+(1 row)
+
+ count 
+-------
+     6
+(1 row)
+
+ count 
+-------
+     6
+(1 row)
+
+ count 
+-------
+(0 rows)
+
+ ?column? 
+----------
+       11
+(1 row)
+
+ count | count 
+-------+-------
+     0 |     1
+(1 row)
+
+ min | max | min | max 
+-----+-----+-----+-----
+   1 |   8 |   2 |   4
+(1 row)
+
+ min | max | min | max 
+-----+-----+-----+-----
+     |     |     |    
+(1 row)
+
+   array_agg   |    array_agg     
+---------------+------------------
+ {1,3,5,6,7,8} | {a,a,NULL,b,b,A}
+(1 row)
+
+    ?column?     
+-----------------
+ {1,3,5,6,7,8,1}
+(1 row)
+
+                    array_agg                    
+-------------------------------------------------
+ {{1,2,NULL},{3,4,5},{6,2,3},{7,2,2},{NULL,4,2}}
+(1 row)
+
+ array_agg 
+-----------
+ {NULL}
+(1 row)
+
+                    array_agg                    
+-------------------------------------------------
+ {{1,2,NULL},{3,4,5},{6,2,3},{7,2,2},{NULL,4,2}}
+(1 row)
+
+                    array_agg                    |              array_agg               |                           array_agg                           
+-------------------------------------------------+--------------------------------------+---------------------------------------------------------------
+ {{1,2,NULL},{3,4,5},{6,2,3},{7,2,2},{NULL,4,2}} | {{NULL},{NULL},{NULL},{NULL},{NULL}} | {{NULL,NULL},{NULL,NULL},{NULL,NULL},{NULL,NULL},{NULL,NULL}}
+(1 row)
+
+ json_agg 
+----------
+ [null]
+(1 row)
+
+ jsonb_agg 
+-----------
+ [null]
+(1 row)
+
+        avg         |        avg         | sum | sum 
+--------------------+--------------------+-----+-----
+ 5.0000000000000000 | 2.8000000000000000 |  30 |  14
+(1 row)
+
+     min      |             avg             |   max   |             sum             
+--------------+-----------------------------+---------+-----------------------------
+ 00:00:00.001 | 7 mons 6 days 19:12:12.4002 | 3 years | 3 years 4 days 00:01:02.001
+(1 row)
+
+        avg         |        avg         | sum | sum 
+--------------------+--------------------+-----+-----
+ 5.0000000000000000 | 2.8000000000000000 |  30 |  14
+(1 row)
+
+        avg         |        avg         | sum | sum 
+--------------------+--------------------+-----+-----
+ 5.0000000000000000 | 3.0000000000000000 |  30 |   6
+(1 row)
+
+       ?column?       
+----------------------
+ 14.00000000000000000
+(1 row)
+
+       ?column?       
+----------------------
+ 14.00000000000000000
+(1 row)
+
+ max 
+-----
+(0 rows)
+
+ max 
+-----
+    
+(1 row)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+ min | min | bool_and | min 
+-----+-----+----------+-----
+ one | 1.5 | f        | 1.1
+(1 row)
+
+ max | max | bool_or | max 
+-----+-----+---------+-----
+ two |   2 | t       |   5
+(1 row)
+
+ avg  | sum |        avg         | sum 
+------+-----+--------------------+-----
+ 1.75 | 3.5 | 3.0500000000000000 | 6.1
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 3
+              sum               
+--------------------------------
+ 3 years 5 mons 7 days 00:00:19
+(1 row)
+
+        avg         
+--------------------
+ 3.0000000000000000
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+DROP INDEX
+CREATE INDEX
+DROP INDEX
+CREATE INDEX
+DROP INDEX
+CREATE INDEX
+INSERT 0 3
+ min 
+-----
+   1
+(1 row)
+
+ min 
+-----
+   2
+(1 row)
+
+ min 
+-----
+   2
+(1 row)
+
+ min | max 
+-----+-----
+   1 |   8
+(1 row)
+
+ ?column? | ?column? 
+----------+----------
+        2 |        9
+(1 row)
+
+ min | max | sum 
+-----+-----+-----
+   1 |   8 |  12
+(1 row)
+
+ min | max 
+-----+-----
+   5 |   5
+(1 row)
+
+ min | max 
+-----+-----
+   1 |   1
+(1 row)
+
+ min | max 
+-----+-----
+   3 |   5
+(1 row)
+
+ max | min 
+-----+-----
+   6 |   1
+(1 row)
+
+ max | min 
+-----+-----
+     |    
+(1 row)
+
+ max | min 
+-----+-----
+   8 |   1
+(1 row)
+
+ min 
+-----
+   4
+(1 row)
+
+ max 
+-----
+   7
+(1 row)
+
+ min 
+-----
+   2
+(1 row)
+
+ max 
+-----
+   2
+(1 row)
+
+ min 
+-----
+    
+(1 row)
+
+ max 
+-----
+    
+(1 row)
+
+ min 
+-----
+   1
+(1 row)
+
+ max 
+-----
+   1
+(1 row)
+
+      var_samp      |      variance      |      round       
+--------------------+--------------------+------------------
+ 9.0000000000000000 | 4.5000000000000000 | 6.33333333333333
+(1 row)
+
+ variance 
+----------
+         
+(1 row)
+
+ variance 
+----------
+         
+(1 row)
+
+      var_pop       |      var_pop       |      round       
+--------------------+--------------------+------------------
+ 6.0000000000000000 | 2.2500000000000000 | 4.22222222222222
+(1 row)
+
+ var_pop 
+---------
+        
+(1 row)
+
+ var_pop 
+---------
+       0
+(1 row)
+
+    stddev_samp     |       stddev       |      round       
+--------------------+--------------------+------------------
+ 3.0000000000000000 | 2.1213203435596426 | 2.51661147842358
+(1 row)
+
+ stddev 
+--------
+       
+(1 row)
+
+     stddev_pop     |     stddev_pop     |      round       
+--------------------+--------------------+------------------
+ 2.4494897427831781 | 1.5000000000000000 | 2.05480466765633
+(1 row)
+
+ stddev_pop 
+------------
+          0
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+DROP TABLE
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 6
+      variance       |      round      |      variance       
+---------------------+-----------------+---------------------
+ 41.3666666666666667 | 17.249666666667 | 17.2496666666666667
+(1 row)
+
+      variance      | round |        variance        
+--------------------+-------+------------------------
+ 4.3333333333333333 |  0.91 | 0.91000000000000000000
+(1 row)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 100
+UPDATE 100
+ round | round | round 
+-------+-------+-------
+  0.08 |  0.08 |     9
+(1 row)
+
+ round | round | round 
+-------+-------+-------
+  0.08 |  0.08 |     9
+(1 row)
+
+ round | round | round 
+-------+-------+-------
+  0.29 |  0.29 |     3
+(1 row)
+
+ round | round | round 
+-------+-------+-------
+  0.29 |  0.29 |     3
+(1 row)
+
+ avg | avg | avg 
+-----+-----+-----
+   1 |   2 |   3
+(1 row)
+
+ count | count | count 
+-------+-------+-------
+     1 |     1 |     1
+(1 row)
+
+ sum | sum | sum 
+-----+-----+-----
+   1 |   2 |   3
+(1 row)
+
+ variance | variance | variance 
+----------+----------+----------
+          |          |         
+(1 row)
+
+ var_pop | var_pop | var_pop 
+---------+---------+---------
+       0 |       0 |       0
+(1 row)
+
+ stddev | stddev_samp | stddev 
+--------+-------------+--------
+        |             |       
+(1 row)
+
+ stddev_pop | stddev_pop | stddev_pop 
+------------+------------+------------
+          0 |          0 |          0
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+ bit_and | bit_or 
+---------+--------
+         |       
+(1 row)
+
+INSERT 0 2
+ bit_and | bit_or 
+---------+--------
+       8 |     29
+(1 row)
+
+INSERT 0 1
+ bit_and | bit_or 
+---------+--------
+       8 |    125
+(1 row)
+
+INSERT 0 1
+ bit_and | bit_or 
+---------+--------
+       8 |    125
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+ bool_and | bool_or 
+----------+---------
+          | 
+(1 row)
+
+INSERT 0 3
+ bool_and | bool_or 
+----------+---------
+ t        | t
+(1 row)
+
+INSERT 0 2
+ bool_and | bool_or 
+----------+---------
+ f        | t
+(1 row)
+
+DELETE 3
+ bool_and | bool_or 
+----------+---------
+ f        | f
+(1 row)
+
+ string_agg 
+------------
+ aabbA
+(1 row)
+
+            json_agg             
+---------------------------------
+ ["a", "a", null, "b", "b", "A"]
+(1 row)
+
+            jsonb_agg            
+---------------------------------
+ ["a", "a", null, "b", "b", "A"]
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 7
+ v | count 
+---+-------
+   |     0
+ 4 |     1
+ 2 |     2
+(3 rows)
+
+ v | mark | count | count | max 
+---+------+-------+-------+-----
+ 2 | f    |     0 |     1 |   1
+   | t    |     0 |     1 |   5
+ 4 | t    |     1 |     3 |   3
+ 2 | t    |     2 |     2 |   7
+(4 rows)
+
+ k | max 
+---+-----
+ 6 |    
+ 3 |    
+ 5 |    
+ 7 |    
+ 1 |   1
+ 8 |    
+(6 rows)
+
+ ?column? 
+----------
+        1
+        1
+        1
+        1
+        1
+        1
+(6 rows)
+
+ sum 
+-----
+ 6.1
+ 6.1
+ 1.1
+ 6.1
+ 6.1
+(5 rows)
+
+DROP TABLE
+CREATE TABLE
+DROP INDEX
+CREATE INDEX
+INSERT 0 4
+ min 
+-----
+   5
+(1 row)
+
+ min 
+-----
+   5
+(1 row)
+
+ min 
+-----
+  10
+(1 row)
+
+ min 
+-----
+  10
+   5
+    
+    
+(4 rows)
+
+ max 
+-----
+  10
+   5
+    
+    
+(4 rows)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 5
+ to_hex | bit_xor 
+--------+---------
+ 1f     |       6
+(1 row)
+
+ to_hex | b | bit_xor 
+--------+---+---------
+ 3      | 1 |       2
+ 1c     | 2 |       4
+(2 rows)
+
+ bit_xor 
+---------
+       0
+(1 row)
+
+ bool_or | bool_and 
+---------+----------
+ t       | t
+(1 row)
+
+DROP TABLE
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 3
+  row  
+-------
+ (1,1)
+ (3,3)
+ (1,2)
+(3 rows)
+
+ min |  row  
+-----+-------
+  20 | (1,1)
+  20 | (3,3)
+  10 | (1,2)
+  30 | (1,2)
+  10 | (3,3)
+  30 | (1,1)
+  10 | (1,1)
+  30 | (3,3)
+  20 | (1,2)
+(9 rows)
+
+DROP TABLE
+CREATE TABLE
+DROP INDEX
+CREATE INDEX
+INSERT 0 6
+ x | max 
+---+-----
+ 5 |    
+ 6 |   2
+ 3 |   4
+ 8 |   4
+ 7 |   2
+ 1 |   2
+(6 rows)
+
+ x | max 
+---+-----
+ 1 |   2
+ 3 |   4
+ 5 |    
+ 6 |   2
+ 7 |   2
+ 8 |   4
+(6 rows)
+
+ z | x | max 
+---+---+-----
+ 5 | 5 |    
+ 3 | 6 |   2
+ 5 | 3 |   4
+ 2 | 8 |   4
+ 2 | 7 |   2
+ 3 | 1 |   2
+(6 rows)
+
+ z | x | max 
+---+---+-----
+ 3 | 1 |   2
+ 5 | 3 |   4
+ 5 | 5 |    
+ 3 | 6 |   2
+ 2 | 7 |   2
+ 2 | 8 |   4
+(6 rows)
+
+ z | max 
+---+-----
+ 3 |   2
+ 5 |   4
+ 2 |   4
+(3 rows)
+
+ x | max | z | min 
+---+-----+---+-----
+ 5 |     | 5 |   4
+ 3 |   4 | 3 |   2
+(2 rows)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 8
+ max 
+-----
+  31
+(1 row)
+
+  min  
+-------
+ -3000
+(1 row)
+
+DROP TABLE
+ ?column? 
+----------
+        1
+        1
+        1
+        1
+        1
+(5 rows)
+
+ v | array_agg 
+---+-----------
+   | {a}
+ 4 | {a,a}
+ 2 | {a,a,a}
+(3 rows)
+
+ ?column? 
+----------
+      123
+(1 row)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 11
+        corr        |        corr        |        corr        |        corr        |        corr        
+--------------------+--------------------+--------------------+--------------------+--------------------
+ 0.9330078226479681 | 0.9330078226479681 | 0.9330078226479681 | 0.9330078226479681 | 0.9330078226479681
+(1 row)
+
+        corr        |        corr        |        corr        |        corr        
+--------------------+--------------------+--------------------+--------------------
+ 0.9330078226479681 | 0.9330078226479681 | 0.9330078226479681 | 0.9330078226479681
+(1 row)
+
+        corr        
+--------------------
+ 0.9326733179802503
+(1 row)
+
+       corr       
+------------------
+ 0.93267331798025
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ corr | corr | corr 
+------+------+------
+    1 |    1 |    1
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ corr | corr | corr 
+------+------+------
+   -1 |   -1 |   -1
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ corr | corr | corr 
+------+------+------
+      |      |     
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 11
+      covar_pop      | covar_pop | covar_pop |      covar_pop      |    round     
+---------------------+-----------+-----------+---------------------+--------------
+ -149.70033719999975 |        33 |    1100.4 | -25.336321999999992 | -149.7003372
+(1 row)
+
+      covar_pop      |      covar_pop      | covar_pop |      covar_pop      
+---------------------+---------------------+-----------+---------------------
+ -149.70033719999975 | -25.336321999999992 |    1100.4 | -149.70033719999975
+(1 row)
+
+     covar_pop     
+-------------------
+ 653.6289512499998
+(1 row)
+
+ covar_pop 
+-----------
+  -1109.43
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ covar_pop | covar_pop | covar_pop 
+-----------+-----------+-----------
+      -7.5 |      -7.5 |      -7.5
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ covar_pop | covar_pop | covar_pop 
+-----------+-----------+-----------
+         0 |         0 |         0
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 11
+     covar_samp      |     covar_samp     |     covar_samp     |     covar_samp      |    round    
+---------------------+--------------------+--------------------+---------------------+-------------
+ -166.33370799999972 | 36.666666666666664 | 1222.6666666666667 | -28.151468888888882 | -166.333708
+(1 row)
+
+     covar_samp      |     covar_samp      |     covar_samp     |     covar_samp      
+---------------------+---------------------+--------------------+---------------------
+ -166.33370799999972 | -28.151468888888882 | 1222.6666666666667 | -166.33370799999972
+(1 row)
+
+    covar_samp    
+------------------
+ 871.505268333333
+(1 row)
+
+ covar_samp 
+------------
+   -2218.86
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ covar_samp | covar_samp | covar_samp 
+------------+------------+------------
+        -15 |        -15 |        -15
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ covar_samp | covar_samp | covar_samp 
+------------+------------+------------
+          0 |          0 |          0
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 11
+  regr_intercept   |   regr_intercept   |   regr_intercept   |   regr_intercept   |  regr_intercept   
+-------------------+--------------------+--------------------+--------------------+-------------------
+ 66.37668792522518 | 1.4700239808153477 | 14.182254196642685 | 3.1991508150525205 | 66.37668792522518
+(1 row)
+
+  regr_intercept   |   regr_intercept   |   regr_intercept   |  regr_intercept   
+-------------------+--------------------+--------------------+-------------------
+ 66.37668792522518 | 3.1991508150525205 | 14.182254196642685 | 66.37668792522518
+(1 row)
+
+  regr_intercept   
+-------------------
+ 45.39536635974404
+(1 row)
+
+  regr_intercept  
+------------------
+ 56.3445012303615
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_intercept | regr_intercept | regr_intercept 
+----------------+----------------+----------------
+              0 |              0 |              0
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+   regr_intercept   |   regr_intercept   |   regr_intercept   
+--------------------+--------------------+--------------------
+ 1.3333333333333333 | 1.3333333333333333 | 1.3333333333333333
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_intercept | regr_intercept | regr_intercept 
+----------------+----------------+----------------
+              1 |              1 |              1
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 11
+        regr_r2        |      regr_r2       |      regr_r2       |       round       |        regr_r2        
+-----------------------+--------------------+--------------------+-------------------+-----------------------
+ 0.0015798837324091457 | 0.8705035971223024 | 0.9284163829157668 | 0.047181068076447 | 0.0015798837324091457
+(1 row)
+
+        regr_r2        |       round       |      regr_r2       |        regr_r2        
+-----------------------+-------------------+--------------------+-----------------------
+ 0.0015798837324091457 | 0.047181068076447 | 0.9284163829157668 | 0.0015798837324091457
+(1 row)
+
+       regr_r2        
+----------------------
+ 0.019497797794755554
+(1 row)
+
+ regr_r2 
+---------
+       1
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_r2 | regr_r2 | regr_r2 
+---------+---------+---------
+       1 |       1 |       1
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_r2 | regr_r2 | regr_r2 
+---------+---------+---------
+       1 |       1 |       1
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_r2 | regr_r2 | regr_r2 
+---------+---------+---------
+       1 |       1 |       1
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 11
+      regr_slope       |      regr_slope      |     regr_slope     |      regr_slope       |      regr_slope       
+-----------------------+----------------------+--------------------+-----------------------+-----------------------
+ -0.011002804768969364 | 0.026378896882494004 | 0.8796163069544365 | -0.001862190892444722 | -0.011002804768969364
+(1 row)
+
+      regr_slope       |      regr_slope       |     regr_slope     |      regr_slope       
+-----------------------+-----------------------+--------------------+-----------------------
+ -0.011002804768969364 | -0.001862190892444722 | 0.8796163069544365 | -0.011002804768969364
+(1 row)
+
+      regr_slope      
+----------------------
+ 0.038025882561248704
+(1 row)
+
+     regr_slope      
+---------------------
+ -0.0441668244053253
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_slope | regr_slope | regr_slope 
+------------+------------+------------
+        0.1 |        0.1 |        0.1
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+      regr_slope      |      regr_slope      |      regr_slope      
+----------------------+----------------------+----------------------
+ -0.03333333333333333 | -0.03333333333333333 | -0.03333333333333333
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_slope | regr_slope | regr_slope 
+------------+------------+------------
+          0 |          0 |          0
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 11
+      regr_sxx      | regr_sxx | regr_sxx |      regr_sxx      |      regr_sxx      
+--------------------+----------+----------+--------------------+--------------------
+ 136056.52408028886 |    12510 |    12510 | 136056.52408028886 | 136056.52408028886
+(1 row)
+
+      regr_sxx      |      regr_sxx      | regr_sxx |      regr_sxx      
+--------------------+--------------------+----------+--------------------
+ 136056.52408028886 | 136056.52408028886 |    12510 | 136056.52408028886
+(1 row)
+
+     regr_sxx      
+-------------------
+ 68756.21626371906
+(1 row)
+
+  regr_sxx  
+------------
+ 50238.1602
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_sxx | regr_sxx | regr_sxx 
+----------+----------+----------
+      450 |      450 |      450
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_sxx | regr_sxx | regr_sxx 
+----------+----------+----------
+        2 |        2 |        2
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 11
+      regr_sxy       | regr_sxy | regr_sxy |      regr_sxy       |      regr_sxy       
+---------------------+----------+----------+---------------------+---------------------
+ -1497.0033719999974 |      330 |    11004 | -253.36321999999993 | -1497.0033719999974
+(1 row)
+
+      regr_sxy       |      regr_sxy       | regr_sxy |      regr_sxy       
+---------------------+---------------------+----------+---------------------
+ -1497.0033719999974 | -253.36321999999993 |    11004 | -1497.0033719999974
+(1 row)
+
+     regr_sxy      
+-------------------
+ 2614.515804999999
+(1 row)
+
+ regr_sxy 
+----------
+ -2218.86
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_sxy | regr_sxy | regr_sxy 
+----------+----------+----------
+      -15 |      -15 |      -15
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_sxy | regr_sxy | regr_sxy 
+----------+----------+----------
+        0 |        0 |        0
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 11
+ regr_syy |     regr_syy      | regr_syy |     regr_syy      | regr_syy 
+----------+-------------------+----------+-------------------+----------
+  10425.6 | 9.999999999999998 |  10425.6 | 9.999999999999998 |  10425.6
+(1 row)
+
+ regr_syy |     regr_syy      | regr_syy | regr_syy 
+----------+-------------------+----------+----------
+  10425.6 | 9.999999999999998 |  10425.6 |  10425.6
+(1 row)
+
+ regr_syy 
+----------
+     5099
+(1 row)
+
+ regr_syy 
+----------
+       98
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_syy | regr_syy | regr_syy 
+----------+----------+----------
+      0.5 |      0.5 |      0.5
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_syy | regr_syy | regr_syy 
+----------+----------+----------
+        0 |        0 |        0
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 11
+ regr_count | regr_count | regr_count | regr_count | regr_count 
+------------+------------+------------+------------+------------
+         10 |         10 |         10 |         10 |         10
+(1 row)
+
+ regr_count | regr_count | regr_count | regr_count 
+------------+------------+------------+------------
+         10 |         10 |         10 |         10
+(1 row)
+
+ regr_count 
+------------
+          4
+(1 row)
+
+ regr_count 
+------------
+          2
+(1 row)
+
+TRUNCATE TABLE
+ regr_count 
+------------
+          0
+(1 row)
+
+INSERT 0 2
+ regr_count 
+------------
+          0
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 11
+ regr_avgx | regr_avgx | regr_avgx | regr_avgx 
+-----------+-----------+-----------+-----------
+        58 |        58 |        58 |        58
+(1 row)
+
+ regr_avgx | regr_avgx | regr_avgx | regr_avgx 
+-----------+-----------+-----------+-----------
+        58 |        58 |        58 |        58
+(1 row)
+
+ regr_avgx 
+-----------
+     43.75
+(1 row)
+
+ regr_avgx 
+-----------
+     43.75
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_avgx | regr_avgx | regr_avgx 
+-----------+-----------+-----------
+        -5 |        -5 |        -5
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_avgx | regr_avgx | regr_avgx 
+-----------+-----------+-----------
+         0 |         0 |         0
+(1 row)
+
+TRUNCATE TABLE
+ regr_avgx 
+-----------
+          
+(1 row)
+
+INSERT 0 11
+ regr_avgy | regr_avgy | regr_avgy | regr_avgy | regr_avgy 
+-----------+-----------+-----------+-----------+-----------
+      65.2 |         3 |      65.2 |         3 |      65.2
+(1 row)
+
+ regr_avgy | regr_avgy | regr_avgy | regr_avgy 
+-----------+-----------+-----------+-----------
+      65.2 |         3 |      65.2 |      65.2
+(1 row)
+
+ regr_avgy 
+-----------
+      49.5
+(1 row)
+
+ regr_avgy 
+-----------
+        49
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_avgy | regr_avgy | regr_avgy 
+-----------+-----------+-----------
+       1.5 |       1.5 |       1.5
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 2
+ regr_avgy | regr_avgy | regr_avgy 
+-----------+-----------+-----------
+         1 |         1 |         1
+(1 row)
+
+TRUNCATE TABLE
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 10
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+          5 | C
+          6 | D
+          7 | D
+          8 | D
+          9 | C
+         10 | B
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | \x41
+          2 | \x42
+          3 | \x43
+          4 | \x44
+          5 | \x43
+          6 | \x44
+          7 | \x44
+          8 | \x44
+          9 | \x43
+         10 | \x42
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+          5 | C
+          6 | D
+          7 | D
+          8 | D
+          9 | C
+         10 | B
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | \x41
+          2 | \x42
+          3 | \x43
+          4 | \x44
+          5 | \x43
+          6 | \x44
+          7 | \x44
+          8 | \x44
+          9 | \x43
+         10 | \x42
+(10 rows)
+
+TRUNCATE TABLE
+INSERT 0 10
+ company_id | string_agg 
+------------+------------
+          9 | C
+          3 | C
+          5 | C
+          4 | D
+         10 | B
+          6 | D
+          2 | B
+          7 | D
+          1 | A
+          8 | D
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+          5 | C
+          6 | D
+          7 | D
+          8 | D
+          9 | C
+         10 | B
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+          5 | C
+          6 | D
+          7 | D
+          8 | D
+          9 | C
+         10 | B
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | \x41
+          2 | \x42
+          3 | \x43
+          4 | \x44
+          5 | \x43
+          6 | \x44
+          7 | \x44
+          8 | \x44
+          9 | \x43
+         10 | \x42
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+          5 | C
+          6 | D
+          7 | D
+          8 | D
+          9 | C
+         10 | B
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | \x41
+          2 | \x42
+          3 | \x43
+          4 | \x44
+          5 | \x43
+          6 | \x44
+          7 | \x44
+          8 | \x44
+          9 | \x43
+         10 | \x42
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+          5 | C
+          6 | D
+          7 | D
+          8 | D
+          9 | C
+         10 | B
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | \x41
+          2 | \x42
+          3 | \x43
+          4 | \x44
+          5 | \x43
+          6 | \x44
+          7 | \x44
+          8 | \x44
+          9 | \x43
+         10 | \x42
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | 
+          2 | 
+          3 | 
+          4 | 
+          5 | 
+          6 | 
+          7 | 
+          8 | 
+          9 | 
+         10 | 
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | 
+          2 | 
+          3 | 
+          4 | 
+          5 | 
+          6 | 
+          7 | 
+          8 | 
+          9 | 
+         10 | 
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | 
+          2 | 
+          3 | 
+          4 | 
+          5 | 
+          6 | 
+          7 | 
+          8 | 
+          9 | 
+         10 | 
+(10 rows)
+
+TRUNCATE TABLE
+INSERT 0 4
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+(4 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | \x41
+          2 | \x42
+          3 | \x43
+          4 | \x44
+(4 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+(4 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | \x41
+          2 | \x42
+          3 | \x43
+          4 | \x44
+(4 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+(4 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | \x41
+          2 | \x42
+          3 | \x43
+          4 | \x44
+(4 rows)
+
+DROP TABLE
+ string_agg 
+------------
+ \x666f6f
+(1 row)
+
+ array_agg 
+-----------
+ {1,2}
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+DROP INDEX
+CREATE INDEX
+INSERT 0 4
+ u | v |   s   
+---+---+-------
+ 3 | 2 | {1,3}
+ 1 | 2 | {3,3}
+(2 rows)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 6
+    array_agg     
+------------------
+ {-3,-2,-1,0,1,2}
+(1 row)
+
+                array_agg                 
+------------------------------------------
+ {{-3,7},{-2,6},{-1,5},{0,7},{1,5},{2,6}}
+(1 row)
+
+    array_agg     
+------------------
+ {-1,1,-2,2,-3,0}
+(1 row)
+
+                array_agg                 
+------------------------------------------
+ {{-1,5},{1,5},{-2,6},{2,6},{-3,7},{0,7}}
+(1 row)
+
+       json_agg        
+-----------------------
+ [-3, -2, -1, 0, 1, 2]
+(1 row)
+
+       jsonb_agg       
+-----------------------
+ [-3, -2, -1, 0, 1, 2]
+(1 row)
+
+       jsonb_agg       
+-----------------------
+ [-1, 1, -2, 2, -3, 0]
+(1 row)
+
+ string_agg 
+------------
+ aaabbb
+(1 row)
+
+ string_agg 
+------------
+ bbbaaa
+(1 row)
+
+    string_agg    
+------------------
+ a, a, a, b, b, b
+(1 row)
+
+    string_agg    
+------------------
+ b, b, b, a, a, a
+(1 row)
+
+    array_agg     |    array_agg     |    array_agg     
+------------------+------------------+------------------
+ {-3,-2,-1,0,1,2} | {-1,1,-2,2,-3,0} | {-3,-2,-1,0,1,2}
+(1 row)
+
+ array_agg  | array_agg  | col3 
+------------+------------+------
+ {-3,-2,-1} | {-1,-2,-3} | a
+ {0,1,2}    | {1,2,0}    | b
+(2 rows)
+
+    array_agg     |    array_agg     | count | count 
+------------------+------------------+-------+-------
+ {-3,-2,-1,0,1,2} | {-1,1,-2,2,-3,0} |     6 |     6
+(1 row)
+
+    array_agg     | array_agg  
+------------------+------------
+ {-3,-2,-1,0,1,2} | {-3,-2,-1}
+(1 row)
+
+ array_agg  |    array_agg     
+------------+------------------
+ {-3,-2,-1} | {-3,-2,-1,0,1,2}
+(1 row)
+
+ count | string_agg 
+-------+------------
+     6 | aaabbb
+(1 row)
+
+ count_1 | count_lower | count_upper | concat 
+---------+-------------+-------------+--------
+       3 |           3 |           3 | aaa
+       3 |           3 |           3 | bbb
+(2 rows)
+
+DELETE 3
+INSERT 0 4
+ b 
+---
+ 3
+ 7
+ 1
+(3 rows)
+
+ ?column? | count 
+----------+-------
+       11 |     2
+(1 row)
+
+ a | col1 | ?column? | count 
+---+------+----------+-------
+ 4 |    0 |       14 |     1
+ 4 |   -3 |       14 |     1
+(2 rows)
+
+ a | b | count | count 
+---+---+-------+-------
+ 1 | 1 |     1 |     0
+ 3 | 3 |     1 |     0
+ 4 | 7 |     2 |     2
+ 2 | 1 |     1 |     0
+(4 rows)
+
+ a | b | count 
+---+---+-------
+   |   |     4
+ 4 | 7 |     2
+(2 rows)
+
+DROP TABLE
+CREATE TABLE
+DROP INDEX
+CREATE INDEX
+INSERT 0 5
+ min 
+-----
+   1
+(1 row)
+
+ min 
+-----
+   1
+(1 row)
+
+ min 
+-----
+    
+(1 row)
+
+ min 
+-----
+(0 rows)
+
+ max 
+-----
+   7
+(1 row)
+
+ max 
+-----
+   7
+(1 row)
+
+ max 
+-----
+    
+(1 row)
+
+ max 
+-----
+(0 rows)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+DROP INDEX
+CREATE INDEX
+DROP TABLE
+CREATE TABLE
+DROP INDEX
+CREATE INDEX
+DROP TABLE
+CREATE TABLE
+DROP INDEX
+CREATE INDEX
+ b 
+---
+(0 rows)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 8
+              x               | sum 
+------------------------------+-----
+ {"foo": "bar"}               |  15
+ [1, 2]                       |  25
+ {"bar": "baz", "foo": "bar"} |  35
+ {"foo": {"bar": "baz"}}      |  45
+(4 rows)
+
+DROP TABLE
+CREATE TABLE
+ every 
+-------
+ 
+(1 row)
+
+INSERT 0 2
+ every 
+-------
+ t
+(1 row)
+
+INSERT 0 2
+ every 
+-------
+ t
+(1 row)
+
+INSERT 0 2
+ every 
+-------
+ f
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 1
+ every 
+-------
+ f
+(1 row)
+
+TRUNCATE TABLE
+INSERT 0 3
+ every 
+-------
+ 
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ c0 
+----
+(0 rows)
+
+DROP TABLE
+CREATE TABLE
+ count 
+-------
+(0 rows)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+ bit_and 
+---------
+ 
+(1 row)
+
+ bit_or 
+--------
+ 
+(1 row)
+
+ bit_and 
+---------
+ 
+(1 row)
+
+ bit_or 
+--------
+ 
+(1 row)
+
+ bit_and | bit_and | bit_and 
+---------+---------+---------
+ 1       | 1000    | 1010
+(1 row)
+
+ bit_or | bit_or | bit_or 
+--------+--------+--------
+ 1      | 1000   | 1010
+(1 row)
+
+ bit_and 
+---------
+ 
+(1 row)
+
+ bit_or 
+--------
+ 
+(1 row)
+
+INSERT 0 5
+ bit_and  | bit_and  
+----------+----------
+ 00001110 | 00001110
+(1 row)
+
+  bit_or  |  bit_or  
+----------+----------
+ 11111111 | 11111110
+(1 row)
+
+INSERT 0 2
+ bit_and  | bit_and  
+----------+----------
+ 00001110 | 00001110
+(1 row)
+
+  bit_or  |  bit_or  
+----------+----------
+ 11111111 | 11111110
+(1 row)
+
+DELETE 7
+INSERT 0 4
+ bit_and 
+---------
+ 
+(1 row)
+
+ bit_or 
+--------
+ 
+(1 row)
+
+ bit_and 
+---------
+        
+(1 row)
+
+ bit_or 
+--------
+       
+(1 row)
+
+ bit_and 
+---------
+ 10
+(1 row)
+
+ bit_and 
+---------
+ 100
+(1 row)
+
+ bit_and 
+---------
+ 0
+(1 row)
+
+ bit_or 
+--------
+ 11
+(1 row)
+
+ bit_or 
+--------
+ 101
+(1 row)
+
+ bit_or 
+--------
+ 1
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+DROP VIEW
+CREATE VIEW
+ c0 
+----
+  0
+(1 row)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 9
+ percentile_disc 
+-----------------
+               6
+(1 row)
+
+ percentile_disc | percentile_disc 
+-----------------+-----------------
+               6 | v6
+(1 row)
+
+  percentile_cont   |   percentile_cont    |        percentile_cont         
+--------------------+----------------------+--------------------------------
+ 5.6499999999999995 | 0.017500000000000016 | 1 year 5 mons 19 days 12:00:00
+(1 row)
+
+ percentile_disc | percentile_disc | percentile_disc 
+-----------------+-----------------+-----------------
+ v1              |               0 |            0.05
+(1 row)
+
+ percentile_cont | percentile_cont | percentile_cont |         percentile_cont          
+-----------------+-----------------+-----------------+----------------------------------
+          0.0175 |            5.65 | 1 mon           | 1 year 6 mons -10 days -12:00:00
+(1 row)
+
+ percentile_disc | percentile_disc | percentile_disc 
+-----------------+-----------------+-----------------
+            0.05 |               2 |               4
+(1 row)
+
+ percentile_cont | percentile_cont | percentile_cont 
+-----------------+-----------------+-----------------
+          0.7625 |             2.5 |            4.25
+(1 row)
+
+ percentile_disc 
+-----------------
+ {0.05}
+(1 row)
+
+ percentile_disc 
+-----------------
+ {0.05,2,4}
+(1 row)
+
+  percentile_cont  
+-------------------
+ {0.7625,2.5,4.25}
+(1 row)
+
+              percentile_disc              
+-------------------------------------------
+ {"1 mon","1 year 2 mons","1 year 4 mons"}
+(1 row)
+
+                           percentile_cont                           
+---------------------------------------------------------------------
+ {"10 mons","1 year 2 mons 15 days","1 year 4 mons 7 days 12:00:00"}
+(1 row)
+
+DROP VIEW
+CREATE VIEW
+                                   pg_get_viewdef                                   
+------------------------------------------------------------------------------------
+  SELECT percentile_disc(0.50::double precision) WITHIN GROUP (ORDER BY f) AS disc,+
+     percentile_cont(0.50::double precision) WITHIN GROUP (ORDER BY f DESC) AS cont+
+    FROM osagg;
+(1 row)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+ min | max 
+-----+-----
+ a   | b
+(1 row)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 6
+                                       json_object_agg                                        
+----------------------------------------------------------------------------------------------
+ { "email" : "user1@gmail.com", "phone" : "111111111111111", "home_page" : "user1.org1.com" }
+ { "email" : "user2@gmail.com", "phone" : "222222222222222", "home_page" : "user2.org1.com" }
+(2 rows)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 5
+                                      json_object_agg                                       
+--------------------------------------------------------------------------------------------
+ { "Alice" : { "Facebook" : "Alice_fb", "Twitter" : "@Alice", "Instagram" : "AliceInst" } }
+ { "Bob" : { "Facebook" : "Bob_fb", "LinkedIn" : "Bob The Builder" } }
+(2 rows)
+
+ json_object_agg  
+------------------
+ { "key" : null }
+(1 row)
+
+ json_object_agg 
+-----------------
+ { "key" : 1 }
+(1 row)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 5
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 6
+                                      json_build_object                                       
+----------------------------------------------------------------------------------------------
+ {"Alice" : { "Facebook" : "Developer", "Google" : "Full Stack", "IBM" : "Research" }}
+ {"Bob" : { "Google" : "DevOps", "Twitter" : "Frontend", "Cockroach Labs" : "DB Developer" }}
+(2 rows)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 6
+                                                                                              json_build_object                                                                                              
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ {"Test Blog" : { "Session Timeout" : "1000ms", "Admin Email" : "admin@email.com", "Application Name" : "Instagram", "KeepAlive" : "true", "Application Name" : "Twitter", "Blog Name" : "Wordpress Blog" }}
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 5
+        corr        | count 
+--------------------+-------
+ 0.5222329678670935 |     3
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+DROP INDEX
+CREATE INDEX
+INSERT 0 6
+ a | b | count 
+---+---+-------
+ 0 | 0 |     1
+ 1 | 1 |     2
+ 2 | 2 |     1
+ 3 | 3 |     1
+ 5 | 5 |     1
+(5 rows)
+
+DROP TABLE
+CREATE TABLE
+DROP INDEX
+CREATE INDEX
+ count 
+-------
+(0 rows)
+
+ percentile_disc 
+-----------------
+              33
+(1 row)
+
+ percentile_disc 
+-----------------
+            33.0
+(1 row)
+
+ percentile_disc 
+-----------------
+              33
+(1 row)
+
+ percentile_disc 
+-----------------
+              33
+(1 row)
+
+ percentile_disc 
+-----------------
+ foo
+(1 row)
+
+   percentile_disc    
+----------------------
+ crdb_tests_aggregate
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 6
+ covar_pop | covar_samp |      regr_sxx      | regr_syy 
+-----------+------------+--------------------+----------
+      37.5 |         45 | 2983.3333333333335 |     17.5
+(1 row)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+DROP INDEX
+CREATE INDEX
+INSERT 0 2
+ min 
+-----
+   0
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+  array_agg   
+--------------
+ {1,2,3,NULL}
+(1 row)
+
+              array_agg               
+--------------------------------------
+ {"(1,foo)","(3,baz)","(,bar)","(,)"}
+(1 row)
+
+              array_agg               
+--------------------------------------
+ {"(1,foo)","(3,baz)","(,bar)","(,)"}
+(1 row)
+
+              array_agg               
+--------------------------------------
+ {"(1,foo)","(3,baz)","(,bar)","(,)"}
+(1 row)
+
+              array_agg               
+--------------------------------------
+ {"(1,foo)","(3,baz)","(,bar)","(,)"}
+(1 row)
+
+  array_agg   
+--------------
+ {1,2,3,NULL}
+(1 row)
+
+              array_agg               
+--------------------------------------
+ {"(1,foo)","(3,baz)","(,bar)","(,)"}
+(1 row)
+
+              array_agg               
+--------------------------------------
+ {"(1,foo)","(3,baz)","(,bar)","(,)"}
+(1 row)
+
+              array_agg               
+--------------------------------------
+ {"(1,foo)","(3,baz)","(,bar)","(,)"}
+(1 row)
+
+              array_agg               
+--------------------------------------
+ {"(1,foo)","(3,baz)","(,bar)","(,)"}
+(1 row)
+
+          array_agg          
+-----------------------------
+ {"(1,1)","(1,)","(,)",NULL}
+(1 row)
+
+          array_agg          
+-----------------------------
+ {NULL,"(1,1)","(1,)","(,)"}
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 3
+                       array_agg                        
+--------------------------------------------------------
+ {{a,"",::byteac},{aa,b,::byteacc},{aaa,bb,::byteaccc}}
+(1 row)
+
+                                        z                                        
+---------------------------------------------------------------------------------
+ {{{1,2,3},{1,2,3},{1,2,3}},{{1,2,3},{1,2,3},{1,2,3}},{{1,2,3},{1,2,3},{1,2,3}}}
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+ a | s 
+---+---
+ 0 | 1
+ 0 | 2
+(2 rows)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+ percentile_cont 
+-----------------
+ {2.2}
+(1 row)
+
+RESET

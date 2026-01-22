@@ -1,0 +1,28 @@
+SET
+DROP TABLE
+CREATE TABLE
+BEGIN
+ pg_sleep 
+----------
+ 
+(1 row)
+
+SAVEPOINT
+ pg_sleep 
+----------
+ 
+(1 row)
+
+INSERT 0 1
+ROLLBACK
+ id 
+----
+(0 rows)
+
+COMMIT
+BEGIN
+SAVEPOINT
+INSERT 0 1
+ROLLBACK
+ROLLBACK
+RESET

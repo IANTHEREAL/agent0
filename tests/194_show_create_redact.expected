@@ -1,0 +1,161 @@
+SET
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE TABLE
+CREATE TABLE
+CREATE TABLE
+  kind  | name |              detail               
+--------+------+-----------------------------------
+ column | a    | text
+ column | j    | jsonb DEFAULT '<redacted>'::jsonb
+(2 rows)
+
+CREATE TABLE
+  kind  | name |           detail           
+--------+------+----------------------------
+ column | b    | boolean DEFAULT <redacted>
+(1 row)
+
+CREATE TABLE
+  kind  | name |                  detail                   
+--------+------+-------------------------------------------
+ column | c    | character(1) DEFAULT '<redacted>'::bpchar
+(1 row)
+
+CREATE TABLE
+  kind  | name |             detail              
+--------+------+---------------------------------
+ column | d    | date DEFAULT '<redacted>'::date
+(1 row)
+
+CREATE TABLE
+  kind  | name |           detail           
+--------+------+----------------------------
+ column | i    | integer DEFAULT <redacted>
+(1 row)
+
+CREATE TABLE
+  kind  | name |              detail               
+--------+------+-----------------------------------
+ column | j    | jsonb DEFAULT '<redacted>'::jsonb
+(1 row)
+
+CREATE TABLE
+  kind  | name | detail  
+--------+------+---------
+ column | n    | integer
+(1 row)
+
+CREATE TABLE
+  kind  | name |                        detail                         
+--------+------+-------------------------------------------------------
+ column | e    | integer
+ column | f    | integer GENERATED ALWAYS AS ((e + <redacted>)) STORED
+(2 rows)
+
+CREATE TABLE
+  kind  | name |                         detail                         
+--------+------+--------------------------------------------------------
+ column | g    | point GENERATED ALWAYS AS ('<redacted>'::point) STORED
+(1 row)
+
+CREATE TABLE
+    kind    |  name   |                               detail                               
+------------+---------+--------------------------------------------------------------------
+ column     | h       | interval NOT NULL
+ column     | i       | interval GENERATED ALWAYS AS ((h - '<redacted>'::interval)) STORED
+ constraint | hi_pkey | PRIMARY KEY (h)
+ index      | hi_pkey | CREATE UNIQUE INDEX hi_pkey ON public.hi USING btree (h)
+(4 rows)
+
+  kind  | name | detail 
+--------+------+--------
+ column | jk   | jsonb
+ column | k    | text
+(2 rows)
+
+CREATE TABLE
+    kind    |   name    |                         detail                         
+------------+-----------+--------------------------------------------------------
+ column     | k         | integer NOT NULL
+ constraint | k_check   | CHECK (<redacted>)
+ constraint | k_k_check | CHECK ((k > <redacted>))
+ constraint | k_pkey    | PRIMARY KEY (k)
+ index      | k_pkey    | CREATE UNIQUE INDEX k_pkey ON public.k USING btree (k)
+(5 rows)
+
+CREATE TABLE
+    kind    |   name   |                          detail                          
+------------+----------+----------------------------------------------------------
+ column     | d        | numeric NOT NULL
+ column     | l        | numeric
+ constraint | dl_check | CHECK ((d <> (l + <redacted>)))
+ constraint | dl_pkey  | PRIMARY KEY (d)
+ index      | dl_pkey  | CREATE UNIQUE INDEX dl_pkey ON public.dl USING btree (d)
+(5 rows)
+
+  kind  | name |             detail              
+--------+------+---------------------------------
+ column | m    | text DEFAULT '<redacted>'::text
+(1 row)
+
+CREATE TABLE
+CREATE INDEX
+    kind    |     name      |                                                     detail                                                     
+------------+---------------+----------------------------------------------------------------------------------------------------------------
+ column     | n             | numeric NOT NULL
+ column     | o             | double precision
+ constraint | no_pkey       | PRIMARY KEY (n)
+ index      | no_o_expr_idx | CREATE UNIQUE INDEX no_o_expr_idx ON public.no USING btree (((o / ('<redacted>'::numeric)::double precision)))
+ index      | no_pkey       | CREATE UNIQUE INDEX no_pkey ON public.no USING btree (n)
+(5 rows)
+
+CREATE TABLE
+CREATE INDEX
+    kind    |     name      |                                         detail                                         
+------------+---------------+----------------------------------------------------------------------------------------
+ column     | p             | uuid NOT NULL
+ constraint | p_pkey        | PRIMARY KEY (p)
+ index      | p_partial_idx | CREATE INDEX p_partial_idx ON public.p USING btree (p) WHERE (p <> '<redacted>'::uuid)
+ index      | p_pkey        | CREATE UNIQUE INDEX p_pkey ON public.p USING btree (p)
+(4 rows)
+
+CREATE VIEW
+                   create_statement                   
+------------------------------------------------------
+ CREATE OR REPLACE VIEW q AS  SELECT <redacted> AS q;
+(1 row)
+
+CREATE VIEW
+                                    create_statement                                    
+----------------------------------------------------------------------------------------
+ CREATE OR REPLACE VIEW r AS  SELECT '<redacted>'::timestamp without time zone + i AS r+
+    FROM hi                                                                            +
+   WHERE h <> '<redacted>'::interval;
+(1 row)
+
+CREATE VIEW
+              create_statement              
+--------------------------------------------
+ CREATE OR REPLACE VIEW s AS  SELECT       +
+         CASE                              +
+             WHEN b THEN '<redacted>'::text+
+             ELSE '<redacted>'::text       +
+         END AS s                          +
+    FROM b                                 +
+   ORDER BY (b AND NOT <redacted>)         +
+  LIMIT <redacted>;
+(1 row)
+
+CREATE VIEW
+                              create_statement                              
+----------------------------------------------------------------------------
+ CREATE OR REPLACE VIEW t AS  SELECT jk_tbl.jk || '<redacted>'::jsonb AS t,+
+     a_tbl.j -> a_tbl.a AS u                                               +
+    FROM a a_tbl                                                           +
+      JOIN jk jk_tbl ON a_tbl.a = (jk_tbl.k || '<redacted>'::text)         +
+   ORDER BY (concat(a_tbl.a, '<redacted>'));
+(1 row)
+
+RESET

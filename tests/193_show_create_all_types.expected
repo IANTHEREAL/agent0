@@ -1,0 +1,75 @@
+SET
+CREATE FUNCTION
+DROP SCHEMA
+CREATE SCHEMA
+SET
+ statement 
+-----------
+(0 rows)
+
+CREATE TYPE
+                          statement                           
+--------------------------------------------------------------
+ CREATE TYPE d.status AS ENUM ('open', 'closed', 'inactive');
+(1 row)
+
+CREATE TYPE
+                          statement                           
+--------------------------------------------------------------
+ CREATE TYPE d.status AS ENUM ('open', 'closed', 'inactive');
+ CREATE TYPE d.tableobj AS ENUM ('row', 'col');
+(2 rows)
+
+DROP TYPE
+                   statement                    
+------------------------------------------------
+ CREATE TYPE d.tableobj AS ENUM ('row', 'col');
+(1 row)
+
+CREATE SCHEMA
+SET
+CREATE TYPE
+                   statement                    
+------------------------------------------------
+ CREATE TYPE d.tableobj AS ENUM ('row', 'col');
+ CREATE TYPE s.status AS ENUM ('a', 'b', 'c');
+(2 rows)
+
+DROP SCHEMA
+CREATE SCHEMA
+SET
+ statement 
+-----------
+(0 rows)
+
+DROP SCHEMA
+CREATE SCHEMA
+SET
+ statement 
+-----------
+(0 rows)
+
+SET
+DROP TYPE
+CREATE TYPE
+COMMENT
+                             statement                              
+--------------------------------------------------------------------
+ CREATE TYPE d.address AS (street text, city text);
+ COMMENT ON TYPE d.address IS 'comment for composite type address';
+ CREATE TYPE d.tableobj AS ENUM ('row', 'col');
+ CREATE TYPE s.status AS ENUM ('a', 'b', 'c');
+(4 rows)
+
+DROP TYPE
+CREATE TYPE
+COMMENT
+                                 statement                                 
+---------------------------------------------------------------------------
+ CREATE TYPE d.roaches AS ENUM ('papa_roach', 'mama_roach', 'baby_roach');
+ COMMENT ON TYPE d.roaches IS 'comment for enum type roaches';
+ CREATE TYPE d.tableobj AS ENUM ('row', 'col');
+ CREATE TYPE s.status AS ENUM ('a', 'b', 'c');
+(4 rows)
+
+RESET

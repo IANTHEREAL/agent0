@@ -1,0 +1,124 @@
+SET
+CREATE SEQUENCE
+CREATE TYPE
+CREATE TABLE
+CREATE FUNCTION
+CREATE FUNCTION
+       get_body_str       
+--------------------------
+                         +
+   SELECT nextval('seq');+
+ 
+(1 row)
+
+DROP FUNCTION
+CREATE FUNCTION
+                          get_body_str                           
+-----------------------------------------------------------------
+                                                                +
+   INSERT INTO t_rewrite(v) VALUES (nextval('seq')) RETURNING v;+
+ 
+(1 row)
+
+DROP FUNCTION
+CREATE FUNCTION
+          get_body_str          
+--------------------------------
+                               +
+   SELECT 'wednesday'::weekday;+
+ 
+(1 row)
+
+DROP FUNCTION
+CREATE FUNCTION
+                                        get_body_str                                        
+--------------------------------------------------------------------------------------------
+                                                                                           +
+   UPDATE t_rewrite SET w = 'thursday'::weekday WHERE w = 'wednesday'::weekday RETURNING w;+
+ 
+(1 row)
+
+DROP FUNCTION
+CREATE FUNCTION
+         get_body_str          
+-------------------------------
+                              +
+   SELECT 'thursday'::weekday;+
+ 
+(1 row)
+
+DROP FUNCTION
+CREATE FUNCTION
+         get_body_str          
+-------------------------------
+                              +
+   SELECT 'thursday'::weekday;+
+ 
+(1 row)
+
+DROP FUNCTION
+CREATE PROCEDURE
+                          get_body_str                           
+-----------------------------------------------------------------
+                                                                +
+   INSERT INTO t_rewrite(v) VALUES (nextval('seq')) RETURNING v;+
+ 
+(1 row)
+
+DROP PROCEDURE
+CREATE PROCEDURE
+                                        get_body_str                                        
+--------------------------------------------------------------------------------------------
+                                                                                           +
+   UPDATE t_rewrite SET w = 'thursday'::weekday WHERE w = 'wednesday'::weekday RETURNING w;+
+ 
+(1 row)
+
+DROP PROCEDURE
+CREATE PROCEDURE
+         get_body_str          
+-------------------------------
+                              +
+   SELECT 'thursday'::weekday;+
+ 
+(1 row)
+
+DROP PROCEDURE
+CREATE PROCEDURE
+         get_body_str          
+-------------------------------
+                              +
+   SELECT 'thursday'::weekday;+
+ 
+(1 row)
+
+DROP PROCEDURE
+CREATE FUNCTION
+CREATE PROCEDURE
+                        get_body_str                         
+-------------------------------------------------------------
+                                                            +
+   SELECT nested_func();                                    +
+   SELECT * FROM (SELECT nested_func() AS nested_func) AS s;+
+ 
+(1 row)
+
+CREATE FUNCTION
+                              get_body_str                               
+-------------------------------------------------------------------------
+                                                                        +
+   DO $foo$                                                             +
+     BEGIN                                                              +
+       INSERT INTO t_rewrite(v) VALUES (nextval('seq')) RETURNING v;    +
+       DO $bar$                                                         +
+         BEGIN                                                          +
+           INSERT INTO t_rewrite(v) VALUES (nextval('seq')) RETURNING v;+
+         END;                                                           +
+       $bar$;                                                           +
+     END;                                                               +
+   $foo$;                                                               +
+   SELECT 1;                                                            +
+ 
+(1 row)
+
+RESET

@@ -1,0 +1,40 @@
+SET
+ int_type | int_bytes 
+----------+-----------
+ integer  |         4
+(1 row)
+
+ bigint_type | bigint_bytes 
+-------------+--------------
+ bigint      |            8
+(1 row)
+
+CREATE TABLE
+ column_name | data_type 
+-------------+-----------
+ i4          | integer
+(1 row)
+
+CREATE TABLE
+ column_name | data_type 
+-------------+-----------
+ i8          | bigint
+(1 row)
+
+CREATE TABLE
+ column_name | data_type | has_nextval 
+-------------+-----------+-------------
+ a           | integer   | t
+(1 row)
+
+CREATE TABLE
+ column_name | data_type | has_nextval 
+-------------+-----------+-------------
+ a           | bigint    | t
+(1 row)
+
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+RESET

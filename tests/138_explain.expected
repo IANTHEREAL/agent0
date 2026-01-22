@@ -1,0 +1,31 @@
+SET
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 3
+     QUERY PLAN      
+---------------------
+ WindowAgg
+   ->  Seq Scan on t
+(2 rows)
+
+           QUERY PLAN            
+---------------------------------
+ WindowAgg
+   InitPlan 1 (returns $0)
+     ->  Aggregate
+           ->  Seq Scan on t t_1
+   ->  Seq Scan on t
+(5 rows)
+
+SELECT 5
+               QUERY PLAN               
+----------------------------------------
+ Limit
+   ->  Sort
+         Sort Key: _inet, _bool
+         ->  Seq Scan on t88037 tab_489
+               Filter: _bool
+(5 rows)
+
+RESET

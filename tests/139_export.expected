@@ -1,0 +1,28 @@
+CREATE SCHEMA
+CREATE FUNCTION
+CREATE TABLE
+CREATE TABLE
+INSERT 0 1
+               filename               
+--------------------------------------
+ nodelocal://1/export1/part-00000.csv
+(1 row)
+
+                 filename                 
+------------------------------------------
+ nodelocal://1/export1/part-00000.parquet
+(1 row)
+
+               filename               
+--------------------------------------
+ nodelocal://1/export1/part-00000.csv
+(1 row)
+
+CREATE TABLE
+                 filename                 | rows | bytes 
+------------------------------------------+------+-------
+ nodelocal://1/export1/part-00000.parquet |    0 |     0
+(1 row)
+
+INSERT 0 1
+INSERT 0 1

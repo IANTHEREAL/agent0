@@ -1,0 +1,253 @@
+SET
+CREATE EXTENSION
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+                         indexdef                          
+-----------------------------------------------------------
+ CREATE INDEX s_a_geom_gin ON public.s USING gin (a, geom)
+ CREATE UNIQUE INDEX s_pkey ON public.s USING btree (k)
+(2 rows)
+
+                         indexdef                          
+-----------------------------------------------------------
+ CREATE INDEX s_a_geom_gin ON public.s USING gin (a, geom)
+ CREATE UNIQUE INDEX s_pkey ON public.s USING btree (k)
+(2 rows)
+
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+ALTER TABLE
+ indexdef 
+----------
+(0 rows)
+
+ indexdef 
+----------
+(0 rows)
+
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+ALTER TABLE
+ indexdef 
+----------
+(0 rows)
+
+ indexdef 
+----------
+(0 rows)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+CREATE TABLE
+                           indexdef                           
+--------------------------------------------------------------
+ CREATE INDEX dst_a_b_j_idx ON public.dst USING gin (a, b, j)
+ CREATE INDEX dst_a_j_idx ON public.dst USING gin (a, j)
+(2 rows)
+
+                           indexdef                           
+--------------------------------------------------------------
+ CREATE INDEX dst_a_b_j_idx ON public.dst USING gin (a, b, j)
+ CREATE INDEX dst_a_j_idx ON public.dst USING gin (a, j)
+(2 rows)
+
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+INSERT 0 3
+ i |  s  |          j           
+---+-----+----------------------
+ 1 | foo | {"x": "y", "num": 1}
+(1 row)
+
+ i |  s  |          j           
+---+-----+----------------------
+ 1 | foo | {"x": "y", "num": 1}
+(1 row)
+
+ i |  s  |          j           
+---+-----+----------------------
+ 1 | foo | {"x": "y", "num": 1}
+(1 row)
+
+ i |  s  |          j           
+---+-----+----------------------
+ 1 | foo | {"x": "y", "num": 1}
+ 3 | baz | {"x": "y", "num": 3}
+(2 rows)
+
+DELETE 1
+ i |  s  |          j           
+---+-----+----------------------
+ 1 | foo | {"x": "y", "num": 1}
+(1 row)
+
+UPDATE 1
+ i |  s  |           j           
+---+-----+-----------------------
+ 1 | foo | {"x": "y", "num": 10}
+(1 row)
+
+UPDATE 1
+UPDATE 1
+ i  |  s  |           j           
+----+-----+-----------------------
+  2 | bar | {"x": "y", "num": 2}
+ 10 | foo | {"x": "y", "num": 10}
+(2 rows)
+
+INSERT 0 1
+ i |  s  |          j           
+---+-----+----------------------
+ 2 | bar | {"x": "y", "num": 2}
+ 3 | bar | {"x": "y", "num": 3}
+(2 rows)
+
+INSERT 0 1
+ i |  s  |          j           
+---+-----+----------------------
+ 3 | bar | {"x": "y", "num": 4}
+(1 row)
+
+ i | s | j 
+---+---+---
+(0 rows)
+
+ i | s | j 
+---+---+---
+(0 rows)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+CREATE INDEX
+ i |  s  |  j  
+---+-----+-----
+ 1 | foo | [7]
+(1 row)
+
+ i |  s  |     j     
+---+-----+-----------
+ 1 | foo | [7]
+ 2 | bar | [7, 0, 7]
+(2 rows)
+
+ i |  s  |     j      
+---+-----+------------
+ 3 | baz | {"a": "b"}
+(1 row)
+
+BEGIN
+DROP TABLE
+CREATE TABLE
+INSERT 0 3
+CREATE INDEX
+COMMIT
+ i |  s  |     j     
+---+-----+-----------
+ 2 | bar | [7, 0, 7]
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 3
+BEGIN
+CREATE INDEX
+COMMIT
+ i | s |     j     
+---+---+-----------
+ 1 |   | [7]
+ 2 |   | [7, 0, 7]
+(2 rows)
+
+CREATE TYPE
+DROP TABLE
+CREATE TABLE
+INSERT 0 3
+CREATE INDEX
+ i |  s  |     j     
+---+-----+-----------
+ 2 | bar | [7, 0, 7]
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+INSERT 0 5
+ id |  foo  |      bar      
+----+-------+---------------
+  1 | "foo" | [7]
+  4 | "foo" | [7, 8, 9, 10]
+(2 rows)
+
+ id | foo | bar 
+----+-----+-----
+(0 rows)
+
+ id |  foo  |      bar      
+----+-------+---------------
+  4 | "foo" | [7, 8, 9, 10]
+(1 row)
+
+ id |  foo  |         bar          
+----+-------+----------------------
+  5 | "foo" | [[0], [7, 8, 9, 10]]
+(1 row)
+
+ id |  foo  |         bar          
+----+-------+----------------------
+  5 | "foo" | [[0], [7, 8, 9, 10]]
+(1 row)
+
+DELETE 1
+ id | foo | bar 
+----+-----+-----
+(0 rows)
+
+UPDATE 1
+ id |    foo    |    bar    
+----+-----------+-----------
+  2 | "updated" | [7, 0, 7]
+(1 row)
+
+DROP INDEX
+INSERT 0 3
+CREATE INDEX
+ id |      foo      |         bar         
+----+---------------+---------------------
+  6 | "backfilling" | [[0], [1], 2, 3]
+  8 | "backfilling" | [[0], [1], [2], []]
+(2 rows)
+
+ id |  foo  |      bar      
+----+-------+---------------
+  1 | "foo" | [7]
+  4 | "foo" | [7, 8, 9, 10]
+(2 rows)
+

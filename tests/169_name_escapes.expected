@@ -1,0 +1,58 @@
+SET
+DROP FUNCTION
+CREATE FUNCTION
+DROP FUNCTION
+CREATE FUNCTION
+DROP VIEW
+DROP TABLE
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+CREATE TABLE
+CREATE INDEX
+      table_name       |                                    create_statement                                     
+-----------------------+-----------------------------------------------------------------------------------------
+ public.";--notbetter" | CREATE TABLE public.";--notbetter" (  x integer NOT NULL,                              +
+                       |   y integer,                                                                           +
+                       |   "welp; DROP USER dumpty;--" integer,                                                 +
+                       |   CONSTRAINT "helpme; DROP USER alice;--" CHECK (x IS NOT NULL),                       +
+                       |   CONSTRAINT "getmeoutofhere;--" PRIMARY KEY (x)                                       +
+                       | );                                                                                     +
+                       | CREATE INDEX "id; DROP USER queenofhearts;--" ON public.";--notbetter" USING btree (x);
+(1 row)
+
+      table_name       |                                    create_statement                                     
+-----------------------+-----------------------------------------------------------------------------------------
+ public.";--notbetter" | CREATE TABLE public.";--notbetter" (  x integer NOT NULL,                              +
+                       |   y integer,                                                                           +
+                       |   "welp; DROP USER dumpty;--" integer,                                                 +
+                       |   CONSTRAINT "helpme; DROP USER alice;--" CHECK (x IS NOT NULL),                       +
+                       |   CONSTRAINT "getmeoutofhere;--" PRIMARY KEY (x)                                       +
+                       | );                                                                                     +
+                       | CREATE INDEX "id; DROP USER queenofhearts;--" ON public.";--notbetter" USING btree (x);
+(1 row)
+
+CREATE VIEW
+         view_name          |                     create_statement                      
+----------------------------+-----------------------------------------------------------
+ public.";--alsoconcerning" | CREATE VIEW public.";--alsoconcerning" AS  SELECT x AS a,+
+                            |     y AS b                                               +
+                            |    FROM ";--notbetter";;
+(1 row)
+
+SELECT 0
+     table_name      |                create_statement                
+---------------------+------------------------------------------------
+ public.";--dontask" | CREATE TABLE public.";--dontask" (  a integer,+
+                     |   b integer                                   +
+                     | );
+(1 row)
+
+     table_name      |                create_statement                
+---------------------+------------------------------------------------
+ public.";--dontask" | CREATE TABLE public.";--dontask" (  a integer,+
+                     |   b integer                                   +
+                     | );
+(1 row)
+
+RESET

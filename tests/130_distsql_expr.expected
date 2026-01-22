@@ -1,0 +1,10 @@
+SET
+CREATE TABLE
+INSERT 0 3
+ c 
+---
+ 2
+ 3
+(2 rows)
+
+RESET

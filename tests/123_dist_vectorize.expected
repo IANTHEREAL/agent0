@@ -1,0 +1,41 @@
+SET
+DROP TABLE
+CREATE TABLE
+INSERT 0 5
+CREATE TABLE
+INSERT 0 5
+ k 
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+(5 rows)
+
+ exists 
+--------
+ t
+(1 row)
+
+CREATE TABLE
+INSERT 0 2
+ case 
+------
+     
+     
+(2 rows)
+
+CREATE TABLE
+INSERT 0 1
+ int2 | s 
+------+---
+    1 | a
+(1 row)
+
+     QUERY PLAN     
+--------------------
+ Seq Scan on t66306
+(1 row)
+
+RESET

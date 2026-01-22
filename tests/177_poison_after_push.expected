@@ -1,0 +1,28 @@
+DO
+CREATE TABLE
+INSERT 0 1
+GRANT
+CREATE EXTENSION
+ id 
+----
+  1
+(1 row)
+
+ id 
+----
+  1
+(1 row)
+
+ id 
+----
+  1
+  2
+(2 rows)
+
+ id 
+----
+  1
+  2
+  3
+(3 rows)
+

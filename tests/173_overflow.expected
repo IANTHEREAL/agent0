@@ -1,0 +1,40 @@
+SET
+DROP TABLE
+CREATE TABLE
+INSERT 0 2
+         sum         
+---------------------
+ 9223372036854775808
+(1 row)
+
+DELETE 2
+INSERT 0 2
+         sum          
+----------------------
+ -9223372036854775809
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+RESET

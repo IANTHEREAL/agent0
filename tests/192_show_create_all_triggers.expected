@@ -1,0 +1,39 @@
+CREATE SCHEMA
+SET
+SET
+CREATE EXTENSION
+RESET
+CREATE TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+CREATE FUNCTION
+CREATE TRIGGER
+                                     create_statement                                      
+-------------------------------------------------------------------------------------------
+ CREATE TRIGGER t1_trigger AFTER INSERT ON t1 FOR EACH ROW EXECUTE FUNCTION trigger_func()
+(1 row)
+
+CREATE TRIGGER
+                                     create_statement                                      
+-------------------------------------------------------------------------------------------
+ CREATE TRIGGER t1_trigger AFTER INSERT ON t1 FOR EACH ROW EXECUTE FUNCTION trigger_func()
+ CREATE TRIGGER t2_trigger AFTER INSERT ON t2 FOR EACH ROW EXECUTE FUNCTION trigger_func()
+(2 rows)
+
+CREATE FUNCTION
+CREATE TRIGGER
+                                      create_statement                                       
+---------------------------------------------------------------------------------------------
+ CREATE TRIGGER t1_trigger AFTER INSERT ON t1 FOR EACH ROW EXECUTE FUNCTION trigger_func()
+ CREATE TRIGGER t1_trigger2 AFTER INSERT ON t1 FOR EACH ROW EXECUTE FUNCTION trigger_func2()
+ CREATE TRIGGER t2_trigger AFTER INSERT ON t2 FOR EACH ROW EXECUTE FUNCTION trigger_func()
+(3 rows)
+
+DROP TRIGGER
+                                     create_statement                                      
+-------------------------------------------------------------------------------------------
+ CREATE TRIGGER t1_trigger AFTER INSERT ON t1 FOR EACH ROW EXECUTE FUNCTION trigger_func()
+ CREATE TRIGGER t2_trigger AFTER INSERT ON t2 FOR EACH ROW EXECUTE FUNCTION trigger_func()
+(2 rows)
+

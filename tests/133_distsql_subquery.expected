@@ -1,0 +1,29 @@
+CREATE TABLE
+INSERT 0 3
+  array  
+---------
+ {1,2,1}
+(1 row)
+
+CREATE TABLE
+INSERT 0 1
+ c 
+---
+ 1
+(1 row)
+
+  a  
+-----
+ {1}
+(1 row)
+
+  row  
+-------
+ (1,1)
+(1 row)
+
+ k 
+---
+ 1
+(1 row)
+

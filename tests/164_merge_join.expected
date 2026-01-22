@@ -1,0 +1,52 @@
+SET
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 5
+CREATE TABLE
+CREATE INDEX
+INSERT 0 6
+ k | v | x | y 
+---+---+---+---
+ 0 | 4 | 0 | 5
+ 3 | 4 | 3 | 2
+ 3 | 4 | 3 | 3
+(3 rows)
+
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+INSERT 0 2
+CREATE TABLE
+CREATE INDEX
+INSERT 0 2
+ k | x 
+---+---
+ 0 | 0
+(1 row)
+
+CREATE TABLE
+CREATE TABLE
+INSERT 0 3
+INSERT 0 3
+ c0 
+----
+  0
+  2
+(2 rows)
+
+CREATE TABLE
+INSERT 0 2
+CREATE TABLE
+INSERT 0 1
+ l | ?column? 
+---+----------
+ 2 | t
+(1 row)
+
+RESET

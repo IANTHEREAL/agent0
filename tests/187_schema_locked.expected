@@ -1,0 +1,80 @@
+SET
+DROP ROLE
+CREATE ROLE
+DROP TABLE
+CREATE TABLE
+        reloptions        
+--------------------------
+ autovacuum_enabled=false
+(1 row)
+
+ALTER TABLE
+ reloptions 
+------------
+ 
+(1 row)
+
+ALTER TABLE
+        reloptions        
+--------------------------
+ autovacuum_enabled=false
+(1 row)
+
+ALTER TABLE
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+BEGIN
+SET
+ALTER TABLE
+ROLLBACK
+        reloptions        
+--------------------------
+ autovacuum_enabled=false
+(1 row)
+
+DROP TABLE
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+ALTER TABLE
+INSERT 0 10
+ALTER TABLE
+CREATE INDEX
+CREATE TABLE
+ALTER TABLE
+GRANT
+COMMENT
+COMMENT
+COMMENT
+ALTER TABLE
+ locked_option_set 
+-------------------
+                 1
+(1 row)
+
+ALTER TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+ reloptions 
+------------
+ 
+(1 row)
+
+ALTER TABLE
+        reloptions        
+--------------------------
+ autovacuum_enabled=false
+(1 row)
+
+ALTER TABLE
+ reloptions 
+------------
+ 
+(1 row)
+
+DROP TABLE
+RESET

@@ -1,0 +1,32 @@
+CREATE TABLE
+CREATE FUNCTION
+CREATE PROCEDURE
+CALL
+CALL
+CALL
+ i  | sum 
+----+-----
+  1 |   1
+  4 |  10
+ 10 |  55
+(3 rows)
+
+CREATE FUNCTION
+ fetch_sum_1_to_n 
+------------------
+               10
+(1 row)
+
+ fetch_sum_1_to_n 
+------------------
+               45
+(1 row)
+
+ i  | sum 
+----+-----
+  1 |   1
+  4 |  10
+ 10 |  55
+  9 |  45
+(4 rows)
+

@@ -1,0 +1,104 @@
+SET
+CREATE TABLE
+CREATE TABLE
+CREATE PROCEDURE
+CREATE PROCEDURE
+CREATE PROCEDURE
+CREATE FUNCTION
+CREATE TABLE
+CREATE INDEX
+CALL
+INSERT 0 1000
+CALL
+ statistics_name | column_names | row_count | distinct_count | null_count 
+-----------------+--------------+-----------+----------------+------------
+ auto            | {a}          |      1000 |             10 |          0
+ auto            | {b}          |      1000 |             10 |          0
+ auto            | {c}          |      1000 |             10 |          0
+ auto            | {d}          |      1000 |              0 |       1000
+(4 rows)
+
+CALL
+UPDATE 270
+CALL
+ statistics_name | column_names | row_count | distinct_count | null_count 
+-----------------+--------------+-----------+----------------+------------
+ auto            | {a}          |      1000 |             10 |          0
+ auto            | {b}          |      1000 |             10 |          0
+ auto            | {c}          |      1000 |             10 |          0
+ auto            | {d}          |      1000 |              0 |       1000
+(4 rows)
+
+CALL
+UPDATE 270
+CALL
+ statistics_name | column_names | row_count | distinct_count | null_count 
+-----------------+--------------+-----------+----------------+------------
+ auto            | {a}          |      1000 |             10 |          0
+ auto            | {b}          |      1000 |             10 |          0
+ auto            | {c}          |      1000 |             10 |          0
+ auto            | {d}          |      1000 |              1 |        730
+(4 rows)
+
+INSERT 0 550
+CALL
+ statistics_name | column_names | row_count | distinct_count | null_count 
+-----------------+--------------+-----------+----------------+------------
+ auto            | {a}          |      1050 |             11 |          0
+ auto            | {b}          |      1050 |             10 |          0
+ auto            | {c}          |      1050 |             10 |          0
+ auto            | {d}          |      1050 |              2 |        365
+(4 rows)
+
+DELETE 500
+CALL
+ statistics_name | column_names | row_count | distinct_count | null_count 
+-----------------+--------------+-----------+----------------+------------
+ auto            | {a}          |       550 |             11 |          0
+ auto            | {b}          |       550 |             10 |          0
+ auto            | {c}          |       550 |              5 |          0
+ auto            | {d}          |       550 |              1 |          0
+(4 rows)
+
+SELECT 550
+CALL
+CALL
+ statistics_name | column_names | row_count | null_count 
+-----------------+--------------+-----------+------------
+ auto            | {a}          |       550 |          0
+ auto            | {b}          |       550 |          0
+ auto            | {c}          |       550 |          0
+ auto            | {d}          |       550 |          0
+(4 rows)
+
+CREATE TABLE
+CALL
+CALL
+ statistics_name | column_names | row_count | distinct_count | null_count 
+-----------------+--------------+-----------+----------------+------------
+ auto            | {x}          |         0 |              0 |          0
+ auto            | {y}          |         0 |              0 |          0
+(2 rows)
+
+DELETE 550
+CALL
+ statistics_name | column_names | row_count | null_count 
+-----------------+--------------+-----------+------------
+ auto            | {a}          |         0 |          0
+ auto            | {b}          |         0 |          0
+ auto            | {c}          |         0 |          0
+ auto            | {d}          |         0 |          0
+(4 rows)
+
+CREATE SCHEMA
+CREATE TABLE
+CALL
+INSERT 0 10
+CALL
+ statistics_name | column_names | row_count | distinct_count | null_count 
+-----------------+--------------+-----------+----------------+------------
+ auto            | {k}          |        10 |             10 |          0
+ auto            | {v}          |        10 |              0 |         10
+(2 rows)
+
+RESET

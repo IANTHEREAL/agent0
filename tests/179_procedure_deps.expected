@@ -1,0 +1,156 @@
+SET
+DROP TABLE
+DROP PROCEDURE
+CREATE TABLE
+INSERT 0 1
+CREATE PROCEDURE
+CALL
+ALTER TABLE
+ sel_exists_after_drop_sel 
+---------------------------
+ t
+(1 row)
+
+ALTER TABLE
+ sel_dropped_after_cascade 
+---------------------------
+ f
+(1 row)
+
+DROP TABLE
+DROP PROCEDURE
+CREATE TABLE
+CREATE PROCEDURE
+CALL
+ a | b  | def 
+---+----+-----
+ 1 | 10 |  10
+(1 row)
+
+ALTER TABLE
+ ins_exists_after_drop_ins 
+---------------------------
+ t
+(1 row)
+
+ALTER TABLE
+ ins_dropped_after_drop_b 
+--------------------------
+ f
+(1 row)
+
+DROP TABLE
+DROP PROCEDURE
+CREATE TABLE
+CREATE PROCEDURE
+CALL
+ a | b  | def | cascade_ins2 
+---+----+-----+--------------
+ 2 | 20 |  10 |          200
+(1 row)
+
+ALTER TABLE
+ ins2_exists_after_drop_ins2 
+-----------------------------
+ t
+(1 row)
+
+ALTER TABLE
+ ins2_dropped_after_cascade 
+----------------------------
+ f
+(1 row)
+
+DROP TABLE
+DROP PROCEDURE
+CREATE TABLE
+CREATE PROCEDURE
+CALL
+CALL
+ a | b  | def 
+---+----+-----
+ 3 | 30 |  10
+(1 row)
+
+ALTER TABLE
+ ups_exists_after_drop_ups 
+---------------------------
+ t
+(1 row)
+
+ALTER TABLE
+ ups_dropped_after_drop_b 
+--------------------------
+ f
+(1 row)
+
+DROP TABLE
+DROP PROCEDURE
+CREATE TABLE
+CREATE PROCEDURE
+CALL
+CALL
+ a | b  | def | cascade_ups2 
+---+----+-----+--------------
+ 4 | 40 |  10 |          400
+(1 row)
+
+ALTER TABLE
+ ups2_exists_after_drop_ups2 
+-----------------------------
+ t
+(1 row)
+
+ALTER TABLE
+ ups2_dropped_after_cascade 
+----------------------------
+ f
+(1 row)
+
+DROP TABLE
+DROP PROCEDURE
+CREATE TABLE
+INSERT 0 1
+CREATE PROCEDURE
+CALL
+ a | b  | def 
+---+----+-----
+ 1 | 11 |  10
+(1 row)
+
+ALTER TABLE
+ up_exists_after_drop_up 
+-------------------------
+ t
+(1 row)
+
+ALTER TABLE
+ up_dropped_after_cascade 
+--------------------------
+ f
+(1 row)
+
+DROP TABLE
+DROP PROCEDURE
+CREATE TABLE
+INSERT 0 2
+CREATE PROCEDURE
+CALL
+ a | b  | def 
+---+----+-----
+ 2 | 20 |  10
+(1 row)
+
+ALTER TABLE
+ del_exists_after_drop_del 
+---------------------------
+ t
+(1 row)
+
+ALTER TABLE
+ del_dropped_after_cascade 
+---------------------------
+ f
+(1 row)
+
+RESET

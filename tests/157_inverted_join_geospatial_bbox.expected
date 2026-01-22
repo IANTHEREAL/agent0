@@ -1,0 +1,68 @@
+SET
+CREATE EXTENSION
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 6
+CREATE TABLE
+CREATE INDEX
+INSERT 0 6
+ lk | rk 
+----+----
+  1 | 13
+(1 row)
+
+ lk | rk 
+----+----
+  1 | 13
+  1 | 16
+  2 | 14
+  2 | 16
+  3 | 12
+  3 | 16
+  5 | 12
+  5 | 16
+(8 rows)
+
+ lk | rk 
+----+----
+  1 | 13
+  1 | 16
+  2 | 14
+  2 | 16
+  3 | 12
+  3 | 16
+  5 | 12
+  5 | 16
+(8 rows)
+
+ lk | rk 
+----+----
+  1 | 13
+(1 row)
+
+ lk | rk 
+----+----
+  1 | 13
+  1 | 16
+  2 | 14
+  2 | 16
+  3 | 12
+  3 | 16
+  5 | 12
+  5 | 16
+(8 rows)
+
+ lk | rk 
+----+----
+  1 | 13
+  1 | 16
+  2 | 14
+  2 | 16
+  3 | 12
+  3 | 16
+  5 | 12
+  5 | 16
+(8 rows)
+
+RESET

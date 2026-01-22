@@ -1,0 +1,20 @@
+CREATE TABLE
+INSERT 0 1
+BEGIN
+ALTER TABLE
+INSERT 0 1
+ALTER TABLE
+COMMIT
+ x |  z  | y 
+---+-----+---
+ 0 | 123 |  
+ 1 | 123 | 1
+(2 rows)
+
+ column_name |    data_type     | column_default | is_generated |                             generation_expression                              
+-------------+------------------+----------------+--------------+--------------------------------------------------------------------------------
+ x           | integer          |                | NEVER        | 
+ z           | integer          | 123            | NEVER        | 
+ y           | double precision |                | ALWAYS       | ((1)::double precision / NULLIF((x)::double precision, (0)::double precision))
+(3 rows)
+

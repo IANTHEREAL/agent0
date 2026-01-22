@@ -1,0 +1,7 @@
+CREATE TABLE
+INSERT 0 1
+ k | a | b | c | v 
+---+---+---+---+---
+ 2 | 2 | 2 | 2 | 5
+(1 row)
+

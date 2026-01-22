@@ -1,0 +1,317 @@
+SET
+CREATE SEQUENCE
+CREATE SCHEMA
+CREATE SEQUENCE
+CREATE TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ALTER TABLE
+ nextval 
+---------
+       1
+(1 row)
+
+ column_name |            column_default             
+-------------+---------------------------------------
+ i           | nextval('foo_i_seq'::regclass)
+ j           | nextval('test_seq'::regclass)
+ k           | nextval('foo_k_seq'::regclass)
+ l           | currval('diff_db.test_seq'::regclass)
+(4 rows)
+
+ column_name |            column_default             
+-------------+---------------------------------------
+ i           | nextval('foo_i_seq'::regclass)
+ j           | nextval('test_seq'::regclass)
+ k           | nextval('foo_k_seq'::regclass)
+ l           | currval('diff_db.test_seq'::regclass)
+(4 rows)
+
+INSERT 0 1
+CREATE SEQUENCE
+CREATE SEQUENCE
+CREATE TABLE
+ALTER SEQUENCE
+ALTER SEQUENCE
+ pg_get_serial_sequence | pg_get_serial_sequence | pg_get_serial_sequence 
+------------------------+------------------------+------------------------
+ public.seq_table_i_seq | public.dep_seq         | public.dep_seq2
+(1 row)
+
+DROP SEQUENCE
+DROP SEQUENCE
+DROP SEQUENCE
+CREATE SEQUENCE
+CREATE SEQUENCE
+CREATE TABLE
+ nextval 
+---------
+       1
+(1 row)
+
+INSERT 0 1
+ALTER SEQUENCE
+ALTER SEQUENCE
+ALTER SEQUENCE
+ column_name |           column_default           
+-------------+------------------------------------
+ i           | nextval('new_bar_i_seq'::regclass)
+ j           | currval('new_s1'::regclass)
+ k           | nextval('new_s2'::regclass)
+(3 rows)
+
+ column_name |           column_default           
+-------------+------------------------------------
+ i           | nextval('new_bar_i_seq'::regclass)
+ j           | currval('new_s1'::regclass)
+ k           | nextval('new_s2'::regclass)
+(3 rows)
+
+INSERT 0 1
+ i | j | k 
+---+---+---
+ 1 | 1 | 1
+ 2 | 1 | 2
+(2 rows)
+
+CREATE SCHEMA
+CREATE SEQUENCE
+CREATE SEQUENCE
+CREATE TABLE
+ nextval 
+---------
+       1
+(1 row)
+
+INSERT 0 1
+ALTER SCHEMA
+ column_name |            column_default            
+-------------+--------------------------------------
+ i           | nextval('new_other_db.s'::regclass)
+ j           | currval('new_other_db.s2'::regclass)
+(2 rows)
+
+ column_name |            column_default            
+-------------+--------------------------------------
+ i           | nextval('new_other_db.s'::regclass)
+ j           | currval('new_other_db.s2'::regclass)
+(2 rows)
+
+INSERT 0 1
+ i | j 
+---+---
+ 1 | 1
+ 2 | 1
+(2 rows)
+
+CREATE SEQUENCE
+CREATE SEQUENCE
+CREATE SCHEMA
+CREATE TABLE
+ nextval 
+---------
+       1
+(1 row)
+
+INSERT 0 1
+ALTER SEQUENCE
+ALTER SEQUENCE
+ALTER SEQUENCE
+ALTER SEQUENCE
+ column_name |              column_default               
+-------------+-------------------------------------------
+ i           | nextval('test_schema.tb_i_seq'::regclass)
+ j           | nextval('test_schema.sc_s1'::regclass)
+ k           | currval('test_schema.sc_s2'::regclass)
+(3 rows)
+
+ column_name |              column_default               
+-------------+-------------------------------------------
+ i           | nextval('test_schema.tb_i_seq'::regclass)
+ j           | nextval('test_schema.sc_s1'::regclass)
+ k           | currval('test_schema.sc_s2'::regclass)
+(3 rows)
+
+INSERT 0 1
+ i | j | k 
+---+---+---
+ 1 | 1 | 1
+ 2 | 2 | 1
+(2 rows)
+
+SET
+CREATE SEQUENCE
+CREATE SEQUENCE
+CREATE TABLE
+ nextval 
+---------
+       1
+(1 row)
+
+INSERT 0 1
+ALTER SCHEMA
+ column_name |                 column_default                 
+-------------+------------------------------------------------
+ i           | nextval('new_test_schema.foo_i_seq'::regclass)
+ j           | nextval('new_test_schema.s3'::regclass)
+ k           | currval('new_test_schema.s4'::regclass)
+(3 rows)
+
+ column_name |                 column_default                 
+-------------+------------------------------------------------
+ i           | nextval('new_test_schema.foo_i_seq'::regclass)
+ j           | nextval('new_test_schema.s3'::regclass)
+ k           | currval('new_test_schema.s4'::regclass)
+(3 rows)
+
+INSERT 0 1
+ i | j | k 
+---+---+---
+ 1 | 1 | 1
+ 2 | 2 | 1
+(2 rows)
+
+SET
+CREATE SCHEMA
+CREATE TABLE
+INSERT 0 1
+SET
+INSERT 0 1
+SET
+CREATE TABLE
+CREATE SEQUENCE
+ALTER TABLE
+ALTER SEQUENCE
+ column_name |        column_default         
+-------------+-------------------------------
+ i           | nextval('t2_i_seq'::regclass)
+ j           | nextval('s5_new'::regclass)
+(2 rows)
+
+ column_name |        column_default         
+-------------+-------------------------------
+ i           | nextval('t2_i_seq'::regclass)
+ j           | nextval('s5_new'::regclass)
+(2 rows)
+
+ pg_get_serial_sequence | pg_get_serial_sequence 
+------------------------+------------------------
+ public.t2_i_seq        | public.s5_new
+(1 row)
+
+INSERT 0 1
+CREATE TABLE
+CREATE TABLE
+CREATE SEQUENCE
+CREATE VIEW
+                pg_get_viewdef                
+----------------------------------------------
+  SELECT i,                                  +
+     nextval('view_seq'::regclass) AS nextval+
+    FROM t3;
+(1 row)
+
+CREATE VIEW
+                      pg_get_viewdef                       
+-----------------------------------------------------------
+  SELECT currval                                          +
+    FROM ( SELECT currval('view_seq'::regclass) AS currval+
+            FROM t3) sub;
+(1 row)
+
+CREATE VIEW
+                  pg_get_viewdef                   
+---------------------------------------------------
+  SELECT nextval('view_seq'::regclass) AS nextval,+
+     t3.i                                         +
+    FROM t3                                       +
+ UNION                                            +
+  SELECT nextval('view_seq'::regclass) AS nextval,+
+     t4.i                                         +
+    FROM t4;
+(1 row)
+
+CREATE VIEW
+                    pg_get_viewdef                    
+------------------------------------------------------
+  SELECT t3.i,                                       +
+     nextval('view_seq'::regclass) AS nextval        +
+    FROM t3                                          +
+      JOIN ( SELECT t4.j,                            +
+             currval('view_seq'::regclass) AS currval+
+            FROM t4) t5 ON t3.i = t5.j;
+(1 row)
+
+CREATE MATERIALIZED VIEW
+                  pg_get_viewdef                   
+---------------------------------------------------
+  SELECT currval('view_seq'::regclass) AS currval,+
+     i                                            +
+    FROM t3;
+(1 row)
+
+CREATE VIEW
+CREATE VIEW
+               pg_get_viewdef                
+---------------------------------------------
+  SELECT currval('view_seq'::regclass) AS i;
+(1 row)
+
+CREATE VIEW
+                          pg_get_viewdef                           
+-------------------------------------------------------------------
+  SELECT i,                                                       +
+     ( SELECT nextval('view_seq'::regclass) AS nextval) AS nextval+
+    FROM t3;
+(1 row)
+
+CREATE VIEW
+               pg_get_viewdef               
+--------------------------------------------
+  SELECT i                                 +
+    FROM t3                                +
+   WHERE i = nextval('view_seq'::regclass);
+(1 row)
+
+CREATE VIEW
+                      pg_get_viewdef                      
+----------------------------------------------------------
+  WITH w AS (                                            +
+          SELECT nextval('view_seq'::regclass) AS nextval+
+         )                                               +
+  SELECT nextval                                         +
+    FROM w;
+(1 row)
+
+CREATE VIEW
+            pg_get_viewdef             
+---------------------------------------
+  SELECT i                            +
+    FROM t3                           +
+  LIMIT nextval('view_seq'::regclass);
+(1 row)
+
+ALTER SEQUENCE
+                           pg_get_viewdef                           
+--------------------------------------------------------------------
+  SELECT i,                                                        +
+     ( SELECT nextval('view_seq2'::regclass) AS nextval) AS nextval+
+    FROM t3;
+(1 row)
+
+INSERT 0 1
+INSERT 0 1
+ i | nextval 
+---+---------
+ 8 |       1
+(1 row)
+
+ nextval | i  
+---------+----
+       2 |  8
+       3 | 35
+(2 rows)
+
+RESET

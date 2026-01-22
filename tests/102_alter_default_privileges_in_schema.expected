@@ -1,0 +1,263 @@
+SET
+DROP ROLE
+DROP ROLE
+DROP ROLE
+CREATE ROLE
+CREATE ROLE
+CREATE ROLE
+GRANT
+GRANT
+CREATE SCHEMA
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+SET
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+  grantee  | privilege_type | is_grantable 
+-----------+----------------+--------------
+ testuser  | DELETE         | YES
+ testuser  | INSERT         | YES
+ testuser  | REFERENCES     | YES
+ testuser  | SELECT         | YES
+ testuser  | TRIGGER        | YES
+ testuser  | TRUNCATE       | YES
+ testuser  | UPDATE         | YES
+ testuser2 | SELECT         | NO
+(8 rows)
+
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+  grantee  | privilege_type | is_grantable 
+-----------+----------------+--------------
+ testuser  | DELETE         | YES
+ testuser  | INSERT         | YES
+ testuser  | REFERENCES     | YES
+ testuser  | SELECT         | YES
+ testuser  | TRIGGER        | YES
+ testuser  | TRUNCATE       | YES
+ testuser  | UPDATE         | YES
+ testuser2 | INSERT         | NO
+ testuser2 | SELECT         | NO
+(9 rows)
+
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+  grantee  | privilege_type | is_grantable 
+-----------+----------------+--------------
+ testuser  | DELETE         | YES
+ testuser  | INSERT         | YES
+ testuser  | REFERENCES     | YES
+ testuser  | SELECT         | YES
+ testuser  | TRIGGER        | YES
+ testuser  | TRUNCATE       | YES
+ testuser  | UPDATE         | YES
+ testuser2 | DELETE         | NO
+ testuser2 | INSERT         | NO
+ testuser2 | REFERENCES     | NO
+ testuser2 | SELECT         | NO
+ testuser2 | TRIGGER        | NO
+ testuser2 | TRUNCATE       | NO
+ testuser2 | UPDATE         | NO
+(14 rows)
+
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+  grantee  | privilege_type | is_grantable 
+-----------+----------------+--------------
+ testuser  | DELETE         | YES
+ testuser  | INSERT         | YES
+ testuser  | REFERENCES     | YES
+ testuser  | SELECT         | YES
+ testuser  | TRIGGER        | YES
+ testuser  | TRUNCATE       | YES
+ testuser  | UPDATE         | YES
+ testuser2 | SELECT         | NO
+(8 rows)
+
+CREATE SCHEMA
+GRANT
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+CREATE TABLE
+  grantee  | privilege_type | is_grantable 
+-----------+----------------+--------------
+ testuser  | DELETE         | YES
+ testuser  | INSERT         | YES
+ testuser  | REFERENCES     | YES
+ testuser  | SELECT         | YES
+ testuser  | TRIGGER        | YES
+ testuser  | TRUNCATE       | YES
+ testuser  | UPDATE         | YES
+ testuser2 | DELETE         | NO
+ testuser2 | INSERT         | NO
+ testuser2 | REFERENCES     | NO
+ testuser2 | SELECT         | NO
+ testuser2 | TRIGGER        | NO
+ testuser2 | TRUNCATE       | NO
+ testuser2 | UPDATE         | NO
+(14 rows)
+
+  grantee  | privilege_type | is_grantable 
+-----------+----------------+--------------
+ testuser  | DELETE         | YES
+ testuser  | INSERT         | YES
+ testuser  | REFERENCES     | YES
+ testuser  | SELECT         | YES
+ testuser  | TRIGGER        | YES
+ testuser  | TRUNCATE       | YES
+ testuser  | UPDATE         | YES
+ testuser2 | DELETE         | NO
+ testuser2 | INSERT         | NO
+ testuser2 | REFERENCES     | NO
+ testuser2 | SELECT         | NO
+ testuser2 | TRIGGER        | NO
+ testuser2 | TRUNCATE       | NO
+ testuser2 | UPDATE         | NO
+(14 rows)
+
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+CREATE TABLE
+  grantee  | privilege_type | is_grantable 
+-----------+----------------+--------------
+ testuser  | DELETE         | YES
+ testuser  | INSERT         | YES
+ testuser  | REFERENCES     | YES
+ testuser  | SELECT         | YES
+ testuser  | TRIGGER        | YES
+ testuser  | TRUNCATE       | YES
+ testuser  | UPDATE         | YES
+ testuser2 | SELECT         | NO
+(8 rows)
+
+  grantee  | privilege_type | is_grantable 
+-----------+----------------+--------------
+ testuser  | DELETE         | YES
+ testuser  | INSERT         | YES
+ testuser  | REFERENCES     | YES
+ testuser  | SELECT         | YES
+ testuser  | TRIGGER        | YES
+ testuser  | TRUNCATE       | YES
+ testuser  | UPDATE         | YES
+ testuser2 | SELECT         | NO
+(8 rows)
+
+CREATE TABLE
+CREATE TABLE
+  grantee  | privilege_type | is_grantable 
+-----------+----------------+--------------
+ testuser  | DELETE         | YES
+ testuser  | INSERT         | YES
+ testuser  | REFERENCES     | YES
+ testuser  | SELECT         | YES
+ testuser  | TRIGGER        | YES
+ testuser  | TRUNCATE       | YES
+ testuser  | UPDATE         | YES
+ testuser2 | SELECT         | NO
+(8 rows)
+
+  grantee  | privilege_type | is_grantable 
+-----------+----------------+--------------
+ testuser  | DELETE         | YES
+ testuser  | INSERT         | YES
+ testuser  | REFERENCES     | YES
+ testuser  | SELECT         | YES
+ testuser  | TRIGGER        | YES
+ testuser  | TRUNCATE       | YES
+ testuser  | UPDATE         | YES
+ testuser2 | SELECT         | NO
+(8 rows)
+
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+  grantee  | privilege_type | is_grantable 
+-----------+----------------+--------------
+ testuser2 | SELECT         | NO
+(1 row)
+
+CREATE SCHEMA
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+ grantee  | privilege_type | is_grantable 
+----------+----------------+--------------
+ testuser | DELETE         | YES
+ testuser | INSERT         | YES
+ testuser | REFERENCES     | YES
+ testuser | SELECT         | YES
+ testuser | TRIGGER        | YES
+ testuser | TRUNCATE       | YES
+ testuser | UPDATE         | YES
+(7 rows)
+
+ role_name |  schema_name  | object_type |       defaclacl        
+-----------+---------------+-------------+------------------------
+ pan       | crdb_internal | r           | {root=r/pan}
+ testuser  | public        | r           | {testuser2=r/testuser}
+ testuser  | s             | r           | {testuser2=r/testuser}
+(3 rows)
+
+ role_name | schema_name | object_type |       defaclacl        
+-----------+-------------+-------------+------------------------
+ testuser  | public      | r           | {testuser2=r/testuser}
+(1 row)
+
+ role_name | schema_name | object_type |       defaclacl        
+-----------+-------------+-------------+------------------------
+ testuser  | s           | r           | {testuser2=r/testuser}
+(1 row)
+
+ role_name | schema_name | object_type | defaclacl 
+-----------+-------------+-------------+-----------
+(0 rows)
+
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ role_name |  schema_name  | object_type |                    defaclacl                     
+-----------+---------------+-------------+--------------------------------------------------
+ pan       | crdb_internal | r           | {root=r/pan}
+ testuser  | public        | r           | {testuser=arwdDxt/testuser,testuser2=r/testuser}
+ testuser  | s             | T           | {testuser2=U/testuser}
+ testuser  | s             | r           | {testuser2=r/testuser}
+ testuser  | s2            | r           | {testuser2=rw/testuser}
+(5 rows)
+
+ role_name | schema_name | object_type |                    defaclacl                     
+-----------+-------------+-------------+--------------------------------------------------
+ testuser  | public      | r           | {testuser=arwdDxt/testuser,testuser2=r/testuser}
+(1 row)
+
+ role_name | schema_name | object_type |       defaclacl        
+-----------+-------------+-------------+------------------------
+ testuser  | s           | T           | {testuser2=U/testuser}
+ testuser  | s           | r           | {testuser2=r/testuser}
+(2 rows)
+
+ role_name | schema_name | object_type |        defaclacl        
+-----------+-------------+-------------+-------------------------
+ testuser  | s2          | r           | {testuser2=rw/testuser}
+(1 row)
+
+ role_name | schema_name | object_type |        defaclacl        
+-----------+-------------+-------------+-------------------------
+ testuser  | s2          | r           | {testuser2=rw/testuser}
+(1 row)
+
+ nspname 
+---------
+(0 rows)
+
+RESET
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+DROP OWNED
+DROP OWNED
+DROP OWNED
+REVOKE
+REVOKE
+DROP ROLE
+DROP ROLE
+DROP ROLE
+RESET

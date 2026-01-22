@@ -1,0 +1,85 @@
+SET
+CREATE TABLE
+CREATE SCHEMA
+CREATE TABLE
+ column_name | data_type | is_nullable 
+-------------+-----------+-------------
+ id          | integer   | NO
+(1 row)
+
+ indexname |                        indexdef                         
+-----------+---------------------------------------------------------
+ a_pkey    | CREATE UNIQUE INDEX a_pkey ON public.a USING btree (id)
+(1 row)
+
+CREATE TABLE
+INSERT 0 1
+SELECT 1
+CREATE VIEW
+CREATE TABLE
+CREATE TABLE
+CREATE SCHEMA
+CREATE TABLE
+ exists 
+--------
+ t
+(1 row)
+
+ exists 
+--------
+ t
+(1 row)
+
+ exists 
+--------
+ t
+(1 row)
+
+ exists 
+--------
+ t
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 1
+DROP TABLE
+CREATE SEQUENCE
+CREATE TABLE
+CREATE INDEX
+BEGIN
+ALTER TABLE
+ALTER TABLE
+COMMIT
+ conname | pg_get_constraintdef 
+---------+----------------------
+ t_pkey  | PRIMARY KEY (j)
+(1 row)
+
+ indexname |                        indexdef                        
+-----------+--------------------------------------------------------
+ idx       | CREATE INDEX idx ON public.t USING btree (j)
+ t_pkey    | CREATE UNIQUE INDEX t_pkey ON public.t USING btree (j)
+(2 rows)
+
+CREATE TABLE
+ALTER TABLE
+ conname  | pg_get_constraintdef 
+----------+----------------------
+ foo_pkey | PRIMARY KEY (i)
+(1 row)
+
+ column_name | data_type | is_nullable 
+-------------+-----------+-------------
+ i           | integer   | NO
+ j           | integer   | NO
+(2 rows)
+
+ indexname |                          indexdef                          
+-----------+------------------------------------------------------------
+ foo_pkey  | CREATE UNIQUE INDEX foo_pkey ON public.foo USING btree (i)
+(1 row)
+
+CREATE SEQUENCE
+DROP SEQUENCE
+RESET

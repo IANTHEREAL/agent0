@@ -1,0 +1,38 @@
+CREATE SCHEMA
+CREATE TYPE
+CREATE TABLE
+ALTER TABLE
+SELECT 0
+CREATE INDEX
+COMMENT
+COMMENT
+COMMENT
+COMMENT
+COMMENT
+COMMENT
+COMMENT
+CREATE FUNCTION
+CREATE FUNCTION
+CREATE SCHEMA
+CREATE TABLE
+INSERT 0 6
+ least |                                                   strip_volatile                                                   
+-------+--------------------------------------------------------------------------------------------------------------------
+     1 | {"type": {}, "table": {"indexes": [{}, {}, {}], "primaryIndex": {}}, "schema": {}, "database": {}, "function": {}}
+     2 | {"table": {"indexes": [{}, {}, {}]}}
+     3 | {"type": {}}
+    29 | {"schema": {}}
+   150 | {"database": {}}
+   999 | {"table": {}}
+(6 rows)
+
+ least |                                                   strip_volatile                                                   
+-------+--------------------------------------------------------------------------------------------------------------------
+     1 | {"type": {}, "table": {"indexes": [{}, {}, {}], "primaryIndex": {}}, "schema": {}, "database": {}, "function": {}}
+     2 | {"table": {"indexes": [{}, {}, {}]}}
+     3 | {"type": {}}
+    29 | {"schema": {}}
+   150 | {"database": {}}
+   999 | {"table": {}}
+(6 rows)
+

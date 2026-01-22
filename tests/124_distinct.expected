@@ -1,0 +1,179 @@
+SET
+CREATE TABLE
+CREATE INDEX
+INSERT 0 7
+ y | z 
+---+---
+ 2 | 3
+ 2 | 3
+ 2 | 6
+ 2 | 9
+ 3 | 5
+ 5 | 6
+ 5 | 6
+(7 rows)
+
+ y | z 
+---+---
+ 2 | 3
+ 2 | 6
+ 2 | 9
+ 3 | 5
+ 5 | 6
+(5 rows)
+
+ y 
+---
+ 2
+ 2
+ 2
+ 3
+ 5
+(5 rows)
+
+ y | z 
+---+---
+ 2 | 3
+ 3 | 5
+ 2 | 6
+ 5 | 6
+ 2 | 9
+(5 rows)
+
+ y | z 
+---+---
+ 2 | 3
+ 2 | 6
+ 2 | 9
+ 3 | 5
+ 5 | 6
+(5 rows)
+
+ y | z 
+---+---
+ 2 | 3
+ 2 | 6
+ 2 | 9
+ 3 | 5
+ 5 | 6
+(5 rows)
+
+ ?column? 
+----------
+        5
+        8
+       11
+(3 rows)
+
+ w | z 
+---+---
+ 2 | 3
+ 3 | 5
+ 2 | 6
+ 5 | 6
+ 2 | 9
+(5 rows)
+
+ w 
+---
+ 2
+ 3
+ 5
+(3 rows)
+
+INSERT 0 2
+ y | z 
+---+---
+ 2 | 3
+ 2 | 6
+ 2 | 9
+ 2 |  
+ 3 | 5
+ 5 | 6
+(6 rows)
+
+  row  
+-------
+ (2,3)
+ (2,6)
+ (2,9)
+ (2,)
+ (3,5)
+ (5,6)
+(6 rows)
+
+ count 
+-------
+     3
+(1 row)
+
+CREATE TABLE
+CREATE INDEX
+INSERT 0 6
+ v 
+---
+ 1
+ 2
+ 5
+  
+(4 rows)
+
+ v 
+---
+ 1
+ 2
+ 5
+  
+(4 rows)
+
+ v 
+---
+ 1
+ 2
+ 5
+(3 rows)
+
+CREATE TABLE
+CREATE VIEW
+INSERT 0 2
+ c0 
+----
+   
+(1 row)
+
+CREATE TABLE
+INSERT 0 2
+   x    
+--------
+ {NULL}
+ 
+(2 rows)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 6
+            x            
+-------------------------
+ [1, 2]
+ [2, 1]
+ {"foo": "bar"}
+ {"foo": {"bar": "baz"}}
+(4 rows)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 3
+ count 
+-------
+     1
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 3
+ x |                       jsonb_agg                        
+---+--------------------------------------------------------
+ 1 | [{"y": 2, "z": "hello"}, {"y": 2, "z": "hello there"}]
+(1 row)
+
+RESET

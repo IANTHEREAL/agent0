@@ -1,0 +1,49 @@
+CREATE TABLE
+INSERT 0 3
+CREATE TABLE
+INSERT 0 3
+ k | v  
+---+----
+ 2 | 20
+ 3 | 30
+(2 rows)
+
+CREATE TABLE
+CREATE TABLE
+INSERT 0 10
+INSERT 0 10
+ b  | d  
+----+----
+  3 |   
+  6 | 12
+  9 |   
+ 12 | 24
+ 15 |   
+(5 rows)
+
+CREATE TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+ id 
+----
+(0 rows)
+
+CREATE TABLE
+INSERT 0 3
+CREATE TABLE
+INSERT 0 3
+ k 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+ k 
+---
+ 1
+ 2
+ 3
+(3 rows)
+

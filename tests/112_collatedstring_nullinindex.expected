@@ -1,0 +1,18 @@
+SET
+CREATE COLLATION
+DROP TABLE
+CREATE TABLE
+INSERT 0 3
+CREATE INDEX
+INSERT 0 1
+INSERT 0 1
+  b  
+-----
+ bar
+ foo
+ 
+ 
+ 
+(5 rows)
+
+RESET

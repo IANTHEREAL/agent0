@@ -1,0 +1,100 @@
+SET
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP FUNCTION
+DROP ROLE
+CREATE FUNCTION
+CREATE TABLE
+CREATE TABLE
+INSERT 0 5
+INSERT 0 9
+ k |  str  
+---+-------
+ 1 | one
+ 2 | two
+ 3 | three
+ 4 | four
+ 5 | five
+(5 rows)
+
+ key |  val  
+-----+-------
+   2 | two
+   3 | three
+   4 | four
+   5 | five
+   6 | six
+   7 | seven
+   8 | eight
+   9 | nine
+  10 | ten
+(9 rows)
+
+ key |  str  
+-----+-------
+   3 | three
+   4 | four
+   5 | five
+(3 rows)
+
+SELECT 3
+SELECT 9
+ key |  str  
+-----+-------
+   2 | two
+   3 | three
+(2 rows)
+
+ k |  str  
+---+-------
+ 3 | three
+ 4 | four
+ 5 | five
+(3 rows)
+
+ key |  val  
+-----+-------
+   2 | two
+   3 | three
+   4 | four
+   5 | five
+   6 | six
+   7 | seven
+   8 | eight
+   9 | nine
+  10 | ten
+(9 rows)
+
+      tablename       
+----------------------
+ st_scan_4
+ st_test_merge_join_2
+ t
+ u
+(4 rows)
+
+CREATE ROLE
+GRANT
+SET
+ k |  str  
+---+-------
+ 1 | one
+ 2 | two
+ 3 | three
+ 4 | four
+ 5 | five
+(5 rows)
+
+RESET
+ k |  str  
+---+-------
+ 1 | one
+ 2 | two
+ 3 | three
+ 4 | four
+ 5 | five
+(5 rows)
+
+RESET

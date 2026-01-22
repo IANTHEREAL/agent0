@@ -1,0 +1,133 @@
+SET
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+CREATE SEQUENCE
+CREATE TABLE
+CREATE FUNCTION
+INSERT 0 1000
+ collect_data_stats 
+--------------------
+                  4
+(1 row)
+
+ statistics_name | column_names | row_count | distinct_count | null_count | partial_predicate 
+-----------------+--------------+-----------+----------------+------------+-------------------
+ __auto__        | {a}          |      1000 |             10 |          0 | 
+ __auto__        | {b}          |      1000 |             10 |          0 | 
+ __auto__        | {c}          |      1000 |             10 |          0 | 
+ __auto__        | {d}          |      1000 |              1 |          0 | 
+(4 rows)
+
+ collect_data_stats 
+--------------------
+                  4
+(1 row)
+
+ statistics_name | column_names | row_count | distinct_count | null_count | partial_predicate 
+-----------------+--------------+-----------+----------------+------------+-------------------
+ __auto__        | {a}          |      1000 |             10 |          0 | 
+ __auto__        | {b}          |      1000 |             10 |          0 | 
+ __auto__        | {c}          |      1000 |             10 |          0 | 
+ __auto__        | {d}          |      1000 |              1 |          0 | 
+(4 rows)
+
+UPDATE 100
+ collect_data_stats 
+--------------------
+                  4
+(1 row)
+
+ statistics_name | column_names | row_count | distinct_count | null_count | partial_predicate 
+-----------------+--------------+-----------+----------------+------------+-------------------
+ __auto__        | {a}          |      1000 |             10 |          0 | 
+ __auto__        | {b}          |      1000 |             10 |          0 | 
+ __auto__        | {c}          |      1000 |             10 |          0 | 
+ __auto__        | {d}          |      1000 |              2 |          0 | 
+(4 rows)
+
+UPDATE 200
+ collect_data_stats 
+--------------------
+                  4
+(1 row)
+
+ statistics_name | column_names | row_count | distinct_count | null_count | partial_predicate 
+-----------------+--------------+-----------+----------------+------------+-------------------
+ __auto__        | {a}          |      1000 |             10 |          0 | 
+ __auto__        | {b}          |      1000 |             10 |          0 | 
+ __auto__        | {c}          |      1000 |             10 |          0 | 
+ __auto__        | {d}          |      1000 |              2 |          0 | 
+(4 rows)
+
+UPDATE 200
+ collect_data_stats 
+--------------------
+                  4
+(1 row)
+
+ statistics_name | column_names | row_count | distinct_count | null_count | partial_predicate 
+-----------------+--------------+-----------+----------------+------------+-------------------
+ __auto__        | {a}          |      1000 |             10 |          0 | 
+ __auto__        | {b}          |      1000 |             10 |          0 | 
+ __auto__        | {c}          |      1000 |             10 |          0 | 
+ __auto__        | {d}          |      1000 |              2 |          0 | 
+(4 rows)
+
+INSERT 0 64
+ collect_data_stats 
+--------------------
+                  4
+(1 row)
+
+ statistics_name | column_names | row_count | distinct_count | null_count | partial_predicate 
+-----------------+--------------+-----------+----------------+------------+-------------------
+ __auto__        | {a}          |      1064 |             14 |          0 | 
+ __auto__        | {b}          |      1064 |             14 |          0 | 
+ __auto__        | {c}          |      1064 |             14 |          0 | 
+ __auto__        | {d}          |      1064 |              2 |         64 | 
+(4 rows)
+
+INSERT 0 60
+ collect_data_stats 
+--------------------
+                  4
+(1 row)
+
+ statistics_name | column_names | row_count | distinct_count | null_count | partial_predicate 
+-----------------+--------------+-----------+----------------+------------+-------------------
+ __auto__        | {a}          |      1076 |             15 |          0 | 
+ __auto__        | {b}          |      1076 |             14 |          0 | 
+ __auto__        | {c}          |      1076 |             14 |          0 | 
+ __auto__        | {d}          |      1076 |              3 |         16 | 
+(4 rows)
+
+DELETE 60
+ collect_data_stats 
+--------------------
+                  4
+(1 row)
+
+ statistics_name | column_names | row_count | distinct_count | null_count | partial_predicate 
+-----------------+--------------+-----------+----------------+------------+-------------------
+ __auto__        | {a}          |      1016 |             11 |          0 | 
+ __auto__        | {b}          |      1016 |             14 |          0 | 
+ __auto__        | {c}          |      1016 |             14 |          0 | 
+ __auto__        | {d}          |      1016 |              3 |          4 | 
+(4 rows)
+
+INSERT 0 1331
+ collect_data_stats 
+--------------------
+                  4
+(1 row)
+
+ statistics_name | column_names | row_count | distinct_count | null_count | partial_predicate 
+-----------------+--------------+-----------+----------------+------------+-------------------
+ __auto__        | {a}          |      2347 |             22 |          0 | 
+ __auto__        | {b}          |      2347 |             25 |          0 | 
+ __auto__        | {c}          |      2347 |             25 |          0 | 
+ __auto__        | {d}          |      2347 |              3 |       1335 | 
+(4 rows)
+
+RESET

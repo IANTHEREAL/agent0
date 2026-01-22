@@ -1,0 +1,166 @@
+SET
+DROP ROLE
+DROP ROLE
+DROP ROLE
+CREATE ROLE
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ defaclrole | defaclnamespace | defaclobjtype |                     defaclacl                     
+------------+-----------------+---------------+---------------------------------------------------
+ pan        | <global>        | S             | {=r/pan,pan=rwU/pan,crdb_tests_public=r*/pan}
+ pan        | <global>        | n             | {=U/pan,pan=UC/pan,crdb_tests_public=U*/pan}
+ pan        | <global>        | r             | {=r/pan,pan=arwdDxt/pan,crdb_tests_public=r*/pan}
+(3 rows)
+
+CREATE ROLE
+CREATE ROLE
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ defaclrole | defaclnamespace | defaclobjtype |                                                       defaclacl                                                       
+------------+-----------------+---------------+-----------------------------------------------------------------------------------------------------------------------
+ pan        | <global>        | S             | {=r/pan,pan=rwU/pan,crdb_tests_public=r*/pan,crdb_tests_foo=r*w*U*/pan,crdb_tests_bar=r*w*U*/pan}
+ pan        | <global>        | T             | {=U/pan,pan=U/pan,crdb_tests_foo=U*/pan,crdb_tests_bar=U*/pan}
+ pan        | <global>        | f             | {=X/pan,pan=X/pan,crdb_tests_foo=X*/pan,crdb_tests_bar=X*/pan}
+ pan        | <global>        | n             | {=U/pan,pan=UC/pan,crdb_tests_public=U*/pan,crdb_tests_foo=U*C*/pan,crdb_tests_bar=U*C*/pan}
+ pan        | <global>        | r             | {=r/pan,pan=arwdDxt/pan,crdb_tests_public=r*/pan,crdb_tests_foo=a*r*w*d*D*x*t*/pan,crdb_tests_bar=a*r*w*d*D*x*t*/pan}
+(5 rows)
+
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ defaclrole | defaclnamespace | defaclobjtype |                                                     defaclacl                                                     
+------------+-----------------+---------------+-------------------------------------------------------------------------------------------------------------------
+ pan        | <global>        | S             | {=r/pan,pan=rwU/pan,crdb_tests_public=r*/pan,crdb_tests_foo=r*wU/pan,crdb_tests_bar=r*wU/pan}
+ pan        | <global>        | T             | {=U/pan,pan=U/pan,crdb_tests_foo=U/pan,crdb_tests_bar=U/pan}
+ pan        | <global>        | f             | {=X/pan,pan=X/pan,crdb_tests_foo=X/pan,crdb_tests_bar=X/pan}
+ pan        | <global>        | n             | {=U/pan,pan=UC/pan,crdb_tests_public=U*/pan,crdb_tests_foo=U*C/pan,crdb_tests_bar=U*C/pan}
+ pan        | <global>        | r             | {=r/pan,pan=arwdDxt/pan,crdb_tests_public=r*/pan,crdb_tests_foo=a*rw*dD*x*t*/pan,crdb_tests_bar=a*rw*dD*x*t*/pan}
+(5 rows)
+
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ defaclrole | defaclnamespace | defaclobjtype |                                                defaclacl                                                
+------------+-----------------+---------------+---------------------------------------------------------------------------------------------------------
+ pan        | <global>        | S             | {=r/pan,pan=rwU/pan,crdb_tests_public=r*/pan,crdb_tests_foo=rwU/pan,crdb_tests_bar=rwU/pan}
+ pan        | <global>        | T             | {=U/pan,pan=U/pan,crdb_tests_foo=U/pan,crdb_tests_bar=U/pan}
+ pan        | <global>        | f             | {=X/pan,pan=X/pan,crdb_tests_foo=X/pan,crdb_tests_bar=X/pan}
+ pan        | <global>        | n             | {=U/pan,pan=UC/pan,crdb_tests_public=U*/pan,crdb_tests_foo=UC/pan,crdb_tests_bar=UC/pan}
+ pan        | <global>        | r             | {=r/pan,pan=arwdDxt/pan,crdb_tests_public=r*/pan,crdb_tests_foo=arwdDxt/pan,crdb_tests_bar=arwdDxt/pan}
+(5 rows)
+
+GRANT ROLE
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+   defaclrole   | defaclnamespace | defaclobjtype |                                                defaclacl                                                
+----------------+-----------------+---------------+---------------------------------------------------------------------------------------------------------
+ crdb_tests_bar | <global>        | S             | {crdb_tests_foo=r*w*U*/crdb_tests_bar,crdb_tests_bar=r*w*U*/crdb_tests_bar}
+ crdb_tests_bar | <global>        | T             | {=U/crdb_tests_bar,crdb_tests_foo=U*/crdb_tests_bar,crdb_tests_bar=U*/crdb_tests_bar}
+ crdb_tests_bar | <global>        | f             | {=X/crdb_tests_bar,crdb_tests_foo=X*/crdb_tests_bar,crdb_tests_bar=X*/crdb_tests_bar}
+ crdb_tests_bar | <global>        | n             | {crdb_tests_foo=U*C*/crdb_tests_bar,crdb_tests_bar=U*C*/crdb_tests_bar}
+ crdb_tests_bar | <global>        | r             | {crdb_tests_foo=a*r*w*d*D*x*t*/crdb_tests_bar,crdb_tests_bar=a*r*w*d*D*x*t*/crdb_tests_bar}
+ crdb_tests_foo | <global>        | S             | {crdb_tests_foo=r*w*U*/crdb_tests_foo,crdb_tests_bar=r*w*U*/crdb_tests_foo}
+ crdb_tests_foo | <global>        | T             | {=U/crdb_tests_foo,crdb_tests_foo=U*/crdb_tests_foo,crdb_tests_bar=U*/crdb_tests_foo}
+ crdb_tests_foo | <global>        | f             | {=X/crdb_tests_foo,crdb_tests_foo=X*/crdb_tests_foo,crdb_tests_bar=X*/crdb_tests_foo}
+ crdb_tests_foo | <global>        | n             | {crdb_tests_foo=U*C*/crdb_tests_foo,crdb_tests_bar=U*C*/crdb_tests_foo}
+ crdb_tests_foo | <global>        | r             | {crdb_tests_foo=a*r*w*d*D*x*t*/crdb_tests_foo,crdb_tests_bar=a*r*w*d*D*x*t*/crdb_tests_foo}
+ pan            | <global>        | S             | {=r/pan,pan=rwU/pan,crdb_tests_public=r*/pan,crdb_tests_foo=rwU/pan,crdb_tests_bar=rwU/pan}
+ pan            | <global>        | T             | {=U/pan,pan=U/pan,crdb_tests_foo=U/pan,crdb_tests_bar=U/pan}
+ pan            | <global>        | f             | {=X/pan,pan=X/pan,crdb_tests_foo=X/pan,crdb_tests_bar=X/pan}
+ pan            | <global>        | n             | {=U/pan,pan=UC/pan,crdb_tests_public=U*/pan,crdb_tests_foo=UC/pan,crdb_tests_bar=UC/pan}
+ pan            | <global>        | r             | {=r/pan,pan=arwdDxt/pan,crdb_tests_public=r*/pan,crdb_tests_foo=arwdDxt/pan,crdb_tests_bar=arwdDxt/pan}
+(15 rows)
+
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+   defaclrole   | defaclnamespace | defaclobjtype |                                                defaclacl                                                
+----------------+-----------------+---------------+---------------------------------------------------------------------------------------------------------
+ crdb_tests_bar | <global>        | S             | {}
+ crdb_tests_bar | <global>        | T             | {=U/crdb_tests_bar}
+ crdb_tests_bar | <global>        | f             | {=X/crdb_tests_bar}
+ crdb_tests_bar | <global>        | n             | {}
+ crdb_tests_bar | <global>        | r             | {}
+ crdb_tests_foo | <global>        | S             | {}
+ crdb_tests_foo | <global>        | T             | {=U/crdb_tests_foo}
+ crdb_tests_foo | <global>        | f             | {=X/crdb_tests_foo}
+ crdb_tests_foo | <global>        | n             | {}
+ crdb_tests_foo | <global>        | r             | {}
+ pan            | <global>        | S             | {=r/pan,pan=rwU/pan,crdb_tests_public=r*/pan,crdb_tests_foo=rwU/pan,crdb_tests_bar=rwU/pan}
+ pan            | <global>        | T             | {=U/pan,pan=U/pan,crdb_tests_foo=U/pan,crdb_tests_bar=U/pan}
+ pan            | <global>        | f             | {=X/pan,pan=X/pan,crdb_tests_foo=X/pan,crdb_tests_bar=X/pan}
+ pan            | <global>        | n             | {=U/pan,pan=UC/pan,crdb_tests_public=U*/pan,crdb_tests_foo=UC/pan,crdb_tests_bar=UC/pan}
+ pan            | <global>        | r             | {=r/pan,pan=arwdDxt/pan,crdb_tests_public=r*/pan,crdb_tests_foo=arwdDxt/pan,crdb_tests_bar=arwdDxt/pan}
+(15 rows)
+
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ defaclrole | defaclnamespace | defaclobjtype |                                                defaclacl                                                
+------------+-----------------+---------------+---------------------------------------------------------------------------------------------------------
+ pan        | <global>        | S             | {=r/pan,pan=rwU/pan,crdb_tests_public=r*/pan,crdb_tests_foo=rwU/pan,crdb_tests_bar=rwU/pan}
+ pan        | <global>        | T             | {=U/pan,pan=U/pan,crdb_tests_foo=U/pan,crdb_tests_bar=U/pan}
+ pan        | <global>        | f             | {=X/pan,pan=X/pan,crdb_tests_foo=X/pan,crdb_tests_bar=X/pan}
+ pan        | <global>        | n             | {=U/pan,pan=UC/pan,crdb_tests_public=U*/pan,crdb_tests_foo=UC/pan,crdb_tests_bar=UC/pan}
+ pan        | <global>        | r             | {=r/pan,pan=arwdDxt/pan,crdb_tests_public=r*/pan,crdb_tests_foo=arwdDxt/pan,crdb_tests_bar=arwdDxt/pan}
+(5 rows)
+
+ALTER DEFAULT PRIVILEGES
+   defaclrole   | defaclnamespace | defaclobjtype |                                                defaclacl                                                
+----------------+-----------------+---------------+---------------------------------------------------------------------------------------------------------
+ crdb_tests_foo | <global>        | T             | {=U/crdb_tests_foo,crdb_tests_foo=U*/crdb_tests_foo}
+ pan            | <global>        | S             | {=r/pan,pan=rwU/pan,crdb_tests_public=r*/pan,crdb_tests_foo=rwU/pan,crdb_tests_bar=rwU/pan}
+ pan            | <global>        | T             | {=U/pan,pan=U/pan,crdb_tests_foo=U/pan,crdb_tests_bar=U/pan}
+ pan            | <global>        | f             | {=X/pan,pan=X/pan,crdb_tests_foo=X/pan,crdb_tests_bar=X/pan}
+ pan            | <global>        | n             | {=U/pan,pan=UC/pan,crdb_tests_public=U*/pan,crdb_tests_foo=UC/pan,crdb_tests_bar=UC/pan}
+ pan            | <global>        | r             | {=r/pan,pan=arwdDxt/pan,crdb_tests_public=r*/pan,crdb_tests_foo=arwdDxt/pan,crdb_tests_bar=arwdDxt/pan}
+(6 rows)
+
+ALTER DEFAULT PRIVILEGES
+ defaclrole | defaclnamespace | defaclobjtype |                                                defaclacl                                                
+------------+-----------------+---------------+---------------------------------------------------------------------------------------------------------
+ pan        | <global>        | S             | {=r/pan,pan=rwU/pan,crdb_tests_public=r*/pan,crdb_tests_foo=rwU/pan,crdb_tests_bar=rwU/pan}
+ pan        | <global>        | T             | {=U/pan,pan=U/pan,crdb_tests_foo=U/pan,crdb_tests_bar=U/pan}
+ pan        | <global>        | f             | {=X/pan,pan=X/pan,crdb_tests_foo=X/pan,crdb_tests_bar=X/pan}
+ pan        | <global>        | n             | {=U/pan,pan=UC/pan,crdb_tests_public=U*/pan,crdb_tests_foo=UC/pan,crdb_tests_bar=UC/pan}
+ pan        | <global>        | r             | {=r/pan,pan=arwdDxt/pan,crdb_tests_public=r*/pan,crdb_tests_foo=arwdDxt/pan,crdb_tests_bar=arwdDxt/pan}
+(5 rows)
+
+DROP OWNED
+DROP ROLE
+DROP ROLE
+DROP ROLE
+RESET

@@ -1,0 +1,59 @@
+SET
+DROP TABLE
+CREATE TABLE
+ bool_and | bool_or 
+----------+---------
+          | 
+(1 row)
+
+ bool_and | bool_or 
+----------+---------
+(0 rows)
+
+INSERT 0 12
+ bool_and | bool_or 
+----------+---------
+          | 
+ t        | t
+ f        | f
+ f        | t
+ t        | t
+ f        | f
+(6 rows)
+
+DROP TABLE
+CREATE TABLE
+ string_agg | string_agg 
+------------+------------
+            | 
+(1 row)
+
+ string_agg | string_agg 
+------------+------------
+(0 rows)
+
+INSERT 0 7
+ string_agg | string_agg 
+------------+------------
+            | 
+ \x31       | 1
+ \x3232     | 22
+ \x3333     | 33
+(4 rows)
+
+DROP TABLE
+SELECT 1
+ ?column? 
+----------
+ t
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+INSERT 0 50000
+ count 
+-------
+ 50000
+(1 row)
+
+RESET

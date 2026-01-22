@@ -1,0 +1,55 @@
+SET
+CREATE SCHEMA
+CREATE FUNCTION
+CREATE FUNCTION
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+DROP SCHEMA
+CREATE SCHEMA
+REVOKE
+CREATE TABLE
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+  regclass   
+-------------
+ root_test.t
+(1 row)
+
+DROP SCHEMA
+RESET

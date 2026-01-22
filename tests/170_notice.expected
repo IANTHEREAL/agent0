@@ -1,0 +1,70 @@
+SET
+CREATE EXTENSION
+RESET
+CREATE SCHEMA
+CREATE FUNCTION
+CREATE FUNCTION
+psql:compatible/notice.sql:92: NOTICE:  hi
+ notice 
+--------
+ 
+(1 row)
+
+psql:compatible/notice.sql:93: NOTICE:  i am....
+ notice 
+--------
+ 
+(1 row)
+
+psql:compatible/notice.sql:94: NOTICE:  otan!!!
+ notice 
+--------
+ 
+(1 row)
+
+ notice 
+--------
+ 
+(1 row)
+
+psql:compatible/notice.sql:98: WARNING:  but you see this
+ notice 
+--------
+ 
+(1 row)
+
+ notice 
+--------
+ 
+(1 row)
+
+SET
+psql:compatible/notice.sql:105: DEBUG:  now you see this
+ notice 
+--------
+ 
+(1 row)
+
+psql:compatible/notice.sql:106: WARNING:  and you see this
+ notice 
+--------
+ 
+(1 row)
+
+ notice 
+--------
+ 
+(1 row)
+
+RESET
+CREATE SCHEMA
+CREATE TABLE
+ALTER TABLE
+CREATE TYPE
+ALTER TYPE
+psql:compatible/notice.sql:127: NOTICE:  enum label "black" already exists, skipping
+ALTER TYPE
+SELECT 1
+CREATE INDEX
+REFRESH MATERIALIZED VIEW
+UNLISTEN

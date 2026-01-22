@@ -1,0 +1,71 @@
+SET
+CREATE EXTENSION
+CREATE EXTENSION
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+INSERT 0 7
+ k 
+---
+ 3
+ 6
+ 7
+(3 rows)
+
+ k 
+---
+ 6
+ 7
+(2 rows)
+
+ k 
+---
+ 3
+ 6
+ 7
+(3 rows)
+
+ k 
+---
+ 6
+ 7
+(2 rows)
+
+ k 
+---
+ 3
+ 6
+ 7
+(3 rows)
+
+ k 
+---
+ 6
+ 7
+(2 rows)
+
+DROP INDEX
+CREATE INDEX
+ k 
+---
+ 3
+ 7
+(2 rows)
+
+ k 
+---
+ 7
+(1 row)
+
+ k 
+---
+ 3
+ 7
+(2 rows)
+
+ k 
+---
+ 7
+(1 row)
+
+RESET

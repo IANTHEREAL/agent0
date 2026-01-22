@@ -1,0 +1,28 @@
+SET
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+CREATE INDEX
+CREATE INDEX
+INSERT 0 1
+ANALYZE
+ attname | null_frac | n_distinct | most_common_vals | histogram_bounds 
+---------+-----------+------------+------------------+------------------
+ j       |         0 |         -1 |                  | 
+(1 row)
+
+ attname | null_frac | n_distinct | most_common_vals | histogram_bounds 
+---------+-----------+------------+------------------+------------------
+ g       |         0 |         -1 |                  | 
+(1 row)
+
+CREATE TABLE
+CREATE INDEX
+INSERT 0 1
+ANALYZE
+ ?column? 
+----------
+ 
+(1 row)
+
+RESET

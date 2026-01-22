@@ -1,0 +1,100 @@
+SET
+DROP ROLE
+DROP ROLE
+CREATE ROLE
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+ grantee  | privilege_type 
+----------+----------------
+ testuser | SELECT
+(1 row)
+
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+ grantee  | privilege_type 
+----------+----------------
+ testuser | INSERT
+ testuser | SELECT
+(2 rows)
+
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+ grantee  | privilege_type 
+----------+----------------
+ testuser | INSERT
+(1 row)
+
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+ grantee  | privilege_type 
+----------+----------------
+ testuser | INSERT
+(1 row)
+
+CREATE ROLE
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+  grantee  | privilege_type 
+-----------+----------------
+ testuser  | INSERT
+ testuser2 | INSERT
+(2 rows)
+
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+  grantee  | privilege_type 
+-----------+----------------
+ testuser  | DELETE
+ testuser  | INSERT
+ testuser  | REFERENCES
+ testuser  | SELECT
+ testuser  | TRIGGER
+ testuser  | TRUNCATE
+ testuser  | UPDATE
+ testuser2 | DELETE
+ testuser2 | INSERT
+ testuser2 | REFERENCES
+ testuser2 | SELECT
+ testuser2 | TRIGGER
+ testuser2 | TRUNCATE
+ testuser2 | UPDATE
+(14 rows)
+
+ALTER DEFAULT PRIVILEGES
+CREATE TABLE
+ grantee | privilege_type 
+---------+----------------
+(0 rows)
+
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+CREATE SCHEMA
+  grantee  | privilege_type 
+-----------+----------------
+ testuser  | CREATE
+ testuser  | USAGE
+ testuser2 | CREATE
+ testuser2 | USAGE
+(4 rows)
+
+CREATE SEQUENCE
+  grantee  | privilege_type 
+-----------+----------------
+ testuser  | SELECT
+ testuser  | UPDATE
+ testuser  | USAGE
+ testuser2 | SELECT
+ testuser2 | UPDATE
+ testuser2 | USAGE
+(6 rows)
+
+CREATE TYPE
+  grantee  | privilege_type 
+-----------+----------------
+ testuser  | USAGE
+ testuser2 | USAGE
+(2 rows)
+
+RESET

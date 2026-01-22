@@ -1,0 +1,232 @@
+SET
+CREATE EXTENSION
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TABLE
+DROP TYPE
+ pg_typeof 
+-----------
+ citext
+(1 row)
+
+ pg_typeof 
+-----------
+ citext
+(1 row)
+
+ pg_typeof 
+-----------
+ citext
+(1 row)
+
+ citext 
+--------
+ Foo
+(1 row)
+
+CREATE TABLE
+ column_name | data_type 
+-------------+-----------
+ c           | citext
+(1 row)
+
+INSERT 0 1
+ pg_typeof 
+-----------
+ citext
+(1 row)
+
+  c   
+------
+ test
+(1 row)
+
+CREATE TABLE
+ column_name | data_type 
+-------------+-----------
+ c           | citext[]
+(1 row)
+
+INSERT 0 1
+ pg_typeof 
+-----------
+ citext[]
+(1 row)
+
+       c       
+---------------
+ {test,TESTER}
+(1 row)
+
+       c       
+---------------
+ {test,TESTER}
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+ column_name | data_type 
+-------------+-----------
+ k           | integer
+ c           | citext
+(2 rows)
+
+INSERT 0 1
+ pg_typeof 
+-----------
+ citext
+(1 row)
+
+  c   
+------
+ test
+(1 row)
+
+DROP TABLE
+CREATE TABLE
+ column_name | data_type 
+-------------+-----------
+ k           | integer
+ c           | citext[]
+(2 rows)
+
+INSERT 0 1
+ pg_typeof 
+-----------
+ citext[]
+(1 row)
+
+       c       
+---------------
+ {test,TESTER}
+(1 row)
+
+CREATE TABLE
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+CREATE TYPE
+CREATE TABLE
+INSERT 0 3
+  c   
+------
+ TeSt
+ tEsT
+(2 rows)
+
+ pg_typeof 
+-----------
+ citext
+(1 row)
+
+CREATE TABLE
+ citext 
+--------
+ test
+(1 row)
+
+ pg_collation_for 
+------------------
+ "default"
+(1 row)
+
+RESET

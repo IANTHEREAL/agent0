@@ -1,0 +1,32 @@
+SET
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+INSERT 0 4
+ k | v | k | v 
+---+---+---+---
+ 0 | 1 | 0 | 1
+ 2 | 4 | 2 | 4
+(2 rows)
+
+DELETE 4
+INSERT 0 3
+ k | v | k | v 
+---+---+---+---
+(0 rows)
+
+DELETE 3
+INSERT 0 1
+ k | k 
+---+---
+(0 rows)
+
+CREATE TABLE
+INSERT 0 1
+CREATE INDEX
+ pk | a | b 
+----+---+---
+  0 | 1 | 2
+(1 row)
+
+RESET

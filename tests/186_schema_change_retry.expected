@@ -1,0 +1,13 @@
+BEGIN
+SAVEPOINT
+CREATE TABLE
+CREATE INDEX
+COMMIT
+BEGIN
+SET
+ tablename 
+-----------
+ t
+(1 row)
+
+COMMIT

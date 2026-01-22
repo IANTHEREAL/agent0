@@ -1,0 +1,123 @@
+SET
+DROP VIEW
+CREATE VIEW
+ routine | create_statement 
+---------+------------------
+(0 rows)
+
+CREATE FUNCTION
+              routine              |                  create_statement                   
+-----------------------------------+-----------------------------------------------------
+ function public.add_one(x bigint) | CREATE OR REPLACE FUNCTION public.add_one(x bigint)+
+                                   |  RETURNS bigint                                    +
+                                   |  LANGUAGE sql                                      +
+                                   | AS $function$SELECT x + 1$function$                +
+                                   | 
+(1 row)
+
+CREATE PROCEDURE
+                                routine                                 |                                     create_statement                                     
+------------------------------------------------------------------------+------------------------------------------------------------------------------------------
+ function public.add_one(x bigint)                                      | CREATE OR REPLACE FUNCTION public.add_one(x bigint)                                     +
+                                                                        |  RETURNS bigint                                                                         +
+                                                                        |  LANGUAGE sql                                                                           +
+                                                                        | AS $function$SELECT x + 1$function$                                                     +
+                                                                        | 
+ procedure public.double_triple(INOUT double bigint, OUT triple bigint) | CREATE OR REPLACE PROCEDURE public.double_triple(INOUT double bigint, OUT triple bigint)+
+                                                                        |  LANGUAGE plpgsql                                                                       +
+                                                                        | AS $procedure$                                                                          +
+                                                                        | BEGIN                                                                                   +
+                                                                        |   double := double * 2;                                                                 +
+                                                                        |   triple := double * 3;                                                                 +
+                                                                        | END;                                                                                    +
+                                                                        | $procedure$                                                                             +
+                                                                        | 
+(2 rows)
+
+CREATE FUNCTION
+                                routine                                 |                                     create_statement                                     
+------------------------------------------------------------------------+------------------------------------------------------------------------------------------
+ function public.add_one(x bigint)                                      | CREATE OR REPLACE FUNCTION public.add_one(x bigint)                                     +
+                                                                        |  RETURNS bigint                                                                         +
+                                                                        |  LANGUAGE sql                                                                           +
+                                                                        | AS $function$SELECT x + 1$function$                                                     +
+                                                                        | 
+ function public.add_one(x double precision)                            | CREATE OR REPLACE FUNCTION public.add_one(x double precision)                           +
+                                                                        |  RETURNS double precision                                                               +
+                                                                        |  LANGUAGE sql                                                                           +
+                                                                        | AS $function$SELECT x + 1$function$                                                     +
+                                                                        | 
+ procedure public.double_triple(INOUT double bigint, OUT triple bigint) | CREATE OR REPLACE PROCEDURE public.double_triple(INOUT double bigint, OUT triple bigint)+
+                                                                        |  LANGUAGE plpgsql                                                                       +
+                                                                        | AS $procedure$                                                                          +
+                                                                        | BEGIN                                                                                   +
+                                                                        |   double := double * 2;                                                                 +
+                                                                        |   triple := double * 3;                                                                 +
+                                                                        | END;                                                                                    +
+                                                                        | $procedure$                                                                             +
+                                                                        | 
+(3 rows)
+
+DROP FUNCTION
+DROP FUNCTION
+                                routine                                 |                                     create_statement                                     
+------------------------------------------------------------------------+------------------------------------------------------------------------------------------
+ procedure public.double_triple(INOUT double bigint, OUT triple bigint) | CREATE OR REPLACE PROCEDURE public.double_triple(INOUT double bigint, OUT triple bigint)+
+                                                                        |  LANGUAGE plpgsql                                                                       +
+                                                                        | AS $procedure$                                                                          +
+                                                                        | BEGIN                                                                                   +
+                                                                        |   double := double * 2;                                                                 +
+                                                                        |   triple := double * 3;                                                                 +
+                                                                        | END;                                                                                    +
+                                                                        | $procedure$                                                                             +
+                                                                        | 
+(1 row)
+
+DROP PROCEDURE
+ routine | create_statement 
+---------+------------------
+(0 rows)
+
+CREATE SCHEMA
+CREATE FUNCTION
+CREATE FUNCTION
+              routine              |                  create_statement                   
+-----------------------------------+-----------------------------------------------------
+ function public.add_one(x bigint) | CREATE OR REPLACE FUNCTION public.add_one(x bigint)+
+                                   |  RETURNS bigint                                    +
+                                   |  LANGUAGE sql                                      +
+                                   | AS $function$SELECT x + 1$function$                +
+                                   | 
+ function s.add_one(x bigint)      | CREATE OR REPLACE FUNCTION s.add_one(x bigint)     +
+                                   |  RETURNS bigint                                    +
+                                   |  LANGUAGE sql                                      +
+                                   | AS $function$SELECT x + 1$function$                +
+                                   | 
+(2 rows)
+
+CREATE FUNCTION
+              routine              |                  create_statement                   
+-----------------------------------+-----------------------------------------------------
+ function public.add_one(x bigint) | CREATE OR REPLACE FUNCTION public.add_one(x bigint)+
+                                   |  RETURNS bigint                                    +
+                                   |  LANGUAGE sql                                      +
+                                   | AS $function$SELECT x + 1$function$                +
+                                   | 
+ function public.select_invalid()  | CREATE OR REPLACE FUNCTION public.select_invalid() +
+                                   |  RETURNS trigger                                   +
+                                   |  LANGUAGE plpgsql                                  +
+                                   | AS $function$                                      +
+                                   | BEGIN                                              +
+                                   |   PERFORM 1 FROM a_b_c;                            +
+                                   |   RETURN NEW;                                      +
+                                   | END;                                               +
+                                   | $function$                                         +
+                                   | 
+ function s.add_one(x bigint)      | CREATE OR REPLACE FUNCTION s.add_one(x bigint)     +
+                                   |  RETURNS bigint                                    +
+                                   |  LANGUAGE sql                                      +
+                                   | AS $function$SELECT x + 1$function$                +
+                                   | 
+(3 rows)
+
+RESET

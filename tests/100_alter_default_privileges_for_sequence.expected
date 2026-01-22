@@ -1,0 +1,80 @@
+SET
+DROP DATABASE
+DROP ROLE
+DROP ROLE
+CREATE ROLE
+CREATE DATABASE
+GRANT
+GRANT
+CREATE SEQUENCE
+   role   | usage | select | update 
+----------+-------+--------+--------
+ testuser | f     | f      | f
+(1 row)
+
+ALTER DEFAULT PRIVILEGES
+ALTER DEFAULT PRIVILEGES
+CREATE SEQUENCE
+   role   | usage | select | update 
+----------+-------+--------+--------
+ testuser | f     | f      | f
+(1 row)
+
+CREATE ROLE
+ALTER DEFAULT PRIVILEGES
+CREATE SEQUENCE
+   role    | usage | select | update 
+-----------+-------+--------+--------
+ testuser  | t     | t      | t
+ testuser2 | t     | t      | t
+(2 rows)
+
+CREATE TABLE
+   role    | select | insert | update | delete 
+-----------+--------+--------+--------+--------
+ testuser  | f      | f      | f      | f
+ testuser2 | f      | f      | f      | f
+(2 rows)
+
+ALTER DEFAULT PRIVILEGES
+CREATE SEQUENCE
+   role    | usage | select | update 
+-----------+-------+--------+--------
+ testuser  | t     | f      | t
+ testuser2 | t     | f      | t
+(2 rows)
+
+ALTER DEFAULT PRIVILEGES
+CREATE SEQUENCE
+   role    | usage | select | update 
+-----------+-------+--------+--------
+ testuser  | f     | f      | f
+ testuser2 | f     | f      | f
+(2 rows)
+
+GRANT
+SET
+ALTER DEFAULT PRIVILEGES
+CREATE SEQUENCE
+   role    | usage | select | update 
+-----------+-------+--------+--------
+ testuser  | t     | t      | t
+ testuser2 | f     | f      | f
+(2 rows)
+
+RESET
+ALTER DEFAULT PRIVILEGES
+SET
+CREATE SEQUENCE
+   role    | usage | select | update 
+-----------+-------+--------+--------
+ testuser  | t     | t      | t
+ testuser2 | f     | f      | f
+(2 rows)
+
+RESET
+DROP DATABASE
+DROP OWNED
+DROP OWNED
+DROP ROLE
+DROP ROLE

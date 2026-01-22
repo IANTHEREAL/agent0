@@ -1,0 +1,23 @@
+SET
+DROP ROLE
+DROP SCHEMA
+CREATE SCHEMA
+CREATE TABLE
+INSERT 0 10
+CREATE TABLE
+ id 
+----
+  1
+  2
+  3
+  4
+  5
+  6
+  7
+  8
+  9
+ 10
+(10 rows)
+
+CREATE ROLE
+RESET

@@ -1,0 +1,7 @@
+DO
+CREATE TABLE
+ has_table_privilege 
+---------------------
+ f
+(1 row)
+

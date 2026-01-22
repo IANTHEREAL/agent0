@@ -1,0 +1,27 @@
+CREATE TABLE
+CREATE TABLE
+ALTER TABLE
+ALTER TABLE
+ pg_typeof 
+-----------
+ bigint
+(1 row)
+
+ count 
+-------
+(0 rows)
+
+ x 
+---
+(0 rows)
+
+ x 
+---
+(0 rows)
+
+ pg_typeof 
+-----------
+ bigint
+(1 row)
+
+INSERT 0 1

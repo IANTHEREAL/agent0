@@ -1,0 +1,13 @@
+SET
+DROP DATABASE
+DROP DATABASE
+RESET
+CREATE DATABASE
+You are now connected to database "parent" as user "pan".
+CREATE DATABASE
+You are now connected to database "template1" as user "pan".
+You are now connected to database "pgdatabase" as user "pan".
+CREATE SCHEMA
+You are now connected to database "template1" as user "pan".
+DROP DATABASE
+DROP DATABASE

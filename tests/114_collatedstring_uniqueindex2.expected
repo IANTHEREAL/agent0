@@ -1,0 +1,92 @@
+SET
+DROP TABLE
+RESET
+CREATE TABLE
+INSERT 0 9
+CREATE INDEX
+ a | b 
+---+---
+ a | 2
+ a | 3
+ A | 1
+ A | 2
+ b | 4
+ B | 3
+ ü | 5
+ ü | 6
+ x | 5
+(9 rows)
+
+ b | a 
+---+---
+ 1 | A
+ 2 | a
+ 2 | A
+ 3 | a
+ 3 | B
+ 4 | b
+ 5 | ü
+ 5 | x
+ 6 | ü
+(9 rows)
+
+ count 
+-------
+     2
+(1 row)
+
+ count 
+-------
+     0
+(1 row)
+
+ count 
+-------
+     4
+(1 row)
+
+ a | b 
+---+---
+ a | 2
+ a | 3
+ A | 1
+ A | 2
+ b | 4
+ B | 3
+ ü | 5
+ ü | 6
+ x | 5
+(9 rows)
+
+ b | a 
+---+---
+ 1 | A
+ 2 | a
+ 2 | A
+ 3 | a
+ 3 | B
+ 4 | b
+ 5 | ü
+ 5 | x
+ 6 | ü
+(9 rows)
+
+DELETE 4
+ a | b 
+---+---
+ a | 2
+ a | 3
+ ü | 5
+ ü | 6
+ x | 5
+(5 rows)
+
+ b | a 
+---+---
+ 2 | a
+ 3 | a
+ 5 | ü
+ 5 | x
+ 6 | ü
+(5 rows)
+

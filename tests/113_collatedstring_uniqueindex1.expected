@@ -1,0 +1,95 @@
+CREATE COLLATION
+CREATE TABLE
+INSERT 0 9
+CREATE INDEX
+ a | b 
+---+---
+ a | 2
+ a | 3
+ A | 1
+ A | 2
+ b | 4
+ B | 3
+ x | 5
+ ü | 5
+ ü | 6
+(9 rows)
+
+ b | a 
+---+---
+ 1 | A
+ 2 | a
+ 2 | A
+ 3 | a
+ 3 | B
+ 4 | b
+ 5 | x
+ 5 | ü
+ 6 | ü
+(9 rows)
+
+ count 
+-------
+     2
+(1 row)
+
+ count 
+-------
+     0
+(1 row)
+
+ count 
+-------
+     4
+(1 row)
+
+UPDATE 9
+ a  | b 
+----+---
+ bb | 4
+ BB | 3
+ xx | 5
+ üü | 5
+ üü | 6
+ aa | 2
+ aa | 3
+ AA | 1
+ AA | 2
+(9 rows)
+
+ b | a  
+---+----
+ 1 | AA
+ 2 | aa
+ 2 | AA
+ 3 | BB
+ 3 | aa
+ 4 | bb
+ 5 | xx
+ 5 | üü
+ 6 | üü
+(9 rows)
+
+DELETE 2
+ a  | b 
+----+---
+ xx | 5
+ üü | 5
+ üü | 6
+ aa | 2
+ aa | 3
+ AA | 1
+ AA | 2
+(7 rows)
+
+ b | a  
+---+----
+ 1 | AA
+ 2 | aa
+ 2 | AA
+ 3 | aa
+ 5 | xx
+ 5 | üü
+ 6 | üü
+(7 rows)
+

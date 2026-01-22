@@ -1,0 +1,42 @@
+SET
+DROP TABLE
+DROP TABLE
+CREATE TABLE
+CREATE TABLE
+INSERT 0 9
+INSERT 0 2
+SET
+BEGIN
+ k |  v   
+---+------
+ a | val1
+ b | val2
+(2 rows)
+
+ k |  v   
+---+------
+ a | val1
+(1 row)
+
+ locktype | relation |     mode     | granted 
+----------+----------+--------------+---------
+ relation | t        | RowShareLock | t
+ tuple    | t        | SIReadLock   | t
+ tuple    | t        | SIReadLock   | t
+ relation | t2       | RowShareLock | t
+ tuple    | t2       | SIReadLock   | t
+(5 rows)
+
+ locktype | relation | page | tuple |    mode    | granted 
+----------+----------+------+-------+------------+---------
+ tuple    | t        |    0 |     1 | SIReadLock | t
+ tuple    | t        |    0 |     2 | SIReadLock | t
+(2 rows)
+
+COMMIT
+ locks_after_commit 
+--------------------
+                  0
+(1 row)
+
+RESET

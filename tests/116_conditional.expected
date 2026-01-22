@@ -1,0 +1,59 @@
+SET
+DROP TABLE
+ case | case 
+------+------
+    1 |     
+(1 row)
+
+ nullif | nullif | nullif 
+--------+--------+--------
+      1 |        | 
+(1 row)
+
+ coalesce | coalesce | coalesce | coalesce 
+----------+----------+----------+----------
+        1 |        2 |        1 |        2
+(1 row)
+
+SELECT 3
+ a | case  
+---+-------
+ 1 | one
+ 2 | two
+ 3 | other
+(3 rows)
+
+ a | case  
+---+-------
+ 1 | one
+ 2 | two
+ 3 | other
+(3 rows)
+
+ a | nullif | a 
+---+--------+---
+ 1 |      1 | 1
+ 2 |        |  
+ 3 |      3 | 3
+(3 rows)
+
+ case | case | case  | case 
+------+------+-------+------
+ two  | one  | three | 
+(1 row)
+
+ case | case | case  | case | case 
+------+------+-------+------+------
+ one  | one  | three | four | two
+(1 row)
+
+CREATE TABLE
+INSERT 0 1
+CREATE TABLE
+INSERT 0 1
+ coalesce 
+----------
+        1
+(1 row)
+
+RESET

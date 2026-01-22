@@ -1,0 +1,68 @@
+SET
+CREATE EXTENSION
+                             postgis_extensions_upgrade                             
+------------------------------------------------------------------------------------
+ Upgrade to version 3.4.2 completed, run SELECT postgis_full_version(); for details
+(1 row)
+
+                                                                                                                                       postgis_full_version                                                                                                                                       
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ POSTGIS="3.4.2 c19ce56" [EXTENSION] PGSQL="160" GEOS="3.12.1-CAPI-1.18.1" PROJ="9.4.0 NETWORK_ENABLED=OFF URL_ENDPOINT=https://cdn.proj.org USER_WRITABLE_DIRECTORY=/tmp/proj DATABASE_PATH=/usr/share/proj/proj.db" LIBXML="2.9.14" LIBJSON="0.17" LIBPROTOBUF="1.4.1" WAGYU="0.5.0 (Internal)"
+(1 row)
+
+ postgis_geos_version 
+----------------------
+ 3.12.1-CAPI-1.18.1
+(1 row)
+
+ postgis_libxml_version 
+------------------------
+ 2.9.14
+(1 row)
+
+ postgis_lib_build_date 
+------------------------
+ 2024-04-01 07:18:37
+(1 row)
+
+ postgis_lib_version 
+---------------------
+ 3.4.2
+(1 row)
+
+ postgis_liblwgeom_version 
+---------------------------
+ 3.4.2 c19ce56
+(1 row)
+
+                                                        postgis_proj_version                                                         
+-------------------------------------------------------------------------------------------------------------------------------------
+ 9.4.0 NETWORK_ENABLED=OFF URL_ENDPOINT=https://cdn.proj.org USER_WRITABLE_DIRECTORY=/tmp/proj DATABASE_PATH=/usr/share/proj/proj.db
+(1 row)
+
+ postgis_scripts_build_date 
+----------------------------
+ 2024-04-01 07:18:37
+(1 row)
+
+ postgis_scripts_installed 
+---------------------------
+ 3.4.2 c19ce56
+(1 row)
+
+ postgis_scripts_released 
+--------------------------
+ 3.4.2 c19ce56
+(1 row)
+
+            postgis_version            
+---------------------------------------
+ 3.4 USE_GEOS=1 USE_PROJ=1 USE_STATS=1
+(1 row)
+
+ postgis_wagyu_version 
+-----------------------
+ 0.5.0 (Internal)
+(1 row)
+
+RESET

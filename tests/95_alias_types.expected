@@ -1,0 +1,47 @@
+SET
+DROP TABLE
+CREATE TABLE
+ column_name | data_type 
+-------------+-----------
+ a           | oid
+ b           | name
+(2 rows)
+
+ column_name | data_type 
+-------------+-----------
+ a           | oid
+ b           | name
+(2 rows)
+
+INSERT 0 1
+INSERT 0 1
+  a  |  b  
+-----+-----
+   2 | def
+ 100 | abc
+(2 rows)
+
+ pg_typeof | pg_typeof 
+-----------+-----------
+ oid       | name
+(1 row)
+
+ ?column? 
+----------
+ defcat
+ abccat
+(2 rows)
+
+ reverse 
+---------
+ fed
+ cba
+(2 rows)
+
+ length 
+--------
+      3
+      3
+(2 rows)
+
+RESET

@@ -1,0 +1,23 @@
+SET
+DROP SCHEMA
+CREATE SCHEMA
+CREATE TABLE
+INSERT 0 5
+ parentID | parentSchemaID |       name        | id  
+----------+----------------+-------------------+-----
+        0 |              0 | comments          |  50
+        0 |              0 | locations         |  51
+        0 |              0 | descriptor_id_seq |  52
+        0 |              0 | userobj1          | 100
+        0 |              0 | userobj2          | 101
+(5 rows)
+
+  column_name   | data_type 
+----------------+-----------
+ parentID       | integer
+ parentSchemaID | integer
+ name           | text
+ id             | integer
+(4 rows)
+
+RESET

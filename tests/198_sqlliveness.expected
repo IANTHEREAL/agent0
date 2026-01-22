@@ -1,0 +1,25 @@
+CREATE SCHEMA
+CREATE SCHEMA
+CREATE TABLE
+INSERT 0 2
+CREATE FUNCTION
+ sql_liveness_is_alive 
+-----------------------
+ f
+(1 row)
+
+ sql_liveness_is_alive 
+-----------------------
+ f
+(1 row)
+
+ count 
+-------
+     1
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
