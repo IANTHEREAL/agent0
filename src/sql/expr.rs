@@ -886,6 +886,32 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
             let uuid = uuid::Uuid::new_v4();
             Ok(Value::Uuid(*uuid.as_bytes()))
         }
+        "UUIDV7" => {
+            // UUIDv7 is a time-based UUID with millisecond precision timestamp
+            // Format: 48-bit timestamp | 4-bit version (7) | 12-bit rand_a | 2-bit variant | 62-bit rand_b
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let timestamp_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+
+            // Start with random bytes
+            let mut bytes = [0u8; 16];
+            let random_uuid = uuid::Uuid::new_v4();
+            bytes.copy_from_slice(random_uuid.as_bytes());
+
+            // Set the 48-bit timestamp in the first 6 bytes (big-endian)
+            let ts_bytes = timestamp_ms.to_be_bytes();
+            bytes[0..6].copy_from_slice(&ts_bytes[2..8]);
+
+            // Set version to 7 (bits 48-51)
+            bytes[6] = (bytes[6] & 0x0F) | 0x70;
+
+            // Set variant to RFC 4122 (bits 64-65)
+            bytes[8] = (bytes[8] & 0x3F) | 0x80;
+
+            Ok(Value::Uuid(bytes))
+        }
         "JSONB_EXISTS" => {
             if args.len() != 2 {
                 return Err(anyhow!("jsonb_exists requires exactly 2 arguments"));
@@ -2909,6 +2935,21 @@ fn eval_function(
         "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => {
             let uuid = uuid::Uuid::new_v4();
             Ok(Value::Uuid(*uuid.as_bytes()))
+        }
+        "UUIDV7" => {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let timestamp_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let mut bytes = [0u8; 16];
+            let random_uuid = uuid::Uuid::new_v4();
+            bytes.copy_from_slice(random_uuid.as_bytes());
+            let ts_bytes = timestamp_ms.to_be_bytes();
+            bytes[0..6].copy_from_slice(&ts_bytes[2..8]);
+            bytes[6] = (bytes[6] & 0x0F) | 0x70;
+            bytes[8] = (bytes[8] & 0x3F) | 0x80;
+            Ok(Value::Uuid(bytes))
         }
         "NEXTVAL" | "CURRVAL" | "SETVAL" => Err(anyhow!(
             "{} is a sequence function and must be evaluated during execution",

@@ -144,7 +144,7 @@ fn is_known_builtin_function(name: &str) -> bool {
         | "ARRAY_REMOVE" | "ARRAY_REPLACE" | "ARRAY_TO_STRING" | "STRING_TO_ARRAY" | "UNNEST"
         | "CARDINALITY" | "ARRAY_FILL"
         // UUID
-        | "GEN_RANDOM_UUID" | "UUID_GENERATE_V4"
+        | "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" | "UUIDV7"
         // Misc
         | "PG_TYPEOF" | "VERSION" | "CURRENT_USER" | "CURRENT_ROLE" | "SESSION_USER"
         | "PG_BACKEND_PID" | "PG_CLIENT_ENCODING" | "PG_CATALOG" | "OBJ_DESCRIPTION" | "COL_DESCRIPTION"

@@ -494,12 +494,12 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
         }
         SqlDataType::Array(inner) => match inner {
             sqlparser::ast::ArrayElemTypeDef::AngleBracket(inner_type) => {
-                convert_data_type(inner_type)
+                Ok(DataType::Array(Box::new(convert_data_type(inner_type)?)))
             }
             sqlparser::ast::ArrayElemTypeDef::SquareBracket(inner_type) => {
-                convert_data_type(inner_type)
+                Ok(DataType::Array(Box::new(convert_data_type(inner_type)?)))
             }
-            _ => Ok(DataType::Text),
+            _ => Ok(DataType::Array(Box::new(DataType::Text))),
         },
         _ => Err(anyhow!("Unsupported data type: {:?}", sql_type)),
     }
@@ -1260,7 +1260,7 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                 "CURRENT_DATE" => DataType::Date,
                 "DATE" => DataType::Date,
                 "NEXTVAL" | "CURRVAL" | "SETVAL" => DataType::Int64,
-                "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => DataType::Uuid,
+                "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" | "UUIDV7" => DataType::Uuid,
                 "JSONB_BUILD_OBJECT" | "JSONB_BUILD_ARRAY" | "JSONB_SET" | "JSONB_AGG"
                 | "TO_JSONB" => DataType::Jsonb,
                 "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "JSON_SET" | "JSON_AGG" | "TO_JSON" => {
@@ -2479,8 +2479,10 @@ pub fn substitute_outer_values(
                 // treating the second-to-last identifier as the table/alias.
                 let table_part = normalize_ident(&parts[parts.len() - 2]);
                 if table_part.eq_ignore_ascii_case(outer_alias) {
-                    let col_name =
-                        parts.last().map(normalize_ident).unwrap_or_else(|| "".to_string());
+                    let col_name = parts
+                        .last()
+                        .map(normalize_ident)
+                        .unwrap_or_else(|| "".to_string());
                     // Find column index in outer schema
                     if let Some(col_idx) = outer_schema
                         .columns
