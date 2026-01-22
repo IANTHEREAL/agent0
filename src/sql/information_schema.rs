@@ -506,6 +506,7 @@ fn pg_type_schema() -> TableSchema {
             int_col("typrelid"),
             int_col("typelem"),
             int_col("typarray"),
+            int_col("typcollation"),
         ],
         version: 1,
         pk_constraint_name: None,
@@ -2468,29 +2469,31 @@ async fn get_pg_type_rows(
     let pg_catalog_oid = schema_oid(schema_oids, "pg_catalog");
 
     #[rustfmt::skip]
-    let builtin_types: &[(i64, &str, i64, &str, &str, &str)] = &[
-        (16, "bool", 1, "t", "b", "B"),
-        (17, "bytea", -1, "f", "b", "U"),
-        (20, "int8", 8, "t", "b", "N"),
-        (21, "int2", 2, "t", "b", "N"),
-        (23, "int4", 4, "t", "b", "N"),
-        (25, "text", -1, "f", "b", "S"),
-        (26, "oid", 4, "t", "b", "N"),
-        (114, "json", -1, "f", "b", "U"),
-        (700, "float4", 4, "t", "b", "N"),
-        (701, "float8", 8, "t", "b", "N"),
-        (1042, "bpchar", -1, "f", "b", "S"),
-        (1043, "varchar", -1, "f", "b", "S"),
-        (1082, "date", 4, "t", "b", "D"),
-        (1114, "timestamp", 8, "t", "b", "D"),
-        (1184, "timestamptz", 8, "t", "b", "D"),
-        (1186, "interval", 16, "f", "b", "T"),
-        (1700, "numeric", -1, "f", "b", "N"),
-        (2950, "uuid", 16, "f", "b", "U"),
-        (3802, "jsonb", -1, "f", "b", "U"),
+    let builtin_types: &[(i64, &str, i64, &str, &str, &str, i64)] = &[
+        // (oid, typname, typlen, typbyval, typtype, typcategory, typcollation)
+        // typcollation: 100 = default collation for collatable types, 0 for others
+        (16, "bool", 1, "t", "b", "B", 0),
+        (17, "bytea", -1, "f", "b", "U", 0),
+        (20, "int8", 8, "t", "b", "N", 0),
+        (21, "int2", 2, "t", "b", "N", 0),
+        (23, "int4", 4, "t", "b", "N", 0),
+        (25, "text", -1, "f", "b", "S", 100),
+        (26, "oid", 4, "t", "b", "N", 0),
+        (114, "json", -1, "f", "b", "U", 0),
+        (700, "float4", 4, "t", "b", "N", 0),
+        (701, "float8", 8, "t", "b", "N", 0),
+        (1042, "bpchar", -1, "f", "b", "S", 100),
+        (1043, "varchar", -1, "f", "b", "S", 100),
+        (1082, "date", 4, "t", "b", "D", 0),
+        (1114, "timestamp", 8, "t", "b", "D", 0),
+        (1184, "timestamptz", 8, "t", "b", "D", 0),
+        (1186, "interval", 16, "f", "b", "T", 0),
+        (1700, "numeric", -1, "f", "b", "N", 0),
+        (2950, "uuid", 16, "f", "b", "U", 0),
+        (3802, "jsonb", -1, "f", "b", "U", 0),
     ];
 
-    for &(oid, typname, typlen, typbyval, typtype, typcategory) in builtin_types {
+    for &(oid, typname, typlen, typbyval, typtype, typcategory, typcollation) in builtin_types {
         rows.push(Row::new(vec![
             int_val(oid),
             text_val(typname),
@@ -2506,6 +2509,7 @@ async fn get_pg_type_rows(
             int_val(0),
             int_val(0),
             int_val(0),
+            int_val(typcollation),
         ]));
     }
 
@@ -2521,6 +2525,7 @@ async fn get_pg_type_rows(
         text_val("f"),
         text_val("t"),
         text_val(","),
+        int_val(0),
         int_val(0),
         int_val(0),
         int_val(0),
@@ -2549,6 +2554,7 @@ async fn get_pg_type_rows(
         int_val(0),
         int_val(HSTORE_OID),
         int_val(0),
+        int_val(0),
     ]));
 
     // Base type.
@@ -2567,6 +2573,7 @@ async fn get_pg_type_rows(
         int_val(0),
         int_val(0),
         int_val(HSTORE_ARRAY_OID),
+        int_val(0),
     ]));
 
     let mut user_types = store.list_types(txn).await?;
@@ -2589,6 +2596,7 @@ async fn get_pg_type_rows(
             text_val("f"),
             text_val("t"),
             text_val(","),
+            int_val(0),
             int_val(0),
             int_val(0),
             int_val(0),
