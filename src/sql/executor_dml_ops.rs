@@ -646,7 +646,7 @@ impl Executor {
             };
 
             let updated_row =
-                dml::execute_update_row_with_pk_change(&self.store(), txn, &t, &schema, r, new_row, &enum_cache, update_info.updates_pk)
+                dml::execute_update_row(&self.store(), txn, &t, &schema, r, new_row, &enum_cache)
                     .await?;
 
             trigger_worker::enqueue_after_triggers(

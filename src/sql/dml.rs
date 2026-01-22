@@ -1018,27 +1018,11 @@ pub async fn execute_update_row(
     new_row: Row,
     enum_cache: &EnumLabelCache,
 ) -> Result<Row> {
-    execute_update_row_with_pk_change(store, txn, table_name, schema, old_row, new_row, enum_cache, false).await
-}
-
-pub async fn execute_update_row_with_pk_change(
-    store: &Arc<TikvStore>,
-    txn: &mut Transaction,
-    table_name: &str,
-    schema: &TableSchema,
-    old_row: &Row,
-    new_row: Row,
-    enum_cache: &EnumLabelCache,
-    updates_pk: bool,
-) -> Result<Row> {
     validate_enum_values(schema, &new_row, enum_cache)?;
 
     let old_pks = schema.get_pk_values(old_row);
     let new_pks = schema.get_pk_values(&new_row);
     let pk_changed = old_pks != new_pks;
-    if updates_pk && pk_changed {
-        return Err(anyhow!("Cannot update PK"));
-    }
 
     if !schema.foreign_keys.is_empty() {
         validate_foreign_keys(store, txn, schema, &new_row).await?;
@@ -1396,7 +1380,6 @@ pub async fn validate_foreign_keys(
 
 pub struct UpdateColumnInfo {
     pub indices: Vec<usize>,
-    pub updates_pk: bool,
 }
 
 pub fn validate_update_columns(
@@ -1404,18 +1387,14 @@ pub fn validate_update_columns(
     assignments: &[Assignment],
 ) -> Result<UpdateColumnInfo> {
     let mut indices = Vec::new();
-    let mut updates_pk = false;
     for a in assignments {
         let c = a.id.last().unwrap().value.clone();
         let idx = schema
             .column_index(&c)
             .ok_or_else(|| anyhow!("Col not found"))?;
-        if schema.pk_indices.contains(&idx) {
-            updates_pk = true;
-        }
         indices.push(idx);
     }
-    Ok(UpdateColumnInfo { indices, updates_pk })
+    Ok(UpdateColumnInfo { indices })
 }
 
 pub async fn compute_update_values(
