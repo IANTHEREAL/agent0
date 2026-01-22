@@ -1,12 +1,12 @@
 # Dify PostgreSQL 兼容性测试报告
 
-**测试时间**: 2026-01-21
+**测试时间**: 2026-01-22 (更新)
 **目标数据库**: (redacted)
 **数据库版本**: PostgreSQL 15.0 (兼容)
 
 ## 一、当前阻塞 Dify 启动的关键问题
 
-### 1. hstore 扩展支持问题 [严重/阻塞]
+### 1. 事务模式 (autocommit=False) / 扩展协议事务语句 [已解决 ✅]
 
 **错误信息**:
 ```
@@ -14,24 +14,47 @@ psycopg2.DatabaseError: error with status PGRES_EMPTY_QUERY and no message from 
 ```
 
 **原因分析**:
-SQLAlchemy 的 psycopg2 方言在连接时会自动检测 hstore 扩展的 OID。它执行以下查询：
-```sql
-SELECT t.oid, t.typarray
-FROM pg_type t
-JOIN pg_namespace ns ON ns.oid = t.typnamespace
-WHERE t.typname = 'hstore' AND ns.nspname = 'public';
+问题根因不是事务逻辑本身，而是 **wire 协议响应类型不正确**：pg-tikv 之前对 `BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`/`SET`/`CREATE SEQUENCE` 等
+成功执行的语句返回了 `EmptyQueryResponse`，libpq/psycopg2 会将其映射为 `PGRES_EMPTY_QUERY` 并当作错误处理。
+
+**测试验证**:
+```python
+# autocommit=False (默认) - 之前失败，现已修复
+conn.autocommit = False
+cur.execute("SELECT 1")  # ✅
+
+# autocommit=True - 成功
+conn.autocommit = True
+cur.execute("SELECT 1")  # ✅ 返回 (1,)
+
+# HstoreAdapter OID 探测也应工作
+extras.HstoreAdapter.get_oids(conn)  # ✅ ((16386,), (16387,))
 ```
 
-当数据库不支持 hstore 扩展时，这个查询返回空结果，psycopg2 无法正确处理。
+**之前会触发 `PGRES_EMPTY_QUERY` 的语句（已修复）**:
+```
+BEGIN / START TRANSACTION
+COMMIT / ROLLBACK
+SAVEPOINT / RELEASE SAVEPOINT / ROLLBACK TO SAVEPOINT
+SET ...
+CREATE/DROP SEQUENCE
+```
 
-**测试结果**:
-- `CREATE EXTENSION IF NOT EXISTS hstore;` → ERROR: Extension 'hstore' is not available
-- pg_type 中没有 hstore 类型
+**修复点**:
+- SQL 执行层为上述语句返回正确的 `CommandComplete` tag（而不是 `EmptyQueryResponse`）。
+- 对事务边界语句使用 pgwire `TransactionStart`/`TransactionEnd` 响应，使 `ReadyForQuery` 携带正确的事务状态（`I`/`T`）。
 
-**解决方案**:
-1. **方案 A (推荐)**: 实现 hstore 扩展支持
-2. **方案 B**: 在 pg_type 系统表中添加 hstore 类型的虚拟条目（即使不实际支持 hstore 功能）
-3. **方案 C**: 需要修改 Dify 代码，禁用 hstore 检测
+---
+
+### ~~2. hstore 扩展支持问题~~ [已解决 ✅]
+
+hstore 类型已经正确注册在 pg_type 中：
+```sql
+SELECT t.oid, t.typarray FROM pg_type t WHERE t.typname = 'hstore';
+-- 返回: (16386, 16387)
+```
+
+当事务问题解决后，hstore 检测应该可以正常工作。
 
 ---
 
@@ -104,16 +127,11 @@ WHERE t.typname = 'hstore' AND ns.nspname = 'public';
 | 功能 | 测试结果 | 影响程度 | 备注 |
 |------|----------|----------|------|
 | **扩展** | | | |
-| hstore 扩展 | ❌ 不可用 | **严重** | 阻塞 Dify 启动 |
 | pg_available_extensions 表 | ❌ 不存在 | 低 | 仅影响扩展查询 |
 | **JSON 聚合函数** | | | |
 | json_agg() | ❌ 不支持 | 中等 | |
 | jsonb_agg() | ❌ 不支持 | 中等 | |
-| **JSONB 集合返回函数** | | | |
-| jsonb_each() | ❌ 不支持 | 中等 | 返回 "Table not found" |
-| jsonb_array_elements() | ❌ 不支持 | 中等 | 返回 "Table not found" |
 | **其他** | | | |
-| LATERAL JOIN | ❌ 不支持 | 中等 | |
 | generate_series() (SELECT 中) | ❌ 受限 | 低 | 作为表函数在 FROM 中可用 |
 | pg_class 系统表 | ⚠️ 部分 | 低 | 查询返回 0 行 |
 
@@ -182,29 +200,6 @@ WHERE t.typname = 'hstore' AND ns.nspname = 'public';
 
 ---
 
-## 五、临时绕过方案
-
-如果暂时无法实现 hstore 支持，可以尝试以下方案：
-
-### 方案 1: 修改 SQLAlchemy 配置
-
-在 Dify 代码中禁用 hstore 检测（需要修改源码）：
-```python
-# 在创建引擎时添加
-create_engine(..., use_native_hstore=False)
-```
-
-### 方案 2: 在数据库中模拟 hstore 类型
-
-```sql
--- 在 pg_type 中添加虚拟的 hstore 类型条目
--- 注意：这需要数据库支持修改系统表
-INSERT INTO pg_type (typname, typnamespace, typowner, ...)
-VALUES ('hstore', (SELECT oid FROM pg_namespace WHERE nspname = 'public'), ...);
-```
-
----
-
 ## 六、测试命令参考
 
 ```bash
@@ -231,8 +226,9 @@ WHERE t.typname = 'hstore' AND ns.nspname = 'public';
 - 基础 JSONB 操作
 - CTE、窗口函数、UPSERT 等高级 SQL 特性
 
-**主要问题**: hstore 扩展不可用导致 psycopg2 连接时报错，这是当前阻塞 Dify 运行的唯一关键问题。
+**主要剩余问题**:
+- `json_agg()` / `jsonb_agg()`（聚合 JSON 输出）
+- `pg_catalog.pg_available_extensions`（扩展枚举）
+- `pg_catalog.pg_class`（系统表元数据补全，给 introspection 使用）
 
-**次要问题**: json_agg、jsonb_each、jsonb_array_elements 等函数不可用，可能影响部分功能。
-
-建议优先解决 hstore 问题以使 Dify 能够正常启动，然后根据实际使用情况逐步补充其他功能。
+建议按 `WORK.md` 的分阶段计划逐步补齐以上能力。

@@ -306,7 +306,9 @@ pub(crate) async fn execute_create_sequence(
     }
 
     if if_not_exists && store.get_sequence(txn, &full_name).await?.is_some() {
-        return Ok(ExecuteResult::Empty);
+        return Ok(ExecuteResult::CommandComplete {
+            tag: "CREATE SEQUENCE",
+        });
     }
 
     let mut start_value: i64 = 1;
@@ -377,7 +379,9 @@ pub(crate) async fn execute_create_sequence(
     };
 
     store.create_sequence(txn, def).await?;
-    Ok(ExecuteResult::Empty)
+    Ok(ExecuteResult::CommandComplete {
+        tag: "CREATE SEQUENCE",
+    })
 }
 
 pub(crate) async fn execute_drop_sequence(
@@ -401,7 +405,7 @@ pub(crate) async fn execute_drop_sequence(
             return Err(anyhow!("Sequence '{}' does not exist", resolved.full));
         }
     }
-    Ok(ExecuteResult::Empty)
+    Ok(ExecuteResult::CommandComplete { tag: "DROP SEQUENCE" })
 }
 
 fn function_name_upper(func: &Function) -> String {

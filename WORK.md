@@ -136,6 +136,29 @@ full hstore semantics.
   - [x] SQLAlchemy probe query returns 1 row and `typarray` is non-zero
 - [x] `./run_tests.sh` passes unchanged.
 
+## Phase 6.1 (DONE): Extended protocol transaction control (psycopg2 `autocommit=false`)
+
+### Rationale
+libpq-based clients (psycopg2/SQLAlchemy) treat `EmptyQueryResponse` as `PGRES_EMPTY_QUERY` and can
+error even when the server successfully applied a statement. pg-tikv previously returned
+`EmptyQueryResponse` for valid utility statements like `BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`,
+which breaks Dify in the default `autocommit=false` mode.
+
+### Modules / Ownership
+- `src/sql/result.rs`: add `CommandComplete` / `TransactionStart` / `TransactionEnd` result variants.
+- `src/sql/executor.rs`: return those variants for transaction control + `SET` statements.
+- `src/sql/sequences.rs`: return `CREATE SEQUENCE` / `DROP SEQUENCE` command tags (instead of empty).
+- `src/protocol/handler.rs`: map to pgwire `Response::{TransactionStart,TransactionEnd,Execution}` so
+  clients see `CommandComplete` and correct `ReadyForQuery` transaction status.
+- `orm-tests/pg-client/extended-protocol-transaction.test.ts`: cover BEGIN/COMMIT/SAVEPOINT under
+  node-postgres forced extended protocol.
+
+### Acceptance Criteria
+- [x] `BEGIN` / `START TRANSACTION` / `COMMIT` / `ROLLBACK` / `SAVEPOINT` / `RELEASE SAVEPOINT` /
+      `ROLLBACK TO SAVEPOINT` return `CommandComplete` (not `EmptyQueryResponse`) in extended protocol.
+- [x] New ORM test passes.
+- [x] `./run_tests.sh` passes unchanged.
+
 ## Phase 7 (TODO): `json_agg()` / `jsonb_agg()` aggregates
 
 ### Modules / Ownership
@@ -202,6 +225,7 @@ set-returning function in the SELECT list (PostgreSQL legacy SRF semantics).
 - Phase 4 completed (`current_setting()` + broader `set_config()` for stored GUCs).
 - Phase 5 completed (driver introspection: `server_version*`, `TimeZone`, `application_name`, `version()`).
 - Phase 6 completed (hstore extension descriptor + pg_type metadata shim).
+- Phase 6.1 completed (extended-protocol transaction control + avoid `PGRES_EMPTY_QUERY`).
 
 # Work: Observability v1 (Per-tenant SQL sampling + key metrics)
 

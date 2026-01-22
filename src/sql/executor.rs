@@ -815,20 +815,20 @@ impl Executor {
                             // Transaction Control
                             Statement::StartTransaction { .. } => {
                                 session.begin().await?;
-                                Ok(vec![ExecuteResult::Empty])
+                                Ok(vec![ExecuteResult::TransactionStart { tag: "BEGIN" }])
                             }
                             Statement::Commit { .. } => {
                                 session.commit().await?;
-                                Ok(vec![ExecuteResult::Empty])
+                                Ok(vec![ExecuteResult::TransactionEnd { tag: "COMMIT" }])
                             }
                             Statement::Savepoint { name } => {
                                 session.create_savepoint(normalize_ident(name))?;
-                                Ok(vec![ExecuteResult::Empty])
+                                Ok(vec![ExecuteResult::CommandComplete { tag: "SAVEPOINT" }])
                             }
                             Statement::ReleaseSavepoint { name } => {
                                 let sp = normalize_ident(name);
                                 session.release_savepoint(&sp)?;
-                                Ok(vec![ExecuteResult::Empty])
+                                Ok(vec![ExecuteResult::CommandComplete { tag: "RELEASE" }])
                             }
                             Statement::Rollback {
                                 savepoint: Some(name),
@@ -836,13 +836,13 @@ impl Executor {
                             } => {
                                 let sp = normalize_ident(name);
                                 session.rollback_to_savepoint(&sp).await?;
-                                Ok(vec![ExecuteResult::Empty])
+                                Ok(vec![ExecuteResult::CommandComplete { tag: "ROLLBACK" }])
                             }
                             Statement::Rollback {
                                 savepoint: None, ..
                             } => {
                                 session.rollback().await?;
-                                Ok(vec![ExecuteResult::Empty])
+                                Ok(vec![ExecuteResult::TransactionEnd { tag: "ROLLBACK" }])
                             }
                             Statement::SetVariable {
                                 variable, value, ..
@@ -915,14 +915,14 @@ impl Executor {
                                     let value = set_variable_value_to_string(value)?;
                                     session.set_known_setting(&var_name, value)?;
                                 }
-                                Ok(vec![ExecuteResult::Empty])
+                                Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
                             }
                             Statement::SetTimeZone { value, .. } => {
                                 let value = set_variable_value_to_string(std::slice::from_ref(
                                     value,
                                 ))?;
                                 session.set_known_setting("timezone", value)?;
-                                Ok(vec![ExecuteResult::Empty])
+                                Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
                             }
                             Statement::ShowVariable { variable } => {
                                 let var_name = variable
@@ -1570,7 +1570,7 @@ impl Executor {
             Statement::SetVariable { .. }
             | Statement::SetTimeZone { .. }
             | Statement::SetNames { .. }
-            | Statement::SetTransaction { .. } => Ok(ExecuteResult::Empty),
+            | Statement::SetTransaction { .. } => Ok(ExecuteResult::CommandComplete { tag: "SET" }),
             Statement::CreateType {
                 name,
                 representation,

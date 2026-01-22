@@ -111,6 +111,24 @@ pub enum ExecuteResult {
     Describe {
         schema: TableSchema,
     },
+    /// Command completed successfully (no rowset).
+    CommandComplete {
+        tag: &'static str,
+    },
+    /// Transaction block started successfully (BEGIN / START TRANSACTION).
+    ///
+    /// This maps to a pgwire `TransactionStart` response so the client can
+    /// track its transaction status correctly.
+    TransactionStart {
+        tag: &'static str,
+    },
+    /// Transaction block ended successfully (COMMIT / ROLLBACK).
+    ///
+    /// This maps to a pgwire `TransactionEnd` response so the client can track
+    /// its transaction status correctly.
+    TransactionEnd {
+        tag: &'static str,
+    },
     /// Empty result (for unsupported/noop statements)
     Empty,
     /// Skipped statement with warning message

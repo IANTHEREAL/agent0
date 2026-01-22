@@ -2626,6 +2626,12 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
             Ok(Response::Query(results))
         }
 
+        ExecuteResult::CommandComplete { tag } => Ok(Response::Execution(Tag::new(tag))),
+
+        ExecuteResult::TransactionStart { tag } => Ok(Response::TransactionStart(Tag::new(tag))),
+
+        ExecuteResult::TransactionEnd { tag } => Ok(Response::TransactionEnd(Tag::new(tag))),
+
         ExecuteResult::Empty => Ok(Response::EmptyQuery),
 
         ExecuteResult::Notice { .. } => Ok(Response::EmptyQuery),
@@ -2854,6 +2860,7 @@ fn encode_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pgwire::messages::response::CommandComplete;
 
     #[test]
     fn test_parse_tenant_username_dot() {
@@ -3230,5 +3237,47 @@ mod tests {
             substitute_placeholders_outside_strings_and_dollar("SELECT $$ $10 $$, $10", &values),
             "SELECT $$ $10 $$, 10"
         );
+    }
+
+    #[test]
+    fn test_result_to_response_transaction_start_is_not_empty_query() {
+        let resp = result_to_response(ExecuteResult::TransactionStart { tag: "BEGIN" }).unwrap();
+        match resp {
+            Response::TransactionStart(tag) => {
+                let complete = CommandComplete::from(tag);
+                assert_eq!(complete.tag, "BEGIN");
+            }
+            _ => panic!("expected TransactionStart"),
+        }
+    }
+
+    #[test]
+    fn test_result_to_response_transaction_end_is_not_empty_query() {
+        let resp = result_to_response(ExecuteResult::TransactionEnd { tag: "COMMIT" }).unwrap();
+        match resp {
+            Response::TransactionEnd(tag) => {
+                let complete = CommandComplete::from(tag);
+                assert_eq!(complete.tag, "COMMIT");
+            }
+            _ => panic!("expected TransactionEnd"),
+        }
+    }
+
+    #[test]
+    fn test_result_to_response_command_complete_is_execution() {
+        let resp = result_to_response(ExecuteResult::CommandComplete { tag: "SET" }).unwrap();
+        match resp {
+            Response::Execution(tag) => {
+                let complete = CommandComplete::from(tag);
+                assert_eq!(complete.tag, "SET");
+            }
+            _ => panic!("expected Execution"),
+        }
+    }
+
+    #[test]
+    fn test_result_to_response_empty_is_empty_query() {
+        let resp = result_to_response(ExecuteResult::Empty).unwrap();
+        assert!(matches!(resp, Response::EmptyQuery));
     }
 }
