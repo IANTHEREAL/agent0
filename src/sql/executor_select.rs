@@ -1385,7 +1385,7 @@ impl Executor {
         Ok(result)
     }
 
-    fn apply_order_by_for_aggregate(
+    pub(crate) fn apply_order_by_for_aggregate(
         &self,
         rows: Vec<Row>,
         order_by: &[sqlparser::ast::OrderByExpr],

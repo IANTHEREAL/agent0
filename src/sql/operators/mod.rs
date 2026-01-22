@@ -26,6 +26,8 @@
 
 mod aggregate;
 mod context;
+mod cte;
+mod distinct;
 mod executor;
 mod filter;
 mod join;
@@ -33,10 +35,14 @@ mod limit;
 mod planner;
 mod project;
 mod scan;
+mod set_operation;
 mod sort;
+mod window;
 
 pub use aggregate::*;
 pub use context::*;
+pub use cte::*;
+pub use distinct::*;
 pub use executor::*;
 pub use filter::*;
 pub use join::*;
@@ -44,7 +50,9 @@ pub use limit::*;
 pub use planner::*;
 pub use project::*;
 pub use scan::*;
+pub use set_operation::*;
 pub use sort::*;
+pub use window::*;
 
 use crate::types::{Row, TableSchema};
 use anyhow::Result;

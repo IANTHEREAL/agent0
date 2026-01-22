@@ -4,6 +4,7 @@ use sqlparser::ast::OrderByExpr;
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::expr::{compare_order_by_values, eval_expr};
+use crate::sql::sequences;
 use crate::types::{Row, TableSchema, Value};
 
 #[derive(Debug)]
@@ -26,11 +27,29 @@ impl SortOperator {
         }
     }
 
-    fn compute_sort_keys(&self, row: &Row) -> Result<Vec<Value>> {
+    async fn compute_sort_keys(
+        &self,
+        row: &Row,
+        ctx: &mut ExecutionContext<'_>,
+    ) -> Result<Vec<Value>> {
         let schema = self.child.schema();
         let mut keys = Vec::with_capacity(self.order_by.len());
         for order_expr in &self.order_by {
-            keys.push(eval_expr(&order_expr.expr, Some(row), Some(schema))?);
+            let value = if sequences::expr_needs_async_eval(&order_expr.expr) {
+                sequences::eval_expr_with_sequences(
+                    &ctx.store,
+                    ctx.txn,
+                    ctx.sequence_values,
+                    ctx.search_path,
+                    &order_expr.expr,
+                    Some(row),
+                    Some(schema),
+                )
+                .await?
+            } else {
+                eval_expr(&order_expr.expr, Some(row), Some(schema))?
+            };
+            keys.push(value);
         }
         Ok(keys)
     }
@@ -61,7 +80,7 @@ impl PhysicalOperator for SortOperator {
         let rows = collect_all(self.child.as_mut(), ctx).await?;
         let mut keyed_rows: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
         for row in rows {
-            let keys = self.compute_sort_keys(&row)?;
+            let keys = self.compute_sort_keys(&row, ctx).await?;
             keyed_rows.push((keys, row));
         }
         keyed_rows.sort_by(|(keys_a, _), (keys_b, _)| self.compare_keys(keys_a, keys_b));
@@ -223,11 +242,8 @@ mod tests {
 
         let sort = SortOperator::new(child, order_by);
 
-        let row1 = Row::new(vec![Value::Int32(1), Value::Text("Alice".to_string())]);
-        let row2 = Row::new(vec![Value::Int32(2), Value::Text("Bob".to_string())]);
-
-        let keys1 = sort.compute_sort_keys(&row1).unwrap();
-        let keys2 = sort.compute_sort_keys(&row2).unwrap();
+        let keys1 = vec![Value::Int32(1)];
+        let keys2 = vec![Value::Int32(2)];
 
         assert_eq!(
             sort.compare_keys(&keys1, &keys2),

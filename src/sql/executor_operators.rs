@@ -20,7 +20,7 @@ pub fn use_operator_execution() -> bool {
     *USE_OPERATORS.get_or_init(|| {
         std::env::var("PGTIKV_USE_OPERATORS")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 
@@ -234,9 +234,10 @@ impl Executor {
                     if f.filter.is_some() {
                         return false;
                     }
-                    if is_simple_agg_func(f) {
-                        has_aggregates = true;
+                    if !is_simple_agg_func(f) {
+                        return false;
                     }
+                    has_aggregates = true;
                 }
                 SelectItem::UnnamedExpr(Expr::Identifier(id))
                 | SelectItem::ExprWithAlias {
@@ -403,14 +404,6 @@ impl Executor {
             agg_types.clone(),
         ));
 
-        if !order_by.is_empty() {
-            root = Box::new(SortOperator::new(root, order_by.to_vec()));
-        }
-
-        if limit.is_some() || offset > 0 {
-            root = Box::new(LimitOperator::new(root, limit, offset));
-        }
-
         let rows = execute_operator_tree(
             &mut root,
             txn,
@@ -488,6 +481,18 @@ impl Executor {
                 values.push(row.values.get(idx).cloned().unwrap_or(Value::Null));
             }
             projected_rows.push(Row::new(values));
+        }
+
+        if !order_by.is_empty() {
+            projected_rows = self.apply_order_by_for_aggregate(projected_rows, order_by, &columns);
+        }
+
+        if offset > 0 {
+            projected_rows = projected_rows.into_iter().skip(offset).collect();
+        }
+
+        if let Some(limit) = limit {
+            projected_rows.truncate(limit);
         }
 
         Ok(ExecuteResult::Select {
