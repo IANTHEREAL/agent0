@@ -2,6 +2,9 @@
 
 mod catalog_oids;
 mod bytea;
+mod alter_owner;
+mod alter_sequence_owned_by;
+mod comment_on;
 mod ddl;
 mod dml;
 mod executor;
@@ -18,6 +21,7 @@ mod executor_udt_cmd;
 mod explain;
 pub mod expr;
 mod helpers;
+mod gin;
 mod index_helpers;
 mod information_schema;
 mod jsonb;

@@ -401,3 +401,21 @@ cd orm-tests && npm test -- --grep "TypeORM"
 - Server-side guardrail: enforce `_pgtikv_sys_observer` can only query `_pgtikv_sys_observability()` / `_pgtikv_sys_query_samples()` in `src/sql/executor.rs`, and exclude these queries from sampling + autocommit commit counting.
 - Portal backend DB client: use `pg8000` (pure Python) with a minimal wrapper (no `psql` subprocess, no custom splitter/pool) to avoid interactive password prompts and keep the portal code easy to maintain.
 - Portal frontend: stop polling `/observability` on HTTP 409 (not bootstrapped) to avoid access-log spam; show a clear “need bootstrap” message instead.
+
+## Lessons Learned (Dify pg_dump Compatibility)
+
+- `pg_dump` emits SQL that sqlparser-rs doesn’t fully cover (e.g. `COMMENT ON EXTENSION`, flexible `CREATE SEQUENCE` option order); prefer tight, purpose-built pre-parsers/normalizers and executor fast-paths over large grammar forks.
+- When validating compatibility via a real dump, add an integration test derived from the dump and include explicit cleanup to keep the shared test database clean for subsequent suites (ORM tests).
+- For metadata-centric features (owners, extensions, dependencies), ensure virtual catalogs expose stable identifiers (e.g., `pg_class`/`pg_proc` OIDs) so ORMs can join reliably, while keeping all persisted metadata keyspace-isolated via the `_sys_*` keys + `TikvStore` key prefixing.
+- For `COMMENT ON`, store comments in dedicated `_sys_comment_*` keys (avoid inflating frequently-read schema blobs), and expose them through `pg_catalog.pg_description` using PostgreSQL’s stable `classoid` constants so ORMs can join/filter correctly.
+- Aggregate queries without `GROUP BY` must return a single row even for empty inputs; ensure JOIN and non-JOIN aggregation code paths share this behavior (caught by `COUNT(*)` over an empty join).
+- For session-level compatibility (`SET`, `SHOW`, `set_config`), prefer executor-level fast-paths that update `Session` state over adding side-effectful hooks into expression evaluation (keeps the hot path stable).
+- Keep per-session GUC storage compact and allocation-free by default; only allocate when a setting is explicitly changed by the client.
+- Integration tests that manipulate schemas should do explicit object cleanup (drop tables then schemas) instead of relying on unsupported `... CASCADE` behavior.
+- For `statement_timeout`, a per-statement `tokio::time::timeout` wrapper is a low-intrusion enforcement mechanism; use a typed error marker so the executor can reliably detect timeouts and abort open transactions.
+- Integration runner detail: unaligned-mode tests concatenate `stdout` + `stderr`, so `ERROR:` lines may appear at the end of `.out`; write `.expected` ordering accordingly when asserting errors.
+- For `current_setting()` / `set_config()` compatibility, prefer a tableless-`SELECT` executor fast-path that reads/writes `SessionSettings`, avoiding threading session context through the expression evaluator.
+- `.expected` files are strict exact-match outputs; avoid accidental trailing blank lines when updating them.
+- Driver/tool compatibility often depends on small introspection surfaces (`server_version_num`, `TimeZone`, `application_name`) and common cast patterns (`current_setting(...)::int`); handle these in fast-path logic and keep pgwire `ParameterStatus` consistent with SQL-level readbacks.
+- Some client libraries probe for extension-provided types (e.g. `hstore`) at connect time; a metadata-only shim in `pg_catalog.pg_type` (with a valid `typarray` link) can unblock startup without implementing full type semantics.
+- The integration suite shares a single database for all `.sql` files; tests that `CREATE EXTENSION`/persist metadata must `DROP ...` at the end to avoid breaking later expectations (e.g. `pg_extension` contents).

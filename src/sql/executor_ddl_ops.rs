@@ -111,10 +111,10 @@ impl Executor {
             .get_schema(txn, &tbl_name)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
-        let is_btree = using
-            .map(|u| u.value.eq_ignore_ascii_case("btree"))
+        let needs_backfill = using
+            .map(|u| u.value.eq_ignore_ascii_case("btree") || u.value.eq_ignore_ascii_case("gin"))
             .unwrap_or(true);
-        let rows = if is_btree {
+        let rows = if needs_backfill {
             self.scan_and_fill(txn, &tbl_name, &schema).await?
         } else {
             Vec::new()

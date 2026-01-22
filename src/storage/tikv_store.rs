@@ -6,7 +6,7 @@ use crate::types::{
 };
 use crate::extensions::InstalledExtension;
 use anyhow::{anyhow, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tikv_client::{
     BoundRange, CheckLevel, Config, Transaction, TransactionClient, TransactionOptions,
@@ -85,6 +85,23 @@ fn setval_standalone(
     state.last_value = value;
     state.is_called = is_called;
     Ok(value)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommentTarget {
+    Extension { name: String },
+    Function { full_name: String },
+    Table { full_name: String },
+    Column {
+        table_full_name: String,
+        column_name: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommentRecord {
+    pub(crate) target: CommentTarget,
+    pub(crate) description: String,
 }
 
 pub struct TikvStore {
@@ -452,6 +469,130 @@ impl TikvStore {
             exts.push(ext);
         }
         Ok(exts)
+    }
+
+    /// Set or clear a comment for an installed extension.
+    pub(crate) async fn set_extension_comment(
+        &self,
+        txn: &mut Transaction,
+        ext_name: &str,
+        comment: Option<&str>,
+    ) -> Result<()> {
+        let key = self.key(&encode_comment_extension_key(ext_name));
+        match comment {
+            Some(text) => txn_put(txn, key, text.as_bytes().to_vec()).await,
+            None => txn_delete(txn, key).await,
+        }
+    }
+
+    /// Set or clear a comment for a function (`schema.name`).
+    pub(crate) async fn set_function_comment(
+        &self,
+        txn: &mut Transaction,
+        func_full_name: &str,
+        comment: Option<&str>,
+    ) -> Result<()> {
+        let key = self.key(&encode_comment_function_key(func_full_name));
+        match comment {
+            Some(text) => txn_put(txn, key, text.as_bytes().to_vec()).await,
+            None => txn_delete(txn, key).await,
+        }
+    }
+
+    /// Set or clear a comment for a table (`schema.name`).
+    pub(crate) async fn set_table_comment(
+        &self,
+        txn: &mut Transaction,
+        table_full_name: &str,
+        comment: Option<&str>,
+    ) -> Result<()> {
+        let key = self.key(&encode_comment_table_key(table_full_name));
+        match comment {
+            Some(text) => txn_put(txn, key, text.as_bytes().to_vec()).await,
+            None => txn_delete(txn, key).await,
+        }
+    }
+
+    /// Set or clear a comment for a table column.
+    pub(crate) async fn set_column_comment(
+        &self,
+        txn: &mut Transaction,
+        table_full_name: &str,
+        column_name: &str,
+        comment: Option<&str>,
+    ) -> Result<()> {
+        let key = self.key(&encode_comment_column_key(table_full_name, column_name));
+        match comment {
+            Some(text) => txn_put(txn, key, text.as_bytes().to_vec()).await,
+            None => txn_delete(txn, key).await,
+        }
+    }
+
+    /// List all stored comments for the current tenant.
+    pub(crate) async fn list_comments(&self, txn: &mut Transaction) -> Result<Vec<CommentRecord>> {
+        let prefix = encode_comment_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut records = Vec::new();
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let rest = &key[prefix.len()..];
+            let Some((&kind, payload)) = rest.split_first() else {
+                continue;
+            };
+            if payload.first() != Some(&0) {
+                continue;
+            }
+            let payload = &payload[1..];
+
+            let target = match kind {
+                b'e' => CommentTarget::Extension {
+                    name: std::str::from_utf8(payload)
+                        .context("comment key: invalid extension name")?
+                        .to_string(),
+                },
+                b'f' => CommentTarget::Function {
+                    full_name: std::str::from_utf8(payload)
+                        .context("comment key: invalid function name")?
+                        .to_string(),
+                },
+                b't' => CommentTarget::Table {
+                    full_name: std::str::from_utf8(payload)
+                        .context("comment key: invalid table name")?
+                        .to_string(),
+                },
+                b'c' => {
+                    let Some(split) = payload.iter().position(|b| *b == 0) else {
+                        continue;
+                    };
+                    let table = std::str::from_utf8(&payload[..split])
+                        .context("comment key: invalid table name")?
+                        .to_string();
+                    let column = std::str::from_utf8(&payload[split + 1..])
+                        .context("comment key: invalid column name")?
+                        .to_string();
+                    CommentTarget::Column {
+                        table_full_name: table,
+                        column_name: column,
+                    }
+                }
+                _ => continue,
+            };
+
+            let description = std::str::from_utf8(pair.value())
+                .context("comment value is not valid UTF-8")?
+                .to_string();
+
+            records.push(CommentRecord { target, description });
+        }
+
+        Ok(records)
     }
 
     pub async fn next_schema_oid(&self, txn: &mut Transaction) -> Result<u32> {
@@ -868,6 +1009,14 @@ impl TikvStore {
         Ok(())
     }
 
+    /// Persist an updated sequence definition (metadata only; does not touch sequence state).
+    pub async fn update_sequence_def(&self, txn: &mut Transaction, def: &SequenceDef) -> Result<()> {
+        let key = self.key(&encode_sequence_key(&def.full_name()));
+        let data = bincode::serialize(def).context("Failed to serialize sequence definition")?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
     pub async fn get_sequence(
         &self,
         txn: &mut Transaction,
@@ -955,7 +1104,7 @@ impl TikvStore {
         if txn.get(key.clone()).await?.is_some() {
             return Err(anyhow!("Function '{}' already exists", full_name));
         }
-        let data = bincode::serialize(&def).context("Failed to serialize function definition")?;
+        let data = serialize_function_def(&def)?;
         txn_put(txn, key, data).await?;
         Ok(())
     }
@@ -970,8 +1119,7 @@ impl TikvStore {
 
         if def.oid == 0 {
             if let Some(existing) = txn.get(key.clone()).await? {
-                let existing: FunctionDef = bincode::deserialize(&existing)
-                    .context("Failed to deserialize function definition")?;
+                let existing: FunctionDef = deserialize_function_def(&existing)?;
                 if existing.oid != 0 {
                     def.oid = existing.oid;
                 }
@@ -981,7 +1129,7 @@ impl TikvStore {
             def.oid = self.next_function_oid(txn).await?;
         }
 
-        let data = bincode::serialize(&def).context("Failed to serialize function definition")?;
+        let data = serialize_function_def(&def)?;
         txn_put(txn, key, data).await?;
         Ok(())
     }
@@ -994,12 +1142,10 @@ impl TikvStore {
         let key = self.key(&encode_function_key(full_name));
         match txn.get(key).await? {
             Some(data) => {
-                let mut def: FunctionDef = bincode::deserialize(&data)
-                    .context("Failed to deserialize function definition")?;
+                let mut def: FunctionDef = deserialize_function_def(&data)?;
                 if def.oid == 0 {
                     def.oid = self.next_function_oid(txn).await?;
-                    let data = bincode::serialize(&def)
-                        .context("Failed to serialize function definition")?;
+                    let data = serialize_function_def(&def)?;
                     txn_put(txn, self.key(&encode_function_key(full_name)), data).await?;
                 }
                 Ok(Some(def))
@@ -1017,11 +1163,14 @@ impl TikvStore {
 
         let mut funcs = Vec::new();
         for pair in pairs {
-            let mut def: FunctionDef =
-                bincode::deserialize(pair.value()).context("Failed to deserialize function")?;
+            let mut def: FunctionDef = deserialize_function_def(pair.value())?;
+            let mut needs_update = false;
             if def.oid == 0 {
                 def.oid = self.next_function_oid(txn).await?;
-                let data = bincode::serialize(&def).context("Failed to serialize function")?;
+                needs_update = true;
+            }
+            if needs_update {
+                let data = serialize_function_def(&def)?;
                 let full_name = format!("{}.{}", def.schema, def.name);
                 txn_put(txn, self.key(&encode_function_key(&full_name)), data).await?;
             }
@@ -1410,6 +1559,108 @@ impl TikvStore {
         }
     }
 
+    /// Create GIN-like inverted index entries for a row.
+    ///
+    /// Each `token_hash` is stored as a separate key that points to `pk_values` via the
+    /// key suffix. The value is empty.
+    pub async fn create_gin_index_entries(
+        &self,
+        txn: &mut Transaction,
+        table_id: u64,
+        index_id: u64,
+        token_hashes: &[u64],
+        pk_values: &[Value],
+    ) -> Result<()> {
+        if token_hashes.is_empty() {
+            return Ok(());
+        }
+
+        let pk_key = encode_pk_values(pk_values);
+        for &token_hash in token_hashes {
+            let key = self.key(&encode_gin_index_key(table_id, index_id, token_hash, &pk_key));
+            txn_put(txn, key, Vec::new()).await?;
+        }
+        Ok(())
+    }
+
+    /// Delete GIN-like inverted index entries for a row.
+    pub async fn delete_gin_index_entries(
+        &self,
+        txn: &mut Transaction,
+        table_id: u64,
+        index_id: u64,
+        token_hashes: &[u64],
+        pk_values: &[Value],
+    ) -> Result<()> {
+        if token_hashes.is_empty() {
+            return Ok(());
+        }
+
+        let pk_key = encode_pk_values(pk_values);
+        for &token_hash in token_hashes {
+            let key = self.key(&encode_gin_index_key(table_id, index_id, token_hash, &pk_key));
+            txn_delete(txn, key).await?;
+        }
+        Ok(())
+    }
+
+    /// Scan a GIN-like inverted index for rows matching **all** token hashes.
+    ///
+    /// This returns encoded PK keys (the same bytes used in `t_{table_id}_{pk}` keys)
+    /// to allow callers to fetch rows without decoding/re-encoding PK values.
+    pub async fn scan_gin_index_intersection(
+        &self,
+        txn: &mut Transaction,
+        table_id: u64,
+        index_id: u64,
+        token_hashes: &[u64],
+    ) -> Result<Vec<Vec<u8>>> {
+        if token_hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut candidates: HashSet<Vec<u8>> = HashSet::new();
+
+        for (i, &token_hash) in token_hashes.iter().enumerate() {
+            if i > 0 && candidates.is_empty() {
+                break;
+            }
+
+            let (start_raw, end_raw) = encode_gin_index_token_range(table_id, index_id, token_hash);
+            let start_key = self.key(&start_raw);
+            let end_key = self.key(&end_raw);
+            let range: BoundRange = (start_key.clone()..end_key).into();
+            let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+            if i == 0 {
+                for pair in pairs {
+                    let full_key: &[u8] = pair.key().as_ref().into();
+                    if full_key.len() <= start_key.len() {
+                        continue;
+                    }
+                    candidates.insert(full_key[start_key.len()..].to_vec());
+                }
+            } else {
+                let mut next: HashSet<Vec<u8>> = HashSet::with_capacity(candidates.len());
+                for pair in pairs {
+                    let full_key: &[u8] = pair.key().as_ref().into();
+                    if full_key.len() <= start_key.len() {
+                        continue;
+                    }
+                    let pk_bytes = &full_key[start_key.len()..];
+                    if candidates.contains(pk_bytes) {
+                        next.insert(pk_bytes.to_vec());
+                    }
+                }
+                candidates = next;
+            }
+        }
+
+        let mut out: Vec<Vec<u8>> = candidates.into_iter().collect();
+        out.sort();
+        Ok(out)
+    }
+
     /// Batch get rows by PKs
     pub async fn batch_get_rows(
         &self,
@@ -1425,6 +1676,25 @@ impl TikvStore {
             if let Some(val) = txn.get(data_key).await? {
                 let row = deserialize_row(&val)?;
                 rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Batch get rows by their encoded PK keys.
+    ///
+    /// `pk_keys` are the raw bytes produced by `encode_pk_values` for the table's PK.
+    pub async fn batch_get_rows_by_pk_keys(
+        &self,
+        txn: &mut Transaction,
+        table_id: u64,
+        pk_keys: Vec<Vec<u8>>,
+    ) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        for pk_key in &pk_keys {
+            let data_key = self.key(&encode_data_key(table_id, pk_key));
+            if let Some(val) = txn.get(data_key).await? {
+                rows.push(deserialize_row(&val)?);
             }
         }
         Ok(rows)

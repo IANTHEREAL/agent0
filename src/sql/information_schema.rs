@@ -1,5 +1,5 @@
 use super::{catalog_oids, names, sequences};
-use crate::storage::TikvStore;
+use crate::storage::{CommentTarget, TikvStore};
 use crate::types::{ColumnDef, DataType, ForeignKeyAction, IndexDef, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -15,6 +15,8 @@ pub fn is_information_schema_table(table_name: &str) -> bool {
             lower.as_str(),
             "tables"
                 | "columns"
+                | "sequences"
+                | "routines"
                 | "schemata"
                 | "table_constraints"
                 | "key_column_usage"
@@ -50,6 +52,8 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
         return Some(match name {
             "tables" => "tables",
             "columns" => "columns",
+            "sequences" => "sequences",
+            "routines" => "routines",
             "schemata" => "schemata",
             "table_constraints" => "table_constraints",
             "key_column_usage" => "key_column_usage",
@@ -196,12 +200,60 @@ fn tables_schema() -> TableSchema {
             text_col("is_insertable_into"),
             text_col("is_typed"),
             text_col("commit_action"),
+            text_col("table_owner"),
         ],
         version: 1,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
+    }
+}
+
+fn sequences_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "sequences".to_string(),
+        columns: vec![
+            text_col("sequence_catalog"),
+            text_col("sequence_schema"),
+            text_col("sequence_name"),
+            text_col("data_type"),
+            int_col("start_value"),
+            int_col("minimum_value"),
+            int_col("maximum_value"),
+            int_col("increment"),
+            text_col("cycle_option"),
+            text_col("sequence_owner"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+    }
+}
+
+fn routines_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "routines".to_string(),
+        columns: vec![
+            text_col("routine_catalog"),
+            text_col("routine_schema"),
+            text_col("routine_name"),
+            text_col("routine_type"),
+            text_col("data_type"),
+            text_col("routine_owner"),
+        ],
+        version: 1,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -260,6 +312,7 @@ fn columns_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -281,6 +334,7 @@ fn schemata_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -305,6 +359,7 @@ fn table_constraints_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -328,6 +383,7 @@ fn key_column_usage_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -351,6 +407,7 @@ fn referential_constraints_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -372,6 +429,7 @@ fn constraint_column_usage_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -390,6 +448,7 @@ fn check_constraints_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -410,6 +469,7 @@ fn pg_range_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -438,6 +498,7 @@ fn pg_type_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -456,6 +517,7 @@ fn pg_enum_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -482,6 +544,7 @@ fn pg_class_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -508,6 +571,7 @@ fn pg_index_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -532,6 +596,7 @@ fn pg_attribute_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -545,6 +610,7 @@ fn pg_namespace_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -565,6 +631,7 @@ fn pg_proc_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -587,6 +654,7 @@ fn pg_extension_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -606,6 +674,7 @@ fn pg_trigger_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -633,6 +702,7 @@ fn pg_constraint_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -646,6 +716,7 @@ fn pg_am_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -664,6 +735,7 @@ fn pg_description_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -683,6 +755,7 @@ fn pg_indexes_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -702,6 +775,7 @@ fn pg_attrdef_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -724,6 +798,7 @@ fn pg_sequence_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -746,6 +821,7 @@ fn pg_tables_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -764,6 +840,7 @@ fn pg_views_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -785,6 +862,7 @@ fn pg_depend_schema() -> TableSchema {
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     }
 }
 
@@ -797,6 +875,8 @@ pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
 
     match name {
         "tables" => Some(tables_schema()),
+        "sequences" => Some(sequences_schema()),
+        "routines" => Some(routines_schema()),
         "columns" => Some(columns_schema()),
         "schemata" => Some(schemata_schema()),
         "table_constraints" => Some(table_constraints_schema()),
@@ -944,6 +1024,8 @@ pub async fn get_information_schema_data(
     let rows = match name {
         "schemata" => get_schemata_rows(&schemas),
         "tables" => get_tables_rows(store, txn, &user_tables).await?,
+        "sequences" => get_sequences_rows(store, txn).await?,
+        "routines" => get_routines_rows(store, txn).await?,
         "columns" => get_columns_rows(store, txn, &user_tables).await?,
         "table_constraints" => get_table_constraints_rows(store, txn, &user_tables).await?,
         "key_column_usage" => get_key_column_usage_rows(store, txn, &user_tables).await?,
@@ -964,7 +1046,7 @@ pub async fn get_information_schema_data(
         "pg_proc" => get_pg_proc_rows(store, txn, &schema_oids).await?,
         "pg_extension" => get_pg_extension_rows(store, txn, &schema_oids).await?,
         "pg_trigger" => get_pg_trigger_rows(store, txn, &user_tables).await?,
-        "pg_description" => get_pg_description_rows(),
+        "pg_description" => get_pg_description_rows(store, txn).await?,
         "pg_constraint" => get_pg_constraint_rows(store, txn, &user_tables, &schema_oids).await?,
         "pg_am" => get_pg_am_rows(),
         "pg_attrdef" => get_pg_attrdef_rows(store, txn, &user_tables).await?,
@@ -1005,6 +1087,11 @@ async fn get_tables_rows(
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
+        let owner = store
+            .get_schema(txn, full_table_name)
+            .await?
+            .map(|s| s.owner)
+            .unwrap_or_else(|| "postgres".to_string());
         rows.push(Row::new(vec![
             text_val("postgres"),
             text_val(&table_schema),
@@ -1018,6 +1105,7 @@ async fn get_tables_rows(
             text_val("YES"),
             text_val("NO"),
             null_val(),
+            Value::Text(owner),
         ]));
     }
 
@@ -1036,6 +1124,49 @@ async fn get_tables_rows(
             text_val("NO"),
             text_val("NO"),
             null_val(),
+            text_val("postgres"),
+        ]));
+    }
+
+    Ok(rows)
+}
+
+async fn get_sequences_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
+    let mut seqs = store.list_sequences(txn).await?;
+    seqs.sort_by(|a, b| a.schema.cmp(&b.schema).then(a.name.cmp(&b.name)));
+
+    let mut rows = Vec::with_capacity(seqs.len());
+    for seq in seqs {
+        rows.push(Row::new(vec![
+            text_val("postgres"),
+            text_val(&seq.schema),
+            text_val(&seq.name),
+            text_val("bigint"),
+            int_val(seq.start_value),
+            int_val(seq.min_value),
+            int_val(seq.max_value),
+            int_val(seq.increment),
+            text_val(if seq.is_cycled { "YES" } else { "NO" }),
+            text_val(&seq.owner),
+        ]));
+    }
+
+    Ok(rows)
+}
+
+async fn get_routines_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
+    let mut funcs = store.list_functions(txn).await?;
+    funcs.sort_by(|a, b| a.schema.cmp(&b.schema).then(a.name.cmp(&b.name)));
+
+    let mut rows = Vec::with_capacity(funcs.len());
+    for func in funcs {
+        rows.push(Row::new(vec![
+            text_val("postgres"),
+            text_val(&func.schema),
+            text_val(&func.name),
+            text_val("FUNCTION"),
+            text_val(&func.return_type),
+            text_val(&func.owner),
         ]));
     }
 
@@ -1812,7 +1943,7 @@ async fn get_pg_tables_rows(
         rows.push(Row::new(vec![
             text_val(&table_schema),
             text_val(&table_name),
-            text_val("postgres"),
+            text_val(&schema.owner),
             null_val(),
             Value::Boolean(hasindexes),
             Value::Boolean(false),
@@ -2200,6 +2331,49 @@ async fn get_pg_type_rows(
         int_val(0),
     ]));
 
+    // Compatibility shim: psycopg2 (used by SQLAlchemy) probes for the `hstore` type
+    // at connect time. We expose catalog metadata so the probe succeeds even though
+    // pg-tikv does not currently implement full hstore semantics.
+    const HSTORE_OID: i64 = 16386;
+    const HSTORE_ARRAY_OID: i64 = 16387;
+    let public_oid = schema_oid(schema_oids, "public");
+
+    // Array type (must exist for `hstore.typarray`).
+    rows.push(Row::new(vec![
+        int_val(HSTORE_ARRAY_OID),
+        text_val("_hstore"),
+        int_val(public_oid),
+        int_val(10),
+        int_val(-1),
+        text_val("f"),
+        text_val("b"),
+        text_val("A"),
+        text_val("f"),
+        text_val("t"),
+        text_val(","),
+        int_val(0),
+        int_val(HSTORE_OID),
+        int_val(0),
+    ]));
+
+    // Base type.
+    rows.push(Row::new(vec![
+        int_val(HSTORE_OID),
+        text_val("hstore"),
+        int_val(public_oid),
+        int_val(10),
+        int_val(-1),
+        text_val("f"),
+        text_val("b"),
+        text_val("U"),
+        text_val("f"),
+        text_val("t"),
+        text_val(","),
+        int_val(0),
+        int_val(0),
+        int_val(HSTORE_ARRAY_OID),
+    ]));
+
     let mut user_types = store.list_types(txn).await?;
     user_types.sort_by_key(|t| t.oid);
     for def in user_types {
@@ -2436,7 +2610,68 @@ async fn get_pg_trigger_rows(
     Ok(rows)
 }
 
-fn get_pg_description_rows() -> Vec<Row> {
-    // Return empty for now - ORMs mostly just check if the table exists
-    vec![]
+async fn get_pg_description_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
+    // pg_catalog relation OIDs (stable in PostgreSQL). ORMs may join/filter on these.
+    const PG_CLASS_OID: i64 = 1259;
+    const PG_PROC_OID: i64 = 1255;
+    const PG_EXTENSION_OID: i64 = 3079;
+
+    let comments = store.list_comments(txn).await?;
+    let mut rows = Vec::new();
+
+    for rec in comments {
+        let target = rec.target;
+        let description = Value::Text(rec.description);
+
+        match target {
+            CommentTarget::Extension { name } => {
+                if store.get_extension(txn, &name).await?.is_none() {
+                    continue;
+                }
+                let objoid = crate::extensions::descriptor(&name)
+                    .map(|d| d.oid)
+                    .unwrap_or(0);
+                rows.push(Row::new(vec![
+                    int_val(objoid),
+                    int_val(PG_EXTENSION_OID),
+                    int_val(0),
+                    description,
+                ]));
+            }
+            CommentTarget::Function { full_name } => {
+                let Some(def) = store.get_function(txn, &full_name).await? else {
+                    continue;
+                };
+                let oid = catalog_oids::pg_proc_function_oid(def.oid);
+                rows.push(Row::new(vec![int_val(oid), int_val(PG_PROC_OID), int_val(0), description]));
+            }
+            CommentTarget::Table { full_name } => {
+                let Some(schema) = store.get_schema(txn, &full_name).await? else {
+                    continue;
+                };
+                let oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
+                rows.push(Row::new(vec![int_val(oid), int_val(PG_CLASS_OID), int_val(0), description]));
+            }
+            CommentTarget::Column {
+                table_full_name,
+                column_name,
+            } => {
+                let Some(schema) = store.get_schema(txn, &table_full_name).await? else {
+                    continue;
+                };
+                let Some(col_idx) = schema.column_index(&column_name) else {
+                    continue;
+                };
+                let oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
+                rows.push(Row::new(vec![
+                    int_val(oid),
+                    int_val(PG_CLASS_OID),
+                    int_val((col_idx + 1) as i64),
+                    description,
+                ]));
+            }
+        }
+    }
+
+    Ok(rows)
 }

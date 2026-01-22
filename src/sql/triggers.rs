@@ -371,6 +371,7 @@ mod tests {
             indexes: vec![],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
 
         let new_values = vec![Value::Int32(1), Value::Null];

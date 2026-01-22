@@ -7,9 +7,10 @@
 
 use std::collections::HashMap;
 
-use sqlparser::ast::{BinaryOperator, Expr};
+use sqlparser::ast::{BinaryOperator, Expr, JsonOperator};
 
 use super::expr::eval_expr;
+use super::helpers::normalize_ident;
 use crate::types::{IndexDef, TableSchema, Value};
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,13 @@ pub enum ScanType {
         index_id: u64,
         index_name: String,
         prefix_values: Vec<Value>,
+        estimated_rows: usize,
+    },
+    GinIndexScan {
+        index_id: u64,
+        index_name: String,
+        column: String,
+        pattern: Value,
         estimated_rows: usize,
     },
 }
@@ -61,6 +69,34 @@ pub fn analyze_predicates(expr: &Expr) -> Vec<PredicateInfo> {
     let mut predicates = Vec::new();
     collect_predicates(expr, &mut predicates);
     predicates
+}
+
+/// Choose the best access path for an optional filter expression.
+///
+/// This extends the equality-based index selection with JSONB `@>` scans that can use
+/// a GIN-like inverted index.
+pub fn choose_best_access_path_for_filter(
+    schema: &TableSchema,
+    filter: Option<&Expr>,
+    estimated_table_rows: usize,
+) -> AccessPath {
+    let Some(filter_expr) = filter else {
+        return AccessPath {
+            scan_type: ScanType::FullTableScan,
+            cost: estimated_table_rows as f64,
+        };
+    };
+
+    let predicates = analyze_predicates(filter_expr);
+    let mut best = choose_best_access_path(schema, &predicates, estimated_table_rows);
+
+    if let Some(gin_path) = choose_gin_access_path(schema, filter_expr, estimated_table_rows) {
+        if gin_path.cost < best.cost {
+            best = gin_path;
+        }
+    }
+
+    best
 }
 
 fn collect_predicates(expr: &Expr, predicates: &mut Vec<PredicateInfo>) {
@@ -106,7 +142,7 @@ fn collect_predicates(expr: &Expr, predicates: &mut Vec<PredicateInfo>) {
         Expr::IsNull(inner) => {
             if let Expr::Identifier(ident) = &**inner {
                 predicates.push(PredicateInfo {
-                    column: ident.value.clone(),
+                    column: normalize_ident(ident),
                     op: PredicateOp::IsNull,
                     value: Value::Null,
                 });
@@ -115,7 +151,7 @@ fn collect_predicates(expr: &Expr, predicates: &mut Vec<PredicateInfo>) {
         Expr::IsNotNull(inner) => {
             if let Expr::Identifier(ident) = &**inner {
                 predicates.push(PredicateInfo {
-                    column: ident.value.clone(),
+                    column: normalize_ident(ident),
                     op: PredicateOp::IsNotNull,
                     value: Value::Null,
                 });
@@ -130,7 +166,7 @@ fn extract_simple_predicate(left: &Expr, right: &Expr, op: PredicateOp) -> Optio
     if let Expr::Identifier(ident) = left {
         if let Ok(val) = eval_expr(right, None, None) {
             return Some(PredicateInfo {
-                column: ident.value.clone(),
+                column: normalize_ident(ident),
                 op,
                 value: val,
             });
@@ -146,7 +182,7 @@ fn extract_simple_predicate(left: &Expr, right: &Expr, op: PredicateOp) -> Optio
                 other => other,
             };
             return Some(PredicateInfo {
-                column: ident.value.clone(),
+                column: normalize_ident(ident),
                 op: reversed_op,
                 value: val,
             });
@@ -296,6 +332,70 @@ fn estimate_selectivity(index: &IndexDef, matched_cols: usize, full_match: bool)
     base_selectivity.max(0.0001)
 }
 
+fn choose_gin_access_path(
+    schema: &TableSchema,
+    filter_expr: &Expr,
+    estimated_table_rows: usize,
+) -> Option<AccessPath> {
+    let (column, pattern) = extract_jsonb_contains_predicate(filter_expr)?;
+
+    let index = schema.indexes.iter().find(|idx| {
+        idx.method
+            .as_deref()
+            .map(|m| m.eq_ignore_ascii_case("gin"))
+            .unwrap_or(false)
+            && idx.columns.len() == 1
+            && idx.expressions.is_empty()
+            && idx.predicate.is_none()
+            && idx.columns[0].eq_ignore_ascii_case(&column)
+    })?;
+
+    // Without stats, assume `@>` is reasonably selective in typical workloads (Dify metadata).
+    let selectivity = 0.01_f64;
+    let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
+    let cost = 0.5 + (estimated_rows as f64 * 0.2);
+
+    Some(AccessPath {
+        scan_type: ScanType::GinIndexScan {
+            index_id: index.id,
+            index_name: index.name.clone(),
+            column,
+            pattern,
+            estimated_rows,
+        },
+        cost,
+    })
+}
+
+fn extract_jsonb_contains_predicate(expr: &Expr) -> Option<(String, Value)> {
+    match expr {
+        Expr::Nested(inner) => extract_jsonb_contains_predicate(inner),
+        Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::And) => {
+            extract_jsonb_contains_predicate(left)
+                .or_else(|| extract_jsonb_contains_predicate(right))
+        }
+        Expr::JsonAccess {
+            left,
+            operator,
+            right,
+        } if matches!(operator, JsonOperator::AtArrow) => {
+            let column = extract_column_name(left)?;
+            let pattern = eval_expr(right, None, None).ok()?;
+            Some((column, pattern))
+        }
+        _ => None,
+    }
+}
+
+fn extract_column_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(normalize_ident(ident)),
+        Expr::CompoundIdentifier(parts) => parts.last().map(normalize_ident),
+        Expr::Nested(inner) => extract_column_name(inner),
+        _ => None,
+    }
+}
+
 #[allow(dead_code)]
 pub fn extract_index_values(
     predicates: &[PredicateInfo],
@@ -406,6 +506,8 @@ pub fn extract_table_predicates(
 mod tests {
     use super::*;
     use sqlparser::ast::Ident;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
 
     fn make_eq_expr(col: &str, val: i32) -> Expr {
         Expr::BinaryOp {
@@ -449,6 +551,7 @@ mod tests {
             indexes: vec![],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
         let path = choose_best_access_path(&schema, &[], 1000);
         assert!(matches!(path.scan_type, ScanType::FullTableScan));
@@ -473,6 +576,7 @@ mod tests {
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
         let predicates = vec![PredicateInfo {
             column: "a".to_string(),
@@ -481,6 +585,49 @@ mod tests {
         }];
         let path = choose_best_access_path(&schema, &predicates, 1000);
         assert!(matches!(path.scan_type, ScanType::IndexScan { .. }));
+    }
+
+    #[test]
+    fn test_choose_gin_index_scan_for_jsonb_contains() {
+        let schema = TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![],
+            version: 1,
+            pk_indices: vec![],
+            indexes: vec![IndexDef {
+                id: 7,
+                name: "idx_meta".to_string(),
+                columns: vec!["metadata".to_string()],
+                unique: false,
+                method: Some("gin".to_string()),
+                predicate: None,
+                expressions: Vec::new(),
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(
+            &dialect,
+            "SELECT * FROM t WHERE metadata @> '{\"type\":\"pdf\"}'",
+        )
+        .unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        let filter = select.selection.as_ref().expect("WHERE exists");
+
+        let path = choose_best_access_path_for_filter(&schema, Some(filter), 1000);
+        match path.scan_type {
+            ScanType::GinIndexScan { index_id, .. } => assert_eq!(index_id, 7),
+            other => panic!("expected GinIndexScan, got {:?}", other),
+        }
     }
 
     #[test]
@@ -606,6 +753,7 @@ mod tests {
             ],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
         let predicates = vec![PredicateInfo {
             column: "a".to_string(),
@@ -650,6 +798,7 @@ mod tests {
             ],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
         let predicates = vec![
             PredicateInfo {
@@ -694,6 +843,7 @@ mod tests {
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
         let predicates = vec![PredicateInfo {
             column: "a".to_string(),
@@ -897,6 +1047,7 @@ mod tests {
             }],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
         let path_no_pred = choose_best_access_path(&schema, &[], 10);
         assert!(matches!(path_no_pred.scan_type, ScanType::FullTableScan));

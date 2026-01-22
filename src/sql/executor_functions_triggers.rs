@@ -467,6 +467,7 @@ fn parse_create_function_sql(sql: &str) -> Result<(ObjectName, FunctionDef, bool
         return_type,
         language,
         body,
+        owner: "postgres".to_string(),
     };
 
     Ok((name, def, or_replace))

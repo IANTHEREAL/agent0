@@ -1,3 +1,208 @@
+# Work: Dify pg_dump Compatibility (Owners, Comments, Session Settings)
+
+## Goal
+
+Progressively move from “restore succeeds” to “PostgreSQL-compatible metadata semantics” for the
+remaining gaps identified during `/tmp/dify_schema.sql` restore.
+
+## Phase 0 (DONE): Restore baseline for `/tmp/dify_schema.sql`
+
+- [x] Support `ALTER ... OWNER TO` for TABLE/SEQUENCE/FUNCTION (metadata only; no privilege checks).
+- [x] Support `ALTER SEQUENCE ... OWNED BY` (persist `SequenceDef.owned_by`).
+- [x] Register `uuid-ossp` as a built-in extension descriptor so `CREATE EXTENSION` works in pg_dump restores.
+- [x] Normalize pg_dump-style `CREATE SEQUENCE` option ordering for sqlparser-rs compatibility.
+- [x] Add integration tests:
+  - [x] `tests/95_alter_owner.sql`
+  - [x] `tests/96_dify_schema.sql` (derived from `/tmp/dify_schema.sql`, with cleanup)
+- [x] Run full suite via `./run_tests.sh`.
+
+## Phase 1 (DONE): Persist `COMMENT ON ...` metadata (pg_catalog.pg_description)
+
+### Modules / Ownership
+- Storage: comment key encoding + TiKV persistence (`TikvStore` CRUD + list).
+- SQL: lightweight `COMMENT ON` parser + executor dispatch (avoid relying on sqlparser-rs for unsupported forms).
+- Introspection: populate `pg_catalog.pg_description` from stored comments.
+
+### Scope (MVP)
+- `COMMENT ON EXTENSION ... IS ...`
+- `COMMENT ON FUNCTION ... IS ...` (ignore argument list for function identity; pg-tikv functions are name-unique today)
+- `COMMENT ON COLUMN ... IS ...`
+- Support `IS NULL` as “drop comment”.
+
+### Acceptance Criteria
+- [x] Add a deterministic integration test (no fixed OIDs):
+  - [x] `tests/97_comment_on.sql` validates `pg_catalog.pg_description` via joins to `pg_class`/`pg_proc`/`pg_extension`.
+  - [x] Coverage includes “set”, “update”, and “drop” (`IS NULL`) for at least one object kind.
+- [x] `./run_tests.sh` passes unchanged.
+
+## Phase 2 (DONE): Session settings + `set_config` semantics (pg_dump startup compatibility)
+
+### Modules / Ownership
+- `src/sql/session.rs`: introduce a small `SessionSettings` container (search_path + selected GUCs) with minimal per-statement overhead.
+- `src/sql/executor.rs`: expand `SET` handling to store pg_dump startup variables; implement a statement-level fast-path for `SELECT set_config(...)`.
+- Introspection surface: add a minimal way to read settings (`SHOW` or `current_setting()`), limited to what we store.
+
+### Scope (MVP)
+- Implement `SELECT pg_catalog.set_config('search_path', ..., false)`:
+  - Updates `Session.search_path` (same behavior as `SET search_path`).
+  - Returns the previous value, matching PostgreSQL’s return shape (`text`).
+- Store (even if behavior is still no-op) pg_dump startup variables so clients can read them back:
+  - `statement_timeout`, `lock_timeout`, `idle_in_transaction_session_timeout`
+  - `client_encoding`, `standard_conforming_strings`, `check_function_bodies`, `xmloption`, `client_min_messages`, `row_security`
+
+### Acceptance Criteria
+- [x] Add `tests/98_session_settings.sql`:
+  - [x] Changes `search_path` via `set_config` and demonstrates name resolution differences.
+  - [x] Reads back the current value via `SHOW`/`current_setting` (whichever we implement).
+- [x] `./run_tests.sh` passes unchanged.
+
+## Phase 3 (DONE): Enforce timeout behavior
+
+### Rationale
+Storing GUCs is cheap; enforcing them correctly can be expensive or invasive (especially cancellation).
+This phase is gated on feasibility without adding overhead to the hot path when timeouts are disabled.
+
+### Scope
+- `statement_timeout`:
+  - Implement a statement-level timeout wrapper (`tokio::time::timeout`) around execution.
+  - Abort cleanly: roll back the transaction and return a PostgreSQL-like error message.
+- `lock_timeout`: stored for readback only (no meaningful lock-wait hook in current TiKV flow).
+
+### Acceptance Criteria
+- [x] Add a deterministic integration test:
+  - [x] `tests/99_statement_timeout.sql` validates timeout error + subsequent statement still succeeds.
+- [x] `./run_tests.sh` passes unchanged.
+
+## Phase 4 (DONE): `current_setting()` readback + broader `set_config()` support
+
+### Modules / Ownership
+- `src/sql/executor.rs`: statement-level fast-path for tableless `SELECT current_setting(...)` and `SELECT set_config(...)`.
+- `src/sql/session.rs`: reuse existing `SessionSettings` readback (`SHOW`) as the single source of truth for stored GUC values.
+
+### Scope (MVP)
+- Implement `current_setting(text)` and `current_setting(text, bool missing_ok)` for session-stored settings:
+  - Unknown + `missing_ok=true` → `NULL`
+  - Unknown + `missing_ok=false` → error `unrecognized configuration parameter`
+- Expand `set_config(text, text, bool)` fast-path:
+  - Keep `search_path` special-cased (same parsing/validation behavior as `SET search_path`)
+  - For other stored GUCs, update `SessionSettings` and return the previous value.
+
+### Acceptance Criteria
+- [x] Add `tests/100_current_setting.sql` to validate `current_setting()` and `set_config()` behavior.
+- [x] `./run_tests.sh` passes unchanged.
+
+## Phase 5 (DONE): Driver introspection (server_version/timezone/application_name + `version()`)
+
+### Modules / Ownership
+- `src/sql/session.rs`: extend `SessionSettings` to expose stable readback values for common driver settings.
+- `src/sql/executor.rs`: harden `current_setting()` fast-path to handle top-level casts (e.g. `::int`).
+- `src/sql/expr.rs`: update `version()` output to include `pg-tikv` version.
+- `src/protocol/handler.rs`: align `ParameterStatus` (`server_version`, `TimeZone`, etc) and persist startup `application_name` into the session.
+
+### Scope (MVP)
+- `SHOW` / `current_setting()`:
+  - `server_version` → `16.0`
+  - `server_version_num` → `160000`
+  - `TimeZone` → `UTC` (settable via `SET TIME ZONE ...`)
+  - `application_name` (settable via `SET`; default empty; also captured from startup parameter)
+- `version()`:
+  - Returns `PostgreSQL 16.0 (pg-tikv <crate version> on TiKV)`
+
+### Acceptance Criteria
+- [x] Add `tests/101_server_introspection.sql` to validate `version()`, `SHOW`, `current_setting()` and `SET TIME ZONE`.
+- [x] `./run_tests.sh` passes unchanged.
+
+## Phase 6 (DONE): hstore compatibility shim (SQLAlchemy/psycopg2 unblock)
+
+### Rationale
+Some Dify deployments (SQLAlchemy + psycopg2) probe `hstore` at connect time via:
+`pg_type` + `pg_namespace` join on `typname='hstore'` / `nspname='public'`.
+We implement a lightweight compatibility shim so this probe succeeds without needing
+full hstore semantics.
+
+### Modules / Ownership
+- `src/extensions/mod.rs`: register `hstore` as a built-in extension descriptor (so `CREATE EXTENSION hstore` works).
+- `src/sql/information_schema.rs`: expose `hstore` type metadata in `pg_catalog.pg_type` (and `_hstore` array type via `typarray`).
+
+### Scope (MVP)
+- `CREATE EXTENSION IF NOT EXISTS hstore` succeeds (metadata only).
+- `pg_catalog.pg_type` contains:
+  - `typname='hstore'` in `public` namespace
+  - a non-zero `typarray` pointing to `_hstore`
+
+### Acceptance Criteria
+- [x] Add `tests/102_hstore_compat.sql` validating:
+  - [x] `CREATE EXTENSION IF NOT EXISTS hstore;`
+  - [x] SQLAlchemy probe query returns 1 row and `typarray` is non-zero
+- [x] `./run_tests.sh` passes unchanged.
+
+## Phase 7 (TODO): `json_agg()` / `jsonb_agg()` aggregates
+
+### Modules / Ownership
+- `src/sql/aggregate.rs`: add aggregators for `JSON_AGG` and `JSONB_AGG` (return `Value::Json` / `Value::Jsonb`).
+- `src/sql/executor_select.rs` + `src/sql/executor_join.rs`: treat `json_agg/jsonb_agg` as aggregate functions (GROUP BY / HAVING).
+
+### Scope (MVP)
+- Support `json_agg(expr)` and `jsonb_agg(expr)` in SELECT aggregates:
+  - NULL inputs produce `null` elements in the array (Postgres behavior).
+  - Empty input → NULL result.
+  - `DISTINCT` and `FILTER (WHERE ...)` supported (reuse existing aggregate framework).
+
+### Acceptance Criteria
+- New integration test covers:
+  - basic aggregation, group by, distinct, filter
+  - both `json_agg` and `jsonb_agg`
+- `./run_tests.sh` passes unchanged.
+
+## Phase 8 (TODO): `pg_available_extensions` catalog surface
+
+### Modules / Ownership
+- `src/sql/information_schema.rs`: add virtual `pg_catalog.pg_available_extensions` (minimum columns: name, default_version, installed_version, comment).
+- `src/extensions/mod.rs`: expose descriptor list for catalog enumeration (no allocation on hot path).
+
+### Acceptance Criteria
+- Integration test validates `SELECT name FROM pg_catalog.pg_available_extensions` includes `uuid-ossp` and `hstore`.
+- `./run_tests.sh` passes unchanged.
+
+## Phase 9 (TODO): pg_catalog completeness hardening (targeted)
+
+### Rationale
+Some tools expect `pg_class` / `pg_type` to include catalog relations and common built-in types,
+not only user objects. Dify review notes `pg_class` is “partial”.
+
+### Scope (MVP)
+- Extend `pg_catalog.pg_class` with rows for the core virtual catalogs we already expose
+  (e.g. `pg_type`, `pg_namespace`, `pg_class`, `pg_proc`, `pg_attribute`, `pg_extension`, ...),
+  using PostgreSQL-stable OIDs where practical.
+- Extend `pg_catalog.pg_type` with a minimal set of built-in type rows required by common
+  introspection flows (uuid/jsonb/text/bytea/int/bool/timestamptz/date/numeric).
+
+### Acceptance Criteria
+- Add an integration test with representative introspection queries that must return non-empty results.
+- `./run_tests.sh` passes unchanged.
+
+## Phase 10 (DEFER): SRF-in-SELECT compatibility (`generate_series()` projection)
+
+### Context
+`generate_series()` is already supported as a table function in `FROM`, but not as a
+set-returning function in the SELECT list (PostgreSQL legacy SRF semantics).
+
+### Plan
+- Only implement if Dify (or ORM tests) actually issues SRFs in projection.
+- If required:
+  - Extend the projection pipeline to expand SRF outputs into multiple rows
+    (careful with JOIN + ORDER BY + LIMIT interactions).
+  - Add targeted integration coverage.
+
+## Progress Notes (keep this updated)
+
+- Phase 1 completed (comment persistence + `pg_description`).
+- Phase 2 completed (session GUC storage + `SHOW` + `set_config(search_path)` fast-path).
+- Phase 3 completed (statement_timeout enforcement).
+- Phase 4 completed (`current_setting()` + broader `set_config()` for stored GUCs).
+- Phase 5 completed (driver introspection: `server_version*`, `TimeZone`, `application_name`, `version()`).
+- Phase 6 completed (hstore extension descriptor + pg_type metadata shim).
+
 # Work: Observability v1 (Per-tenant SQL sampling + key metrics)
 
 ## Feature Request

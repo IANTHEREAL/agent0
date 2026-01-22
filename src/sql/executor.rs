@@ -1,6 +1,9 @@
 //! SQL executor
 
 use super::ddl;
+use super::alter_owner;
+use super::alter_sequence_owned_by;
+use super::comment_on;
 use super::executor_functions_triggers::strip_leading_sql_comments;
 use super::explain;
 use super::helpers::{
@@ -33,6 +36,392 @@ use tikv_client::Transaction;
 use tracing::debug;
 
 const OBSERVABILITY_USER: &str = "_pgtikv_sys_observer";
+
+#[derive(Debug)]
+struct StatementTimeoutError;
+
+impl std::fmt::Display for StatementTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "canceling statement due to statement timeout")
+    }
+}
+
+impl std::error::Error for StatementTimeoutError {}
+
+fn set_variable_value_to_string(value: &[Expr]) -> Result<String> {
+    if value.len() != 1 {
+        return Err(anyhow!("Unsupported SET value list"));
+    }
+    let expr = &value[0];
+    match expr {
+        Expr::Value(sqlparser::ast::Value::Number(s, _)) => Ok(s.clone()),
+        Expr::Value(sqlparser::ast::Value::SingleQuotedString(s))
+        | Expr::Value(sqlparser::ast::Value::DoubleQuotedString(s))
+        | Expr::Value(sqlparser::ast::Value::EscapedStringLiteral(s))
+        | Expr::Value(sqlparser::ast::Value::RawStringLiteral(s))
+        | Expr::Value(sqlparser::ast::Value::NationalStringLiteral(s))
+        | Expr::Value(sqlparser::ast::Value::UnQuotedString(s)) => Ok(s.clone()),
+        Expr::Value(sqlparser::ast::Value::Boolean(b)) => {
+            Ok((if *b { "on" } else { "off" }).to_string())
+        }
+        Expr::Identifier(ident) => {
+            let v = ident.value.as_str();
+            if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") {
+                Ok("on".to_string())
+            } else if v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") {
+                Ok("off".to_string())
+            } else {
+                Ok(ident.value.clone())
+            }
+        }
+        Expr::CompoundIdentifier(idents) if idents.len() == 1 => Ok(idents[0].value.clone()),
+        Expr::Value(sqlparser::ast::Value::Null) => Ok(String::new()),
+        Expr::Interval(interval) => {
+            // Drivers commonly set `TimeZone` using an offset interval:
+            // `SET TIME ZONE INTERVAL '+00:00' HOUR TO MINUTE`.
+            // We accept hour-to-minute intervals and store the literal value (e.g. "+00:00")
+            // for readback via `SHOW` / `current_setting`.
+            if matches!(interval.leading_field, Some(sqlparser::ast::DateTimeField::Hour))
+                && matches!(
+                    interval.last_field,
+                    Some(sqlparser::ast::DateTimeField::Minute)
+                )
+            {
+                let Some(s) = try_parse_const_text(interval.value.as_ref()) else {
+                    return Err(anyhow!("Unsupported SET value: {}", expr));
+                };
+                Ok(s)
+            } else {
+                Err(anyhow!("Unsupported SET value: {}", expr))
+            }
+        }
+        _ => Err(anyhow!("Unsupported SET value: {}", expr)),
+    }
+}
+
+fn parse_search_path_guc_value(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for token in s.split(',') {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let schema = if token.starts_with('"') && token.ends_with('"') && token.len() >= 2 {
+            token[1..token.len() - 1].to_string()
+        } else {
+            token.to_lowercase()
+        };
+        out.push(schema);
+    }
+    out
+}
+
+fn try_parse_const_text(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Value(sqlparser::ast::Value::SingleQuotedString(s))
+        | Expr::Value(sqlparser::ast::Value::DoubleQuotedString(s))
+        | Expr::Value(sqlparser::ast::Value::EscapedStringLiteral(s))
+        | Expr::Value(sqlparser::ast::Value::RawStringLiteral(s))
+        | Expr::Value(sqlparser::ast::Value::NationalStringLiteral(s))
+        | Expr::Value(sqlparser::ast::Value::UnQuotedString(s)) => Some(s.clone()),
+        Expr::Cast { expr, .. } | Expr::TryCast { expr, .. } | Expr::SafeCast { expr, .. } => {
+            try_parse_const_text(expr.as_ref())
+        }
+        _ => None,
+    }
+}
+
+fn try_parse_const_bool(expr: &Expr) -> Option<bool> {
+    match expr {
+        Expr::Value(sqlparser::ast::Value::Boolean(b)) => Some(*b),
+        Expr::Identifier(ident) => {
+            let v = ident.value.as_str();
+            if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") {
+                Some(true)
+            } else if v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Expr::Cast { expr, .. } | Expr::TryCast { expr, .. } | Expr::SafeCast { expr, .. } => {
+            try_parse_const_bool(expr.as_ref())
+        }
+        _ => None,
+    }
+}
+
+fn unwrap_top_level_cast<'a>(
+    mut expr: &'a Expr,
+) -> (&'a Expr, Option<&'a sqlparser::ast::DataType>) {
+    let mut cast_to: Option<&'a sqlparser::ast::DataType> = None;
+    loop {
+        match expr {
+            Expr::Cast { expr: inner, data_type, .. }
+            | Expr::TryCast { expr: inner, data_type, .. }
+            | Expr::SafeCast { expr: inner, data_type, .. } => {
+                cast_to = Some(data_type);
+                expr = inner.as_ref();
+            }
+            Expr::Nested(inner) => {
+                expr = inner.as_ref();
+            }
+            _ => break,
+        }
+    }
+    (expr, cast_to)
+}
+
+fn cast_current_setting_value(value: Value, target_type: &DataType) -> Result<Value> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+
+    let Value::Text(s) = value else {
+        return Ok(value);
+    };
+
+    match target_type {
+        DataType::Text => Ok(Value::Text(s)),
+        DataType::Int32 => {
+            let v: i32 = s.parse().map_err(|_| {
+                anyhow!("invalid input syntax for type integer: \"{}\"", s)
+            })?;
+            Ok(Value::Int32(v))
+        }
+        DataType::Int64 => {
+            let v: i64 = s.parse().map_err(|_| {
+                anyhow!("invalid input syntax for type bigint: \"{}\"", s)
+            })?;
+            Ok(Value::Int64(v))
+        }
+        DataType::Boolean => {
+            let v = s.as_str();
+            if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") {
+                Ok(Value::Boolean(true))
+            } else if v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") {
+                Ok(Value::Boolean(false))
+            } else {
+                Err(anyhow!("invalid input syntax for type boolean: \"{}\"", s))
+            }
+        }
+        _ => Ok(Value::Text(s)),
+    }
+}
+
+fn is_set_config_function(name: &sqlparser::ast::ObjectName) -> bool {
+    match name.0.as_slice() {
+        [ident] => ident.value.eq_ignore_ascii_case("set_config"),
+        [schema, ident] => {
+            schema.value.eq_ignore_ascii_case("pg_catalog") && ident.value.eq_ignore_ascii_case("set_config")
+        }
+        _ => false,
+    }
+}
+
+fn is_current_setting_function(name: &sqlparser::ast::ObjectName) -> bool {
+    match name.0.as_slice() {
+        [ident] => ident.value.eq_ignore_ascii_case("current_setting"),
+        [schema, ident] => {
+            schema.value.eq_ignore_ascii_case("pg_catalog")
+                && ident.value.eq_ignore_ascii_case("current_setting")
+        }
+        _ => false,
+    }
+}
+
+fn try_execute_set_config_select(session: &mut Session, query: &Query) -> Result<Option<ExecuteResult>> {
+    if query.with.is_some() {
+        return Ok(None);
+    }
+    if !query.locks.is_empty() || query.for_clause.is_some() {
+        return Ok(None);
+    }
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    if select.into.is_some() || !select.lateral_views.is_empty() || !select.from.is_empty() {
+        return Ok(None);
+    }
+    if select.projection.len() != 1 {
+        return Ok(None);
+    }
+
+    let (expr, alias) = match &select.projection[0] {
+        SelectItem::UnnamedExpr(expr) => (expr, None),
+        SelectItem::ExprWithAlias { expr, alias } => (expr, Some(normalize_ident(alias))),
+        _ => return Ok(None),
+    };
+
+    let Expr::Function(func) = expr else {
+        return Ok(None);
+    };
+    if func.over.is_some()
+        || func.filter.is_some()
+        || func.distinct
+        || !func.order_by.is_empty()
+        || !is_set_config_function(&func.name)
+    {
+        return Ok(None);
+    }
+
+    let [a0, a1, a2] = func.args.as_slice() else {
+        return Ok(None);
+    };
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(var_expr)) = a0 else {
+        return Ok(None);
+    };
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(val_expr)) = a1 else {
+        return Ok(None);
+    };
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(local_expr)) = a2 else {
+        return Ok(None);
+    };
+
+    let Some(var_name) = try_parse_const_text(var_expr) else {
+        return Ok(None);
+    };
+    let Some(new_value) = try_parse_const_text(val_expr) else {
+        return Ok(None);
+    };
+    let Some(_is_local) = try_parse_const_bool(local_expr) else {
+        return Ok(None);
+    };
+
+    let var_name = var_name.to_lowercase();
+    if var_name == "search_path" {
+        let prev = session
+            .show_setting_value("search_path")
+            .unwrap_or_else(|| "public".to_string());
+
+        let mut new_search_path = parse_search_path_guc_value(&new_value);
+        new_search_path.retain(|s| !s.is_empty() && s != "$user");
+        if new_search_path.len() == 1 && new_search_path[0] == "default" {
+            new_search_path = vec!["public".to_string()];
+        }
+        for schema in &new_search_path {
+            if schema.contains('.') {
+                return Err(anyhow!("schema name '{}' must not contain '.'", schema));
+            }
+        }
+        if new_search_path.is_empty() {
+            new_search_path.push("public".to_string());
+        }
+        session.set_search_path(new_search_path);
+
+        return Ok(Some(ExecuteResult::Select {
+            columns: vec![alias.unwrap_or_else(|| "set_config".to_string())],
+            column_types: Some(vec![DataType::Text]),
+            rows: vec![Row::new(vec![Value::Text(prev)])],
+        }));
+    }
+
+    let prev = session.show_setting_value(&var_name);
+    if session.set_known_setting(&var_name, new_value)? {
+        let prev = prev.unwrap_or_else(|| "0".to_string());
+        return Ok(Some(ExecuteResult::Select {
+            columns: vec![alias.unwrap_or_else(|| "set_config".to_string())],
+            column_types: Some(vec![DataType::Text]),
+            rows: vec![Row::new(vec![Value::Text(prev)])],
+        }));
+    }
+
+    Ok(None)
+}
+
+fn try_execute_current_setting_select(
+    session: &mut Session,
+    query: &Query,
+) -> Result<Option<ExecuteResult>> {
+    if query.with.is_some() {
+        return Ok(None);
+    }
+    if !query.locks.is_empty() || query.for_clause.is_some() {
+        return Ok(None);
+    }
+
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(None);
+    };
+    if select.into.is_some() || !select.lateral_views.is_empty() || !select.from.is_empty() {
+        return Ok(None);
+    }
+    if select.projection.len() != 1 {
+        return Ok(None);
+    }
+
+    let (expr, alias) = match &select.projection[0] {
+        SelectItem::UnnamedExpr(expr) => (expr, None),
+        SelectItem::ExprWithAlias { expr, alias } => (expr, Some(normalize_ident(alias))),
+        _ => return Ok(None),
+    };
+
+    let (expr, cast_to) = unwrap_top_level_cast(expr);
+
+    let Expr::Function(func) = expr else {
+        return Ok(None);
+    };
+    if func.over.is_some()
+        || func.filter.is_some()
+        || func.distinct
+        || !func.order_by.is_empty()
+        || !is_current_setting_function(&func.name)
+    {
+        return Ok(None);
+    }
+
+    let (var_expr, missing_ok_expr) = match func.args.as_slice() {
+        [a0] => (a0, None),
+        [a0, a1] => (a0, Some(a1)),
+        _ => return Ok(None),
+    };
+
+    let FunctionArg::Unnamed(FunctionArgExpr::Expr(var_expr)) = var_expr else {
+        return Ok(None);
+    };
+    let Some(var_name) = try_parse_const_text(var_expr) else {
+        return Ok(None);
+    };
+    let missing_ok = match missing_ok_expr {
+        None => false,
+        Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(e))) => {
+            let Some(v) = try_parse_const_bool(e) else {
+                return Ok(None);
+            };
+            v
+        }
+        _ => return Ok(None),
+    };
+
+    let var_name = var_name.to_lowercase();
+    let value = match session.show_setting_value(&var_name) {
+        Some(v) => Value::Text(v),
+        None if missing_ok => Value::Null,
+        None => {
+            return Err(anyhow!(
+                "unrecognized configuration parameter \"{}\"",
+                var_name
+            ))
+        }
+    };
+
+    let mut output_type = DataType::Text;
+    if let Some(cast_to) = cast_to {
+        if let Ok(t) = crate::sql::helpers::convert_data_type(cast_to) {
+            output_type = t;
+        } else {
+            return Ok(None);
+        }
+    }
+    let value = cast_current_setting_value(value, &output_type)?;
+
+    Ok(Some(ExecuteResult::Select {
+        columns: vec![alias.unwrap_or_else(|| "current_setting".to_string())],
+        column_types: Some(vec![output_type]),
+        rows: vec![Row::new(vec![value])],
+    }))
+}
 
 fn query_has_nested_queries(query: &Query) -> bool {
     struct NestedQueryVisitor {
@@ -208,6 +597,14 @@ impl Executor {
                     });
                     return res.map(ExecuteResults::single);
                 }
+                if starts_with("COMMENT ON") {
+                    let start = Instant::now();
+                    let res = self.execute_comment_on_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
                 if starts_with("CREATE OR REPLACE FUNCTION") || starts_with("CREATE FUNCTION") {
                     let start = Instant::now();
                     let res = self.execute_create_function_cmd(session, sql).await;
@@ -252,6 +649,28 @@ impl Executor {
             }
 
             if !is_observability_user {
+                if (sql_upper.starts_with("ALTER TABLE")
+                    || sql_upper.starts_with("ALTER SEQUENCE")
+                    || sql_upper.starts_with("ALTER FUNCTION"))
+                    && sql_upper.contains(" OWNER TO ")
+                {
+                    let start = Instant::now();
+                    let res = self.execute_alter_owner_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
+
+                if sql_upper.starts_with("ALTER SEQUENCE") && sql_upper.contains("OWNED") {
+                    let start = Instant::now();
+                    let res = self.execute_alter_sequence_owned_by_cmd(session, sql).await;
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
+
                 if sql_upper.starts_with("REFRESH MATERIALIZED VIEW") {
                     let start = Instant::now();
                     let res = self.execute_refresh_materialized_view_cmd(session, sql).await;
@@ -365,6 +784,7 @@ impl Executor {
                         | Statement::ReleaseSavepoint { .. }
                         | Statement::Rollback { .. }
                         | Statement::SetVariable { .. }
+                        | Statement::ShowVariable { .. }
                         | Statement::SetTimeZone { .. }
                         | Statement::SetNames { .. }
                         | Statement::SetTransaction { .. } => {
@@ -447,21 +867,7 @@ impl Executor {
                                             Expr::Value(sqlparser::ast::Value::SingleQuotedString(
                                                 s,
                                             )) => {
-                                                for token in s.split(',') {
-                                                    let token = token.trim();
-                                                    if token.is_empty() {
-                                                        continue;
-                                                    }
-                                                    let schema = if token.starts_with('"')
-                                                        && token.ends_with('"')
-                                                        && token.len() >= 2
-                                                    {
-                                                        token[1..token.len() - 1].to_string()
-                                                    } else {
-                                                        token.to_lowercase()
-                                                    };
-                                                    new_search_path.push(schema);
-                                                }
+                                                new_search_path.extend(parse_search_path_guc_value(s));
                                             }
                                             _ => {
                                                 return Err(anyhow!(
@@ -490,18 +896,74 @@ impl Executor {
                                         new_search_path.push("public".to_string());
                                     }
                                     session.set_search_path(new_search_path);
+                                } else if matches!(
+                                    var_name.as_str(),
+                                    "statement_timeout"
+                                        | "lock_timeout"
+                                        | "idle_in_transaction_session_timeout"
+                                        | "timezone"
+                                        | "application_name"
+                                        | "client_encoding"
+                                        | "standard_conforming_strings"
+                                        | "check_function_bodies"
+                                        | "xmloption"
+                                        | "client_min_messages"
+                                        | "row_security"
+                                        | "default_tablespace"
+                                        | "default_table_access_method"
+                                ) {
+                                    let value = set_variable_value_to_string(value)?;
+                                    session.set_known_setting(&var_name, value)?;
                                 }
                                 Ok(vec![ExecuteResult::Empty])
                             }
+                            Statement::SetTimeZone { value, .. } => {
+                                let value = set_variable_value_to_string(std::slice::from_ref(
+                                    value,
+                                ))?;
+                                session.set_known_setting("timezone", value)?;
+                                Ok(vec![ExecuteResult::Empty])
+                            }
+                            Statement::ShowVariable { variable } => {
+                                let var_name = variable
+                                    .iter()
+                                    .map(normalize_ident)
+                                    .collect::<Vec<_>>()
+                                    .join(".")
+                                    .to_lowercase();
+                                let value = session.show_setting_value(&var_name).ok_or_else(|| {
+                                    anyhow!("unrecognized configuration parameter \"{}\"", var_name)
+                                })?;
+
+                                Ok(vec![ExecuteResult::Select {
+                                    columns: vec![var_name],
+                                    column_types: Some(vec![DataType::Text]),
+                                    rows: vec![Row::new(vec![Value::Text(value)])],
+                                }])
+                            }
                             // DDL/DML - delegated to session transaction management
                             _ => {
+                                if let Statement::Query(query) = stmt {
+                                    if let Some(result) =
+                                        try_execute_set_config_select(session, query.as_ref())?
+                                    {
+                                        return Ok(vec![result]);
+                                    }
+                                    if let Some(result) =
+                                        try_execute_current_setting_select(session, query.as_ref())?
+                                    {
+                                        return Ok(vec![result]);
+                                    }
+                                }
+
                                 let is_autocommit = !session.is_in_transaction();
 
                                 if is_autocommit {
                                     session.begin().await?;
                                 }
 
-                                let res = async {
+                                let timeout = session.statement_timeout();
+                                let fut = async {
                                     let (txn, sequence_values, search_path) = session
                                         .get_mut_txn_sequence_values_and_search_path()
                                         .expect("Transaction must be active");
@@ -519,8 +981,27 @@ impl Executor {
                                     Ok::<(Vec<ExecuteResult>, ExecuteResult), anyhow::Error>((
                                         notices, result,
                                     ))
+                                };
+
+                                let res = match timeout {
+                                    Some(timeout) => match tokio::time::timeout(timeout, fut).await {
+                                        Ok(res) => res,
+                                        Err(_) => Err(anyhow::Error::new(StatementTimeoutError)),
+                                    },
+                                    None => fut.await,
+                                };
+
+                                if res
+                                    .as_ref()
+                                    .err()
+                                    .is_some_and(|e| e.is::<StatementTimeoutError>())
+                                    && !is_autocommit
+                                {
+                                    // pg-tikv does not currently implement PostgreSQL's "failed
+                                    // transaction" state. To avoid leaving an open transaction in
+                                    // an unknown partial state, abort it on statement timeout.
+                                    session.rollback().await?;
                                 }
-                                .await;
 
                                 if is_autocommit {
                                     if res.is_ok() {
@@ -600,6 +1081,304 @@ impl Executor {
             }
             _ => Ok(Vec::new()),
         }
+    }
+
+    pub(crate) async fn execute_alter_owner_cmd(
+        &self,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecuteResult> {
+        let alter_owner::AlterOwnerCommand {
+            kind,
+            if_exists,
+            name,
+            new_owner,
+        } = alter_owner::parse_alter_owner_sql(sql)?;
+
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
+
+        let result = async {
+            let (txn, _sequence_values, search_path) = session
+                .get_mut_txn_sequence_values_and_search_path()
+                .expect("Transaction must be active");
+
+            match kind {
+                alter_owner::AlterOwnerKind::Table => {
+                    let resolved = names::resolve_existing_table_name(
+                        self.store.as_ref(),
+                        txn,
+                        &name,
+                        search_path,
+                    )
+                    .await?;
+                    let resolved = match resolved {
+                        Some(r) => r,
+                        None if if_exists => return Ok(ExecuteResult::Empty),
+                        None => return Err(anyhow!("Table '{}' does not exist", name)),
+                    };
+
+                    let mut schema = self
+                        .store
+                        .get_schema(txn, &resolved.full)
+                        .await?
+                        .ok_or_else(|| anyhow!("Table '{}' does not exist", resolved.full))?;
+                    schema.owner = new_owner;
+                    self.store.update_schema(txn, schema).await?;
+                    Ok(ExecuteResult::AlterTable {
+                        table_name: resolved.full,
+                    })
+                }
+                alter_owner::AlterOwnerKind::Sequence => {
+                    let resolved = names::resolve_existing_sequence_name(
+                        self.store.as_ref(),
+                        txn,
+                        &name,
+                        search_path,
+                    )
+                    .await?;
+                    let resolved = match resolved {
+                        Some(r) => r,
+                        None if if_exists => return Ok(ExecuteResult::Empty),
+                        None => return Err(anyhow!("Sequence '{}' does not exist", name)),
+                    };
+
+                    let mut seq = self
+                        .store
+                        .get_sequence(txn, &resolved.full)
+                        .await?
+                        .ok_or_else(|| anyhow!("Sequence '{}' does not exist", resolved.full))?;
+                    seq.owner = new_owner;
+                    self.store.update_sequence_def(txn, &seq).await?;
+                    Ok(ExecuteResult::AlterSequence {
+                        sequence_name: resolved.full,
+                    })
+                }
+                alter_owner::AlterOwnerKind::Function => {
+                    let resolved = names::resolve_existing_function_name(
+                        self.store.as_ref(),
+                        txn,
+                        &name,
+                        search_path,
+                    )
+                    .await?;
+                    let resolved = match resolved {
+                        Some(r) => r,
+                        None if if_exists => return Ok(ExecuteResult::Empty),
+                        None => return Err(anyhow!("Function '{}' does not exist", name)),
+                    };
+
+                    let mut func = self
+                        .store
+                        .get_function(txn, &resolved.full)
+                        .await?
+                        .ok_or_else(|| anyhow!("Function '{}' does not exist", resolved.full))?;
+                    func.owner = new_owner;
+                    self.store.replace_function(txn, func).await?;
+                    Ok(ExecuteResult::AlterFunction {
+                        function_name: resolved.full,
+                    })
+                }
+            }
+        }
+        .await;
+
+        if is_autocommit {
+            if result.is_ok() {
+                session.commit().await?;
+            } else {
+                session.rollback().await?;
+            }
+        }
+
+        result
+    }
+
+    pub(crate) async fn execute_alter_sequence_owned_by_cmd(
+        &self,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecuteResult> {
+        let alter_sequence_owned_by::AlterSequenceOwnedByCommand {
+            if_exists,
+            sequence_name,
+            owned_by,
+        } = alter_sequence_owned_by::parse_alter_sequence_owned_by_sql(sql)?;
+
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
+
+        let result = async {
+            let (txn, _sequence_values, search_path) = session
+                .get_mut_txn_sequence_values_and_search_path()
+                .expect("Transaction must be active");
+
+            let resolved = names::resolve_existing_sequence_name(
+                self.store.as_ref(),
+                txn,
+                &sequence_name,
+                search_path,
+            )
+            .await?;
+            let resolved = match resolved {
+                Some(r) => r,
+                None if if_exists => return Ok(ExecuteResult::Empty),
+                None => return Err(anyhow!("Sequence '{}' does not exist", sequence_name)),
+            };
+
+            let mut seq = self
+                .store
+                .get_sequence(txn, &resolved.full)
+                .await?
+                .ok_or_else(|| anyhow!("Sequence '{}' does not exist", resolved.full))?;
+
+            seq.owned_by = match owned_by {
+                None => None,
+                Some((table_name, column_name)) => {
+                    let resolved_table = names::resolve_existing_table_name(
+                        self.store.as_ref(),
+                        txn,
+                        &table_name,
+                        search_path,
+                    )
+                    .await?
+                    .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
+                    let schema = self
+                        .store
+                        .get_schema(txn, &resolved_table.full)
+                        .await?
+                        .ok_or_else(|| anyhow!("Table '{}' does not exist", resolved_table.full))?;
+
+                    if schema.column_index(&column_name).is_none() {
+                        return Err(anyhow!(
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            column_name,
+                            resolved_table.name
+                        ));
+                    }
+
+                    Some((resolved_table.full, column_name))
+                }
+            };
+
+            self.store.update_sequence_def(txn, &seq).await?;
+            Ok(ExecuteResult::AlterSequence {
+                sequence_name: resolved.full,
+            })
+        }
+        .await;
+
+        if is_autocommit {
+            if result.is_ok() {
+                session.commit().await?;
+            } else {
+                session.rollback().await?;
+            }
+        }
+
+        result
+    }
+
+    pub(crate) async fn execute_comment_on_cmd(
+        &self,
+        session: &mut Session,
+        sql: &str,
+    ) -> Result<ExecuteResult> {
+        let comment_on::CommentOnCommand { target, comment } = comment_on::parse_comment_on_sql(sql)?;
+
+        let is_autocommit = !session.is_in_transaction();
+        if is_autocommit {
+            session.begin().await?;
+        }
+
+        let result = async {
+            let (txn, _sequence_values, search_path) = session
+                .get_mut_txn_sequence_values_and_search_path()
+                .expect("Transaction must be active");
+
+            match target {
+                comment_on::CommentOnTarget::Extension { name } => {
+                    if self.store.get_extension(txn, &name).await?.is_none() {
+                        return Err(anyhow!("extension \"{}\" does not exist", name));
+                    }
+                    self.store
+                        .set_extension_comment(txn, &name, comment.as_deref())
+                        .await?;
+                }
+                comment_on::CommentOnTarget::Function { name } => {
+                    let resolved = names::resolve_existing_function_name(
+                        self.store.as_ref(),
+                        txn,
+                        &name,
+                        search_path,
+                    )
+                    .await?
+                    .ok_or_else(|| anyhow!("Function '{}' does not exist", name))?;
+
+                    self.store
+                        .set_function_comment(txn, &resolved.full, comment.as_deref())
+                        .await?;
+                }
+                comment_on::CommentOnTarget::Table { name } => {
+                    let resolved = names::resolve_existing_table_name(
+                        self.store.as_ref(),
+                        txn,
+                        &name,
+                        search_path,
+                    )
+                    .await?
+                    .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?;
+
+                    self.store
+                        .set_table_comment(txn, &resolved.full, comment.as_deref())
+                        .await?;
+                }
+                comment_on::CommentOnTarget::Column { table, column } => {
+                    let resolved_table = names::resolve_existing_table_name(
+                        self.store.as_ref(),
+                        txn,
+                        &table,
+                        search_path,
+                    )
+                    .await?
+                    .ok_or_else(|| anyhow!("Table '{}' does not exist", table))?;
+                    let schema = self
+                        .store
+                        .get_schema(txn, &resolved_table.full)
+                        .await?
+                        .ok_or_else(|| anyhow!("Table '{}' does not exist", resolved_table.full))?;
+
+                    if schema.column_index(&column).is_none() {
+                        return Err(anyhow!(
+                            "column \"{}\" of relation \"{}\" does not exist",
+                            column,
+                            resolved_table.name
+                        ));
+                    }
+
+                    self.store
+                        .set_column_comment(txn, &resolved_table.full, &column, comment.as_deref())
+                        .await?;
+                }
+            }
+
+            Ok(ExecuteResult::Empty)
+        }
+        .await;
+
+        if is_autocommit {
+            if result.is_ok() {
+                session.commit().await?;
+            } else {
+                session.rollback().await?;
+            }
+        }
+
+        result
     }
 
     /// Execute a parsed SQL statement on a given transaction
@@ -1906,15 +2685,37 @@ impl Executor {
         };
 
         let tables = self.store.list_tables(txn).await?;
-        let mut schemas: HashMap<String, TableSchema> = HashMap::new();
+        let mut schemas_by_full: HashMap<String, TableSchema> = HashMap::new();
+        let mut schemas_by_short: HashMap<String, Option<TableSchema>> = HashMap::new();
         for table_name in &tables {
             if let Ok(Some(schema)) = self.store.get_schema(txn, table_name).await {
-                schemas.insert(table_name.clone(), schema);
+                schemas_by_full.insert(table_name.clone(), schema.clone());
+
+                // EXPLAIN queries often refer to tables without schema qualification.
+                // Provide a short-name lookup when the name is unambiguous.
+                let short = table_name
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(table_name.as_str())
+                    .to_string();
+                match schemas_by_short.get(&short) {
+                    None => {
+                        schemas_by_short.insert(short, Some(schema));
+                    }
+                    Some(Some(_)) => {
+                        schemas_by_short.insert(short, None);
+                    }
+                    Some(None) => {}
+                }
             }
         }
 
-        let schema_lookup =
-            |table_name: &str| -> Option<TableSchema> { schemas.get(table_name).cloned() };
+        let schema_lookup = |table_name: &str| -> Option<TableSchema> {
+            if let Some(schema) = schemas_by_full.get(table_name) {
+                return Some(schema.clone());
+            }
+            schemas_by_short.get(table_name).and_then(|s| s.clone())
+        };
 
         let row_count_lookup = |_table_name: &str| -> usize { 1000 };
 
@@ -2034,5 +2835,143 @@ impl Executor {
         }
 
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        cast_current_setting_value, is_current_setting_function, is_set_config_function,
+        parse_search_path_guc_value, set_variable_value_to_string, try_parse_const_bool,
+        try_parse_const_text, unwrap_top_level_cast,
+    };
+    use crate::types::Value;
+    use sqlparser::ast::{DataType, DateTimeField, Expr, Ident, Interval, ObjectName, Value as SqlValue};
+
+    #[test]
+    fn test_set_variable_value_to_string_basic() {
+        assert_eq!(
+            set_variable_value_to_string(&[Expr::Value(SqlValue::Number(
+                "0".to_string(),
+                false
+            ))])
+            .unwrap(),
+            "0"
+        );
+        assert_eq!(
+            set_variable_value_to_string(&[Expr::Value(SqlValue::SingleQuotedString(
+                "UTF8".to_string()
+            ))])
+            .unwrap(),
+            "UTF8"
+        );
+        assert_eq!(
+            set_variable_value_to_string(&[Expr::Value(SqlValue::Boolean(false))]).unwrap(),
+            "off"
+        );
+        assert_eq!(
+            set_variable_value_to_string(&[Expr::Identifier(Ident::new("on"))]).unwrap(),
+            "on"
+        );
+        assert_eq!(
+            set_variable_value_to_string(&[Expr::Identifier(Ident::new("OFF"))]).unwrap(),
+            "off"
+        );
+    }
+
+    #[test]
+    fn test_set_variable_value_to_string_timezone_interval() {
+        let expr = Expr::Interval(Interval {
+            value: Box::new(Expr::Value(SqlValue::SingleQuotedString("+00:00".to_string()))),
+            leading_field: Some(DateTimeField::Hour),
+            leading_precision: None,
+            last_field: Some(DateTimeField::Minute),
+            fractional_seconds_precision: None,
+        });
+        assert_eq!(set_variable_value_to_string(&[expr]).unwrap(), "+00:00");
+    }
+
+    #[test]
+    fn test_parse_search_path_guc_value() {
+        let parsed = parse_search_path_guc_value("public, \"$user\", \"MySchema\", foo");
+        assert_eq!(
+            parsed,
+            vec![
+                "public".to_string(),
+                "$user".to_string(),
+                "MySchema".to_string(),
+                "foo".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_try_parse_const_text_and_bool() {
+        let expr = Expr::Value(SqlValue::SingleQuotedString("search_path".to_string()));
+        assert_eq!(try_parse_const_text(&expr).as_deref(), Some("search_path"));
+
+        let cast_expr = Expr::Cast {
+            expr: Box::new(Expr::Value(SqlValue::SingleQuotedString("x".to_string()))),
+            data_type: DataType::Text,
+            format: None,
+        };
+        assert_eq!(try_parse_const_text(&cast_expr).as_deref(), Some("x"));
+
+        assert_eq!(
+            try_parse_const_bool(&Expr::Identifier(Ident::new("true"))),
+            Some(true)
+        );
+        assert_eq!(
+            try_parse_const_bool(&Expr::Value(SqlValue::Boolean(false))),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn test_is_set_config_function() {
+        assert!(is_set_config_function(&ObjectName(vec![Ident::new(
+            "set_config"
+        )])));
+        assert!(is_set_config_function(&ObjectName(vec![
+            Ident::new("pg_catalog"),
+            Ident::new("set_config")
+        ])));
+        assert!(!is_set_config_function(&ObjectName(vec![Ident::new(
+            "other"
+        )])));
+    }
+
+    #[test]
+    fn test_is_current_setting_function() {
+        assert!(is_current_setting_function(&ObjectName(vec![Ident::new(
+            "current_setting"
+        )])));
+        assert!(is_current_setting_function(&ObjectName(vec![
+            Ident::new("pg_catalog"),
+            Ident::new("current_setting")
+        ])));
+        assert!(!is_current_setting_function(&ObjectName(vec![Ident::new(
+            "other"
+        )])));
+    }
+
+    #[test]
+    fn test_unwrap_top_level_cast() {
+        let inner = Expr::Identifier(Ident::new("x"));
+        let expr = Expr::Cast {
+            expr: Box::new(Expr::Nested(Box::new(inner.clone()))),
+            data_type: DataType::Int(None),
+            format: None,
+        };
+        let (unwrapped, cast_to) = unwrap_top_level_cast(&expr);
+        assert!(matches!(unwrapped, Expr::Identifier(_)));
+        assert!(cast_to.is_some());
+    }
+
+    #[test]
+    fn test_cast_current_setting_value_integer() {
+        let v = cast_current_setting_value(Value::Text("160000".to_string()), &crate::types::DataType::Int32)
+            .unwrap();
+        assert_eq!(v, Value::Int32(160000));
     }
 }

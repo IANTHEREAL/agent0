@@ -8,11 +8,12 @@ use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
 use super::expr::eval_expr;
+use super::gin;
 use super::helpers::{coerce_value_for_column, eval_default_expr, infer_expr_type};
 use super::index_helpers;
 use super::sequences;
 use crate::storage::TikvStore;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::types::{ColumnDef, DataType, IndexDef, Row, TableSchema, Value};
 
 pub type EnumLabelCache = HashMap<String, HashSet<String>>;
 
@@ -96,6 +97,58 @@ fn validate_enum_values(schema: &TableSchema, row: &Row, cache: &EnumLabelCache)
     }
 
     Ok(())
+}
+
+fn supported_gin_index_column(schema: &TableSchema, index: &IndexDef) -> Option<usize> {
+    if !index
+        .method
+        .as_deref()
+        .map(|m| m.eq_ignore_ascii_case("gin"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    // MVP: single-column, non-partial, non-expression GIN only.
+    if index.columns.len() != 1 || !index.expressions.is_empty() || index.predicate.is_some() {
+        return None;
+    }
+
+    let col_idx = schema.column_index(&index.columns[0])?;
+    match schema.columns.get(col_idx)?.data_type {
+        DataType::Json | DataType::Jsonb => Some(col_idx),
+        _ => None,
+    }
+}
+
+fn extract_gin_token_hashes_from_row(
+    schema: &TableSchema,
+    index: &IndexDef,
+    row: &Row,
+) -> Result<Vec<u64>> {
+    let Some(col_idx) = supported_gin_index_column(schema, index) else {
+        return Ok(Vec::new());
+    };
+
+    let json_text = match row.values.get(col_idx) {
+        Some(Value::Null) | None => return Ok(Vec::new()),
+        Some(Value::Json(s) | Value::Jsonb(s) | Value::Text(s)) => s.as_str(),
+        Some(other) => {
+            return Err(anyhow!(
+                "GIN index '{}' requires JSON/JSONB value, got {}",
+                index.name,
+                other.data_type().unwrap_or(DataType::Text)
+            ));
+        }
+    };
+
+    let json: serde_json::Value = serde_json::from_str(json_text)
+        .map_err(|e| anyhow!("Invalid JSONB value for GIN index '{}': {}", index.name, e))?;
+    let tokens = gin::extract_gin_tokens(&json);
+    let mut hashes = tokens.key_values;
+    hashes.reserve(tokens.key_exists.len());
+    hashes.extend(tokens.key_exists);
+    Ok(hashes)
 }
 
 fn eval_upsert_expr(
@@ -450,6 +503,17 @@ pub async fn execute_insert_row(
                     return Err(e);
                 }
             }
+            // Materialize supported GIN indexes only after B-Tree indexes succeed, so
+            // ON CONFLICT paths don't need additional cleanup.
+            for index in &schema.indexes {
+                let hashes = extract_gin_token_hashes_from_row(schema, index, &row)?;
+                if hashes.is_empty() {
+                    continue;
+                }
+                store
+                    .create_gin_index_entries(txn, schema.table_id, index.id, &hashes, &pk_values)
+                    .await?;
+            }
             Ok(Some(row))
         }
         Err(e)
@@ -532,31 +596,75 @@ async fn update_row_indexes(
     new_row: &Row,
 ) -> Result<()> {
     let pk_values = schema.get_pk_values(old_row);
+
     for index in &schema.indexes {
-        let old_idx = schema.get_index_values(index, old_row);
-        store
-            .delete_index_entry(
-                txn,
-                schema.table_id,
-                index.id,
-                &old_idx,
-                &pk_values,
-                index.unique,
-            )
-            .await?;
+        let gin_hashes = extract_gin_token_hashes_from_row(schema, index, old_row)?;
+        if !gin_hashes.is_empty() {
+            store
+                .delete_gin_index_entries(
+                    txn,
+                    schema.table_id,
+                    index.id,
+                    &gin_hashes,
+                    &pk_values,
+                )
+                .await?;
+            continue;
+        }
+
+        if !index_helpers::is_index_materializable(index) {
+            continue;
+        }
+
+        let old_matches = index_helpers::eval_index_predicate(index, schema, old_row)?;
+        if old_matches {
+            let old_idx = index_helpers::get_index_values_with_expressions(index, schema, old_row)?;
+            store
+                .delete_index_entry(
+                    txn,
+                    schema.table_id,
+                    index.id,
+                    &old_idx,
+                    &pk_values,
+                    index.unique,
+                )
+                .await?;
+        }
     }
+
     for index in &schema.indexes {
-        let new_idx = schema.get_index_values(index, new_row);
-        store
-            .create_index_entry(
-                txn,
-                schema.table_id,
-                index.id,
-                &new_idx,
-                &pk_values,
-                index.unique,
-            )
-            .await?;
+        let gin_hashes = extract_gin_token_hashes_from_row(schema, index, new_row)?;
+        if !gin_hashes.is_empty() {
+            store
+                .create_gin_index_entries(
+                    txn,
+                    schema.table_id,
+                    index.id,
+                    &gin_hashes,
+                    &pk_values,
+                )
+                .await?;
+            continue;
+        }
+
+        if !index_helpers::is_index_materializable(index) {
+            continue;
+        }
+
+        let new_matches = index_helpers::eval_index_predicate(index, schema, new_row)?;
+        if new_matches {
+            let new_idx = index_helpers::get_index_values_with_expressions(index, schema, new_row)?;
+            store
+                .create_index_entry(
+                    txn,
+                    schema.table_id,
+                    index.id,
+                    &new_idx,
+                    &pk_values,
+                    index.unique,
+                )
+                .await?;
+        }
     }
     Ok(())
 }
@@ -876,16 +984,26 @@ pub async fn execute_delete_row(
     let pks = schema.get_pk_values(row);
     store.delete_by_pk(txn, table_name, &pks).await?;
     for index in &schema.indexes {
-        let idx_values = schema.get_index_values(index, row);
+        let gin_hashes = extract_gin_token_hashes_from_row(schema, index, row)?;
+        if !gin_hashes.is_empty() {
+            store
+                .delete_gin_index_entries(txn, schema.table_id, index.id, &gin_hashes, &pks)
+                .await?;
+            continue;
+        }
+
+        if !index_helpers::is_index_materializable(index) {
+            continue;
+        }
+
+        let matches = index_helpers::eval_index_predicate(index, schema, row)?;
+        if !matches {
+            continue;
+        }
+
+        let idx_values = index_helpers::get_index_values_with_expressions(index, schema, row)?;
         store
-            .delete_index_entry(
-                txn,
-                schema.table_id,
-                index.id,
-                &idx_values,
-                &pks,
-                index.unique,
-            )
+            .delete_index_entry(txn, schema.table_id, index.id, &idx_values, &pks, index.unique)
             .await?;
     }
     Ok(())
@@ -910,6 +1028,14 @@ pub async fn execute_update_row(
 
     let pks = schema.get_pk_values(old_row);
     for index in &schema.indexes {
+        let gin_hashes = extract_gin_token_hashes_from_row(schema, index, old_row)?;
+        if !gin_hashes.is_empty() {
+            store
+                .delete_gin_index_entries(txn, schema.table_id, index.id, &gin_hashes, &pks)
+                .await?;
+            continue;
+        }
+
         if !index_helpers::is_index_materializable(index) {
             continue;
         }
@@ -923,6 +1049,14 @@ pub async fn execute_update_row(
     }
     store.upsert(txn, table_name, new_row.clone()).await?;
     for index in &schema.indexes {
+        let gin_hashes = extract_gin_token_hashes_from_row(schema, index, &new_row)?;
+        if !gin_hashes.is_empty() {
+            store
+                .create_gin_index_entries(txn, schema.table_id, index.id, &gin_hashes, &pks)
+                .await?;
+            continue;
+        }
+
         if !index_helpers::is_index_materializable(index) {
             continue;
         }
@@ -1298,6 +1432,7 @@ pub fn build_update_join_context<'a>(
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: String::new(),
     };
 
     let mut column_offsets: HashMap<String, usize> = HashMap::new();
@@ -1342,6 +1477,7 @@ mod tests {
             indexes: vec![],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         }
     }
 

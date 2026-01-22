@@ -68,9 +68,9 @@ impl Executor {
                             } else {
                                 vec![DataType::Text; col_names.len()]
                             };
-                            let schema = TableSchema {
-                                table_id: 0,
-                                name: cte_name.clone(),
+	                            let schema = TableSchema {
+	                                table_id: 0,
+	                                name: cte_name.clone(),
                                 columns: col_names
                                     .iter()
                                     .enumerate()
@@ -88,11 +88,12 @@ impl Executor {
                                     })
                                     .collect(),
                                 pk_indices: vec![],
-                                indexes: vec![],
-                                version: 1,
-                                check_constraints: vec![],
-                                foreign_keys: vec![],
-                            };
+	                                indexes: vec![],
+	                                version: 1,
+	                                check_constraints: vec![],
+	                                foreign_keys: vec![],
+	                                owner: String::new(),
+	                            };
                             ctes.insert(cte_name, (schema, rows));
                         }
                         _ => return Err(anyhow!("CTE must be a SELECT query")),
@@ -187,9 +188,9 @@ impl Executor {
         } else {
             vec![DataType::Text; col_names.len()]
         };
-        let schema = TableSchema {
-            table_id: 0,
-            name: cte_name.to_string(),
+	        let schema = TableSchema {
+	            table_id: 0,
+	            name: cte_name.to_string(),
             columns: col_names
                 .iter()
                 .enumerate()
@@ -204,11 +205,12 @@ impl Executor {
                 })
                 .collect(),
             pk_indices: vec![],
-            indexes: vec![],
-            version: 1,
-            check_constraints: vec![],
-            foreign_keys: vec![],
-        };
+	            indexes: vec![],
+	            version: 1,
+	            check_constraints: vec![],
+	            foreign_keys: vec![],
+	            owner: String::new(),
+	        };
 
         let mut working_table = all_rows.clone();
         let max_iterations = 1000;

@@ -8,105 +8,107 @@ QUERY PLAN
 Result  (cost=0.00..0.01 rows=1 width=4)
 (1 row)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
   Filter: (b = 'one')
 (2 rows)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
   Filter: (id = 1)
 (2 rows)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
-  Filter: (a = 10)
+Index Scan using idx_a on explain_test  (cost=0.15..1.15 rows=100 width=44)
+  Index Cond: (a = 10)
 (2 rows)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
-  Filter: (c = 100)
+Index Scan using idx_c_unique on explain_test  (cost=0.15..0.16 rows=1 width=44)
+  Index Cond: (c = 100)
 (2 rows)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
-  Filter: ((a = 10) AND (b = 'one'))
+Index Scan using idx_ab on explain_test  (cost=0.15..0.25 rows=10 width=44)
+  Index Cond: (a = 10) AND (b = 'one')
 (2 rows)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
 (1 row)
 QUERY PLAN
-Sort  (cost=9976.78..9976.78 rows=1000 width=40)
+Sort  (cost=9976.78..9976.78 rows=1000 width=44)
   Sort Key: a
-  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
 (3 rows)
 QUERY PLAN
-Sort  (cost=9976.78..9976.78 rows=1000 width=40)
+Sort  (cost=9976.78..9976.78 rows=1000 width=44)
   Sort Key: a
-  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
 (3 rows)
 QUERY PLAN
-Sort  (cost=9976.78..9976.78 rows=1000 width=40)
+Sort  (cost=9976.78..9976.78 rows=1000 width=44)
   Sort Key: a, b
-  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
 (3 rows)
 QUERY PLAN
-Limit  (cost=0.00..0.01 rows=1 width=40)
-  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+Limit  (cost=0.00..0.01 rows=1 width=44)
+  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
 (2 rows)
 QUERY PLAN
-Limit  (cost=0.00..0.10 rows=10 width=40)
-  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+Limit  (cost=0.00..0.10 rows=10 width=44)
+  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
 (2 rows)
 QUERY PLAN
-Limit  (cost=9976.78..9976.80 rows=2 width=40)
-  ->  Sort  (cost=9976.78..9976.78 rows=1000 width=40)
+Limit  (cost=9976.78..9976.80 rows=2 width=44)
+  ->  Sort  (cost=9976.78..9976.78 rows=1000 width=44)
         Sort Key: a
-        ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+        ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
 (4 rows)
 QUERY PLAN
-HashAggregate  (cost=11.00..21.00 rows=100 width=40)
+HashAggregate  (cost=11.00..21.00 rows=100 width=44)
   Group Key: a
-  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
 (3 rows)
 QUERY PLAN
-HashAggregate  (cost=11.00..21.00 rows=100 width=40)
+HashAggregate  (cost=11.00..21.00 rows=100 width=44)
   Group Key: a
-  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
 (3 rows)
 QUERY PLAN
-HashAggregate  (cost=11.00..21.00 rows=100 width=40)
+HashAggregate  (cost=11.00..21.00 rows=100 width=44)
   Group Key: a
-  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+  ->  Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
 (3 rows)
 QUERY PLAN
 Nested Loop Inner  (cost=0.00..10022.00 rows=1000000 width=40)
-      Seq Scan on explain_test t1  (cost=0.00..11.00 rows=1000 width=40)
+      Seq Scan on explain_test t1  (cost=0.00..11.00 rows=1000 width=44)
   ->  Seq Scan on explain_join t2  (cost=0.00..11.00 rows=1000 width=40)
 (3 rows)
 QUERY PLAN
 Nested Loop Inner  (cost=0.00..10022.00 rows=1000000 width=40)
-      Seq Scan on explain_test t1  (cost=0.00..11.00 rows=1000 width=40)
+      Seq Scan on explain_test t1  (cost=0.00..11.00 rows=1000 width=44)
   ->  Seq Scan on explain_join t2  (cost=0.00..11.00 rows=1000 width=40)
 (3 rows)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
   Filter: a IN (10, 20)
 (2 rows)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
   Filter: a BETWEEN 10 AND 20
 (2 rows)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
   Filter: b LIKE 'o%'
 (2 rows)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
   Filter: (b IS NOT NULL)
 (2 rows)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
 (1 row)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=40)
+Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
   Filter: id IN (SELECT test_id FROM explain_join)
 (2 rows)
 QUERY PLAN
 Seq Scan on cte  (cost=0.00..11.00 rows=1000 width=40)
 (1 row)
+NOTICE:  table "explain_test" does not exist, skipping
+NOTICE:  table "explain_join" does not exist, skipping

@@ -4,7 +4,9 @@ use std::fmt::Write;
 
 use sqlparser::ast::{Expr, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins};
 
-use super::planner::{analyze_predicates, choose_best_access_path, PredicateInfo, ScanType};
+use super::planner::{
+    analyze_predicates, choose_best_access_path_for_filter, PredicateInfo, ScanType,
+};
 use crate::types::TableSchema;
 
 const DEFAULT_ROW_WIDTH: usize = 40;
@@ -258,7 +260,8 @@ fn generate_table_factor_plan(
             let estimated_rows = row_count_lookup(table_name);
 
             if let Some(schema) = schema_lookup(table_name) {
-                let access_path = choose_best_access_path(&schema, predicates, estimated_rows);
+                let access_path =
+                    choose_best_access_path_for_filter(&schema, filter_expr, estimated_rows);
 
                 match access_path.scan_type {
                     ScanType::IndexScan {
@@ -308,6 +311,26 @@ fn generate_table_factor_plan(
                             } else {
                                 Some(index_cond)
                             },
+                            filter: None,
+                            cost: PlanCost {
+                                startup: 0.15,
+                                total: 0.15 + (est_rows as f64 * 0.01),
+                                rows: est_rows.max(1),
+                                width: estimate_row_width(&schema),
+                            },
+                        }
+                    }
+                    ScanType::GinIndexScan {
+                        index_name,
+                        estimated_rows: est_rows,
+                        ..
+                    } => {
+                        let index_cond = filter_expr.map(|e| format_expr(e));
+                        PlanNode::IndexScan {
+                            table_name: table_name.to_string(),
+                            alias: alias_name,
+                            index_name,
+                            index_cond,
                             filter: None,
                             cost: PlanCost {
                                 startup: 0.15,
@@ -659,6 +682,7 @@ mod tests {
                 }],
                 check_constraints: vec![],
                 foreign_keys: vec![],
+                owner: String::new(),
             })
         } else {
             None

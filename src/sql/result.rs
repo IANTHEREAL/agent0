@@ -28,6 +28,14 @@ pub enum ExecuteResult {
     AlterTable {
         table_name: String,
     },
+    /// ALTER SEQUENCE result
+    AlterSequence {
+        sequence_name: String,
+    },
+    /// ALTER FUNCTION result
+    AlterFunction {
+        function_name: String,
+    },
     /// CREATE INDEX result
     CreateIndex {
         index_name: String,

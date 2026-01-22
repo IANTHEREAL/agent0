@@ -33,73 +33,224 @@ fn preprocess_explain(sql: &str) -> Option<String> {
     None
 }
 
+fn is_sequence_option_keyword(token_upper: &str) -> bool {
+    matches!(
+        token_upper,
+        "INCREMENT"
+            | "MINVALUE"
+            | "MAXVALUE"
+            | "START"
+            | "CACHE"
+            | "CYCLE"
+            | "OWNED"
+            | "NO"
+    )
+}
+
+/// sqlparser-rs' `CREATE SEQUENCE` parser expects options in a fixed order:
+/// `INCREMENT`, `MINVALUE`, `MAXVALUE`, `START`, `CACHE`, `[NO] CYCLE`, then optional `OWNED BY`.
+///
+/// PostgreSQL allows options in any order and `pg_dump` frequently emits
+/// `START ... INCREMENT ... NO MINVALUE NO MAXVALUE ...`, which fails to parse because
+/// sqlparser's `[ [ NO ] CYCLE ]` logic consumes a standalone `NO` even when it isn't
+/// followed by `CYCLE`.
+///
+/// To keep compatibility without expanding sqlparser-rs, we normalize common
+/// `CREATE SEQUENCE` option orderings into the expected order.
 fn reorder_single_create_sequence(stmt: &str) -> Option<String> {
     let trimmed = stmt.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    // Cheap prefix check: only attempt to rewrite CREATE ... SEQUENCE statements.
     let upper = trimmed.to_uppercase();
-
-    if !upper.starts_with("CREATE SEQUENCE ") {
+    if !upper.starts_with("CREATE ") || !upper.contains(" SEQUENCE") {
         return None;
     }
 
-    if !upper.contains("INCREMENT") || !upper.contains("START") {
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    if tokens.len() < 3 {
+        return None;
+    }
+    if !tokens[0].eq_ignore_ascii_case("CREATE") {
         return None;
     }
 
-    let start_idx = upper.find("START").unwrap();
-    let inc_idx = upper.find("INCREMENT").unwrap();
+    let seq_pos = tokens
+        .iter()
+        .position(|t| t.eq_ignore_ascii_case("SEQUENCE"))?;
 
-    if inc_idx <= start_idx {
+    // Position right after sequence name (and optional IF NOT EXISTS / AS <type>).
+    let mut name_pos = seq_pos + 1;
+    if name_pos + 2 < tokens.len()
+        && tokens[name_pos].eq_ignore_ascii_case("IF")
+        && tokens[name_pos + 1].eq_ignore_ascii_case("NOT")
+        && tokens[name_pos + 2].eq_ignore_ascii_case("EXISTS")
+    {
+        name_pos += 3;
+    }
+    if name_pos >= tokens.len() {
         return None;
     }
 
-    let mut tokens: Vec<&str> = trimmed.split_whitespace().collect();
-
-    let mut inc_start = None;
-    let mut inc_end = None;
-    let mut start_pos = None;
-
-    for (i, token) in tokens.iter().enumerate() {
-        let t = token.to_uppercase();
-        if t == "INCREMENT" {
-            inc_start = Some(i);
-        } else if inc_start.is_some() && inc_end.is_none() {
-            if t == "BY" {
-                continue;
+    let mut opt_pos = name_pos + 1;
+    if opt_pos < tokens.len() && tokens[opt_pos].eq_ignore_ascii_case("AS") {
+        opt_pos += 1;
+        while opt_pos < tokens.len() {
+            let t_upper = tokens[opt_pos].trim_end_matches(';').to_uppercase();
+            if is_sequence_option_keyword(t_upper.as_str()) {
+                break;
             }
-            let clean = t.trim_end_matches(';');
-            if clean.parse::<i64>().is_ok() || clean.starts_with('-') || clean.starts_with('+') {
-                inc_end = Some(i);
-            }
-        }
-        if t == "START" {
-            start_pos = Some(i);
+            opt_pos += 1;
         }
     }
 
-    if let (Some(inc_s), Some(inc_e), Some(start_p)) = (inc_start, inc_end, start_pos) {
-        if inc_s > start_p {
-            let inc_tokens: Vec<&str> = tokens[inc_s..=inc_e].to_vec();
-            tokens.drain(inc_s..=inc_e);
-            let insert_at = tokens
-                .iter()
-                .position(|t| t.to_uppercase() == "START")
-                .unwrap();
-            for (i, t) in inc_tokens.into_iter().enumerate() {
-                tokens.insert(insert_at + i, t);
+    let mut increment: Option<Vec<&str>> = None;
+    let mut minvalue: Option<Vec<&str>> = None;
+    let mut maxvalue: Option<Vec<&str>> = None;
+    let mut start: Option<Vec<&str>> = None;
+    let mut cache: Option<Vec<&str>> = None;
+    let mut cycle: Option<Vec<&str>> = None;
+    let mut owned_by: Option<Vec<&str>> = None;
+
+    let mut i = opt_pos;
+    while i < tokens.len() {
+        let token = tokens[i];
+        let token_upper = token.trim_end_matches(';').to_uppercase();
+        match token_upper.as_str() {
+            "INCREMENT" => {
+                let mut seg = vec![token];
+                i += 1;
+                if i < tokens.len() && tokens[i].eq_ignore_ascii_case("BY") {
+                    seg.push(tokens[i]);
+                    i += 1;
+                }
+                if i >= tokens.len() {
+                    return None;
+                }
+                seg.push(tokens[i]);
+                i += 1;
+                increment = Some(seg);
             }
-            return Some(tokens.join(" "));
+            "MINVALUE" => {
+                if i + 1 >= tokens.len() {
+                    return None;
+                }
+                minvalue = Some(vec![tokens[i], tokens[i + 1]]);
+                i += 2;
+            }
+            "MAXVALUE" => {
+                if i + 1 >= tokens.len() {
+                    return None;
+                }
+                maxvalue = Some(vec![tokens[i], tokens[i + 1]]);
+                i += 2;
+            }
+            "START" => {
+                let mut seg = vec![token];
+                i += 1;
+                if i < tokens.len() && tokens[i].eq_ignore_ascii_case("WITH") {
+                    seg.push(tokens[i]);
+                    i += 1;
+                }
+                if i >= tokens.len() {
+                    return None;
+                }
+                seg.push(tokens[i]);
+                i += 1;
+                start = Some(seg);
+            }
+            "CACHE" => {
+                if i + 1 >= tokens.len() {
+                    return None;
+                }
+                cache = Some(vec![tokens[i], tokens[i + 1]]);
+                i += 2;
+            }
+            "CYCLE" => {
+                cycle = Some(vec![tokens[i]]);
+                i += 1;
+            }
+            "NO" => {
+                if i + 1 >= tokens.len() {
+                    return None;
+                }
+                let next_upper = tokens[i + 1].trim_end_matches(';').to_uppercase();
+                match next_upper.as_str() {
+                    "MINVALUE" => {
+                        minvalue = Some(vec![tokens[i], tokens[i + 1]]);
+                        i += 2;
+                    }
+                    "MAXVALUE" => {
+                        maxvalue = Some(vec![tokens[i], tokens[i + 1]]);
+                        i += 2;
+                    }
+                    "CYCLE" => {
+                        cycle = Some(vec![tokens[i], tokens[i + 1]]);
+                        i += 2;
+                    }
+                    _ => return None,
+                }
+            }
+            "OWNED" => {
+                if i + 1 >= tokens.len() || !tokens[i + 1].eq_ignore_ascii_case("BY") {
+                    return None;
+                }
+                owned_by = Some(tokens[i..].to_vec());
+                break;
+            }
+            _ => return None,
         }
     }
 
-    None
+    // If there are no options to normalize, leave the statement untouched.
+    if increment.is_none()
+        && minvalue.is_none()
+        && maxvalue.is_none()
+        && start.is_none()
+        && cache.is_none()
+        && cycle.is_none()
+        && owned_by.is_none()
+    {
+        return None;
+    }
+
+    let mut out: Vec<&str> = Vec::with_capacity(tokens.len());
+    out.extend_from_slice(&tokens[..opt_pos]);
+    if let Some(seg) = increment.as_ref() {
+        out.extend_from_slice(seg);
+    }
+    if let Some(seg) = minvalue.as_ref() {
+        out.extend_from_slice(seg);
+    }
+    if let Some(seg) = maxvalue.as_ref() {
+        out.extend_from_slice(seg);
+    }
+    if let Some(seg) = start.as_ref() {
+        out.extend_from_slice(seg);
+    }
+    if let Some(seg) = cache.as_ref() {
+        out.extend_from_slice(seg);
+    }
+    if let Some(seg) = cycle.as_ref() {
+        out.extend_from_slice(seg);
+    }
+    if let Some(seg) = owned_by.as_ref() {
+        out.extend_from_slice(seg);
+    }
+
+    let normalized = out.join(" ");
+    let input_normalized = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized == input_normalized {
+        None
+    } else {
+        Some(normalized)
+    }
 }
 
 fn preprocess_create_sequence(sql: &str) -> Option<String> {
-    let upper = sql.to_uppercase();
-    if !upper.contains("CREATE SEQUENCE")
-        || !upper.contains("INCREMENT")
-        || !upper.contains("START")
-    {
+    if !sql.to_uppercase().contains("CREATE SEQUENCE") {
         return None;
     }
 
@@ -1110,6 +1261,22 @@ mod tests {
                 panic!("sqlparser-rs issue with double-digit placeholders in multi-row INSERT");
             }
         }
+    }
+
+    #[test]
+    fn test_parse_create_sequence_out_of_order_pg_dump_style() {
+        // `pg_dump` commonly emits START/INCREMENT/NO MINVALUE/NO MAXVALUE out of sqlparser-rs'
+        // expected order. `parse_sql` should normalize it for compatibility.
+        let sql = r#"
+            CREATE SEQUENCE public.task_id_sequence
+                START WITH 1
+                INCREMENT BY 1
+                NO MINVALUE
+                NO MAXVALUE
+                CACHE 1;
+        "#;
+        let stmts = parse_sql(sql).unwrap();
+        assert_eq!(stmts.len(), 1);
     }
 
     #[test]

@@ -436,6 +436,9 @@ pub struct TableSchema {
     pub check_constraints: Vec<CheckConstraint>,
     #[serde(default)]
     pub foreign_keys: Vec<ForeignKeyConstraint>,
+    /// Owner role/user name for this table (metadata only; no permission enforcement yet).
+    #[serde(default = "default_owner")]
+    pub owner: String,
 }
 
 impl TableSchema {
@@ -455,6 +458,7 @@ impl TableSchema {
             indexes: Vec::new(),
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),
+            owner: default_owner(),
         }
     }
 }
@@ -566,6 +570,9 @@ pub struct FunctionDef {
     pub return_type: String,
     pub language: String,
     pub body: String,
+    /// Owner role/user name for this function (metadata only).
+    #[serde(default = "default_owner")]
+    pub owner: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -613,4 +620,9 @@ mod tests {
         assert_eq!(v.as_uuid().unwrap(), uuid);
         assert!(Value::Text("x".into()).as_uuid().is_err());
     }
+
+}
+
+fn default_owner() -> String {
+    "postgres".to_string()
 }

@@ -11,6 +11,7 @@ use tikv_client::Transaction;
 use super::helpers::{
     coerce_value_for_column, convert_data_type, fill_row_defaults, infer_data_type, normalize_ident,
 };
+use super::gin;
 use super::index_helpers;
 use super::names;
 use super::sequences;
@@ -23,6 +24,58 @@ use crate::types::{
 };
 
 const DDL_SCAN_BATCH_SIZE: u32 = 1024;
+
+fn supported_gin_index_column(schema: &TableSchema, index: &IndexDef) -> Option<usize> {
+    if !index
+        .method
+        .as_deref()
+        .map(|m| m.eq_ignore_ascii_case("gin"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    // MVP: single-column, non-partial, non-expression GIN only.
+    if index.columns.len() != 1 || !index.expressions.is_empty() || index.predicate.is_some() {
+        return None;
+    }
+
+    let col_idx = schema.column_index(&index.columns[0])?;
+    match schema.columns.get(col_idx)?.data_type {
+        DataType::Json | DataType::Jsonb => Some(col_idx),
+        _ => None,
+    }
+}
+
+fn extract_gin_token_hashes_from_row(
+    schema: &TableSchema,
+    index: &IndexDef,
+    row: &Row,
+) -> Result<Vec<u64>> {
+    let Some(col_idx) = supported_gin_index_column(schema, index) else {
+        return Ok(Vec::new());
+    };
+
+    let json_text = match row.values.get(col_idx) {
+        Some(Value::Null) | None => return Ok(Vec::new()),
+        Some(Value::Json(s) | Value::Jsonb(s) | Value::Text(s)) => s.as_str(),
+        Some(other) => {
+            return Err(anyhow!(
+                "GIN index '{}' requires JSON/JSONB value, got {}",
+                index.name,
+                other.data_type().unwrap_or(DataType::Text)
+            ));
+        }
+    };
+
+    let json: serde_json::Value = serde_json::from_str(json_text)
+        .map_err(|e| anyhow!("Invalid JSONB value for GIN index '{}': {}", index.name, e))?;
+    let tokens = gin::extract_gin_tokens(&json);
+    let mut hashes = tokens.key_values;
+    hashes.reserve(tokens.key_exists.len());
+    hashes.extend(tokens.key_exists);
+    Ok(hashes)
+}
 
 async fn resolve_column_data_type(
     store: &Arc<TikvStore>,
@@ -685,6 +738,7 @@ pub async fn execute_create_table(
         indexes,
         check_constraints,
         foreign_keys,
+        owner: "postgres".to_string(),
     };
     store.create_table(txn, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, &schema).await?;
@@ -762,6 +816,7 @@ pub async fn create_table_from_query_result(
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: "postgres".to_string(),
     };
     store.create_table(txn, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, &schema).await?;
@@ -833,6 +888,7 @@ pub async fn create_table_from_select_into(
         indexes: vec![],
         check_constraints: vec![],
         foreign_keys: vec![],
+        owner: "postgres".to_string(),
     };
     store.create_table(txn, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, &schema).await?;
@@ -954,6 +1010,17 @@ pub async fn execute_create_index(
                     &pk_values,
                     unique,
                 )
+                .await?;
+        }
+    } else if supported_gin_index_column(&schema, &new_index).is_some() {
+        for row in rows {
+            let hashes = extract_gin_token_hashes_from_row(&schema, &new_index, &row)?;
+            if hashes.is_empty() {
+                continue;
+            }
+            let pk_values = schema.get_pk_values(&row);
+            store
+                .create_gin_index_entries(txn, schema.table_id, index_id, &hashes, &pk_values)
                 .await?;
         }
     }
@@ -1212,8 +1279,30 @@ pub async fn execute_drop_index(
     if let Some(pos) = schema.indexes.iter().position(|i| i.name == idx_name) {
         let index = schema.indexes.remove(pos);
         for row in rows {
-            let idx_values = schema.get_index_values(&index, &row);
             let pk_values = schema.get_pk_values(&row);
+
+            let gin_hashes = extract_gin_token_hashes_from_row(schema, &index, &row)?;
+            if !gin_hashes.is_empty() {
+                store
+                    .delete_gin_index_entries(
+                        txn,
+                        schema.table_id,
+                        index.id,
+                        &gin_hashes,
+                        &pk_values,
+                    )
+                    .await?;
+                continue;
+            }
+
+            if !index_helpers::is_index_materializable(&index) {
+                continue;
+            }
+
+            if !index_helpers::eval_index_predicate(&index, schema, &row)? {
+                continue;
+            }
+            let idx_values = index_helpers::get_index_values_with_expressions(&index, schema, &row)?;
             store
                 .delete_index_entry(
                     txn,

@@ -4,6 +4,7 @@ use super::helpers::{
     apply_offset_limit_fetch, collect_having_agg_funcs, dedup_rows, distinct_on_rows_with_indices,
     eval_having_expr, fill_row_defaults, get_select_item_name, infer_expr_type, AggExpr,
 };
+use super::gin;
 use super::names;
 use super::planner::{self, ScanType};
 use super::sequences;
@@ -137,7 +138,8 @@ impl Executor {
             return Ok(result);
         }
 
-        let (t, outer_alias, schema, all_rows_base, is_virtual) = match &select.from[0].relation {
+        let (t, outer_alias, schema, all_rows_base, is_virtual, rows_loaded) =
+            match &select.from[0].relation {
             TableFactor::Table {
                 name, alias, args, ..
             } => {
@@ -154,7 +156,7 @@ impl Executor {
                         let (schema, rows) = self
                             .execute_generate_series(func_args, &als, alias.as_ref())
                             .await?;
-                        (schema.name.clone(), als, schema, rows, true)
+                        (schema.name.clone(), als, schema, rows, true, true)
                     } else {
                         return Err(anyhow!("generate_series requires at least 2 arguments"));
                     }
@@ -174,7 +176,7 @@ impl Executor {
                                 .as_ref()
                                 .map(|a| a.name.value.clone())
                                 .unwrap_or_else(|| obj_name.clone());
-                            (schema.name.clone(), alias_str, schema, rows, true)
+                            (schema.name.clone(), alias_str, schema, rows, true, true)
                         } else {
                             let lookup_name = match schema_opt {
                                 Some(schema) => format!("{}.{}", schema, obj_name),
@@ -194,22 +196,57 @@ impl Executor {
                                 .as_ref()
                                 .map(|a| a.name.value.clone())
                                 .unwrap_or_else(|| obj_name.clone());
-                            (schema.name.clone(), alias_str, schema, rows, is_virtual)
+                            (schema.name.clone(), alias_str, schema, rows, is_virtual, true)
                         }
                     } else {
-                        let lookup_name = match schema_opt {
-                            Some(schema) => format!("{}.{}", schema, obj_name),
-                            None => obj_name.clone(),
-                        };
-                        let (schema, rows) = self
-                            .get_table_data(txn, sequence_values, search_path, &lookup_name, ctes)
-                            .await?;
-                        let is_virtual = schema.table_id == 0;
                         let alias_str = alias
                             .as_ref()
                             .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| obj_name.clone());
-                        (schema.name.clone(), alias_str, schema, rows, is_virtual)
+
+                        // Prefer loading schema only for base tables, so we can use indexes
+                        // without first scanning the full table.
+                        let cte_key = obj_name.to_lowercase();
+                        if let Some((cte_schema, cte_rows)) = ctes.get(&cte_key) {
+                            (
+                                cte_schema.name.clone(),
+                                alias_str,
+                                cte_schema.clone(),
+                                cte_rows.clone(),
+                                true,
+                                true,
+                            )
+                        } else if let Some(resolved) = names::resolve_existing_table_name(
+                            self.store().as_ref(),
+                            txn,
+                            name,
+                            search_path,
+                        )
+                        .await?
+                        {
+                            let schema = self
+                                .store()
+                                .get_schema(txn, &resolved.full)
+                                .await?
+                                .ok_or_else(|| anyhow!("Table not found"))?;
+                            (schema.name.clone(), alias_str, schema, Vec::new(), false, false)
+                        } else {
+                            let lookup_name = match schema_opt {
+                                Some(schema) => format!("{}.{}", schema, obj_name),
+                                None => obj_name.clone(),
+                            };
+                            let (schema, rows) = self
+                                .get_table_data(
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    &lookup_name,
+                                    ctes,
+                                )
+                                .await?;
+                            let is_virtual = schema.table_id == 0;
+                            (schema.name.clone(), alias_str, schema, rows, is_virtual, true)
+                        }
                     }
                 }
             }
@@ -232,7 +269,7 @@ impl Executor {
                         ctes,
                     )
                     .await?;
-                (alias_name.clone(), alias_name, schema, rows, true)
+                (alias_name.clone(), alias_name, schema, rows, true, true)
             }
             _ => return Err(anyhow!("Unsupported table")),
         };
@@ -269,37 +306,109 @@ impl Executor {
 
         let all_rows = if is_virtual {
             all_rows_base
+        } else if rows_loaded {
+            // Rows are already materialized (CTE, derived table, view, etc). Index scans
+            // are only applicable to base tables.
+            all_rows_base
         } else {
-            let mut index_scan_rows = None;
-            if let Some(ref sel) = resolved_selection {
-                let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
-                    vec![DataType::Uuid]
-                } else {
-                    schema
-                        .pk_indices
-                        .iter()
-                        .map(|&idx| schema.columns[idx].data_type.clone())
-                        .collect()
-                };
+            let estimated_rows = 1000;
 
-                let predicates = planner::analyze_predicates(sel);
-                let estimated_rows = all_rows_base.len().max(100);
-                let access_path =
-                    planner::choose_best_access_path(&schema, &predicates, estimated_rows);
+            match &resolved_selection {
+                None => self.scan_and_fill(txn, &t, &schema).await?,
+                Some(sel) => {
+                    let access_path =
+                        planner::choose_best_access_path_for_filter(&schema, Some(sel), estimated_rows);
 
-                match access_path.scan_type {
-                    ScanType::IndexScan {
-                        index_id,
-                        ref index_name,
-                        ref values,
-                        ..
-                    } => {
-                        let index = schema.indexes.iter().find(|i| i.id == index_id);
-                        if let Some(idx) = index {
+                    match access_path.scan_type {
+                        ScanType::GinIndexScan {
+                            index_id,
+                            ref index_name,
+                            ref pattern,
+                            ..
+                        } => {
+                            let index = schema.indexes.iter().find(|i| i.id == index_id);
+                            let Some(idx) = index else {
+                                return Err(anyhow!("GIN index not found"));
+                            };
+
+                            let pattern_text = match pattern {
+                                Value::Json(s) | Value::Jsonb(s) | Value::Text(s) => Some(s.as_str()),
+                                Value::Null => None,
+                                other => {
+                                    return Err(anyhow!(
+                                        "GIN pattern must be json/jsonb, got {}",
+                                        other.data_type().unwrap_or(DataType::Text)
+                                    ));
+                                }
+                            };
+
+                            if let Some(pattern_text) = pattern_text {
+                                let pattern_json: serde_json::Value =
+                                    serde_json::from_str(pattern_text)
+                                        .map_err(|e| anyhow!("Invalid JSONB pattern for @>: {}", e))?;
+                                let token_hashes =
+                                    gin::extract_gin_tokens(&pattern_json).into_scan_hashes();
+                                if token_hashes.is_empty() {
+                                    // Patterns like '{}' yield no tokens; fall back to a full scan.
+                                    debug!(
+                                        "GIN predicate yields no tokens; falling back to full scan (index: {})",
+                                        index_name
+                                    );
+                                    self.scan_and_fill(txn, &t, &schema).await?
+                                } else {
+                                    debug!(
+                                        "Using GIN Index Scan on {} (cost: {:.2})",
+                                        index_name, access_path.cost
+                                    );
+                                    let pk_keys = self
+                                        .store()
+                                        .scan_gin_index_intersection(
+                                            txn,
+                                            schema.table_id,
+                                            idx.id,
+                                            &token_hashes,
+                                        )
+                                        .await?;
+                                    let mut rows = self
+                                        .store()
+                                        .batch_get_rows_by_pk_keys(txn, schema.table_id, pk_keys)
+                                        .await?;
+                                    for r in &mut rows {
+                                        fill_row_defaults(r, &schema)?;
+                                    }
+                                    rows
+                                }
+                            } else {
+                                // `col @> NULL` yields NULL, which is treated as false in WHERE.
+                                Vec::new()
+                            }
+                        }
+                        ScanType::IndexScan {
+                            index_id,
+                            ref index_name,
+                            ref values,
+                            ..
+                        } => {
+                            let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
+                                vec![DataType::Uuid]
+                            } else {
+                                schema
+                                    .pk_indices
+                                    .iter()
+                                    .map(|&idx| schema.columns[idx].data_type.clone())
+                                    .collect()
+                            };
+
+                            let index = schema.indexes.iter().find(|i| i.id == index_id);
+                            let Some(idx) = index else {
+                                return Err(anyhow!("Index not found"));
+                            };
+
                             debug!(
                                 "Using Index Scan on {} (cost: {:.2})",
                                 index_name, access_path.cost
                             );
+
                             let pks = self
                                 .store()
                                 .scan_index(
@@ -311,65 +420,22 @@ impl Executor {
                                     &pk_types,
                                 )
                                 .await?;
-                            if !pks.is_empty() {
-                                let mut rows = self
-                                    .store()
-                                    .batch_get_rows(txn, schema.table_id, pks.clone(), &schema)
-                                    .await?;
-                                if !rows.is_empty() {
-                                    for r in &mut rows {
-                                        fill_row_defaults(r, &schema)?;
-                                    }
-                                    index_scan_rows = Some(rows);
-                                }
-                            }
-                        }
-                    }
-                    ScanType::IndexRangeScan {
-                        index_id,
-                        ref index_name,
-                        ref prefix_values,
-                        ..
-                    } => {
-                        let index = schema.indexes.iter().find(|i| i.id == index_id);
-                        if let Some(idx) = index {
-                            debug!(
-                                "Using Index Range Scan on {} with {} prefix columns (cost: {:.2})",
-                                index_name,
-                                prefix_values.len(),
-                                access_path.cost
-                            );
-                            let pks = self
+                            let mut rows = self
                                 .store()
-                                .scan_index(
-                                    txn,
-                                    schema.table_id,
-                                    idx.id,
-                                    prefix_values,
-                                    idx.unique,
-                                    &pk_types,
-                                )
+                                .batch_get_rows(txn, schema.table_id, pks, &schema)
                                 .await?;
-                            if !pks.is_empty() {
-                                let mut rows = self
-                                    .store()
-                                    .batch_get_rows(txn, schema.table_id, pks.clone(), &schema)
-                                    .await?;
-                                if !rows.is_empty() {
-                                    for r in &mut rows {
-                                        fill_row_defaults(r, &schema)?;
-                                    }
-                                    index_scan_rows = Some(rows);
-                                }
+                            for r in &mut rows {
+                                fill_row_defaults(r, &schema)?;
                             }
+                            rows
                         }
-                    }
-                    ScanType::FullTableScan => {
-                        debug!("Using Full Table Scan (cost: {:.2})", access_path.cost);
+                        ScanType::IndexRangeScan { .. } | ScanType::FullTableScan => {
+                            debug!("Using Full Table Scan (cost: {:.2})", access_path.cost);
+                            self.scan_and_fill(txn, &t, &schema).await?
+                        }
                     }
                 }
             }
-            index_scan_rows.unwrap_or(all_rows_base)
         };
 
         let filtered_rows = if let Some(ref sel) = resolved_selection {

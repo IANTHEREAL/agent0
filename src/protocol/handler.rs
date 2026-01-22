@@ -47,10 +47,13 @@ pub struct PgServerParameterProvider;
 impl ServerParameterProvider for PgServerParameterProvider {
     fn server_parameters<C: ClientInfo>(&self, _client: &C) -> Option<HashMap<String, String>> {
         let mut params = HashMap::new();
-        params.insert("server_version".to_owned(), "15.0".to_owned());
+        params.insert("server_version".to_owned(), "16.0".to_owned());
+        params.insert("server_version_num".to_owned(), "160000".to_owned());
         params.insert("server_encoding".to_owned(), "UTF8".to_owned());
         params.insert("client_encoding".to_owned(), "UTF8".to_owned());
         params.insert("DateStyle".to_owned(), "ISO, MDY".to_owned());
+        params.insert("TimeZone".to_owned(), "UTC".to_owned());
+        params.insert("standard_conforming_strings".to_owned(), "on".to_owned());
         Some(params)
     }
 }
@@ -1019,6 +1022,22 @@ impl StartupHandler for DynamicPgHandler {
                                     .await?;
                                 client.close().await?;
                                 return Ok(());
+                            }
+
+                            if let Some(app_name) =
+                                client.metadata().get("application_name").cloned()
+                            {
+                                let mut session_guard = self.session.lock().await;
+                                if let Some(session) = session_guard.as_mut() {
+                                    if let Err(e) = session
+                                        .set_known_setting("application_name", app_name)
+                                    {
+                                        warn!(
+                                            "Failed to apply application_name from startup: {}",
+                                            e
+                                        );
+                                    }
+                                }
                             }
 
                             pgwire::api::auth::finish_authentication(
@@ -2501,6 +2520,10 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
         ExecuteResult::Call => Ok(Response::Execution(Tag::new("CALL"))),
 
         ExecuteResult::AlterTable { .. } => Ok(Response::Execution(Tag::new("ALTER TABLE"))),
+
+        ExecuteResult::AlterSequence { .. } => Ok(Response::Execution(Tag::new("ALTER SEQUENCE"))),
+
+        ExecuteResult::AlterFunction { .. } => Ok(Response::Execution(Tag::new("ALTER FUNCTION"))),
 
         ExecuteResult::Insert { affected_rows } => Ok(Response::Execution(
             Tag::new("INSERT")

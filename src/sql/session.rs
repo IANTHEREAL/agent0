@@ -6,11 +6,176 @@ use crate::txn::SavepointState;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tikv_client::Transaction;
 
 pub enum TransactionState {
     Idle,
     Active(Transaction),
+}
+
+/// A small, per-connection container for session-level settings (GUCs).
+///
+/// This is intentionally compact and avoids heap allocations unless a setting is
+/// explicitly changed by the client (`SET` / `set_config`).
+#[derive(Debug, Default)]
+pub(crate) struct SessionSettings {
+    search_path: Vec<String>,
+
+    // pg_dump startup variables we keep for readback (`SHOW`) and later timeout enforcement.
+    statement_timeout_ms: u64,
+    lock_timeout_ms: u64,
+    idle_in_transaction_session_timeout_ms: u64,
+    timezone: Option<String>,
+    application_name: Option<String>,
+    client_encoding: Option<String>,
+    standard_conforming_strings: Option<String>,
+    check_function_bodies: Option<String>,
+    xmloption: Option<String>,
+    client_min_messages: Option<String>,
+    row_security: Option<String>,
+    default_tablespace: Option<String>,
+    default_table_access_method: Option<String>,
+}
+
+impl SessionSettings {
+    pub(crate) fn new() -> Self {
+        Self {
+            search_path: vec!["public".to_string()],
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn search_path(&self) -> &[String] {
+        &self.search_path
+    }
+
+    pub(crate) fn set_search_path(&mut self, search_path: Vec<String>) {
+        self.search_path = search_path;
+    }
+
+    fn parse_timeout_millis(value: &str) -> Result<u64> {
+        let s = value.trim();
+        if s.is_empty() {
+            return Ok(0);
+        }
+
+        // PostgreSQL accepts units like `ms`, `s`, `min`, `h` for timeout GUCs.
+        // Keep parsing strict and allocation-free: scan the numeric prefix and then
+        // interpret an optional unit suffix.
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+            i += 1;
+        }
+        if i == 0 {
+            return Err(anyhow!("invalid timeout value '{}'", value));
+        }
+        let (num_part, unit_part) = s.split_at(i);
+        let unit = unit_part.trim();
+
+        let num: f64 = num_part
+            .parse()
+            .map_err(|_| anyhow!("invalid timeout value '{}'", value))?;
+        if !num.is_finite() || num < 0.0 {
+            return Err(anyhow!("invalid timeout value '{}'", value));
+        }
+        if num == 0.0 {
+            return Ok(0);
+        }
+
+        let multiplier: f64 = if unit.is_empty() {
+            1.0
+        } else if unit.eq_ignore_ascii_case("ms") {
+            1.0
+        } else if unit.eq_ignore_ascii_case("s") {
+            1_000.0
+        } else if unit.eq_ignore_ascii_case("min") {
+            60_000.0
+        } else if unit.eq_ignore_ascii_case("h") {
+            3_600_000.0
+        } else {
+            return Err(anyhow!("invalid timeout unit '{}'", unit));
+        };
+
+        let ms = (num * multiplier).ceil();
+        if ms > u64::MAX as f64 {
+            return Err(anyhow!("timeout value out of range '{}'", value));
+        }
+        Ok(ms as u64)
+    }
+
+    /// Set a known session setting. Returns `true` if the setting name is recognized.
+    pub(crate) fn set_known_setting(&mut self, name: &str, value: String) -> Result<bool> {
+        match name {
+            "statement_timeout" => self.statement_timeout_ms = Self::parse_timeout_millis(&value)?,
+            "lock_timeout" => self.lock_timeout_ms = Self::parse_timeout_millis(&value)?,
+            "idle_in_transaction_session_timeout" => {
+                self.idle_in_transaction_session_timeout_ms = Self::parse_timeout_millis(&value)?
+            }
+            "timezone" => self.timezone = Some(value),
+            "application_name" => self.application_name = Some(value),
+            "client_encoding" => self.client_encoding = Some(value),
+            "standard_conforming_strings" => self.standard_conforming_strings = Some(value),
+            "check_function_bodies" => self.check_function_bodies = Some(value),
+            "xmloption" => self.xmloption = Some(value),
+            "client_min_messages" => self.client_min_messages = Some(value),
+            "row_security" => self.row_security = Some(value),
+            "default_tablespace" => self.default_tablespace = Some(value),
+            "default_table_access_method" => self.default_table_access_method = Some(value),
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    /// Get a session setting value in a Postgres-like string form, for `SHOW`.
+    pub(crate) fn show_value(&self, name: &str) -> Option<String> {
+        match name {
+            // These are used heavily by drivers for feature detection.
+            "server_version" => Some("16.0".to_string()),
+            "server_version_num" => Some("160000".to_string()),
+            "search_path" => Some(self.search_path.join(", ")),
+            "statement_timeout" => Some(self.statement_timeout_ms.to_string()),
+            "lock_timeout" => Some(self.lock_timeout_ms.to_string()),
+            "idle_in_transaction_session_timeout" => {
+                Some(self.idle_in_transaction_session_timeout_ms.to_string())
+            }
+            "timezone" => Some(self.timezone.as_deref().unwrap_or("UTC").to_string()),
+            "application_name" => Some(self.application_name.as_deref().unwrap_or("").to_string()),
+            "client_encoding" => Some(self.client_encoding.as_deref().unwrap_or("UTF8").to_string()),
+            "standard_conforming_strings" => Some(
+                self.standard_conforming_strings
+                    .as_deref()
+                    .unwrap_or("on")
+                    .to_string(),
+            ),
+            "check_function_bodies" => Some(self.check_function_bodies.as_deref().unwrap_or("on").to_string()),
+            "xmloption" => Some(self.xmloption.as_deref().unwrap_or("content").to_string()),
+            "client_min_messages" => Some(
+                self.client_min_messages
+                    .as_deref()
+                    .unwrap_or("notice")
+                    .to_string(),
+            ),
+            "row_security" => Some(self.row_security.as_deref().unwrap_or("on").to_string()),
+            "default_tablespace" => Some(self.default_tablespace.as_deref().unwrap_or("").to_string()),
+            "default_table_access_method" => Some(
+                self.default_table_access_method
+                    .as_deref()
+                    .unwrap_or("heap")
+                    .to_string(),
+            ),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn statement_timeout(&self) -> Option<Duration> {
+        if self.statement_timeout_ms == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.statement_timeout_ms))
+        }
+    }
 }
 
 pub struct Session {
@@ -19,7 +184,7 @@ pub struct Session {
     state: TransactionState,
     savepoints: Arc<SavepointState>,
     last_sequence_values: HashMap<String, i64>,
-    search_path: Vec<String>,
+    settings: SessionSettings,
     #[allow(dead_code)]
     current_user: Option<String>,
     #[allow(dead_code)]
@@ -36,7 +201,7 @@ impl Session {
             state: TransactionState::Idle,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
-            search_path: vec!["public".to_string()],
+            settings: SessionSettings::new(),
             current_user: None,
             is_superuser: false,
             connection_id,
@@ -56,7 +221,7 @@ impl Session {
             state: TransactionState::Idle,
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
-            search_path: vec!["public".to_string()],
+            settings: SessionSettings::new(),
             current_user: Some(username),
             is_superuser,
             connection_id,
@@ -110,7 +275,7 @@ impl Session {
     ) -> Option<(&mut Transaction, &mut HashMap<String, i64>, &[String])> {
         match &mut self.state {
             TransactionState::Active(txn) => {
-                Some((txn, &mut self.last_sequence_values, &self.search_path))
+                Some((txn, &mut self.last_sequence_values, self.settings.search_path()))
             }
             _ => None,
         }
@@ -118,11 +283,23 @@ impl Session {
 
     #[allow(dead_code)]
     pub fn search_path(&self) -> &[String] {
-        &self.search_path
+        self.settings.search_path()
     }
 
     pub fn set_search_path(&mut self, search_path: Vec<String>) {
-        self.search_path = search_path;
+        self.settings.set_search_path(search_path);
+    }
+
+    pub(crate) fn set_known_setting(&mut self, name: &str, value: String) -> Result<bool> {
+        self.settings.set_known_setting(name, value)
+    }
+
+    pub(crate) fn show_setting_value(&self, name: &str) -> Option<String> {
+        self.settings.show_value(name)
+    }
+
+    pub(crate) fn statement_timeout(&self) -> Option<Duration> {
+        self.settings.statement_timeout()
     }
 
     pub fn create_savepoint(&mut self, name: String) -> Result<()> {
@@ -227,5 +404,80 @@ impl Session {
                 Ok(()) // No-op
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SessionSettings;
+
+    #[test]
+    fn test_session_settings_defaults_and_overrides() {
+        let mut settings = SessionSettings::new();
+
+        assert_eq!(settings.show_value("server_version").as_deref(), Some("16.0"));
+        assert_eq!(
+            settings.show_value("server_version_num").as_deref(),
+            Some("160000")
+        );
+        assert_eq!(settings.show_value("timezone").as_deref(), Some("UTC"));
+        assert_eq!(settings.show_value("application_name").as_deref(), Some(""));
+        assert_eq!(settings.show_value("search_path").as_deref(), Some("public"));
+        assert_eq!(settings.show_value("statement_timeout").as_deref(), Some("0"));
+        assert_eq!(settings.show_value("client_encoding").as_deref(), Some("UTF8"));
+
+        assert!(settings
+            .set_known_setting("client_min_messages", "warning".to_string())
+            .unwrap());
+        assert_eq!(
+            settings.show_value("client_min_messages").as_deref(),
+            Some("warning")
+        );
+
+        assert!(settings
+            .set_known_setting("timezone", "Asia/Shanghai".to_string())
+            .unwrap());
+        assert_eq!(
+            settings.show_value("timezone").as_deref(),
+            Some("Asia/Shanghai")
+        );
+
+        assert!(settings
+            .set_known_setting("application_name", "pg-tikv-tests".to_string())
+            .unwrap());
+        assert_eq!(
+            settings.show_value("application_name").as_deref(),
+            Some("pg-tikv-tests")
+        );
+
+        assert!(!settings
+            .set_known_setting("unknown_setting", "x".to_string())
+            .unwrap());
+        assert_eq!(settings.show_value("unknown_setting"), None);
+    }
+
+    #[test]
+    fn test_session_settings_timeout_parsing() {
+        let mut settings = SessionSettings::new();
+
+        settings
+            .set_known_setting("statement_timeout", "20".to_string())
+            .unwrap();
+        assert_eq!(settings.show_value("statement_timeout").as_deref(), Some("20"));
+
+        settings
+            .set_known_setting("statement_timeout", "1s".to_string())
+            .unwrap();
+        assert_eq!(settings.show_value("statement_timeout").as_deref(), Some("1000"));
+
+        assert!(settings
+            .set_known_setting("statement_timeout", "-1".to_string())
+            .is_err());
+        assert!(settings
+            .set_known_setting("statement_timeout", "abc".to_string())
+            .is_err());
+        assert!(settings
+            .set_known_setting("statement_timeout", "1unknown".to_string())
+            .is_err());
     }
 }

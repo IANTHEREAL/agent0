@@ -99,6 +99,7 @@ impl Executor {
             indexes: vec![],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: "postgres".to_string(),
         };
 
         ddl::execute_create_materialized_view(

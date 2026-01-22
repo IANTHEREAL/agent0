@@ -15,6 +15,12 @@ thread_local! {
     static CONNECTION_ID: Cell<i32> = const { Cell::new(0) };
 }
 
+const VERSION_STRING: &str = concat!(
+    "PostgreSQL 16.0 (pg-tikv ",
+    env!("CARGO_PKG_VERSION"),
+    " on TiKV)"
+);
+
 /// Set the connection_id for the current thread (call before query execution)
 pub fn set_connection_id(id: i32) {
     CONNECTION_ID.with(|c| c.set(id));
@@ -2897,9 +2903,7 @@ fn eval_function(
         "SET_CONFIG" => Ok(Value::Text(String::new())),
         "PG_IS_IN_RECOVERY" => Ok(Value::Boolean(false)),
         "PG_BACKEND_PID" => Ok(Value::Int32(get_connection_id())),
-        "VERSION" => Ok(Value::Text(
-            "PostgreSQL 15.0 on x86_64-pc-linux-gnu, compiled by gcc, 64-bit".to_string(),
-        )),
+        "VERSION" => Ok(Value::Text(VERSION_STRING.to_string())),
         "CURRENT_DATABASE" => Ok(Value::Text("postgres".to_string())),
         "CURRENT_SCHEMA" => Ok(Value::Text("public".to_string())),
         "CURRENT_USER" | "SESSION_USER" | "USER" => Ok(Value::Text("postgres".to_string())),
@@ -6367,6 +6371,16 @@ mod tests {
             }
         }
         panic!("Failed to parse expression");
+    }
+
+    #[test]
+    fn test_version_includes_pg_tikv() {
+        let v = eval_expr(&parse_expr("version()"), None, None).unwrap();
+        let Value::Text(s) = v else {
+            panic!("version() must return text");
+        };
+        assert!(s.starts_with("PostgreSQL "));
+        assert!(s.contains("pg-tikv "));
     }
 
     #[test]

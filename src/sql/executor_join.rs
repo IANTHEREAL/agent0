@@ -151,6 +151,7 @@ impl Executor {
                 version: 1,
                 check_constraints: vec![],
                 foreign_keys: vec![],
+                owner: String::new(),
             };
 
             let row = Row::new(vec![
@@ -242,6 +243,7 @@ impl Executor {
                 version: 1,
                 check_constraints: vec![],
                 foreign_keys: vec![],
+                owner: String::new(),
             };
 
             let rows = groups
@@ -446,6 +448,7 @@ impl Executor {
                 version: 1,
                 check_constraints: vec![],
                 foreign_keys: vec![],
+                owner: String::new(),
             };
 
             let row = Row::new(vec![
@@ -592,6 +595,7 @@ impl Executor {
                 version: 1,
                 check_constraints: vec![],
                 foreign_keys: vec![],
+                owner: String::new(),
             };
 
             return Ok((schema, rows));
@@ -626,6 +630,7 @@ impl Executor {
                 version: 1,
                 check_constraints: vec![],
                 foreign_keys: vec![],
+                owner: String::new(),
             };
             let rows = vec![Row::new(vec![result])];
             return Ok((schema, rows));
@@ -686,6 +691,7 @@ impl Executor {
                             version: 1,
                             check_constraints: vec![],
                             foreign_keys: vec![],
+                            owner: String::new(),
                         };
                         Ok((schema, rows))
                     }
@@ -729,6 +735,7 @@ impl Executor {
                 version: 1,
                 check_constraints: vec![],
                 foreign_keys: vec![],
+                owner: String::new(),
             };
             let rows = vec![Row::new(vec![result])];
             return Ok((schema, rows));
@@ -792,6 +799,7 @@ impl Executor {
             version: 1,
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
 
         let rows: Vec<Row> = values.into_iter().map(|v| Row::new(vec![v])).collect();
@@ -888,6 +896,7 @@ impl Executor {
                         version: 1,
                         check_constraints: vec![],
                         foreign_keys: vec![],
+                        owner: String::new(),
                     };
                     Ok((schema, rows))
                 }
@@ -1070,6 +1079,7 @@ impl Executor {
                             version: 1,
                             check_constraints: vec![],
                             foreign_keys: vec![],
+                            owner: String::new(),
                         };
 
                         let mut new_rows = Vec::new();
@@ -1143,6 +1153,7 @@ impl Executor {
                             version: 1,
                             check_constraints: vec![],
                             foreign_keys: vec![],
+                            owner: String::new(),
                         };
                         combined_rows = new_rows;
                     }
@@ -1176,6 +1187,7 @@ impl Executor {
                         version: 1,
                         check_constraints: vec![],
                         foreign_keys: vec![],
+                        owner: String::new(),
                     };
 
                     Ok((final_alias, final_schema, combined_rows))
@@ -1487,6 +1499,7 @@ impl Executor {
                             indexes: vec![],
                             check_constraints: vec![],
                             foreign_keys: vec![],
+                            owner: String::new(),
                         });
                     }
 
@@ -1743,6 +1756,7 @@ impl Executor {
                 indexes: vec![],
                 check_constraints: vec![],
                 foreign_keys: vec![],
+                owner: String::new(),
             };
 
             let mut new_combined_rows = Vec::new();
@@ -1869,6 +1883,7 @@ impl Executor {
             indexes: vec![],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
 
         // Resolve subqueries (EXISTS, IN (SELECT ...), scalar subqueries) in WHERE clause
@@ -2098,6 +2113,36 @@ impl Executor {
                     }
                     aggs[agg_idx].update(&val)?;
                 }
+            }
+
+            if groups.is_empty() && group_keys_exprs.is_empty() && !agg_funcs.is_empty() {
+                // PostgreSQL semantics: aggregate query without GROUP BY returns exactly one row,
+                // even when the input is empty (e.g., `SELECT COUNT(*) FROM empty` -> 0).
+                let key: Vec<Value> = Vec::new();
+                let key_bytes = bincode::serialize(&key).unwrap();
+
+                let mut aggs = Vec::new();
+                for (_, agg_expr) in &agg_funcs {
+                    match agg_expr {
+                        AggExpr::Function(f) => {
+                            let name = f.name.0.last().unwrap().value.to_uppercase();
+                            if name == "STRING_AGG" {
+                                aggs.push(Aggregator::new_string_agg(",".to_string()));
+                            } else {
+                                aggs.push(Aggregator::new(&name)?);
+                            }
+                        }
+                        AggExpr::ArrayAgg(_) => {
+                            aggs.push(Aggregator::new_array_agg());
+                        }
+                    }
+                }
+
+                groups.insert(key_bytes.clone(), aggs);
+                group_rows.insert(
+                    key_bytes,
+                    Row::new(vec![Value::Null; final_schema.columns.len()]),
+                );
             }
 
             let mut final_rows = Vec::new();

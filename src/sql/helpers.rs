@@ -973,13 +973,16 @@ pub fn get_unsupported_reason(sql_upper: &str) -> Option<String> {
         return Some("ALTER AGGREGATE not supported".into());
     }
     if sql_upper.starts_with("ALTER FUNCTION") {
+        if sql_upper.contains(" OWNER TO ") {
+            return None;
+        }
         return Some("ALTER FUNCTION not supported".into());
     }
     if sql_upper.starts_with("ALTER SEQUENCE") {
+        if sql_upper.contains(" OWNER TO ") || sql_upper.contains(" OWNED BY ") {
+            return None;
+        }
         return Some("ALTER SEQUENCE not supported".into());
-    }
-    if sql_upper.starts_with("ALTER TABLE") && sql_upper.contains("OWNER TO") {
-        return Some("ALTER TABLE OWNER TO not supported".into());
     }
     None
 }
@@ -1558,6 +1561,7 @@ mod tests {
             indexes: vec![],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
 
         let dialect = PostgreSqlDialect {};
@@ -1594,6 +1598,7 @@ mod tests {
             indexes: vec![],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
 
         let dialect = PostgreSqlDialect {};
@@ -1630,6 +1635,7 @@ mod tests {
             indexes: vec![],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
 
         let dialect = PostgreSqlDialect {};
@@ -1666,6 +1672,7 @@ mod tests {
             indexes: vec![],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
 
         let dialect = PostgreSqlDialect {};
@@ -1708,6 +1715,7 @@ mod tests {
             indexes: vec![],
             check_constraints: vec![],
             foreign_keys: vec![],
+            owner: String::new(),
         };
 
         let dialect = PostgreSqlDialect {};

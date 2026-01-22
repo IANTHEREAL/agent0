@@ -30,6 +30,7 @@
 | GIN 索引查询加速 | P0 | JSONB 查询性能 |
 | AT TIME ZONE | P0 | 时区转换（Dify 大量使用） |
 | JSONB @> 操作符 | P0 | JSONB 包含查询 |
+| ALTER ... OWNER TO | P1 | Schema 导入警告 |
 | bytea 函数 | P1 | uuidv7() 依赖 |
 | CREATE EXTENSION | P1 | uuid-ossp 扩展 |
 | CURRENT_TIMESTAMP(0) | P1 | 精度截断 |
@@ -53,6 +54,7 @@ Phase 3 (P2): 性能优化      ← 3-5 天，GIN 索引加速
 | [04_bytea_functions.md](04_bytea_functions.md) | set_bit/int8send/uuid_send | P1 | 4h |
 | [05_encode_decode.md](05_encode_decode.md) | encode()/decode() | P1 | 2h |
 | [06_gin_index_query.md](06_gin_index_query.md) | GIN 索引查询优化 | P2 | 3-5d |
+| [07_alter_owner.md](07_alter_owner.md) | ALTER ... OWNER TO | P1 | 1-2d |
 
 ## 验证方案
 
