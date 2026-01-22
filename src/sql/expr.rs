@@ -220,6 +220,7 @@ fn eval_expr_join_impl(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
                 },
                 sqlparser::ast::UnaryOperator::Not => match val {
                     Value::Boolean(b) => Ok(Value::Boolean(!b)),
+                    Value::Null => Ok(Value::Null),
                     _ => Err(anyhow!("NOT requires boolean")),
                 },
                 _ => Err(anyhow!("Unsupported unary operator")),
@@ -1143,6 +1144,7 @@ fn eval_expr_impl(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) 
                 },
                 sqlparser::ast::UnaryOperator::Not => match val {
                     Value::Boolean(b) => Ok(Value::Boolean(!b)),
+                    Value::Null => Ok(Value::Null),
                     _ => Err(anyhow!("NOT requires boolean, got {:?}", val)),
                 },
                 _ => Err(anyhow!("Unsupported unary operator: {:?}", op)),
@@ -4913,12 +4915,24 @@ fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<Valu
         }
 
         // Logical
+        // SQL three-valued logic for boolean operators
+        // https://www.postgresql.org/docs/current/functions-logical.html
         BinaryOperator::And => match (left, right) {
-            (Value::Boolean(l), Value::Boolean(r)) => Ok(Value::Boolean(l && r)),
+            (Value::Boolean(false), _) | (_, Value::Boolean(false)) => Ok(Value::Boolean(false)),
+            (Value::Boolean(true), Value::Boolean(true)) => Ok(Value::Boolean(true)),
+            (Value::Boolean(true), Value::Null) | (Value::Null, Value::Boolean(true)) => {
+                Ok(Value::Null)
+            }
+            (Value::Null, Value::Null) => Ok(Value::Null),
             _ => Err(anyhow!("AND requires boolean operands")),
         },
         BinaryOperator::Or => match (left, right) {
-            (Value::Boolean(l), Value::Boolean(r)) => Ok(Value::Boolean(l || r)),
+            (Value::Boolean(true), _) | (_, Value::Boolean(true)) => Ok(Value::Boolean(true)),
+            (Value::Boolean(false), Value::Boolean(false)) => Ok(Value::Boolean(false)),
+            (Value::Boolean(false), Value::Null) | (Value::Null, Value::Boolean(false)) => {
+                Ok(Value::Null)
+            }
+            (Value::Null, Value::Null) => Ok(Value::Null),
             _ => Err(anyhow!("OR requires boolean operands")),
         },
 

@@ -42,6 +42,7 @@ pub fn is_information_schema_table(table_name: &str) -> bool {
                 | "pg_views"
                 | "pg_depend"
                 | "pg_indexes"
+                | "pg_collation"
         )
 }
 
@@ -84,6 +85,7 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
             "pg_views" => "pg_views",
             "pg_depend" => "pg_depend",
             "pg_indexes" => "pg_indexes",
+            "pg_collation" => "pg_collation",
             _ => return None,
         });
     }
@@ -107,6 +109,7 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
         "pg_tables" => Some("pg_tables"),
         "pg_views" => Some("pg_views"),
         "pg_depend" => Some("pg_depend"),
+        "pg_collation" => Some("pg_collation"),
         _ => None,
     }
 }
@@ -744,6 +747,34 @@ fn pg_am_schema() -> TableSchema {
     }
 }
 
+fn pg_collation_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_collation".to_string(),
+        columns: vec![
+            int_col("oid"),
+            text_col("collname"),
+            int_col("collnamespace"),
+            int_col("collowner"),
+            text_col("collprovider"),
+            bool_col("collisdeterministic"),
+            int_col("collencoding"),
+            text_col("collcollate"),
+            text_col("collctype"),
+            text_col("colllocale"),
+            text_col("collicurules"),
+            text_col("collversion"),
+        ],
+        version: 1,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+    }
+}
+
 fn pg_description_schema() -> TableSchema {
     TableSchema {
         table_id: 0,
@@ -934,6 +965,7 @@ pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
         "pg_views" => Some(pg_views_schema()),
         "pg_depend" => Some(pg_depend_schema()),
         "pg_indexes" => Some(pg_indexes_schema()),
+        "pg_collation" => Some(pg_collation_schema()),
         _ => None,
     }
 }
@@ -1114,6 +1146,7 @@ pub async fn get_information_schema_data(
         "pg_views" => get_pg_views_rows(store, txn).await?,
         "pg_depend" => get_pg_depend_rows(store, txn).await?,
         "pg_indexes" => get_pg_indexes_rows(store, txn, &user_tables).await?,
+        "pg_collation" => get_pg_collation_rows(&schema_oids),
         _ => vec![],
     };
 
@@ -2171,6 +2204,54 @@ fn get_pg_am_rows() -> Vec<Row> {
         Row::new(vec![int_val(2742), text_val("gin")]),
         Row::new(vec![int_val(4000), text_val("spgist")]),
         Row::new(vec![int_val(3580), text_val("brin")]),
+    ]
+}
+
+fn get_pg_collation_rows(schema_oids: &HashMap<String, u32>) -> Vec<Row> {
+    let pg_catalog_oid = schema_oids.get("pg_catalog").copied().unwrap_or(11) as i64;
+    vec![
+        Row::new(vec![
+            int_val(100),
+            text_val("default"),
+            int_val(pg_catalog_oid),
+            int_val(10),
+            text_val("d"),
+            Value::Boolean(true),
+            int_val(-1),
+            null_val(),
+            null_val(),
+            null_val(),
+            null_val(),
+            null_val(),
+        ]),
+        Row::new(vec![
+            int_val(950),
+            text_val("C"),
+            int_val(pg_catalog_oid),
+            int_val(10),
+            text_val("c"),
+            Value::Boolean(true),
+            int_val(-1),
+            text_val("C"),
+            text_val("C"),
+            null_val(),
+            null_val(),
+            null_val(),
+        ]),
+        Row::new(vec![
+            int_val(951),
+            text_val("POSIX"),
+            int_val(pg_catalog_oid),
+            int_val(10),
+            text_val("c"),
+            Value::Boolean(true),
+            int_val(-1),
+            text_val("POSIX"),
+            text_val("POSIX"),
+            null_val(),
+            null_val(),
+            null_val(),
+        ]),
     ]
 }
 

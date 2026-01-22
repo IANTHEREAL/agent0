@@ -2014,6 +2014,82 @@ mod tests {
             Expr::Value(SqlValue::Number(ref n, _)) if n == "7"
         ));
     }
+
+    #[test]
+    fn test_substitute_join_context_values_recurses_into_cast() {
+        let mut column_offsets: HashMap<String, usize> = HashMap::new();
+        column_offsets.insert("pg_attribute.attrelid".to_string(), 0);
+
+        let combined_row = Row {
+            values: vec![Value::Int32(42)],
+        };
+
+        let expr = Expr::Cast {
+            expr: Box::new(Expr::CompoundIdentifier(vec![
+                Ident::new("pg_catalog"),
+                Ident::new("pg_attribute"),
+                Ident::new("attrelid"),
+            ])),
+            data_type: sqlparser::ast::DataType::Regclass,
+            format: None,
+        };
+
+        let out = substitute_join_context_values(&expr, &column_offsets, &combined_row);
+        match out {
+            Expr::Cast { expr: inner, .. } => assert!(matches!(
+                *inner,
+                Expr::Value(SqlValue::Number(ref n, _)) if n == "42"
+            )),
+            other => panic!("expected cast expression, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_expr_has_outer_reference_schema_qualified_compound_identifier() {
+        let expr = Expr::CompoundIdentifier(vec![
+            Ident::new("pg_catalog"),
+            Ident::new("pg_attribute"),
+            Ident::new("attrelid"),
+        ]);
+        assert!(expr_has_outer_reference(&expr, "pg_attribute"));
+        assert!(!expr_has_outer_reference(&expr, "pg_attrdef"));
+    }
+
+    #[test]
+    fn test_substitute_outer_values_schema_qualified_compound_identifier() {
+        let outer_schema = TableSchema {
+            name: "o".to_string(),
+            table_id: 0,
+            columns: vec![ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+        let outer_row = Row::new(vec![Value::Int32(9)]);
+
+        let expr = Expr::CompoundIdentifier(vec![
+            Ident::new("pg_catalog"),
+            Ident::new("o"),
+            Ident::new("id"),
+        ]);
+        let out = substitute_outer_values(&expr, "o", &outer_schema, &outer_row);
+        assert!(matches!(
+            out,
+            Expr::Value(SqlValue::Number(ref n, _)) if n == "9"
+        ));
+    }
 }
 
 pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
@@ -2212,7 +2288,9 @@ pub fn expr_has_outer_reference(expr: &Expr, outer_alias: &str) -> bool {
     match expr {
         Expr::CompoundIdentifier(parts) => {
             if parts.len() >= 2 {
-                let table_part = normalize_ident(&parts[0]);
+                // Support schema-qualified (schema.table.col) and even db.schema.table.col by
+                // treating the second-to-last identifier as the table/alias.
+                let table_part = normalize_ident(&parts[parts.len() - 2]);
                 table_part.eq_ignore_ascii_case(outer_alias)
             } else {
                 false
@@ -2397,9 +2475,12 @@ pub fn substitute_outer_values(
     match expr {
         Expr::CompoundIdentifier(parts) => {
             if parts.len() >= 2 {
-                let table_part = normalize_ident(&parts[0]);
+                // Support schema-qualified (schema.table.col) and even db.schema.table.col by
+                // treating the second-to-last identifier as the table/alias.
+                let table_part = normalize_ident(&parts[parts.len() - 2]);
                 if table_part.eq_ignore_ascii_case(outer_alias) {
-                    let col_name = normalize_ident(&parts[1]);
+                    let col_name =
+                        parts.last().map(normalize_ident).unwrap_or_else(|| "".to_string());
                     // Find column index in outer schema
                     if let Some(col_idx) = outer_schema
                         .columns
@@ -2747,6 +2828,45 @@ pub fn substitute_join_context_values(
             column_offsets,
             combined_row,
         ))),
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            format,
+        } => Expr::Cast {
+            expr: Box::new(substitute_join_context_values(
+                inner,
+                column_offsets,
+                combined_row,
+            )),
+            data_type: data_type.clone(),
+            format: format.clone(),
+        },
+        Expr::TryCast {
+            expr: inner,
+            data_type,
+            format,
+        } => Expr::TryCast {
+            expr: Box::new(substitute_join_context_values(
+                inner,
+                column_offsets,
+                combined_row,
+            )),
+            data_type: data_type.clone(),
+            format: format.clone(),
+        },
+        Expr::SafeCast {
+            expr: inner,
+            data_type,
+            format,
+        } => Expr::SafeCast {
+            expr: Box::new(substitute_join_context_values(
+                inner,
+                column_offsets,
+                combined_row,
+            )),
+            data_type: data_type.clone(),
+            format: format.clone(),
+        },
         Expr::Function(f) => {
             let mut new_args = Vec::new();
             for arg in &f.args {
