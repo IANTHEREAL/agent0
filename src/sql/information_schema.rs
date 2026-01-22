@@ -714,6 +714,7 @@ fn pg_constraint_schema() -> TableSchema {
             int_col("connamespace"),
             text_col("contype"),
             int_col("conrelid"),
+            int_col("contypid"),
             int_col("confrelid"),
             int_array_col("conkey"),
             int_array_col("confkey"),
@@ -721,7 +722,7 @@ fn pg_constraint_schema() -> TableSchema {
             text_col("confupdtype"),
             bool_col("condeferrable"),
             bool_col("condeferred"),
-            text_col("constraintdef"), // Pre-computed definition for pg_get_constraintdef()
+            text_col("constraintdef"),
         ],
         version: 1,
         pk_constraint_name: None,
@@ -2330,6 +2331,7 @@ async fn get_pg_constraint_rows(
                 int_val(connamespace_oid),
                 text_val("p"),
                 int_val(conrelid),
+                int_val(0), // contypid
                 int_val(0), // confrelid
                 Value::Array(conkey),
                 Value::Array(vec![]),
@@ -2360,7 +2362,8 @@ async fn get_pg_constraint_rows(
                 int_val(connamespace_oid),
                 text_val("u"),
                 int_val(conrelid),
-                int_val(0),
+                int_val(0), // contypid
+                int_val(0), // confrelid
                 Value::Array(conkey),
                 Value::Array(vec![]),
                 null_val(),
@@ -2389,7 +2392,8 @@ async fn get_pg_constraint_rows(
                 int_val(connamespace_oid),
                 text_val("c"),
                 int_val(conrelid),
-                int_val(0),
+                int_val(0), // contypid
+                int_val(0), // confrelid
                 Value::Array(vec![]),
                 Value::Array(vec![]),
                 null_val(),
@@ -2444,6 +2448,7 @@ async fn get_pg_constraint_rows(
                 int_val(connamespace_oid),
                 text_val("f"),
                 int_val(conrelid),
+                int_val(0), // contypid
                 int_val(confrelid),
                 Value::Array(conkey),
                 Value::Array(confkey),
