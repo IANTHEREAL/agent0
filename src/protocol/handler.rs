@@ -2727,6 +2727,8 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
 
         ExecuteResult::AlterFunction { .. } => Ok(Response::Execution(Tag::new("ALTER FUNCTION"))),
 
+        ExecuteResult::AlterIndex { .. } => Ok(Response::Execution(Tag::new("ALTER INDEX"))),
+
         ExecuteResult::Insert { affected_rows } => Ok(Response::Execution(
             Tag::new("INSERT")
                 .with_oid(0)

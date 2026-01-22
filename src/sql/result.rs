@@ -36,6 +36,10 @@ pub enum ExecuteResult {
     AlterFunction {
         function_name: String,
     },
+    /// ALTER INDEX result
+    AlterIndex {
+        index_name: String,
+    },
     /// CREATE INDEX result
     CreateIndex {
         index_name: String,

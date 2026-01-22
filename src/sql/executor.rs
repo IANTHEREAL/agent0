@@ -1697,7 +1697,9 @@ impl Executor {
                     .await
                 }
             }
-            Statement::AlterIndex { .. } => Ok(ExecuteResult::Empty),
+            Statement::AlterIndex { name, .. } => Ok(ExecuteResult::AlterIndex {
+                index_name: name.to_string(),
+            }),
             Statement::CreateRole {
                 names,
                 if_not_exists,
