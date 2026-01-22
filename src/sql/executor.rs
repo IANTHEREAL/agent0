@@ -1413,7 +1413,7 @@ impl Executor {
                 }
             }
 
-            Ok(ExecuteResult::Empty)
+            Ok(ExecuteResult::CommandComplete { tag: "COMMENT" })
         }
         .await;
 
