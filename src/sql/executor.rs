@@ -1758,7 +1758,7 @@ impl Executor {
                 )
                 .await
             }
-            Statement::Comment { .. } => Ok(ExecuteResult::Empty),
+            Statement::Comment { .. } => Ok(ExecuteResult::CommandComplete { tag: "COMMENT" }),
             Statement::Copy { .. } => Ok(ExecuteResult::Empty),
             Statement::Explain {
                 statement,

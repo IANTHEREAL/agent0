@@ -370,6 +370,10 @@ cd orm-tests && npm test -- --grep "TypeORM"
 - Window functions sort entire result set (not streaming)
 - `count()` in JOIN context not supported (use `.errors` file)
 
+## TODO
+
+- [ ] `ALTER INDEX ... RENAME TO` - Currently a stub that returns success without actually renaming the index. Need to implement: find index in table schema, update index name, persist updated schema to TiKV.
+
 ## Environment Variables
 
 | Var | Default | Purpose |
