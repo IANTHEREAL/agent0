@@ -823,6 +823,10 @@ impl TikvStore {
         let row_data = serialize_row(&row)?;
         if txn.get(data_key.clone()).await?.is_some() {
             let short_table = table_name.rsplit('.').next().unwrap_or(table_name);
+            let constraint_name = schema
+                .pk_constraint_name
+                .clone()
+                .unwrap_or_else(|| format!("{}_pkey", short_table));
             let pk_col_names: Vec<String> = schema
                 .pk_indices
                 .iter()
@@ -839,8 +843,8 @@ impl TikvStore {
                 })
                 .collect();
             return Err(anyhow!(
-                "duplicate key value violates unique constraint \"{}_pkey\"\nDETAIL:  Key ({})=({}) already exists.",
-                short_table,
+                "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+                constraint_name,
                 pk_col_names.join(", "),
                 pk_val_strs.join(", ")
             ));

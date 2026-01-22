@@ -1,0 +1,603 @@
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:34: ERROR:  Table 'pg_database' not found
+ has_database_privilege 
+------------------------
+ t
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:43: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:49: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:52: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:58: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:62: ERROR:  Schema 's' already exists
+    schema_name     
+--------------------
+ crdb_internal
+ extensions
+ information_schema
+ pg_catalog
+ public
+ root_test
+ s
+ s2
+ sc
+(9 rows)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:142: ERROR:  Table 'pg_database' not found
+ id 
+----
+  2
+  3
+  7
+(3 rows)
+
+ ?column? 
+----------
+        1
+(1 row)
+
+ ?column? 
+----------
+        1
+(1 row)
+
+ id 
+----
+  2
+  3
+  7
+(3 rows)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:197: ERROR:  Table 'pg_database' not found
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+ ?column? 
+----------
+        1
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:208: ERROR:  Table 'public.a' already exists
+ id 
+----
+  2
+  3
+  7
+(3 rows)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:220: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: USER at Line: 1, Column 7
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+                warning                
+---------------------------------------
+ SKIPPED: ALTER DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:246: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: USER at Line: 1, Column 7
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:271: ERROR:  Table 'pg_settings' not found
+  attrelid   |  attname  | atttypid | attnum | attlen | attnotnull | atthasdef | attisdropped | attislocal | atttypmod | attgenerated | attidentity 
+-------------+-----------+----------+--------+--------+------------+-----------+--------------+------------+-----------+--------------+-------------
+ 10000000055 | id        |       23 |      1 |      4 | t          | f         | f            | t          |        -1 |              | 
+ 10000000037 | job_id    |       20 |      1 |      8 | t          | t         | f            | t          |        -1 |              | 
+ 10000000037 | job_type  |       25 |      2 |     -1 | t          | f         | f            | t          |        -1 |              | 
+ 10000000037 | status    |       25 |      3 |     -1 | t          | f         | f            | t          |        -1 |              | 
+ 10000000044 | a         |       25 |      1 |     -1 | f          | f         | f            | t          |        -1 |              | 
+ 10000000031 | key       |       25 |      1 |     -1 | t          | f         | f            | t          |        -1 |              | 
+ 10000000031 | value     |       23 |      2 |      4 | t          | f         | f            | t          |        -1 |              | 
+ 10000000031 | extra     |       23 |      3 |      4 | t          | f         | f            | t          |        -1 |              | 
+ 10000000052 | k         |       25 |      1 |     -1 | t          | f         | f            | t          |        -1 |              | 
+ 10000000052 | v         |       25 |      2 |     -1 | f          | f         | f            | t          |        -1 |              | 
+ 10000000042 | k         |       23 |      1 |      4 | t          | f         | f            | t          |        -1 |              | 
+ 10000000042 | c         |       25 |      2 |     -1 | f          | f         | f            | t          |        -1 |              | 
+ 10000000043 | c         |       25 |      1 |     -1 | f          | f         | f            | t          |        -1 |              | 
+ 10000000028 | _int8     |       20 |      1 |      8 | f          | t         | f            | t          |        -1 |              | 
+ 10000000028 | _float8   |      701 |      2 |      8 | f          | t         | f            | t          |        -1 |              | 
+ 10000000028 | _date     |     1082 |      3 |      4 | f          | t         | f            | t          |        -1 |              | 
+ 10000000028 | _jsonb    |     3802 |      4 |     -1 | f          | t         | f            | t          |        -1 |              | 
+ 10000000053 | _rowid    |       20 |      1 |      8 | t          | t         | f            | t          |        -1 |              | 
+ 10000000053 | char(256) |       23 |      2 |      4 | f          | f         | f            | t          |        -1 |              | 
+ 10000000047 | k         |       25 |      1 |     -1 | t          | f         | f            | t          |        -1 |              | 
+ 10000000047 | v         |       25 |      2 |     -1 | f          | f         | f            | t          |        -1 |              | 
+ 10000000033 | _rowid    |       20 |      1 |      8 | t          | t         | f            | t          |        -1 |              | 
+ 10000000033 | _bool     |       16 |      2 |      1 | f          | f         | f            | t          |        -1 |              | 
+ 10000000032 | a         |       23 |      1 |      4 | f          | f         | f            | t          |        -1 |              | 
+ 10000000032 | b         |     1114 |      2 |      8 | f          | f         | f            | t          |        -1 |              | 
+ 10000000034 | i         |       23 |      1 |      4 | f          | f         | f            | t          |        -1 |              | 
+ 10000000050 | a         |       23 |      1 |      4 | f          | f         | f            | t          |        -1 |              | 
+ 10000000051 | b         |       23 |      1 |      4 | f          | f         | f            | t          |        -1 |              | 
+ 10000000026 | l         |       23 |      1 |      4 | f          | f         | f            | t          |        -1 |              | 
+ 10000000026 | str2      |       25 |      2 |     -1 | f          | f         | f            | t          |        -1 |              | 
+ 10000000027 | m         |       23 |      1 |      4 | f          | f         | f            | t          |        -1 |              | 
+ 10000000027 | str3      |       25 |      2 |     -1 | f          | f         | f            | t          |        -1 |              | 
+ 10000000036 | c01       |       23 |      1 |      4 | f          | f         | f            | t          |        -1 |              | 
+ 10000000029 | a         |       20 |      1 |      8 | f          | f         | f            | t          |        -1 |              | 
+ 10000000030 | b         |       20 |      1 |      8 | f          | f         | f            | t          |        -1 |              | 
+ 10000000038 | a         |       23 |      1 |      4 | f          | f         | f            | t          |        -1 |              | 
+(36 rows)
+
+ ?column? 
+----------
+ 
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:287: ERROR:  Schema 's' already exists
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:323: ERROR:  Table 'pg_database' not found
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:327: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: USER at Line: 1, Column 8
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:344: ERROR:  Table 'pg_database' not found
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:353: ERROR:  Table 'pg_database' not found
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+    schema_name     
+--------------------
+ crdb_internal
+ extensions
+ information_schema
+ pg_catalog
+ public
+ regression_105906
+ root_test
+ s
+ s2
+ sc
+(10 rows)
+
+    schema_name     
+--------------------
+ crdb_internal
+ extensions
+ information_schema
+ pg_catalog
+ public
+ regression_105906
+ root_test
+ s
+ s2
+ sc
+(10 rows)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+    schema_name     
+--------------------
+ crdb_internal
+ extensions
+ information_schema
+ pg_catalog
+ public
+ rEgReSsIoN 105906
+ root_test
+ s
+ s2
+ sc
+(10 rows)
+
+    schema_name     
+--------------------
+ crdb_internal
+ extensions
+ information_schema
+ pg_catalog
+ public
+ rEgReSsIoN 105906
+ root_test
+ s
+ s2
+ sc
+(10 rows)
+
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/121_database.sql:405: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

@@ -430,6 +430,9 @@ pub struct TableSchema {
     pub table_id: u64,
     pub columns: Vec<ColumnDef>,
     pub version: u64,
+    /// Primary key constraint name (e.g. `table_pkey` or a user-specified `CONSTRAINT` name).
+    #[serde(default)]
+    pub pk_constraint_name: Option<String>,
     pub pk_indices: Vec<usize>,
     pub indexes: Vec<IndexDef>,
     #[serde(default)]
@@ -449,11 +452,18 @@ impl TableSchema {
         columns: Vec<ColumnDef>,
         pk_indices: Vec<usize>,
     ) -> Self {
+        let pk_constraint_name = if pk_indices.is_empty() {
+            None
+        } else {
+            let short = name.rsplit('.').next().unwrap_or(&name);
+            Some(format!("{}_pkey", short))
+        };
         Self {
             name,
             table_id,
             columns,
             version: 1,
+            pk_constraint_name,
             pk_indices,
             indexes: Vec::new(),
             check_constraints: Vec::new(),

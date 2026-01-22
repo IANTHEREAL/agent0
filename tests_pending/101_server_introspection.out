@@ -1,0 +1,24 @@
+version_prefix
+t
+(1 row)
+version_has_pgtikv
+t
+(1 row)
+server_version
+16.0
+(1 row)
+server_version_num
+160000
+(1 row)
+server_version_num
+160000
+(1 row)
+timezone
+UTC
+(1 row)
+application_name
+pg-tikv-tests
+(1 row)
+timezone
+Asia/Shanghai
+(1 row)

@@ -1,0 +1,10 @@
+psql:/home/dongxu/lab/pg-tikv/tests/176_pg_extension.sql:10: ERROR:  Extension 'postgis' is not available
+psql:/home/dongxu/lab/pg-tikv/tests/176_pg_extension.sql:15: NOTICE:  table "pg_extension_test" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/176_pg_extension.sql:30: ERROR:  Table 'crdb_extension.geography_columns' not found
+psql:/home/dongxu/lab/pg-tikv/tests/176_pg_extension.sql:33: ERROR:  Table 'crdb_extension.geometry_columns' not found
+psql:/home/dongxu/lab/pg-tikv/tests/176_pg_extension.sql:36: ERROR:  Table 'geography_columns' not found
+psql:/home/dongxu/lab/pg-tikv/tests/176_pg_extension.sql:39: ERROR:  Table 'geometry_columns' not found
+psql:/home/dongxu/lab/pg-tikv/tests/176_pg_extension.sql:42: ERROR:  Table 'crdb_extension.spatial_ref_sys' not found
+psql:/home/dongxu/lab/pg-tikv/tests/176_pg_extension.sql:45: ERROR:  Table 'spatial_ref_sys' not found
+psql:/home/dongxu/lab/pg-tikv/tests/176_pg_extension.sql:47: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/pg-tikv/tests/176_pg_extension.sql:48: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

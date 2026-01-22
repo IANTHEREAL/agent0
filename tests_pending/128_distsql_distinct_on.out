@@ -1,0 +1,52 @@
+psql:/home/dongxu/lab/pg-tikv/tests/128_distsql_distinct_on.sql:10: ERROR:  Table 'public.xyz' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/128_distsql_distinct_on.sql:20: ERROR:  Column count mismatch
+ x | y | z 
+---+---+---
+ 1 | 2 | 3
+ 2 | 5 | 6
+ 3 | 2 | 3
+ 4 | 5 | 6
+ 5 | 2 | 6
+ 6 | 3 | 5
+ 7 | 2 | 9
+ 8 | 2 |  
+ 9 | 2 |  
+(9 rows)
+
+ x | y | z 
+---+---+---
+ 1 | 2 | 3
+ 2 | 5 | 6
+ 3 | 2 | 3
+ 4 | 5 | 6
+ 5 | 2 | 6
+ 6 | 3 | 5
+ 7 | 2 | 9
+ 8 | 2 |  
+ 9 | 2 |  
+(9 rows)
+
+ x | y 
+---+---
+ 1 | 2
+ 6 | 3
+ 2 | 5
+(3 rows)
+
+ a | b | c 
+---+---+---
+ 1 | 1 | 1
+ 2 | 3 | 4
+ 1 | 2 | 2
+ 1 | 1 | 2
+ 3 | 4 | 5
+(5 rows)
+
+ a | b 
+---+---
+ 1 | 1
+ 1 | 2
+ 2 | 3
+ 3 | 4
+(4 rows)
+

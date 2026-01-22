@@ -1,0 +1,178 @@
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:24: ERROR:  Table 'public.foo' already exists
+ nextval 
+---------
+       1
+(1 row)
+
+ column_name |                    column_default                    
+-------------+------------------------------------------------------
+ x           | length(CAST(pg_typeof(CAST(123 AS BIGINT)) AS TEXT))
+ j           | nextval(CAST('test_seq' AS REGCLASS))
+ k           | nextval('public.foo_k_seq'::regclass)
+ l           | currval('diff_db.test_seq')
+(4 rows)
+
+ column_name |                    column_default                    
+-------------+------------------------------------------------------
+ x           | length(CAST(pg_typeof(CAST(123 AS BIGINT)) AS TEXT))
+ j           | nextval(CAST('test_seq' AS REGCLASS))
+ k           | nextval('public.foo_k_seq'::regclass)
+ l           | currval('diff_db.test_seq')
+(4 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:94: ERROR:  Unsupported function: pg_get_serial_sequence
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:116: ERROR:  Sequence 'public.s2' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:123: ERROR:  Table 'public.bar' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:126: ERROR:  Sequence name must be text/regclass
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:129: ERROR:  Column count mismatch
+                warning                
+---------------------------------------
+ SKIPPED: ALTER SEQUENCE not supported
+(1 row)
+
+                warning                
+---------------------------------------
+ SKIPPED: ALTER SEQUENCE not supported
+(1 row)
+
+                warning                
+---------------------------------------
+ SKIPPED: ALTER SEQUENCE not supported
+(1 row)
+
+ column_name | column_default 
+-------------+----------------
+ x           | 
+(1 row)
+
+ column_name | column_default 
+-------------+----------------
+ x           | 
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:155: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:158: ERROR:  Column 'i' not found
+ nextval 
+---------
+       1
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:189: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: SCHEMA at Line: 1, Column 7
+ column_name | column_default 
+-------------+----------------
+(0 rows)
+
+ column_name | column_default 
+-------------+----------------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:206: ERROR:  Table 'new_other_db.t' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:209: ERROR:  Table 'new_other_db.t' not found
+ nextval 
+---------
+       1
+(1 row)
+
+                warning                
+---------------------------------------
+ SKIPPED: ALTER SEQUENCE not supported
+(1 row)
+
+                warning                
+---------------------------------------
+ SKIPPED: ALTER SEQUENCE not supported
+(1 row)
+
+                warning                
+---------------------------------------
+ SKIPPED: ALTER SEQUENCE not supported
+(1 row)
+
+ column_name |            column_default            
+-------------+--------------------------------------
+ i           | nextval('public.tb_i_seq'::regclass)
+ j           | nextval(CAST('sc_s1' AS REGCLASS))
+ k           | currval('sc_s2')
+(3 rows)
+
+ column_name |            column_default            
+-------------+--------------------------------------
+ i           | nextval('public.tb_i_seq'::regclass)
+ j           | nextval(CAST('sc_s1' AS REGCLASS))
+ k           | currval('sc_s2')
+(3 rows)
+
+ i | j | k 
+---+---+---
+ 1 | 1 | 1
+ 2 | 2 | 1
+(2 rows)
+
+ nextval 
+---------
+       1
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:296: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: SCHEMA at Line: 1, Column 7
+ column_name | column_default 
+-------------+----------------
+(0 rows)
+
+ column_name | column_default 
+-------------+----------------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:313: ERROR:  Table 'new_test_schema.foo' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:316: ERROR:  Table 'new_test_schema.foo' not found
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:326: ERROR:  Schema 'other_db' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:329: ERROR:  Table 'other_db.t' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:344: ERROR:  Table 'public.t2' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:345: ERROR:  Sequence 'public.s5' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:346: ERROR:  Column 'j' does not exist
+                warning                
+---------------------------------------
+ SKIPPED: ALTER SEQUENCE not supported
+(1 row)
+
+ column_name | column_default 
+-------------+----------------
+ x           | 
+(1 row)
+
+ column_name | column_default 
+-------------+----------------
+ x           | 
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:368: ERROR:  Unsupported function: pg_get_serial_sequence
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:371: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:374: ERROR:  Table 'public.t3' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:377: ERROR:  Table 'public.t4' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:389: ERROR:  Unsupported function: pg_get_viewdef
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:397: ERROR:  Unsupported function: pg_get_viewdef
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:406: ERROR:  Unsupported function: pg_get_viewdef
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:415: ERROR:  Unsupported function: pg_get_viewdef
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:418: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: WITH at Line: 1, Column 70
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:421: ERROR:  Unsupported function: pg_get_viewdef
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:430: ERROR:  Unsupported function: pg_get_viewdef
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:436: ERROR:  Unsupported function: pg_get_viewdef
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:442: ERROR:  Unsupported function: pg_get_viewdef
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:448: ERROR:  Unsupported function: pg_get_viewdef
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:454: ERROR:  Unsupported function: pg_get_viewdef
+                warning                
+---------------------------------------
+ SKIPPED: ALTER SEQUENCE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:460: ERROR:  Unsupported function: pg_get_viewdef
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:463: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:466: ERROR:  Column count mismatch
+ m | str3 
+---+------
+ 3 | v3
+ 2 | v2
+ 1 | v1
+(3 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:472: ERROR:  Column 'i' not found
+psql:/home/dongxu/lab/pg-tikv/tests/190_sequences_regclass.sql:474: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

@@ -1,0 +1,18 @@
+ pg_typeof 
+-----------
+ bigint
+(1 row)
+
+ count 
+-------
+(0 rows)
+
+ x 
+---
+(0 rows)
+
+ x 
+---
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/140_function_lookup.sql:30: ERROR:  Unsupported RETURNING

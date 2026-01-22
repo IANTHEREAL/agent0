@@ -367,6 +367,7 @@ mod tests {
                 },
             ],
             version: 1,
+            pk_constraint_name: Some("test_pkey".to_string()),
             pk_indices: vec![0],
             indexes: vec![],
             check_constraints: vec![],

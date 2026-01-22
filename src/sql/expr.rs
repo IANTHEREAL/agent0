@@ -154,46 +154,54 @@ fn eval_expr_join_impl(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
             }
         }
         Expr::CompoundIdentifier(parts) => {
-            if parts.len() == 2 {
-                let table_alias = &parts[0].value;
-                let col_name = &parts[1].value;
-                let key = format!("{}.{}", table_alias, col_name);
-                if let Some(&offset) = ctx.column_offsets.get(&key) {
+            // Support both 2-part (table.column) and 3-part (schema.table.column) identifiers
+            // For 3-part, we ignore the schema and use table.column for lookup
+            let (table_alias, col_name) = if parts.len() == 2 {
+                (&parts[0].value, &parts[1].value)
+            } else if parts.len() == 3 {
+                // schema.table.column -> use table.column
+                (&parts[1].value, &parts[2].value)
+            } else {
+                return Err(anyhow!(
+                    "Unsupported compound identifier with {} parts",
+                    parts.len()
+                ));
+            };
+
+            let key = format!("{}.{}", table_alias, col_name);
+            if let Some(&offset) = ctx.column_offsets.get(&key) {
+                return Ok(ctx.combined_row.values[offset].clone());
+            }
+            let key_lower =
+                format!("{}.{}", table_alias.to_lowercase(), col_name.to_lowercase());
+            for (k, &offset) in &ctx.column_offsets {
+                if k.to_lowercase() == key_lower {
                     return Ok(ctx.combined_row.values[offset].clone());
                 }
-                let key_lower =
-                    format!("{}.{}", table_alias.to_lowercase(), col_name.to_lowercase());
+            }
+            // For Sequelize-style aliases with '->' (e.g., "tags->sequelize_post_tags"),
+            // try to find a column that ends with ".table_alias.col_name"
+            if table_alias.contains("->") {
+                let suffix = format!(".{}.{}", table_alias, col_name);
+                let suffix_lower = suffix.to_lowercase();
                 for (k, &offset) in &ctx.column_offsets {
-                    if k.to_lowercase() == key_lower {
+                    if k.to_lowercase().ends_with(&suffix_lower) {
                         return Ok(ctx.combined_row.values[offset].clone());
                     }
                 }
-                // For Sequelize-style aliases with '->' (e.g., "tags->sequelize_post_tags"),
-                // try to find a column that ends with ".table_alias.col_name"
-                if table_alias.contains("->") {
-                    let suffix = format!(".{}.{}", table_alias, col_name);
-                    let suffix_lower = suffix.to_lowercase();
-                    for (k, &offset) in &ctx.column_offsets {
-                        if k.to_lowercase().ends_with(&suffix_lower) {
-                            return Ok(ctx.combined_row.values[offset].clone());
-                        }
-                    }
-                    // Also try matching just "table_alias.col_name" at the end
-                    let direct_suffix = format!("{}.{}", table_alias, col_name);
-                    let direct_suffix_lower = direct_suffix.to_lowercase();
-                    for (k, &offset) in &ctx.column_offsets {
-                        if k.to_lowercase() == direct_suffix_lower
-                            || k.to_lowercase()
-                                .ends_with(&format!(".{}", direct_suffix_lower))
-                        {
-                            return Ok(ctx.combined_row.values[offset].clone());
-                        }
+                // Also try matching just "table_alias.col_name" at the end
+                let direct_suffix = format!("{}.{}", table_alias, col_name);
+                let direct_suffix_lower = direct_suffix.to_lowercase();
+                for (k, &offset) in &ctx.column_offsets {
+                    if k.to_lowercase() == direct_suffix_lower
+                        || k.to_lowercase()
+                            .ends_with(&format!(".{}", direct_suffix_lower))
+                    {
+                        return Ok(ctx.combined_row.values[offset].clone());
                     }
                 }
-                Err(anyhow!("Column '{}.{}' not found", table_alias, col_name))
-            } else {
-                Err(anyhow!("Unsupported compound identifier"))
             }
+            Err(anyhow!("Column '{}.{}' not found", table_alias, col_name))
         }
         Expr::BinaryOp { left, op, right } => {
             let left_val = eval_expr_join(left, ctx)?;
@@ -1070,6 +1078,10 @@ fn eval_function_join(func: &sqlparser::ast::Function, ctx: &JoinContext) -> Res
             }
             Ok(Value::Text("CREATE INDEX".to_string()))
         }
+        "PG_TABLE_IS_VISIBLE" | "PG_TYPE_IS_VISIBLE" | "PG_FUNCTION_IS_VISIBLE" => {
+            Ok(Value::Boolean(true))
+        }
+        "PG_GET_SERIAL_SEQUENCE" => Ok(Value::Null),
         _ => Err(anyhow!("Unsupported function in JOIN: {}", func_name)),
     }
 }
@@ -2975,6 +2987,7 @@ fn eval_function(
             Ok(Value::Text(type_name.to_string()))
         }
         "OBJ_DESCRIPTION" | "COL_DESCRIPTION" | "SHOBJ_DESCRIPTION" => Ok(Value::Null),
+        "PG_GET_SERIAL_SEQUENCE" => Ok(Value::Null),
         "PG_CATALOG.SET_CONFIG" => Ok(Value::Text(String::new())),
         "UNNEST" => match args.into_iter().next() {
             Some(Value::Array(arr)) => Ok(Value::Array(arr)),
@@ -4393,6 +4406,8 @@ fn parse_timestamp_string(s: &str) -> Result<Value> {
     let formats = [
         "%Y-%m-%d %H:%M:%S%.f",
         "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
         "%Y-%m-%d",
         "%Y/%m/%d %H:%M:%S",
         "%Y/%m/%d",
@@ -7117,6 +7132,12 @@ mod tests {
         assert!(matches!(result, Value::Timestamp(_)));
 
         let result = parse_timestamp_string("2024-01-01").unwrap();
+        assert!(matches!(result, Value::Timestamp(_)));
+
+        let result = parse_timestamp_string("2026-01-22T04:36:12.931807").unwrap();
+        assert!(matches!(result, Value::Timestamp(_)));
+
+        let result = parse_timestamp_string("2024-01-15T10:30:00").unwrap();
         assert!(matches!(result, Value::Timestamp(_)));
     }
 

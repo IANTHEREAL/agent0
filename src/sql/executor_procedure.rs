@@ -95,6 +95,10 @@ impl Executor {
             name: view_name.clone(),
             columns: col_defs,
             version: 1,
+            pk_constraint_name: Some(format!(
+                "{}_pkey",
+                view_name.rsplit('.').next().unwrap_or(&view_name)
+            )),
             pk_indices: vec![0],
             indexes: vec![],
             check_constraints: vec![],

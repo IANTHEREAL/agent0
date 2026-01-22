@@ -1,0 +1,31 @@
+ int_type | int_bytes 
+----------+-----------
+ integer  |         4
+(1 row)
+
+ bigint_type | bigint_bytes 
+-------------+--------------
+ bigint      |            8
+(1 row)
+
+ column_name | data_type 
+-------------+-----------
+ i4          | integer
+(1 row)
+
+ column_name | data_type 
+-------------+-----------
+ i8          | bigint
+(1 row)
+
+ column_name | data_type | has_nextval 
+-------------+-----------+-------------
+ a           | integer   | t
+(1 row)
+
+ column_name | data_type | has_nextval 
+-------------+-----------+-------------
+ a           | bigint    | t
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/150_int_size.sql:62: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

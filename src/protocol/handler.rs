@@ -176,6 +176,176 @@ fn is_ident_char(b: u8) -> bool {
     matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
 }
 
+fn parse_startup_options(options: &str) -> Vec<(String, String)> {
+    let tokens: Vec<&str> = options.split_whitespace().collect();
+    let mut settings = Vec::new();
+    let mut i = 0usize;
+    while i < tokens.len() {
+        if tokens[i] == "-c" {
+            if let Some(kv) = tokens.get(i + 1) {
+                if let Some((key, value)) = kv.split_once('=') {
+                    settings.push((key.to_string(), value.to_string()));
+                }
+                i += 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    settings
+}
+
+fn client_min_messages_rank(level: &str) -> Option<u8> {
+    match level.to_ascii_lowercase().as_str() {
+        "debug5" => Some(1),
+        "debug4" => Some(2),
+        "debug3" => Some(3),
+        "debug2" => Some(4),
+        "debug1" => Some(5),
+        "debug" => Some(4),
+        "log" => Some(6),
+        "info" => Some(7),
+        "notice" => Some(8),
+        "warning" => Some(9),
+        "error" => Some(10),
+        "fatal" => Some(11),
+        "panic" => Some(12),
+        _ => None,
+    }
+}
+
+fn client_allows_notice(client_min_messages: Option<String>) -> bool {
+    let notice_rank = client_min_messages_rank("notice").unwrap_or(8);
+    let min_rank = client_min_messages
+        .as_deref()
+        .and_then(client_min_messages_rank)
+        .unwrap_or(notice_rank);
+    notice_rank >= min_rank
+}
+
+fn infer_parameter_types(sql: &str, param_count: usize) -> Vec<Type> {
+    let mut types = vec![Type::UNKNOWN; param_count];
+    if param_count == 0 {
+        return types;
+    }
+
+    // Use ASCII-only case normalization to keep byte offsets stable. Full Unicode uppercasing can
+    // change byte length and make `pos` invalid for slicing, potentially panicking on non-ASCII SQL.
+    let sql_upper = sql.to_ascii_uppercase();
+    let bytes = sql.as_bytes();
+
+    let mut placeholder_positions: Vec<(usize, usize)> = Vec::new();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut dollar_delim: Option<Vec<u8>> = None;
+
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(delim) = dollar_delim.as_ref() {
+            let delim_len = delim.len();
+            if i + delim_len <= bytes.len() && &bytes[i..i + delim_len] == delim.as_slice() {
+                dollar_delim = None;
+                i += delim_len;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        let b = bytes[i];
+
+        if b == b'\'' && !in_double_quote {
+            if in_single_quote && i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            in_single_quote = !in_single_quote;
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single_quote {
+            if in_double_quote && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                i += 2;
+                continue;
+            }
+            in_double_quote = !in_double_quote;
+            i += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote && b == b'$' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 {
+                if let Ok(num) = std::str::from_utf8(&bytes[i + 1..j])
+                    .unwrap_or("0")
+                    .parse::<usize>()
+                {
+                    placeholder_positions.push((i, num));
+                }
+                i = j;
+                continue;
+            }
+
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'$' {
+                if !(bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    break;
+                }
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'$' {
+                dollar_delim = Some(bytes[i..=j].to_vec());
+                i = j + 1;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    for (pos, param_num) in placeholder_positions {
+        if param_num == 0 || param_num > param_count {
+            continue;
+        }
+        let param_idx = param_num - 1;
+
+        if types[param_idx] != Type::UNKNOWN {
+            continue;
+        }
+
+        let before = &sql_upper[..pos];
+        let before_trimmed = before.trim_end();
+
+        if before_trimmed.ends_with("LIMIT") {
+            types[param_idx] = Type::INT8;
+            continue;
+        }
+
+        if before_trimmed.ends_with("OFFSET") {
+            types[param_idx] = Type::INT8;
+            continue;
+        }
+
+        if before_trimmed.ends_with("FIRST") || before_trimmed.ends_with("NEXT") {
+            let keyword_start = if before_trimmed.ends_with("FIRST") {
+                before_trimmed.len().saturating_sub(5)
+            } else {
+                before_trimmed.len().saturating_sub(4)
+            };
+            let even_before = before_trimmed[..keyword_start].trim_end();
+            if even_before.ends_with("FETCH") {
+                types[param_idx] = Type::INT8;
+                continue;
+            }
+        }
+    }
+
+    types
+}
+
 #[allow(dead_code)]
 fn find_keyword_outside_strings(query: &str, keyword: &str) -> Option<usize> {
     let bytes = query.as_bytes();
@@ -1024,13 +1194,25 @@ impl StartupHandler for DynamicPgHandler {
                                 return Ok(());
                             }
 
-                            if let Some(app_name) =
-                                client.metadata().get("application_name").cloned()
-                            {
-                                let mut session_guard = self.session.lock().await;
-                                if let Some(session) = session_guard.as_mut() {
+                            let mut session_guard = self.session.lock().await;
+                            if let Some(session) = session_guard.as_mut() {
+                                if let Some(options) = client.metadata().get("options") {
+                                    for (key, value) in parse_startup_options(options) {
+                                        if let Err(e) = session.set_known_setting(
+                                            &key.to_ascii_lowercase(),
+                                            value,
+                                        ) {
+                                            warn!(
+                                                "Failed to apply startup option {}: {}",
+                                                key, e
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if let Some(app_name) = client.metadata().get("application_name") {
                                     if let Err(e) = session
-                                        .set_known_setting("application_name", app_name)
+                                        .set_known_setting("application_name", app_name.clone())
                                     {
                                         warn!(
                                             "Failed to apply application_name from startup: {}",
@@ -1171,14 +1353,16 @@ impl SimpleQueryHandler for DynamicPgHandler {
                 let mut responses: Vec<Response<'a>> = Vec::new();
                 for result in results.into_vec() {
                     if let ExecuteResult::Notice { message } = result {
-                        let notice = NoticeResponse::from(ErrorInfo::new(
-                            "NOTICE".to_string(),
-                            "00000".to_string(),
-                            message,
-                        ));
-                        client
-                            .send(PgWireBackendMessage::NoticeResponse(notice))
-                            .await?;
+                        if client_allows_notice(session.show_setting_value("client_min_messages")) {
+                            let notice = NoticeResponse::from(ErrorInfo::new(
+                                "NOTICE".to_string(),
+                                "00000".to_string(),
+                                message,
+                            ));
+                            client
+                                .send(PgWireBackendMessage::NoticeResponse(notice))
+                                .await?;
+                        }
                         continue;
                     }
                     responses.push(result_to_response(result)?);
@@ -1417,8 +1601,16 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         let param_count = count_sql_parameters(&stmt.statement);
         let mut param_types: Vec<Type> = stmt.parameter_types.clone();
 
-        if param_types.len() < param_count {
-            param_types.resize(param_count, Type::UNKNOWN);
+        if param_types.len() < param_count || param_types.iter().any(|t| *t == Type::UNKNOWN) {
+            let inferred = infer_parameter_types(&stmt.statement, param_count);
+            for i in param_types.len()..param_count {
+                param_types.push(inferred[i].clone());
+            }
+            for i in 0..param_types.len().min(inferred.len()) {
+                if param_types[i] == Type::UNKNOWN && inferred[i] != Type::UNKNOWN {
+                    param_types[i] = inferred[i].clone();
+                }
+            }
         }
 
         let fields = self.infer_result_fields_from_query(&stmt.statement).await;
@@ -2080,14 +2272,16 @@ impl SimpleQueryHandler for PgHandler {
                 let mut responses: Vec<Response<'a>> = Vec::new();
                 for result in results.into_vec() {
                     if let ExecuteResult::Notice { message } = result {
-                        let notice = NoticeResponse::from(ErrorInfo::new(
-                            "NOTICE".to_string(),
-                            "00000".to_string(),
-                            message,
-                        ));
-                        client
-                            .send(PgWireBackendMessage::NoticeResponse(notice))
-                            .await?;
+                        if client_allows_notice(session.show_setting_value("client_min_messages")) {
+                            let notice = NoticeResponse::from(ErrorInfo::new(
+                                "NOTICE".to_string(),
+                                "00000".to_string(),
+                                message,
+                            ));
+                            client
+                                .send(PgWireBackendMessage::NoticeResponse(notice))
+                                .await?;
+                        }
                         continue;
                     }
                     responses.push(result_to_response(result)?);
@@ -2309,8 +2503,16 @@ impl ExtendedQueryHandler for PgHandler {
         let param_count = count_sql_parameters(&stmt.statement);
         let mut param_types: Vec<Type> = stmt.parameter_types.clone();
 
-        if param_types.len() < param_count {
-            param_types.resize(param_count, Type::UNKNOWN);
+        if param_types.len() < param_count || param_types.iter().any(|t| *t == Type::UNKNOWN) {
+            let inferred = infer_parameter_types(&stmt.statement, param_count);
+            for i in param_types.len()..param_count {
+                param_types.push(inferred[i].clone());
+            }
+            for i in 0..param_types.len().min(inferred.len()) {
+                if param_types[i] == Type::UNKNOWN && inferred[i] != Type::UNKNOWN {
+                    param_types[i] = inferred[i].clone();
+                }
+            }
         }
 
         let fields = self.infer_result_fields_from_query(&stmt.statement).await;
@@ -3279,5 +3481,78 @@ mod tests {
     fn test_result_to_response_empty_is_empty_query() {
         let resp = result_to_response(ExecuteResult::Empty).unwrap();
         assert!(matches!(resp, Response::EmptyQuery));
+    }
+
+    #[test]
+    fn test_infer_parameter_types_limit() {
+        let types = infer_parameter_types("SELECT * FROM users LIMIT $1", 1);
+        assert_eq!(types, vec![Type::INT8]);
+    }
+
+    #[test]
+    fn test_infer_parameter_types_offset() {
+        let types = infer_parameter_types("SELECT * FROM users OFFSET $1", 1);
+        assert_eq!(types, vec![Type::INT8]);
+    }
+
+    #[test]
+    fn test_infer_parameter_types_limit_offset() {
+        let types = infer_parameter_types("SELECT * FROM users LIMIT $1 OFFSET $2", 2);
+        assert_eq!(types, vec![Type::INT8, Type::INT8]);
+    }
+
+    #[test]
+    fn test_infer_parameter_types_fetch() {
+        let types = infer_parameter_types("SELECT * FROM users FETCH FIRST $1 ROWS ONLY", 1);
+        assert_eq!(types, vec![Type::INT8]);
+
+        let types = infer_parameter_types("SELECT * FROM users FETCH NEXT $1 ROWS ONLY", 1);
+        assert_eq!(types, vec![Type::INT8]);
+    }
+
+    #[test]
+    fn test_infer_parameter_types_where_clause_unknown() {
+        let types = infer_parameter_types("SELECT * FROM users WHERE id = $1", 1);
+        assert_eq!(types, vec![Type::UNKNOWN]);
+    }
+
+    #[test]
+    fn test_infer_parameter_types_mixed() {
+        let types =
+            infer_parameter_types("SELECT * FROM users WHERE id = $1 LIMIT $2 OFFSET $3", 3);
+        assert_eq!(types, vec![Type::UNKNOWN, Type::INT8, Type::INT8]);
+    }
+
+    #[test]
+    fn test_infer_parameter_types_preserves_string_literals() {
+        let types = infer_parameter_types("SELECT 'LIMIT $1' FROM users LIMIT $1", 1);
+        assert_eq!(types, vec![Type::INT8]);
+    }
+
+    #[test]
+    fn test_infer_parameter_types_preserves_dollar_quoted() {
+        let types = infer_parameter_types("SELECT $$ LIMIT $1 $$ FROM users LIMIT $1", 1);
+        assert_eq!(types, vec![Type::INT8]);
+    }
+
+    #[test]
+    fn test_infer_parameter_types_case_insensitive() {
+        let types = infer_parameter_types("SELECT * FROM users limit $1", 1);
+        assert_eq!(types, vec![Type::INT8]);
+
+        let types = infer_parameter_types("SELECT * FROM users Offset $1", 1);
+        assert_eq!(types, vec![Type::INT8]);
+    }
+
+    #[test]
+    fn test_infer_parameter_types_no_params() {
+        let types = infer_parameter_types("SELECT * FROM users", 0);
+        assert!(types.is_empty());
+    }
+
+    #[test]
+    fn test_infer_parameter_types_non_ascii_does_not_panic() {
+        let types = infer_parameter_types("SELECT 'ııı' FROM users LIMIT $1", 1);
+        assert_eq!(types, vec![Type::INT8]);
     }
 }

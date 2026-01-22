@@ -1,0 +1,1 @@
+psql:/home/dongxu/lab/pg-tikv/tests/118_crdb_internal_catalog.sql:19: ERROR:  Schema 'sc' already exists

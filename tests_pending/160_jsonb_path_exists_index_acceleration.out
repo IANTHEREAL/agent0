@@ -1,0 +1,227 @@
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:28: ERROR:  Column count mismatch
+ a | b 
+---+---
+(0 rows)
+
+ a | b 
+---+---
+(0 rows)
+
+ jpq 
+-----
+(0 rows)
+
+ jpq 
+-----
+(0 rows)
+
+ jpq 
+-----
+(0 rows)
+
+ jpq 
+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:87: ERROR:  Column count mismatch
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jsonb_path_exists 
+---+-------------------
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jsonb_path_exists 
+---+-------------------
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ jpq 
+-----
+(0 rows)
+
+ a | jpq1 | jpq2 
+---+------+------
+(0 rows)
+
+ a | jpq1 | jpq2 
+---+------+------
+(0 rows)
+
+ a | jpq1 | jpq2 
+---+------+------
+(0 rows)
+
+ a | jpq1 | jpq2 
+---+------+------
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jpq 
+---+-----
+(0 rows)
+
+ a | jsonb_path_query | jpq 
+---+------------------+-----
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:180: ERROR:  Column count mismatch
+ a 
+---
+(0 rows)
+
+ a 
+---
+(0 rows)
+
+ a 
+---
+(0 rows)
+
+ a 
+---
+(0 rows)
+
+ a 
+---
+(0 rows)
+
+ a 
+---
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:204: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:207: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:210: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:213: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:216: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:219: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:224: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:227: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:230: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:233: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:236: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:261: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:264: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:267: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:270: ERROR:  Unsupported function: jsonb_path_exists
+psql:/home/dongxu/lab/pg-tikv/tests/160_jsonb_path_exists_index_acceleration.sql:272: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

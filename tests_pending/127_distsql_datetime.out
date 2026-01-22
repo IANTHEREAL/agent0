@@ -1,0 +1,5 @@
+psql:/home/dongxu/lab/pg-tikv/tests/127_distsql_datetime.sql:10: ERROR:  Unsupported types for multiplication
+ ?column? 
+----------
+(0 rows)
+

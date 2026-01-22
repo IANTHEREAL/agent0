@@ -1,0 +1,1 @@
+psql:/home/dongxu/lab/pg-tikv/tests/166_mixed_version_distributed_merge.sql:24: ERROR:  Cannot drop primary key constraint 'dist_merge_idx_pkey'

@@ -1,0 +1,10 @@
+psql:/home/dongxu/lab/pg-tikv/tests/212_upgrade.sql:9: ERROR:  Schema 'crdb_internal' already exists
+ ?column? 
+----------
+ null
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/212_upgrade.sql:40: ERROR:  Unsupported function: node_executable_version
+psql:/home/dongxu/lab/pg-tikv/tests/212_upgrade.sql:41: ERROR:  SQL parse error: sql parser error: Expected variable value, found: ; at Line: 1, Column 47
+psql:/home/dongxu/lab/pg-tikv/tests/212_upgrade.sql:44: ERROR:  Unsupported function: release_series
+psql:/home/dongxu/lab/pg-tikv/tests/212_upgrade.sql:46: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

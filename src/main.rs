@@ -17,8 +17,8 @@ use std::env;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
-use tracing::{info, warn, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::{info, warn};
+use tracing_subscriber::{fmt, EnvFilter};
 
 const DEFAULT_PG_PORT: u16 = 5433;
 const DEFAULT_PD_ENDPOINTS: &str = "127.0.0.1:2379";
@@ -60,8 +60,10 @@ fn main() -> Result<()> {
 }
 
 async fn async_main() -> Result<()> {
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(Level::INFO)
+    let subscriber = fmt::Subscriber::builder()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .with_target(false)
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;

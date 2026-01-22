@@ -1,0 +1,15 @@
+ k |  v   
+---+------
+ a | val1
+ b | val2
+(2 rows)
+
+ k |  v   
+---+------
+ a | val1
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/110_cluster_locks_write_buffering.sql:51: ERROR:  Table 'pg_locks' not found
+psql:/home/dongxu/lab/pg-tikv/tests/110_cluster_locks_write_buffering.sql:59: ERROR:  Table 'pg_locks' not found
+psql:/home/dongxu/lab/pg-tikv/tests/110_cluster_locks_write_buffering.sql:67: ERROR:  Table 'pg_locks' not found
+psql:/home/dongxu/lab/pg-tikv/tests/110_cluster_locks_write_buffering.sql:69: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

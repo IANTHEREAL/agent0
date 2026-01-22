@@ -1,0 +1,8 @@
+psql:/home/dongxu/lab/pg-tikv/tests/139_export.sql:51: ERROR:  Table 'public.t' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/139_export.sql:52: ERROR:  Unknown col
+psql:/home/dongxu/lab/pg-tikv/tests/139_export.sql:58: ERROR:  Table 'crdb_internal.export_into' not found
+psql:/home/dongxu/lab/pg-tikv/tests/139_export.sql:64: ERROR:  Table 'crdb_internal.export_into' not found
+psql:/home/dongxu/lab/pg-tikv/tests/139_export.sql:70: ERROR:  Table 'crdb_internal.export_into' not found
+psql:/home/dongxu/lab/pg-tikv/tests/139_export.sql:84: ERROR:  Table 'crdb_internal.export_into' not found
+psql:/home/dongxu/lab/pg-tikv/tests/139_export.sql:91: ERROR:  Table 'crdb_internal.export_into' not found
+psql:/home/dongxu/lab/pg-tikv/tests/139_export.sql:98: ERROR:  Table 'crdb_internal.export_into' not found

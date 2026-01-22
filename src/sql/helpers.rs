@@ -1104,7 +1104,9 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                     matched = Some(col);
                 }
             }
-            matched.map(|c| c.data_type.clone()).unwrap_or(DataType::Text)
+            matched
+                .map(|c| c.data_type.clone())
+                .unwrap_or(DataType::Text)
         }
         Expr::CompoundIdentifier(parts) => {
             if parts.is_empty() {
@@ -1148,7 +1150,9 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                         matched = Some(col);
                     }
                 }
-                matched.map(|c| c.data_type.clone()).unwrap_or(DataType::Text)
+                matched
+                    .map(|c| c.data_type.clone())
+                    .unwrap_or(DataType::Text)
             } else {
                 DataType::Text
             }
@@ -1257,9 +1261,8 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
                 "DATE" => DataType::Date,
                 "NEXTVAL" | "CURRVAL" | "SETVAL" => DataType::Int64,
                 "GEN_RANDOM_UUID" | "UUID_GENERATE_V4" => DataType::Uuid,
-                "JSONB_BUILD_OBJECT" | "JSONB_BUILD_ARRAY" | "JSONB_SET" | "JSONB_AGG" | "TO_JSONB" => {
-                    DataType::Jsonb
-                }
+                "JSONB_BUILD_OBJECT" | "JSONB_BUILD_ARRAY" | "JSONB_SET" | "JSONB_AGG"
+                | "TO_JSONB" => DataType::Jsonb,
                 "JSON_BUILD_OBJECT" | "JSON_BUILD_ARRAY" | "JSON_SET" | "JSON_AGG" | "TO_JSON" => {
                     DataType::Json
                 }
@@ -1487,6 +1490,7 @@ fn sql_datatype_to_internal(dt: &SqlDataType) -> DataType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::ast::Value as SqlValue;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
     use std::collections::HashMap;
@@ -1557,6 +1561,7 @@ mod tests {
                 default_expr: None,
             }],
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![],
             check_constraints: vec![],
@@ -1594,6 +1599,7 @@ mod tests {
                 default_expr: None,
             }],
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![],
             check_constraints: vec![],
@@ -1631,6 +1637,7 @@ mod tests {
                 default_expr: None,
             }],
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![],
             check_constraints: vec![],
@@ -1668,6 +1675,7 @@ mod tests {
                 default_expr: None,
             }],
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![],
             check_constraints: vec![],
@@ -1711,6 +1719,7 @@ mod tests {
                 default_expr: None,
             }],
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![],
             check_constraints: vec![],
@@ -1805,11 +1814,8 @@ mod tests {
     fn test_infer_expr_type_json_access_contains_returns_boolean() {
         let schema = TableSchema::default();
         let dialect = PostgreSqlDialect {};
-        let statements = Parser::parse_sql(
-            &dialect,
-            "SELECT '{\"a\":1}'::jsonb @> '{\"a\":1}'::jsonb",
-        )
-        .unwrap();
+        let statements =
+            Parser::parse_sql(&dialect, "SELECT '{\"a\":1}'::jsonb @> '{\"a\":1}'::jsonb").unwrap();
         let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
             panic!("expected query");
         };
@@ -1963,7 +1969,10 @@ mod tests {
 
     #[test]
     fn test_infer_expr_type_bytea_builtins() {
-        assert_eq!(infer_first_expr("SELECT int8send(0::bigint)"), DataType::Bytes);
+        assert_eq!(
+            infer_first_expr("SELECT int8send(0::bigint)"),
+            DataType::Bytes
+        );
         assert_eq!(
             infer_first_expr(r"SELECT get_bit(E'\\x80'::bytea, 0)"),
             DataType::Int32
@@ -1982,6 +1991,28 @@ mod tests {
             ),
             DataType::Bytes
         );
+    }
+
+    #[test]
+    fn test_substitute_join_context_values_only_substitutes_qualified() {
+        let mut column_offsets: HashMap<String, usize> = HashMap::new();
+        column_offsets.insert("id".to_string(), 0);
+        column_offsets.insert("o.id".to_string(), 0);
+
+        let combined_row = Row {
+            values: vec![Value::Int32(7)],
+        };
+
+        let expr = Expr::Identifier(Ident::new("id"));
+        let out = substitute_join_context_values(&expr, &column_offsets, &combined_row);
+        assert!(matches!(out, Expr::Identifier(_)));
+
+        let expr = Expr::CompoundIdentifier(vec![Ident::new("o"), Ident::new("id")]);
+        let out = substitute_join_context_values(&expr, &column_offsets, &combined_row);
+        assert!(matches!(
+            out,
+            Expr::Value(SqlValue::Number(ref n, _)) if n == "7"
+        ));
     }
 }
 
@@ -2259,6 +2290,10 @@ pub fn expr_has_outer_reference(expr: &Expr, outer_alias: &str) -> bool {
         | Expr::Exists { subquery: q, .. } => query_has_outer_reference(q, outer_alias),
         _ => false,
     }
+}
+
+pub fn expr_has_any_outer_reference(expr: &Expr, aliases: &[String]) -> bool {
+    aliases.iter().any(|a| expr_has_outer_reference(expr, a))
 }
 
 pub fn query_has_outer_reference_in_expr(expr: &Expr, outer_alias: &str) -> bool {
@@ -2615,6 +2650,214 @@ pub fn substitute_outer_values_in_query(
                 .having
                 .as_ref()
                 .map(|h| substitute_outer_values(h, outer_alias, outer_schema, outer_row));
+
+            Box::new(SetExpr::Select(Box::new(sqlparser::ast::Select {
+                distinct: select.distinct.clone(),
+                top: select.top.clone(),
+                projection: new_projection,
+                into: select.into.clone(),
+                from: select.from.clone(),
+                lateral_views: select.lateral_views.clone(),
+                selection: new_selection,
+                group_by: select.group_by.clone(),
+                cluster_by: select.cluster_by.clone(),
+                distribute_by: select.distribute_by.clone(),
+                sort_by: select.sort_by.clone(),
+                having: new_having,
+                named_window: select.named_window.clone(),
+                qualify: select.qualify.clone(),
+            })))
+        }
+        _ => query.body.clone(),
+    };
+
+    Query {
+        with: query.with.clone(),
+        body: new_body,
+        order_by: query.order_by.clone(),
+        limit: query.limit.clone(),
+        offset: query.offset.clone(),
+        fetch: query.fetch.clone(),
+        locks: query.locks.clone(),
+        limit_by: query.limit_by.clone(),
+        for_clause: query.for_clause.clone(),
+    }
+}
+
+/// Substitute outer column references in a subquery using JoinContext
+/// This handles correlated subqueries in JOIN queries where multiple tables may be referenced
+pub fn substitute_join_context_values(
+    expr: &Expr,
+    column_offsets: &std::collections::HashMap<String, usize>,
+    combined_row: &crate::types::Row,
+) -> Expr {
+    match expr {
+        // Only substitute *qualified* outer references (e.g. `outer_alias.col`). Substituting bare
+        // identifiers is not scope-aware and can incorrectly rewrite inner-scope columns that share
+        // names with outer columns in correlated subqueries.
+        Expr::Identifier(_) => expr.clone(),
+        Expr::CompoundIdentifier(parts) => {
+            let (table_part, col_name) = if parts.len() == 2 {
+                (normalize_ident(&parts[0]), normalize_ident(&parts[1]))
+            } else if parts.len() == 3 {
+                (normalize_ident(&parts[1]), normalize_ident(&parts[2]))
+            } else {
+                return expr.clone();
+            };
+
+            let key = format!("{}.{}", table_part, col_name);
+            if let Some(&offset) = column_offsets.get(&key) {
+                if let Some(value) = combined_row.values.get(offset) {
+                    return value_to_sql_expr(value);
+                }
+            }
+            let key_lower = key.to_lowercase();
+            for (k, &offset) in column_offsets {
+                if k.to_lowercase() == key_lower {
+                    if let Some(value) = combined_row.values.get(offset) {
+                        return value_to_sql_expr(value);
+                    }
+                }
+            }
+            expr.clone()
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(substitute_join_context_values(
+                left,
+                column_offsets,
+                combined_row,
+            )),
+            op: op.clone(),
+            right: Box::new(substitute_join_context_values(
+                right,
+                column_offsets,
+                combined_row,
+            )),
+        },
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(substitute_join_context_values(
+                inner,
+                column_offsets,
+                combined_row,
+            )),
+        },
+        Expr::Nested(inner) => Expr::Nested(Box::new(substitute_join_context_values(
+            inner,
+            column_offsets,
+            combined_row,
+        ))),
+        Expr::Function(f) => {
+            let mut new_args = Vec::new();
+            for arg in &f.args {
+                let new_arg =
+                    match arg {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                substitute_join_context_values(e, column_offsets, combined_row),
+                            ))
+                        }
+                        other => other.clone(),
+                    };
+                new_args.push(new_arg);
+            }
+            Expr::Function(sqlparser::ast::Function {
+                name: f.name.clone(),
+                args: new_args,
+                filter: f.filter.clone(),
+                null_treatment: f.null_treatment.clone(),
+                over: f.over.clone(),
+                distinct: f.distinct,
+                special: f.special,
+                order_by: f.order_by.clone(),
+            })
+        }
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(substitute_join_context_values(
+            inner,
+            column_offsets,
+            combined_row,
+        ))),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(substitute_join_context_values(
+            inner,
+            column_offsets,
+            combined_row,
+        ))),
+        Expr::Subquery(q) => Expr::Subquery(Box::new(substitute_join_context_values_in_query(
+            q,
+            column_offsets,
+            combined_row,
+        ))),
+        Expr::InSubquery {
+            expr: inner,
+            subquery,
+            negated,
+        } => Expr::InSubquery {
+            expr: Box::new(substitute_join_context_values(
+                inner,
+                column_offsets,
+                combined_row,
+            )),
+            subquery: Box::new(substitute_join_context_values_in_query(
+                subquery,
+                column_offsets,
+                combined_row,
+            )),
+            negated: *negated,
+        },
+        Expr::Exists { subquery, negated } => Expr::Exists {
+            subquery: Box::new(substitute_join_context_values_in_query(
+                subquery,
+                column_offsets,
+                combined_row,
+            )),
+            negated: *negated,
+        },
+        _ => expr.clone(),
+    }
+}
+
+/// Substitute outer values in a query using JoinContext
+pub fn substitute_join_context_values_in_query(
+    query: &Query,
+    column_offsets: &std::collections::HashMap<String, usize>,
+    combined_row: &crate::types::Row,
+) -> Query {
+    let new_body = match &*query.body {
+        SetExpr::Select(select) => {
+            let new_selection = select
+                .selection
+                .as_ref()
+                .map(|sel| substitute_join_context_values(sel, column_offsets, combined_row));
+
+            let new_projection: Vec<sqlparser::ast::SelectItem> = select
+                .projection
+                .iter()
+                .map(|item| match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(e) => {
+                        sqlparser::ast::SelectItem::UnnamedExpr(substitute_join_context_values(
+                            e,
+                            column_offsets,
+                            combined_row,
+                        ))
+                    }
+                    sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
+                        sqlparser::ast::SelectItem::ExprWithAlias {
+                            expr: substitute_join_context_values(
+                                expr,
+                                column_offsets,
+                                combined_row,
+                            ),
+                            alias: alias.clone(),
+                        }
+                    }
+                    other => other.clone(),
+                })
+                .collect();
+
+            let new_having = select
+                .having
+                .as_ref()
+                .map(|h| substitute_join_context_values(h, column_offsets, combined_row));
 
             Box::new(SetExpr::Select(Box::new(sqlparser::ast::Select {
                 distinct: select.distinct.clone(),

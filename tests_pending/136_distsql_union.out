@@ -1,0 +1,156 @@
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:9: ERROR:  Table 'public.xyz' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:19: ERROR:  null value in column "x" of relation "xyz" violates not-null constraint
+DETAIL:  Failing row contains (NULL, NULL, NULL).
+ x 
+---
+ 1
+ 1
+ 2
+ 2
+ 3
+ 3
+ 4
+ 4
+ 5
+ 5
+ 6
+ 6
+ 7
+ 7
+ 8
+ 8
+ 9
+ 9
+(18 rows)
+
+ x 
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+ 7
+ 8
+ 9
+(9 rows)
+
+ x 
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+ 7
+ 8
+ 9
+(9 rows)
+
+ x 
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+ 6
+ 7
+ 8
+ 9
+(9 rows)
+
+ x | y 
+---+---
+ 1 | 2
+ 2 | 5
+ 3 | 2
+ 4 | 5
+ 5 | 2
+ 6 | 3
+ 7 | 2
+ 8 | 2
+ 9 | 2
+ 2 | 1
+ 5 | 2
+ 2 | 3
+ 5 | 4
+ 2 | 5
+ 3 | 6
+ 2 | 7
+ 2 | 8
+ 2 | 9
+(18 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:37: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:40: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:43: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:46: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:49: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:52: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:55: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:58: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:61: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:64: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:67: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:70: ERROR:  Unsupported set expression
+ x | y 
+---+---
+ 2 | 5
+ 5 | 2
+(2 rows)
+
+ x | y 
+---+---
+ 2 | 5
+ 5 | 2
+(2 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:79: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:82: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:85: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:88: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:91: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:94: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:97: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:100: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:103: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:106: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:109: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:112: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:115: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:118: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:121: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:124: ERROR:  Unsupported set expression
+ x | y 
+---+---
+ 1 | 2
+ 3 | 2
+ 4 | 5
+ 6 | 3
+ 7 | 2
+ 8 | 2
+ 9 | 2
+(7 rows)
+
+ x | y 
+---+---
+ 1 | 2
+ 3 | 2
+ 4 | 5
+ 6 | 3
+ 7 | 2
+ 8 | 2
+ 9 | 2
+(7 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:133: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:136: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:139: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:142: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:145: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:148: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:151: ERROR:  Unsupported set expression
+psql:/home/dongxu/lab/pg-tikv/tests/136_distsql_union.sql:154: ERROR:  Unsupported set expression

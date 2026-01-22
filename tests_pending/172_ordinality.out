@@ -1,0 +1,59 @@
+psql:/home/dongxu/lab/pg-tikv/tests/172_ordinality.sql:6: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/172_ordinality.sql:10: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/172_ordinality.sql:13: ERROR:  Table 'public.foo' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/172_ordinality.sql:14: ERROR:  invalid input syntax for type bigint: "a"
+ x | ordinality 
+---+------------
+(0 rows)
+
+ x | ordinality 
+---+------------
+(0 rows)
+
+ max 
+-----
+    
+(1 row)
+
+ x | ordinality | x | ordinality 
+---+------------+---+------------
+(0 rows)
+
+ xx | ordinality 
+----+------------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/172_ordinality.sql:64: ERROR:  Unsupported JOIN type
+ x | ordinality 
+---+------------
+(0 rows)
+
+ x | ordinality 
+---+------------
+(0 rows)
+
+ x | ordinality 
+---+------------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/172_ordinality.sql:91: ERROR:  invalid input syntax for type bigint: "c"
+ x | ordinality 
+---+------------
+(0 rows)
+
+ x | ordinality 
+---+------------
+(0 rows)
+
+ x | ordinality 
+---+------------
+(0 rows)
+
+ ?column? 
+----------
+(0 rows)
+
+ x | ordinality 
+---+------------
+(0 rows)
+

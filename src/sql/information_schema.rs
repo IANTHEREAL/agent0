@@ -203,6 +203,7 @@ fn tables_schema() -> TableSchema {
             text_col("table_owner"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -228,6 +229,7 @@ fn sequences_schema() -> TableSchema {
             text_col("sequence_owner"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -249,6 +251,7 @@ fn routines_schema() -> TableSchema {
             text_col("routine_owner"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -308,6 +311,7 @@ fn columns_schema() -> TableSchema {
             text_col("is_updatable"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -330,6 +334,7 @@ fn schemata_schema() -> TableSchema {
             text_col("sql_path"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -355,6 +360,7 @@ fn table_constraints_schema() -> TableSchema {
             text_col("enforced"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -379,6 +385,7 @@ fn key_column_usage_schema() -> TableSchema {
             int_col("position_in_unique_constraint"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -403,6 +410,7 @@ fn referential_constraints_schema() -> TableSchema {
             text_col("delete_rule"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -425,6 +433,7 @@ fn constraint_column_usage_schema() -> TableSchema {
             text_col("constraint_name"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -444,6 +453,7 @@ fn check_constraints_schema() -> TableSchema {
             text_col("check_clause"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -465,6 +475,7 @@ fn pg_range_schema() -> TableSchema {
             text_col("rngsubdiff"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -494,6 +505,7 @@ fn pg_type_schema() -> TableSchema {
             int_col("typarray"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -513,6 +525,7 @@ fn pg_enum_schema() -> TableSchema {
             text_col("enumlabel"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -540,6 +553,7 @@ fn pg_class_schema() -> TableSchema {
             bool_col("relispartition"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -567,6 +581,7 @@ fn pg_index_schema() -> TableSchema {
             text_col("indexdef"), // Pre-computed index definition for pg_get_indexdef()
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -590,8 +605,11 @@ fn pg_attribute_schema() -> TableSchema {
             bool_col("attisdropped"),
             bool_col("attislocal"),
             int_col("atttypmod"),
+            text_col("attgenerated"), // 'a' = always, 's' = stored, '' = not generated
+            text_col("attidentity"),  // 'a' = always, 'd' = by default, '' = not identity
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -606,6 +624,7 @@ fn pg_namespace_schema() -> TableSchema {
         name: "pg_namespace".to_string(),
         columns: vec![int_col("oid"), text_col("nspname"), int_col("nspowner")],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -627,6 +646,7 @@ fn pg_proc_schema() -> TableSchema {
             text_col("prokind"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -650,6 +670,7 @@ fn pg_extension_schema() -> TableSchema {
             text_array_col("extcondition"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -670,6 +691,7 @@ fn pg_trigger_schema() -> TableSchema {
             text_col("tgenabled"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -698,6 +720,7 @@ fn pg_constraint_schema() -> TableSchema {
             text_col("constraintdef"), // Pre-computed definition for pg_get_constraintdef()
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -712,6 +735,7 @@ fn pg_am_schema() -> TableSchema {
         name: "pg_am".to_string(),
         columns: vec![int_col("oid"), text_col("amname")],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -731,6 +755,7 @@ fn pg_description_schema() -> TableSchema {
             text_col("description"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -751,6 +776,7 @@ fn pg_indexes_schema() -> TableSchema {
             text_col("indexdef"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -771,6 +797,7 @@ fn pg_attrdef_schema() -> TableSchema {
             text_col("adsrc"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -794,6 +821,7 @@ fn pg_sequence_schema() -> TableSchema {
             bool_col("seqcycle"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -817,6 +845,7 @@ fn pg_tables_schema() -> TableSchema {
             bool_col("rowsecurity"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -836,6 +865,7 @@ fn pg_views_schema() -> TableSchema {
             text_col("definition"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -858,6 +888,7 @@ fn pg_depend_schema() -> TableSchema {
             text_col("deptype"),
         ],
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -931,6 +962,34 @@ fn data_type_to_pg_type(dt: &DataType) -> &'static str {
         DataType::Vector(_) => "vector",
         DataType::Time => "time without time zone",
         DataType::UserDefined(_) => "character varying",
+        DataType::Numeric { .. } => "numeric",
+    }
+}
+
+fn data_type_to_udt_name(dt: &DataType) -> &'static str {
+    match dt {
+        DataType::Boolean => "bool",
+        DataType::Int32 => "integer",
+        DataType::Int64 => "int8",
+        DataType::Float64 => "float8",
+        DataType::Text => "text",
+        DataType::Bytes => "bytea",
+        DataType::Timestamp => "timestamp",
+        DataType::TimestampTz => "timestamptz",
+        DataType::Date => "date",
+        DataType::Interval => "interval",
+        DataType::Uuid => "uuid",
+        DataType::Array(inner) => match inner.as_ref() {
+            DataType::Int32 => "_int4",
+            DataType::Int64 => "_int8",
+            DataType::Text => "_text",
+            _ => "anyarray",
+        },
+        DataType::Json => "json",
+        DataType::Jsonb => "jsonb",
+        DataType::Vector(_) => "vector",
+        DataType::Time => "time",
+        DataType::UserDefined(_) => "text",
         DataType::Numeric { .. } => "numeric",
     }
 }
@@ -1193,7 +1252,8 @@ async fn get_columns_rows(
                     }
                     _ => {
                         let pg_type = data_type_to_pg_type(&col.data_type);
-                        (pg_type, "pg_catalog", pg_type)
+                        let udt = data_type_to_udt_name(&col.data_type);
+                        (pg_type, "pg_catalog", udt)
                     }
                 };
                 let is_nullable = if col.nullable { "YES" } else { "NO" };
@@ -1290,7 +1350,10 @@ async fn get_table_constraints_rows(
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
         if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
             if !table_def.pk_indices.is_empty() {
-                let pk_name = format!("{}_pkey", table_name);
+                let pk_name = table_def
+                    .pk_constraint_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_pkey", table_name));
                 rows.push(Row::new(vec![
                     text_val("postgres"),
                     text_val(&table_schema),
@@ -1397,7 +1460,10 @@ async fn get_key_column_usage_rows(
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
         if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
             if !table_def.pk_indices.is_empty() {
-                let pk_name = format!("{}_pkey", table_name);
+                let pk_name = table_def
+                    .pk_constraint_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_pkey", table_name));
                 for (i, &col_idx) in table_def.pk_indices.iter().enumerate() {
                     let col_name = &table_def.columns[col_idx].name;
                     rows.push(Row::new(vec![
@@ -1465,7 +1531,11 @@ async fn get_referential_constraints_rows(
         if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
             for fk in &table_def.foreign_keys {
                 let (ref_schema, ref_table_name) = split_schema_and_name(&fk.ref_table);
-                let ref_pk_name = format!("{}_pkey", ref_table_name);
+                let ref_pk_name = store
+                    .get_schema(txn, &fk.ref_table)
+                    .await?
+                    .and_then(|s| s.pk_constraint_name)
+                    .unwrap_or_else(|| format!("{}_pkey", ref_table_name));
                 let update_rule = match fk.on_update {
                     crate::types::ForeignKeyAction::Cascade => "CASCADE",
                     crate::types::ForeignKeyAction::SetNull => "SET NULL",
@@ -1509,7 +1579,10 @@ async fn get_constraint_column_usage_rows(
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
         if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
             if !table_def.pk_indices.is_empty() {
-                let pk_name = format!("{}_pkey", table_name);
+                let pk_name = table_def
+                    .pk_constraint_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_pkey", table_name));
                 for &col_idx in &table_def.pk_indices {
                     let col_name = &table_def.columns[col_idx].name;
                     rows.push(Row::new(vec![
@@ -1653,7 +1726,10 @@ async fn get_pg_class_rows(
 
             // Add primary key index if exists
             if !schema.pk_indices.is_empty() {
-                let pk_name = format!("{}_pkey", table_name);
+                let pk_name = schema
+                    .pk_constraint_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_pkey", table_name));
                 let pk_oid = catalog_oids::pg_class_pk_index_oid(schema.table_id)?;
                 rows.push(Row::new(vec![
                     int_val(pk_oid),
@@ -1764,6 +1840,10 @@ async fn get_pg_index_rows(
 
             if !schema.pk_indices.is_empty() {
                 let pk_oid = catalog_oids::pg_class_pk_index_oid(schema.table_id)?;
+                let pk_name = schema
+                    .pk_constraint_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_pkey", table_name));
 
                 let indkey = schema
                     .pk_indices
@@ -1777,8 +1857,8 @@ async fn get_pg_index_rows(
                     .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
                     .collect();
                 let indexdef = format!(
-                    "CREATE UNIQUE INDEX {}_pkey ON {}.{} USING btree ({})",
-                    table_name,
+                    "CREATE UNIQUE INDEX {} ON {}.{} USING btree ({})",
+                    pk_name,
                     table_schema,
                     table_name,
                     pk_cols.join(", ")
@@ -1816,14 +1896,18 @@ async fn get_pg_indexes_rows(
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
         if let Some(schema) = store.get_schema(txn, full_table_name).await? {
             if !schema.pk_indices.is_empty() {
+                let pk_name = schema
+                    .pk_constraint_name
+                    .clone()
+                    .unwrap_or_else(|| format!("{}_pkey", table_name));
                 let pk_cols: Vec<String> = schema
                     .pk_indices
                     .iter()
                     .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
                     .collect();
                 let indexdef = format!(
-                    "CREATE UNIQUE INDEX {}_pkey ON {}.{} USING btree ({})",
-                    table_name,
+                    "CREATE UNIQUE INDEX {} ON {}.{} USING btree ({})",
+                    pk_name,
                     table_schema,
                     table_name,
                     pk_cols.join(", ")
@@ -1831,7 +1915,7 @@ async fn get_pg_indexes_rows(
                 rows.push(Row::new(vec![
                     text_val(&table_schema),
                     text_val(&table_name),
-                    text_val(&format!("{}_pkey", table_name)),
+                    text_val(&pk_name),
                     null_val(),
                     text_val(&indexdef),
                 ]));
@@ -2068,7 +2152,9 @@ async fn get_pg_attribute_rows(
                     Value::Boolean(col.is_serial || col.default_expr.is_some()),
                     Value::Boolean(false),
                     Value::Boolean(true),
-                    int_val(-1), // type modifier
+                    int_val(-1),
+                    text_val(""),
+                    text_val(""),
                 ]));
             }
         }
@@ -2140,7 +2226,10 @@ async fn get_pg_constraint_rows(
         };
 
         if !schema.pk_indices.is_empty() {
-            let conname = format!("{}_pkey", table_short_name);
+            let conname = schema
+                .pk_constraint_name
+                .clone()
+                .unwrap_or_else(|| format!("{}_pkey", table_short_name));
             let conkey: Vec<Value> = schema
                 .pk_indices
                 .iter()
@@ -2295,35 +2384,60 @@ async fn get_pg_type_rows(
     schema_oids: &HashMap<String, u32>,
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
+    let pg_catalog_oid = schema_oid(schema_oids, "pg_catalog");
 
-    // Return the vector type so ORMs can discover it
-    rows.push(Row::new(vec![
-        int_val(16385),     // oid: custom type OID for vector
-        text_val("vector"), // typname
-        int_val(schema_oid(schema_oids, "pg_catalog")),
-        int_val(10),   // typowner: system user
-        int_val(-1),   // typlen: variable length
-        text_val("f"), // typbyval: false (not passed by value)
-        text_val("b"), // typtype: base type
-        text_val("A"), // typcategory: Array type
-        text_val("f"), // typispreferred: false
-        text_val("t"), // typisdefined: true
-        text_val(","), // typdelim: comma delimiter
-        int_val(0),    // typrelid: not a composite type
-        int_val(0),    // typelem: not an array
-        int_val(0),    // typarray: no array type
-    ]));
+    #[rustfmt::skip]
+    let builtin_types: &[(i64, &str, i64, &str, &str, &str)] = &[
+        (16, "bool", 1, "t", "b", "B"),
+        (17, "bytea", -1, "f", "b", "U"),
+        (20, "int8", 8, "t", "b", "N"),
+        (21, "int2", 2, "t", "b", "N"),
+        (23, "int4", 4, "t", "b", "N"),
+        (25, "text", -1, "f", "b", "S"),
+        (26, "oid", 4, "t", "b", "N"),
+        (114, "json", -1, "f", "b", "U"),
+        (700, "float4", 4, "t", "b", "N"),
+        (701, "float8", 8, "t", "b", "N"),
+        (1042, "bpchar", -1, "f", "b", "S"),
+        (1043, "varchar", -1, "f", "b", "S"),
+        (1082, "date", 4, "t", "b", "D"),
+        (1114, "timestamp", 8, "t", "b", "D"),
+        (1184, "timestamptz", 8, "t", "b", "D"),
+        (1186, "interval", 16, "f", "b", "T"),
+        (1700, "numeric", -1, "f", "b", "N"),
+        (2950, "uuid", 16, "f", "b", "U"),
+        (3802, "jsonb", -1, "f", "b", "U"),
+    ];
+
+    for &(oid, typname, typlen, typbyval, typtype, typcategory) in builtin_types {
+        rows.push(Row::new(vec![
+            int_val(oid),
+            text_val(typname),
+            int_val(pg_catalog_oid),
+            int_val(10),
+            int_val(typlen),
+            text_val(typbyval),
+            text_val(typtype),
+            text_val(typcategory),
+            text_val("f"),
+            text_val("t"),
+            text_val(","),
+            int_val(0),
+            int_val(0),
+            int_val(0),
+        ]));
+    }
 
     rows.push(Row::new(vec![
-        int_val(1082), // oid: built-in date
-        text_val("date"),
-        int_val(schema_oid(schema_oids, "pg_catalog")),
+        int_val(16385),
+        text_val("vector"),
+        int_val(pg_catalog_oid),
         int_val(10),
-        int_val(4),
-        text_val("t"),
+        int_val(-1),
+        text_val("f"),
         text_val("b"),
-        text_val("D"),
-        text_val("t"),
+        text_val("A"),
+        text_val("f"),
         text_val("t"),
         text_val(","),
         int_val(0),

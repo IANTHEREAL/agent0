@@ -1,0 +1,31 @@
+ case | case 
+------+------
+    1 | 
+(1 row)
+
+ nullif | nullif | nullif 
+--------+--------+--------
+      1 |        | 
+(1 row)
+
+ coalesce | coalesce | coalesce | coalesce 
+----------+----------+----------+----------
+        1 |        2 |        1 |        2
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/116_conditional.sql:24: ERROR:  SQL parse error: sql parser error: Expected a data type name, found: ) at Line: 1, Column 18
+psql:/home/dongxu/lab/pg-tikv/tests/116_conditional.sql:37: ERROR:  Table 't' not found
+psql:/home/dongxu/lab/pg-tikv/tests/116_conditional.sql:50: ERROR:  Table 't' not found
+psql:/home/dongxu/lab/pg-tikv/tests/116_conditional.sql:53: ERROR:  Table 't' not found
+ case | case | case  | case 
+------+------+-------+------
+ two  | one  | three | 
+(1 row)
+
+ case | case | case  | case  | case 
+------+------+-------+-------+------
+ one  | one  | three | three | two
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/116_conditional.sql:103: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/pg-tikv/tests/116_conditional.sql:105: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

@@ -1,0 +1,167 @@
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:6: ERROR:  Extension 'citext' is not available
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:16: ERROR:  SQL parse error: sql parser error: Expected ), found: 'Foo' at Line: 1, Column 25
+ pg_typeof 
+-----------
+ text
+(1 row)
+
+ pg_typeof 
+-----------
+ text
+(1 row)
+
+ citext 
+--------
+ Foo
+(1 row)
+
+ column_name | data_type 
+-------------+-----------
+ c           | text
+(1 row)
+
+ pg_typeof 
+-----------
+ text
+(1 row)
+
+ c 
+---
+(0 rows)
+
+ column_name | data_type 
+-------------+-----------
+ c           | text
+(1 row)
+
+ pg_typeof 
+-----------
+ text[]
+(1 row)
+
+       c       
+---------------
+ {test,TESTER}
+(1 row)
+
+ c 
+---
+(0 rows)
+
+ column_name | data_type 
+-------------+-----------
+ k           | int4
+ c           | text
+(2 rows)
+
+ pg_typeof 
+-----------
+ text
+(1 row)
+
+ c 
+---
+(0 rows)
+
+ column_name | data_type 
+-------------+-----------
+ k           | int4
+ c           | text
+(2 rows)
+
+ pg_typeof 
+-----------
+ text[]
+(1 row)
+
+ c 
+---
+(0 rows)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:163: ERROR:  Unsupported value literal: EscapedStringLiteral("u047D")
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:166: ERROR:  Unsupported value literal: EscapedStringLiteral("u00E9")
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:169: ERROR:  Unsupported value literal: EscapedStringLiteral("u00E9")
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:172: ERROR:  Unsupported value literal: EscapedStringLiteral("u00C9")
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:175: ERROR:  Unsupported value literal: EscapedStringLiteral("u0065u0301")
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:178: ERROR:  Unsupported value literal: EscapedStringLiteral("u00E9")
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:214: ERROR:  composite type 'public.ctype' cannot be used as a column type
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:220: ERROR:  Table 'composite_citext_tbl' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:223: ERROR:  Table 'composite_citext_tbl' not found
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:226: ERROR:  Table 'composite_citext_tbl' not found
+ citext 
+--------
+ test
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:236: ERROR:  Unsupported function: pg_collation_for
+psql:/home/dongxu/lab/pg-tikv/tests/109_citext.sql:238: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

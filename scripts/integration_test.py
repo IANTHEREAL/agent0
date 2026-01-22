@@ -461,7 +461,12 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
         expects_aligned = False
 
     mode = PsqlOutputMode.ALIGNED if expects_aligned else PsqlOutputMode.UNALIGNED
-    client_min_messages = "notice" if mode == PsqlOutputMode.ALIGNED else "warning"
+    expected_wants_notice = any("NOTICE:" in line for line in expected_lines)
+    client_min_messages = (
+        "notice"
+        if mode == PsqlOutputMode.ALIGNED or expected_wants_notice
+        else "warning"
+    )
 
     if setup_file.exists():
         log_info(f"  Running setup: {setup_file.name}")

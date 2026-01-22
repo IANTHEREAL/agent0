@@ -1,0 +1,134 @@
+ i  
+----
+  5
+ 10
+  1
+  6
+  2
+  7
+  3
+  8
+  4
+  9
+(10 rows)
+
+ i  
+----
+  5
+ 10
+  1
+  6
+  2
+  7
+  3
+  8
+  4
+  9
+(10 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/180_propagate_input_ordering.sql:23: ERROR:  Column 'foo' not found
+ i  | mod2 
+----+------
+ 5  | 1
+ 10 | 0
+ 1  | 1
+ 6  | 0
+ 2  | 0
+ 7  | 1
+ 3  | 1
+ 8  | 0
+ 4  | 0
+ 9  | 1
+(10 rows)
+
+  ?column?   
+-------------
+ {1,2,3,4,5}
+(1 row)
+
+ tmp.x | tmp2.i 
+-------+--------
+     1 |     10
+     1 |     11
+     1 |     12
+     1 |      8
+     1 |      9
+     2 |     10
+     2 |     11
+     2 |     12
+     2 |      8
+     2 |      9
+(10 rows)
+
+ i  
+----
+ 10
+  9
+  8
+  7
+  6
+  5
+  4
+  3
+  2
+  1
+(10 rows)
+
+ i  
+----
+ 10
+  9
+  8
+  7
+  6
+  5
+  4
+  3
+  2
+  1
+(10 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/180_propagate_input_ordering.sql:48: ERROR:  Table 'public.ab' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/180_propagate_input_ordering.sql:54: ERROR:  Table 'public.xy' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/180_propagate_input_ordering.sql:57: ERROR:  duplicate key value violates unique constraint "xy_pkey"
+DETAIL:  Key (x)=(2) already exists.
+  v  
+-----
+  10
+   3
+  10
+   1
+  20
+   2
+  20
+  30
+  30
+  40
+  40
+  50
+ 100
+ 200
+ 300
+ 400
+(16 rows)
+
+  v  
+-----
+   1
+   2
+   3
+  10
+  10
+  20
+  20
+  30
+  30
+  40
+  40
+  50
+ 100
+ 200
+ 300
+ 400
+(16 rows)
+

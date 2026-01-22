@@ -249,9 +249,18 @@ fn find_check_constraint_index(schema: &TableSchema, table: &str, name: &str) ->
 }
 
 fn constraint_name_exists(schema: &TableSchema, table: &str, name: &str) -> bool {
-    let pk_name = format!("{}_pkey", table);
-    if !schema.pk_indices.is_empty() && name == pk_name {
-        return true;
+    if !schema.pk_indices.is_empty() {
+        let default_pk_name;
+        let pk_name = match schema.pk_constraint_name.as_deref() {
+            Some(n) => n,
+            None => {
+                default_pk_name = format!("{}_pkey", table);
+                &default_pk_name
+            }
+        };
+        if name == pk_name {
+            return true;
+        }
     }
 
     if schema.foreign_keys.iter().any(|fk| fk.name == name) {
@@ -444,14 +453,21 @@ pub async fn execute_create_table(
         });
     }
 
+    let mut pk_constraint_name: Option<String> = None;
     let pk_columns: Vec<String> = constraints
         .iter()
         .filter_map(|c| match c {
             TableConstraint::Unique {
+                name,
                 columns,
                 is_primary,
                 ..
-            } if *is_primary => Some(columns.iter().map(normalize_ident).collect::<Vec<_>>()),
+            } if *is_primary => {
+                if pk_constraint_name.is_none() {
+                    pk_constraint_name = name.as_ref().map(normalize_ident);
+                }
+                Some(columns.iter().map(normalize_ident).collect::<Vec<_>>())
+            }
             _ => None,
         })
         .flatten()
@@ -485,6 +501,9 @@ pub async fn execute_create_table(
                 ColumnOption::Unique { is_primary, .. } => {
                     if *is_primary {
                         is_pk = true;
+                        if pk_constraint_name.is_none() {
+                            pk_constraint_name = opt.name.as_ref().map(normalize_ident);
+                        }
                     } else {
                         unique = true;
                     }
@@ -605,6 +624,15 @@ pub async fn execute_create_table(
             }
         }
     }
+
+    let pk_constraint_name = if pk_indices.is_empty() {
+        None
+    } else {
+        Some(
+            pk_constraint_name
+                .unwrap_or_else(|| format!("{}_pkey", table_object_name)),
+        )
+    };
 
     let table_id = store.next_table_id(txn).await?;
 
@@ -734,6 +762,7 @@ pub async fn execute_create_table(
         table_id,
         columns: col_defs,
         version: 1,
+        pk_constraint_name,
         pk_indices,
         indexes,
         check_constraints,
@@ -807,11 +836,16 @@ pub async fn create_table_from_query_result(
     }
 
     let table_id = store.next_table_id(txn).await?;
+    let pk_constraint_name = Some(format!(
+        "{}_pkey",
+        table_name.rsplit('.').next().unwrap_or(table_name)
+    ));
     let schema = TableSchema {
         name: table_name.to_string(),
         table_id,
         columns: col_defs,
         version: 1,
+        pk_constraint_name,
         pk_indices: vec![0],
         indexes: vec![],
         check_constraints: vec![],
@@ -879,11 +913,16 @@ pub async fn create_table_from_select_into(
     }));
 
     let table_id = store.next_table_id(txn).await?;
+    let pk_constraint_name = Some(format!(
+        "{}_pkey",
+        table_name.rsplit('.').next().unwrap_or(table_name)
+    ));
     let schema = TableSchema {
         name: table_name.to_string(),
         table_id,
         columns: col_defs,
         version: 1,
+        pk_constraint_name,
         pk_indices: vec![0],
         indexes: vec![],
         check_constraints: vec![],
@@ -1413,6 +1452,7 @@ pub async fn execute_alter_table(
         }
         AlterTableOperation::AddConstraint(constraint) => match constraint {
             TableConstraint::Unique {
+                name,
                 columns,
                 is_primary,
                 ..
@@ -1429,6 +1469,11 @@ pub async fn execute_alter_table(
                     }
                 }
                 schema.pk_indices = pk_indices;
+                schema.pk_constraint_name = Some(
+                    name.as_ref()
+                        .map(normalize_ident)
+                        .unwrap_or_else(|| format!("{}_pkey", table_object_name)),
+                );
                 schema.version += 1;
                 store.update_schema(txn, schema).await?;
             }
@@ -1697,12 +1742,39 @@ pub async fn execute_alter_table(
             }
 
             let constraint_name = normalize_ident(name);
-            let pk_name = format!("{}_pkey", table_object_name);
-            if !schema.pk_indices.is_empty() && constraint_name == pk_name {
-                return Err(anyhow!(
-                    "Cannot drop primary key constraint '{}'",
-                    constraint_name
-                ));
+            if !schema.pk_indices.is_empty() {
+                let default_pk_name;
+                let pk_name = match schema.pk_constraint_name.as_deref() {
+                    Some(n) => n,
+                    None => {
+                        default_pk_name = format!("{}_pkey", table_object_name);
+                        &default_pk_name
+                    }
+                };
+                if constraint_name == pk_name {
+                    let (start, end) = crate::storage::encode_table_data_range(schema.table_id);
+                    let range: tikv_client::BoundRange = (start..end).into();
+                    let existing_rows: Vec<_> = txn.scan(range, 1).await?.collect();
+                    if !existing_rows.is_empty() {
+                        return Err(anyhow!(
+                            "Cannot drop primary key constraint '{}' because it contains data",
+                            constraint_name
+                        ));
+                    }
+
+                    for &idx in &schema.pk_indices {
+                        if let Some(col) = schema.columns.get_mut(idx) {
+                            col.primary_key = false;
+                        }
+                    }
+                    schema.pk_indices.clear();
+                    schema.pk_constraint_name = None;
+                    schema.version += 1;
+                    store.update_schema(txn, schema).await?;
+                    return Ok(ExecuteResult::AlterTable {
+                        table_name: result_table_name,
+                    });
+                }
             }
 
             if let Some(pos) = schema
@@ -1929,9 +2001,18 @@ pub async fn execute_alter_table(
                 return Err(anyhow!("Constraint '{}' already exists", new));
             }
 
-            let pk_name = format!("{}_pkey", table_object_name);
-            if !schema.pk_indices.is_empty() && old == pk_name {
-                return Err(anyhow!("Cannot rename primary key constraint '{}'", old));
+            if !schema.pk_indices.is_empty() {
+                let default_pk_name;
+                let pk_name = match schema.pk_constraint_name.as_deref() {
+                    Some(n) => n,
+                    None => {
+                        default_pk_name = format!("{}_pkey", table_object_name);
+                        &default_pk_name
+                    }
+                };
+                if old == pk_name {
+                    return Err(anyhow!("Cannot rename primary key constraint '{}'", old));
+                }
             }
 
             if let Some(fk) = schema.foreign_keys.iter_mut().find(|fk| fk.name == old) {
@@ -2019,10 +2100,6 @@ pub async fn execute_alter_table(
                     store.update_schema(txn, schema).await?;
                 }
                 AlterColumnOperation::SetDataType { data_type, using } => {
-                    if using.is_some() {
-                        return Err(anyhow!("ALTER COLUMN ... TYPE ... USING is not supported"));
-                    }
-
                     if schema.pk_indices.contains(&col_idx) {
                         return Err(anyhow!(
                             "Cannot alter type of primary key column '{}'",
@@ -2071,8 +2148,14 @@ pub async fn execute_alter_table(
                             let mut row = crate::storage::deserialize_row(&value)?;
                             fill_row_defaults(&mut row, &schema)?;
 
-                            let old_val = std::mem::replace(&mut row.values[col_idx], Value::Null);
-                            let new_val = coerce_value_for_type_change(old_val, &target_col)?;
+                            let new_val = if let Some(using_expr) = &using {
+                                let result = eval_expr(using_expr, Some(&row), Some(&schema))?;
+                                coerce_value_for_column(result, &target_col)?
+                            } else {
+                                let old_val =
+                                    std::mem::replace(&mut row.values[col_idx], Value::Null);
+                                coerce_value_for_type_change(old_val, &target_col)?
+                            };
                             row.values[col_idx] = new_val;
 
                             let pk_values = schema.get_pk_values(&row);

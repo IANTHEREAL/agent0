@@ -1,0 +1,16 @@
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:101: ERROR:  cannot drop schema 'd': schema is not empty
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:102: ERROR:  Schema 'd' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:109: ERROR:  Table 'public.pg_show_create_all_types' not found
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:115: ERROR:  Table 'public.pg_show_create_all_types' not found
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:121: ERROR:  Table 'public.pg_show_create_all_types' not found
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:127: ERROR:  Table 'public.pg_show_create_all_types' not found
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:130: ERROR:  Schema 's' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:138: ERROR:  Table 'public.pg_show_create_all_types' not found
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:144: ERROR:  Table 'public.pg_show_create_all_types' not found
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:150: ERROR:  Table 'public.pg_show_create_all_types' not found
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:158: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:163: ERROR:  Table 'public.pg_show_create_all_types' not found
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:166: ERROR:  Type 'public.address' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:176: ERROR:  Unsupported COMMENT ON statement
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:181: ERROR:  Table 'public.pg_show_create_all_types' not found
+psql:/home/dongxu/lab/pg-tikv/tests/193_show_create_all_types.sql:183: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

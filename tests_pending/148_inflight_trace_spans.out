@@ -1,0 +1,22 @@
+psql:/home/dongxu/lab/pg-tikv/tests/148_inflight_trace_spans.sql:12: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: DO at Line: 1, Column 1
+psql:/home/dongxu/lab/pg-tikv/tests/148_inflight_trace_spans.sql:15: ERROR:  Table 'public.kv' already exists
+ k | v 
+---+---
+ 1 | 1
+ 2 | 2
+ 3 | 3
+ 4 | 4
+ 5 | 5
+(5 rows)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/148_inflight_trace_spans.sql:44: ERROR:  invalid input syntax for type integer: "k"
+ ?column? 
+----------
+ t
+(1 row)
+

@@ -1,0 +1,5 @@
+psql:/home/dongxu/lab/pg-tikv/tests/138_explain.sql:19: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: OFF at Line: 1, Column 15
+psql:/home/dongxu/lab/pg-tikv/tests/138_explain.sql:23: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: OFF at Line: 1, Column 15
+psql:/home/dongxu/lab/pg-tikv/tests/138_explain.sql:28: ERROR:  Unsupported types for addition
+psql:/home/dongxu/lab/pg-tikv/tests/138_explain.sql:36: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: OFF at Line: 1, Column 15
+psql:/home/dongxu/lab/pg-tikv/tests/138_explain.sql:38: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

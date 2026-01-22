@@ -1,0 +1,35 @@
+psql:/home/dongxu/lab/pg-tikv/tests/145_hash_join_dist.sql:5: ERROR:  Table 'public.t' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/145_hash_join_dist.sql:8: ERROR:  Column count mismatch
+ k | a | b | c | s | t | z 
+---+---+---+---+---+---+---
+(0 rows)
+
+ b  | d  
+----+----
+  6 | 12
+ 12 | 24
+  3 |   
+  9 |   
+ 15 |   
+(5 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/145_hash_join_dist.sql:48: ERROR:  Table 'public.b' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/145_hash_join_dist.sql:49: ERROR:  Column not found
+psql:/home/dongxu/lab/pg-tikv/tests/145_hash_join_dist.sql:50: ERROR:  Column not found
+ id 
+----
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/145_hash_join_dist.sql:58: ERROR:  Table 'public.t86075' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/145_hash_join_dist.sql:59: ERROR:  duplicate key value violates unique constraint "t86075_pkey"
+DETAIL:  Key (k)=(1) already exists.
+ k 
+---
+ 1
+(1 row)
+
+ k 
+---
+ 1
+(1 row)
+

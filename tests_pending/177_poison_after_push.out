@@ -1,0 +1,29 @@
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:15: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: DO at Line: 1, Column 1
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:18: ERROR:  Table 'public.t' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:21: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:24: ERROR:  Role or user 'testuser' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:28: ERROR:  Extension 'dblink' is not available
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:29: ERROR:  Unsupported function: dblink_connect
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:30: ERROR:  Unsupported function: dblink_connect
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:33: ERROR:  Unsupported function: dblink_exec
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:34: ERROR:  Unsupported function: dblink_exec
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:37: ERROR:  Unsupported function: dblink_exec
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:40: ERROR:  SQL parse error: sql parser error: Expected ), found: int at Line: 1, Column 62
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:43: ERROR:  Unsupported function: dblink_exec
+ x |  z  | y 
+---+-----+---
+ 0 | 123 |  
+ 1 | 123 |  
+(2 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:49: ERROR:  Unsupported function: dblink_exec
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:52: ERROR:  Unsupported function: dblink_exec
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:55: ERROR:  Unsupported function: dblink_exec
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:57: ERROR:  Unsupported function: dblink_exec
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:60: ERROR:  Unsupported function: dblink_exec
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:63: ERROR:  SQL parse error: sql parser error: Expected ), found: int at Line: 1, Column 74
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:66: ERROR:  Unsupported function: dblink_exec
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:69: ERROR:  SQL parse error: sql parser error: Expected ), found: int at Line: 1, Column 73
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:72: ERROR:  Unsupported function: dblink_exec
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:74: ERROR:  Unsupported function: dblink_disconnect
+psql:/home/dongxu/lab/pg-tikv/tests/177_poison_after_push.sql:75: ERROR:  Unsupported function: dblink_disconnect

@@ -127,6 +127,7 @@ fn http_response_schema(name: &str) -> TableSchema {
                 default_expr: None,
             },
         ],
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         version: 1,

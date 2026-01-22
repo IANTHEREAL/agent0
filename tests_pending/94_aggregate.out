@@ -1,0 +1,1584 @@
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:7: NOTICE:  table "kv" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:15: ERROR:  Unsupported data type: Interval
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:22: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:25: ERROR:  Unsupported function: min
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:28: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:31: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:34: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:37: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:40: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:47: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:50: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:53: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:56: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:59: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:65: ERROR:  Unsupported function: min
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:68: ERROR:  Unsupported expression: ArrayAgg(ArrayAgg { distinct: false, expr: Value(Number("1", false)), order_by: None, limit: None, within_group: false })
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:71: ERROR:  Unsupported expression: ArrayAgg(ArrayAgg { distinct: false, expr: Cast { expr: Value(SingleQuotedString("{1}")), data_type: Array(SquareBracket(Int(None))), format: None }, order_by: None, limit: None, within_group: false })
+   ?column?    
+---------------
+ {{1},{1},{1}}
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:77: ERROR:  Unsupported function: json_agg
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:80: ERROR:  Unsupported function: jsonb_agg
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:83: ERROR:  Unsupported function: count
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:86: ERROR:  Unsupported function: json_agg
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:89: ERROR:  Unsupported function: jsonb_agg
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:92: ERROR:  Unsupported expression: ArrayAgg(ArrayAgg { distinct: false, expr: Cast { expr: Value(Null), data_type: Int(None), format: None }, order_by: None, limit: None, within_group: false })
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:95: ERROR:  Unsupported expression: ArrayAgg(ArrayAgg { distinct: false, expr: Cast { expr: Value(Null), data_type: Text, format: None }, order_by: None, limit: None, within_group: false })
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:98: ERROR:  Only SELECT supported
+ coalesce 
+----------
+        0
+(1 row)
+
+ count 
+-------
+   100
+(1 row)
+
+ ?column? 
+----------
+        1
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:110: ERROR:  Table 'kv' not found
+ ?column? 
+----------
+        0
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:122: ERROR:  Table 'kv' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:127: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:130: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:133: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:136: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:139: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:142: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:145: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:148: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:179: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:182: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:185: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:188: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:191: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:194: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:197: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:200: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:203: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:206: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:209: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:213: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:216: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:235: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:238: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:241: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:244: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:247: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:261: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:264: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:270: ERROR:  Unsupported function: count
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:273: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:276: ERROR:  Unsupported function: count
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:279: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:282: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:285: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:288: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:291: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:294: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:297: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:300: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:303: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:306: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:309: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:312: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:315: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:318: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:321: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:324: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:327: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:330: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:333: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:336: ERROR:  Unsupported function: count
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:339: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:342: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:345: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:348: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:351: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:354: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:357: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:360: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:363: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:366: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:369: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:372: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:375: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:378: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:381: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:384: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:387: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:390: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:393: NOTICE:  table "abc_tbl" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:394: NOTICE:  table "abc_tbl" does not exist, skipping
+ min | min | bool_and | min 
+-----+-----+----------+-----
+ one | 1.5 | f        | 1.1
+(1 row)
+
+ max | max | bool_or | max 
+-----+-----+---------+-----
+ two |   2 | t       |   5
+(1 row)
+
+        avg         | sum |        avg         | sum 
+--------------------+-----+--------------------+-----
+ 1.7500000000000000 | 3.5 | 3.0500000000000000 | 6.1
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:415: NOTICE:  table "intervals" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:418: ERROR:  Unsupported data type: Interval
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:421: ERROR:  Table 'intervals' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:424: ERROR:  Table 'intervals' not found
+        avg         
+--------------------
+ 3.0000000000000000
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:452: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 9520000 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:454: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 9520000 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:456: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 9520000 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+ min 
+-----
+   1
+(1 row)
+
+ min 
+-----
+   2
+(1 row)
+
+ min 
+-----
+   2
+(1 row)
+
+ min | max 
+-----+-----
+   1 |   8
+(1 row)
+
+ ?column? | ?column? 
+----------+----------
+        2 |        9
+(1 row)
+
+ min | max | sum 
+-----+-----+-----
+   1 |   8 |  12
+(1 row)
+
+ min | max 
+-----+-----
+   5 |   5
+(1 row)
+
+ min | max 
+-----+-----
+   1 |   1
+(1 row)
+
+ min | max 
+-----+-----
+   3 |   5
+(1 row)
+
+ max | min 
+-----+-----
+   6 |   1
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:493: ERROR:  Cannot compare distinct types: Array([Float64(3.0), Int32(1)]) vs Float64(8.0)
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:496: ERROR:  Unsupported function: max
+ min 
+-----
+   4
+(1 row)
+
+ max 
+-----
+   7
+(1 row)
+
+ min 
+-----
+   2
+(1 row)
+
+ max 
+-----
+   2
+(1 row)
+
+ min 
+-----
+    
+(1 row)
+
+ max 
+-----
+    
+(1 row)
+
+ min 
+-----
+   1
+(1 row)
+
+ max 
+-----
+   1
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:523: ERROR:  Unsupported function: var_samp
+ variance 
+----------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:529: ERROR:  Unsupported function: variance
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:532: ERROR:  Unsupported function: var_pop
+ var_pop 
+---------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:538: ERROR:  Unsupported function: var_pop
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:541: ERROR:  Unsupported function: stddev_samp
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:544: ERROR:  Unsupported function: stddev
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:547: ERROR:  Unsupported function: stddev_pop
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:550: ERROR:  Unsupported function: stddev_pop
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:553: ERROR:  Unsupported function: avg
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:559: NOTICE:  table "ifd" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:560: NOTICE:  table "ifd" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:577: ERROR:  Unsupported function: variance
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:582: ERROR:  Unsupported function: variance
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:585: NOTICE:  table "sqrdiff" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:588: NOTICE:  table "mnop" does not exist, skipping
+ round | round | round 
+-------+-------+-------
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+(100 rows)
+
+ round | round | round 
+-------+-------+-------
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+(100 rows)
+
+ round | round | round 
+-------+-------+-------
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+(100 rows)
+
+ round | round | round 
+-------+-------+-------
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+ 2     | 2     | 
+(100 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:616: ERROR:  Unsupported function: avg
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:619: ERROR:  Unsupported function: count
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:622: ERROR:  Unsupported function: sum
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:625: ERROR:  Unsupported function: variance
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:628: ERROR:  Unsupported function: var_pop
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:631: ERROR:  Unsupported function: stddev
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:634: ERROR:  Unsupported function: stddev_pop
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:637: NOTICE:  table "bits" does not exist, skipping
+ bit_and | bit_or 
+---------+--------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:647: ERROR:  Unsupported function: bit_and
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:653: ERROR:  Unsupported function: bit_and
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:659: ERROR:  Unsupported function: bit_and
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:662: NOTICE:  table "bools" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:663: ERROR:  Unsupported data type: Bool
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:666: ERROR:  Table 'bools' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:669: ERROR:  Table 'bools' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:672: ERROR:  Table 'bools' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:675: ERROR:  Table 'bools' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:678: ERROR:  Table 'bools' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:681: ERROR:  Table 'bools' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:684: ERROR:  Table 'bools' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:687: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:690: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:693: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:696: NOTICE:  table "filter_test" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:701: ERROR:  Unsupported data type: Bool
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:711: ERROR:  Table 'filter_test' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:714: ERROR:  Table 'filter_test' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:717: ERROR:  Table 'filter_test' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:720: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:730: ERROR:  SQL parse error: sql parser error: Expected an identifier or a '*' after '.', found: * at Line: 1, Column 30
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:733: ERROR:  SQL parse error: sql parser error: Expected an identifier or a '*' after '.', found: * at Line: 1, Column 77
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:736: NOTICE:  table "opt_test" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:738: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 9520000 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+ min 
+-----
+   5
+(1 row)
+
+ min 
+-----
+   5
+(1 row)
+
+ min 
+-----
+  10
+(1 row)
+
+ min 
+-----
+   5
+    
+    
+  10
+(4 rows)
+
+ max 
+-----
+  10
+    
+   5
+    
+(4 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:760: NOTICE:  table "xor_bytes" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:772: ERROR:  Unsupported function: to_hex
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:775: ERROR:  Unsupported function: to_hex
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:778: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:781: ERROR:  Unsupported function: bool_or
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:786: NOTICE:  table "ab" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:788: NOTICE:  table "xy" does not exist, skipping
+ ?column? 
+----------
+ {1,1}
+ {1,2}
+ {3,3}
+(3 rows)
+
+ min | ?column? 
+-----+----------
+  20 | {3,3}
+  30 | {3,3}
+  10 | {1,2}
+  10 | {1,1}
+  10 | {3,3}
+  20 | {1,1}
+  20 | {1,2}
+  30 | {1,1}
+  30 | {1,2}
+(9 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:801: NOTICE:  table "group_ord" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:807: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 9520000 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+ x | max 
+---+-----
+ 5 |    
+ 1 |   2
+ 3 |   4
+ 6 |   2
+ 7 |   2
+ 8 |   4
+(6 rows)
+
+ x | max 
+---+-----
+ 1 |   2
+ 3 |   4
+ 5 |    
+ 6 |   2
+ 7 |   2
+ 8 |   4
+(6 rows)
+
+ z | x | max 
+---+---+-----
+ 3 | 1 |   2
+ 5 | 5 |    
+ 3 | 6 |   2
+ 5 | 3 |   4
+ 2 | 7 |   2
+ 2 | 8 |   4
+(6 rows)
+
+ z | x | max 
+---+---+-----
+ 3 | 1 |   2
+ 5 | 3 |   4
+ 5 | 5 |    
+ 3 | 6 |   2
+ 2 | 7 |   2
+ 2 | 8 |   4
+(6 rows)
+
+ z | max 
+---+-----
+ 2 |   4
+ 5 |   4
+ 3 |   2
+(3 rows)
+
+ subquery.x | subquery.max | subquery.z | subquery.min 
+------------+--------------+------------+--------------
+          5 |              |          5 |            4
+          3 | 4            |          3 |            2
+(2 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:838: NOTICE:  table "index_tab" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:839: NOTICE:  table "index_tab" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:854: ERROR:  SQL parse error: sql parser error: Expected ), found: ( at Line: 3, Column 3
+ max 
+-----
+    
+(1 row)
+
+ min 
+-----
+    
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:869: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:872: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:875: ERROR:  Table 'kv' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:878: NOTICE:  table "statistics_agg_test" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:879: NOTICE:  table "statistics_agg_test" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:905: ERROR:  Unsupported function: corr
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:909: ERROR:  Unsupported function: corr
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:913: ERROR:  Unsupported function: corr
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:917: ERROR:  Unsupported function: corr
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:929: ERROR:  Unsupported function: corr
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:941: ERROR:  Unsupported function: corr
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:953: ERROR:  Unsupported function: corr
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:974: ERROR:  Unsupported function: covar_pop
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:978: ERROR:  Unsupported function: covar_pop
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:982: ERROR:  Unsupported function: covar_pop
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:986: ERROR:  Unsupported function: covar_pop
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:998: ERROR:  Unsupported function: covar_pop
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1010: ERROR:  Unsupported function: covar_pop
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1031: ERROR:  Unsupported function: covar_samp
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1035: ERROR:  Unsupported function: covar_samp
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1039: ERROR:  Unsupported function: covar_samp
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1043: ERROR:  Unsupported function: covar_samp
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1055: ERROR:  Unsupported function: covar_samp
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1067: ERROR:  Unsupported function: covar_samp
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1088: ERROR:  Unsupported function: regr_intercept
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1092: ERROR:  Unsupported function: regr_intercept
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1096: ERROR:  Unsupported function: regr_intercept
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1100: ERROR:  Unsupported function: regr_intercept
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1112: ERROR:  Unsupported function: regr_intercept
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1124: ERROR:  Unsupported function: regr_intercept
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1136: ERROR:  Unsupported function: regr_intercept
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1157: ERROR:  Unsupported function: regr_r2
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1161: ERROR:  Unsupported function: regr_r2
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1165: ERROR:  Unsupported function: regr_r2
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1169: ERROR:  Unsupported function: regr_r2
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1181: ERROR:  Unsupported function: regr_r2
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1193: ERROR:  Unsupported function: regr_r2
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1205: ERROR:  Unsupported function: regr_r2
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1226: ERROR:  Unsupported function: regr_slope
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1230: ERROR:  Unsupported function: regr_slope
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1234: ERROR:  Unsupported function: regr_slope
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1238: ERROR:  Unsupported function: regr_slope
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1250: ERROR:  Unsupported function: regr_slope
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1262: ERROR:  Unsupported function: regr_slope
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1274: ERROR:  Unsupported function: regr_slope
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1295: ERROR:  Unsupported function: regr_sxx
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1299: ERROR:  Unsupported function: regr_sxx
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1303: ERROR:  Unsupported function: regr_sxx
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1307: ERROR:  Unsupported function: regr_sxx
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1319: ERROR:  Unsupported function: regr_sxx
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1331: ERROR:  Unsupported function: regr_sxx
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1352: ERROR:  Unsupported function: regr_sxy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1356: ERROR:  Unsupported function: regr_sxy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1360: ERROR:  Unsupported function: regr_sxy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1364: ERROR:  Unsupported function: regr_sxy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1376: ERROR:  Unsupported function: regr_sxy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1388: ERROR:  Unsupported function: regr_sxy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1409: ERROR:  Unsupported function: regr_syy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1413: ERROR:  Unsupported function: regr_syy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1417: ERROR:  Unsupported function: regr_syy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1421: ERROR:  Unsupported function: regr_syy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1433: ERROR:  Unsupported function: regr_syy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1445: ERROR:  Unsupported function: regr_syy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1466: ERROR:  Unsupported function: regr_count
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1470: ERROR:  Unsupported function: regr_count
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1474: ERROR:  Unsupported function: regr_count
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1478: ERROR:  Unsupported function: regr_count
+ regr_count 
+------------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1493: ERROR:  Unsupported function: regr_count
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1515: ERROR:  Unsupported function: regr_avgx
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1519: ERROR:  Unsupported function: regr_avgx
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1523: ERROR:  Unsupported function: regr_avgx
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1527: ERROR:  Unsupported function: regr_avgx
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1539: ERROR:  Unsupported function: regr_avgx
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1551: ERROR:  Unsupported function: regr_avgx
+ regr_avgx 
+-----------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1575: ERROR:  Unsupported function: regr_avgy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1579: ERROR:  Unsupported function: regr_avgy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1583: ERROR:  Unsupported function: regr_avgy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1587: ERROR:  Unsupported function: regr_avgy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1599: ERROR:  Unsupported function: regr_avgy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1611: ERROR:  Unsupported function: regr_avgy
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1617: NOTICE:  table "string_agg_test" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1618: NOTICE:  table "string_agg_test" does not exist, skipping
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+          5 | C
+          6 | D
+          7 | D
+          8 | D
+          9 | C
+         10 | B
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | [65]
+          2 | [66]
+          3 | [67]
+          4 | [68]
+          5 | [67]
+          6 | [68]
+          7 | [68]
+          8 | [68]
+          9 | [67]
+         10 | [66]
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+          5 | C
+          6 | D
+          7 | D
+          8 | D
+          9 | C
+         10 | B
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | [65]
+          2 | [66]
+          3 | [67]
+          4 | [68]
+          5 | [67]
+          6 | [68]
+          7 | [68]
+          8 | [68]
+          9 | [67]
+         10 | [66]
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          3 | C
+          7 | D
+          9 | C
+          1 | A
+          2 | B
+          4 | D
+          5 | C
+          6 | D
+          8 | D
+         10 | B
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+          5 | C
+          6 | D
+          7 | D
+          8 | D
+          9 | C
+         10 | B
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+          5 | C
+          6 | D
+          7 | D
+          8 | D
+          9 | C
+         10 | B
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | [65]
+          2 | [66]
+          3 | [67]
+          4 | [68]
+          5 | [67]
+          6 | [68]
+          7 | [68]
+          8 | [68]
+          9 | [67]
+         10 | [66]
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+          5 | C
+          6 | D
+          7 | D
+          8 | D
+          9 | C
+         10 | B
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | [65]
+          2 | [66]
+          3 | [67]
+          4 | [68]
+          5 | [67]
+          6 | [68]
+          7 | [68]
+          8 | [68]
+          9 | [67]
+         10 | [66]
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+          5 | C
+          6 | D
+          7 | D
+          8 | D
+          9 | C
+         10 | B
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | [65]
+          2 | [66]
+          3 | [67]
+          4 | [68]
+          5 | [67]
+          6 | [68]
+          7 | [68]
+          8 | [68]
+          9 | [67]
+         10 | [66]
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | 
+          2 | 
+          3 | 
+          4 | 
+          5 | 
+          6 | 
+          7 | 
+          8 | 
+          9 | 
+         10 | 
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | 
+          2 | 
+          3 | 
+          4 | 
+          5 | 
+          6 | 
+          7 | 
+          8 | 
+          9 | 
+         10 | 
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | 
+          2 | 
+          3 | 
+          4 | 
+          5 | 
+          6 | 
+          7 | 
+          8 | 
+          9 | 
+         10 | 
+(10 rows)
+
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+(4 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1767: ERROR:  Column 'employee' not found
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+(4 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1787: ERROR:  Column 'employee' not found
+ company_id | string_agg 
+------------+------------
+          1 | A
+          2 | B
+          3 | C
+          4 | D
+(4 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1807: ERROR:  Column 'employee' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1813: ERROR:  Unsupported function: string_agg
+ ?column? 
+----------
+ {1,2}
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1819: NOTICE:  table "uvw" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1821: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 9520000 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+ u | v |   s   
+---+---+-------
+ 3 | 2 | {1,3}
+ 1 | 2 | {3,3}
+(2 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1831: NOTICE:  table "tab" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1832: NOTICE:  table "tab" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1840: ERROR:  invalid input syntax for type integer: "{-3, 7}"
+ ?column? 
+----------
+ 
+(1 row)
+
+ ?column? 
+----------
+ 
+(1 row)
+
+ ?column? 
+----------
+ 
+(1 row)
+
+ ?column? 
+----------
+ 
+(1 row)
+
+ json_agg 
+----------
+(0 rows)
+
+ jsonb_agg 
+-----------
+(0 rows)
+
+ jsonb_agg 
+-----------
+(0 rows)
+
+ string_agg 
+------------
+ 
+(1 row)
+
+ string_agg 
+------------
+ 
+(1 row)
+
+ string_agg 
+------------
+ 
+(1 row)
+
+ string_agg 
+------------
+ 
+(1 row)
+
+ ?column? | ?column? | ?column? 
+----------+----------+----------
+          |          | 
+(1 row)
+
+ ?column? | ?column? | col3 
+----------+----------+------
+(0 rows)
+
+ ?column? | ?column? | count | count 
+----------+----------+-------+-------
+          |          |     0 |     0
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1885: ERROR:  Unsupported expression: AggregateExpressionWithFilter { expr: ArrayAgg(ArrayAgg { distinct: false, expr: Identifier(Ident { value: "col1", quote_style: None }), order_by: Some([OrderByExpr { expr: Identifier(Ident { value: "col1", quote_style: None }), asc: None, nulls_first: None }]), limit: None, within_group: false }), filter: BinaryOp { left: Identifier(Ident { value: "col1", quote_style: None }), op: Lt, right: Value(Number("0", false)) } }
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1888: ERROR:  Unsupported expression: AggregateExpressionWithFilter { expr: ArrayAgg(ArrayAgg { distinct: false, expr: Identifier(Ident { value: "col1", quote_style: None }), order_by: Some([OrderByExpr { expr: Identifier(Ident { value: "col3", quote_style: None }), asc: None, nulls_first: None }, OrderByExpr { expr: Identifier(Ident { value: "col1", quote_style: None }), asc: None, nulls_first: None }]), limit: None, within_group: false }), filter: BinaryOp { left: Identifier(Ident { value: "col1", quote_style: None }), op: Lt, right: Value(Number("0", false)) } }
+ count | string_agg 
+-------+------------
+     0 | 
+(1 row)
+
+ count_1 | count_lower | count_upper | concat 
+---------+-------------+-------------+--------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1912: ERROR:  No PK
+ b 
+---
+ 3
+ 7
+ 1
+(3 rows)
+
+ ?column? | count 
+----------+-------
+(0 rows)
+
+ a | col1 | ?column? | count 
+---+------+----------+-------
+(0 rows)
+
+ a | b | count | count 
+---+---+-------+-------
+ 1 | 1 |     2 |     0
+ 3 | 3 |     2 |     0
+ 2 | 1 |     2 |     0
+ 4 | 7 |     1 |     0
+(4 rows)
+
+ a | b | count 
+---+---+-------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1933: NOTICE:  table "xyz" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1939: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 9520000 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+ min 
+-----
+   1
+(1 row)
+
+ min 
+-----
+   1
+(1 row)
+
+ min 
+-----
+    
+(1 row)
+
+ min 
+-----
+(0 rows)
+
+ max 
+-----
+   7
+(1 row)
+
+ max 
+-----
+   7
+(1 row)
+
+ max 
+-----
+    
+(1 row)
+
+ max 
+-----
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1973: NOTICE:  table "t44469_a" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1975: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 9520000 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1979: NOTICE:  table "t44469_b" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1981: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 9520000 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1985: NOTICE:  table "t44469_cd" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1987: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 9520000 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+ b 
+---
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:1997: NOTICE:  table "t" does not exist, skipping
+              x               | sum 
+------------------------------+-----
+ {"foo": "bar"}               |  15
+ [1,2]                        |  25
+ {"bar": "baz", "foo": "bar"} |  35
+ {"foo": {"bar": "baz"}}      |  45
+(4 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2013: NOTICE:  table "t_every" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2014: ERROR:  Unsupported data type: Bool
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2017: ERROR:  Table 't_every' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2020: ERROR:  Table 't_every' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2023: ERROR:  Table 't_every' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2026: ERROR:  Table 't_every' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2029: ERROR:  Table 't_every' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2032: ERROR:  Table 't_every' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2035: ERROR:  Table 't_every' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2038: ERROR:  Table 't_every' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2039: ERROR:  Table 't_every' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2042: ERROR:  Table 't_every' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2045: ERROR:  Table 't_every' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2048: ERROR:  Table 't_every' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2051: ERROR:  Table 't_every' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2054: NOTICE:  table "t46423" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2059: ERROR:  Unsupported function: variance
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2062: NOTICE:  table "t45453" does not exist, skipping
+ count 
+-------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2069: NOTICE:  table "vals" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2072: NOTICE:  table "vals" does not exist, skipping
+ bit_and 
+---------
+(0 rows)
+
+ bit_or 
+--------
+(0 rows)
+
+ bit_and 
+---------
+(0 rows)
+
+ bit_or 
+--------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2091: ERROR:  Unsupported function: bit_and
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2094: ERROR:  Unsupported function: bit_or
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2097: ERROR:  Unsupported function: bit_and
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2100: ERROR:  Unsupported function: bit_or
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2111: ERROR:  Unsupported function: bit_and
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2114: ERROR:  Unsupported function: bit_or
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2122: ERROR:  Unsupported function: bit_and
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2125: ERROR:  Unsupported function: bit_or
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2128: ERROR:  No PK
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2135: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2138: ERROR:  Unsupported function: bit_and
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2141: ERROR:  Unsupported function: bit_or
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2144: ERROR:  Unsupported function: bit_and
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2147: ERROR:  Unsupported function: bit_or
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2150: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2153: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2156: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2159: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2162: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2165: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2168: NOTICE:  table "t46981_0" does not exist, skipping
+ count 
+-------
+ 0
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2177: NOTICE:  table "osagg" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2180: NOTICE:  table "osagg" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2185: ERROR:  Unsupported data type: Interval
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2195: ERROR:  Table 'osagg' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2200: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 2, Column 32
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2206: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 2, Column 32
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2213: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 2, Column 32
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2220: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 2, Column 32
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2228: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 2, Column 32
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2235: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 2, Column 32
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2242: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 2, Column 32
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2247: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 2, Column 48
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2252: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 2, Column 59
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2257: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 2, Column 59
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2262: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 2, Column 59
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2277: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 2, Column 59
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2283: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 2, Column 39
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2286: ERROR:  Unsupported function: pg_get_viewdef
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2295: NOTICE:  table "t_collate" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2296: NOTICE:  table "t_collate" does not exist, skipping
+ min | max 
+-----+-----
+ a   | b
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2303: NOTICE:  table "profiles" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2304: NOTICE:  table "profiles" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2319: ERROR:  Unsupported function: json_object_agg
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2322: NOTICE:  table "users" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2323: NOTICE:  table "users" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2333: NOTICE:  table "user_networks" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2334: NOTICE:  table "user_networks" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2355: ERROR:  Unsupported function in JOIN: json_object_agg
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2358: ERROR:  Unsupported function: json_object_agg
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2361: ERROR:  Unsupported function: json_object_agg
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2364: NOTICE:  table "persons" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2365: NOTICE:  table "persons" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2375: NOTICE:  table "companies" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2376: NOTICE:  table "companies" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2389: NOTICE:  table "jobs" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2390: NOTICE:  table "jobs" does not exist, skipping
+ json_build_object 
+-------------------
+ {}
+ {}
+(2 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2414: NOTICE:  table "blog" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2415: NOTICE:  table "blog" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2423: NOTICE:  table "blog_properties" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2424: NOTICE:  table "blog_properties" does not exist, skipping
+ json_build_object 
+-------------------
+ {}
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2444: NOTICE:  table "t55776" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2445: ERROR:  Unsupported data type: Float8
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2451: ERROR:  Table 't55776' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2454: ERROR:  Table 't55776' not found
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2457: NOTICE:  table "t63159" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2459: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 9520000 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+ a | b | count 
+---+---+-------
+ 0 | 0 |     1
+ 1 | 1 |     2
+ 2 | 2 |     1
+ 3 | 3 |     1
+ 5 | 5 |     1
+(5 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2467: NOTICE:  table "t63436" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2469: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 9520000 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+ count 
+-------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2474: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 1, Column 37
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2477: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 1, Column 37
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2480: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 1, Column 37
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2483: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 1, Column 37
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2486: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 1, Column 37
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2489: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 1, Column 37
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2492: NOTICE:  table "corrupt_combine" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2508: ERROR:  Unsupported function: covar_pop
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2512: NOTICE:  table "t2" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2518: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 9520000 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+ min 
+-----
+   0
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2526: NOTICE:  table "nulls_last_test" does not exist, skipping
+   ?column?   
+--------------
+ {3,1,NULL,2}
+(1 row)
+
+                 ?column?                 
+------------------------------------------
+ {{3,baz},{1,foo},{NULL,bar},{NULL,NULL}}
+(1 row)
+
+                 ?column?                 
+------------------------------------------
+ {{3,baz},{1,foo},{NULL,bar},{NULL,NULL}}
+(1 row)
+
+                 ?column?                 
+------------------------------------------
+ {{3,baz},{1,foo},{NULL,bar},{NULL,NULL}}
+(1 row)
+
+                 ?column?                 
+------------------------------------------
+ {{3,baz},{1,foo},{NULL,bar},{NULL,NULL}}
+(1 row)
+
+   ?column?   
+--------------
+ {3,1,NULL,2}
+(1 row)
+
+                 ?column?                 
+------------------------------------------
+ {{3,baz},{1,foo},{NULL,bar},{NULL,NULL}}
+(1 row)
+
+                 ?column?                 
+------------------------------------------
+ {{3,baz},{1,foo},{NULL,bar},{NULL,NULL}}
+(1 row)
+
+                 ?column?                 
+------------------------------------------
+ {{3,baz},{1,foo},{NULL,bar},{NULL,NULL}}
+(1 row)
+
+                 ?column?                 
+------------------------------------------
+ {{3,baz},{1,foo},{NULL,bar},{NULL,NULL}}
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2580: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2591: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2605: NOTICE:  table "__test_array_agg" does not exist, skipping
+                        ?column?                        
+--------------------------------------------------------
+ {{a,"",::byteac},{aa,b,::byteacc},{aaa,bb,::byteaccc}}
+(1 row)
+
+                                        z                                        
+---------------------------------------------------------------------------------
+ {{{1,2,3},{1,2,3},{1,2,3}},{{1,2,3},{1,2,3},{1,2,3}},{{1,2,3},{1,2,3},{1,2,3}}}
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2622: NOTICE:  table "t124101" does not exist, skipping
+ a | s 
+---+---
+ 0 | 1
+ 0 | 2
+(2 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2640: NOTICE:  table "t90519" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2645: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: GROUP at Line: 1, Column 49
+psql:/home/dongxu/lab/pg-tikv/tests/94_aggregate.sql:2647: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

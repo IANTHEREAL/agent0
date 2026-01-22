@@ -670,6 +670,7 @@ mod tests {
                     },
                 ],
                 version: 1,
+                pk_constraint_name: Some("users_pkey".to_string()),
                 pk_indices: vec![0],
                 indexes: vec![IndexDef {
                     id: 1,

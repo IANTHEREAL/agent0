@@ -1,0 +1,14 @@
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:7: ERROR:  Extension 'postgis' is not available
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:9: ERROR:  Extension 'btree_gist' is not available
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:31: ERROR:  Unsupported function: ST_Intersects
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:34: ERROR:  Unsupported function: ST_CoveredBy
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:37: ERROR:  Unsupported function: ST_Intersects
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:40: ERROR:  Unsupported function: ST_CoveredBy
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:43: ERROR:  Unsupported function: ST_Intersects
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:46: ERROR:  Unsupported function: ST_CoveredBy
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:52: ERROR:  SQL parse error: sql parser error: Expected ), found: gist_text_ops at Line: 1, Column 53
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:55: ERROR:  Unsupported function: ST_Intersects
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:58: ERROR:  Unsupported function: ST_CoveredBy
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:61: ERROR:  Unsupported function: ST_Intersects
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:64: ERROR:  Unsupported function: ST_CoveredBy
+psql:/home/dongxu/lab/pg-tikv/tests/154_inverted_filter_geospatial_dist.sql:66: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

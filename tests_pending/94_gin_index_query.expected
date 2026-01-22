@@ -1,0 +1,18 @@
+QUERY PLAN
+Index Scan using gin_test_metadata_idx on gin_test  (cost=0.15..0.25 rows=10 width=68)
+  Index Cond: metadata @> '{"type":"pdf"}'
+(2 rows)
+id
+1
+3
+(2 rows)
+id
+1
+(1 row)
+count
+0
+(1 row)
+id
+4
+(1 row)
+NOTICE:  table "gin_test" does not exist, skipping

@@ -1,0 +1,36 @@
+psql:/home/dongxu/lab/pg-tikv/tests/207_udf_cte.sql:5: ERROR:  Table 'public.ab' already exists
+ f 
+---
+ 
+(1 row)
+
+ f 
+---
+ 
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/207_udf_cte.sql:32: ERROR:  Unsupported function: f
+psql:/home/dongxu/lab/pg-tikv/tests/207_udf_cte.sql:43: ERROR:  Unsupported function: f
+ f 
+---
+ 
+(1 row)
+
+ f | ?column? 
+---+----------
+   |        2
+(1 row)
+
+ f | ?column? 
+---+----------
+   |        2
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/207_udf_cte.sql:80: ERROR:  No PK
+psql:/home/dongxu/lab/pg-tikv/tests/207_udf_cte.sql:83: ERROR:  Unsupported function: f
+psql:/home/dongxu/lab/pg-tikv/tests/207_udf_cte.sql:103: ERROR:  Unsupported function: f
+ f138273_2 
+-----------
+ 
+(1 row)
+

@@ -1,0 +1,79 @@
+psql:/home/dongxu/lab/pg-tikv/tests/155_inverted_filter_json_array.sql:74: ERROR:  GIN index 'json_tab_foo_inv' requires JSON/JSONB value, got vector(0)
+ a | b 
+---+---
+(0 rows)
+
+ a 
+---
+(0 rows)
+
+ a 
+---
+(0 rows)
+
+ a | b 
+---+---
+(0 rows)
+
+ a 
+---
+(0 rows)
+
+ a | b 
+---+---
+(0 rows)
+
+ a 
+---
+(0 rows)
+
+ a 
+---
+(0 rows)
+
+ a | b 
+---+---
+(0 rows)
+
+ a 
+---
+(0 rows)
+
+ a | b 
+---+---
+(0 rows)
+
+ a | b 
+---+---
+(0 rows)
+
+ a | b 
+---+---
+(0 rows)
+
+ a | b 
+---+---
+(0 rows)
+
+ a | b 
+---+---
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/155_inverted_filter_json_array.sql:132: ERROR:  invalid input syntax for type integer: "{}"
+ a 
+---
+(0 rows)
+
+ a | b 
+---+---
+(0 rows)
+
+ a | b 
+---+---
+(0 rows)
+
+ a | b 
+---+---
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/155_inverted_filter_json_array.sql:147: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

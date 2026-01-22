@@ -1,0 +1,65 @@
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:24: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:26: ERROR:  Procedure 'sel' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:28: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:29: ERROR:  DROP COLUMN ... CASCADE is not supported
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:30: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:44: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:46: ERROR:  Procedure 'ins' does not exist
+ a | b | def 
+---+---+-----
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:49: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:50: ERROR:  DROP COLUMN ... CASCADE is not supported
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:51: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:66: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:68: ERROR:  Procedure 'ins2' does not exist
+ a | b | def | cascade_ins2 
+---+---+-----+--------------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:71: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:72: ERROR:  DROP COLUMN ... CASCADE is not supported
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:73: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:88: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:90: ERROR:  Procedure 'ups' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:91: ERROR:  Procedure 'ups' does not exist
+ a | b | def 
+---+---+-----
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:94: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:95: ERROR:  DROP COLUMN ... CASCADE is not supported
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:96: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:113: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:115: ERROR:  Procedure 'ups2' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:116: ERROR:  Procedure 'ups2' does not exist
+ a | b | def | cascade_ups2 
+---+---+-----+--------------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:119: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:120: ERROR:  DROP COLUMN ... CASCADE is not supported
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:121: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:137: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:139: ERROR:  Procedure 'up' does not exist
+ a | b  | def 
+---+----+-----
+ 1 | 10 |  10
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:142: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:143: ERROR:  DROP COLUMN ... CASCADE is not supported
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:144: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:160: ERROR:  CREATE PROCEDURE requires AS BEGIN ... END syntax
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:162: ERROR:  Procedure 'del' does not exist
+ a | b  | def 
+---+----+-----
+ 1 | 10 |  10
+ 2 | 20 |  10
+(2 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:165: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:166: ERROR:  DROP COLUMN ... CASCADE is not supported
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:167: ERROR:  Unsupported function: to_regprocedure
+psql:/home/dongxu/lab/pg-tikv/tests/179_procedure_deps.sql:169: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

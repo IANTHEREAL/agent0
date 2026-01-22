@@ -1,0 +1,56 @@
+psql:/home/dongxu/lab/pg-tikv/tests/181_rand_ident.sql:105: ERROR:  Table 'crdb_internal.gen_rand_ident' not found
+ gen_rand_ident 
+----------------
+ 
+(1 row)
+
+ gen_rand_ident 
+----------------
+ 
+(1 row)
+
+ gen_rand_ident 
+----------------
+ 
+(1 row)
+
+ gen_rand_ident 
+----------------
+ 
+(1 row)
+
+ gen_rand_ident 
+----------------
+ 
+(1 row)
+
+ gen_rand_ident 
+----------------
+ 
+(1 row)
+
+ gen_rand_ident 
+----------------
+ 
+(1 row)
+
+ quote_ident 
+-------------
+ 
+(1 row)
+
+ gen_rand_ident 
+----------------
+ 
+(1 row)
+
+ gen_rand_ident 
+----------------
+ 
+(1 row)
+
+ gen_rand_ident 
+----------------
+ 
+(1 row)
+

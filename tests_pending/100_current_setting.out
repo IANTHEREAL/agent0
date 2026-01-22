@@ -1,0 +1,21 @@
+search_path
+public
+(1 row)
+statement_timeout
+0
+(1 row)
+missing_ok
+NULL
+(1 row)
+prev_timeout
+0
+(1 row)
+statement_timeout
+200
+(1 row)
+prev_sp
+public
+(1 row)
+search_path
+public, ss_s1
+(1 row)

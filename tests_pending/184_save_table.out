@@ -1,0 +1,196 @@
+psql:/home/dongxu/lab/pg-tikv/tests/184_save_table.sql:17: NOTICE:  table "st_test_merge_join_2" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/184_save_table.sql:18: NOTICE:  table "st_scan_4" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/184_save_table.sql:19: NOTICE:  table "u" does not exist, skipping
+ k |  str  
+---+-------
+ 1 | one
+ 2 | two
+ 3 | three
+ 4 | four
+ 5 | five
+(5 rows)
+
+ key |  val  
+-----+-------
+   2 | two
+   3 | three
+   4 | four
+   5 | five
+   6 | six
+   7 | seven
+   8 | eight
+   9 | nine
+  10 | ten
+(9 rows)
+
+ key |  str  
+-----+-------
+   3 | three
+   4 | four
+   5 | five
+(3 rows)
+
+ key |  str  
+-----+-------
+   2 | two
+   3 | three
+(2 rows)
+
+ _rowid | k |  str  
+--------+---+-------
+      1 | 3 | three
+      2 | 4 | four
+      3 | 5 | five
+(3 rows)
+
+ _rowid | key |  val  
+--------+-----+-------
+      1 |   2 | two
+      2 |   3 | three
+      3 |   4 | four
+      4 |   5 | five
+      5 |   6 | six
+      6 |   7 | seven
+      7 |   8 | eight
+      8 |   9 | nine
+      9 |  10 | ten
+(9 rows)
+
+         tablename         
+---------------------------
+ ;--dontask
+ ;--notbetter
+ a
+ ab
+ abc
+ abc_decimal
+ abcd
+ actor
+ anykey_json_tab
+ array_tab
+ automatic_jobs
+ b
+ backfill_a
+ backfill_b
+ backfill_c
+ bar
+ c
+ category
+ citext_with_width_tbl
+ copy
+ cpk
+ customer
+ d
+ data
+ data_stats_history
+ def
+ def_decimal
+ distsql_mj_test
+ drop_a
+ drop_j
+ film
+ film_actor
+ film_category
+ foo
+ g
+ geo_table
+ geo_table2
+ guardrails
+ inventory
+ json_tab
+ kab
+ kabc
+ kabcd
+ kv
+ kw
+ l
+ large
+ large_numbers
+ ltable
+ m
+ m_err
+ metric_values
+ metric_values_desc
+ metrics
+ n
+ node_inflight_trace_spans
+ numtosquare
+ numtostr
+ payment
+ pg_extension_test
+ pg_tests_auto_stats
+ pg_tests_stats_history
+ r
+ records
+ relatedapp_city
+ relatedapp_location
+ rental
+ rtable
+ s
+ seed
+ small
+ source_tbl_huge
+ src
+ st_scan_4
+ st_test_merge_join_2
+ t
+ t0
+ t1
+ t11
+ t115290
+ t135151
+ t145232
+ t155159
+ t158945
+ t159124
+ t2
+ t3
+ t39433
+ t4
+ t44079
+ t5
+ t50596
+ t65040
+ t66306
+ t7
+ t86075
+ t86075_2
+ t88128
+ t89601
+ t9
+ t95560a
+ t95560b
+ tab0
+ test_create
+ ts
+ u
+ v
+ v00
+ woo; DROP USER humpty;
+ x
+ xy
+ xyz
+ y
+(113 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/184_save_table.sql:93: ERROR:  Unsupported statement: SetRole { context_modifier: None, role_name: Some(Ident { value: "testuser", quote_style: None }) }
+ k |  str  
+---+-------
+ 1 | one
+ 2 | two
+ 3 | three
+ 4 | four
+ 5 | five
+(5 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/184_save_table.sql:95: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+ k |  str  
+---+-------
+ 1 | one
+ 2 | two
+ 3 | three
+ 4 | four
+ 5 | five
+(5 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/184_save_table.sql:100: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

@@ -472,7 +472,8 @@ impl Executor {
         } else {
             None
         };
-        let indices = dml::validate_update_columns(&schema, assignments)?;
+        let update_info = dml::validate_update_columns(&schema, assignments)?;
+        let indices = &update_info.indices;
 
         let (from_schema, from_rows, from_alias) = if let Some(from_table) = from {
             let from_resolved = match &from_table.relation {
@@ -645,7 +646,7 @@ impl Executor {
             };
 
             let updated_row =
-                dml::execute_update_row(&self.store(), txn, &t, &schema, r, new_row, &enum_cache)
+                dml::execute_update_row_with_pk_change(&self.store(), txn, &t, &schema, r, new_row, &enum_cache, update_info.updates_pk)
                     .await?;
 
             trigger_worker::enqueue_after_triggers(

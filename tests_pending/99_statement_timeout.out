@@ -1,0 +1,10 @@
+after_timeout
+1
+(1 row)
+pg_sleep
+
+(1 row)
+after_disabled
+1
+(1 row)
+psql:/home/dongxu/lab/pg-tikv/tests/99_statement_timeout.sql:4: ERROR:  canceling statement due to statement timeout

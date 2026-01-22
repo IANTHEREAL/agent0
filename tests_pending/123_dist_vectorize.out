@@ -1,0 +1,18 @@
+ k 
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+(5 rows)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/123_dist_vectorize.sql:35: ERROR:  Unsupported types for multiplication
+psql:/home/dongxu/lab/pg-tikv/tests/123_dist_vectorize.sql:40: ERROR:  Unsupported expression: Collate { expr: Identifier(Ident { value: "s", quote_style: None }), collation: ObjectName([Ident { value: "C", quote_style: Some('"') }]) }
+psql:/home/dongxu/lab/pg-tikv/tests/123_dist_vectorize.sql:46: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: OFF at Line: 1, Column 15
+psql:/home/dongxu/lab/pg-tikv/tests/123_dist_vectorize.sql:51: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

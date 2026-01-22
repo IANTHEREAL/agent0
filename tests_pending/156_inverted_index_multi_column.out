@@ -1,0 +1,138 @@
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:5: ERROR:  Extension 'btree_gin' is not available
+                         indexdef                          
+-----------------------------------------------------------
+ CREATE INDEX s_a_geom_gin ON public.s USING gin (a, geom)
+ CREATE UNIQUE INDEX s_pkey ON public.s USING btree (k)
+(2 rows)
+
+                         indexdef                          
+-----------------------------------------------------------
+ CREATE INDEX s_a_geom_gin ON public.s USING gin (a, geom)
+ CREATE UNIQUE INDEX s_pkey ON public.s USING btree (k)
+(2 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:71: ERROR:  Cannot drop column 'j' used in index 'drop_j_a_j_gin'
+                              indexdef                              
+--------------------------------------------------------------------
+ CREATE INDEX drop_j_a_j_gin ON public.drop_j USING gin (a, j)
+ CREATE INDEX drop_j_b_a_j_gin ON public.drop_j USING gin (b, a, j)
+(2 rows)
+
+                              indexdef                              
+--------------------------------------------------------------------
+ CREATE INDEX drop_j_a_j_gin ON public.drop_j USING gin (a, j)
+ CREATE INDEX drop_j_b_a_j_gin ON public.drop_j USING gin (b, a, j)
+(2 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:90: ERROR:  Cannot drop column 'a' used in index 'drop_a_a_j_gin'
+                              indexdef                              
+--------------------------------------------------------------------
+ CREATE INDEX drop_a_a_j_gin ON public.drop_a USING gin (a, j)
+ CREATE INDEX drop_a_b_a_j_gin ON public.drop_a USING gin (b, a, j)
+(2 rows)
+
+                              indexdef                              
+--------------------------------------------------------------------
+ CREATE INDEX drop_a_a_j_gin ON public.drop_a USING gin (a, j)
+ CREATE INDEX drop_a_b_a_j_gin ON public.drop_a USING gin (b, a, j)
+(2 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:106: ERROR:  SQL parse error: sql parser error: Expected ',' or ')' after column definition, found: INCLUDING at Line: 1, Column 28
+ indexdef 
+----------
+(0 rows)
+
+ indexdef 
+----------
+(0 rows)
+
+ i |  s  |          j           
+---+-----+----------------------
+ 1 | foo | {"num": 1, "x": "y"}
+(1 row)
+
+ i |  s  |          j           
+---+-----+----------------------
+ 1 | foo | {"num": 1, "x": "y"}
+(1 row)
+
+ i |  s  |          j           
+---+-----+----------------------
+ 1 | foo | {"num": 1, "x": "y"}
+(1 row)
+
+ i |  s  |          j           
+---+-----+----------------------
+ 1 | foo | {"num": 1, "x": "y"}
+ 3 | baz | {"num": 3, "x": "y"}
+(2 rows)
+
+ i |  s  |          j           
+---+-----+----------------------
+ 1 | foo | {"num": 1, "x": "y"}
+(1 row)
+
+ i |  s  |           j           
+---+-----+-----------------------
+ 1 | foo | {"num": 10, "x": "y"}
+(1 row)
+
+ i  |  s  |           j           
+----+-----+-----------------------
+  2 | bar | {"num": 2, "x": "y"}
+ 10 | foo | {"num": 10, "x": "y"}
+(2 rows)
+
+ i |  s  |          j           
+---+-----+----------------------
+ 2 | bar | {"num": 2, "x": "y"}
+ 3 | bar | {"num": 3, "x": "y"}
+(2 rows)
+
+ i |  s  |          j           
+---+-----+----------------------
+ 3 | bar | {"num": 4, "x": "y"}
+(1 row)
+
+ i | s | j 
+---+---+---
+(0 rows)
+
+ i | s | j 
+---+---+---
+(0 rows)
+
+ i | s | j 
+---+---+---
+(0 rows)
+
+ i | s | j 
+---+---+---
+(0 rows)
+
+ i |  s  |     j      
+---+-----+------------
+ 3 | baz | {"a": "b"}
+(1 row)
+
+ i | s | j 
+---+---+---
+(0 rows)
+
+ i | s | j 
+---+---+---
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:259: ERROR:  SQL parse error: sql parser error: Expected (, found: , at Line: 1, Column 51
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:265: ERROR:  Table 'backfill_d' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:268: ERROR:  Table 'backfill_d' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:271: ERROR:  Table 'backfill_d' not found
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:291: ERROR:  could not identify an ordering operator for type jsonb
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:294: ERROR:  could not identify an ordering operator for type jsonb
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:297: ERROR:  could not identify an ordering operator for type jsonb
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:300: ERROR:  could not identify an ordering operator for type jsonb
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:303: ERROR:  could not identify an ordering operator for type jsonb
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:309: ERROR:  could not identify an ordering operator for type jsonb
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:315: ERROR:  could not identify an ordering operator for type jsonb
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:330: ERROR:  could not identify an ordering operator for type jsonb
+psql:/home/dongxu/lab/pg-tikv/tests/156_inverted_index_multi_column.sql:333: ERROR:  could not identify an ordering operator for type jsonb

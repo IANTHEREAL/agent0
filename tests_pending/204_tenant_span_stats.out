@@ -1,0 +1,7 @@
+psql:/home/dongxu/lab/pg-tikv/tests/204_tenant_span_stats.sql:17: ERROR:  GENERATE_SERIES is a set-returning function, not supported in this context
+ id 
+----
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/204_tenant_span_stats.sql:26: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: USER at Line: 1, Column 8
+psql:/home/dongxu/lab/pg-tikv/tests/204_tenant_span_stats.sql:35: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

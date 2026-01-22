@@ -1,0 +1,24 @@
+prev
+public
+(1 row)
+search_path
+ss_s1
+(1 row)
+v
+a
+(1 row)
+prev
+ss_s1
+(1 row)
+search_path
+ss_s2
+(1 row)
+v
+b
+(1 row)
+statement_timeout
+0
+(1 row)
+client_encoding
+UTF8
+(1 row)

@@ -1,0 +1,6 @@
+                                    notice                                     
+-------------------------------------------------------------------------------
+ skipped: schema_repair requires CockroachDB crdb_internal/system catalog APIs
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/188_schema_repair.sql:17: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

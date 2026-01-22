@@ -1,0 +1,9 @@
+psql:/home/dongxu/lab/pg-tikv/tests/192_show_create_all_triggers.sql:7: ERROR:  Schema 'd' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/192_show_create_all_triggers.sql:15: ERROR:  Extension 'plpgsql' is not available
+psql:/home/dongxu/lab/pg-tikv/tests/192_show_create_all_triggers.sql:16: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/pg-tikv/tests/192_show_create_all_triggers.sql:22: ERROR:  Table 'd.t2' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/192_show_create_all_triggers.sql:28: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/pg-tikv/tests/192_show_create_all_triggers.sql:54: ERROR:  Column 't.tgisinternal' not found
+psql:/home/dongxu/lab/pg-tikv/tests/192_show_create_all_triggers.sql:69: ERROR:  Column 't.tgisinternal' not found
+psql:/home/dongxu/lab/pg-tikv/tests/192_show_create_all_triggers.sql:95: ERROR:  Column 't.tgisinternal' not found
+psql:/home/dongxu/lab/pg-tikv/tests/192_show_create_all_triggers.sql:107: ERROR:  Column 't.tgisinternal' not found

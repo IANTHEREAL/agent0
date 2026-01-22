@@ -1,0 +1,16 @@
+psql:/home/dongxu/lab/pg-tikv/tests/208_udf_prepare.sql:5: ERROR:  Function 'public.f' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/208_udf_prepare.sql:8: ERROR:  Unsupported statement: Prepare { name: Ident { value: "p", quote_style: None }, data_types: [], statement: Query(Query { with: None, body: Select(Select { distinct: None, top: None, projection: [UnnamedExpr(Cast { expr: Value(Placeholder("$1")), data_type: Int(None), format: None })], into: None, from: [], lateral_views: [], selection: None, group_by: Expressions([]), cluster_by: [], distribute_by: [], sort_by: [], having: None, named_window: [], qualify: None }), order_by: [], limit: None, limit_by: [], offset: None, fetch: None, locks: [], for_clause: None }) }
+psql:/home/dongxu/lab/pg-tikv/tests/208_udf_prepare.sql:11: ERROR:  Unsupported statement: Execute { name: Ident { value: "p", quote_style: None }, parameters: [Function(Function { name: ObjectName([Ident { value: "f", quote_style: None }]), args: [], filter: None, null_treatment: None, over: None, distinct: false, special: false, order_by: [] })] }
+psql:/home/dongxu/lab/pg-tikv/tests/208_udf_prepare.sql:14: ERROR:  Unsupported statement: Deallocate { name: Ident { value: "p", quote_style: None }, prepare: false }
+psql:/home/dongxu/lab/pg-tikv/tests/208_udf_prepare.sql:23: ERROR:  Unsupported statement: Prepare { name: Ident { value: "p", quote_style: None }, data_types: [], statement: Insert { or: None, ignore: false, into: true, table_name: ObjectName([Ident { value: "t147186", quote_style: None }]), columns: [Ident { value: "a", quote_style: None }], overwrite: false, source: Some(Query { with: None, body: Values(Values { explicit_row: false, rows: [[Value(Placeholder("$1"))]] }), order_by: [], limit: None, limit_by: [], offset: None, fetch: None, locks: [], for_clause: None }), partitioned: None, after_columns: [], table: false, on: None, returning: None } }
+psql:/home/dongxu/lab/pg-tikv/tests/208_udf_prepare.sql:29: ERROR:  Unsupported statement: Execute { name: Ident { value: "p", quote_style: None }, parameters: [Value(Number("1", false))] }
+ a | b 
+---+---
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/208_udf_prepare.sql:38: ERROR:  Unsupported statement: Execute { name: Ident { value: "p", quote_style: None }, parameters: [Value(Number("2", false))] }
+ a | b 
+---+---
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/208_udf_prepare.sql:44: ERROR:  Unsupported statement: Deallocate { name: Ident { value: "p", quote_style: None }, prepare: false }

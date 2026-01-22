@@ -1,0 +1,8 @@
+psql:/home/dongxu/lab/pg-tikv/tests/165_merge_join_dist.sql:22: ERROR:  Unsupported JOIN type
+ a | b  
+---+----
+ 2 | 20
+ 3 | 30
+(2 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/165_merge_join_dist.sql:27: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

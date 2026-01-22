@@ -1,0 +1,6 @@
+psql:/home/dongxu/lab/pg-tikv/tests/111_collatedstring_normalization.sql:6: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: COLLATION at Line: 1, Column 8
+psql:/home/dongxu/lab/pg-tikv/tests/111_collatedstring_normalization.sql:8: ERROR:  Table 'public.t' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/111_collatedstring_normalization.sql:11: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/pg-tikv/tests/111_collatedstring_normalization.sql:14: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/pg-tikv/tests/111_collatedstring_normalization.sql:20: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/pg-tikv/tests/111_collatedstring_normalization.sql:23: ERROR:  Column 'a' not found

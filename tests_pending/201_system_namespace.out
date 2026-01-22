@@ -1,0 +1,20 @@
+psql:/home/dongxu/lab/pg-tikv/tests/201_system_namespace.sql:8: ERROR:  cannot drop schema 'system': schema is not empty
+psql:/home/dongxu/lab/pg-tikv/tests/201_system_namespace.sql:9: ERROR:  Schema 'system' already exists
+ parentID | parentSchemaID |       name        | id  
+----------+----------------+-------------------+-----
+        0 |              0 | comments          |  50
+        0 |              0 | locations         |  51
+        0 |              0 | descriptor_id_seq |  52
+        0 |              0 | userobj1          | 100
+        0 |              0 | userobj2          | 101
+(5 rows)
+
+  column_name   |     data_type     
+----------------+-------------------
+ parentID       | integer
+ parentSchemaID | integer
+ name           | character varying
+ id             | integer
+(4 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/201_system_namespace.sql:37: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

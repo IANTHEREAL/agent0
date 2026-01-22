@@ -1,0 +1,18 @@
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:8: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:48: ERROR:  SQL parse error: sql parser error: Expected a privilege keyword, found: modifyclustersetting at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:51: ERROR:  SQL parse error: sql parser error: Expected a privilege keyword, found: viewactivity at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:54: ERROR:  SQL parse error: sql parser error: Expected a privilege keyword, found: externalconnection at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:57: ERROR:  Table 'public.pg_show_system_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:60: ERROR:  Table 'public.pg_show_system_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:63: ERROR:  SQL parse error: sql parser error: Expected a privilege keyword, found: viewactivity at Line: 1, Column 8
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:66: ERROR:  Table 'public.pg_show_system_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:69: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: USER at Line: 1, Column 8
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:72: ERROR:  SQL parse error: sql parser error: Expected a privilege keyword, found: viewactivity at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:75: ERROR:  SQL parse error: sql parser error: Expected a privilege keyword, found: externalconnection at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:78: ERROR:  SQL parse error: sql parser error: Expected a privilege keyword, found: repaircluster at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:81: ERROR:  SQL parse error: sql parser error: Expected a privilege keyword, found: repairclustermetadata at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:84: ERROR:  Table 'public.pg_show_system_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:87: ERROR:  Table 'public.pg_show_system_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:90: ERROR:  Table 'public.pg_show_system_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:93: ERROR:  Table 'public.pg_show_system_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/196_show_grants_synthetic.sql:95: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

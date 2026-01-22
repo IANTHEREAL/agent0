@@ -1,0 +1,47 @@
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:21: ERROR:  Table 'public.a' already exists
+ column_name | data_type | is_nullable 
+-------------+-----------+-------------
+ id          | integer   | YES
+(1 row)
+
+ indexname | indexdef 
+-----------+----------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:120: ERROR:  View 'public.v' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:168: ERROR:  Unsupported function: to_regclass
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:171: ERROR:  Unsupported function: to_regclass
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:174: ERROR:  Unsupported function: to_regclass
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:177: ERROR:  Unsupported function: to_regclass
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:233: ERROR:  Sequence 'public.seq' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:254: ERROR:  Table 'public.t' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:255: ERROR:  Column not found
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:264: ERROR:  Constraint 't_pkey' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:265: ERROR:  Column 'j' does not exist
+ conname | pg_get_constraintdef 
+---------+----------------------
+(0 rows)
+
+ indexname | indexdef 
+-----------+----------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:286: ERROR:  Table 'public.foo' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:292: ERROR:  Column exists
+ conname | pg_get_constraintdef 
+---------+----------------------
+(0 rows)
+
+ column_name | data_type | is_nullable 
+-------------+-----------+-------------
+ x           | bigint    | YES
+ j           | integer   | NO
+ k           | integer   | NO
+ l           | integer   | NO
+(4 rows)
+
+ indexname | indexdef 
+-----------+----------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/216_zone_config.sql:327: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

@@ -1018,7 +1018,27 @@ pub async fn execute_update_row(
     new_row: Row,
     enum_cache: &EnumLabelCache,
 ) -> Result<Row> {
+    execute_update_row_with_pk_change(store, txn, table_name, schema, old_row, new_row, enum_cache, false).await
+}
+
+pub async fn execute_update_row_with_pk_change(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    table_name: &str,
+    schema: &TableSchema,
+    old_row: &Row,
+    new_row: Row,
+    enum_cache: &EnumLabelCache,
+    updates_pk: bool,
+) -> Result<Row> {
     validate_enum_values(schema, &new_row, enum_cache)?;
+
+    let old_pks = schema.get_pk_values(old_row);
+    let new_pks = schema.get_pk_values(&new_row);
+    let pk_changed = old_pks != new_pks;
+    if updates_pk && pk_changed {
+        return Err(anyhow!("Cannot update PK"));
+    }
 
     if !schema.foreign_keys.is_empty() {
         validate_foreign_keys(store, txn, schema, &new_row).await?;
@@ -1026,12 +1046,35 @@ pub async fn execute_update_row(
 
     handle_foreign_key_on_update(store, txn, table_name, schema, old_row, &new_row).await?;
 
-    let pks = schema.get_pk_values(old_row);
+    if pk_changed {
+        let existing = store
+            .batch_get_rows(txn, schema.table_id, vec![new_pks.clone()], schema)
+            .await?;
+        if !existing.is_empty() {
+            let pk_cols: Vec<_> = schema.pk_indices.iter().map(|&i| schema.columns[i].name.clone()).collect();
+            let pk_vals: Vec<_> = new_pks.iter().map(|v| format!("{}", v)).collect();
+            let default_pk_name = format!(
+                "{}_pkey",
+                schema.name.rsplit('.').next().unwrap_or(&schema.name)
+            );
+            let pk_constraint_name = schema
+                .pk_constraint_name
+                .clone()
+                .unwrap_or(default_pk_name);
+            return Err(anyhow!(
+                "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+                pk_constraint_name,
+                pk_cols.join(", "),
+                pk_vals.join(", ")
+            ));
+        }
+    }
+
     for index in &schema.indexes {
         let gin_hashes = extract_gin_token_hashes_from_row(schema, index, old_row)?;
         if !gin_hashes.is_empty() {
             store
-                .delete_gin_index_entries(txn, schema.table_id, index.id, &gin_hashes, &pks)
+                .delete_gin_index_entries(txn, schema.table_id, index.id, &gin_hashes, &old_pks)
                 .await?;
             continue;
         }
@@ -1043,16 +1086,22 @@ pub async fn execute_update_row(
         if old_matches {
             let old_idx = index_helpers::get_index_values_with_expressions(index, schema, old_row)?;
             store
-                .delete_index_entry(txn, schema.table_id, index.id, &old_idx, &pks, index.unique)
+                .delete_index_entry(txn, schema.table_id, index.id, &old_idx, &old_pks, index.unique)
                 .await?;
         }
     }
+
+    if pk_changed {
+        store.delete_by_pk(txn, table_name, &old_pks).await?;
+    }
+
     store.upsert(txn, table_name, new_row.clone()).await?;
+
     for index in &schema.indexes {
         let gin_hashes = extract_gin_token_hashes_from_row(schema, index, &new_row)?;
         if !gin_hashes.is_empty() {
             store
-                .create_gin_index_entries(txn, schema.table_id, index.id, &gin_hashes, &pks)
+                .create_gin_index_entries(txn, schema.table_id, index.id, &gin_hashes, &new_pks)
                 .await?;
             continue;
         }
@@ -1065,7 +1114,7 @@ pub async fn execute_update_row(
             let new_idx =
                 index_helpers::get_index_values_with_expressions(index, schema, &new_row)?;
             store
-                .create_index_entry(txn, schema.table_id, index.id, &new_idx, &pks, index.unique)
+                .create_index_entry(txn, schema.table_id, index.id, &new_idx, &new_pks, index.unique)
                 .await?;
         }
     }
@@ -1345,22 +1394,28 @@ pub async fn validate_foreign_keys(
     Ok(())
 }
 
+pub struct UpdateColumnInfo {
+    pub indices: Vec<usize>,
+    pub updates_pk: bool,
+}
+
 pub fn validate_update_columns(
     schema: &TableSchema,
     assignments: &[Assignment],
-) -> Result<Vec<usize>> {
+) -> Result<UpdateColumnInfo> {
     let mut indices = Vec::new();
+    let mut updates_pk = false;
     for a in assignments {
         let c = a.id.last().unwrap().value.clone();
         let idx = schema
             .column_index(&c)
             .ok_or_else(|| anyhow!("Col not found"))?;
         if schema.pk_indices.contains(&idx) {
-            return Err(anyhow!("Cannot update PK"));
+            updates_pk = true;
         }
         indices.push(idx);
     }
-    Ok(indices)
+    Ok(UpdateColumnInfo { indices, updates_pk })
 }
 
 pub async fn compute_update_values(
@@ -1428,6 +1483,7 @@ pub fn build_update_join_context<'a>(
         table_id: 0,
         columns: combined_col_defs,
         version: 1,
+        pk_constraint_name: None,
         pk_indices: vec![],
         indexes: vec![],
         check_constraints: vec![],
@@ -1473,6 +1529,7 @@ mod tests {
                 default_expr: None,
             }],
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![],
             check_constraints: vec![],

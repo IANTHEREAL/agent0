@@ -1,0 +1,338 @@
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:7: ERROR:  Table 'public.abc' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:16: ERROR:  composite type 'public.typ' cannot be used as a column type
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:19: ERROR:  Table 'comp' does not exist
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:28: ERROR:  Unsupported function: SOME
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ a | b  |  c  
+---+----+-----
+ 1 | 1  | 1
+ 1 | 10 | 100
+ 3 | 30 | 300
+(3 rows)
+
+ a | b | c 
+---+---+---
+(0 rows)
+
+ a | b  |  c  
+---+----+-----
+ 1 | 1  | 1
+ 1 | 10 | 100
+(2 rows)
+
+ a | b | c 
+---+---+---
+(0 rows)
+
+ a | b | c 
+---+---+---
+(0 rows)
+
+ bool 
+------
+ f
+(1 row)
+
+ bool 
+------
+ t
+(1 row)
+
+ bool 
+------
+ f
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:91: ERROR:  Unsupported table
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:94: ERROR:  Unsupported table
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:97: ERROR:  Unsupported table
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:100: ERROR:  Unsupported table
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:103: ERROR:  Unsupported table
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:106: ERROR:  Unsupported table
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:109: ERROR:  Unsupported table
+ a | b  |  c  
+---+----+-----
+ 1 | 1  | 1
+ 1 | 10 | 100
+(2 rows)
+
+ a | b  |  c  
+---+----+-----
+ 1 | 1  | 1
+ 1 | 10 | 100
+ 2 | 20 | 200
+(3 rows)
+
+ a | b | c 
+---+---+---
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:121: ERROR:  OR requires boolean operands
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:124: ERROR:  OR requires boolean operands
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:127: ERROR:  Unsupported expression: Subquery(Query { with: None, body: Select(Select { distinct: None, top: None, projection: [UnnamedExpr(Function(Function { name: ObjectName([Ident { value: "COUNT", quote_style: None }]), args: [Unnamed(Wildcard)], filter: None, null_treatment: None, over: None, distinct: false, special: false, order_by: [] }))], into: None, from: [TableWithJoins { relation: Derived { lateral: false, subquery: Query { with: None, body: Select(Select { distinct: None, top: None, projection: [UnnamedExpr(Identifier(Ident { value: "a", quote_style: None }))], into: None, from: [TableWithJoins { relation: Table { name: ObjectName([Ident { value: "abc", quote_style: None }]), alias: None, args: None, with_hints: [], version: None, partitions: [] }, joins: [] }], lateral_views: [], selection: Some(BinaryOp { left: Identifier(Ident { value: "b", quote_style: None }), op: Eq, right: Value(Number("20", false)) }), group_by: Expressions([]), cluster_by: [], distribute_by: [], sort_by: [], having: None, named_window: [], qualify: None }), order_by: [], limit: None, limit_by: [], offset: None, fetch: None, locks: [], for_clause: None }, alias: Some(TableAlias { name: Ident { value: "__pgtikv_all_any", quote_style: None }, columns: [Ident { value: "__pgtikv_val", quote_style: None }] }) }, joins: [] }], lateral_views: [], selection: None, group_by: Expressions([]), cluster_by: [], distribute_by: [], sort_by: [], having: None, named_window: [], qualify: None }), order_by: [], limit: None, limit_by: [], offset: None, fetch: None, locks: [], for_clause: None })
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:130: ERROR:  Unsupported table
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:133: ERROR:  Unsupported table
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:136: ERROR:  Unsupported table
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:139: ERROR:  Unsupported table
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ a | b  |  c  
+---+----+-----
+ 2 | 20 | 200
+ 3 | 30 | 300
+(2 rows)
+
+ a | b | c 
+---+---+---
+(0 rows)
+
+ a | b | c 
+---+---+---
+(0 rows)
+
+ a | b | c 
+---+---+---
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:186: ERROR:  Unsupported table
+ bool 
+------
+ t
+(1 row)
+
+ bool 
+------
+ f
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:195: ERROR:  Unsupported table
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:198: ERROR:  Unsupported table
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:201: ERROR:  Unsupported table
+ a | b | c 
+---+---+---
+(0 rows)
+
+ a | b  |  c  
+---+----+-----
+ 1 | 1  | 1
+ 1 | 10 | 100
+(2 rows)
+
+ a | b | c 
+---+---+---
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:213: ERROR:  Unsupported table
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:216: ERROR:  Unsupported table
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:219: ERROR:  Unsupported table
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:267: ERROR:  Unsupported function: SOME
+ ?column? 
+----------
+ t
+(1 row)
+
+ ?column? 
+----------
+ f
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:276: ERROR:  Unsupported function: SOME
+ ?column? 
+----------
+ f
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:282: ERROR:  ANY requires an array operand
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:285: ERROR:  Unsupported function: SOME
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:288: ERROR:  ALL requires an array operand
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:292: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:295: ERROR:  Unsupported expression: ArraySubquery(Query { with: None, body: Select(Select { distinct: None, top: None, projection: [UnnamedExpr(Function(Function { name: ObjectName([Ident { value: "ROW", quote_style: None }]), args: [Unnamed(Expr(Identifier(Ident { value: "a", quote_style: None }))), Unnamed(Expr(Identifier(Ident { value: "b", quote_style: None })))], filter: None, null_treatment: None, over: None, distinct: false, special: false, order_by: [] }))], into: None, from: [TableWithJoins { relation: Table { name: ObjectName([Ident { value: "abc", quote_style: None }]), alias: None, args: None, with_hints: [], version: None, partitions: [] }, joins: [] }], lateral_views: [], selection: None, group_by: Expressions([]), cluster_by: [], distribute_by: [], sort_by: [], having: None, named_window: [], qualify: None }), order_by: [], limit: Some(Value(Number("1", false))), limit_by: [], offset: None, fetch: None, locks: [], for_clause: None })
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:302: ERROR:  Table 'comp' not found
+psql:/home/dongxu/lab/pg-tikv/tests/200_suboperators.sql:308: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

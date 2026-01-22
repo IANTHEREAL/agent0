@@ -1,0 +1,38 @@
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:17: ERROR:  SQL parse error: sql parser error: Expected TO, found: d at Line: 1, Column 26
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:36: ERROR:  SQL parse error: sql parser error: Expected joined table, found: . at Line: 6, Column 71
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:39: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:40: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:41: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:42: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:57: ERROR:  SQL parse error: sql parser error: Expected joined table, found: . at Line: 6, Column 71
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:66: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:81: ERROR:  SQL parse error: sql parser error: Expected joined table, found: . at Line: 6, Column 67
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:84: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:99: ERROR:  SQL parse error: sql parser error: Expected joined table, found: . at Line: 6, Column 67
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:102: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:117: ERROR:  SQL parse error: sql parser error: Expected joined table, found: . at Line: 6, Column 67
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:120: ERROR:  SQL parse error: sql parser error: Expected TO, found: d at Line: 1, Column 26
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:126: ERROR:  Unsupported statement: SetRole { context_modifier: None, role_name: Some(Ident { value: "testuser", quote_style: None }) }
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:129: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:144: ERROR:  SQL parse error: sql parser error: Expected joined table, found: . at Line: 6, Column 67
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:148: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:151: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:153: ERROR:  Unsupported statement: SetRole { context_modifier: None, role_name: Some(Ident { value: "testuser", quote_style: None }) }
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:171: ERROR:  SQL parse error: sql parser error: Expected joined table, found: . at Line: 6, Column 67
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:173: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/101_alter_default_privileges_for_type.sql:177: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

@@ -1,0 +1,13 @@
+ x |  z  | y 
+---+-----+---
+ 0 | 123 |  
+ 1 | 123 |  
+(2 rows)
+
+ column_name |    data_type     | column_default | is_generated | generation_expression 
+-------------+------------------+----------------+--------------+-----------------------
+ x           | integer          |                | NEVER        | 
+ z           | integer          | 123            | NEVER        | 
+ y           | double precision |                | NEVER        | 
+(3 rows)
+

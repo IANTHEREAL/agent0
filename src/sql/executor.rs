@@ -48,6 +48,31 @@ impl std::fmt::Display for StatementTimeoutError {
 
 impl std::error::Error for StatementTimeoutError {}
 
+fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
+    fn contains_pessimistic_retry(err: &tikv_client::Error) -> bool {
+        const WRITE_CONFLICT_REASON_PESSIMISTIC_RETRY: i32 = 2;
+        match err {
+            tikv_client::Error::PessimisticLockError { inner, .. } => contains_pessimistic_retry(inner),
+            tikv_client::Error::UndeterminedError(inner) => contains_pessimistic_retry(inner),
+            tikv_client::Error::ExtractedErrors(errors)
+            | tikv_client::Error::MultipleKeyErrors(errors) => {
+                errors.iter().any(contains_pessimistic_retry)
+            }
+            tikv_client::Error::KeyError(key_error) => key_error
+                .conflict
+                .as_ref()
+                .is_some_and(|conflict| conflict.reason == WRITE_CONFLICT_REASON_PESSIMISTIC_RETRY),
+            _ => false,
+        }
+    }
+
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<tikv_client::Error>()
+            .is_some_and(contains_pessimistic_retry)
+    })
+}
+
 fn set_variable_value_to_string(value: &[Expr]) -> Result<String> {
     if value.len() != 1 {
         return Err(anyhow!("Unsupported SET value list"));
@@ -958,67 +983,89 @@ impl Executor {
 
                                 let is_autocommit = !session.is_in_transaction();
 
-                                if is_autocommit {
-                                    session.begin().await?;
-                                }
+                                let max_attempts = if is_autocommit { 3usize } else { 1usize };
 
-                                let timeout = session.statement_timeout();
-                                let fut = async {
-                                    let (txn, sequence_values, search_path) = session
-                                        .get_mut_txn_sequence_values_and_search_path()
-                                        .expect("Transaction must be active");
-                                    let notices = self
-                                        .collect_notices_before_statement(txn, search_path, stmt)
-                                        .await?;
-                                    let result = self
-                                        .execute_statement_on_txn(
-                                            txn,
-                                            sequence_values,
-                                            search_path,
-                                            stmt,
-                                        )
-                                        .await?;
-                                    Ok::<(Vec<ExecuteResult>, ExecuteResult), anyhow::Error>((
-                                        notices, result,
-                                    ))
-                                };
+                                for attempt in 0..max_attempts {
+                                    if is_autocommit {
+                                        session.begin().await?;
+                                    }
 
-                                let res = match timeout {
-                                    Some(timeout) => match tokio::time::timeout(timeout, fut).await {
-                                        Ok(res) => res,
-                                        Err(_) => Err(anyhow::Error::new(StatementTimeoutError)),
-                                    },
-                                    None => fut.await,
-                                };
+                                    let timeout = session.statement_timeout();
+                                    let fut = async {
+                                        let (txn, sequence_values, search_path) = session
+                                            .get_mut_txn_sequence_values_and_search_path()
+                                            .expect("Transaction must be active");
+                                        let notices = self
+                                            .collect_notices_before_statement(txn, search_path, stmt)
+                                            .await?;
+                                        let result = self
+                                            .execute_statement_on_txn(
+                                                txn,
+                                                sequence_values,
+                                                search_path,
+                                                stmt,
+                                            )
+                                            .await?;
+                                        Ok::<(Vec<ExecuteResult>, ExecuteResult), anyhow::Error>((
+                                            notices, result,
+                                        ))
+                                    };
 
-                                if res
-                                    .as_ref()
-                                    .err()
-                                    .is_some_and(|e| e.is::<StatementTimeoutError>())
-                                    && !is_autocommit
-                                {
-                                    // pg-tikv does not currently implement PostgreSQL's "failed
-                                    // transaction" state. To avoid leaving an open transaction in
-                                    // an unknown partial state, abort it on statement timeout.
-                                    session.rollback().await?;
-                                }
+                                    let res = match timeout {
+                                        Some(timeout) => match tokio::time::timeout(timeout, fut).await {
+                                            Ok(res) => res,
+                                            Err(_) => Err(anyhow::Error::new(StatementTimeoutError)),
+                                        },
+                                        None => fut.await,
+                                    };
 
-                                if is_autocommit {
-                                    if res.is_ok() {
-                                        if is_observability_query {
-                                            session.rollback().await?;
-                                        } else {
-                                            session.commit().await?;
+                                    if res
+                                        .as_ref()
+                                        .err()
+                                        .is_some_and(|e| e.is::<StatementTimeoutError>())
+                                        && !is_autocommit
+                                    {
+                                        // pg-tikv does not currently implement PostgreSQL's "failed
+                                        // transaction" state. To avoid leaving an open transaction in
+                                        // an unknown partial state, abort it on statement timeout.
+                                        session.rollback().await?;
+                                    }
+
+                                    if is_autocommit {
+                                        match res {
+                                            Ok((notices, result)) => {
+                                                if is_observability_query {
+                                                    session.rollback().await?;
+                                                } else {
+                                                    session.commit().await?;
+                                                }
+                                                let mut stmt_results = notices;
+                                                stmt_results.push(result);
+                                                return Ok(stmt_results);
+                                            }
+                                            Err(err) => {
+                                                session.rollback().await?;
+                                                let should_retry = attempt + 1 < max_attempts
+                                                    && is_retryable_tikv_error(&err);
+                                                if should_retry {
+                                                    let backoff_ms =
+                                                        10u64.saturating_mul(1u64 << attempt.min(8));
+                                                    tokio::time::sleep(Duration::from_millis(backoff_ms))
+                                                        .await;
+                                                    continue;
+                                                }
+                                                return Err(err);
+                                            }
                                         }
                                     } else {
-                                        session.rollback().await?;
+                                        let (notices, result) = res?;
+                                        let mut stmt_results = notices;
+                                        stmt_results.push(result);
+                                        return Ok(stmt_results);
                                     }
                                 }
 
-                                let (notices, result) = res?;
-                                let mut stmt_results = notices;
-                                stmt_results.push(result);
-                                Ok(stmt_results)
+                                unreachable!("retry loop must return")
                             }
                         }
                     })
@@ -1806,6 +1853,45 @@ impl Executor {
         } else {
             super::expr::eval_expr_join(expr, join_ctx)
         }
+    }
+
+    pub(crate) fn eval_scalar_subquery_in_join<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        subquery: &'a Query,
+        join_ctx: &'a super::expr::JoinContext<'a>,
+        outer_ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
+        Box::pin(async move {
+            let substituted_query = super::helpers::substitute_join_context_values_in_query(
+                subquery,
+                &join_ctx.column_offsets,
+                join_ctx.combined_row,
+            );
+            let result = self
+                .execute_query_with_outer_ctes(
+                    txn,
+                    sequence_values,
+                    search_path,
+                    &substituted_query,
+                    outer_ctes,
+                )
+                .await?;
+            match result {
+                ExecuteResult::Select { rows, .. } => {
+                    if rows.is_empty() {
+                        Ok(Value::Null)
+                    } else if rows.len() == 1 {
+                        Ok(rows[0].values.first().cloned().unwrap_or(Value::Null))
+                    } else {
+                        Err(anyhow!("Scalar subquery returned more than one row"))
+                    }
+                }
+                _ => Err(anyhow!("Subquery must return a SELECT result")),
+            }
+        })
     }
 
     pub(crate) async fn execute_query(

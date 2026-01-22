@@ -1,0 +1,5 @@
+psql:/home/dongxu/lab/pg-tikv/tests/122_direct_columnar_scans.sql:17: ERROR:  Column count mismatch
+ k | a | b | c | v 
+---+---+---+---+---
+(0 rows)
+

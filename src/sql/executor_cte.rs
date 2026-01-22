@@ -87,6 +87,7 @@ impl Executor {
                                         default_expr: None,
                                     })
                                     .collect(),
+	                                pk_constraint_name: None,
                                 pk_indices: vec![],
 	                                indexes: vec![],
 	                                version: 1,
@@ -204,6 +205,7 @@ impl Executor {
                     default_expr: None,
                 })
                 .collect(),
+            pk_constraint_name: None,
             pk_indices: vec![],
 	            indexes: vec![],
 	            version: 1,

@@ -1,0 +1,51 @@
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:11: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: USER at Line: 1, Column 8
+                warning                 
+----------------------------------------
+ SKIPPED: CREATE DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:18: ERROR:  SQL parse error: sql parser error: Expected TO, found: d at Line: 1, Column 26
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:24: ERROR:  Role or user 'testuser' does not exist
+CREATE SEQUENCE
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:34: ERROR:  Unsupported function: has_sequence_privilege
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:37: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:38: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+CREATE SEQUENCE
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:48: ERROR:  Unsupported function: has_sequence_privilege
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:56: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: USER at Line: 1, Column 8
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:59: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+CREATE SEQUENCE
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:71: ERROR:  Only SELECT supported
+CREATE TABLE
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:84: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:87: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+CREATE SEQUENCE
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:99: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:102: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+CREATE SEQUENCE
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:114: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:117: ERROR:  SQL parse error: sql parser error: Expected TO, found: d at Line: 1, Column 26
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:124: ERROR:  Unsupported statement: SetRole { context_modifier: None, role_name: Some(Ident { value: "testuser", quote_style: None }) }
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:127: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+CREATE SEQUENCE
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:139: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:142: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:148: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:155: ERROR:  Unsupported statement: SetRole { context_modifier: None, role_name: Some(Ident { value: "testuser", quote_style: None }) }
+CREATE SEQUENCE
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:167: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:169: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+               warning                
+--------------------------------------
+ SKIPPED: DROP DATABASE not supported
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:175: ERROR:  SQL parse error: sql parser error: Expected TABLE, VIEW, INDEX, ROLE, SCHEMA, FUNCTION, STAGE or SEQUENCE after DROP, found: OWNED at Line: 1, Column 6
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:176: ERROR:  SQL parse error: sql parser error: Expected TABLE, VIEW, INDEX, ROLE, SCHEMA, FUNCTION, STAGE or SEQUENCE after DROP, found: OWNED at Line: 1, Column 6
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:177: ERROR:  Role 'testuser2' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/100_alter_default_privileges_for_sequence.sql:178: ERROR:  Role 'testuser' does not exist

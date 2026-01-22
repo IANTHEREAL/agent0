@@ -1,0 +1,4 @@
+psql:/home/dongxu/lab/pg-tikv/tests/167_mixed_version_timeseries_range_already_exists.sql:10: NOTICE:  table "zone_configs" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/167_mixed_version_timeseries_range_already_exists.sql:22: NOTICE:  table "cluster_settings" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/167_mixed_version_timeseries_range_already_exists.sql:32: ERROR:  Unsupported function: node_executable_version
+psql:/home/dongxu/lab/pg-tikv/tests/167_mixed_version_timeseries_range_already_exists.sql:34: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

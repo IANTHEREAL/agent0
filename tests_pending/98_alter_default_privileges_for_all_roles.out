@@ -1,0 +1,32 @@
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:12: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:26: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:30: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:33: ERROR:  Table 'public.t2' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:44: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:47: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:50: ERROR:  Table 'public.t3' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:61: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:64: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:67: ERROR:  Table 'public.t4' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:78: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:81: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: USER at Line: 1, Column 8
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:84: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:87: ERROR:  Table 'public.t5' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:98: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:101: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:104: ERROR:  Table 'public.t6' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:115: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:118: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:121: ERROR:  Table 'public.t7' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:132: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:135: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:140: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:141: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:142: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:145: ERROR:  Schema 's' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:154: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:157: ERROR:  Sequence 'public.seq' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:169: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:172: ERROR:  Type 'public.typ' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:183: ERROR:  Unsupported join table
+psql:/home/dongxu/lab/pg-tikv/tests/98_alter_default_privileges_for_all_roles.sql:185: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

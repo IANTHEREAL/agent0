@@ -1,0 +1,8 @@
+psql:/home/dongxu/lab/pg-tikv/tests/171_optimizer_timeout.sql:18: ERROR:  Unsupported data type: Float8
+psql:/home/dongxu/lab/pg-tikv/tests/171_optimizer_timeout.sql:21: ERROR:  Table 'table1' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/171_optimizer_timeout.sql:24: ERROR:  Table 'table1' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/171_optimizer_timeout.sql:27: ERROR:  Table 'table1' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/171_optimizer_timeout.sql:31: ERROR:  Table 'table1' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/171_optimizer_timeout.sql:35: ERROR:  Table 'table1' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/171_optimizer_timeout.sql:64: ERROR:  SQL parse error: sql parser error: Expected end of statement, found: ON at Line: 14, Column 133
+psql:/home/dongxu/lab/pg-tikv/tests/171_optimizer_timeout.sql:67: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

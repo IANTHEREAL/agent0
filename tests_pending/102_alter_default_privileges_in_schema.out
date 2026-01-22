@@ -1,0 +1,51 @@
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:17: ERROR:  SQL parse error: sql parser error: Expected TO, found: postgres at Line: 1, Column 26
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:27: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:30: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:33: ERROR:  Unsupported statement: SetRole { context_modifier: None, role_name: Some(Ident { value: "testuser", quote_style: None }) }
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:37: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:46: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:50: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:59: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:63: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:72: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:76: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:85: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:95: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:105: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:111: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:115: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:119: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:129: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:135: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:145: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:151: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:155: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:164: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:171: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:173: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:182: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:192: ERROR:  Table 'pg_default_acl' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:202: ERROR:  Table 'pg_default_acl' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:212: ERROR:  Table 'pg_default_acl' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:222: ERROR:  Table 'pg_default_acl' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:226: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:228: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:231: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:240: ERROR:  Table 'pg_default_acl' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:250: ERROR:  Table 'pg_default_acl' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:260: ERROR:  Table 'pg_default_acl' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:270: ERROR:  Table 'pg_default_acl' not found
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:280: ERROR:  Table 'pg_default_acl' not found
+ nspname 
+---------
+(0 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:288: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:291: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:292: ERROR:  SQL parse error: sql parser error: Expected one of VIEW or TABLE or INDEX or ROLE, found: DEFAULT at Line: 1, Column 7
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:294: ERROR:  SQL parse error: sql parser error: Expected TABLE, VIEW, INDEX, ROLE, SCHEMA, FUNCTION, STAGE or SEQUENCE after DROP, found: OWNED at Line: 1, Column 6
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:295: ERROR:  SQL parse error: sql parser error: Expected TABLE, VIEW, INDEX, ROLE, SCHEMA, FUNCTION, STAGE or SEQUENCE after DROP, found: OWNED at Line: 1, Column 6
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:296: ERROR:  SQL parse error: sql parser error: Expected TABLE, VIEW, INDEX, ROLE, SCHEMA, FUNCTION, STAGE or SEQUENCE after DROP, found: OWNED at Line: 1, Column 6
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:299: ERROR:  SQL parse error: sql parser error: Expected FROM, found: postgres at Line: 1, Column 24
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:301: ERROR:  SQL parse error: sql parser error: Expected FROM, found: postgres at Line: 1, Column 24
+psql:/home/dongxu/lab/pg-tikv/tests/102_alter_default_privileges_in_schema.sql:307: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

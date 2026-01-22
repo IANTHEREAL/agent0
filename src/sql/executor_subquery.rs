@@ -250,6 +250,50 @@ impl Executor {
         Ok(resolved)
     }
 
+    pub(crate) async fn resolve_projection_subqueries_for_join(
+        &self,
+        txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        projection: &[SelectItem],
+        outer_aliases: &[String],
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Result<Vec<SelectItem>> {
+        let mut resolved = Vec::with_capacity(projection.len());
+        for item in projection {
+            let resolved_item = match item {
+                SelectItem::UnnamedExpr(e) => {
+                    if super::helpers::expr_has_any_outer_reference(e, outer_aliases) {
+                        SelectItem::UnnamedExpr(e.clone())
+                    } else {
+                        SelectItem::UnnamedExpr(
+                            self.resolve_subqueries(txn, sequence_values, search_path, e, ctes)
+                                .await?,
+                        )
+                    }
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    if super::helpers::expr_has_any_outer_reference(expr, outer_aliases) {
+                        SelectItem::ExprWithAlias {
+                            expr: expr.clone(),
+                            alias: alias.clone(),
+                        }
+                    } else {
+                        SelectItem::ExprWithAlias {
+                            expr: self
+                                .resolve_subqueries(txn, sequence_values, search_path, expr, ctes)
+                                .await?,
+                            alias: alias.clone(),
+                        }
+                    }
+                }
+                other => other.clone(),
+            };
+            resolved.push(resolved_item);
+        }
+        Ok(resolved)
+    }
+
     #[allow(dead_code)]
     pub(crate) async fn resolve_projection_subqueries_with_outer_context(
         &self,

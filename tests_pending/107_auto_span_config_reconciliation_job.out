@@ -1,0 +1,10 @@
+ count |            job_type             | status  
+-------+---------------------------------+---------
+     1 | AUTO SPAN CONFIG RECONCILIATION | running
+(1 row)
+
+  status  
+----------
+ canceled
+(1 row)
+

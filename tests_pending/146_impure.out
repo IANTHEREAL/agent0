@@ -1,0 +1,24 @@
+ count 
+-------
+     0
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/146_impure.sql:10: ERROR:  Only SELECT supported
+ count 
+-------
+     0
+(1 row)
+
+ count 
+-------
+     0
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/146_impure.sql:60: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/pg-tikv/tests/146_impure.sql:63: ERROR:  Column count mismatch
+psql:/home/dongxu/lab/pg-tikv/tests/146_impure.sql:69: ERROR:  Column count mismatch
+ count 
+-------
+     0
+(1 row)
+

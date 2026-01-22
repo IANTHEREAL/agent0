@@ -165,6 +165,13 @@ impl SessionSettings {
                     .unwrap_or("heap")
                     .to_string(),
             ),
+            // Transaction isolation level - TiKV uses snapshot isolation which maps to
+            // "repeatable read" in PostgreSQL terminology. Support both forms:
+            // - "transaction_isolation" (standard PostgreSQL GUC name)
+            // - "transaction.isolation.level" (how SHOW transaction isolation level parses)
+            "transaction_isolation" | "transaction.isolation.level" => {
+                Some("read committed".to_string())
+            }
             _ => None,
         }
     }
@@ -454,6 +461,15 @@ mod tests {
             .set_known_setting("unknown_setting", "x".to_string())
             .unwrap());
         assert_eq!(settings.show_value("unknown_setting"), None);
+
+        assert_eq!(
+            settings.show_value("transaction_isolation").as_deref(),
+            Some("read committed")
+        );
+        assert_eq!(
+            settings.show_value("transaction.isolation.level").as_deref(),
+            Some("read committed")
+        );
     }
 
     #[test]

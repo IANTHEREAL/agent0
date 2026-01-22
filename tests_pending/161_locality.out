@@ -1,0 +1,15 @@
+ locality_value 
+----------------
+ test
+(1 row)
+
+ locality_value 
+----------------
+ dc1
+(1 row)
+
+ locality_value 
+----------------
+ 
+(1 row)
+

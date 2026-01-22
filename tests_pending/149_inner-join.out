@@ -1,0 +1,24 @@
+psql:/home/dongxu/lab/pg-tikv/tests/149_inner-join.sql:5: ERROR:  Table 'public.abc' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/149_inner-join.sql:13: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/pg-tikv/tests/149_inner-join.sql:16: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/pg-tikv/tests/149_inner-join.sql:19: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/pg-tikv/tests/149_inner-join.sql:22: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/pg-tikv/tests/149_inner-join.sql:25: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/pg-tikv/tests/149_inner-join.sql:28: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/pg-tikv/tests/149_inner-join.sql:31: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/pg-tikv/tests/149_inner-join.sql:58: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/pg-tikv/tests/149_inner-join.sql:61: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/pg-tikv/tests/149_inner-join.sql:64: ERROR:  Column 'a' not found
+psql:/home/dongxu/lab/pg-tikv/tests/149_inner-join.sql:67: ERROR:  Column 'a' not found
+ a | b | c 
+---+---+---
+ 1 | 1 | 1
+ 1 | 1 | 1
+(2 rows)
+
+ c 
+---
+ 1
+ 1
+(2 rows)
+

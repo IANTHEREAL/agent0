@@ -1,0 +1,25 @@
+psql:/home/dongxu/lab/pg-tikv/tests/137_experimental_distsql_planning_5node.sql:5: ERROR:  Table 'public.kv' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/137_experimental_distsql_planning_5node.sql:6: ERROR:  duplicate key value violates unique constraint "kv_pkey"
+DETAIL:  Key (k)=(1) already exists.
+psql:/home/dongxu/lab/pg-tikv/tests/137_experimental_distsql_planning_5node.sql:7: ERROR:  Table 'public.kw' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/137_experimental_distsql_planning_5node.sql:8: ERROR:  duplicate key value violates unique constraint "kw_pkey"
+DETAIL:  Key (k)=(1) already exists.
+ k | v 
+---+---
+ 1 | 1
+ 2 | 2
+ 3 | 3
+ 4 | 4
+ 5 | 5
+(5 rows)
+
+ k 
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+(5 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/137_experimental_distsql_planning_5node.sql:19: ERROR:  Column 'xmin' not found

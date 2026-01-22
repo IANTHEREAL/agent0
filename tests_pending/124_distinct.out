@@ -1,0 +1,161 @@
+ y | z 
+---+---
+ 2 | 3
+ 2 | 3
+ 2 | 6
+ 2 | 9
+ 3 | 5
+ 5 | 6
+ 5 | 6
+(7 rows)
+
+ y | z 
+---+---
+ 2 | 3
+ 2 | 6
+ 2 | 9
+ 3 | 5
+ 5 | 6
+(5 rows)
+
+ y 
+---
+ 2
+ 2
+ 2
+ 3
+ 5
+(5 rows)
+
+ y | z 
+---+---
+ 2 | 3
+ 3 | 5
+ 2 | 6
+ 5 | 6
+ 2 | 9
+(5 rows)
+
+ y | z 
+---+---
+ 2 | 3
+ 2 | 6
+ 2 | 9
+ 3 | 5
+ 5 | 6
+(5 rows)
+
+ y | z 
+---+---
+ 2 | 3
+ 2 | 6
+ 2 | 9
+ 3 | 5
+ 5 | 6
+(5 rows)
+
+ ?column? 
+----------
+        5
+        8
+       11
+(3 rows)
+
+ w | z 
+---+---
+ 2 | 3
+ 3 | 5
+ 2 | 6
+ 5 | 6
+ 2 | 9
+(5 rows)
+
+ w 
+---
+ 2
+ 3
+ 5
+(3 rows)
+
+ y | z 
+---+---
+ 2 | 3
+ 2 | 6
+ 2 | 9
+ 2 |  
+ 3 | 5
+ 5 | 6
+(6 rows)
+
+ ?column? 
+----------
+ {2,3}
+ {5,6}
+ {2,6}
+ {3,5}
+ {2,9}
+ {2,NULL}
+(6 rows)
+
+ count 
+-------
+     3
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/124_distinct.sql:64: ERROR:  Table 'public.kv' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/124_distinct.sql:68: ERROR:  duplicate key value violates unique constraint "kv_pkey"
+DETAIL:  Key (k)=(1) already exists.
+ v 
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+(5 rows)
+
+ v 
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+(5 rows)
+
+ v 
+---
+ 1
+ 2
+ 3
+ 4
+ 5
+(5 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/124_distinct.sql:88: ERROR:  duplicate key value violates unique constraint "t0_c0_key"
+DETAIL:  Key (c0)=(NULL) already exists.
+ c0 
+----
+(0 rows)
+
+   x    
+--------
+ {NULL}
+       
+(2 rows)
+
+            x            
+-------------------------
+ [1,2]
+ {"foo": "bar"}
+ {"foo": {"bar": "baz"}}
+ [2,1]
+(4 rows)
+
+ count 
+-------
+     3
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/124_distinct.sql:141: ERROR:  Unsupported function: jsonb_agg
+psql:/home/dongxu/lab/pg-tikv/tests/124_distinct.sql:143: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

@@ -1,0 +1,10 @@
+psql:/home/dongxu/lab/pg-tikv/tests/112_collatedstring_nullinindex.sql:6: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: COLLATION at Line: 1, Column 8
+psql:/home/dongxu/lab/pg-tikv/tests/112_collatedstring_nullinindex.sql:15: ERROR:  Unsupported expression: Collate { expr: Value(SingleQuotedString("foo")), collation: ObjectName([Ident { value: "en", quote_style: None }]) }
+psql:/home/dongxu/lab/pg-tikv/tests/112_collatedstring_nullinindex.sql:18: ERROR:  Index name required
+ b 
+---
+ 
+ 
+(2 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/112_collatedstring_nullinindex.sql:29: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

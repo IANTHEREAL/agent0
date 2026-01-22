@@ -547,6 +547,7 @@ mod tests {
             table_id: 1,
             columns: vec![],
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![],
             check_constraints: vec![],
@@ -564,6 +565,7 @@ mod tests {
             table_id: 1,
             columns: vec![],
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![IndexDef {
                 id: 1,
@@ -594,6 +596,7 @@ mod tests {
             table_id: 1,
             columns: vec![],
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![IndexDef {
                 id: 7,
@@ -730,6 +733,7 @@ mod tests {
             table_id: 1,
             columns: vec![],
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![
                 IndexDef {
@@ -775,6 +779,7 @@ mod tests {
             table_id: 1,
             columns: vec![],
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![
                 IndexDef {
@@ -831,6 +836,7 @@ mod tests {
             table_id: 1,
             columns: vec![],
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![IndexDef {
                 id: 1,
@@ -1035,6 +1041,7 @@ mod tests {
             table_id: 1,
             columns: vec![],
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![IndexDef {
                 id: 1,

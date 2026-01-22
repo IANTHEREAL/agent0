@@ -1,0 +1,14 @@
+psql:/home/dongxu/lab/pg-tikv/tests/213_upsert_non_metamorphic.sql:8: NOTICE:  table "dest" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/213_upsert_non_metamorphic.sql:9: NOTICE:  table "t54456" does not exist, skipping
+psql:/home/dongxu/lab/pg-tikv/tests/213_upsert_non_metamorphic.sql:31: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 6004740 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+psql:/home/dongxu/lab/pg-tikv/tests/213_upsert_non_metamorphic.sql:44: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 6004740 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+psql:/home/dongxu/lab/pg-tikv/tests/213_upsert_non_metamorphic.sql:58: ERROR:  Table 'public.src' already exists
+psql:/home/dongxu/lab/pg-tikv/tests/213_upsert_non_metamorphic.sql:72: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 13454740 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+psql:/home/dongxu/lab/pg-tikv/tests/213_upsert_non_metamorphic.sql:82: ERROR:  gRPC api error: status: OutOfRange, message: "Error, message length too large: found 13454740 bytes, the limit is: 4194304 bytes", details: [], metadata: MetadataMap { headers: {"content-type": "application/grpc", "grpc-accept-encoding": "identity, deflate, gzip"} }
+ count 
+-------
+ 25000
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/213_upsert_non_metamorphic.sql:107: ERROR:  Only SELECT supported
+psql:/home/dongxu/lab/pg-tikv/tests/213_upsert_non_metamorphic.sql:109: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

@@ -700,11 +700,18 @@ pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
     // without an owner field. Decode them and synthesize a default owner.
     let legacy: LegacyTableSchema =
         bincode::deserialize(data).context("Failed to deserialize legacy schema")?;
+    let pk_constraint_name = if legacy.pk_indices.is_empty() {
+        None
+    } else {
+        let short = legacy.name.rsplit('.').next().unwrap_or(legacy.name.as_str());
+        Some(format!("{}_pkey", short))
+    };
     Ok(TableSchema {
         name: legacy.name,
         table_id: legacy.table_id,
         columns: legacy.columns,
         version: legacy.version,
+        pk_constraint_name,
         pk_indices: legacy.pk_indices,
         indexes: legacy.indexes,
         check_constraints: legacy.check_constraints,
@@ -887,6 +894,7 @@ mod tests {
                 },
             ],
             version: 1,
+            pk_constraint_name: Some("test_table_pkey".to_string()),
             pk_indices: vec![0],
             indexes: vec![],
             check_constraints: vec![],

@@ -1,0 +1,15 @@
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:7: ERROR:  Extension 'postgis' is not available
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:10: ERROR:  Unsupported function: PostGIS_Extensions_Upgrade
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:13: ERROR:  Unsupported function: PostGIS_Full_Version
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:16: ERROR:  Unsupported function: PostGIS_GEOS_Version
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:19: ERROR:  Unsupported function: PostGIS_LibXML_Version
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:22: ERROR:  Unsupported function: PostGIS_Lib_Build_Date
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:25: ERROR:  Unsupported function: PostGIS_Lib_Version
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:28: ERROR:  Unsupported function: PostGIS_Liblwgeom_Version
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:31: ERROR:  Unsupported function: PostGIS_PROJ_Version
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:34: ERROR:  Unsupported function: PostGIS_Scripts_Build_Date
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:37: ERROR:  Unsupported function: PostGIS_Scripts_Installed
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:40: ERROR:  Unsupported function: PostGIS_Scripts_Released
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:43: ERROR:  Unsupported function: PostGIS_Version
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:46: ERROR:  Unsupported function: PostGIS_Wagyu_Version
+psql:/home/dongxu/lab/pg-tikv/tests/142_geospatial_meta.sql:48: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

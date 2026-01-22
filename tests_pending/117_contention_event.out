@@ -1,0 +1,17 @@
+ pg_sleep 
+----------
+ 
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/117_contention_event.sql:40: ERROR:  Table 'pg_stat_activity' not found
+SET
+BEGIN
+ERROR:  relation "kv" does not exist
+LINE 1: ...ation_name = 'contention_event_bg'; BEGIN; UPDATE kv SET v =...
+                                                             ^
+ k | v  
+---+----
+ k | v1
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/117_contention_event.sql:52: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

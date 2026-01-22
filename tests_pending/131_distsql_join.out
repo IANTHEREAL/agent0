@@ -1,0 +1,29 @@
+psql:/home/dongxu/lab/pg-tikv/tests/131_distsql_join.sql:20: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/pg-tikv/tests/131_distsql_join.sql:23: ERROR:  No PK
+psql:/home/dongxu/lab/pg-tikv/tests/131_distsql_join.sql:33: ERROR:  AND requires boolean operands
+psql:/home/dongxu/lab/pg-tikv/tests/131_distsql_join.sql:36: ERROR:  No PK
+ k | k 
+---+---
+ 0 | 0
+ 0 | 0
+ 0 | 0
+ 0 | 0
+ 0 | 0
+ 0 | 0
+ 0 | 0
+ 0 | 0
+ 0 | 0
+ 1 | 1
+ 2 | 2
+ 2 | 2
+ 2 | 2
+ 2 | 2
+(14 rows)
+
+psql:/home/dongxu/lab/pg-tikv/tests/131_distsql_join.sql:55: ERROR:  Index name required
+ pk | a | b 
+----+---+---
+  0 | 1 | 2
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/131_distsql_join.sql:60: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

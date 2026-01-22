@@ -146,6 +146,7 @@ impl Executor {
                         default_expr: None,
                     },
                 ],
+                pk_constraint_name: None,
                 pk_indices: vec![],
                 indexes: vec![],
                 version: 1,
@@ -238,6 +239,7 @@ impl Executor {
                         default_expr: None,
                     },
                 ],
+                pk_constraint_name: None,
                 pk_indices: vec![],
                 indexes: vec![],
                 version: 1,
@@ -443,6 +445,7 @@ impl Executor {
                         default_expr: None,
                     },
                 ],
+                pk_constraint_name: None,
                 pk_indices: vec![],
                 indexes: vec![],
                 version: 1,
@@ -590,6 +593,7 @@ impl Executor {
                         default_expr: None,
                     },
                 ],
+                pk_constraint_name: None,
                 pk_indices: vec![],
                 indexes: vec![],
                 version: 1,
@@ -625,6 +629,7 @@ impl Executor {
                     is_serial: false,
                     default_expr: None,
                 }],
+                pk_constraint_name: None,
                 pk_indices: vec![],
                 indexes: vec![],
                 version: 1,
@@ -686,6 +691,7 @@ impl Executor {
                                     default_expr: None,
                                 })
                                 .collect(),
+                            pk_constraint_name: None,
                             pk_indices: vec![],
                             indexes: vec![],
                             version: 1,
@@ -730,6 +736,7 @@ impl Executor {
                     is_serial: false,
                     default_expr: None,
                 }],
+                pk_constraint_name: None,
                 pk_indices: vec![],
                 indexes: vec![],
                 version: 1,
@@ -794,6 +801,7 @@ impl Executor {
                 is_serial: false,
                 default_expr: None,
             }],
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![],
             version: 1,
@@ -891,6 +899,7 @@ impl Executor {
                                 default_expr: None,
                             })
                             .collect(),
+                        pk_constraint_name: None,
                         pk_indices: vec![],
                         indexes: vec![],
                         version: 1,
@@ -1027,6 +1036,11 @@ impl Executor {
                             )
                             .await?;
 
+                        let left_columns: Vec<String> = all_table_aliases
+                            .iter()
+                            .flat_map(|(_, cols)| cols.iter().map(|c| c.name.clone()))
+                            .collect();
+
                         let join_condition = match &join.join_operator {
                             JoinOperator::Inner(JoinConstraint::On(expr)) => Some(expr.clone()),
                             JoinOperator::LeftOuter(JoinConstraint::On(expr)) => Some(expr.clone()),
@@ -1036,6 +1050,82 @@ impl Executor {
                             JoinOperator::FullOuter(JoinConstraint::On(expr)) => Some(expr.clone()),
                             JoinOperator::CrossJoin => None,
                             JoinOperator::Inner(JoinConstraint::None) => None,
+                            JoinOperator::Inner(JoinConstraint::Using(cols))
+                            | JoinOperator::LeftOuter(JoinConstraint::Using(cols))
+                            | JoinOperator::RightOuter(JoinConstraint::Using(cols))
+                            | JoinOperator::FullOuter(JoinConstraint::Using(cols)) => {
+                                let using_cols: Vec<String> =
+                                    cols.iter().map(|c| normalize_ident(c)).collect();
+                                if using_cols.is_empty() {
+                                    None
+                                } else {
+                                    let left_alias = all_table_aliases
+                                        .iter()
+                                        .find(|(_, cols)| {
+                                            cols.iter()
+                                                .any(|c| c.name.eq_ignore_ascii_case(&using_cols[0]))
+                                        })
+                                        .map(|(a, _)| a.clone())
+                                        .unwrap_or_else(|| base_alias.clone());
+                                    let cond = using_cols
+                                        .iter()
+                                        .map(|col| Expr::BinaryOp {
+                                            left: Box::new(Expr::CompoundIdentifier(vec![
+                                                Ident::new(left_alias.clone()),
+                                                Ident::new(col.clone()),
+                                            ])),
+                                            op: BinaryOperator::Eq,
+                                            right: Box::new(Expr::CompoundIdentifier(vec![
+                                                Ident::new(join_alias.clone()),
+                                                Ident::new(col.clone()),
+                                            ])),
+                                        })
+                                        .reduce(|a, b| Expr::BinaryOp {
+                                            left: Box::new(a),
+                                            op: BinaryOperator::And,
+                                            right: Box::new(b),
+                                        });
+                                    cond
+                                }
+                            }
+                            JoinOperator::Inner(JoinConstraint::Natural)
+                            | JoinOperator::LeftOuter(JoinConstraint::Natural)
+                            | JoinOperator::RightOuter(JoinConstraint::Natural)
+                            | JoinOperator::FullOuter(JoinConstraint::Natural) => {
+                                let right_columns: Vec<String> = join_schema
+                                    .columns
+                                    .iter()
+                                    .map(|c| c.name.clone())
+                                    .collect();
+                                let common_cols: Vec<String> = left_columns
+                                    .iter()
+                                    .filter(|c| right_columns.contains(c))
+                                    .cloned()
+                                    .collect();
+                                if common_cols.is_empty() {
+                                    None
+                                } else {
+                                    let cond = common_cols
+                                        .iter()
+                                        .map(|col| Expr::BinaryOp {
+                                            left: Box::new(Expr::CompoundIdentifier(vec![
+                                                Ident::new(base_alias.clone()),
+                                                Ident::new(col.clone()),
+                                            ])),
+                                            op: BinaryOperator::Eq,
+                                            right: Box::new(Expr::CompoundIdentifier(vec![
+                                                Ident::new(join_alias.clone()),
+                                                Ident::new(col.clone()),
+                                            ])),
+                                        })
+                                        .reduce(|a, b| Expr::BinaryOp {
+                                            left: Box::new(a),
+                                            op: BinaryOperator::And,
+                                            right: Box::new(b),
+                                        });
+                                    cond
+                                }
+                            }
                             _ => None,
                         };
 
@@ -1074,6 +1164,7 @@ impl Executor {
                             table_id: 0,
                             name: "nested_join".to_string(),
                             columns: temp_columns,
+                            pk_constraint_name: None,
                             pk_indices: vec![],
                             indexes: vec![],
                             version: 1,
@@ -1148,6 +1239,7 @@ impl Executor {
                             table_id: 0,
                             name: "nested_join".to_string(),
                             columns: new_columns,
+                            pk_constraint_name: None,
                             pk_indices: vec![],
                             indexes: vec![],
                             version: 1,
@@ -1182,6 +1274,7 @@ impl Executor {
                         table_id: 0,
                         name: final_alias.clone(),
                         columns: prefixed_columns,
+                        pk_constraint_name: None,
                         pk_indices: vec![],
                         indexes: vec![],
                         version: 1,
@@ -1395,14 +1488,58 @@ impl Executor {
                     .unwrap_or_else(|| "subquery".to_string());
                 let alias_columns = alias.as_ref().map(|a| a.columns.as_slice()).unwrap_or(&[]);
 
+                let left_columns: Vec<String> = combined_schemas
+                    .iter()
+                    .flat_map(|(_, s)| s.columns.iter().map(|c| c.name.clone()))
+                    .collect();
+
                 let (join_condition, is_natural) = match &join.join_operator {
                     JoinOperator::Inner(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
                     JoinOperator::LeftOuter(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
                     JoinOperator::Inner(JoinConstraint::None) => (None, false),
                     JoinOperator::CrossJoin => (None, false),
+                    JoinOperator::Inner(JoinConstraint::Using(cols))
+                    | JoinOperator::LeftOuter(JoinConstraint::Using(cols)) => {
+                        let using_cols: Vec<String> =
+                            cols.iter().map(|c| normalize_ident(c)).collect();
+                        if using_cols.is_empty() {
+                            (None, true)
+                        } else {
+                            let left_alias = combined_schemas
+                                .iter()
+                                .find(|(_, s)| {
+                                    s.columns
+                                        .iter()
+                                        .any(|c| c.name.eq_ignore_ascii_case(&using_cols[0]))
+                                })
+                                .map(|(a, _)| a.clone())
+                                .unwrap_or_else(|| base_alias.clone());
+                            let cond = using_cols
+                                .iter()
+                                .map(|col| Expr::BinaryOp {
+                                    left: Box::new(Expr::CompoundIdentifier(vec![
+                                        Ident::new(left_alias.clone()),
+                                        Ident::new(col.clone()),
+                                    ])),
+                                    op: BinaryOperator::Eq,
+                                    right: Box::new(Expr::CompoundIdentifier(vec![
+                                        Ident::new(join_alias.clone()),
+                                        Ident::new(col.clone()),
+                                    ])),
+                                })
+                                .reduce(|a, b| Expr::BinaryOp {
+                                    left: Box::new(a),
+                                    op: BinaryOperator::And,
+                                    right: Box::new(b),
+                                })
+                                .unwrap();
+                            (Some(cond), true)
+                        }
+                    }
                     _ => return Err(anyhow!("Unsupported LATERAL JOIN type")),
                 };
                 let _ = is_natural;
+                let _ = left_columns;
 
                 let has_correlated_subquery = join_condition.as_ref().map_or(false, |cond| {
                     combined_schemas.iter().any(|(alias, _)| {
@@ -1495,6 +1632,7 @@ impl Executor {
                             table_id: 0,
                             columns: combined_col_defs,
                             version: 1,
+                            pk_constraint_name: None,
                             pk_indices: vec![],
                             indexes: vec![],
                             check_constraints: vec![],
@@ -1671,7 +1809,58 @@ impl Executor {
                             .iter()
                             .map(|col| Expr::BinaryOp {
                                 left: Box::new(Expr::CompoundIdentifier(vec![
-                                    Ident::new(base_alias.clone()),
+                                    Ident::new(
+                                        combined_schemas
+                                            .iter()
+                                            .find(|(_, s)| {
+                                                s.columns
+                                                    .iter()
+                                                    .any(|c| c.name.eq_ignore_ascii_case(col))
+                                            })
+                                            .map(|(a, _)| a.clone())
+                                            .unwrap_or_else(|| base_alias.clone()),
+                                    ),
+                                    Ident::new(col.clone()),
+                                ])),
+                                op: BinaryOperator::Eq,
+                                right: Box::new(Expr::CompoundIdentifier(vec![
+                                    Ident::new(join_alias.clone()),
+                                    Ident::new(col.clone()),
+                                ])),
+                            })
+                            .reduce(|a, b| Expr::BinaryOp {
+                                left: Box::new(a),
+                                op: BinaryOperator::And,
+                                right: Box::new(b),
+                            })
+                            .unwrap();
+                        (Some(cond), true)
+                    }
+                }
+                JoinOperator::Inner(JoinConstraint::Using(cols))
+                | JoinOperator::LeftOuter(JoinConstraint::Using(cols))
+                | JoinOperator::RightOuter(JoinConstraint::Using(cols))
+                | JoinOperator::FullOuter(JoinConstraint::Using(cols)) => {
+                    let using_cols: Vec<String> = cols.iter().map(|c| normalize_ident(c)).collect();
+                    has_natural_join = true;
+                    natural_join_common_cols = using_cols.clone();
+                    if using_cols.is_empty() {
+                        (None, true)
+                    } else {
+                        let left_alias = combined_schemas
+                            .iter()
+                            .find(|(_, s)| {
+                                s.columns
+                                    .iter()
+                                    .any(|c| c.name.eq_ignore_ascii_case(&using_cols[0]))
+                            })
+                            .map(|(a, _)| a.clone())
+                            .unwrap_or_else(|| base_alias.clone());
+                        let cond = using_cols
+                            .iter()
+                            .map(|col| Expr::BinaryOp {
+                                left: Box::new(Expr::CompoundIdentifier(vec![
+                                    Ident::new(left_alias.clone()),
                                     Ident::new(col.clone()),
                                 ])),
                                 op: BinaryOperator::Eq,
@@ -1690,6 +1879,7 @@ impl Executor {
                     }
                 }
                 JoinOperator::CrossJoin => (None, false),
+                JoinOperator::Inner(JoinConstraint::None) => (None, false),
                 _ => return Err(anyhow!("Unsupported JOIN type")),
             };
             let _ = is_natural;
@@ -1752,6 +1942,7 @@ impl Executor {
                 table_id: 0,
                 columns: combined_col_defs,
                 version: 1,
+                pk_constraint_name: None,
                 pk_indices: vec![],
                 indexes: vec![],
                 check_constraints: vec![],
@@ -1879,6 +2070,7 @@ impl Executor {
             table_id: 0,
             columns: final_columns,
             version: 1,
+            pk_constraint_name: None,
             pk_indices: vec![],
             indexes: vec![],
             check_constraints: vec![],
@@ -1924,8 +2116,16 @@ impl Executor {
             combined_rows
         };
 
+        let outer_aliases: Vec<String> = combined_schemas.iter().map(|(a, _)| a.clone()).collect();
         let resolved_projection = self
-            .resolve_projection_subqueries(txn, sequence_values, search_path, &select.projection, ctes)
+            .resolve_projection_subqueries_for_join(
+                txn,
+                sequence_values,
+                search_path,
+                &select.projection,
+                &outer_aliases,
+                ctes,
+            )
             .await?;
 
         let group_keys_exprs = match &select.group_by {
@@ -2664,7 +2864,17 @@ impl Executor {
                                     }
                                 }
                             }
-                            vals.push(
+                            let value = if let Expr::Subquery(subquery) = e {
+                                self.eval_scalar_subquery_in_join(
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    subquery,
+                                    &ctx,
+                                    ctes,
+                                )
+                                .await?
+                            } else {
                                 self.eval_expr_join_maybe_sequence(
                                     txn,
                                     sequence_values,
@@ -2672,8 +2882,9 @@ impl Executor {
                                     e,
                                     &ctx,
                                 )
-                                .await?,
-                            );
+                                .await?
+                            };
+                            vals.push(value);
                         }
                         SelectItem::Wildcard(_) => {}
                     }
@@ -2732,7 +2943,17 @@ impl Executor {
                         SelectItem::Wildcard(_) => continue,
                         _ => return Err(anyhow!("Unsupported select item")),
                     };
-                    vals.push(
+                    let value = if let Expr::Subquery(subquery) = expr {
+                        self.eval_scalar_subquery_in_join(
+                            txn,
+                            sequence_values,
+                            search_path,
+                            subquery,
+                            &ctx,
+                            ctes,
+                        )
+                        .await?
+                    } else {
                         self.eval_expr_join_maybe_sequence(
                             txn,
                             sequence_values,
@@ -2740,8 +2961,9 @@ impl Executor {
                             expr,
                             &ctx,
                         )
-                        .await?,
-                    );
+                        .await?
+                    };
+                    vals.push(value);
                 }
                 result_rows.push(Row::new(vals));
             }

@@ -1,0 +1,17 @@
+id|name|category_name
+1|Item A|Electronics
+2|Item B|Books
+3|Item C|Electronics
+(3 rows)
+id|name|category_name
+1|Item A|Electronics
+2|Item B|Books
+3|Item C|Electronics
+4|Item D|NULL
+(4 rows)
+order_date|product|quantity
+2024-01-15|Gadget|2
+2024-01-15|Widget|5
+2024-01-25|Gizmo|1
+2024-02-20|Widget|3
+(4 rows)

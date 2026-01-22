@@ -1,0 +1,1 @@
+psql:/home/dongxu/lab/pg-tikv/tests/144_guardrails.sql:8: ERROR:  GENERATE_SERIES is a set-returning function, not supported in this context

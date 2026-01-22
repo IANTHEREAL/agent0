@@ -1,0 +1,24 @@
+psql:/home/dongxu/lab/pg-tikv/tests/202_target_names.sql:32: ERROR:  SQL parse error: sql parser error: Expected an object type after CREATE, found: COLLATION at Line: 1, Column 8
+psql:/home/dongxu/lab/pg-tikv/tests/202_target_names.sql:46: ERROR:  Unsupported statement: SetRole { context_modifier: None, role_name: Some(Ident { value: "target_names_user", quote_style: None }) }
+psql:/home/dongxu/lab/pg-tikv/tests/202_target_names.sql:49: ERROR:  Unsupported expression: Collate { expr: Identifier(Ident { value: "t", quote_style: None }), collation: ObjectName([Ident { value: "en_US", quote_style: Some('"') }]) }
+psql:/home/dongxu/lab/pg-tikv/tests/202_target_names.sql:60: ERROR:  Unsupported function: row
+ ?column? | ?column? | ?column? | ?column? | ?column? | ?column? 
+----------+----------+----------+----------+----------+----------
+      123 | 123      |    123.0 | t        | f        | 
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/202_target_names.sql:66: ERROR:  Unsupported expression: CompositeAccess { expr: Nested(Function(Function { name: ObjectName([Ident { value: "pg_get_keywords", quote_style: None }]), args: [], filter: None, null_treatment: None, over: None, distinct: false, special: false, order_by: [] })), key: Ident { value: "word", quote_style: None } }
+psql:/home/dongxu/lab/pg-tikv/tests/202_target_names.sql:69: ERROR:  Unsupported expression: ArraySubquery(Query { with: None, body: Select(Select { distinct: None, top: None, projection: [UnnamedExpr(Value(Number("1", false)))], into: None, from: [], lateral_views: [], selection: None, group_by: Expressions([]), cluster_by: [], distribute_by: [], sort_by: [], having: None, named_window: [], qualify: None }), order_by: [], limit: None, limit_by: [], offset: None, fetch: None, locks: [], for_clause: None })
+ ?column? 
+----------
+ t
+(1 row)
+
+ case | case | case | case | case 
+------+------+------+------+------
+      |      |      |      | 4
+(1 row)
+
+psql:/home/dongxu/lab/pg-tikv/tests/202_target_names.sql:85: ERROR:  Unsupported function: VALUES
+psql:/home/dongxu/lab/pg-tikv/tests/202_target_names.sql:87: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1
+psql:/home/dongxu/lab/pg-tikv/tests/202_target_names.sql:90: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: RESET at Line: 1, Column 1

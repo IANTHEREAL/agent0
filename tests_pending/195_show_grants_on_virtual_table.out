@@ -1,0 +1,7 @@
+psql:/home/dongxu/lab/pg-tikv/tests/195_show_grants_on_virtual_table.sql:8: ERROR:  Role or user 'PUBLIC' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/195_show_grants_on_virtual_table.sql:33: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/195_show_grants_on_virtual_table.sql:42: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: DO at Line: 1, Column 1
+psql:/home/dongxu/lab/pg-tikv/tests/195_show_grants_on_virtual_table.sql:69: ERROR:  Table 'information_schema.role_table_grants' not found
+psql:/home/dongxu/lab/pg-tikv/tests/195_show_grants_on_virtual_table.sql:81: ERROR:  SQL parse error: sql parser error: Expected an SQL statement, found: DO at Line: 1, Column 1
+psql:/home/dongxu/lab/pg-tikv/tests/195_show_grants_on_virtual_table.sql:84: ERROR:  Role or user 'testuser2' does not exist
+psql:/home/dongxu/lab/pg-tikv/tests/195_show_grants_on_virtual_table.sql:109: ERROR:  Table 'information_schema.role_table_grants' not found
