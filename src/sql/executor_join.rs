@@ -7,6 +7,7 @@ use super::helpers::{
     infer_expr_type, normalize_ident, AggExpr,
 };
 use super::names;
+use super::operators::{hash_row_key_for_join, row_key_has_null_for_join, row_keys_equal_for_join, HashJoinConfig};
 use super::sequences;
 use super::window::{compute_window_functions_join, extract_window_functions};
 use super::{
@@ -22,6 +23,128 @@ use sqlparser::ast::{
 };
 use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
+
+fn resolve_join_expr_offset(expr: &Expr, column_offsets: &HashMap<String, usize>) -> Option<usize> {
+    match expr {
+        Expr::Identifier(ident) => column_offsets.get(&ident.value).copied(),
+        Expr::CompoundIdentifier(parts) => {
+            // Match `table.column` and `schema.table.column` similarly to `eval_expr_join`.
+            let (table_alias, col_name) = if parts.len() == 2 {
+                (&parts[0].value, &parts[1].value)
+            } else if parts.len() == 3 {
+                (&parts[1].value, &parts[2].value)
+            } else {
+                return None;
+            };
+
+            let key = format!("{}.{}", table_alias, col_name);
+            if let Some(&offset) = column_offsets.get(&key) {
+                return Some(offset);
+            }
+
+            let key_lower = key.to_lowercase();
+            for (k, &offset) in column_offsets {
+                if k.to_lowercase() == key_lower {
+                    return Some(offset);
+                }
+            }
+
+            if table_alias.contains("->") {
+                let suffix = format!(".{}.{}", table_alias, col_name).to_lowercase();
+                for (k, &offset) in column_offsets {
+                    if k.to_lowercase().ends_with(&suffix) {
+                        return Some(offset);
+                    }
+                }
+
+                let direct_suffix = format!("{}.{}", table_alias, col_name).to_lowercase();
+                for (k, &offset) in column_offsets {
+                    let k_lower = k.to_lowercase();
+                    if k_lower == direct_suffix || k_lower.ends_with(&format!(".{}", direct_suffix)) {
+                        return Some(offset);
+                    }
+                }
+            }
+
+            None
+        }
+        Expr::Nested(inner) => resolve_join_expr_offset(inner, column_offsets),
+        _ => None,
+    }
+}
+
+fn extract_equi_join_key_indices_for_hash_join(
+    expr: &Expr,
+    column_offsets: &HashMap<String, usize>,
+    left_col_count: usize,
+    right_col_count: usize,
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                let (mut lk1, mut rk1) = extract_equi_join_key_indices_for_hash_join(
+                    left,
+                    column_offsets,
+                    left_col_count,
+                    right_col_count,
+                )?;
+                let (lk2, rk2) = extract_equi_join_key_indices_for_hash_join(
+                    right,
+                    column_offsets,
+                    left_col_count,
+                    right_col_count,
+                )?;
+                lk1.extend(lk2);
+                rk1.extend(rk2);
+                Some((lk1, rk1))
+            }
+            BinaryOperator::Eq => {
+                let left_off = resolve_join_expr_offset(left, column_offsets)?;
+                let right_off = resolve_join_expr_offset(right, column_offsets)?;
+
+                let left_in_left = left_off < left_col_count;
+                let right_in_left = right_off < left_col_count;
+
+                let left_in_right = left_off >= left_col_count
+                    && left_off < left_col_count.saturating_add(right_col_count);
+                let right_in_right = right_off >= left_col_count
+                    && right_off < left_col_count.saturating_add(right_col_count);
+
+                // Require one side from the current left input and one side from the current right input.
+                if left_in_left && right_in_right {
+                    return Some((vec![left_off], vec![right_off - left_col_count]));
+                }
+                if right_in_left && left_in_right {
+                    return Some((vec![right_off], vec![left_off - left_col_count]));
+                }
+                None
+            }
+            _ => None,
+        },
+        Expr::Nested(inner) => extract_equi_join_key_indices_for_hash_join(
+            inner,
+            column_offsets,
+            left_col_count,
+            right_col_count,
+        ),
+        _ => None,
+    }
+}
+
+fn hash_join_key_types_compatible(left: &DataType, right: &DataType) -> bool {
+    use DataType::*;
+    match (left, right) {
+        (Int32, Int32) | (Int64, Int64) | (Int32, Int64) | (Int64, Int32) => true,
+        (Numeric { .. }, Numeric { .. }) => true,
+        (Boolean, Boolean)
+        | (Text, Text)
+        | (Bytes, Bytes)
+        | (Timestamp, Timestamp)
+        | (Date, Date)
+        | (Uuid, Uuid) => true,
+        _ => false,
+    }
+}
 
 impl Executor {
     #[allow(dead_code)]
@@ -1950,97 +2073,280 @@ impl Executor {
                 owner: String::new(),
             };
 
-            let mut new_combined_rows = Vec::new();
-            let mut right_matched: Vec<bool> = vec![false; join_rows.len()];
-
-            for left_row in &combined_rows {
-                let mut matched = false;
-
-                let resolved_condition = if has_correlated_subquery {
-                    if let Some(ref cond) = join_condition {
-                        let mut substituted = cond.clone();
-                        let mut value_offset = 0;
-                        for (alias, schema) in &combined_schemas {
-                            let row_values: Vec<Value> = left_row.values
-                                [value_offset..value_offset + schema.columns.len()]
-                                .to_vec();
-                            let outer_row = Row::new(row_values);
-                            substituted = super::helpers::substitute_outer_values(
-                                &substituted,
-                                alias,
-                                schema,
-                                &outer_row,
-                            );
-                            value_offset += schema.columns.len();
-                        }
-                        Some(
-                            self.resolve_subqueries(
-                                txn,
-                                sequence_values,
-                                search_path,
-                                &substituted,
-                                ctes,
-                            )
-                            .await?,
-                        )
-                    } else {
-                        None
+            let hash_join_config = HashJoinConfig::default();
+            let join_key_indices = if !has_correlated_subquery {
+                join_condition.as_ref().and_then(|cond| {
+                    extract_equi_join_key_indices_for_hash_join(
+                        cond,
+                        &column_offsets,
+                        left_col_count,
+                        join_schema.columns.len(),
+                    )
+                })
+            } else {
+                None
+            }
+            .and_then(|(lk, rk)| {
+                if lk.is_empty() || lk.len() != rk.len() {
+                    return None;
+                }
+                for (li, ri) in lk.iter().copied().zip(rk.iter().copied()) {
+                    let left_dt = temp_combined_schema.columns.get(li).map(|c| &c.data_type)?;
+                    let right_dt = temp_combined_schema
+                        .columns
+                        .get(left_col_count + ri)
+                        .map(|c| &c.data_type)?;
+                    if !hash_join_key_types_compatible(left_dt, right_dt) {
+                        return None;
                     }
+                }
+                Some((lk, rk))
+            });
+
+            let use_hash_join = join_key_indices.is_some()
+                && (combined_rows.len() + join_rows.len()) >= hash_join_config.min_rows_threshold;
+
+            let left_outer = is_left_join || is_full_join;
+            let right_outer = is_right_join || is_full_join;
+
+            let mut new_combined_rows = Vec::new();
+            if use_hash_join {
+                let (left_key_indices, right_key_indices) = join_key_indices.unwrap();
+                let mut right_matched: Vec<bool> = if right_outer {
+                    vec![false; join_rows.len()]
                 } else {
-                    join_condition.clone()
+                    Vec::new()
                 };
 
-                for (right_idx, right_row) in join_rows.iter().enumerate() {
-                    let mut combined_values = left_row.values.clone();
-                    combined_values.extend(right_row.values.clone());
-                    let combined_row = Row::new(combined_values);
+                // Choose the smaller side as build, but preserve the legacy output order
+                // (left outer loop, right inner loop).
+                let left_is_build = combined_rows.len() <= join_rows.len();
 
-                    let matches = if let Some(ref cond) = resolved_condition {
-                        let ctx = JoinContext {
-                            tables: HashMap::new(),
-                            column_offsets: column_offsets.clone(),
-                            combined_row: &combined_row,
-                            combined_schema: &temp_combined_schema,
+                if left_is_build {
+                    // Build hash table on left, probe right. Record matches per left row to
+                    // preserve output ordering.
+                    let mut buckets: HashMap<u64, Vec<usize>> =
+                        HashMap::with_capacity((combined_rows.len() as f64 * 1.4) as usize);
+                    for (li, left_row) in combined_rows.iter().enumerate() {
+                        if row_key_has_null_for_join(left_row, &left_key_indices) {
+                            continue;
+                        }
+                        let hash = hash_row_key_for_join(left_row, &left_key_indices);
+                        buckets.entry(hash).or_default().push(li);
+                    }
+
+                    let mut left_matches: Vec<Vec<usize>> = vec![Vec::new(); combined_rows.len()];
+                    for (ri, right_row) in join_rows.iter().enumerate() {
+                        if row_key_has_null_for_join(right_row, &right_key_indices) {
+                            continue;
+                        }
+                        let hash = hash_row_key_for_join(right_row, &right_key_indices);
+                        let Some(candidates) = buckets.get(&hash) else {
+                            continue;
                         };
-                        matches!(
-                            self.eval_expr_join_maybe_sequence(
-                                txn,
-                                sequence_values,
-                                search_path,
-                                cond,
-                                &ctx
+                        for &li in candidates {
+                            let left_row = &combined_rows[li];
+                            if !row_keys_equal_for_join(
+                                left_row,
+                                &left_key_indices,
+                                right_row,
+                                &right_key_indices,
+                            ) {
+                                continue;
+                            }
+                            left_matches[li].push(ri);
+                            if right_outer {
+                                right_matched[ri] = true;
+                            }
+                        }
+                    }
+
+                    for (li, left_row) in combined_rows.iter().enumerate() {
+                        let matches = &left_matches[li];
+                        if !matches.is_empty() {
+                            for &ri in matches {
+                                let right_row = &join_rows[ri];
+                                let mut values = Vec::with_capacity(
+                                    left_row.values.len() + right_row.values.len(),
+                                );
+                                values.extend(left_row.values.iter().cloned());
+                                values.extend(right_row.values.iter().cloned());
+                                new_combined_rows.push(Row::new(values));
+                            }
+                        } else if left_outer {
+                            let mut values = Vec::with_capacity(
+                                left_row.values.len() + join_schema.columns.len(),
+                            );
+                            values.extend(left_row.values.iter().cloned());
+                            values.extend(
+                                std::iter::repeat(Value::Null).take(join_schema.columns.len()),
+                            );
+                            new_combined_rows.push(Row::new(values));
+                        }
+                    }
+                } else {
+                    // Build hash table on right, probe left (legacy ordering).
+                    let mut buckets: HashMap<u64, Vec<usize>> =
+                        HashMap::with_capacity((join_rows.len() as f64 * 1.4) as usize);
+                    for (ri, right_row) in join_rows.iter().enumerate() {
+                        if row_key_has_null_for_join(right_row, &right_key_indices) {
+                            continue;
+                        }
+                        let hash = hash_row_key_for_join(right_row, &right_key_indices);
+                        buckets.entry(hash).or_default().push(ri);
+                    }
+
+                    for left_row in &combined_rows {
+                        let mut matched = false;
+
+                        if !row_key_has_null_for_join(left_row, &left_key_indices) {
+                            let hash = hash_row_key_for_join(left_row, &left_key_indices);
+                            if let Some(candidates) = buckets.get(&hash) {
+                                for &ri in candidates {
+                                    let right_row = &join_rows[ri];
+                                    if !row_keys_equal_for_join(
+                                        left_row,
+                                        &left_key_indices,
+                                        right_row,
+                                        &right_key_indices,
+                                    ) {
+                                        continue;
+                                    }
+                                    let mut values = Vec::with_capacity(
+                                        left_row.values.len() + right_row.values.len(),
+                                    );
+                                    values.extend(left_row.values.iter().cloned());
+                                    values.extend(right_row.values.iter().cloned());
+                                    new_combined_rows.push(Row::new(values));
+                                    matched = true;
+                                    if right_outer {
+                                        right_matched[ri] = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        if left_outer && !matched {
+                            let mut values = Vec::with_capacity(
+                                left_row.values.len() + join_schema.columns.len(),
+                            );
+                            values.extend(left_row.values.iter().cloned());
+                            values.extend(
+                                std::iter::repeat(Value::Null).take(join_schema.columns.len()),
+                            );
+                            new_combined_rows.push(Row::new(values));
+                        }
+                    }
+                }
+
+                if right_outer {
+                    for (ri, right_row) in join_rows.iter().enumerate() {
+                        if !right_matched[ri] {
+                            let mut values = Vec::with_capacity(left_col_count + right_row.values.len());
+                            values.extend(std::iter::repeat(Value::Null).take(left_col_count));
+                            values.extend(right_row.values.iter().cloned());
+                            new_combined_rows.push(Row::new(values));
+                        }
+                    }
+                }
+            } else {
+                let mut right_matched: Vec<bool> = vec![false; join_rows.len()];
+
+                for left_row in &combined_rows {
+                    let mut matched = false;
+
+                    let resolved_condition = if has_correlated_subquery {
+                        if let Some(ref cond) = join_condition {
+                            let mut substituted = cond.clone();
+                            let mut value_offset = 0;
+                            for (alias, schema) in &combined_schemas {
+                                let row_values: Vec<Value> = left_row.values
+                                    [value_offset..value_offset + schema.columns.len()]
+                                    .to_vec();
+                                let outer_row = Row::new(row_values);
+                                substituted = super::helpers::substitute_outer_values(
+                                    &substituted,
+                                    alias,
+                                    schema,
+                                    &outer_row,
+                                );
+                                value_offset += schema.columns.len();
+                            }
+                            Some(
+                                self.resolve_subqueries(
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    &substituted,
+                                    ctes,
+                                )
+                                .await?,
                             )
-                            .await?,
-                            Value::Boolean(true)
-                        )
+                        } else {
+                            None
+                        }
                     } else {
-                        true
+                        join_condition.clone()
                     };
 
-                    if matches {
-                        new_combined_rows.push(combined_row);
-                        matched = true;
-                        right_matched[right_idx] = true;
-                    }
-                }
-                if (is_left_join || is_full_join) && !matched {
-                    let mut combined_values = left_row.values.clone();
-                    for _ in 0..join_schema.columns.len() {
-                        combined_values.push(Value::Null);
-                    }
-                    new_combined_rows.push(Row::new(combined_values));
-                }
-            }
+                    for (right_idx, right_row) in join_rows.iter().enumerate() {
+                        let mut combined_values = Vec::with_capacity(
+                            left_row.values.len() + right_row.values.len(),
+                        );
+                        combined_values.extend(left_row.values.iter().cloned());
+                        combined_values.extend(right_row.values.iter().cloned());
+                        let combined_row = Row::new(combined_values);
 
-            if is_right_join || is_full_join {
-                for (right_idx, right_row) in join_rows.iter().enumerate() {
-                    if !right_matched[right_idx] {
-                        let mut combined_values: Vec<Value> = Vec::new();
-                        for _ in 0..left_col_count {
-                            combined_values.push(Value::Null);
+                        let matches = if let Some(ref cond) = resolved_condition {
+                            let ctx = JoinContext {
+                                tables: HashMap::new(),
+                                column_offsets: column_offsets.clone(),
+                                combined_row: &combined_row,
+                                combined_schema: &temp_combined_schema,
+                            };
+                            matches!(
+                                self.eval_expr_join_maybe_sequence(
+                                    txn,
+                                    sequence_values,
+                                    search_path,
+                                    cond,
+                                    &ctx
+                                )
+                                .await?,
+                                Value::Boolean(true)
+                            )
+                        } else {
+                            true
+                        };
+
+                        if matches {
+                            new_combined_rows.push(combined_row);
+                            matched = true;
+                            right_matched[right_idx] = true;
                         }
-                        combined_values.extend(right_row.values.clone());
+                    }
+                    if (is_left_join || is_full_join) && !matched {
+                        let mut combined_values = Vec::with_capacity(
+                            left_row.values.len() + join_schema.columns.len(),
+                        );
+                        combined_values.extend(left_row.values.iter().cloned());
+                        combined_values.extend(
+                            std::iter::repeat(Value::Null).take(join_schema.columns.len()),
+                        );
                         new_combined_rows.push(Row::new(combined_values));
+                    }
+                }
+
+                if is_right_join || is_full_join {
+                    for (right_idx, right_row) in join_rows.iter().enumerate() {
+                        if !right_matched[right_idx] {
+                            let mut combined_values: Vec<Value> =
+                                Vec::with_capacity(left_col_count + right_row.values.len());
+                            combined_values
+                                .extend(std::iter::repeat(Value::Null).take(left_col_count));
+                            combined_values.extend(right_row.values.iter().cloned());
+                            new_combined_rows.push(Row::new(combined_values));
+                        }
                     }
                 }
             }

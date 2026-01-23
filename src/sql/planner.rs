@@ -11,7 +11,109 @@ use sqlparser::ast::{BinaryOperator, Expr, JsonOperator};
 
 use super::expr::eval_expr;
 use super::helpers::normalize_ident;
+use super::operators::HashJoinConfig;
 use crate::types::{IndexDef, TableSchema, Value};
+
+/// Result of join algorithm selection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JoinAlgorithmChoice {
+    /// Classic nested-loop join (O(N×M)).
+    NestedLoop,
+    /// Hash join for equi-joins (O(N+M)).
+    HashJoin {
+        /// Whether the logical left input is chosen as the build side.
+        left_is_build: bool,
+        /// Join key column indices in the logical left input.
+        left_key_indices: Vec<usize>,
+        /// Join key column indices in the logical right input.
+        right_key_indices: Vec<usize>,
+    },
+}
+
+/// Choose join algorithm based on join condition and row-count estimates.
+///
+/// This only selects hash join for simple equi-join conditions of the form:
+/// `a.col = b.col [AND ...]`.
+pub fn choose_join_algorithm(
+    join_condition: Option<&Expr>,
+    left_schema: &TableSchema,
+    right_schema: &TableSchema,
+    left_row_estimate: usize,
+    right_row_estimate: usize,
+    config: &HashJoinConfig,
+) -> JoinAlgorithmChoice {
+    let Some(cond) = join_condition else {
+        return JoinAlgorithmChoice::NestedLoop;
+    };
+
+    let Some((left_keys, right_keys)) = extract_equi_join_keys(cond, left_schema, right_schema)
+    else {
+        return JoinAlgorithmChoice::NestedLoop;
+    };
+
+    if left_row_estimate + right_row_estimate < config.min_rows_threshold {
+        return JoinAlgorithmChoice::NestedLoop;
+    }
+
+    let left_is_build = left_row_estimate <= right_row_estimate;
+    JoinAlgorithmChoice::HashJoin {
+        left_is_build,
+        left_key_indices: left_keys,
+        right_key_indices: right_keys,
+    }
+}
+
+/// Extract equi-join key indices from a join condition expression.
+///
+/// Returns `(left_key_indices, right_key_indices)` if the expression is a conjunction of
+/// equality predicates comparing one left column to one right column.
+pub(crate) fn extract_equi_join_keys(
+    expr: &Expr,
+    left_schema: &TableSchema,
+    right_schema: &TableSchema,
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::Eq => extract_column_pair(left, right, left_schema, right_schema),
+            BinaryOperator::And => {
+                let (mut lk1, mut rk1) = extract_equi_join_keys(left, left_schema, right_schema)?;
+                let (lk2, rk2) = extract_equi_join_keys(right, left_schema, right_schema)?;
+                lk1.extend(lk2);
+                rk1.extend(rk2);
+                Some((lk1, rk1))
+            }
+            _ => None,
+        },
+        Expr::Nested(inner) => extract_equi_join_keys(inner, left_schema, right_schema),
+        _ => None,
+    }
+}
+
+fn extract_column_pair(
+    left_expr: &Expr,
+    right_expr: &Expr,
+    left_schema: &TableSchema,
+    right_schema: &TableSchema,
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    let left_col = extract_column_name(left_expr)?;
+    let right_col = extract_column_name(right_expr)?;
+
+    if let (Some(li), Some(ri)) = (
+        left_schema.column_index(&left_col),
+        right_schema.column_index(&right_col),
+    ) {
+        return Some((vec![li], vec![ri]));
+    }
+
+    if let (Some(li), Some(ri)) = (
+        left_schema.column_index(&right_col),
+        right_schema.column_index(&left_col),
+    ) {
+        return Some((vec![li], vec![ri]));
+    }
+
+    None
+}
 
 #[derive(Debug, Clone)]
 pub enum ScanType {
@@ -517,6 +619,116 @@ mod tests {
                 val.to_string(),
                 false,
             ))),
+        }
+    }
+
+    fn schema_with_cols(name: &str, cols: &[&str]) -> TableSchema {
+        TableSchema {
+            name: name.to_string(),
+            table_id: 1,
+            columns: cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| crate::types::ColumnDef {
+                    name: c.to_string(),
+                    data_type: crate::types::DataType::Int32,
+                    nullable: true,
+                    primary_key: i == 0,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                })
+                .collect(),
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![0],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_extract_equi_join_keys_single() {
+        let left = schema_with_cols("l", &["id", "v"]);
+        let right = schema_with_cols("r", &["user_id", "v"]);
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("id"))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Identifier(Ident::new("user_id"))),
+        };
+
+        let (lk, rk) = extract_equi_join_keys(&expr, &left, &right).unwrap();
+        assert_eq!(lk, vec![0]);
+        assert_eq!(rk, vec![0]);
+    }
+
+    #[test]
+    fn test_extract_equi_join_keys_swapped_sides() {
+        let left = schema_with_cols("l", &["id"]);
+        let right = schema_with_cols("r", &["user_id"]);
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("user_id"))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Identifier(Ident::new("id"))),
+        };
+
+        let (lk, rk) = extract_equi_join_keys(&expr, &left, &right).unwrap();
+        assert_eq!(lk, vec![0]);
+        assert_eq!(rk, vec![0]);
+    }
+
+    #[test]
+    fn test_extract_equi_join_keys_multi_key_and() {
+        let left = schema_with_cols("l", &["a", "b"]);
+        let right = schema_with_cols("r", &["x", "y"]);
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new("a"))),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expr::Identifier(Ident::new("x"))),
+            }),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new("b"))),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expr::Identifier(Ident::new("y"))),
+            }),
+        };
+
+        let (lk, rk) = extract_equi_join_keys(&expr, &left, &right).unwrap();
+        assert_eq!(lk, vec![0, 1]);
+        assert_eq!(rk, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_choose_join_algorithm_threshold_and_build_side() {
+        let left = schema_with_cols("l", &["id"]);
+        let right = schema_with_cols("r", &["id"]);
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("id"))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Identifier(Ident::new("id"))),
+        };
+
+        let cfg = HashJoinConfig {
+            max_memory_bytes: 1,
+            min_rows_threshold: 100,
+        };
+
+        assert_eq!(
+            choose_join_algorithm(Some(&expr), &left, &right, 10, 10, &cfg),
+            JoinAlgorithmChoice::NestedLoop
+        );
+
+        match choose_join_algorithm(Some(&expr), &left, &right, 1000, 10, &cfg) {
+            JoinAlgorithmChoice::HashJoin { left_is_build, .. } => assert!(!left_is_build),
+            other => panic!("expected HashJoin, got {:?}", other),
         }
     }
 

@@ -5,8 +5,10 @@ use std::fmt::Write;
 use sqlparser::ast::{Expr, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins};
 
 use super::planner::{
-    analyze_predicates, choose_best_access_path_for_filter, PredicateInfo, ScanType,
+    analyze_predicates, choose_best_access_path_for_filter, choose_join_algorithm,
+    JoinAlgorithmChoice, PredicateInfo, ScanType,
 };
+use super::operators::HashJoinConfig;
 use crate::types::TableSchema;
 
 const DEFAULT_ROW_WIDTH: usize = 40;
@@ -29,6 +31,12 @@ pub enum PlanNode {
     },
     NestedLoop {
         join_type: String,
+        cost: PlanCost,
+        children: Vec<PlanNode>,
+    },
+    HashJoin {
+        join_type: String,
+        hash_cond: Option<String>,
         cost: PlanCost,
         children: Vec<PlanNode>,
     },
@@ -169,7 +177,83 @@ fn generate_select_plan(
         row_count_lookup,
     );
 
-    if select.from.len() > 1 || !select.from[0].joins.is_empty() {
+    // Prefer a more accurate plan for the common 2-table join case so EXPLAIN can show
+    // "Hash Join" when applicable.
+    if select.from.len() == 1 && select.from[0].joins.len() == 1 {
+        let join = &select.from[0].joins[0];
+        let right_plan = generate_table_factor_plan(
+            &join.relation,
+            &[],
+            None,
+            schema_lookup,
+            row_count_lookup,
+        );
+
+        let join_type = match &join.join_operator {
+            sqlparser::ast::JoinOperator::LeftOuter(_) => "Left",
+            sqlparser::ast::JoinOperator::RightOuter(_) => "Right",
+            sqlparser::ast::JoinOperator::FullOuter(_) => "Full",
+            sqlparser::ast::JoinOperator::CrossJoin => "Cross",
+            _ => "Inner",
+        }
+        .to_string();
+
+        let join_condition = match &join.join_operator {
+            sqlparser::ast::JoinOperator::Inner(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::LeftOuter(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::RightOuter(sqlparser::ast::JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::FullOuter(sqlparser::ast::JoinConstraint::On(expr)) => {
+                Some(expr)
+            }
+            _ => None,
+        };
+
+        let left_cost = get_plan_cost(&plan);
+        let right_cost = get_plan_cost(&right_plan);
+        let total_rows: usize = left_cost.rows.saturating_mul(right_cost.rows);
+        let total_cost: f64 = left_cost.total + right_cost.total + (total_rows as f64 * 0.01);
+        let cost = PlanCost {
+            startup: 0.0,
+            total: total_cost,
+            rows: total_rows.max(1),
+            width: DEFAULT_ROW_WIDTH,
+        };
+
+        let left_schema = match &select.from[0].relation {
+            TableFactor::Table { name, .. } => name.0.last().and_then(|i| schema_lookup(&i.value)),
+            _ => None,
+        };
+        let right_schema = match &join.relation {
+            TableFactor::Table { name, .. } => name.0.last().and_then(|i| schema_lookup(&i.value)),
+            _ => None,
+        };
+
+        let alg = match (join_condition, left_schema.as_ref(), right_schema.as_ref()) {
+            (Some(cond), Some(l), Some(r)) => choose_join_algorithm(
+                Some(cond),
+                l,
+                r,
+                left_cost.rows,
+                right_cost.rows,
+                &HashJoinConfig::default(),
+            ),
+            _ => JoinAlgorithmChoice::NestedLoop,
+        };
+
+        plan = match alg {
+            JoinAlgorithmChoice::HashJoin { .. } => PlanNode::HashJoin {
+                join_type,
+                hash_cond: join_condition.map(format_expr),
+                cost,
+                children: vec![plan, right_plan],
+            },
+            JoinAlgorithmChoice::NestedLoop => PlanNode::NestedLoop {
+                join_type,
+                cost,
+                children: vec![plan, right_plan],
+            },
+        };
+    } else if select.from.len() > 1 || !select.from[0].joins.is_empty() {
         let mut children = vec![plan.clone()];
 
         for join in &select.from[0].joins {
@@ -396,6 +480,7 @@ fn get_plan_cost(plan: &PlanNode) -> PlanCost {
         PlanNode::SeqScan { cost, .. } => cost.clone(),
         PlanNode::IndexScan { cost, .. } => cost.clone(),
         PlanNode::NestedLoop { cost, .. } => cost.clone(),
+        PlanNode::HashJoin { cost, .. } => cost.clone(),
         PlanNode::Sort { cost, .. } => cost.clone(),
         PlanNode::Limit { cost, .. } => cost.clone(),
         PlanNode::Aggregate { cost, .. } => cost.clone(),
@@ -569,6 +654,25 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
                 prefix, join_type, cost.startup, cost.total, cost.rows, cost.width
             )
             .unwrap();
+            for (i, child) in children.iter().enumerate() {
+                format_plan_node(output, child, indent + 6, i == 0);
+            }
+        }
+        PlanNode::HashJoin {
+            join_type,
+            hash_cond,
+            cost,
+            children,
+        } => {
+            writeln!(
+                output,
+                "{}Hash Join {}  (cost={:.2}..{:.2} rows={} width={})",
+                prefix, join_type, cost.startup, cost.total, cost.rows, cost.width
+            )
+            .unwrap();
+            if let Some(cond) = hash_cond {
+                writeln!(output, "{}  Hash Cond: {}", " ".repeat(indent), cond).unwrap();
+            }
             for (i, child) in children.iter().enumerate() {
                 format_plan_node(output, child, indent + 6, i == 0);
             }

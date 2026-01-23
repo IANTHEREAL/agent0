@@ -29,3 +29,9 @@
 - `docs/design/16_set_returning_functions.md`：generate_series / unnest（FROM 子句）
 - `docs/design/15_explain_analyze.md`：EXPLAIN ANALYZE
 - `docs/design/13_listen_notify.md`：LISTEN/NOTIFY
+
+## 性能优化
+
+- `docs/design/18_hash_join.md`：Hash Join 实现（等值连接优化）
+  - 设计概述：[18_hash_join.md](./18_hash_join.md)
+  - 详细实现计划：[hash_join_implementation_plan.md](./hash_join_implementation_plan.md)

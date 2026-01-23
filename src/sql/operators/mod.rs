@@ -20,6 +20,7 @@
 //! - `Filter` - Row filtering with predicates
 //! - `Project` - Column projection and expression evaluation
 //! - `NestedLoopJoin` - Basic join implementation
+//! - `HashJoin` - Equi-join hash join
 //! - `HashAggregate` - GROUP BY with hash table
 //! - `Sort` - ORDER BY implementation
 //! - `Limit` - LIMIT/OFFSET handling
@@ -30,6 +31,7 @@ mod cte;
 mod distinct;
 mod executor;
 mod filter;
+mod hash_join;
 mod join;
 mod limit;
 mod planner;
@@ -45,6 +47,7 @@ pub use cte::*;
 pub use distinct::*;
 pub use executor::*;
 pub use filter::*;
+pub use hash_join::*;
 pub use join::*;
 pub use limit::*;
 pub use planner::*;
