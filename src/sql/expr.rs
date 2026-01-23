@@ -5651,6 +5651,20 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
             Ok(l_days.cmp(r) as i8)
         }
         (Value::Uuid(l), Value::Uuid(r)) => Ok(l.cmp(r) as i8),
+        (Value::Uuid(l), Value::Text(t)) => {
+            if let Ok(r) = uuid::Uuid::parse_str(t) {
+                Ok(l.cmp(r.as_bytes()) as i8)
+            } else {
+                Err(anyhow!("invalid input syntax for type uuid: \"{}\"", t))
+            }
+        }
+        (Value::Text(t), Value::Uuid(r)) => {
+            if let Ok(l) = uuid::Uuid::parse_str(t) {
+                Ok(l.as_bytes().cmp(r) as i8)
+            } else {
+                Err(anyhow!("invalid input syntax for type uuid: \"{}\"", t))
+            }
+        }
         (Value::Bytes(l), Value::Bytes(r)) => Ok(l.cmp(r) as i8),
         (Value::Array(l), Value::Array(r)) => {
             let min_len = l.len().min(r.len());
