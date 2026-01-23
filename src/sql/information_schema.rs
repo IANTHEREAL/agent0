@@ -1096,10 +1096,27 @@ fn schema_oid(schema_oids: &HashMap<String, u32>, schema: &str) -> i64 {
     schema_oids.get(schema).copied().unwrap_or(2200) as i64
 }
 
+/// Filter hints extracted from WHERE clause to optimize virtual table generation
+#[derive(Default, Clone)]
+pub struct VirtualTableFilter {
+    pub table_name: Option<String>,
+    pub table_schema: Option<String>,
+}
+
 pub async fn get_information_schema_data(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     table_name: &str,
+) -> Result<(TableSchema, Vec<Row>)> {
+    get_information_schema_data_filtered(store, txn, table_name, &VirtualTableFilter::default())
+        .await
+}
+
+pub async fn get_information_schema_data_filtered(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    table_name: &str,
+    filter: &VirtualTableFilter,
 ) -> Result<(TableSchema, Vec<Row>)> {
     let lower = table_name.to_lowercase();
     let name = lower
@@ -1110,9 +1127,36 @@ pub async fn get_information_schema_data(
     let schema =
         get_information_schema_schema(table_name).ok_or_else(|| anyhow!("Unknown table"))?;
 
-    let user_tables = store.list_tables(txn).await?;
-    let schemas = store.list_schemas(txn).await?;
-    let schema_oids = store.list_schema_oids(txn).await?;
+    let needs_schemas = matches!(
+        name,
+        "schemata" | "pg_namespace" | "pg_type" | "pg_proc" | "pg_extension" | "pg_collation"
+    );
+    let needs_tables = !matches!(
+        name,
+        "schemata" | "pg_namespace" | "pg_type" | "pg_proc" | "pg_extension" | "pg_enum"
+            | "pg_range" | "pg_collation" | "pg_am" | "pg_sequence" | "pg_depend" | "pg_views"
+            | "sequences" | "routines" | "pg_description"
+    );
+
+    let user_tables = if needs_tables {
+        if let Some(ref tbl) = filter.table_name {
+            let schema_prefix = filter.table_schema.as_deref().unwrap_or("public");
+            vec![format!("{}.{}", schema_prefix, tbl)]
+        } else {
+            store.list_tables(txn).await?
+        }
+    } else {
+        vec![]
+    };
+
+    let (schemas, schema_oids) = if needs_schemas {
+        (
+            store.list_schemas(txn).await?,
+            store.list_schema_oids(txn).await?,
+        )
+    } else {
+        (vec!["public".to_string()], std::collections::HashMap::new())
+    };
 
     let rows = match name {
         "schemata" => get_schemata_rows(&schemas),

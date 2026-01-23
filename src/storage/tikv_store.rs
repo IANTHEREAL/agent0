@@ -8,10 +8,14 @@ use crate::extensions::InstalledExtension;
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tikv_client::{
     BoundRange, CheckLevel, Config, Transaction, TransactionClient, TransactionOptions,
 };
+use tokio::sync::RwLock;
 use tracing::{debug, info};
+
+const SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Maximum scan limit for TiKV operations.
 const SCAN_LIMIT: u32 = u32::MAX;
@@ -104,8 +108,25 @@ pub(crate) struct CommentRecord {
     pub(crate) description: String,
 }
 
+struct SchemaCache {
+    schemas: Option<(Instant, Vec<String>)>,
+    schema_oids: Option<(Instant, HashMap<String, u32>)>,
+    tables: Option<(Instant, Vec<String>)>,
+}
+
+impl SchemaCache {
+    fn new() -> Self {
+        Self {
+            schemas: None,
+            schema_oids: None,
+            tables: None,
+        }
+    }
+}
+
 pub struct TikvStore {
     client: Arc<TransactionClient>,
+    cache: Arc<RwLock<SchemaCache>>,
 }
 
 impl TikvStore {
@@ -132,6 +153,7 @@ impl TikvStore {
         info!("Connected to TiKV. Keyspace: {:?}", keyspace);
         Ok(Self {
             client: Arc::new(client),
+            cache: Arc::new(RwLock::new(SchemaCache::new())),
         })
     }
 
@@ -225,10 +247,31 @@ impl TikvStore {
         }
         let oid = self.next_schema_oid(txn).await?;
         txn_put(txn, key, oid.to_be_bytes().to_vec()).await?;
+        self.invalidate_schema_cache().await;
         Ok(true)
     }
 
+    pub async fn invalidate_schema_cache(&self) {
+        let mut cache = self.cache.write().await;
+        cache.schemas = None;
+        cache.schema_oids = None;
+    }
+
+    pub async fn invalidate_table_cache(&self) {
+        let mut cache = self.cache.write().await;
+        cache.tables = None;
+    }
+
     pub async fn list_schema_oids(&self, txn: &mut Transaction) -> Result<HashMap<String, u32>> {
+        {
+            let cache = self.cache.read().await;
+            if let Some((ts, oids)) = &cache.schema_oids {
+                if ts.elapsed() < SCHEMA_CACHE_TTL {
+                    return Ok(oids.clone());
+                }
+            }
+        }
+
         let prefix = encode_schema_def_prefix();
         let mut end = prefix.clone();
         end.push(0xFF);
@@ -270,6 +313,11 @@ impl TikvStore {
             };
 
             oids.insert(schema, oid);
+        }
+
+        {
+            let mut cache = self.cache.write().await;
+            cache.schema_oids = Some((Instant::now(), oids.clone()));
         }
 
         Ok(oids)
@@ -388,10 +436,22 @@ impl TikvStore {
         }
 
         txn_delete(txn, key).await?;
+        self.invalidate_schema_cache().await;
         Ok(true)
     }
 
     pub async fn list_schemas(&self, txn: &mut Transaction) -> Result<Vec<String>> {
+        {
+            let cache = self.cache.read().await;
+            if let Some((ts, schemas)) = &cache.schemas {
+                if ts.elapsed() < SCHEMA_CACHE_TTL {
+                    info!("list_schemas: cache HIT ({} schemas, age {}ms)", schemas.len(), ts.elapsed().as_millis());
+                    return Ok(schemas.clone());
+                }
+            }
+        }
+        info!("list_schemas: cache MISS");
+
         let prefix = encode_schema_def_prefix();
         let mut end = prefix.clone();
         end.push(0xFF);
@@ -414,6 +474,12 @@ impl TikvStore {
         }
         schemas.sort();
         schemas.dedup();
+
+        {
+            let mut cache = self.cache.write().await;
+            cache.schemas = Some((Instant::now(), schemas.clone()));
+        }
+
         Ok(schemas)
     }
 
@@ -756,7 +822,6 @@ impl TikvStore {
         Ok(next_val)
     }
 
-    /// Create a new table schema
     pub async fn create_table(&self, txn: &mut Transaction, schema: TableSchema) -> Result<()> {
         let schema_key = self.key(&encode_schema_key(&schema.name));
         if txn.get(schema_key.clone()).await?.is_some() {
@@ -768,6 +833,7 @@ impl TikvStore {
             "Created table '{}' with ID {}",
             schema.name, schema.table_id
         );
+        self.invalidate_table_cache().await;
         Ok(())
     }
 
@@ -785,7 +851,6 @@ impl TikvStore {
         }
     }
 
-    /// Drop a table
     pub async fn drop_table(&self, txn: &mut Transaction, table_name: &str) -> Result<bool> {
         let schema_opt = self.get_schema(txn, table_name).await?;
         if let Some(schema) = schema_opt {
@@ -802,6 +867,7 @@ impl TikvStore {
             }
 
             info!("Dropped table '{}'", table_name);
+            self.invalidate_table_cache().await;
             Ok(true)
         } else {
             Ok(false)
@@ -931,6 +997,17 @@ impl TikvStore {
     }
 
     pub async fn list_tables(&self, txn: &mut Transaction) -> Result<Vec<String>> {
+        {
+            let cache = self.cache.read().await;
+            if let Some((ts, tables)) = &cache.tables {
+                if ts.elapsed() < SCHEMA_CACHE_TTL {
+                    info!("list_tables: cache HIT ({} tables, age {}ms)", tables.len(), ts.elapsed().as_millis());
+                    return Ok(tables.clone());
+                }
+            }
+        }
+        info!("list_tables: cache MISS");
+
         let prefix = encode_schema_prefix();
         let mut end = prefix.clone();
         end.push(0xFF);
@@ -944,6 +1021,12 @@ impl TikvStore {
                 tables.push(name);
             }
         }
+
+        {
+            let mut cache = self.cache.write().await;
+            cache.tables = Some((Instant::now(), tables.clone()));
+        }
+
         Ok(tables)
     }
 

@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use tikv_client::Transaction;
 use tokio::sync::{Mutex, OnceCell};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 /// Custom metadata key for storing the extracted keyspace
 const METADATA_KEYSPACE: &str = "keyspace";
@@ -176,6 +176,56 @@ fn is_ident_char(b: u8) -> bool {
     matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
 }
 
+fn resolve_table_for_insert(table_name: &str, search_path: &[String]) -> String {
+    // Strip quotes from table name (GORM uses quoted identifiers)
+    let strip_quotes = |s: &str| -> String {
+        s.trim_matches('"').to_string()
+    };
+    
+    if table_name.contains('.') {
+        // Split on . and strip quotes from each part
+        let parts: Vec<&str> = table_name.splitn(2, '.').collect();
+        if parts.len() == 2 {
+            format!("{}.{}", strip_quotes(parts[0]), strip_quotes(parts[1]))
+        } else {
+            strip_quotes(table_name)
+        }
+    } else {
+        let schema = search_path.first().map(|s| s.as_str()).unwrap_or("public");
+        format!("{}.{}", schema, strip_quotes(table_name))
+    }
+}
+
+fn count_placeholders_in_expr(expr: &Expr) -> usize {
+    match expr {
+        Expr::Value(sqlparser::ast::Value::Placeholder(p)) => {
+            if p.starts_with('$') && p[1..].chars().all(|c| c.is_ascii_digit()) {
+                1
+            } else {
+                0
+            }
+        }
+        Expr::BinaryOp { left, right, .. } => {
+            count_placeholders_in_expr(left) + count_placeholders_in_expr(right)
+        }
+        Expr::UnaryOp { expr, .. } => count_placeholders_in_expr(expr),
+        Expr::Nested(inner) => count_placeholders_in_expr(inner),
+        Expr::Function(f) => f.args.iter().fold(0, |acc, arg| {
+            acc + match arg {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                    count_placeholders_in_expr(e)
+                }
+                sqlparser::ast::FunctionArg::Named { arg: sqlparser::ast::FunctionArgExpr::Expr(e), .. } => {
+                    count_placeholders_in_expr(e)
+                }
+                _ => 0,
+            }
+        }),
+        Expr::Cast { expr, .. } => count_placeholders_in_expr(expr),
+        _ => 0,
+    }
+}
+
 fn parse_startup_options(options: &str) -> Vec<(String, String)> {
     let tokens: Vec<&str> = options.split_whitespace().collect();
     let mut settings = Vec::new();
@@ -224,7 +274,9 @@ fn client_allows_notice(client_min_messages: Option<String>) -> bool {
 }
 
 fn infer_parameter_types(sql: &str, param_count: usize) -> Vec<Type> {
-    let mut types = vec![Type::UNKNOWN; param_count];
+    // Default to TEXT: drivers can encode any value to TEXT, server does implicit conversion.
+    // UNKNOWN (OID 705) breaks pgx/GORM which cannot encode time.Time to unknown type.
+    let mut types = vec![Type::TEXT; param_count];
     if param_count == 0 {
         return types;
     }
@@ -311,10 +363,6 @@ fn infer_parameter_types(sql: &str, param_count: usize) -> Vec<Type> {
             continue;
         }
         let param_idx = param_num - 1;
-
-        if types[param_idx] != Type::UNKNOWN {
-            continue;
-        }
 
         let before = &sql_upper[..pos];
         let before_trimmed = before.trim_end();
@@ -655,6 +703,83 @@ impl DynamicPgHandler {
 
     pub fn connection_id(&self) -> i32 {
         self.connection_id
+    }
+
+    async fn infer_insert_parameter_types(&self, sql: &str, param_count: usize) -> Option<Vec<Type>> {
+        if param_count == 0 {
+            return Some(vec![]);
+        }
+
+        let parsed = crate::sql::parse_sql(sql).ok()?;
+        let stmt = parsed.into_iter().next()?;
+        
+        let (table_name, columns, values_list): (String, Vec<String>, Vec<Vec<Expr>>) = match stmt {
+            Statement::Insert { table_name, columns, source, .. } => {
+                let table_name_str = table_name.to_string();
+                let columns: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
+                let values = match source.as_ref() {
+                    Some(src) => src,
+                    None => return None,
+                };
+                if let sqlparser::ast::SetExpr::Values(v) = values.body.as_ref() {
+                    (table_name_str, columns, v.rows.clone())
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+
+        info!("infer_insert_parameter_types: table={}, columns={:?}, param_count={}", table_name, columns, param_count);
+
+        let executor = self.executor.get()?;
+        let store = executor.store();
+        
+        let mut session_guard = self.session.lock().await;
+        let session = session_guard.as_mut()?;
+        let mut txn = store.begin().await.ok()?;
+        
+        let search_path = session.search_path();
+        let resolved_table = resolve_table_for_insert(&table_name, search_path);
+        
+        info!("infer_insert_parameter_types: resolved_table={}", resolved_table);
+        
+        let schema = store.get_schema(&mut txn, &resolved_table).await.ok()??;
+        let _ = txn.rollback().await;
+        
+        info!("infer_insert_parameter_types: got schema with {} columns", schema.columns.len());
+        
+        let col_types: std::collections::HashMap<String, DataType> = schema
+            .columns
+            .iter()
+            .map(|c| (c.name.to_lowercase(), c.data_type.clone()))
+            .collect();
+        
+        let column_order: Vec<String> = if !columns.is_empty() {
+            columns.iter().map(|c: &String| c.to_lowercase()).collect()
+        } else {
+            schema.columns.iter().map(|c| c.name.to_lowercase()).collect()
+        };
+        
+        let mut types = vec![Type::TEXT; param_count];
+        
+        if let Some(first_row) = values_list.first() {
+            let mut param_idx = 0usize;
+            for (col_idx, expr) in first_row.iter().enumerate() {
+                let col_name = column_order.get(col_idx)?;
+                let col_type = col_types.get(col_name);
+                
+                let placeholders = count_placeholders_in_expr(expr);
+                for _ in 0..placeholders {
+                    if param_idx < param_count {
+                        types[param_idx] = datatype_to_pgtype(col_type);
+                        param_idx += 1;
+                    }
+                }
+            }
+        }
+        
+        Some(types)
     }
 
     async fn infer_result_fields_from_query(&self, query: &str) -> Vec<FieldInfo> {
@@ -1601,8 +1726,17 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         let param_count = count_sql_parameters(&stmt.statement);
         let mut param_types: Vec<Type> = stmt.parameter_types.clone();
 
+        info!("do_describe_statement: sql={}, param_count={}, initial_types={:?}", stmt.statement.chars().take(100).collect::<String>(), param_count, param_types);
+        
         if param_types.len() < param_count || param_types.iter().any(|t| *t == Type::UNKNOWN) {
-            let inferred = infer_parameter_types(&stmt.statement, param_count);
+            let inferred = if let Some(insert_types) = self.infer_insert_parameter_types(&stmt.statement, param_count).await {
+                info!("do_describe_statement: inferred INSERT types={:?}", insert_types);
+                insert_types
+            } else {
+                let fallback = infer_parameter_types(&stmt.statement, param_count);
+                info!("do_describe_statement: fallback types={:?}", fallback);
+                fallback
+            };
             for i in param_types.len()..param_count {
                 param_types.push(inferred[i].clone());
             }
@@ -1612,6 +1746,8 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                 }
             }
         }
+        
+        info!("do_describe_statement: final_types={:?}", param_types);
 
         let fields = self.infer_result_fields_from_query(&stmt.statement).await;
         Ok(DescribeStatementResponse::new(param_types, fields))
@@ -1857,11 +1993,31 @@ fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
                 .flatten()
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "NULL".to_string()),
+            t if *t == Type::TIMESTAMP || *t == Type::TIMESTAMPTZ => {
+                use chrono::{DateTime, NaiveDateTime, Utc};
+                if portal.parameter_format.is_binary(i) {
+                    if let Ok(Some(ts)) = portal.parameter::<DateTime<Utc>>(i, &param_type) {
+                        format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S%.6f%:z"))
+                    } else if let Ok(Some(ts)) = portal.parameter::<NaiveDateTime>(i, &param_type) {
+                        format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S%.6f"))
+                    } else {
+                        "NULL".to_string()
+                    }
+                } else {
+                    portal
+                        .parameter::<String>(i, &Type::TEXT)
+                        .ok()
+                        .flatten()
+                        .map(|v| format!("'{}'", v.replace("'", "''")))
+                        .unwrap_or_else(|| "NULL".to_string())
+                }
+            }
             t if *t == Type::UNKNOWN => {
-                // Type::UNKNOWN - check format and try appropriate decoding
                 if portal.parameter_format.is_binary(i) {
                     // Binary format - try to decode as common types
-                    // Try i32 first (most common for integers)
+                    // NOTE: Do NOT try timestamp here - timestamps and i64 are both 8 bytes,
+                    // and we can't reliably distinguish them without knowing the actual type.
+                    // Timestamps should only be decoded when param_type is TIMESTAMP/TIMESTAMPTZ.
                     if let Ok(Some(v)) = portal.parameter::<i32>(i, &Type::INT4) {
                         v.to_string()
                     } else if let Ok(Some(v)) = portal.parameter::<i64>(i, &Type::INT8) {
@@ -2884,11 +3040,30 @@ fn encode_value(
         Value::Bytes(b) => encoder.encode_field(&format!("\\x{}", hex::encode(b))),
         Value::Timestamp(ts) => {
             use chrono::{DateTime, Offset, Utc};
-            let seconds = ts / 1000;
-            let millis = (ts % 1000).unsigned_abs() as u32;
-            let nanos = millis * 1_000_000;
+            
+            // Detect timestamp format:
+            // - Unix epoch milliseconds: typical values 1.0e12 to 2.5e12 (years 2001-2049)
+            // - PostgreSQL epoch microseconds: typical values 0 to 1.6e15 (years 2000-2050)
+            // If value is > 1e13 (year 2286 in Unix ms), assume it's PG epoch microseconds.
+            // PostgreSQL epoch is 2000-01-01 00:00:00 UTC = 946684800 seconds since Unix epoch.
+            const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
+            const MAX_REASONABLE_UNIX_MS: i64 = 10_000_000_000_000; // year ~2286
+            
+            let (seconds, micros) = if ts.abs() > MAX_REASONABLE_UNIX_MS {
+                // Likely PostgreSQL epoch microseconds - convert to Unix seconds
+                let pg_micros = ts;
+                let unix_secs = (pg_micros / 1_000_000) + PG_EPOCH_UNIX_SECS;
+                let micros = (pg_micros % 1_000_000).unsigned_abs() as u32;
+                (unix_secs, micros)
+            } else {
+                // Unix epoch milliseconds (our standard format)
+                let secs = ts / 1000;
+                let millis = (ts % 1000).unsigned_abs() as u32;
+                (secs, millis * 1000)
+            };
+            
+            let nanos = micros * 1000;
             if let Some(dt) = DateTime::<Utc>::from_timestamp(seconds, nanos) {
-                let micros = nanos / 1000;
                 let is_timestamptz = matches!(col_type, Some(DataType::TimestampTz));
 
                 if is_timestamptz {
@@ -2915,7 +3090,8 @@ fn encode_value(
                     encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
                 }
             } else {
-                encoder.encode_field(&ts.to_string())
+                // Fallback: encode as ISO string if all else fails
+                encoder.encode_field(&format!("1970-01-01 00:00:00"))
             }
         }
         Value::Interval(iv) => encoder.encode_field(&iv.to_string()),
@@ -3513,16 +3689,16 @@ mod tests {
     }
 
     #[test]
-    fn test_infer_parameter_types_where_clause_unknown() {
+    fn test_infer_parameter_types_where_clause_defaults_to_text() {
         let types = infer_parameter_types("SELECT * FROM users WHERE id = $1", 1);
-        assert_eq!(types, vec![Type::UNKNOWN]);
+        assert_eq!(types, vec![Type::TEXT]);
     }
 
     #[test]
     fn test_infer_parameter_types_mixed() {
         let types =
             infer_parameter_types("SELECT * FROM users WHERE id = $1 LIMIT $2 OFFSET $3", 3);
-        assert_eq!(types, vec![Type::UNKNOWN, Type::INT8, Type::INT8]);
+        assert_eq!(types, vec![Type::TEXT, Type::INT8, Type::INT8]);
     }
 
     #[test]

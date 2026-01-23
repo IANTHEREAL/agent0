@@ -6,6 +6,7 @@ use super::helpers::{
     distinct_on_rows_join_with_indices, eval_having_expr_join, get_select_item_name,
     infer_expr_type, normalize_ident, AggExpr,
 };
+use super::information_schema::VirtualTableFilter;
 use super::names;
 use super::operators::{hash_row_key_for_join, row_key_has_null_for_join, row_keys_equal_for_join, HashJoinConfig};
 use super::sequences;
@@ -23,6 +24,65 @@ use sqlparser::ast::{
 };
 use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
+
+fn extract_virtual_table_filter(where_clause: &Option<Expr>) -> VirtualTableFilter {
+    let mut filter = VirtualTableFilter::default();
+    if let Some(expr) = where_clause {
+        extract_filter_from_expr(expr, &mut filter);
+    }
+    filter
+}
+
+fn extract_filter_from_expr(expr: &Expr, filter: &mut VirtualTableFilter) {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            if matches!(op, BinaryOperator::And) {
+                extract_filter_from_expr(left, filter);
+                extract_filter_from_expr(right, filter);
+            } else if matches!(op, BinaryOperator::Eq) {
+                if let (Some(col), Some(val)) = (get_column_name(left), get_string_value(right)) {
+                    match col.to_lowercase().as_str() {
+                        "table_name" | "relname" => filter.table_name = Some(val),
+                        "table_schema" | "nspname" => filter.table_schema = Some(val),
+                        _ => {}
+                    }
+                } else if let (Some(col), Some(val)) = (get_column_name(right), get_string_value(left)) {
+                    match col.to_lowercase().as_str() {
+                        "table_name" | "relname" => filter.table_name = Some(val),
+                        "table_schema" | "nspname" => filter.table_schema = Some(val),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Expr::Nested(inner) => extract_filter_from_expr(inner, filter),
+        _ => {}
+    }
+}
+
+fn get_column_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.clone()),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.clone()),
+        _ => None,
+    }
+}
+
+fn get_string_value(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => Some(s.clone()),
+        Expr::Value(sqlparser::ast::Value::DoubleQuotedString(s)) => Some(s.clone()),
+        Expr::Function(func) => {
+            let fn_name = func.name.to_string().to_uppercase();
+            if fn_name == "CURRENT_SCHEMA" || fn_name == "CURRENT_SCHEMA()" {
+                Some("public".to_string())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
 
 fn resolve_join_expr_offset(expr: &Expr, column_offsets: &HashMap<String, usize>) -> Option<usize> {
     match expr {
@@ -174,6 +234,18 @@ impl Executor {
         search_path: &[String],
         table_name: &str,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Result<(TableSchema, Vec<Row>)> {
+        self.get_table_data_filtered(txn, sequence_values, search_path, table_name, ctes, &VirtualTableFilter::default()).await
+    }
+
+    pub(crate) async fn get_table_data_filtered(
+        &self,
+        txn: &mut Transaction,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        table_name: &str,
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+        filter: &VirtualTableFilter,
     ) -> Result<(TableSchema, Vec<Row>)> {
         let t_lower = table_name.to_lowercase();
 
@@ -769,10 +841,11 @@ impl Executor {
         }
 
         if super::information_schema::get_information_schema_schema(&t_lower).is_some() {
-            return super::information_schema::get_information_schema_data(
+            return super::information_schema::get_information_schema_data_filtered(
                 &self.store(),
                 txn,
                 &t_lower,
+                filter,
             )
             .await;
         }
@@ -1047,6 +1120,35 @@ impl Executor {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(String, TableSchema, Vec<Row>)>> + Send + 'a>,
     > {
+        let default_filter = VirtualTableFilter::default();
+        self.resolve_table_factor_impl(txn, sequence_values, search_path, factor, ctes, default_filter)
+    }
+
+    pub(crate) fn resolve_table_factor_filtered<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        factor: &'a TableFactor,
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+        filter: &'a VirtualTableFilter,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(String, TableSchema, Vec<Row>)>> + Send + 'a>,
+    > {
+        self.resolve_table_factor_impl(txn, sequence_values, search_path, factor, ctes, filter.clone())
+    }
+
+    fn resolve_table_factor_impl<'a>(
+        &'a self,
+        txn: &'a mut Transaction,
+        sequence_values: &'a mut HashMap<String, i64>,
+        search_path: &'a [String],
+        factor: &'a TableFactor,
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+        filter: VirtualTableFilter,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(String, TableSchema, Vec<Row>)>> + Send + 'a>,
+    > {
         Box::pin(async move {
             match factor {
                 TableFactor::Table {
@@ -1059,7 +1161,6 @@ impl Executor {
                         .unwrap_or_else(|| obj_name.clone());
                     let tbl_upper = obj_name.to_uppercase();
 
-                    // Handle GENERATE_SERIES as a table-valued function
                     if tbl_upper == "GENERATE_SERIES" {
                         if let Some(func_args) = args {
                             let (schema, rows) = self
@@ -1104,7 +1205,7 @@ impl Executor {
                         }
                     };
                     let (schema, rows) = self
-                        .get_table_data(txn, sequence_values, search_path, &table_name, ctes)
+                        .get_table_data_filtered(txn, sequence_values, search_path, &table_name, ctes, &filter)
                         .await?;
                     Ok((als, schema, rows))
                 }
@@ -1422,13 +1523,16 @@ impl Executor {
         select: &sqlparser::ast::Select,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
+        let vt_filter = extract_virtual_table_filter(&select.selection);
+
         let (base_alias, base_schema, base_rows) = self
-            .resolve_table_factor(
+            .resolve_table_factor_filtered(
                 txn,
                 sequence_values,
                 search_path,
                 &select.from[0].relation,
                 ctes,
+                &vt_filter,
             )
             .await?;
 
@@ -1465,7 +1569,7 @@ impl Executor {
                             None => obj_name.clone(),
                         };
                         let (schema, rows) = self
-                            .get_table_data(txn, sequence_values, search_path, &tbl, ctes)
+                            .get_table_data_filtered(txn, sequence_values, search_path, &tbl, ctes, &vt_filter)
                             .await?;
                         (als, schema, rows)
                     }
@@ -1492,12 +1596,13 @@ impl Executor {
                     (alias_name, schema, rows)
                 }
                 TableFactor::NestedJoin { .. } => {
-                    self.resolve_table_factor(
+                    self.resolve_table_factor_filtered(
                         txn,
                         sequence_values,
                         search_path,
                         &from_item.relation,
                         ctes,
+                        &vt_filter,
                     )
                     .await?
                 }
@@ -1544,7 +1649,7 @@ impl Executor {
                                 None => obj_name.clone(),
                             };
                             let (schema, rows) = self
-                                .get_table_data(txn, sequence_values, search_path, &tbl, ctes)
+                                .get_table_data_filtered(txn, sequence_values, search_path, &tbl, ctes, &vt_filter)
                                 .await?;
                             (als, schema, rows)
                         }
@@ -1572,12 +1677,13 @@ impl Executor {
                         (alias_name, schema, rows)
                     }
                     TableFactor::NestedJoin { .. } => {
-                        self.resolve_table_factor(
+                        self.resolve_table_factor_filtered(
                             txn,
                             sequence_values,
                             search_path,
                             &extra_join.relation,
                             ctes,
+                            &vt_filter,
                         )
                         .await?
                     }
