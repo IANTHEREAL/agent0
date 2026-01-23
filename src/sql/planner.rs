@@ -316,7 +316,8 @@ pub fn choose_best_access_path(
         if index.predicate.is_some() && !predicate_implies_index_predicate(predicates, index) {
             continue;
         }
-        if let Some((scan_type, cost)) = evaluate_index(index, &predicate_map, estimated_table_rows)
+        if let Some((scan_type, cost)) =
+            evaluate_index(schema, index, &predicate_map, estimated_table_rows)
         {
             if cost < best_path.cost {
                 best_path = AccessPath { scan_type, cost };
@@ -374,6 +375,7 @@ fn is_planner_usable_index(index: &IndexDef) -> bool {
 }
 
 fn evaluate_index(
+    schema: &TableSchema,
     index: &IndexDef,
     predicate_map: &HashMap<&str, &PredicateInfo>,
     estimated_table_rows: usize,
@@ -383,7 +385,17 @@ fn evaluate_index(
 
     for col in &index.columns {
         if let Some(pred) = predicate_map.get(col.as_str()) {
-            matched_values.push(pred.value.clone());
+            let coerced = if let Some(col_def) = schema
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(col))
+            {
+                super::helpers::coerce_value_for_column(pred.value.clone(), col_def)
+                    .unwrap_or_else(|_| pred.value.clone())
+            } else {
+                pred.value.clone()
+            };
+            matched_values.push(coerced);
         } else {
             all_matched = false;
             break;

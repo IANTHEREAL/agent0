@@ -226,6 +226,98 @@ fn count_placeholders_in_expr(expr: &Expr) -> usize {
     }
 }
 
+fn infer_types_from_expr(
+    expr: &Expr,
+    col_types: &std::collections::HashMap<String, DataType>,
+    types: &mut Vec<Type>,
+) {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            match op {
+                sqlparser::ast::BinaryOperator::Eq
+                | sqlparser::ast::BinaryOperator::NotEq
+                | sqlparser::ast::BinaryOperator::Lt
+                | sqlparser::ast::BinaryOperator::LtEq
+                | sqlparser::ast::BinaryOperator::Gt
+                | sqlparser::ast::BinaryOperator::GtEq => {
+                    if let (Expr::Identifier(ident), Expr::Value(sqlparser::ast::Value::Placeholder(p))) = (left.as_ref(), right.as_ref()) {
+                        if let Some(idx) = extract_placeholder_index(p) {
+                            let col_name = ident.value.to_lowercase();
+                            if let Some(col_type) = col_types.get(&col_name) {
+                                if idx < types.len() {
+                                    types[idx] = datatype_to_pgtype(Some(col_type));
+                                }
+                            }
+                        }
+                    } else if let (Expr::Value(sqlparser::ast::Value::Placeholder(p)), Expr::Identifier(ident)) = (left.as_ref(), right.as_ref()) {
+                        if let Some(idx) = extract_placeholder_index(p) {
+                            let col_name = ident.value.to_lowercase();
+                            if let Some(col_type) = col_types.get(&col_name) {
+                                if idx < types.len() {
+                                    types[idx] = datatype_to_pgtype(Some(col_type));
+                                }
+                            }
+                        }
+                    } else if let (Expr::CompoundIdentifier(parts), Expr::Value(sqlparser::ast::Value::Placeholder(p))) = (left.as_ref(), right.as_ref()) {
+                        if let Some(idx) = extract_placeholder_index(p) {
+                            if let Some(last) = parts.last() {
+                                let col_name = last.value.to_lowercase();
+                                if let Some(col_type) = col_types.get(&col_name) {
+                                    if idx < types.len() {
+                                        types[idx] = datatype_to_pgtype(Some(col_type));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    infer_types_from_expr(left, col_types, types);
+                    infer_types_from_expr(right, col_types, types);
+                }
+                sqlparser::ast::BinaryOperator::And | sqlparser::ast::BinaryOperator::Or => {
+                    infer_types_from_expr(left, col_types, types);
+                    infer_types_from_expr(right, col_types, types);
+                }
+                _ => {}
+            }
+        }
+        Expr::Nested(inner) => infer_types_from_expr(inner, col_types, types),
+        Expr::InList { expr: left_expr, list, .. } => {
+            if let Expr::Identifier(ident) = left_expr.as_ref() {
+                let col_name = ident.value.to_lowercase();
+                if let Some(col_type) = col_types.get(&col_name) {
+                    for item in list {
+                        if let Expr::Value(sqlparser::ast::Value::Placeholder(p)) = item {
+                            if let Some(idx) = extract_placeholder_index(p) {
+                                if idx < types.len() {
+                                    types[idx] = datatype_to_pgtype(Some(col_type));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_placeholder_index(p: &str) -> Option<usize> {
+    if p.starts_with('$') && p[1..].chars().all(|c| c.is_ascii_digit()) {
+        p[1..].parse::<usize>().ok().map(|n| n - 1)
+    } else {
+        None
+    }
+}
+
+fn extract_placeholder_index_from_expr(expr: &sqlparser::ast::Expr) -> Option<usize> {
+    match expr {
+        sqlparser::ast::Expr::Value(sqlparser::ast::Value::Placeholder(p)) => {
+            extract_placeholder_index(p)
+        }
+        _ => None,
+    }
+}
+
 fn parse_startup_options(options: &str) -> Vec<(String, String)> {
     let tokens: Vec<&str> = options.split_whitespace().collect();
     let mut settings = Vec::new();
@@ -778,6 +870,153 @@ impl DynamicPgHandler {
                 }
             }
         }
+        
+        Some(types)
+    }
+
+    async fn infer_update_parameter_types(&self, sql: &str, param_count: usize) -> Option<Vec<Type>> {
+        if param_count == 0 {
+            return Some(vec![]);
+        }
+
+        let parsed = crate::sql::parse_sql(sql).ok()?;
+        let stmt = parsed.into_iter().next()?;
+        
+        let (table_name, assignments) = match stmt {
+            Statement::Update { table, assignments, .. } => {
+                let table_name = match &table.relation {
+                    sqlparser::ast::TableFactor::Table { name, .. } => name.to_string(),
+                    _ => return None,
+                };
+                (table_name, assignments)
+            }
+            _ => return None,
+        };
+
+        info!("infer_update_parameter_types: table={}, assignments={}, param_count={}", 
+              table_name, assignments.len(), param_count);
+
+        let executor = self.executor.get()?;
+        let store = executor.store();
+        
+        let mut session_guard = self.session.lock().await;
+        let session = session_guard.as_mut()?;
+        let mut txn = store.begin().await.ok()?;
+        
+        let search_path = session.search_path();
+        let resolved_table = resolve_table_for_insert(&table_name, search_path);
+        
+        info!("infer_update_parameter_types: resolved_table={}", resolved_table);
+        
+        let schema = store.get_schema(&mut txn, &resolved_table).await.ok()??;
+        let _ = txn.rollback().await;
+        
+        info!("infer_update_parameter_types: got schema with {} columns", schema.columns.len());
+        
+        let col_types: std::collections::HashMap<String, DataType> = schema
+            .columns
+            .iter()
+            .map(|c| (c.name.to_lowercase(), c.data_type.clone()))
+            .collect();
+        
+        let mut types = vec![Type::TEXT; param_count];
+        let mut param_idx = 0usize;
+        
+        for assignment in &assignments {
+            let col_names: Vec<String> = assignment.id.iter()
+                .map(|ident| ident.value.to_lowercase())
+                .collect();
+            
+            if let Some(col_name) = col_names.last() {
+                let col_type = col_types.get(col_name);
+                let placeholders = count_placeholders_in_expr(&assignment.value);
+                
+                for _ in 0..placeholders {
+                    if param_idx < param_count {
+                        types[param_idx] = datatype_to_pgtype(col_type);
+                        param_idx += 1;
+                    }
+                }
+            }
+        }
+        
+        info!("infer_update_parameter_types: inferred {} types, remaining {} as TEXT", param_idx, param_count - param_idx);
+        
+        Some(types)
+    }
+
+    async fn infer_select_parameter_types(&self, sql: &str, param_count: usize) -> Option<Vec<Type>> {
+        if param_count == 0 {
+            return Some(vec![]);
+        }
+
+        let parsed = crate::sql::parse_sql(sql).ok()?;
+        let stmt = parsed.into_iter().next()?;
+        
+        let (table_name, selection, limit_expr, offset_expr) = match stmt {
+            Statement::Query(query) => {
+                if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
+                    let table_name = select.from.first().and_then(|f| {
+                        match &f.relation {
+                            sqlparser::ast::TableFactor::Table { name, .. } => Some(name.to_string()),
+                            _ => None,
+                        }
+                    })?;
+                    (table_name, select.selection.clone(), query.limit.clone(), query.offset.clone())
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+
+        info!("infer_select_parameter_types: table={}, param_count={}", table_name, param_count);
+
+        let executor = self.executor.get()?;
+        let store = executor.store();
+        
+        let mut session_guard = self.session.lock().await;
+        let session = session_guard.as_mut()?;
+        let mut txn = store.begin().await.ok()?;
+        
+        let search_path = session.search_path();
+        let resolved_table = resolve_table_for_insert(&table_name, search_path);
+        
+        let schema = store.get_schema(&mut txn, &resolved_table).await.ok()??;
+        let _ = txn.rollback().await;
+        
+        let col_types: std::collections::HashMap<String, DataType> = schema
+            .columns
+            .iter()
+            .map(|c| (c.name.to_lowercase(), c.data_type.clone()))
+            .collect();
+        
+        let mut types = vec![Type::TEXT; param_count];
+        
+        // Infer types from WHERE clause
+        if let Some(ref sel) = selection {
+            infer_types_from_expr(sel, &col_types, &mut types);
+        }
+        
+        // LIMIT placeholder should be INT8
+        if let Some(ref limit) = limit_expr {
+            if let Some(idx) = extract_placeholder_index_from_expr(limit) {
+                if idx < types.len() {
+                    types[idx] = Type::INT8;
+                }
+            }
+        }
+        
+        // OFFSET placeholder should be INT8
+        if let Some(ref offset) = offset_expr {
+            if let Some(idx) = extract_placeholder_index_from_expr(&offset.value) {
+                if idx < types.len() {
+                    types[idx] = Type::INT8;
+                }
+            }
+        }
+        
+        info!("infer_select_parameter_types: inferred types={:?}", types);
         
         Some(types)
     }
@@ -1732,6 +1971,12 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             let inferred = if let Some(insert_types) = self.infer_insert_parameter_types(&stmt.statement, param_count).await {
                 info!("do_describe_statement: inferred INSERT types={:?}", insert_types);
                 insert_types
+            } else if let Some(update_types) = self.infer_update_parameter_types(&stmt.statement, param_count).await {
+                info!("do_describe_statement: inferred UPDATE types={:?}", update_types);
+                update_types
+            } else if let Some(select_types) = self.infer_select_parameter_types(&stmt.statement, param_count).await {
+                info!("do_describe_statement: inferred SELECT types={:?}", select_types);
+                select_types
             } else {
                 let fallback = infer_parameter_types(&stmt.statement, param_count);
                 info!("do_describe_statement: fallback types={:?}", fallback);
