@@ -3034,7 +3034,59 @@ fn encode_value(
         Value::Null => encoder.encode_field(&None::<String>),
         Value::Boolean(b) => encoder.encode_field(b),
         Value::Int32(i) => encoder.encode_field(i),
-        Value::Int64(i) => encoder.encode_field(i),
+        Value::Int64(i) => {
+            // Check if this Int64 should be interpreted as a timestamp based on column type
+            // This handles the case where timestamps were incorrectly stored as Int64
+            if matches!(col_type, Some(DataType::Timestamp) | Some(DataType::TimestampTz)) {
+                // Treat as timestamp - reuse the timestamp encoding logic
+                use chrono::{DateTime, Offset, Utc};
+                const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
+                const MAX_REASONABLE_UNIX_MS: i64 = 10_000_000_000_000;
+                
+                let (seconds, micros) = if i.abs() > MAX_REASONABLE_UNIX_MS {
+                    let pg_micros = i;
+                    let unix_secs = (pg_micros / 1_000_000) + PG_EPOCH_UNIX_SECS;
+                    let micros = (pg_micros % 1_000_000).unsigned_abs() as u32;
+                    (unix_secs, micros)
+                } else {
+                    let secs = i / 1000;
+                    let millis = (i % 1000).unsigned_abs() as u32;
+                    (secs, millis * 1000)
+                };
+                
+                let nanos = micros * 1000;
+                if let Some(dt) = DateTime::<Utc>::from_timestamp(seconds, nanos) {
+                    let is_timestamptz = matches!(col_type, Some(DataType::TimestampTz));
+                    if is_timestamptz {
+                        let local = dt.with_timezone(&chrono_tz::America::Los_Angeles);
+                        let base = if micros == 0 {
+                            local.format("%Y-%m-%d %H:%M:%S").to_string()
+                        } else {
+                            local.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
+                        };
+                        let offset_secs = local.offset().fix().local_minus_utc();
+                        let sign = if offset_secs >= 0 { '+' } else { '-' };
+                        let abs = offset_secs.unsigned_abs();
+                        let hours = abs / 3600;
+                        let minutes = (abs % 3600) / 60;
+                        let tz = if minutes == 0 {
+                            format!("{sign}{:02}", hours)
+                        } else {
+                            format!("{sign}{:02}:{:02}", hours, minutes)
+                        };
+                        encoder.encode_field(&format!("{base}{tz}"))
+                    } else if micros == 0 {
+                        encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                    } else {
+                        encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string())
+                    }
+                } else {
+                    encoder.encode_field(&"1970-01-01 00:00:00".to_string())
+                }
+            } else {
+                encoder.encode_field(i)
+            }
+        }
         Value::Float64(f) => encoder.encode_field(f),
         Value::Text(s) => encoder.encode_field(s),
         Value::Bytes(b) => encoder.encode_field(&format!("\\x{}", hex::encode(b))),
