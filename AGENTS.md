@@ -424,3 +424,13 @@ cd orm-tests && npm test -- --grep "TypeORM"
 - Some client libraries probe for extension-provided types (e.g. `hstore`) at connect time; a metadata-only shim in `pg_catalog.pg_type` (with a valid `typarray` link) can unblock startup without implementing full type semantics.
 - The integration suite shares a single database for all `.sql` files; tests that `CREATE EXTENSION`/persist metadata must `DROP ...` at the end to avoid breaking later expectations (e.g. `pg_extension` contents).
 - For wire-protocol compatibility, never return `EmptyQueryResponse` for a successfully executed utility statement (e.g. `BEGIN`/`COMMIT`/`SAVEPOINT`/`SET`): libpq-based clients surface it as `PGRES_EMPTY_QUERY` and may treat it as an error; use `CommandComplete`, and for transaction boundaries use pgwire `TransactionStart`/`TransactionEnd` so `ReadyForQuery` carries the right transaction status.
+
+## Lessons Learned (Volcano Operator Refactoring)
+
+- When routing queries through the operator path, validate column existence BEFORE execution, not during. Use `validate_projection_columns()` to catch errors like `SELECT nonexistent_col FROM table` early, even when the table is empty.
+- Never use `.unwrap_or(Value::Null)` for expression evaluation in projections - this silently converts errors to NULL values, causing `SELECT bad_col FROM table` to return empty results instead of proper errors.
+- The `is_simple_operator_query()` function acts as a gatekeeper for the operator path. Keep it conservative - queries that don't match fall through to the legacy executor, ensuring incremental migration without breaking complex queries.
+- Expression validation (`is_simple_projection_expr()`, `validate_projection_columns()`) must be recursive to handle nested expressions like `CAST(col AS INT)`, `CASE WHEN`, and binary operations.
+- HAVING expressions reference computed aggregates, not raw data. When evaluating `HAVING COUNT(*) > 5`, the `COUNT(*)` is a reference to an already-computed column value, not a function to execute. Use a special evaluator (`eval_having_expr_for_operators`) that maps aggregate function calls to their column indices in the aggregated row.
+- Match aggregates by function name AND arguments: `COUNT(*)` and `COUNT(id)` are different. Compare function name, stringified arguments, and DISTINCT flag.
+- See `WORK.md` for detailed Volcano refactoring progress and per-phase lessons.

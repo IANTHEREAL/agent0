@@ -1167,10 +1167,13 @@ fn eval_expr_impl(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) 
         }
         Expr::CompoundIdentifier(parts) => {
             if parts.len() >= 2 {
+                let table_part = &parts[parts.len() - 2].value;
                 let col_name = &parts[parts.len() - 1].value;
                 if let (Some(row), Some(schema)) = (row, schema) {
+                    let qualified_name = format!("{}.{}", table_part, col_name);
                     let idx = schema
-                        .column_index(col_name)
+                        .column_index(&qualified_name)
+                        .or_else(|| schema.column_index(col_name))
                         .ok_or_else(|| anyhow!("Column '{}' not found", col_name))?;
                     Ok(row.values[idx].clone())
                 } else {

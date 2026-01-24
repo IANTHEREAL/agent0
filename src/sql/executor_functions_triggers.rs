@@ -284,6 +284,7 @@ fn strip_default_clause(arg: &str) -> &str {
     arg
 }
 
+#[allow(dead_code)]
 fn looks_like_type_keyword(token: &str) -> bool {
     matches!(
         token.to_ascii_lowercase().as_str(),

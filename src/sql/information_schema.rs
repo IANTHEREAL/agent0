@@ -1137,6 +1137,7 @@ pub struct VirtualTableFilter {
     pub table_schema: Option<String>,
 }
 
+#[allow(dead_code)]
 pub async fn get_information_schema_data(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,

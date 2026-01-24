@@ -283,6 +283,7 @@ impl Value {
     /// Returns the underlying `BYTEA` contents as a borrowed byte slice.
     ///
     /// This is a zero-copy accessor; it does not allocate.
+    #[allow(dead_code)]
     pub fn as_bytea(&self) -> Result<&[u8]> {
         match self {
             Value::Bytes(bytes) => Ok(bytes),
@@ -293,6 +294,7 @@ impl Value {
     /// Returns the value as a `uuid::Uuid`.
     ///
     /// This is a cheap conversion (16 bytes); it does not allocate.
+    #[allow(dead_code)]
     pub fn as_uuid(&self) -> Result<uuid::Uuid> {
         match self {
             Value::Uuid(bytes) => Ok(uuid::Uuid::from_bytes(*bytes)),

@@ -98,6 +98,25 @@ impl NestedLoopJoinOperator {
         }
     }
 
+    pub fn with_schema(
+        left: BoxedOperator,
+        right: BoxedOperator,
+        join_type: JoinType,
+        condition: Option<Expr>,
+        output_schema: TableSchema,
+    ) -> Self {
+        Self {
+            left,
+            right,
+            join_type,
+            condition,
+            output_schema,
+            result_rows: Vec::new(),
+            position: 0,
+            opened: false,
+        }
+    }
+
     fn make_null_row(schema: &TableSchema) -> Row {
         Row::new(vec![Value::Null; schema.columns.len()])
     }

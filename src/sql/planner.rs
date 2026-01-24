@@ -133,6 +133,7 @@ pub enum ScanType {
     GinIndexScan {
         index_id: u64,
         index_name: String,
+        #[allow(dead_code)]
         column: String,
         pattern: Value,
         estimated_rows: usize,

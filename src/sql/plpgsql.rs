@@ -30,6 +30,7 @@ impl PlpgsqlContext {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get_var(&self, name: &str) -> Option<&Value> {
         let name_lower = name.to_lowercase();
         self.variables

@@ -184,6 +184,7 @@ impl TriggerWorker {
         &self.config
     }
 
+    #[allow(dead_code)]
     pub(crate) fn worker_id(&self) -> &str {
         &self.worker_id
     }

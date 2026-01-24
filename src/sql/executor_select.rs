@@ -1,12 +1,13 @@
 //! SELECT query execution
 
-use super::executor_operators::use_operator_execution;
+use super::executor_operators::{extract_limit, extract_offset, use_operator_execution};
 use super::helpers::{
     apply_offset_limit_fetch, collect_having_agg_funcs, dedup_rows, distinct_on_rows_with_indices,
     eval_having_expr, fill_row_defaults, get_select_item_name, infer_expr_type, AggExpr,
 };
 use super::gin;
 use super::names;
+use super::operators::JoinType;
 use super::planner::{self, ScanType};
 use super::sequences;
 use super::window::{compute_window_functions, extract_window_functions, WindowFuncInfo};
@@ -14,8 +15,8 @@ use super::{expr::eval_expr, Aggregator, ExecuteResult, Executor};
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    Distinct, Expr, FunctionArg, FunctionArgExpr, GroupByExpr, LockType, ObjectName, Query,
-    SelectItem, SetExpr, TableFactor, Value as SqlValue,
+    Distinct, Expr, FunctionArg, FunctionArgExpr, GroupByExpr, JoinConstraint, LockType,
+    ObjectName, Query, SelectItem, SetExpr, TableFactor, Value as SqlValue,
 };
 use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
@@ -145,6 +146,27 @@ impl Executor {
         let has_joins = !select.from[0].joins.is_empty() || select.from.len() > 1;
 
         if has_joins {
+            if Self::is_simple_join_operator_query(query, select) {
+                if let Some(result) = self
+                    .try_execute_simple_join_with_operators(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        query,
+                        select,
+                    )
+                    .await?
+                {
+                    if let Some((target_name, _temp)) = select_into_target {
+                        return self
+                            .create_table_from_result(txn, db_id, search_path, &target_name, result)
+                            .await;
+                    }
+                    return Ok(result);
+                }
+            }
+
             let result = self
                 .execute_join_query_with_ctes(
                     txn,
@@ -395,7 +417,6 @@ impl Executor {
             && !rows_loaded
             && !has_correlated_exists
             && select_into_target.is_none()
-            && select.having.is_none()
             && Self::is_aggregate_operator_query(query, select)
         {
             debug!("Using operator execution path for aggregate query");
@@ -433,6 +454,7 @@ impl Executor {
                     schema,
                     resolved_selection.as_ref(),
                     &select.group_by,
+                    select.having.as_ref(),
                     &query.order_by,
                     super::executor_operators::extract_limit(query),
                     super::executor_operators::extract_offset(query),
@@ -2131,6 +2153,98 @@ impl Executor {
             }
             std::cmp::Ordering::Equal
         });
+    }
+
+    async fn try_execute_simple_join_with_operators(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        query: &Query,
+        select: &sqlparser::ast::Select,
+    ) -> Result<Option<ExecuteResult>> {
+        let (left_table, left_alias) = match &select.from[0].relation {
+            TableFactor::Table { name, alias, .. } => {
+                let (_, obj_name) = names::split_object_name(name)?;
+                let alias_str = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| obj_name.clone());
+                (name.clone(), alias_str)
+            }
+            _ => return Ok(None),
+        };
+
+        let join = &select.from[0].joins[0];
+        let (right_table, right_alias) = match &join.relation {
+            TableFactor::Table { name, alias, .. } => {
+                let (_, obj_name) = names::split_object_name(name)?;
+                let alias_str = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| obj_name.clone());
+                (name.clone(), alias_str)
+            }
+            _ => return Ok(None),
+        };
+
+        let join_type = JoinType::from(&join.join_operator);
+        let join_condition = match &join.join_operator {
+            sqlparser::ast::JoinOperator::Inner(JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::LeftOuter(JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::RightOuter(JoinConstraint::On(expr))
+            | sqlparser::ast::JoinOperator::FullOuter(JoinConstraint::On(expr)) => {
+                Some(expr.clone())
+            }
+            sqlparser::ast::JoinOperator::CrossJoin => None,
+            _ => return Ok(None),
+        };
+
+        let left_resolved = names::resolve_ddl_object_name(&left_table, search_path)?;
+        let left_schema = match self
+            .store()
+            .get_schema(txn, db_id, &left_resolved.full)
+            .await?
+        {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let right_resolved = names::resolve_ddl_object_name(&right_table, search_path)?;
+        let right_schema = match self
+            .store()
+            .get_schema(txn, db_id, &right_resolved.full)
+            .await?
+        {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let limit = extract_limit(query);
+        let offset = extract_offset(query);
+
+        let result = self
+            .execute_simple_join_with_operators(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                left_schema,
+                right_schema,
+                &left_alias,
+                &right_alias,
+                join_type,
+                join_condition,
+                select.selection.as_ref(),
+                &query.order_by,
+                limit,
+                offset,
+                &select.projection,
+            )
+            .await?;
+
+        Ok(Some(result))
     }
 }
 

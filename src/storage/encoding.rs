@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 //! Key encoding for TiKV
 //!
 //! Key layout:
@@ -688,7 +689,12 @@ pub fn encode_gin_index_prefix(table_id: u64, index_id: u64, token_hash: u64) ->
 }
 
 /// Encode the fixed prefix for a GIN-like inverted index entry (storage format v2, database-scoped).
-pub fn encode_gin_index_prefix_v2(db_id: u64, table_id: u64, index_id: u64, token_hash: u64) -> Vec<u8> {
+pub fn encode_gin_index_prefix_v2(
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    token_hash: u64,
+) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(TABLE_INDEX_PREFIX);
     key.extend_from_slice(&table_id.to_be_bytes());
@@ -1149,7 +1155,11 @@ pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
     let pk_constraint_name = if legacy.pk_indices.is_empty() {
         None
     } else {
-        let short = legacy.name.rsplit('.').next().unwrap_or(legacy.name.as_str());
+        let short = legacy
+            .name
+            .rsplit('.')
+            .next()
+            .unwrap_or(legacy.name.as_str());
         Some(format!("{}_pkey", short))
     };
     Ok(TableSchema {
@@ -1251,8 +1261,14 @@ mod tests {
     #[test]
     fn test_encode_database_id_key() {
         let key = encode_database_id_key(1);
-        assert_eq!(&key[..SYS_DATABASE_BY_ID_PREFIX.len()], SYS_DATABASE_BY_ID_PREFIX);
-        assert_eq!(&key[SYS_DATABASE_BY_ID_PREFIX.len()..], &1_u64.to_be_bytes());
+        assert_eq!(
+            &key[..SYS_DATABASE_BY_ID_PREFIX.len()],
+            SYS_DATABASE_BY_ID_PREFIX
+        );
+        assert_eq!(
+            &key[SYS_DATABASE_BY_ID_PREFIX.len()..],
+            &1_u64.to_be_bytes()
+        );
     }
 
     #[test]

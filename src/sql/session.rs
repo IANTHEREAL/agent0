@@ -280,6 +280,7 @@ impl Session {
         self.current_database_id
     }
 
+    #[allow(dead_code)]
     pub fn current_database(&self) -> &str {
         &self.current_database_name
     }

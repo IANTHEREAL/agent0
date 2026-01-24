@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports)]
 //! Physical operators for Volcano-style query execution
 //!
 //! This module implements the iterator model for query execution where each

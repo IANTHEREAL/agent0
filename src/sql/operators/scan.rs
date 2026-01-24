@@ -25,6 +25,7 @@ impl TableScanOperator {
         }
     }
 
+    #[allow(dead_code)]
     pub fn new_with_rows(schema: TableSchema, rows: Vec<Row>) -> Self {
         Self {
             schema,

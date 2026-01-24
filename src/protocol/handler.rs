@@ -798,6 +798,7 @@ impl DynamicPgHandler {
         }
     }
 
+    #[allow(dead_code)]
     pub fn connection_id(&self) -> i32 {
         self.connection_id
     }

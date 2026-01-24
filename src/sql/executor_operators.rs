@@ -2,7 +2,10 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, GroupByExpr, OrderByExpr, Query, SelectItem, SetExpr};
+use sqlparser::ast::{
+    Expr, Function, FunctionArg, FunctionArgExpr, GroupByExpr, OrderByExpr, Query, SelectItem,
+    SetExpr, UnaryOperator,
+};
 use tikv_client::Transaction;
 
 use super::expr::eval_expr;
@@ -14,6 +17,381 @@ use super::operators::{
 };
 use super::{ExecuteResult, Executor};
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+use sqlparser::ast::Ident;
+
+fn rewrite_join_expr_with_aliases(
+    expr: &Expr,
+    left_alias: &str,
+    right_alias: &str,
+    left_schema: &TableSchema,
+    right_schema: &TableSchema,
+) -> Expr {
+    match expr {
+        Expr::Identifier(ident) => {
+            let col_name = &ident.value;
+            if left_schema.column_index(col_name).is_some() {
+                Expr::CompoundIdentifier(vec![
+                    Ident::new(left_alias),
+                    Ident::new(col_name.clone()),
+                ])
+            } else if right_schema.column_index(col_name).is_some() {
+                Expr::CompoundIdentifier(vec![
+                    Ident::new(right_alias),
+                    Ident::new(col_name.clone()),
+                ])
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let table_ref = parts[0].value.to_lowercase();
+            let col_name = &parts[1].value;
+
+            let left_lower = left_alias.to_lowercase();
+            let right_lower = right_alias.to_lowercase();
+            let left_table_lower = left_schema.name.to_lowercase();
+            let right_table_lower = right_schema.name.to_lowercase();
+
+            if table_ref == left_lower || table_ref == left_table_lower {
+                Expr::CompoundIdentifier(vec![
+                    Ident::new(left_alias),
+                    Ident::new(col_name.clone()),
+                ])
+            } else if table_ref == right_lower || table_ref == right_table_lower {
+                Expr::CompoundIdentifier(vec![
+                    Ident::new(right_alias),
+                    Ident::new(col_name.clone()),
+                ])
+            } else {
+                expr.clone()
+            }
+        }
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(rewrite_join_expr_with_aliases(
+                left,
+                left_alias,
+                right_alias,
+                left_schema,
+                right_schema,
+            )),
+            op: op.clone(),
+            right: Box::new(rewrite_join_expr_with_aliases(
+                right,
+                left_alias,
+                right_alias,
+                left_schema,
+                right_schema,
+            )),
+        },
+        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            op: op.clone(),
+            expr: Box::new(rewrite_join_expr_with_aliases(
+                inner,
+                left_alias,
+                right_alias,
+                left_schema,
+                right_schema,
+            )),
+        },
+        Expr::Nested(inner) => Expr::Nested(Box::new(rewrite_join_expr_with_aliases(
+            inner,
+            left_alias,
+            right_alias,
+            left_schema,
+            right_schema,
+        ))),
+        Expr::IsNull(inner) => Expr::IsNull(Box::new(rewrite_join_expr_with_aliases(
+            inner,
+            left_alias,
+            right_alias,
+            left_schema,
+            right_schema,
+        ))),
+        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(rewrite_join_expr_with_aliases(
+            inner,
+            left_alias,
+            right_alias,
+            left_schema,
+            right_schema,
+        ))),
+        Expr::InList {
+            expr: inner,
+            list,
+            negated,
+        } => Expr::InList {
+            expr: Box::new(rewrite_join_expr_with_aliases(
+                inner,
+                left_alias,
+                right_alias,
+                left_schema,
+                right_schema,
+            )),
+            list: list
+                .iter()
+                .map(|e| {
+                    rewrite_join_expr_with_aliases(
+                        e,
+                        left_alias,
+                        right_alias,
+                        left_schema,
+                        right_schema,
+                    )
+                })
+                .collect(),
+            negated: *negated,
+        },
+        Expr::Between {
+            expr: inner,
+            negated,
+            low,
+            high,
+        } => Expr::Between {
+            expr: Box::new(rewrite_join_expr_with_aliases(
+                inner,
+                left_alias,
+                right_alias,
+                left_schema,
+                right_schema,
+            )),
+            negated: *negated,
+            low: Box::new(rewrite_join_expr_with_aliases(
+                low,
+                left_alias,
+                right_alias,
+                left_schema,
+                right_schema,
+            )),
+            high: Box::new(rewrite_join_expr_with_aliases(
+                high,
+                left_alias,
+                right_alias,
+                left_schema,
+                right_schema,
+            )),
+        },
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => Expr::Case {
+            operand: operand.as_ref().map(|o| {
+                Box::new(rewrite_join_expr_with_aliases(
+                    o,
+                    left_alias,
+                    right_alias,
+                    left_schema,
+                    right_schema,
+                ))
+            }),
+            conditions: conditions
+                .iter()
+                .map(|c| {
+                    rewrite_join_expr_with_aliases(
+                        c,
+                        left_alias,
+                        right_alias,
+                        left_schema,
+                        right_schema,
+                    )
+                })
+                .collect(),
+            results: results
+                .iter()
+                .map(|r| {
+                    rewrite_join_expr_with_aliases(
+                        r,
+                        left_alias,
+                        right_alias,
+                        left_schema,
+                        right_schema,
+                    )
+                })
+                .collect(),
+            else_result: else_result.as_ref().map(|e| {
+                Box::new(rewrite_join_expr_with_aliases(
+                    e,
+                    left_alias,
+                    right_alias,
+                    left_schema,
+                    right_schema,
+                ))
+            }),
+        },
+        Expr::Function(f) => {
+            let rewritten_args = f
+                .args
+                .clone()
+                .into_iter()
+                .map(|arg| match arg {
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(rewrite_join_expr_with_aliases(
+                            &e,
+                            left_alias,
+                            right_alias,
+                            left_schema,
+                            right_schema,
+                        )))
+                    }
+                    other => other,
+                })
+                .collect();
+            Expr::Function(Function {
+                name: f.name.clone(),
+                args: rewritten_args,
+                filter: f.filter.clone(),
+                null_treatment: f.null_treatment.clone(),
+                over: f.over.clone(),
+                distinct: f.distinct,
+                special: f.special,
+                order_by: f.order_by.clone(),
+            })
+        }
+        Expr::Cast { expr: inner, data_type, format } => Expr::Cast {
+            expr: Box::new(rewrite_join_expr_with_aliases(
+                inner,
+                left_alias,
+                right_alias,
+                left_schema,
+                right_schema,
+            )),
+            data_type: data_type.clone(),
+            format: format.clone(),
+        },
+        _ => expr.clone(),
+    }
+}
+
+fn eval_having_expr_for_operators(
+    expr: &Expr,
+    row: &Row,
+    schema: &TableSchema,
+    agg_exprs: &[AggregateExpr],
+    group_by_count: usize,
+) -> Result<Value> {
+    match expr {
+        Expr::BinaryOp { left, op, right } => {
+            let left_val =
+                eval_having_expr_for_operators(left, row, schema, agg_exprs, group_by_count)?;
+            let right_val =
+                eval_having_expr_for_operators(right, row, schema, agg_exprs, group_by_count)?;
+            super::expr::eval_binary_op_public(left_val, op, right_val)
+        }
+        Expr::UnaryOp { op, expr: inner } => {
+            let val =
+                eval_having_expr_for_operators(inner, row, schema, agg_exprs, group_by_count)?;
+            match op {
+                UnaryOperator::Not => match val {
+                    Value::Boolean(b) => Ok(Value::Boolean(!b)),
+                    _ => Err(anyhow!("NOT requires boolean operand")),
+                },
+                UnaryOperator::Minus => match val {
+                    Value::Int32(n) => Ok(Value::Int32(-n)),
+                    Value::Int64(n) => Ok(Value::Int64(-n)),
+                    Value::Float64(n) => Ok(Value::Float64(-n)),
+                    _ => Err(anyhow!("Unary minus requires numeric operand")),
+                },
+                _ => Err(anyhow!("Unsupported unary operator in HAVING: {:?}", op)),
+            }
+        }
+        Expr::Nested(inner) => {
+            eval_having_expr_for_operators(inner, row, schema, agg_exprs, group_by_count)
+        }
+        Expr::Function(f) => {
+            let func_name = f
+                .name
+                .0
+                .last()
+                .map(|i| i.value.to_uppercase())
+                .unwrap_or_default();
+
+            if matches!(
+                func_name.as_str(),
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "ARRAY_AGG"
+            ) {
+                if let Some(agg_idx) = find_matching_aggregate(f, agg_exprs) {
+                    let col_idx = group_by_count + agg_idx;
+                    return row
+                        .values
+                        .get(col_idx)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("Aggregate column index out of bounds"));
+                }
+                return Err(anyhow!(
+                    "Aggregate function {} in HAVING not found in SELECT",
+                    func_name
+                ));
+            }
+            eval_expr(expr, Some(row), Some(schema))
+        }
+        Expr::Identifier(id) => {
+            if let Some(col_idx) = schema.columns.iter().position(|c| c.name == id.value) {
+                row.values
+                    .get(col_idx)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("Column index out of bounds"))
+            } else {
+                Err(anyhow!("Column {} not found", id.value))
+            }
+        }
+        Expr::Value(_) | Expr::TypedString { .. } => eval_expr(expr, Some(row), Some(schema)),
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            format,
+        } => {
+            let inner_val =
+                eval_having_expr_for_operators(inner, row, schema, agg_exprs, group_by_count)?;
+            let cast_expr = Expr::Cast {
+                expr: Box::new(super::helpers::value_to_sql_expr(&inner_val)),
+                data_type: data_type.clone(),
+                format: format.clone(),
+            };
+            eval_expr(&cast_expr, Some(row), Some(schema))
+        }
+        _ => eval_expr(expr, Some(row), Some(schema)),
+    }
+}
+
+fn find_matching_aggregate(f: &Function, agg_exprs: &[AggregateExpr]) -> Option<usize> {
+    let func_name = f
+        .name
+        .0
+        .last()
+        .map(|i| i.value.to_uppercase())
+        .unwrap_or_default();
+
+    let f_arg = f.args.first().and_then(|arg| match arg {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+        FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => None,
+        _ => None,
+    });
+
+    let f_is_wildcard = matches!(
+        f.args.first(),
+        Some(FunctionArg::Unnamed(FunctionArgExpr::Wildcard))
+    ) || f.args.is_empty();
+
+    for (i, agg) in agg_exprs.iter().enumerate() {
+        if agg.func_name != func_name {
+            continue;
+        }
+        if agg.distinct != f.distinct {
+            continue;
+        }
+
+        let agg_is_wildcard = agg.arg.is_none();
+        if f_is_wildcard && agg_is_wildcard {
+            return Some(i);
+        }
+        if let (Some(f_e), Some(agg_e)) = (f_arg, &agg.arg) {
+            if format!("{}", f_e) == format!("{}", agg_e) {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
 
 pub fn use_operator_execution() -> bool {
     static USE_OPERATORS: OnceLock<bool> = OnceLock::new();
@@ -92,6 +470,111 @@ fn expr_has_function_call(expr: &Expr) -> bool {
 }
 
 impl Executor {
+    fn is_simple_projection_expr(expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
+            Expr::Cast { expr, .. } => Self::is_simple_projection_expr(expr),
+            Expr::Nested(e) => Self::is_simple_projection_expr(e),
+            Expr::Function(_)
+            | Expr::AggregateExpressionWithFilter { .. }
+            | Expr::ArrayAgg(_)
+            | Expr::Subquery(_)
+            | Expr::InSubquery { .. }
+            | Expr::Exists { .. } => false,
+            Expr::BinaryOp { left, right, .. } => {
+                Self::is_simple_projection_expr(left) && Self::is_simple_projection_expr(right)
+            }
+            Expr::UnaryOp { expr, .. } => Self::is_simple_projection_expr(expr),
+            Expr::Value(_) => true,
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
+                operand
+                    .as_ref()
+                    .map_or(true, |e| Self::is_simple_projection_expr(e))
+                    && conditions.iter().all(Self::is_simple_projection_expr)
+                    && results.iter().all(Self::is_simple_projection_expr)
+                    && else_result
+                        .as_ref()
+                        .map_or(true, |e| Self::is_simple_projection_expr(e))
+            }
+            Expr::IsNull(e)
+            | Expr::IsNotNull(e)
+            | Expr::IsTrue(e)
+            | Expr::IsFalse(e)
+            | Expr::IsNotTrue(e)
+            | Expr::IsNotFalse(e) => Self::is_simple_projection_expr(e),
+            _ => false,
+        }
+    }
+
+    fn validate_projection_columns(expr: &Expr, schema: &TableSchema) -> Result<()> {
+        match expr {
+            Expr::Identifier(ident) => {
+                let col_name = &ident.value;
+                if !schema
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(col_name))
+                {
+                    return Err(anyhow!("column \"{}\" does not exist", col_name));
+                }
+                Ok(())
+            }
+            Expr::CompoundIdentifier(parts) => {
+                if let Some(col_ident) = parts.last() {
+                    let col_name = &col_ident.value;
+                    if !schema
+                        .columns
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(col_name))
+                    {
+                        return Err(anyhow!("column \"{}\" does not exist", col_name));
+                    }
+                }
+                Ok(())
+            }
+            Expr::BinaryOp { left, right, .. } => {
+                Self::validate_projection_columns(left, schema)?;
+                Self::validate_projection_columns(right, schema)
+            }
+            Expr::UnaryOp { expr, .. } => Self::validate_projection_columns(expr, schema),
+            Expr::Cast { expr, .. } => Self::validate_projection_columns(expr, schema),
+            Expr::Nested(e) => Self::validate_projection_columns(e, schema),
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
+                if let Some(op) = operand {
+                    Self::validate_projection_columns(op, schema)?;
+                }
+                for cond in conditions {
+                    Self::validate_projection_columns(cond, schema)?;
+                }
+                for res in results {
+                    Self::validate_projection_columns(res, schema)?;
+                }
+                if let Some(el) = else_result {
+                    Self::validate_projection_columns(el, schema)?;
+                }
+                Ok(())
+            }
+            Expr::IsNull(e)
+            | Expr::IsNotNull(e)
+            | Expr::IsTrue(e)
+            | Expr::IsFalse(e)
+            | Expr::IsNotTrue(e)
+            | Expr::IsNotFalse(e) => Self::validate_projection_columns(e, schema),
+            Expr::Value(_) => Ok(()),
+            _ => Ok(()),
+        }
+    }
+
     pub(crate) fn is_simple_operator_query(query: &Query, select: &sqlparser::ast::Select) -> bool {
         if select.from.len() != 1 {
             return false;
@@ -112,32 +595,16 @@ impl Executor {
             }
         }
 
-        let has_function_or_agg = select.projection.iter().any(|item| {
+        let is_valid_projection = select.projection.iter().all(|item| {
             match item {
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => true,
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                    matches!(
-                        e,
-                        Expr::Function(_)
-                            | Expr::AggregateExpressionWithFilter { .. }
-                            | Expr::ArrayAgg(_)
-                    )
+                    Self::is_simple_projection_expr(e)
                 }
-                _ => false,
             }
         });
 
-        if has_function_or_agg {
-            return false;
-        }
-
-        let is_wildcard_only = select.projection.iter().all(|item| {
-            matches!(
-                item,
-                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
-            )
-        });
-
-        if !is_wildcard_only {
+        if !is_valid_projection {
             return false;
         }
 
@@ -380,6 +847,7 @@ impl Executor {
         schema: TableSchema,
         filter: Option<&Expr>,
         group_by: &GroupByExpr,
+        having: Option<&Expr>,
         order_by: &[OrderByExpr],
         limit: Option<usize>,
         offset: usize,
@@ -388,6 +856,7 @@ impl Executor {
         let (group_by_exprs, group_by_names, group_by_types) =
             Self::extract_group_by_info(group_by, &schema);
         let (agg_exprs, agg_names, agg_types) = Self::extract_aggregate_info(projection, &schema);
+        let group_by_count = group_by_names.len();
 
         let mut root: BoxedOperator = Box::new(TableScanOperator::new(schema.clone()));
 
@@ -398,7 +867,7 @@ impl Executor {
         root = Box::new(HashAggregateOperator::new(
             root,
             group_by_exprs,
-            agg_exprs,
+            agg_exprs.clone(),
             group_by_names.clone(),
             group_by_types.clone(),
             agg_names.clone(),
@@ -414,6 +883,28 @@ impl Executor {
             sequence_values,
         )
         .await?;
+
+        let agg_output_schema = root.schema().clone();
+
+        // Apply HAVING filter after aggregation
+        let rows = if let Some(having_expr) = having {
+            let mut filtered_rows = Vec::with_capacity(rows.len());
+            for row in rows {
+                let having_val = eval_having_expr_for_operators(
+                    having_expr,
+                    &row,
+                    &agg_output_schema,
+                    &agg_exprs,
+                    group_by_count,
+                )?;
+                if matches!(having_val, Value::Boolean(true)) {
+                    filtered_rows.push(row);
+                }
+            }
+            filtered_rows
+        } else {
+            rows
+        };
 
         let columns: Vec<String> = projection
             .iter()
@@ -508,6 +999,9 @@ impl Executor {
         query: &Query,
         select: &sqlparser::ast::Select,
     ) -> bool {
+        if !use_operator_execution() {
+            return false;
+        }
         if select.from.len() != 1 {
             return false;
         }
@@ -581,6 +1075,7 @@ impl Executor {
         true
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn execute_join_with_operators(
         &self,
         txn: &mut Transaction,
@@ -711,6 +1206,208 @@ impl Executor {
         })
     }
 
+    pub(crate) async fn execute_simple_join_with_operators(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        left_schema: TableSchema,
+        right_schema: TableSchema,
+        left_alias: &str,
+        right_alias: &str,
+        join_type: JoinType,
+        join_condition: Option<Expr>,
+        filter: Option<&Expr>,
+        order_by: &[OrderByExpr],
+        limit: Option<usize>,
+        offset: usize,
+        projection: &[SelectItem],
+    ) -> Result<ExecuteResult> {
+        let mut combined_columns: Vec<ColumnDef> = Vec::new();
+        for col in &left_schema.columns {
+            combined_columns.push(ColumnDef {
+                name: format!("{}.{}", left_alias, col.name),
+                data_type: col.data_type.clone(),
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            });
+        }
+        for col in &right_schema.columns {
+            combined_columns.push(ColumnDef {
+                name: format!("{}.{}", right_alias, col.name),
+                data_type: col.data_type.clone(),
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            });
+        }
+
+        let combined_schema = TableSchema {
+            name: "join_result".to_string(),
+            table_id: 0,
+            columns: combined_columns,
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+
+        let rewritten_condition = join_condition.map(|cond| {
+            rewrite_join_expr_with_aliases(
+                &cond,
+                left_alias,
+                right_alias,
+                &left_schema,
+                &right_schema,
+            )
+        });
+
+        let rewritten_filter = filter.map(|f| {
+            rewrite_join_expr_with_aliases(f, left_alias, right_alias, &left_schema, &right_schema)
+        });
+
+        let rewritten_order_by: Vec<OrderByExpr> = order_by
+            .iter()
+            .map(|o| OrderByExpr {
+                expr: rewrite_join_expr_with_aliases(
+                    &o.expr,
+                    left_alias,
+                    right_alias,
+                    &left_schema,
+                    &right_schema,
+                ),
+                asc: o.asc,
+                nulls_first: o.nulls_first,
+            })
+            .collect();
+
+        let left_op: BoxedOperator = Box::new(TableScanOperator::new(left_schema.clone()));
+        let right_op: BoxedOperator = Box::new(TableScanOperator::new(right_schema.clone()));
+
+        let mut root: BoxedOperator = Box::new(NestedLoopJoinOperator::with_schema(
+            left_op,
+            right_op,
+            join_type,
+            rewritten_condition,
+            combined_schema.clone(),
+        ));
+
+        if let Some(filter_expr) = rewritten_filter {
+            root = Box::new(FilterOperator::new(root, filter_expr));
+        }
+
+        if !rewritten_order_by.is_empty() {
+            root = Box::new(SortOperator::new(root, rewritten_order_by));
+        }
+
+        if limit.is_some() || offset > 0 {
+            root = Box::new(LimitOperator::new(root, limit, offset));
+        }
+
+        let rows = execute_operator_tree(
+            &mut root,
+            txn,
+            self.store(),
+            db_id,
+            search_path,
+            sequence_values,
+        )
+        .await?;
+
+        let is_wildcard = projection.iter().any(|p| matches!(p, SelectItem::Wildcard(_)));
+
+        let (columns, column_types, projected_rows) = if is_wildcard {
+            let cols: Vec<String> = combined_schema
+                .columns
+                .iter()
+                .map(|c| {
+                    c.name
+                        .split('.')
+                        .last()
+                        .unwrap_or(&c.name)
+                        .to_string()
+                })
+                .collect();
+            let types: Vec<DataType> = combined_schema
+                .columns
+                .iter()
+                .map(|c| c.data_type.clone())
+                .collect();
+            (cols, types, rows)
+        } else {
+            let rewritten_projection: Vec<SelectItem> = projection
+                .iter()
+                .map(|item| match item {
+                    SelectItem::UnnamedExpr(expr) => SelectItem::UnnamedExpr(
+                        rewrite_join_expr_with_aliases(
+                            expr,
+                            left_alias,
+                            right_alias,
+                            &left_schema,
+                            &right_schema,
+                        ),
+                    ),
+                    SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias {
+                        expr: rewrite_join_expr_with_aliases(
+                            expr,
+                            left_alias,
+                            right_alias,
+                            &left_schema,
+                            &right_schema,
+                        ),
+                        alias: alias.clone(),
+                    },
+                    other => other.clone(),
+                })
+                .collect();
+
+            let cols: Vec<String> = rewritten_projection
+                .iter()
+                .map(|item| super::helpers::get_select_item_name(item))
+                .collect();
+
+            let types: Vec<DataType> = rewritten_projection
+                .iter()
+                .map(|item| match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                        infer_expr_type(expr, &combined_schema)
+                    }
+                    _ => DataType::Text,
+                })
+                .collect();
+
+            let mut projected = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut values = Vec::with_capacity(rewritten_projection.len());
+                for item in &rewritten_projection {
+                    let expr = match item {
+                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+                        _ => continue,
+                    };
+                    let val = eval_expr(expr, Some(&row), Some(&combined_schema))?;
+                    values.push(val);
+                }
+                projected.push(Row::new(values));
+            }
+            (cols, types, projected)
+        };
+
+        Ok(ExecuteResult::Select {
+            columns,
+            column_types: Some(column_types),
+            rows: projected_rows,
+        })
+    }
+
     pub(crate) async fn execute_with_operators(
         &self,
         txn: &mut Transaction,
@@ -736,7 +1433,7 @@ impl Executor {
             estimated_rows,
         )?;
 
-        let rows = execute_operator_tree(
+        let raw_rows = execute_operator_tree(
             &mut operator,
             txn,
             self.store(),
@@ -746,33 +1443,62 @@ impl Executor {
         )
         .await?;
 
-        let columns: Vec<String> = projection
-            .iter()
-            .flat_map(|item| match item {
-                SelectItem::Wildcard(_) => {
-                    schema.columns.iter().map(|c| c.name.clone()).collect()
-                }
-                SelectItem::UnnamedExpr(_) => {
-                    vec![super::helpers::get_select_item_name(item)]
-                }
-                SelectItem::ExprWithAlias { alias, .. } => vec![alias.value.clone()],
-                SelectItem::QualifiedWildcard(_, _) => {
-                    schema.columns.iter().map(|c| c.name.clone()).collect()
-                }
-            })
-            .collect();
+        let is_wildcard_only = projection.iter().all(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
+            )
+        });
 
-        let column_types: Vec<DataType> = projection
-            .iter()
-            .flat_map(|item| match item {
+        if is_wildcard_only {
+            let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+            let column_types: Vec<DataType> =
+                schema.columns.iter().map(|c| c.data_type.clone()).collect();
+            return Ok(ExecuteResult::Select {
+                columns,
+                column_types: Some(column_types),
+                rows: raw_rows,
+            });
+        }
+
+        let mut columns: Vec<String> = Vec::new();
+        let mut column_types: Vec<DataType> = Vec::new();
+        let mut projection_exprs: Vec<Expr> = Vec::new();
+
+        for item in projection {
+            match item {
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
-                    schema.columns.iter().map(|c| c.data_type.clone()).collect()
+                    for col in &schema.columns {
+                        columns.push(col.name.clone());
+                        column_types.push(col.data_type.clone());
+                        projection_exprs.push(Expr::Identifier(sqlparser::ast::Ident::new(
+                            col.name.clone(),
+                        )));
+                    }
                 }
-                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                    vec![infer_expr_type(expr, &schema)]
+                SelectItem::UnnamedExpr(expr) => {
+                    Self::validate_projection_columns(expr, &schema)?;
+                    columns.push(super::helpers::get_select_item_name(item));
+                    column_types.push(infer_expr_type(expr, &schema));
+                    projection_exprs.push(expr.clone());
                 }
-            })
-            .collect();
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    Self::validate_projection_columns(expr, &schema)?;
+                    columns.push(alias.value.clone());
+                    column_types.push(infer_expr_type(expr, &schema));
+                    projection_exprs.push(expr.clone());
+                }
+            }
+        }
+
+        let mut rows: Vec<Row> = Vec::with_capacity(raw_rows.len());
+        for row in raw_rows {
+            let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
+            for expr in &projection_exprs {
+                values.push(eval_expr(expr, Some(&row), Some(&schema))?);
+            }
+            rows.push(Row::new(values));
+        }
 
         Ok(ExecuteResult::Select {
             columns,
@@ -812,10 +1538,10 @@ mod tests {
     }
 
     #[test]
-    fn test_is_not_simple_query_with_column_projection() {
+    fn test_is_simple_query_with_column_projection() {
         let query = parse_query("SELECT id, name FROM users WHERE id > 5");
         let select = get_select(&query);
-        assert!(!Executor::is_simple_operator_query(&query, select));
+        assert!(Executor::is_simple_operator_query(&query, select));
     }
 
     #[test]
