@@ -80,6 +80,7 @@ impl Executor {
     pub(crate) async fn execute_insert(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         table_name: &ObjectName,
@@ -88,18 +89,26 @@ impl Executor {
         returning: &Option<Vec<SelectItem>>,
         on_conflict: &Option<OnInsert>,
     ) -> Result<ExecuteResult> {
-        let resolved =
-            names::resolve_existing_table_name(self.store().as_ref(), txn, table_name, search_path)
-                .await?
-                .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
+        let resolved = names::resolve_existing_table_name(
+            self.store().as_ref(),
+            txn,
+            db_id,
+            table_name,
+            search_path,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
         let t = resolved.full;
         let schema = self
             .store()
-            .get_schema(txn, &t)
+            .get_schema(txn, db_id, &t)
             .await?
             .ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
-        let enum_cache = dml::build_enum_label_cache(&self.store(), txn, &schema).await?;
-        let trigger_defs = self.store().list_triggers_for_table(txn, &t).await?;
+        let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
+        let trigger_defs = self
+            .store()
+            .list_triggers_for_table(txn, db_id, &t)
+            .await?;
         let source = source
             .as_ref()
             .ok_or_else(|| anyhow!("INSERT requires VALUES"))?;
@@ -112,7 +121,7 @@ impl Executor {
             SetExpr::Values(Values { rows, .. }) => rows.clone(),
             SetExpr::Select(_) => {
                 let select_result = self
-                    .execute_query(txn, sequence_values, search_path, source)
+                    .execute_query(txn, db_id, sequence_values, search_path, source)
                     .await?;
                 match select_result {
                     super::ExecuteResult::Select {
@@ -151,6 +160,7 @@ impl Executor {
             let (mut row_vals, indices) = dml::prepare_insert_row(
                 &self.store(),
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 &schema,
@@ -161,6 +171,7 @@ impl Executor {
             dml::fill_missing_columns(
                 &self.store(),
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 &schema,
@@ -175,6 +186,7 @@ impl Executor {
             let row = match triggers::apply_before_triggers(
                 &self.store(),
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 &trigger_defs,
@@ -192,6 +204,7 @@ impl Executor {
             let result = dml::execute_insert_row(
                 &self.store(),
                 txn,
+                db_id,
                 &t,
                 &schema,
                 row,
@@ -202,6 +215,7 @@ impl Executor {
             if let Some(final_row) = result {
                 trigger_worker::enqueue_after_triggers(
                     txn,
+                    db_id,
                     self.tenant_keyspace(),
                     &t,
                     TriggerOp::Insert,
@@ -214,6 +228,7 @@ impl Executor {
                 if let Some(ret_row) = dml::eval_returning_row(
                     &self.store(),
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     returning,
@@ -244,6 +259,7 @@ impl Executor {
     pub(crate) async fn execute_delete(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         from: &[sqlparser::ast::TableWithJoins],
@@ -257,6 +273,7 @@ impl Executor {
                 let resolved = names::resolve_existing_table_name(
                     self.store().as_ref(),
                     txn,
+                    db_id,
                     name,
                     search_path,
                 )
@@ -273,22 +290,25 @@ impl Executor {
         let t = resolved_target.full.clone();
         let schema = self
             .store()
-            .get_schema(txn, &t)
+            .get_schema(txn, db_id, &t)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
-        let trigger_defs = self.store().list_triggers_for_table(txn, &t).await?;
+        let trigger_defs = self
+            .store()
+            .list_triggers_for_table(txn, db_id, &t)
+            .await?;
         if schema.pk_indices.is_empty() {
             return Err(anyhow!("No PK"));
         }
         let resolved_selection = if let Some(sel) = selection {
             Some(
-                self.resolve_subqueries(txn, sequence_values, search_path, sel, &ctes_ctx)
+                self.resolve_subqueries(txn, db_id, sequence_values, search_path, sel, &ctes_ctx)
                     .await?,
             )
         } else {
             None
         };
-        let rows = self.scan_and_fill(txn, &t, &schema).await?;
+        let rows = self.scan_and_fill(txn, db_id, &t, &schema).await?;
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
         let ret_cols = dml::build_returning_columns(returning, &schema)?;
@@ -304,6 +324,7 @@ impl Executor {
                     let resolved = names::resolve_existing_table_name(
                         self.store().as_ref(),
                         txn,
+                        db_id,
                         name,
                         search_path,
                     )
@@ -319,10 +340,11 @@ impl Executor {
             };
             let using_schema = self
                 .store()
-                .get_schema(txn, &using_resolved.full)
+                .get_schema(txn, db_id, &using_resolved.full)
                 .await?
                 .ok_or_else(|| anyhow!("USING table not found"))?;
-            let using_rows = self.scan_and_fill(txn, &using_resolved.full, &using_schema).await?;
+            let using_rows =
+                self.scan_and_fill(txn, db_id, &using_resolved.full, &using_schema).await?;
             Some((using_schema, using_rows, using_alias))
         };
 
@@ -349,6 +371,7 @@ impl Executor {
                         if matches!(
                             self.eval_expr_join_maybe_sequence(
                                 txn,
+                                db_id,
                                 sequence_values,
                                 search_path,
                                 e,
@@ -366,6 +389,7 @@ impl Executor {
                     matches!(
                         self.eval_expr_maybe_sequence(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             e,
@@ -390,6 +414,7 @@ impl Executor {
             if let Some(ret_row) = dml::eval_returning_row(
                 &self.store(),
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 returning,
@@ -400,9 +425,10 @@ impl Executor {
             {
                 ret_rows.push(ret_row);
             }
-            dml::execute_delete_row(&self.store(), txn, &t, &schema, &r).await?;
+            dml::execute_delete_row(&self.store(), txn, db_id, &t, &schema, &r).await?;
             trigger_worker::enqueue_after_triggers(
                 txn,
+                db_id,
                 self.tenant_keyspace(),
                 &t,
                 TriggerOp::Delete,
@@ -429,6 +455,7 @@ impl Executor {
     pub(crate) async fn execute_update(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         table: &sqlparser::ast::TableWithJoins,
@@ -440,7 +467,13 @@ impl Executor {
         let ctes_ctx: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let resolved_target = match &table.relation {
             sqlparser::ast::TableFactor::Table { name, .. } => {
-                names::resolve_existing_table_name(self.store().as_ref(), txn, name, search_path)
+                names::resolve_existing_table_name(
+                    self.store().as_ref(),
+                    txn,
+                    db_id,
+                    name,
+                    search_path,
+                )
                     .await?
                     .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?
             }
@@ -456,17 +489,20 @@ impl Executor {
         };
         let schema = self
             .store()
-            .get_schema(txn, &t)
+            .get_schema(txn, db_id, &t)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
-        let enum_cache = dml::build_enum_label_cache(&self.store(), txn, &schema).await?;
-        let trigger_defs = self.store().list_triggers_for_table(txn, &t).await?;
+        let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
+        let trigger_defs = self
+            .store()
+            .list_triggers_for_table(txn, db_id, &t)
+            .await?;
         if schema.pk_indices.is_empty() {
             return Err(anyhow!("No PK"));
         }
         let resolved_selection = if let Some(sel) = selection {
             Some(
-                self.resolve_subqueries(txn, sequence_values, search_path, sel, &ctes_ctx)
+                self.resolve_subqueries(txn, db_id, sequence_values, search_path, sel, &ctes_ctx)
                     .await?,
             )
         } else {
@@ -481,6 +517,7 @@ impl Executor {
                     names::resolve_existing_table_name(
                         self.store().as_ref(),
                         txn,
+                        db_id,
                         name,
                         search_path,
                     )
@@ -499,16 +536,16 @@ impl Executor {
             };
             let fs = self
                 .store()
-                .get_schema(txn, &from_name)
+                .get_schema(txn, db_id, &from_name)
                 .await?
                 .ok_or_else(|| anyhow!("FROM table not found"))?;
-            let fr = self.scan_and_fill(txn, &from_name, &fs).await?;
+            let fr = self.scan_and_fill(txn, db_id, &from_name, &fs).await?;
             (Some(fs), Some(fr), Some(from_alias_str))
         } else {
             (None, None, None)
         };
 
-        let rows = self.scan_and_fill(txn, &t, &schema).await?;
+        let rows = self.scan_and_fill(txn, db_id, &t, &schema).await?;
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
         let ret_cols = dml::build_returning_columns(returning, &schema)?;
@@ -535,6 +572,7 @@ impl Executor {
                         if matches!(
                             self.eval_expr_join_maybe_sequence(
                                 txn,
+                                db_id,
                                 sequence_values,
                                 search_path,
                                 sel,
@@ -555,6 +593,7 @@ impl Executor {
                     if !matches!(
                         self.eval_expr_maybe_sequence(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             e,
@@ -587,6 +626,7 @@ impl Executor {
                     dml::compute_update_values(
                         &self.store(),
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         &schema,
@@ -600,6 +640,7 @@ impl Executor {
                     dml::compute_update_values(
                         &self.store(),
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         &schema,
@@ -614,6 +655,7 @@ impl Executor {
                 dml::compute_update_values(
                     &self.store(),
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     &schema,
@@ -631,6 +673,7 @@ impl Executor {
             let new_row = match triggers::apply_before_triggers(
                 &self.store(),
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 &trigger_defs,
@@ -646,11 +689,21 @@ impl Executor {
             };
 
             let updated_row =
-                dml::execute_update_row(&self.store(), txn, &t, &schema, r, new_row, &enum_cache)
+                dml::execute_update_row(
+                    &self.store(),
+                    txn,
+                    db_id,
+                    &t,
+                    &schema,
+                    r,
+                    new_row,
+                    &enum_cache,
+                )
                     .await?;
 
             trigger_worker::enqueue_after_triggers(
                 txn,
+                db_id,
                 self.tenant_keyspace(),
                 &t,
                 TriggerOp::Update,
@@ -663,6 +716,7 @@ impl Executor {
             if let Some(ret_row) = dml::eval_returning_row(
                 &self.store(),
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 returning,

@@ -1,0 +1,22 @@
+datname
+createdb_100
+(1 row)
+current_database
+createdb_100
+(1 row)
+id|v
+1|a
+2|b
+(2 rows)
+datname
+createdb_100_renamed
+(1 row)
+current_database
+createdb_100_renamed
+(1 row)
+id|v
+1|a
+2|b
+(2 rows)
+datname
+(0 rows)

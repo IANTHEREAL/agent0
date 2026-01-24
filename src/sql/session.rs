@@ -196,12 +196,21 @@ pub struct Session {
     current_user: Option<String>,
     #[allow(dead_code)]
     is_superuser: bool,
+    current_database_id: u64,
+    current_database_name: Arc<str>,
     /// Connection ID for pg_backend_pid() support
     connection_id: i32,
 }
 
 impl Session {
-    pub fn new(store: Arc<TikvStore>, observability: Arc<TenantObservability>, connection_id: i32) -> Self {
+    /// Create a session for the given database.
+    pub fn new_with_database(
+        store: Arc<TikvStore>,
+        observability: Arc<TenantObservability>,
+        connection_id: i32,
+        database_id: u64,
+        database_name: String,
+    ) -> Self {
         Self {
             store,
             observability,
@@ -211,16 +220,21 @@ impl Session {
             settings: SessionSettings::new(),
             current_user: None,
             is_superuser: false,
+            current_database_id: database_id,
+            current_database_name: Arc::from(database_name),
             connection_id,
         }
     }
 
-    pub fn new_with_user(
+    /// Create a session for the given user and database.
+    pub fn new_with_user_and_database(
         store: Arc<TikvStore>,
         observability: Arc<TenantObservability>,
         username: String,
         is_superuser: bool,
         connection_id: i32,
+        database_id: u64,
+        database_name: String,
     ) -> Self {
         Self {
             store,
@@ -231,6 +245,8 @@ impl Session {
             settings: SessionSettings::new(),
             current_user: Some(username),
             is_superuser,
+            current_database_id: database_id,
+            current_database_name: Arc::from(database_name),
             connection_id,
         }
     }
@@ -258,6 +274,18 @@ impl Session {
 
     pub fn connection_id(&self) -> i32 {
         self.connection_id
+    }
+
+    pub fn current_database_id(&self) -> u64 {
+        self.current_database_id
+    }
+
+    pub fn current_database(&self) -> &str {
+        &self.current_database_name
+    }
+
+    pub(crate) fn current_database_name_arc(&self) -> Arc<str> {
+        self.current_database_name.clone()
     }
 
     /// Check if currently in a transaction block

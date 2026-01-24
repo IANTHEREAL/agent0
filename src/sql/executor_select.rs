@@ -25,6 +25,7 @@ impl Executor {
     pub(crate) fn execute_query_with_outer_ctes<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        db_id: u64,
         sequence_values: &'a mut HashMap<String, i64>,
         search_path: &'a [String],
         query: &'a Query,
@@ -34,14 +35,35 @@ impl Executor {
         Box::pin(async move {
             if query.with.is_none() {
                 return self
-                    .execute_query_with_ctes(txn, sequence_values, search_path, query, outer_ctes)
+                    .execute_query_with_ctes(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        query,
+                        outer_ctes,
+                    )
                     .await;
             }
 
             let merged_ctes = self
-                .build_cte_context_with_base(txn, sequence_values, search_path, query, outer_ctes)
+                .build_cte_context_with_base(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    query,
+                    outer_ctes,
+                )
                 .await?;
-            self.execute_query_with_ctes(txn, sequence_values, search_path, query, &merged_ctes)
+            self.execute_query_with_ctes(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                query,
+                &merged_ctes,
+            )
                 .await
         })
     }
@@ -49,6 +71,7 @@ impl Executor {
     pub(crate) async fn execute_query_with_ctes(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         query: &Query,
@@ -64,6 +87,7 @@ impl Executor {
             let result = self
                 .execute_set_operation(
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     op,
@@ -108,11 +132,11 @@ impl Executor {
 
         if select.from.is_empty() {
             let result = self
-                .execute_tableless_query(txn, sequence_values, search_path, select, ctes)
+                .execute_tableless_query(txn, db_id, sequence_values, search_path, select, ctes)
                 .await?;
             if let Some((target_name, _temp)) = select_into_target {
                 return self
-                    .create_table_from_result(txn, search_path, &target_name, result)
+                    .create_table_from_result(txn, db_id, search_path, &target_name, result)
                     .await;
             }
             return Ok(result);
@@ -124,6 +148,7 @@ impl Executor {
             let result = self
                 .execute_join_query_with_ctes(
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     query,
@@ -133,7 +158,7 @@ impl Executor {
                 .await?;
             if let Some((target_name, _temp)) = select_into_target {
                 return self
-                    .create_table_from_result(txn, search_path, &target_name, result)
+                    .create_table_from_result(txn, db_id, search_path, &target_name, result)
                     .await;
             }
             return Ok(result);
@@ -166,6 +191,7 @@ impl Executor {
                         if let Some((schema, rows)) = self
                             .try_execute_extension_table_function(
                                 txn,
+                                db_id,
                                 search_path,
                                 name,
                                 func_args,
@@ -186,6 +212,7 @@ impl Executor {
                             let (schema, rows) = self
                                 .get_table_data(
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     &lookup_name,
@@ -220,6 +247,7 @@ impl Executor {
                         } else if let Some(resolved) = names::resolve_existing_table_name(
                             self.store().as_ref(),
                             txn,
+                            db_id,
                             name,
                             search_path,
                         )
@@ -227,7 +255,7 @@ impl Executor {
                         {
                             let schema = self
                                 .store()
-                                .get_schema(txn, &resolved.full)
+                                .get_schema(txn, db_id, &resolved.full)
                                 .await?
                                 .ok_or_else(|| anyhow!("Table not found"))?;
                             (schema.name.clone(), alias_str, schema, Vec::new(), false, false)
@@ -239,6 +267,7 @@ impl Executor {
                             let (schema, rows) = self
                                 .get_table_data(
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     &lookup_name,
@@ -262,6 +291,7 @@ impl Executor {
                 let (schema, rows) = self
                     .execute_derived_table(
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         subquery,
@@ -286,7 +316,7 @@ impl Executor {
                 Some(sel.clone())
             } else {
                 Some(
-                    self.resolve_subqueries(txn, sequence_values, search_path, sel, ctes)
+                    self.resolve_subqueries(txn, db_id, sequence_values, search_path, sel, ctes)
                         .await?,
                 )
             }
@@ -297,6 +327,7 @@ impl Executor {
         let resolved_projection = self
             .resolve_projection_subqueries_with_outer_context(
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 &select.projection,
@@ -334,17 +365,19 @@ impl Executor {
                     &mut lock_operator,
                     txn,
                     self.store(),
+                    db_id,
                     search_path,
                     sequence_values,
                 )
                 .await?;
                 if !lock_rows.is_empty() {
-                    self.store().lock_rows(txn, &t, &lock_rows).await?;
+                    self.store().lock_rows(txn, db_id, &t, &lock_rows).await?;
                 }
             }
             return self
                 .execute_with_operators(
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     schema,
@@ -382,17 +415,19 @@ impl Executor {
                     &mut lock_operator,
                     txn,
                     self.store(),
+                    db_id,
                     search_path,
                     sequence_values,
                 )
                 .await?;
                 if !lock_rows.is_empty() {
-                    self.store().lock_rows(txn, &t, &lock_rows).await?;
+                    self.store().lock_rows(txn, db_id, &t, &lock_rows).await?;
                 }
             }
             return self
                 .execute_aggregate_with_operators(
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     schema,
@@ -416,7 +451,7 @@ impl Executor {
             let estimated_rows = 1000;
 
             match &resolved_selection {
-                None => self.scan_and_fill(txn, &t, &schema).await?,
+                None => self.scan_and_fill(txn, db_id, &t, &schema).await?,
                 Some(sel) => {
                     let access_path =
                         planner::choose_best_access_path_for_filter(&schema, Some(sel), estimated_rows);
@@ -456,7 +491,7 @@ impl Executor {
                                         "GIN predicate yields no tokens; falling back to full scan (index: {})",
                                         index_name
                                     );
-                                    self.scan_and_fill(txn, &t, &schema).await?
+                                    self.scan_and_fill(txn, db_id, &t, &schema).await?
                                 } else {
                                     debug!(
                                         "Using GIN Index Scan on {} (cost: {:.2})",
@@ -466,6 +501,7 @@ impl Executor {
                                         .store()
                                         .scan_gin_index_intersection(
                                             txn,
+                                            db_id,
                                             schema.table_id,
                                             idx.id,
                                             &token_hashes,
@@ -473,7 +509,7 @@ impl Executor {
                                         .await?;
                                     let mut rows = self
                                         .store()
-                                        .batch_get_rows_by_pk_keys(txn, schema.table_id, pk_keys)
+                                        .batch_get_rows_by_pk_keys(txn, db_id, schema.table_id, pk_keys)
                                         .await?;
                                     for r in &mut rows {
                                         fill_row_defaults(r, &schema)?;
@@ -515,6 +551,7 @@ impl Executor {
                                 .store()
                                 .scan_index(
                                     txn,
+                                    db_id,
                                     schema.table_id,
                                     idx.id,
                                     values,
@@ -524,7 +561,7 @@ impl Executor {
                                 .await?;
                             let mut rows = self
                                 .store()
-                                .batch_get_rows(txn, schema.table_id, pks, &schema)
+                                .batch_get_rows(txn, db_id, schema.table_id, pks, &schema)
                                 .await?;
                             for r in &mut rows {
                                 fill_row_defaults(r, &schema)?;
@@ -533,7 +570,7 @@ impl Executor {
                         }
                         ScanType::IndexRangeScan { .. } | ScanType::FullTableScan => {
                             debug!("Using Full Table Scan (cost: {:.2})", access_path.cost);
-                            self.scan_and_fill(txn, &t, &schema).await?
+                            self.scan_and_fill(txn, db_id, &t, &schema).await?
                         }
                     }
                 }
@@ -547,6 +584,7 @@ impl Executor {
                     let result = self
                         .eval_selection_with_correlated_exists(
                             txn,
+                            db_id,
                             sequence_values,
                             sel,
                             search_path,
@@ -564,6 +602,7 @@ impl Executor {
                     if matches!(
                         self.eval_expr_maybe_sequence(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             sel,
@@ -587,7 +626,9 @@ impl Executor {
             .iter()
             .any(|l| matches!(l.lock_type, LockType::Update));
         if has_for_update && !filtered_rows.is_empty() {
-            self.store().lock_rows(txn, &t, &filtered_rows).await?;
+            self.store()
+                .lock_rows(txn, db_id, &t, &filtered_rows)
+                .await?;
         }
 
         let group_keys_exprs = match &select.group_by {
@@ -656,6 +697,7 @@ impl Executor {
                 return self
                     .execute_grouping_sets_query(
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         query,
@@ -672,6 +714,7 @@ impl Executor {
             return self
                 .execute_aggregate_query(
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     query,
@@ -715,6 +758,7 @@ impl Executor {
             if !query.order_by.is_empty() && !order_by_references_correlated_subquery {
                 self.apply_order_by(
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     filtered_rows,
@@ -752,6 +796,7 @@ impl Executor {
         } else {
             self.project_rows(
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 select,
@@ -801,7 +846,7 @@ impl Executor {
         };
         if let Some((target_name, _temp)) = select_into_target {
             return self
-                .create_table_from_result(txn, search_path, &target_name, result)
+                .create_table_from_result(txn, db_id, search_path, &target_name, result)
                 .await;
         }
         Ok(result)
@@ -810,6 +855,7 @@ impl Executor {
     async fn execute_aggregate_query(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         query: &Query,
@@ -832,6 +878,7 @@ impl Executor {
                 key.push(
                     self.eval_expr_maybe_sequence(
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         expr,
@@ -856,6 +903,7 @@ impl Executor {
                                             match self
                                                 .eval_expr_maybe_sequence(
                                                     txn,
+                                                    db_id,
                                                     sequence_values,
                                                     search_path,
                                                     e,
@@ -913,6 +961,7 @@ impl Executor {
                     let filter_val = self
                         .eval_expr_maybe_sequence(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             filter,
@@ -928,6 +977,7 @@ impl Executor {
                 let val = if let Some(e) = arg_expr {
                     self.eval_expr_maybe_sequence(
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         e,
@@ -1006,6 +1056,7 @@ impl Executor {
                     sequences::replace_sequence_functions(
                         &self.store(),
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         having_expr,
@@ -1037,6 +1088,7 @@ impl Executor {
                         sequences::replace_sequence_functions(
                             &self.store(),
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             expr,
@@ -1083,7 +1135,7 @@ impl Executor {
         };
         if let Some((target_name, _temp)) = select_into_target {
             return self
-                .create_table_from_result(txn, search_path, &target_name, result)
+                .create_table_from_result(txn, db_id, search_path, &target_name, result)
                 .await;
         }
         Ok(result)
@@ -1093,6 +1145,7 @@ impl Executor {
     async fn execute_grouping_sets_query(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         query: &Query,
@@ -1129,6 +1182,7 @@ impl Executor {
                     key.push(
                         self.eval_expr_maybe_sequence(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             expr,
@@ -1153,6 +1207,7 @@ impl Executor {
                                                 match self
                                                     .eval_expr_maybe_sequence(
                                                         txn,
+                                                        db_id,
                                                         sequence_values,
                                                         search_path,
                                                         e,
@@ -1207,6 +1262,7 @@ impl Executor {
                         let filter_val = self
                             .eval_expr_maybe_sequence(
                                 txn,
+                                db_id,
                                 sequence_values,
                                 search_path,
                                 filter,
@@ -1222,6 +1278,7 @@ impl Executor {
                     let val = if let Some(e) = arg_expr {
                         self.eval_expr_maybe_sequence(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             e,
@@ -1271,6 +1328,7 @@ impl Executor {
                         sequences::replace_sequence_functions(
                             &self.store(),
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             having_expr,
@@ -1329,6 +1387,7 @@ impl Executor {
                                 sequences::replace_sequence_functions(
                                     &self.store(),
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     expr,
@@ -1379,7 +1438,7 @@ impl Executor {
         };
         if let Some((target_name, _temp)) = select_into_target {
             return self
-                .create_table_from_result(txn, search_path, &target_name, result)
+                .create_table_from_result(txn, db_id, search_path, &target_name, result)
                 .await;
         }
         Ok(result)
@@ -1476,6 +1535,7 @@ impl Executor {
     async fn apply_order_by(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         filtered_rows: Vec<Row>,
@@ -1513,6 +1573,7 @@ impl Executor {
                     let val = if sequences::expr_needs_async_eval(actual_expr) {
                         self.eval_expr_maybe_sequence(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             actual_expr,
@@ -1592,6 +1653,7 @@ impl Executor {
     async fn project_rows(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         select: &sqlparser::ast::Select,
@@ -1743,6 +1805,7 @@ impl Executor {
                                         match self
                                             .eval_expr_maybe_sequence(
                                                 txn,
+                                                db_id,
                                                 sequence_values,
                                                 search_path,
                                                 arg_expr,
@@ -1781,6 +1844,7 @@ impl Executor {
                                     let source_val = self
                                         .eval_expr_maybe_sequence(
                                             txn,
+                                            db_id,
                                             sequence_values,
                                             search_path,
                                             arg0,
@@ -1797,6 +1861,7 @@ impl Executor {
                                     let pattern_val = self
                                         .eval_expr_maybe_sequence(
                                             txn,
+                                            db_id,
                                             sequence_values,
                                             search_path,
                                             arg1,
@@ -1816,6 +1881,7 @@ impl Executor {
                                             match self
                                                 .eval_expr_maybe_sequence(
                                                     txn,
+                                                    db_id,
                                                     sequence_values,
                                                     search_path,
                                                     arg2,
@@ -1876,6 +1942,7 @@ impl Executor {
                                     let source_val = self
                                         .eval_expr_maybe_sequence(
                                             txn,
+                                            db_id,
                                             sequence_values,
                                             search_path,
                                             arg0,
@@ -1892,6 +1959,7 @@ impl Executor {
                                     let pattern_val = self
                                         .eval_expr_maybe_sequence(
                                             txn,
+                                            db_id,
                                             sequence_values,
                                             search_path,
                                             arg1,
@@ -1911,6 +1979,7 @@ impl Executor {
                                         match self
                                             .eval_expr_maybe_sequence(
                                                 txn,
+                                                db_id,
                                                 sequence_values,
                                                 search_path,
                                                 arg2,
@@ -1953,6 +2022,7 @@ impl Executor {
                                     match self
                                         .eval_expr_maybe_sequence(
                                             txn,
+                                            db_id,
                                             sequence_values,
                                             search_path,
                                             expr,
@@ -1976,6 +2046,7 @@ impl Executor {
                         let value = if let Expr::Subquery(subquery) = expr {
                             self.eval_correlated_subquery(
                                 txn,
+                                db_id,
                                 sequence_values,
                                 search_path,
                                 subquery,
@@ -1987,6 +2058,7 @@ impl Executor {
                         } else {
                             self.eval_expr_maybe_sequence(
                                 txn,
+                                db_id,
                                 sequence_values,
                                 search_path,
                                 expr,

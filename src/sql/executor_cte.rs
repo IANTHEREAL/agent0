@@ -13,6 +13,7 @@ impl Executor {
     pub(crate) async fn build_cte_context_with_base(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         query: &Query,
@@ -27,6 +28,7 @@ impl Executor {
                     let (schema, rows) = self
                         .execute_recursive_cte(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             &cte_name,
@@ -40,6 +42,7 @@ impl Executor {
                     let cte_result = self
                         .execute_query_with_outer_ctes(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             &cte.query,
@@ -108,18 +111,20 @@ impl Executor {
     pub(crate) async fn build_cte_context(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         query: &Query,
     ) -> Result<HashMap<String, (TableSchema, Vec<Row>)>> {
         let base = HashMap::new();
-        self.build_cte_context_with_base(txn, sequence_values, search_path, query, &base)
+        self.build_cte_context_with_base(txn, db_id, sequence_values, search_path, query, &base)
             .await
     }
 
     pub(crate) async fn execute_recursive_cte(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         cte_name: &str,
@@ -158,6 +163,7 @@ impl Executor {
         let base_result = self
             .execute_query_with_ctes(
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 &base_query,
@@ -238,15 +244,16 @@ impl Executor {
                 limit_by: vec![],
                 for_clause: None,
             };
-            let recursive_result = self
-                .execute_query_with_ctes(
-                    txn,
-                    sequence_values,
-                    search_path,
-                    &recursive_query,
-                    &temp_ctes,
-                )
-                .await?;
+        let recursive_result = self
+            .execute_query_with_ctes(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                &recursive_query,
+                &temp_ctes,
+            )
+            .await?;
 
             let new_rows = match recursive_result {
                 ExecuteResult::Select { rows, .. } => rows,

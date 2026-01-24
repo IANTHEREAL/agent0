@@ -11,6 +11,7 @@ mod ddl;
 mod dml;
 mod executor;
 mod executor_cte;
+mod executor_database;
 mod executor_ddl_ops;
 mod executor_dml_ops;
 mod executor_extensions;

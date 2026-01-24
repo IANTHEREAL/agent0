@@ -26,6 +26,7 @@ pub fn is_information_schema_table(table_name: &str) -> bool {
                 | "pg_range"
                 | "pg_type"
                 | "pg_enum"
+                | "pg_database"
                 | "pg_class"
                 | "pg_index"
                 | "pg_attribute"
@@ -69,6 +70,7 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
             "pg_range" => "pg_range",
             "pg_type" => "pg_type",
             "pg_enum" => "pg_enum",
+            "pg_database" => "pg_database",
             "pg_class" => "pg_class",
             "pg_index" => "pg_index",
             "pg_attribute" => "pg_attribute",
@@ -103,6 +105,7 @@ pub fn parse_information_schema_table(table_name: &str) -> Option<&str> {
         "pg_constraint" => Some("pg_constraint"),
         "pg_am" => Some("pg_am"),
         "pg_indexes" => Some("pg_indexes"),
+        "pg_database" => Some("pg_database"),
         "pg_enum" => Some("pg_enum"),
         "pg_attrdef" => Some("pg_attrdef"),
         "pg_sequence" => Some("pg_sequence"),
@@ -538,6 +541,36 @@ fn pg_enum_schema() -> TableSchema {
     }
 }
 
+fn pg_database_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_database".to_string(),
+        columns: vec![
+            int_col("oid"),
+            text_col("datname"),
+            int_col("datdba"),
+            int_col("encoding"),
+            text_col("datcollate"),
+            text_col("datctype"),
+            bool_col("datistemplate"),
+            bool_col("datallowconn"),
+            int_col("datconnlimit"),
+            int_col("datlastsysoid"),
+            int_col("datfrozenxid"),
+            int_col("datminmxid"),
+            int_col("dattablespace"),
+            text_col("datacl"),
+        ],
+        version: 1,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+    }
+}
+
 fn pg_class_schema() -> TableSchema {
     TableSchema {
         table_id: 0,
@@ -951,6 +984,7 @@ pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
         "pg_range" => Some(pg_range_schema()),
         "pg_type" => Some(pg_type_schema()),
         "pg_enum" => Some(pg_enum_schema()),
+        "pg_database" => Some(pg_database_schema()),
         "pg_class" => Some(pg_class_schema()),
         "pg_index" => Some(pg_index_schema()),
         "pg_attribute" => Some(pg_attribute_schema()),
@@ -1106,15 +1140,23 @@ pub struct VirtualTableFilter {
 pub async fn get_information_schema_data(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     table_name: &str,
 ) -> Result<(TableSchema, Vec<Row>)> {
-    get_information_schema_data_filtered(store, txn, table_name, &VirtualTableFilter::default())
+    get_information_schema_data_filtered(
+        store,
+        txn,
+        db_id,
+        table_name,
+        &VirtualTableFilter::default(),
+    )
         .await
 }
 
 pub async fn get_information_schema_data_filtered(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     table_name: &str,
     filter: &VirtualTableFilter,
 ) -> Result<(TableSchema, Vec<Row>)> {
@@ -1135,7 +1177,7 @@ pub async fn get_information_schema_data_filtered(
         name,
         "schemata" | "pg_namespace" | "pg_type" | "pg_proc" | "pg_extension" | "pg_enum"
             | "pg_range" | "pg_collation" | "pg_am" | "pg_sequence" | "pg_depend" | "pg_views"
-            | "sequences" | "routines" | "pg_description"
+            | "sequences" | "routines" | "pg_description" | "pg_database"
     );
 
     let user_tables = if needs_tables {
@@ -1143,7 +1185,7 @@ pub async fn get_information_schema_data_filtered(
             let schema_prefix = filter.table_schema.as_deref().unwrap_or("public");
             vec![format!("{}.{}", schema_prefix, tbl)]
         } else {
-            store.list_tables(txn).await?
+            store.list_tables(txn, db_id).await?
         }
     } else {
         vec![]
@@ -1151,8 +1193,8 @@ pub async fn get_information_schema_data_filtered(
 
     let (schemas, schema_oids) = if needs_schemas {
         (
-            store.list_schemas(txn).await?,
-            store.list_schema_oids(txn).await?,
+            store.list_schemas(txn, db_id).await?,
+            store.list_schema_oids(txn, db_id).await?,
         )
     } else {
         (vec!["public".to_string()], std::collections::HashMap::new())
@@ -1160,38 +1202,39 @@ pub async fn get_information_schema_data_filtered(
 
     let rows = match name {
         "schemata" => get_schemata_rows(&schemas),
-        "tables" => get_tables_rows(store, txn, &user_tables).await?,
-        "sequences" => get_sequences_rows(store, txn).await?,
-        "routines" => get_routines_rows(store, txn).await?,
-        "columns" => get_columns_rows(store, txn, &user_tables).await?,
-        "table_constraints" => get_table_constraints_rows(store, txn, &user_tables).await?,
-        "key_column_usage" => get_key_column_usage_rows(store, txn, &user_tables).await?,
+        "tables" => get_tables_rows(store, txn, db_id, &user_tables).await?,
+        "sequences" => get_sequences_rows(store, txn, db_id).await?,
+        "routines" => get_routines_rows(store, txn, db_id).await?,
+        "columns" => get_columns_rows(store, txn, db_id, &user_tables).await?,
+        "table_constraints" => get_table_constraints_rows(store, txn, db_id, &user_tables).await?,
+        "key_column_usage" => get_key_column_usage_rows(store, txn, db_id, &user_tables).await?,
         "referential_constraints" => {
-            get_referential_constraints_rows(store, txn, &user_tables).await?
+            get_referential_constraints_rows(store, txn, db_id, &user_tables).await?
         }
         "constraint_column_usage" => {
-            get_constraint_column_usage_rows(store, txn, &user_tables).await?
+            get_constraint_column_usage_rows(store, txn, db_id, &user_tables).await?
         }
-        "check_constraints" => get_check_constraints_rows(store, txn, &user_tables).await?,
+        "check_constraints" => get_check_constraints_rows(store, txn, db_id, &user_tables).await?,
         "pg_range" => vec![], // No range types defined
-        "pg_type" => get_pg_type_rows(store, txn, &schema_oids).await?,
-        "pg_enum" => get_pg_enum_rows(store, txn).await?,
+        "pg_type" => get_pg_type_rows(store, txn, db_id, &schema_oids).await?,
+        "pg_enum" => get_pg_enum_rows(store, txn, db_id).await?,
+        "pg_database" => get_pg_database_rows(store, txn).await?,
         "pg_namespace" => get_pg_namespace_rows(&schemas, &schema_oids),
-        "pg_class" => get_pg_class_rows(store, txn, &user_tables, &schema_oids).await?,
-        "pg_index" => get_pg_index_rows(store, txn, &user_tables, &schema_oids).await?,
-        "pg_attribute" => get_pg_attribute_rows(store, txn, &user_tables).await?,
-        "pg_proc" => get_pg_proc_rows(store, txn, &schema_oids).await?,
-        "pg_extension" => get_pg_extension_rows(store, txn, &schema_oids).await?,
-        "pg_trigger" => get_pg_trigger_rows(store, txn, &user_tables).await?,
-        "pg_description" => get_pg_description_rows(store, txn).await?,
-        "pg_constraint" => get_pg_constraint_rows(store, txn, &user_tables, &schema_oids).await?,
+        "pg_class" => get_pg_class_rows(store, txn, db_id, &user_tables, &schema_oids).await?,
+        "pg_index" => get_pg_index_rows(store, txn, db_id, &user_tables, &schema_oids).await?,
+        "pg_attribute" => get_pg_attribute_rows(store, txn, db_id, &user_tables).await?,
+        "pg_proc" => get_pg_proc_rows(store, txn, db_id, &schema_oids).await?,
+        "pg_extension" => get_pg_extension_rows(store, txn, db_id, &schema_oids).await?,
+        "pg_trigger" => get_pg_trigger_rows(store, txn, db_id, &user_tables).await?,
+        "pg_description" => get_pg_description_rows(store, txn, db_id).await?,
+        "pg_constraint" => get_pg_constraint_rows(store, txn, db_id, &user_tables, &schema_oids).await?,
         "pg_am" => get_pg_am_rows(),
-        "pg_attrdef" => get_pg_attrdef_rows(store, txn, &user_tables).await?,
-        "pg_sequence" => get_pg_sequence_rows(store, txn).await?,
-        "pg_tables" => get_pg_tables_rows(store, txn, &user_tables).await?,
-        "pg_views" => get_pg_views_rows(store, txn).await?,
-        "pg_depend" => get_pg_depend_rows(store, txn).await?,
-        "pg_indexes" => get_pg_indexes_rows(store, txn, &user_tables).await?,
+        "pg_attrdef" => get_pg_attrdef_rows(store, txn, db_id, &user_tables).await?,
+        "pg_sequence" => get_pg_sequence_rows(store, txn, db_id).await?,
+        "pg_tables" => get_pg_tables_rows(store, txn, db_id, &user_tables).await?,
+        "pg_views" => get_pg_views_rows(store, txn, db_id).await?,
+        "pg_depend" => get_pg_depend_rows(store, txn, db_id).await?,
+        "pg_indexes" => get_pg_indexes_rows(store, txn, db_id, &user_tables).await?,
         "pg_collation" => get_pg_collation_rows(&schema_oids),
         _ => vec![],
     };
@@ -1219,6 +1262,7 @@ fn get_schemata_rows(schemas: &[String]) -> Vec<Row> {
 async fn get_tables_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
@@ -1226,7 +1270,7 @@ async fn get_tables_rows(
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
         let owner = store
-            .get_schema(txn, full_table_name)
+            .get_schema(txn, db_id, full_table_name)
             .await?
             .map(|s| s.owner)
             .unwrap_or_else(|| "postgres".to_string());
@@ -1247,7 +1291,7 @@ async fn get_tables_rows(
         ]));
     }
 
-    let views = store.list_views(txn).await.unwrap_or_default();
+    let views = store.list_views(txn, db_id).await.unwrap_or_default();
     for view_def in views {
         rows.push(Row::new(vec![
             text_val("postgres"),
@@ -1269,8 +1313,12 @@ async fn get_tables_rows(
     Ok(rows)
 }
 
-async fn get_sequences_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
-    let mut seqs = store.list_sequences(txn).await?;
+async fn get_sequences_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+) -> Result<Vec<Row>> {
+    let mut seqs = store.list_sequences(txn, db_id).await?;
     seqs.sort_by(|a, b| a.schema.cmp(&b.schema).then(a.name.cmp(&b.name)));
 
     let mut rows = Vec::with_capacity(seqs.len());
@@ -1292,8 +1340,12 @@ async fn get_sequences_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Re
     Ok(rows)
 }
 
-async fn get_routines_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
-    let mut funcs = store.list_functions(txn).await?;
+async fn get_routines_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+) -> Result<Vec<Row>> {
+    let mut funcs = store.list_functions(txn, db_id).await?;
     funcs.sort_by(|a, b| a.schema.cmp(&b.schema).then(a.name.cmp(&b.name)));
 
     let mut rows = Vec::with_capacity(funcs.len());
@@ -1314,13 +1366,14 @@ async fn get_routines_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Res
 async fn get_columns_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
-        if let Some(schema) = store.get_schema(txn, full_table_name).await? {
+        if let Some(schema) = store.get_schema(txn, db_id, full_table_name).await? {
             for (i, col) in schema.columns.iter().enumerate() {
                 let (data_type_str, udt_schema, udt_name) = match &col.data_type {
                     DataType::UserDefined(full_udt) => {
@@ -1421,13 +1474,14 @@ async fn get_columns_rows(
 async fn get_table_constraints_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
-        if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
+        if let Some(table_def) = store.get_schema(txn, db_id, full_table_name).await? {
             if !table_def.pk_indices.is_empty() {
                 let pk_name = table_def
                     .pk_constraint_name
@@ -1531,13 +1585,14 @@ async fn get_table_constraints_rows(
 async fn get_key_column_usage_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
-        if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
+        if let Some(table_def) = store.get_schema(txn, db_id, full_table_name).await? {
             if !table_def.pk_indices.is_empty() {
                 let pk_name = table_def
                     .pk_constraint_name
@@ -1601,17 +1656,18 @@ async fn get_key_column_usage_rows(
 async fn get_referential_constraints_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
     for full_table_name in user_tables {
         let (table_schema, _) = split_schema_and_name(full_table_name);
-        if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
+        if let Some(table_def) = store.get_schema(txn, db_id, full_table_name).await? {
             for fk in &table_def.foreign_keys {
                 let (ref_schema, ref_table_name) = split_schema_and_name(&fk.ref_table);
                 let ref_pk_name = store
-                    .get_schema(txn, &fk.ref_table)
+                    .get_schema(txn, db_id, &fk.ref_table)
                     .await?
                     .and_then(|s| s.pk_constraint_name)
                     .unwrap_or_else(|| format!("{}_pkey", ref_table_name));
@@ -1650,13 +1706,14 @@ async fn get_referential_constraints_rows(
 async fn get_constraint_column_usage_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
-        if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
+        if let Some(table_def) = store.get_schema(txn, db_id, full_table_name).await? {
             if !table_def.pk_indices.is_empty() {
                 let pk_name = table_def
                     .pk_constraint_name
@@ -1715,13 +1772,14 @@ async fn get_constraint_column_usage_rows(
 async fn get_check_constraints_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
-        if let Some(table_def) = store.get_schema(txn, full_table_name).await? {
+        if let Some(table_def) = store.get_schema(txn, db_id, full_table_name).await? {
             for (i, check) in table_def.check_constraints.iter().enumerate() {
                 let name = check
                     .name
@@ -1753,9 +1811,37 @@ fn get_pg_namespace_rows(schemas: &[String], schema_oids: &HashMap<String, u32>)
         .collect()
 }
 
+async fn get_pg_database_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
+    let mut dbs = store.list_databases(txn).await?;
+    dbs.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let mut rows = Vec::with_capacity(dbs.len());
+    for db in dbs {
+        rows.push(Row::new(vec![
+            int_val(db.oid as i64),
+            text_val(&db.name),
+            int_val(10), // owner OID (metadata only)
+            int_val(6),  // encoding: UTF8
+            text_val("C"),
+            text_val("C"),
+            Value::Boolean(db.is_template),
+            Value::Boolean(db.allow_conn),
+            int_val(-1),
+            int_val(0),
+            int_val(0),
+            int_val(0),
+            int_val(0),
+            null_val(),
+        ]));
+    }
+
+    Ok(rows)
+}
+
 async fn get_pg_class_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
     schema_oids: &HashMap<String, u32>,
 ) -> Result<Vec<Row>> {
@@ -1764,7 +1850,7 @@ async fn get_pg_class_rows(
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
         let namespace_oid = schema_oid(schema_oids, &table_schema);
-        if let Some(schema) = store.get_schema(txn, full_table_name).await? {
+        if let Some(schema) = store.get_schema(txn, db_id, full_table_name).await? {
             let table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
 
             // Add the table itself
@@ -1828,7 +1914,7 @@ async fn get_pg_class_rows(
         }
     }
 
-    let sequences = store.list_sequences(txn).await?;
+    let sequences = store.list_sequences(txn, db_id).await?;
     for seq in sequences {
         let seq_oid = catalog_oids::pg_class_sequence_oid(seq.oid);
         let namespace_oid = schema_oid(schema_oids, &seq.schema);
@@ -1848,7 +1934,7 @@ async fn get_pg_class_rows(
         ]));
     }
 
-    let views = store.list_views(txn).await.unwrap_or_default();
+    let views = store.list_views(txn, db_id).await.unwrap_or_default();
     for view_def in views {
         let namespace_oid = schema_oid(schema_oids, &view_def.schema);
         let view_oid = catalog_oids::pg_class_view_oid(view_def.oid);
@@ -1874,6 +1960,7 @@ async fn get_pg_class_rows(
 async fn get_pg_index_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
     _schema_oids: &HashMap<String, u32>,
 ) -> Result<Vec<Row>> {
@@ -1881,7 +1968,7 @@ async fn get_pg_index_rows(
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
-        if let Some(schema) = store.get_schema(txn, full_table_name).await? {
+        if let Some(schema) = store.get_schema(txn, db_id, full_table_name).await? {
             let base_table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
 
             for idx in &schema.indexes {
@@ -1967,13 +2054,14 @@ async fn get_pg_index_rows(
 async fn get_pg_indexes_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
-        if let Some(schema) = store.get_schema(txn, full_table_name).await? {
+        if let Some(schema) = store.get_schema(txn, db_id, full_table_name).await? {
             if !schema.pk_indices.is_empty() {
                 let pk_name = schema
                     .pk_constraint_name
@@ -2019,13 +2107,14 @@ async fn get_pg_indexes_rows(
 async fn get_pg_attrdef_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
-        let Some(schema) = store.get_schema(txn, full_table_name).await? else {
+        let Some(schema) = store.get_schema(txn, db_id, full_table_name).await? else {
             continue;
         };
         let table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
@@ -2060,8 +2149,12 @@ async fn get_pg_attrdef_rows(
     Ok(rows)
 }
 
-async fn get_pg_sequence_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
-    let seqs = store.list_sequences(txn).await?;
+async fn get_pg_sequence_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+) -> Result<Vec<Row>> {
+    let seqs = store.list_sequences(txn, db_id).await?;
     let mut rows = Vec::with_capacity(seqs.len());
 
     for seq in seqs {
@@ -2083,9 +2176,10 @@ async fn get_pg_sequence_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> 
 async fn get_pg_tables_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
-    let triggers = store.list_triggers(txn).await.unwrap_or_default();
+    let triggers = store.list_triggers(txn, db_id).await.unwrap_or_default();
     let mut tables_with_triggers: HashMap<String, bool> = HashMap::new();
     for t in triggers {
         tables_with_triggers.insert(t.table, true);
@@ -2094,7 +2188,7 @@ async fn get_pg_tables_rows(
     let mut rows = Vec::new();
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
-        let Some(schema) = store.get_schema(txn, full_table_name).await? else {
+        let Some(schema) = store.get_schema(txn, db_id, full_table_name).await? else {
             continue;
         };
         let hasindexes = !schema.pk_indices.is_empty() || !schema.indexes.is_empty();
@@ -2118,8 +2212,12 @@ async fn get_pg_tables_rows(
     Ok(rows)
 }
 
-async fn get_pg_views_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
-    let mut views = store.list_views(txn).await?;
+async fn get_pg_views_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+) -> Result<Vec<Row>> {
+    let mut views = store.list_views(txn, db_id).await?;
     views.sort_by(|a, b| a.full_name().cmp(&b.full_name()));
 
     let mut rows = Vec::new();
@@ -2135,18 +2233,22 @@ async fn get_pg_views_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Res
     Ok(rows)
 }
 
-async fn get_pg_depend_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
+async fn get_pg_depend_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+) -> Result<Vec<Row>> {
     // pg_class has OID 1259 in PostgreSQL; use the standard constant so ORMs can join if needed.
     const PG_CLASS_OID: i64 = 1259;
 
-    let seqs = store.list_sequences(txn).await?;
+    let seqs = store.list_sequences(txn, db_id).await?;
     let mut rows = Vec::new();
 
     for seq in seqs {
         let Some((owned_table, owned_col)) = seq.owned_by.as_ref() else {
             continue;
         };
-        let Some(schema) = store.get_schema(txn, owned_table).await? else {
+        let Some(schema) = store.get_schema(txn, db_id, owned_table).await? else {
             continue;
         };
         let Some(col_idx) = schema.columns.iter().position(|c| c.name == *owned_col) else {
@@ -2174,18 +2276,19 @@ async fn get_pg_depend_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Re
 async fn get_pg_attribute_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
     for table_name in user_tables {
-        if let Some(schema) = store.get_schema(txn, table_name).await? {
+        if let Some(schema) = store.get_schema(txn, db_id, table_name).await? {
             let base_table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
 
             for (i, col) in schema.columns.iter().enumerate() {
                 let (type_oid, attlen) = if let DataType::UserDefined(udt_name) = &col.data_type {
                     let oid = store
-                        .get_type(txn, udt_name)
+                        .get_type(txn, db_id, udt_name)
                         .await?
                         .map(|t| t.oid as i64)
                         .unwrap_or(25);
@@ -2304,6 +2407,7 @@ fn get_pg_collation_rows(schema_oids: &HashMap<String, u32>) -> Vec<Row> {
 async fn get_pg_constraint_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
     schema_oids: &HashMap<String, u32>,
 ) -> Result<Vec<Row>> {
@@ -2331,7 +2435,7 @@ async fn get_pg_constraint_rows(
     let mut table_schemas: HashMap<String, TableSchema> = HashMap::new();
 
     for table_name in user_tables {
-        if let Some(schema) = store.get_schema(txn, table_name).await? {
+        if let Some(schema) = store.get_schema(txn, db_id, table_name).await? {
             let base_table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
 
             table_oids.insert(table_name.to_string(), base_table_oid);
@@ -2512,6 +2616,7 @@ async fn get_pg_constraint_rows(
 async fn get_pg_type_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     schema_oids: &HashMap<String, u32>,
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
@@ -2625,7 +2730,7 @@ async fn get_pg_type_rows(
         int_val(0),
     ]));
 
-    let mut user_types = store.list_types(txn).await?;
+    let mut user_types = store.list_types(txn, db_id).await?;
     user_types.sort_by_key(|t| t.oid);
     for def in user_types {
         let (typlen, typbyval, typtype, typcategory) = match def.kind {
@@ -2655,10 +2760,14 @@ async fn get_pg_type_rows(
     Ok(rows)
 }
 
-async fn get_pg_enum_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
+async fn get_pg_enum_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
 
-    let mut user_types = store.list_types(txn).await?;
+    let mut user_types = store.list_types(txn, db_id).await?;
     user_types.sort_by_key(|t| t.oid);
 
     for def in user_types {
@@ -2687,12 +2796,13 @@ async fn get_pg_enum_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Resu
 async fn get_pg_proc_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     schema_oids: &HashMap<String, u32>,
 ) -> Result<Vec<Row>> {
     let pg_catalog_oid = schema_oid(schema_oids, "pg_catalog");
     let extensions_oid = schema_oid(schema_oids, crate::extensions::EXTENSIONS_SCHEMA);
 
-    let mut funcs = store.list_functions(txn).await?;
+    let mut funcs = store.list_functions(txn, db_id).await?;
     funcs.sort_by_key(|f| f.oid);
 
     let mut rows = Vec::new();
@@ -2721,7 +2831,7 @@ async fn get_pg_proc_rows(
         ]));
     }
 
-    if let Some(ext) = store.get_extension(txn, "http").await? {
+    if let Some(ext) = store.get_extension(txn, db_id, "http").await? {
         if ext.enabled {
             for (oid, name) in [
                 (1101_i64, "http_get"),
@@ -2750,7 +2860,7 @@ async fn get_pg_proc_rows(
 
         let prorettype = if base_ret.contains('.') {
             store
-                .get_type(txn, base_ret)
+                .get_type(txn, db_id, base_ret)
                 .await?
                 .map(|t| t.oid as i64)
                 .unwrap_or(25)
@@ -2791,9 +2901,10 @@ async fn get_pg_proc_rows(
 async fn get_pg_extension_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     schema_oids: &HashMap<String, u32>,
 ) -> Result<Vec<Row>> {
-    let mut exts = store.list_extensions(txn).await?;
+    let mut exts = store.list_extensions(txn, db_id).await?;
     exts.sort_by(|a, b| a.name.cmp(&b.name));
 
     let mut rows = Vec::new();
@@ -2821,11 +2932,12 @@ async fn get_pg_extension_rows(
 async fn get_pg_trigger_rows(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut table_oids: HashMap<String, i64> = HashMap::new();
     for table_name in user_tables {
-        if let Some(schema) = store.get_schema(txn, table_name).await? {
+        if let Some(schema) = store.get_schema(txn, db_id, table_name).await? {
             table_oids.insert(
                 table_name.to_string(),
                 catalog_oids::pg_class_table_oid(schema.table_id)?,
@@ -2834,7 +2946,7 @@ async fn get_pg_trigger_rows(
     }
 
     let mut func_oids: HashMap<String, i64> = HashMap::new();
-    let funcs = store.list_functions(txn).await?;
+    let funcs = store.list_functions(txn, db_id).await?;
     for f in funcs {
         func_oids.insert(
             format!("{}.{}", f.schema, f.name),
@@ -2842,7 +2954,7 @@ async fn get_pg_trigger_rows(
         );
     }
 
-    let mut triggers = store.list_triggers(txn).await?;
+    let mut triggers = store.list_triggers(txn, db_id).await?;
     triggers.sort_by_key(|t| t.oid);
 
     let mut rows = Vec::new();
@@ -2862,13 +2974,17 @@ async fn get_pg_trigger_rows(
     Ok(rows)
 }
 
-async fn get_pg_description_rows(store: &Arc<TikvStore>, txn: &mut Transaction) -> Result<Vec<Row>> {
+async fn get_pg_description_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+) -> Result<Vec<Row>> {
     // pg_catalog relation OIDs (stable in PostgreSQL). ORMs may join/filter on these.
     const PG_CLASS_OID: i64 = 1259;
     const PG_PROC_OID: i64 = 1255;
     const PG_EXTENSION_OID: i64 = 3079;
 
-    let comments = store.list_comments(txn).await?;
+    let comments = store.list_comments(txn, db_id).await?;
     let mut rows = Vec::new();
 
     for rec in comments {
@@ -2877,7 +2993,7 @@ async fn get_pg_description_rows(store: &Arc<TikvStore>, txn: &mut Transaction) 
 
         match target {
             CommentTarget::Extension { name } => {
-                if store.get_extension(txn, &name).await?.is_none() {
+                if store.get_extension(txn, db_id, &name).await?.is_none() {
                     continue;
                 }
                 let objoid = crate::extensions::descriptor(&name)
@@ -2891,14 +3007,14 @@ async fn get_pg_description_rows(store: &Arc<TikvStore>, txn: &mut Transaction) 
                 ]));
             }
             CommentTarget::Function { full_name } => {
-                let Some(def) = store.get_function(txn, &full_name).await? else {
+                let Some(def) = store.get_function(txn, db_id, &full_name).await? else {
                     continue;
                 };
                 let oid = catalog_oids::pg_proc_function_oid(def.oid);
                 rows.push(Row::new(vec![int_val(oid), int_val(PG_PROC_OID), int_val(0), description]));
             }
             CommentTarget::Table { full_name } => {
-                let Some(schema) = store.get_schema(txn, &full_name).await? else {
+                let Some(schema) = store.get_schema(txn, db_id, &full_name).await? else {
                     continue;
                 };
                 let oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
@@ -2908,7 +3024,7 @@ async fn get_pg_description_rows(store: &Arc<TikvStore>, txn: &mut Transaction) 
                 table_full_name,
                 column_name,
             } => {
-                let Some(schema) = store.get_schema(txn, &table_full_name).await? else {
+                let Some(schema) = store.get_schema(txn, db_id, &table_full_name).await? else {
                     continue;
                 };
                 let Some(col_idx) = schema.column_index(&column_name) else {

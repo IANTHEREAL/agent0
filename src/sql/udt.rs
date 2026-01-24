@@ -21,12 +21,13 @@ pub(crate) fn resolve_type_name(
 pub async fn execute_create_type(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     name: &ObjectName,
     representation: &UserDefinedTypeRepresentation,
 ) -> Result<ExecuteResult> {
     let (schema, type_name, full_name) = resolve_type_name(name, search_path)?;
-    if !store.schema_exists(txn, &schema).await? {
+    if !store.schema_exists(txn, db_id, &schema).await? {
         return Err(anyhow!("schema '{}' does not exist", schema));
     }
 
@@ -50,7 +51,7 @@ pub async fn execute_create_type(
         }
     };
 
-    let oid = store.next_type_oid(txn).await?;
+    let oid = store.next_type_oid(txn, db_id).await?;
     let def = UserTypeDef {
         oid,
         schema,
@@ -59,13 +60,14 @@ pub async fn execute_create_type(
         owner: "postgres".to_string(),
     };
 
-    store.create_type(txn, def).await?;
+    store.create_type(txn, db_id, def).await?;
     Ok(ExecuteResult::Empty)
 }
 
 pub async fn create_enum_type(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     schema: String,
     type_name: String,
     labels: Vec<String>,
@@ -85,7 +87,7 @@ pub async fn create_enum_type(
         return Err(anyhow!("ENUM must have at least one value"));
     }
 
-    let oid = store.next_type_oid(txn).await?;
+    let oid = store.next_type_oid(txn, db_id).await?;
     let def = UserTypeDef {
         oid,
         schema,
@@ -94,20 +96,21 @@ pub async fn create_enum_type(
         owner: "postgres".to_string(),
     };
 
-    store.create_type(txn, def).await?;
+    store.create_type(txn, db_id, def).await?;
     Ok(ExecuteResult::Empty)
 }
 
 pub async fn drop_types(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     full_names: &[String],
     if_exists: bool,
 ) -> Result<ExecuteResult> {
-    let user_tables = store.list_tables(txn).await?;
+    let user_tables = store.list_tables(txn, db_id).await?;
 
     for full_name in full_names {
-        let exists = store.get_type(txn, full_name).await?.is_some();
+        let exists = store.get_type(txn, db_id, full_name).await?.is_some();
         if !exists {
             if if_exists {
                 continue;
@@ -116,7 +119,7 @@ pub async fn drop_types(
         }
 
         for table_name in &user_tables {
-            if let Some(schema) = store.get_schema(txn, table_name).await? {
+            if let Some(schema) = store.get_schema(txn, db_id, table_name).await? {
                 if let Some(col) = schema
                     .columns
                     .iter()
@@ -130,7 +133,7 @@ pub async fn drop_types(
             }
         }
 
-        store.drop_type(txn, full_name).await?;
+        store.drop_type(txn, db_id, full_name).await?;
     }
     Ok(ExecuteResult::Empty)
 }

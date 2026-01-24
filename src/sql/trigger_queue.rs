@@ -140,6 +140,7 @@ pub(crate) enum TriggerOp {
 pub(crate) struct TriggerEvent {
     pub id: u64,
     pub trigger_name: String,
+    pub db_id: u64,
     pub table_name: String,
     pub operation: TriggerOp,
     pub old_row: Option<Row>,
@@ -155,6 +156,7 @@ pub(crate) struct TriggerEvent {
 impl TriggerEvent {
     pub(crate) fn new_pending(
         trigger_name: String,
+        db_id: u64,
         table_name: String,
         operation: TriggerOp,
         old_row: Option<Row>,
@@ -163,6 +165,7 @@ impl TriggerEvent {
         Self {
             id: generate_event_id(),
             trigger_name,
+            db_id,
             table_name,
             operation,
             old_row,
@@ -224,6 +227,7 @@ mod tests {
     fn trigger_event_bincode_roundtrip() {
         let ev = TriggerEvent::new_pending(
             "t".to_string(),
+            1,
             "public.tbl".to_string(),
             TriggerOp::Insert,
             None,

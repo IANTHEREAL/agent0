@@ -80,6 +80,7 @@ fn extract_gin_token_hashes_from_row(
 async fn resolve_column_data_type(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     sql_type: &SqlDataType,
 ) -> Result<(DataType, bool)> {
@@ -95,13 +96,19 @@ async fn resolve_column_data_type(
                 "VECTOR" | "JSON" | "JSONB" => Ok((convert_data_type(sql_type)?, false)),
                 _ => {
                     let resolved_type =
-                        names::resolve_existing_type_name(store.as_ref(), txn, name, search_path)
+                        names::resolve_existing_type_name(
+                            store.as_ref(),
+                            txn,
+                            db_id,
+                            name,
+                            search_path,
+                        )
                             .await?;
                     let Some(resolved_type) = resolved_type else {
                         return Ok((convert_data_type(sql_type)?, false));
                     };
                     let full_name = resolved_type.full;
-                    match store.get_type(txn, &full_name).await? {
+                    match store.get_type(txn, db_id, &full_name).await? {
                         Some(def) => match def.kind {
                             crate::types::UserTypeKind::Enum { .. } => {
                                 Ok((DataType::UserDefined(full_name), false))
@@ -123,6 +130,7 @@ async fn resolve_column_data_type(
 async fn create_implicit_sequences_for_schema(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     schema: &TableSchema,
 ) -> Result<()> {
     for col in &schema.columns {
@@ -130,6 +138,7 @@ async fn create_implicit_sequences_for_schema(
             store
                 .create_sequence(
                     txn,
+                    db_id,
                     sequences::build_implicit_sequence_def(
                         &schema.name,
                         &col.name,
@@ -145,15 +154,16 @@ async fn create_implicit_sequences_for_schema(
 async fn drop_owned_sequences_for_table(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     table_name: &str,
 ) -> Result<()> {
-    let seqs = store.list_sequences(txn).await?;
+    let seqs = store.list_sequences(txn, db_id).await?;
     for def in seqs {
         let Some((owned_table, _)) = &def.owned_by else {
             continue;
         };
         if owned_table == table_name {
-            store.drop_sequence(txn, &def.full_name()).await?;
+            store.drop_sequence(txn, db_id, &def.full_name()).await?;
         }
     }
     Ok(())
@@ -376,10 +386,13 @@ fn prefix_end(mut key: Vec<u8>) -> Vec<u8> {
     unreachable!("prefix_end called with all-0xFF prefix")
 }
 
-fn index_prefix_range(table_id: u64, index_id: u64) -> (Vec<u8>, Vec<u8>) {
+fn index_prefix_range(db_id: u64, table_id: u64, index_id: u64) -> (Vec<u8>, Vec<u8>) {
     // Compute the end bound by incrementing the fixed-length (table_id, index_id) prefix,
     // so the range is independent of memcomparable-encoded index values.
-    let mut prefix = Vec::with_capacity(2 + 8 + 1 + 8);
+    let mut prefix = Vec::with_capacity(2 + 8 + 1 + 2 + 8 + 1 + 8);
+    prefix.extend_from_slice(b"d_");
+    prefix.extend_from_slice(&db_id.to_be_bytes());
+    prefix.push(b'_');
     prefix.extend_from_slice(b"i_");
     prefix.extend_from_slice(&table_id.to_be_bytes());
     prefix.push(b'_');
@@ -432,6 +445,7 @@ fn coerce_value_for_type_change(val: Value, target_col: &ColumnDef) -> Result<Va
 pub async fn execute_create_table(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     name: &ObjectName,
     columns: &[SqlColumnDef],
@@ -443,11 +457,11 @@ pub async fn execute_create_table(
         name: table_object_name,
         full: table_full_name,
     } = names::resolve_ddl_object_name(name, search_path)?;
-    if !store.schema_exists(txn, &table_schema_name).await? {
+    if !store.schema_exists(txn, db_id, &table_schema_name).await? {
         return Err(anyhow!("schema '{}' does not exist", table_schema_name));
     }
 
-    if if_not_exists && store.table_exists(txn, &table_full_name).await? {
+    if if_not_exists && store.table_exists(txn, db_id, &table_full_name).await? {
         return Ok(ExecuteResult::CreateTable {
             table_name: table_full_name,
         });
@@ -489,7 +503,7 @@ pub async fn execute_create_table(
     for col in columns {
         let col_name = normalize_ident(&col.name);
         let (data_type, mut is_serial) =
-            resolve_column_data_type(store, txn, search_path, &col.data_type).await?;
+            resolve_column_data_type(store, txn, db_id, search_path, &col.data_type).await?;
 
         let mut is_pk = pk_columns.contains(&col_name);
         let mut nullable = true;
@@ -545,6 +559,7 @@ pub async fn execute_create_table(
                         names::resolve_existing_table_name(
                             store.as_ref(),
                             txn,
+                            db_id,
                             foreign_table,
                             search_path,
                         )
@@ -634,7 +649,7 @@ pub async fn execute_create_table(
         )
     };
 
-    let table_id = store.next_table_id(txn).await?;
+    let table_id = store.next_table_id(txn, db_id).await?;
 
     let mut indexes = Vec::new();
     let mut next_index_id = 1u64;
@@ -702,6 +717,7 @@ pub async fn execute_create_table(
                     names::resolve_existing_table_name(
                         store.as_ref(),
                         txn,
+                        db_id,
                         foreign_table,
                         search_path,
                     )
@@ -769,8 +785,8 @@ pub async fn execute_create_table(
         foreign_keys,
         owner: "postgres".to_string(),
     };
-    store.create_table(txn, schema.clone()).await?;
-    create_implicit_sequences_for_schema(store, txn, &schema).await?;
+    store.create_table(txn, db_id, schema.clone()).await?;
+    create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
 
     Ok(ExecuteResult::CreateTable {
         table_name: table_full_name,
@@ -780,13 +796,14 @@ pub async fn execute_create_table(
 pub async fn create_table_from_query_result(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     table_name: &str,
     if_not_exists: bool,
     result_cols: Vec<String>,
     result_rows: Vec<Row>,
     explicit_columns: &[SqlColumnDef],
 ) -> Result<ExecuteResult> {
-    if if_not_exists && store.table_exists(txn, table_name).await? {
+    if if_not_exists && store.table_exists(txn, db_id, table_name).await? {
         return Ok(ExecuteResult::CreateTable {
             table_name: table_name.to_string(),
         });
@@ -835,7 +852,7 @@ pub async fn create_table_from_query_result(
         }));
     }
 
-    let table_id = store.next_table_id(txn).await?;
+    let table_id = store.next_table_id(txn, db_id).await?;
     let pk_constraint_name = Some(format!(
         "{}_pkey",
         table_name.rsplit('.').next().unwrap_or(table_name)
@@ -852,19 +869,21 @@ pub async fn create_table_from_query_result(
         foreign_keys: vec![],
         owner: "postgres".to_string(),
     };
-    store.create_table(txn, schema.clone()).await?;
-    create_implicit_sequences_for_schema(store, txn, &schema).await?;
+    store.create_table(txn, db_id, schema.clone()).await?;
+    create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
 
     let row_count = result_rows.len();
     for (i, row) in result_rows.into_iter().enumerate() {
         let mut values = vec![Value::Int64((i + 1) as i64)];
         values.extend(row.values);
-        store.upsert(txn, table_name, Row::new(values)).await?;
+        store
+            .upsert(txn, db_id, table_name, Row::new(values))
+            .await?;
     }
 
     if row_count > 0 {
         store
-            .set_sequence_value(txn, schema.table_id, row_count as u64)
+            .set_sequence_value(txn, db_id, schema.table_id, row_count as u64)
             .await?;
     }
 
@@ -876,11 +895,12 @@ pub async fn create_table_from_query_result(
 pub async fn create_table_from_select_into(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     table_name: &str,
     result_cols: Vec<String>,
     result_rows: Vec<Row>,
 ) -> Result<ExecuteResult> {
-    if store.table_exists(txn, table_name).await? {
+    if store.table_exists(txn, db_id, table_name).await? {
         return Err(anyhow!("relation \"{}\" already exists", table_name));
     }
 
@@ -912,7 +932,7 @@ pub async fn create_table_from_select_into(
         }
     }));
 
-    let table_id = store.next_table_id(txn).await?;
+    let table_id = store.next_table_id(txn, db_id).await?;
     let pk_constraint_name = Some(format!(
         "{}_pkey",
         table_name.rsplit('.').next().unwrap_or(table_name)
@@ -929,19 +949,21 @@ pub async fn create_table_from_select_into(
         foreign_keys: vec![],
         owner: "postgres".to_string(),
     };
-    store.create_table(txn, schema.clone()).await?;
-    create_implicit_sequences_for_schema(store, txn, &schema).await?;
+    store.create_table(txn, db_id, schema.clone()).await?;
+    create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
 
     let row_count = result_rows.len();
     for (i, row) in result_rows.into_iter().enumerate() {
         let mut values = vec![Value::Int64((i + 1) as i64)];
         values.extend(row.values);
-        store.upsert(txn, table_name, Row::new(values)).await?;
+        store
+            .upsert(txn, db_id, table_name, Row::new(values))
+            .await?;
     }
 
     if row_count > 0 {
         store
-            .set_sequence_value(txn, schema.table_id, row_count as u64)
+            .set_sequence_value(txn, db_id, schema.table_id, row_count as u64)
             .await?;
     }
 
@@ -953,6 +975,7 @@ pub async fn create_table_from_select_into(
 pub async fn execute_create_index(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     idx_name: &str,
     table_name: &str,
     using: Option<&sqlparser::ast::Ident>,
@@ -966,7 +989,7 @@ pub async fn execute_create_index(
     let tbl_name = table_name;
 
     let mut schema = store
-        .get_schema(txn, tbl_name)
+        .get_schema(txn, db_id, tbl_name)
         .await?
         .ok_or_else(|| anyhow!("Table not found"))?;
 
@@ -1043,6 +1066,7 @@ pub async fn execute_create_index(
             store
                 .create_index_entry(
                     txn,
+                    db_id,
                     schema.table_id,
                     index_id,
                     &idx_values,
@@ -1059,13 +1083,13 @@ pub async fn execute_create_index(
             }
             let pk_values = schema.get_pk_values(&row);
             store
-                .create_gin_index_entries(txn, schema.table_id, index_id, &hashes, &pk_values)
+                .create_gin_index_entries(txn, db_id, schema.table_id, index_id, &hashes, &pk_values)
                 .await?;
         }
     }
 
     schema.indexes.push(new_index);
-    store.update_schema(txn, schema).await?;
+    store.update_schema(txn, db_id, schema).await?;
 
     Ok(ExecuteResult::CreateIndex {
         index_name: idx_name_str,
@@ -1075,27 +1099,30 @@ pub async fn execute_create_index(
 pub async fn execute_create_view(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     name: &ObjectName,
     query: &Query,
     or_replace: bool,
 ) -> Result<ExecuteResult> {
     let resolved = names::resolve_ddl_object_name(name, search_path)?;
-    if !store.schema_exists(txn, &resolved.schema).await? {
+    if !store.schema_exists(txn, db_id, &resolved.schema).await? {
         return Err(anyhow!("schema '{}' does not exist", resolved.schema));
     }
     let view_name = resolved.full;
 
-    if store.get_view(txn, &view_name).await?.is_some() {
+    if store.get_view(txn, db_id, &view_name).await?.is_some() {
         if or_replace {
-            store.drop_view(txn, &view_name).await?;
+            store.drop_view(txn, db_id, &view_name).await?;
         } else {
             return Err(anyhow!("View '{}' already exists", view_name));
         }
     }
 
     let query_str = query.to_string();
-    store.create_view(txn, &view_name, &query_str).await?;
+    store
+        .create_view(txn, db_id, &view_name, &query_str)
+        .await?;
 
     Ok(ExecuteResult::CreateView { view_name })
 }
@@ -1103,6 +1130,7 @@ pub async fn execute_create_view(
 pub async fn execute_drop_view(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     names: &[ObjectName],
     if_exists: bool,
@@ -1112,6 +1140,7 @@ pub async fn execute_drop_view(
         let resolved = match names::resolve_existing_view_name(
             store.as_ref(),
             txn,
+            db_id,
             name,
             search_path,
         )
@@ -1125,7 +1154,7 @@ pub async fn execute_drop_view(
                 continue;
             }
         };
-        if !store.drop_view(txn, &resolved.full).await? && !if_exists {
+        if !store.drop_view(txn, db_id, &resolved.full).await? && !if_exists {
             return Err(anyhow!("View '{}' does not exist", resolved.full));
         }
         last = resolved.full;
@@ -1136,6 +1165,7 @@ pub async fn execute_drop_view(
 pub async fn execute_create_materialized_view(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     name: &ObjectName,
     query: &Query,
@@ -1144,21 +1174,21 @@ pub async fn execute_create_materialized_view(
     rows: Vec<Row>,
 ) -> Result<ExecuteResult> {
     let resolved = names::resolve_ddl_object_name(name, search_path)?;
-    if !store.schema_exists(txn, &resolved.schema).await? {
+    if !store.schema_exists(txn, db_id, &resolved.schema).await? {
         return Err(anyhow!("schema '{}' does not exist", resolved.schema));
     }
     let view_name = resolved.full;
     schema.name = view_name.clone();
 
     if store
-        .get_materialized_view(txn, &view_name)
+        .get_materialized_view(txn, db_id, &view_name)
         .await?
         .is_some()
     {
         if or_replace {
-            drop_owned_sequences_for_table(store, txn, &view_name).await?;
-            store.drop_materialized_view(txn, &view_name).await?;
-            store.drop_table(txn, &view_name).await?;
+            drop_owned_sequences_for_table(store, txn, db_id, &view_name).await?;
+            store.drop_materialized_view(txn, db_id, &view_name).await?;
+            store.drop_table(txn, db_id, &view_name).await?;
         } else {
             return Err(anyhow!("Materialized view '{}' already exists", view_name));
         }
@@ -1166,18 +1196,18 @@ pub async fn execute_create_materialized_view(
 
     let query_str = query.to_string();
     store
-        .create_materialized_view(txn, &view_name, &query_str)
+        .create_materialized_view(txn, db_id, &view_name, &query_str)
         .await?;
 
     let row_count = rows.len();
-    store.create_table(txn, schema.clone()).await?;
-    create_implicit_sequences_for_schema(store, txn, &schema).await?;
+    store.create_table(txn, db_id, schema.clone()).await?;
+    create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
     for row in rows {
-        store.insert(txn, &view_name, row).await?;
+        store.insert(txn, db_id, &view_name, row).await?;
     }
     if row_count > 0 {
         store
-            .set_sequence_value(txn, schema.table_id, row_count as u64)
+            .set_sequence_value(txn, db_id, schema.table_id, row_count as u64)
             .await?;
     }
 
@@ -1187,6 +1217,7 @@ pub async fn execute_create_materialized_view(
 pub async fn execute_drop_materialized_view(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     names: &[ObjectName],
     if_exists: bool,
@@ -1196,6 +1227,7 @@ pub async fn execute_drop_materialized_view(
         let resolved = match names::resolve_existing_materialized_view_name(
             store.as_ref(),
             txn,
+            db_id,
             name,
             search_path,
         )
@@ -1210,7 +1242,7 @@ pub async fn execute_drop_materialized_view(
             }
         };
 
-        let exists = store.drop_materialized_view(txn, &resolved.full).await?;
+        let exists = store.drop_materialized_view(txn, db_id, &resolved.full).await?;
         if !exists && !if_exists {
             return Err(anyhow!(
                 "Materialized view '{}' does not exist",
@@ -1218,8 +1250,8 @@ pub async fn execute_drop_materialized_view(
             ));
         }
         if exists {
-            drop_owned_sequences_for_table(store, txn, &resolved.full).await?;
-            store.drop_table(txn, &resolved.full).await?;
+            drop_owned_sequences_for_table(store, txn, db_id, &resolved.full).await?;
+            store.drop_table(txn, db_id, &resolved.full).await?;
         }
         last = resolved.full;
     }
@@ -1229,28 +1261,29 @@ pub async fn execute_drop_materialized_view(
 pub async fn execute_refresh_materialized_view(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     name: &str,
     rows: Vec<Row>,
 ) -> Result<ExecuteResult> {
-    if store.get_materialized_view(txn, name).await?.is_none() {
+    if store.get_materialized_view(txn, db_id, name).await?.is_none() {
         return Err(anyhow!("Materialized view '{}' does not exist", name));
     }
 
     let schema = store
-        .get_schema(txn, name)
+        .get_schema(txn, db_id, name)
         .await?
         .ok_or_else(|| anyhow!("Materialized view '{}' does not exist", name))?;
 
-    if !store.truncate_table(txn, name).await? {
+    if !store.truncate_table(txn, db_id, name).await? {
         return Err(anyhow!("Materialized view '{}' does not exist", name));
     }
     let row_count = rows.len();
     for row in rows {
-        store.insert(txn, name, row).await?;
+        store.insert(txn, db_id, name, row).await?;
     }
     if row_count > 0 {
         store
-            .set_sequence_value(txn, schema.table_id, row_count as u64)
+            .set_sequence_value(txn, db_id, schema.table_id, row_count as u64)
             .await?;
     }
 
@@ -1262,6 +1295,7 @@ pub async fn execute_refresh_materialized_view(
 pub async fn execute_drop_table(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     names: &[ObjectName],
     if_exists: bool,
@@ -1269,7 +1303,8 @@ pub async fn execute_drop_table(
     let mut last = String::new();
     for name in names {
         let resolved =
-            match names::resolve_existing_table_name(store.as_ref(), txn, name, search_path).await?
+            match names::resolve_existing_table_name(store.as_ref(), txn, db_id, name, search_path)
+                .await?
             {
                 Some(resolved) => resolved,
                 None => {
@@ -1279,13 +1314,16 @@ pub async fn execute_drop_table(
                     continue;
                 }
             };
-        for trigger in store.list_triggers_for_table(txn, &resolved.full).await? {
+        for trigger in store
+            .list_triggers_for_table(txn, db_id, &resolved.full)
+            .await?
+        {
             let _ = store
-                .drop_trigger(txn, &resolved.full, &trigger.name)
+                .drop_trigger(txn, db_id, &resolved.full, &trigger.name)
                 .await?;
         }
-        drop_owned_sequences_for_table(store, txn, &resolved.full).await?;
-        store.drop_table(txn, &resolved.full).await?;
+        drop_owned_sequences_for_table(store, txn, db_id, &resolved.full).await?;
+        store.drop_table(txn, db_id, &resolved.full).await?;
         last = resolved.full;
     }
     Ok(ExecuteResult::DropTable { table_name: last })
@@ -1294,14 +1332,16 @@ pub async fn execute_drop_table(
 pub async fn execute_truncate(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     table_name: &ObjectName,
 ) -> Result<ExecuteResult> {
-    let resolved = names::resolve_existing_table_name(store.as_ref(), txn, table_name, search_path)
-        .await?
+    let resolved =
+        names::resolve_existing_table_name(store.as_ref(), txn, db_id, table_name, search_path)
+            .await?
         .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
     let t = resolved.full;
-    if !store.truncate_table(txn, &t).await? {
+    if !store.truncate_table(txn, db_id, &t).await? {
         return Err(anyhow!("Table '{}' does not exist", t));
     }
     Ok(ExecuteResult::TruncateTable { table_name: t })
@@ -1310,6 +1350,7 @@ pub async fn execute_truncate(
 pub async fn execute_drop_index(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     idx_name: &str,
     schema: &mut TableSchema,
     _table_name: &str,
@@ -1325,6 +1366,7 @@ pub async fn execute_drop_index(
                 store
                     .delete_gin_index_entries(
                         txn,
+                        db_id,
                         schema.table_id,
                         index.id,
                         &gin_hashes,
@@ -1345,6 +1387,7 @@ pub async fn execute_drop_index(
             store
                 .delete_index_entry(
                     txn,
+                    db_id,
                     schema.table_id,
                     index.id,
                     &idx_values,
@@ -1353,7 +1396,7 @@ pub async fn execute_drop_index(
                 )
                 .await?;
         }
-        store.update_schema(txn, schema.clone()).await?;
+        store.update_schema(txn, db_id, schema.clone()).await?;
         return Ok(Some(idx_name.to_string()));
     }
     Ok(None)
@@ -1362,18 +1405,19 @@ pub async fn execute_drop_index(
 pub async fn execute_alter_table(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     name: &ObjectName,
     operation: &AlterTableOperation,
 ) -> Result<ExecuteResult> {
-    let resolved = names::resolve_existing_table_name(store.as_ref(), txn, name, search_path)
+    let resolved = names::resolve_existing_table_name(store.as_ref(), txn, db_id, name, search_path)
         .await?
         .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?;
     let table_object_name = resolved.name.clone();
     let t = resolved.full;
     let mut result_table_name = t.clone();
     let mut schema = store
-        .get_schema(txn, &t)
+        .get_schema(txn, db_id, &t)
         .await?
         .ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
     assign_generated_check_constraint_names(
@@ -1391,7 +1435,7 @@ pub async fn execute_alter_table(
                 return Err(anyhow!("Column exists"));
             }
             let (data_type, mut is_serial) =
-                resolve_column_data_type(store, txn, search_path, &column_def.data_type).await?;
+                resolve_column_data_type(store, txn, db_id, search_path, &column_def.data_type).await?;
             let mut nullable = true;
             let mut default_expr = None;
             for opt in &column_def.options {
@@ -1414,7 +1458,7 @@ pub async fn execute_alter_table(
                 nullable = false;
             }
             if !nullable && default_expr.is_none() {
-                let (start, end) = crate::storage::encode_table_data_range(schema.table_id);
+                let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                 let range: tikv_client::BoundRange = (start..end).into();
                 let existing_rows: Vec<_> = txn.scan(range, 1).await?.collect();
                 if !existing_rows.is_empty() {
@@ -1434,6 +1478,7 @@ pub async fn execute_alter_table(
                 store
                     .create_sequence(
                         txn,
+                        db_id,
                         sequences::build_implicit_sequence_def(
                             &schema.name,
                             schema
@@ -1448,7 +1493,7 @@ pub async fn execute_alter_table(
                     .await?;
             }
             schema.version += 1;
-            store.update_schema(txn, schema).await?;
+            store.update_schema(txn, db_id, schema).await?;
         }
         AlterTableOperation::AddConstraint(constraint) => match constraint {
             TableConstraint::Unique {
@@ -1475,7 +1520,7 @@ pub async fn execute_alter_table(
                         .unwrap_or_else(|| format!("{}_pkey", table_object_name)),
                 );
                 schema.version += 1;
-                store.update_schema(txn, schema).await?;
+                store.update_schema(txn, db_id, schema).await?;
             }
             TableConstraint::Unique { columns, name, .. } => {
                 let col_names: Vec<String> = columns.iter().map(normalize_ident).collect();
@@ -1516,7 +1561,7 @@ pub async fn execute_alter_table(
                     expressions: Vec::new(),
                 };
 
-                let (start, end) = crate::storage::encode_table_data_range(schema.table_id);
+                let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                 let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                 while let Some(batch) = scanner.next_batch(txn).await? {
                     for pair in batch {
@@ -1528,6 +1573,7 @@ pub async fn execute_alter_table(
                         store
                             .create_index_entry(
                                 txn,
+                                db_id,
                                 schema.table_id,
                                 new_index.id,
                                 &idx_values,
@@ -1540,7 +1586,7 @@ pub async fn execute_alter_table(
 
                 schema.indexes.push(new_index);
                 schema.version += 1;
-                store.update_schema(txn, schema).await?;
+                store.update_schema(txn, db_id, schema).await?;
             }
             TableConstraint::ForeignKey {
                 name,
@@ -1561,13 +1607,17 @@ pub async fn execute_alter_table(
                 let ref_table = names::resolve_existing_table_name(
                     store.as_ref(),
                     txn,
+                    db_id,
                     foreign_table,
                     search_path,
                 )
                 .await?
                 .ok_or_else(|| anyhow!("Referenced table '{}' does not exist", foreign_table))?
                 .full;
-                let ref_schema = store.get_schema(txn, &ref_table).await?.ok_or_else(|| {
+                let ref_schema = store
+                    .get_schema(txn, db_id, &ref_table)
+                    .await?
+                    .ok_or_else(|| {
                     anyhow!("Referenced table '{}' not found for foreign key", ref_table)
                 })?;
                 let ref_cols: Vec<String> = referred_columns.iter().map(normalize_ident).collect();
@@ -1615,7 +1665,7 @@ pub async fn execute_alter_table(
                     };
 
                 // PostgreSQL validates existing rows by default (unless NOT VALID).
-                let (start, end) = crate::storage::encode_table_data_range(schema.table_id);
+                let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                 let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                 while let Some(batch) = scanner.next_batch(txn).await? {
                     for pair in batch {
@@ -1640,6 +1690,7 @@ pub async fn execute_alter_table(
                         let ref_rows = store
                             .batch_get_rows(
                                 txn,
+                                db_id,
                                 ref_schema.table_id,
                                 vec![fk_values.clone()],
                                 &ref_schema,
@@ -1671,7 +1722,7 @@ pub async fn execute_alter_table(
                     on_update: parse_action(on_update),
                 });
                 schema.version += 1;
-                store.update_schema(txn, schema).await?;
+                store.update_schema(txn, db_id, schema).await?;
             }
             TableConstraint::Check { name, expr } => {
                 let expr_str = expr.to_string();
@@ -1693,7 +1744,7 @@ pub async fn execute_alter_table(
                 }
 
                 // PostgreSQL validates existing rows by default (unless NOT VALID).
-                let (start, end) = crate::storage::encode_table_data_range(schema.table_id);
+                let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                 let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                 while let Some(batch) = scanner.next_batch(txn).await? {
                     for pair in batch {
@@ -1724,7 +1775,7 @@ pub async fn execute_alter_table(
                     expr: expr_str,
                 });
                 schema.version += 1;
-                store.update_schema(txn, schema).await?;
+                store.update_schema(txn, db_id, schema).await?;
             }
             _ => {
                 return Err(anyhow!(
@@ -1752,7 +1803,7 @@ pub async fn execute_alter_table(
                     }
                 };
                 if constraint_name == pk_name {
-                    let (start, end) = crate::storage::encode_table_data_range(schema.table_id);
+                    let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                     let range: tikv_client::BoundRange = (start..end).into();
                     let existing_rows: Vec<_> = txn.scan(range, 1).await?.collect();
                     if !existing_rows.is_empty() {
@@ -1770,7 +1821,7 @@ pub async fn execute_alter_table(
                     schema.pk_indices.clear();
                     schema.pk_constraint_name = None;
                     schema.version += 1;
-                    store.update_schema(txn, schema).await?;
+                    store.update_schema(txn, db_id, schema).await?;
                     return Ok(ExecuteResult::AlterTable {
                         table_name: result_table_name,
                     });
@@ -1784,7 +1835,7 @@ pub async fn execute_alter_table(
             {
                 schema.foreign_keys.remove(pos);
                 schema.version += 1;
-                store.update_schema(txn, schema).await?;
+                store.update_schema(txn, db_id, schema).await?;
                 return Ok(ExecuteResult::AlterTable {
                     table_name: result_table_name,
                 });
@@ -1795,7 +1846,7 @@ pub async fn execute_alter_table(
             {
                 schema.check_constraints.remove(pos);
                 schema.version += 1;
-                store.update_schema(txn, schema).await?;
+                store.update_schema(txn, db_id, schema).await?;
                 return Ok(ExecuteResult::AlterTable {
                     table_name: result_table_name,
                 });
@@ -1816,7 +1867,7 @@ pub async fn execute_alter_table(
                     });
                 }
 
-                let (start, end) = index_prefix_range(schema.table_id, index.id);
+                let (start, end) = index_prefix_range(db_id, schema.table_id, index.id);
                 delete_range(txn, start, end).await?;
                 schema.indexes.remove(pos);
 
@@ -1833,7 +1884,7 @@ pub async fn execute_alter_table(
                 }
 
                 schema.version += 1;
-                store.update_schema(txn, schema).await?;
+                store.update_schema(txn, db_id, schema).await?;
                 return Ok(ExecuteResult::AlterTable {
                     table_name: result_table_name,
                 });
@@ -1892,7 +1943,7 @@ pub async fn execute_alter_table(
                         }
                     }
 
-                    let (start, end) = crate::storage::encode_table_data_range(schema.table_id);
+                    let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                     let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                     while let Some(batch) = scanner.next_batch(txn).await? {
                         for pair in batch {
@@ -1911,7 +1962,7 @@ pub async fn execute_alter_table(
                         }
                     }
                     schema.version += 1;
-                    store.update_schema(txn, schema).await?;
+                    store.update_schema(txn, db_id, schema).await?;
                 }
                 None => {
                     if !if_exists {
@@ -1959,7 +2010,7 @@ pub async fn execute_alter_table(
                 }
             }
             schema.version += 1;
-            store.update_schema(txn, schema).await?;
+            store.update_schema(txn, db_id, schema).await?;
         }
         AlterTableOperation::RenameTable { table_name } => {
             let new_table = table_name
@@ -1970,13 +2021,13 @@ pub async fn execute_alter_table(
 
             let (schema_name, _) = names::parse_full_name(&t)?;
             let new_full = format!("{}.{}", schema_name, new_table);
-            store.rename_table_schema(txn, &t, &new_full).await?;
+            store.rename_table_schema(txn, db_id, &t, &new_full).await?;
             result_table_name = new_full.clone();
 
             // Update referencing-side metadata (FKs store ref_table as a string).
-            let tables = store.list_tables(txn).await?;
+            let tables = store.list_tables(txn, db_id).await?;
             for table in tables {
-                let mut s = match store.get_schema(txn, &table).await? {
+                let mut s = match store.get_schema(txn, db_id, &table).await? {
                     Some(s) => s,
                     None => continue,
                 };
@@ -1989,7 +2040,7 @@ pub async fn execute_alter_table(
                 }
                 if changed {
                     s.version += 1;
-                    store.update_schema(txn, s).await?;
+                    store.update_schema(txn, db_id, s).await?;
                 }
             }
         }
@@ -2018,7 +2069,7 @@ pub async fn execute_alter_table(
             if let Some(fk) = schema.foreign_keys.iter_mut().find(|fk| fk.name == old) {
                 fk.name = new;
                 schema.version += 1;
-                store.update_schema(txn, schema).await?;
+                store.update_schema(txn, db_id, schema).await?;
                 return Ok(ExecuteResult::AlterTable {
                     table_name: result_table_name,
                 });
@@ -2027,7 +2078,7 @@ pub async fn execute_alter_table(
             if let Some(pos) = find_check_constraint_index(&schema, &table_object_name, &old) {
                 schema.check_constraints[pos].name = Some(new);
                 schema.version += 1;
-                store.update_schema(txn, schema).await?;
+                store.update_schema(txn, db_id, schema).await?;
                 return Ok(ExecuteResult::AlterTable {
                     table_name: result_table_name,
                 });
@@ -2040,7 +2091,7 @@ pub async fn execute_alter_table(
             {
                 idx.name = new;
                 schema.version += 1;
-                store.update_schema(txn, schema).await?;
+                store.update_schema(txn, db_id, schema).await?;
                 return Ok(ExecuteResult::AlterTable {
                     table_name: result_table_name,
                 });
@@ -2058,12 +2109,12 @@ pub async fn execute_alter_table(
                 AlterColumnOperation::SetDefault { value } => {
                     schema.columns[col_idx].default_expr = Some(value.to_string());
                     schema.version += 1;
-                    store.update_schema(txn, schema).await?;
+                    store.update_schema(txn, db_id, schema).await?;
                 }
                 AlterColumnOperation::DropDefault => {
                     schema.columns[col_idx].default_expr = None;
                     schema.version += 1;
-                    store.update_schema(txn, schema).await?;
+                    store.update_schema(txn, db_id, schema).await?;
                 }
                 AlterColumnOperation::SetNotNull => {
                     if !schema.columns[col_idx].nullable {
@@ -2072,7 +2123,7 @@ pub async fn execute_alter_table(
                         });
                     }
 
-                    let (start, end) = crate::storage::encode_table_data_range(schema.table_id);
+                    let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                     let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                     while let Some(batch) = scanner.next_batch(txn).await? {
                         for pair in batch {
@@ -2092,12 +2143,12 @@ pub async fn execute_alter_table(
 
                     schema.columns[col_idx].nullable = false;
                     schema.version += 1;
-                    store.update_schema(txn, schema).await?;
+                    store.update_schema(txn, db_id, schema).await?;
                 }
                 AlterColumnOperation::DropNotNull => {
                     schema.columns[col_idx].nullable = true;
                     schema.version += 1;
-                    store.update_schema(txn, schema).await?;
+                    store.update_schema(txn, db_id, schema).await?;
                 }
                 AlterColumnOperation::SetDataType { data_type, using } => {
                     if schema.pk_indices.contains(&col_idx) {
@@ -2118,7 +2169,7 @@ pub async fn execute_alter_table(
                     }
 
                     let (new_type, _) =
-                        resolve_column_data_type(store, txn, search_path, data_type).await?;
+                        resolve_column_data_type(store, txn, db_id, search_path, data_type).await?;
                     if schema.columns[col_idx].data_type == new_type {
                         return Ok(ExecuteResult::AlterTable {
                             table_name: result_table_name,
@@ -2133,14 +2184,14 @@ pub async fn execute_alter_table(
                         .collect();
 
                     for idx in &affected_indexes {
-                        let (start, end) = index_prefix_range(schema.table_id, idx.id);
+                        let (start, end) = index_prefix_range(db_id, schema.table_id, idx.id);
                         delete_range(txn, start, end).await?;
                     }
 
                     let mut target_col = schema.columns[col_idx].clone();
                     target_col.data_type = new_type.clone();
 
-                    let (start, end) = crate::storage::encode_table_data_range(schema.table_id);
+                    let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                     let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                     while let Some(batch) = scanner.next_batch(txn).await? {
                         for pair in batch {
@@ -2164,6 +2215,7 @@ pub async fn execute_alter_table(
                                 store
                                     .create_index_entry(
                                         txn,
+                                        db_id,
                                         schema.table_id,
                                         idx.id,
                                         &idx_values,
@@ -2180,7 +2232,7 @@ pub async fn execute_alter_table(
 
                     schema.columns[col_idx].data_type = new_type;
                     schema.version += 1;
-                    store.update_schema(txn, schema).await?;
+                    store.update_schema(txn, db_id, schema).await?;
                 }
             }
         }
@@ -2238,7 +2290,7 @@ mod tests {
 
     #[test]
     fn index_prefix_range_includes_all_index_entries() {
-        let (start, end) = index_prefix_range(42, 7);
+        let (start, end) = index_prefix_range(5, 42, 7);
 
         for suffix in [
             &[0x00][..],
@@ -2255,7 +2307,7 @@ mod tests {
             assert!(key < end);
         }
 
-        let (next_start, _) = index_prefix_range(42, 8);
+        let (next_start, _) = index_prefix_range(5, 42, 8);
         assert!(next_start >= end);
     }
 

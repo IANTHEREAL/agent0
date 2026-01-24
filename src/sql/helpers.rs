@@ -937,15 +937,6 @@ pub fn infer_data_type(value: &Value) -> DataType {
 
 /// Check if a SQL statement should be skipped
 pub fn get_skip_reason(sql_upper: &str) -> Option<String> {
-    if sql_upper.starts_with("DROP DATABASE") {
-        return Some("DROP DATABASE not supported".into());
-    }
-    if sql_upper.starts_with("CREATE DATABASE") {
-        return Some("CREATE DATABASE not supported".into());
-    }
-    if sql_upper.starts_with("ALTER DATABASE") {
-        return Some("ALTER DATABASE not supported".into());
-    }
     if sql_upper.starts_with("\\") {
         return Some("psql meta-command not supported".into());
     }
@@ -1842,8 +1833,8 @@ mod tests {
 
     #[test]
     fn test_get_skip_reason() {
-        assert!(get_skip_reason("DROP DATABASE test").is_some());
-        assert!(get_skip_reason("CREATE DATABASE test").is_some());
+        assert!(get_skip_reason("DROP DATABASE test").is_none());
+        assert!(get_skip_reason("CREATE DATABASE test").is_none());
         assert!(get_skip_reason("SELECT * FROM foo").is_none());
     }
 

@@ -1,0 +1,35 @@
+datname
+postgres
+(1 row)
+datname
+createdb_103_opts
+(1 row)
+table_schema|table_name
+public|isot
+(1 row)
+table_schema|table_name
+(0 rows)
+datname
+(0 rows)
+NOTICE:  database "createdb_103_opts" does not exist, skipping
+NOTICE:  database "createdb_103_iso" does not exist, skipping
+NOTICE:  database "createdb_103_current" does not exist, skipping
+NOTICE:  database "createdb_103_owner" does not exist, skipping
+NOTICE:  database "createdb_103_a" does not exist, skipping
+NOTICE:  database "createdb_103_b" does not exist, skipping
+ERROR:  cannot use reserved database name "postgres"
+ERROR:  cannot drop database "postgres": it is a system database
+ERROR:  cannot rename database "postgres"
+NOTICE:  database "createdb_103_opts" already exists, skipping
+ERROR:  only UTF8 encoding is supported
+ERROR:  CREATE DATABASE TEMPLATE is not supported (got "badtmpl")
+ERROR:  Unsupported CREATE DATABASE option: CONNECTION
+ERROR:  invalid database name: bad-name
+ERROR:  database "createdb_103_b" already exists
+ERROR:  CREATE DATABASE cannot run inside a transaction block
+ERROR:  DROP DATABASE cannot run inside a transaction block
+ERROR:  ALTER DATABASE cannot run inside a transaction block
+ERROR:  cannot drop the currently open database
+ERROR:  cannot rename the currently open database
+NOTICE:  database "createdb_103_iso" does not exist, skipping
+NOTICE:  database "createdb_103_opts" does not exist, skipping

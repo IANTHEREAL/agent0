@@ -89,6 +89,7 @@ impl Executor {
     pub(crate) async fn try_execute_extension_table_function(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         search_path: &[String],
         name: &ObjectName,
         args: &[FunctionArg],
@@ -193,7 +194,7 @@ impl Executor {
             _ => return Ok(None),
         };
 
-        let installed = self.store().get_extension(txn, "http").await?;
+        let installed = self.store().get_extension(txn, db_id, "http").await?;
         let Some(installed) = installed else {
             return Err(anyhow!("extension \"http\" is not installed"));
         };
@@ -241,15 +242,25 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let (txn, _sequence_values, _search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
 
-            if !self.store().schema_exists(txn, desc.default_schema).await? {
+            if !self
+                .store()
+                .schema_exists(txn, db_id, desc.default_schema)
+                .await?
+            {
                 return Err(anyhow!("schema '{}' does not exist", desc.default_schema));
             }
 
-            if self.store().get_extension(txn, &ext_name).await?.is_some() {
+            if self
+                .store()
+                .get_extension(txn, db_id, &ext_name)
+                .await?
+                .is_some()
+            {
                 if if_not_exists {
                     return Ok(super::ExecuteResult::CreateExtension {
                         ext_name: ext_name.clone(),
@@ -259,7 +270,7 @@ impl Executor {
             }
 
             let ext = InstalledExtension::new(desc);
-            self.store().put_extension(txn, &ext).await?;
+            self.store().put_extension(txn, db_id, &ext).await?;
 
             Ok(super::ExecuteResult::CreateExtension {
                 ext_name: ext_name.clone(),
@@ -295,11 +306,12 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let (txn, _sequence_values, _search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
 
-            let dropped = self.store().drop_extension(txn, &ext_name).await?;
+            let dropped = self.store().drop_extension(txn, db_id, &ext_name).await?;
             if !dropped && !if_exists {
                 return Err(anyhow!("extension \"{}\" does not exist", ext_name));
             }

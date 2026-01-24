@@ -22,12 +22,44 @@ use serde::{Deserialize, Serialize};
 
 /// System key prefixes
 const SYS_NEXT_TABLE_ID: &[u8] = b"_sys_next_table_id";
+const SYS_NEXT_DATABASE_ID: &[u8] = b"_sys_next_database_id";
 const SYS_NEXT_TYPE_OID: &[u8] = b"_sys_next_type_oid";
 const SYS_NEXT_SCHEMA_OID: &[u8] = b"_sys_next_schema_oid";
 const SYS_NEXT_SEQUENCE_OID: &[u8] = b"_sys_next_sequence_oid";
 const SYS_NEXT_FUNCTION_OID: &[u8] = b"_sys_next_function_oid";
 const SYS_NEXT_TRIGGER_OID: &[u8] = b"_sys_next_trigger_oid";
 const SYS_NEXT_VIEW_OID: &[u8] = b"_sys_next_view_oid";
+const SYS_FORMAT_VERSION: &[u8] = b"_sys_format_version";
+const SYS_DATABASE_BY_NAME_PREFIX: &[u8] = b"_sys_dbname_";
+const SYS_DATABASE_BY_ID_PREFIX: &[u8] = b"_sys_dbid_";
+
+// === Storage format v2 (database-scoped prefixes) ===
+//
+// Keyspace-level metadata remains under `_sys_*` keys. Database-local metadata
+// and user data are partitioned by `database_id` using a fixed binary prefix.
+//
+// Database prefix format: `d_{db_id:8bytes}_`
+const DATABASE_DATA_PREFIX: &[u8] = b"d_";
+const DB_SYS_NEXT_TABLE_ID: &[u8] = b"sys_next_table_id";
+const DB_SYS_NEXT_TYPE_OID: &[u8] = b"sys_next_type_oid";
+const DB_SYS_NEXT_SCHEMA_OID: &[u8] = b"sys_next_schema_oid";
+const DB_SYS_NEXT_SEQUENCE_OID: &[u8] = b"sys_next_sequence_oid";
+const DB_SYS_NEXT_FUNCTION_OID: &[u8] = b"sys_next_function_oid";
+const DB_SYS_NEXT_TRIGGER_OID: &[u8] = b"sys_next_trigger_oid";
+const DB_SYS_NEXT_VIEW_OID: &[u8] = b"sys_next_view_oid";
+const DB_SYS_SCHEMA_PREFIX: &[u8] = b"sys_schema_";
+const DB_SYS_SCHEMADEF_PREFIX: &[u8] = b"sys_schemadef_";
+const DB_SYS_VIEW_PREFIX: &[u8] = b"sys_view_";
+const DB_SYS_MATVIEW_PREFIX: &[u8] = b"sys_matview_";
+const DB_SYS_PROCEDURE_PREFIX: &[u8] = b"sys_proc_";
+const DB_SYS_FUNCTION_PREFIX: &[u8] = b"sys_func_";
+const DB_SYS_TRIGGER_PREFIX: &[u8] = b"sys_trigger_";
+const DB_SYS_TYPE_PREFIX: &[u8] = b"sys_type_";
+const DB_SYS_SEQUENCEDEF_PREFIX: &[u8] = b"sys_seqdef_";
+const DB_SYS_EXTENSION_PREFIX: &[u8] = b"sys_ext_";
+const DB_SYS_EXTENSIONCFG_PREFIX: &[u8] = b"sys_extcfg_";
+const DB_SYS_COMMENT_PREFIX: &[u8] = b"sys_comment_";
+const DB_SYS_SEQ_PREFIX: &[u8] = b"sys_seq_";
 const SYS_SCHEMA_PREFIX: &[u8] = b"_sys_schema_";
 const SYS_SCHEMADEF_PREFIX: &[u8] = b"_sys_schemadef_";
 const SYS_VIEW_PREFIX: &[u8] = b"_sys_view_";
@@ -83,6 +115,314 @@ pub fn encode_next_trigger_oid_key() -> Vec<u8> {
 /// Encode the system key for next view OID (user-defined views)
 pub fn encode_next_view_oid_key() -> Vec<u8> {
     SYS_NEXT_VIEW_OID.to_vec()
+}
+
+/// Encode the system key for allocating the next database ID (storage format v2).
+pub fn encode_next_database_id_key() -> Vec<u8> {
+    SYS_NEXT_DATABASE_ID.to_vec()
+}
+
+/// Encode the system key storing the storage-format version for a keyspace.
+pub fn encode_format_version_key() -> Vec<u8> {
+    SYS_FORMAT_VERSION.to_vec()
+}
+
+/// Encode database name -> ID mapping key (keyspace-level, storage format v2).
+pub fn encode_database_name_key(db_name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SYS_DATABASE_BY_NAME_PREFIX.len() + db_name.len());
+    key.extend_from_slice(SYS_DATABASE_BY_NAME_PREFIX);
+    key.extend_from_slice(db_name.as_bytes());
+    key
+}
+
+/// Encode database ID -> definition key (keyspace-level, storage format v2).
+pub fn encode_database_id_key(db_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SYS_DATABASE_BY_ID_PREFIX.len() + 8);
+    key.extend_from_slice(SYS_DATABASE_BY_ID_PREFIX);
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key
+}
+
+pub fn encode_database_id_prefix() -> Vec<u8> {
+    SYS_DATABASE_BY_ID_PREFIX.to_vec()
+}
+
+/// Encode the prefix for all keys belonging to a database (storage format v2).
+///
+/// Format: `d_{db_id:8bytes}_`
+pub fn encode_database_data_prefix(db_id: u64) -> Vec<u8> {
+    let mut key = Vec::with_capacity(DATABASE_DATA_PREFIX.len() + 8 + 1);
+    key.extend_from_slice(DATABASE_DATA_PREFIX);
+    key.extend_from_slice(&db_id.to_be_bytes());
+    key.push(b'_');
+    key
+}
+
+/// Get the raw key range for all data within a database (storage format v2).
+///
+/// Range: `[d_{db_id}_, d_{db_id+1}_)` (numeric, big-endian ordering). If `db_id == u64::MAX`,
+/// fall back to a prefix upper bound by incrementing the trailing separator byte.
+pub fn encode_database_data_range(db_id: u64) -> (Vec<u8>, Vec<u8>) {
+    let start = encode_database_data_prefix(db_id);
+    let end = match db_id.checked_add(1) {
+        Some(next) => encode_database_data_prefix(next),
+        None => {
+            let mut end = start.clone();
+            // `encode_database_data_prefix` always ends with '_' (0x5F).
+            if let Some(last) = end.last_mut() {
+                *last = last.wrapping_add(1);
+            }
+            end
+        }
+    };
+    (start, end)
+}
+
+pub fn encode_next_table_id_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_TABLE_ID);
+    key
+}
+
+pub fn encode_next_type_oid_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_TYPE_OID);
+    key
+}
+
+pub fn encode_next_schema_oid_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_SCHEMA_OID);
+    key
+}
+
+pub fn encode_next_sequence_oid_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_SEQUENCE_OID);
+    key
+}
+
+pub fn encode_next_function_oid_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_FUNCTION_OID);
+    key
+}
+
+pub fn encode_next_trigger_oid_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_TRIGGER_OID);
+    key
+}
+
+pub fn encode_next_view_oid_key_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_NEXT_VIEW_OID);
+    key
+}
+
+pub fn encode_schema_key_v2(db_id: u64, table_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SCHEMA_PREFIX);
+    key.extend_from_slice(table_name.as_bytes());
+    key
+}
+
+pub fn encode_schema_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SCHEMA_PREFIX);
+    key
+}
+
+pub fn encode_schema_def_key_v2(db_id: u64, schema_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SCHEMADEF_PREFIX);
+    key.extend_from_slice(schema_name.as_bytes());
+    key
+}
+
+pub fn encode_schema_def_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SCHEMADEF_PREFIX);
+    key
+}
+
+pub fn encode_type_key_v2(db_id: u64, full_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_TYPE_PREFIX);
+    key.extend_from_slice(full_name.as_bytes());
+    key
+}
+
+pub fn encode_type_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_TYPE_PREFIX);
+    key
+}
+
+pub fn encode_sequence_def_key_v2(db_id: u64, full_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SEQUENCEDEF_PREFIX);
+    key.extend_from_slice(full_name.as_bytes());
+    key
+}
+
+pub fn encode_sequence_def_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SEQUENCEDEF_PREFIX);
+    key
+}
+
+pub fn encode_sequence_value_key_v2(db_id: u64, sequence_oid: u32) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SEQ_PREFIX);
+    key.extend_from_slice(&sequence_oid.to_be_bytes());
+    key
+}
+
+pub fn encode_table_sequence_value_key_v2(db_id: u64, table_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_SEQ_PREFIX);
+    key.extend_from_slice(&table_id.to_be_bytes());
+    key
+}
+
+pub fn encode_extension_key_v2(db_id: u64, ext_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_EXTENSION_PREFIX);
+    key.extend_from_slice(ext_name.as_bytes());
+    key
+}
+
+pub fn encode_extension_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_EXTENSION_PREFIX);
+    key
+}
+
+pub fn encode_extension_config_key_v2(db_id: u64, ext_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_EXTENSIONCFG_PREFIX);
+    key.extend_from_slice(ext_name.as_bytes());
+    key
+}
+
+pub fn encode_view_key_v2(db_id: u64, view_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_VIEW_PREFIX);
+    key.extend_from_slice(view_name.as_bytes());
+    key
+}
+
+pub fn encode_view_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_VIEW_PREFIX);
+    key
+}
+
+pub fn encode_matview_key_v2(db_id: u64, matview_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_MATVIEW_PREFIX);
+    key.extend_from_slice(matview_name.as_bytes());
+    key
+}
+
+pub fn encode_matview_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_MATVIEW_PREFIX);
+    key
+}
+
+pub fn encode_procedure_key_v2(db_id: u64, proc_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_PROCEDURE_PREFIX);
+    key.extend_from_slice(proc_name.as_bytes());
+    key
+}
+
+pub fn encode_procedure_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_PROCEDURE_PREFIX);
+    key
+}
+
+pub fn encode_function_key_v2(db_id: u64, full_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_FUNCTION_PREFIX);
+    key.extend_from_slice(full_name.as_bytes());
+    key
+}
+
+pub fn encode_function_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_FUNCTION_PREFIX);
+    key
+}
+
+pub fn encode_trigger_key_v2(db_id: u64, table_full_name: &str, trigger_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_TRIGGER_PREFIX);
+    key.extend_from_slice(table_full_name.as_bytes());
+    key.push(b'/');
+    key.extend_from_slice(trigger_name.as_bytes());
+    key
+}
+
+pub fn encode_trigger_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_TRIGGER_PREFIX);
+    key
+}
+
+pub fn encode_trigger_table_prefix_v2(db_id: u64, table_full_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_TRIGGER_PREFIX);
+    key.extend_from_slice(table_full_name.as_bytes());
+    key.push(b'/');
+    key
+}
+
+pub(crate) fn encode_comment_prefix_v2(db_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_COMMENT_PREFIX);
+    key
+}
+
+pub(crate) fn encode_comment_extension_key_v2(db_id: u64, ext_name: &str) -> Vec<u8> {
+    let mut key = encode_comment_prefix_v2(db_id);
+    key.push(b'e');
+    key.push(0);
+    key.extend_from_slice(ext_name.as_bytes());
+    key
+}
+
+pub(crate) fn encode_comment_function_key_v2(db_id: u64, func_full_name: &str) -> Vec<u8> {
+    let mut key = encode_comment_prefix_v2(db_id);
+    key.push(b'f');
+    key.push(0);
+    key.extend_from_slice(func_full_name.as_bytes());
+    key
+}
+
+pub(crate) fn encode_comment_table_key_v2(db_id: u64, table_full_name: &str) -> Vec<u8> {
+    let mut key = encode_comment_prefix_v2(db_id);
+    key.push(b't');
+    key.push(0);
+    key.extend_from_slice(table_full_name.as_bytes());
+    key
+}
+
+pub(crate) fn encode_comment_column_key_v2(
+    db_id: u64,
+    table_full_name: &str,
+    column_name: &str,
+) -> Vec<u8> {
+    let mut key = encode_comment_prefix_v2(db_id);
+    key.push(b'c');
+    key.push(0);
+    key.extend_from_slice(table_full_name.as_bytes());
+    key.push(0);
+    key.extend_from_slice(column_name.as_bytes());
+    key
 }
 
 /// Encode the schema key for a table
@@ -265,6 +605,16 @@ pub fn encode_data_key(table_id: u64, row_key: &[u8]) -> Vec<u8> {
     key
 }
 
+/// Encode a data key for a row (storage format v2, database-scoped).
+pub fn encode_data_key_v2(db_id: u64, table_id: u64, row_key: &[u8]) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(TABLE_DATA_PREFIX);
+    key.extend_from_slice(&table_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(row_key);
+    key
+}
+
 /// Encode an index key using memcomparable format for correct sort order.
 /// If pk is None, it's a unique index key (Value -> PK)
 /// If pk is Some, it's a non-unique index key (Value+PK -> Empty)
@@ -275,6 +625,34 @@ pub fn encode_index_key(
     pk: Option<&[Value]>,
 ) -> Vec<u8> {
     let mut key = TABLE_INDEX_PREFIX.to_vec();
+    key.extend_from_slice(&table_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&index_id.to_be_bytes());
+    key.push(b'_');
+
+    for value in values {
+        encode_value_memcomparable(value, &mut key);
+    }
+
+    if let Some(pk_values) = pk {
+        key.push(0x01); // Separator byte (not '_' to avoid collision with encoded data)
+        for value in pk_values {
+            encode_value_memcomparable(value, &mut key);
+        }
+    }
+    key
+}
+
+/// Encode an index key (storage format v2, database-scoped).
+pub fn encode_index_key_v2(
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    values: &[Value],
+    pk: Option<&[Value]>,
+) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(TABLE_INDEX_PREFIX);
     key.extend_from_slice(&table_id.to_be_bytes());
     key.push(b'_');
     key.extend_from_slice(&index_id.to_be_bytes());
@@ -309,6 +687,20 @@ pub fn encode_gin_index_prefix(table_id: u64, index_id: u64, token_hash: u64) ->
     key
 }
 
+/// Encode the fixed prefix for a GIN-like inverted index entry (storage format v2, database-scoped).
+pub fn encode_gin_index_prefix_v2(db_id: u64, table_id: u64, index_id: u64, token_hash: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(TABLE_INDEX_PREFIX);
+    key.extend_from_slice(&table_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&index_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(TABLE_GIN_MARKER);
+    key.extend_from_slice(&token_hash.to_be_bytes());
+    key.push(GIN_PK_SEP_START);
+    key
+}
+
 /// Encode a full GIN-like inverted index key for `token_hash` pointing to the row `pk_key`.
 pub fn encode_gin_index_key(
     table_id: u64,
@@ -317,6 +709,19 @@ pub fn encode_gin_index_key(
     pk_key: &[u8],
 ) -> Vec<u8> {
     let mut key = encode_gin_index_prefix(table_id, index_id, token_hash);
+    key.extend_from_slice(pk_key);
+    key
+}
+
+/// Encode a full GIN-like inverted index key (storage format v2, database-scoped).
+pub fn encode_gin_index_key_v2(
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    token_hash: u64,
+    pk_key: &[u8],
+) -> Vec<u8> {
+    let mut key = encode_gin_index_prefix_v2(db_id, table_id, index_id, token_hash);
     key.extend_from_slice(pk_key);
     key
 }
@@ -330,6 +735,19 @@ pub fn encode_gin_index_token_range(
     token_hash: u64,
 ) -> (Vec<u8>, Vec<u8>) {
     let start = encode_gin_index_prefix(table_id, index_id, token_hash);
+    let mut end = start.clone();
+    *end.last_mut().expect("prefix has separator") = GIN_PK_SEP_END;
+    (start, end)
+}
+
+/// Return the raw key range for scanning all GIN postings for a token hash (storage format v2, database-scoped).
+pub fn encode_gin_index_token_range_v2(
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    token_hash: u64,
+) -> (Vec<u8>, Vec<u8>) {
+    let start = encode_gin_index_prefix_v2(db_id, table_id, index_id, token_hash);
     let mut end = start.clone();
     *end.last_mut().expect("prefix has separator") = GIN_PK_SEP_END;
     (start, end)
@@ -649,6 +1067,34 @@ pub fn encode_table_data_range(table_id: u64) -> (Vec<u8>, Vec<u8>) {
     (start, end)
 }
 
+/// Get the key range for scanning all rows of a table (storage format v2, database-scoped).
+pub fn encode_table_data_range_v2(db_id: u64, table_id: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut start = encode_database_data_prefix(db_id);
+    start.extend_from_slice(TABLE_DATA_PREFIX);
+    start.extend_from_slice(&table_id.to_be_bytes());
+    start.push(b'_');
+
+    let mut end = encode_database_data_prefix(db_id);
+    end.extend_from_slice(TABLE_DATA_PREFIX);
+    end.extend_from_slice(&(table_id + 1).to_be_bytes());
+
+    (start, end)
+}
+
+/// Get the key range for scanning all index entries of a table (storage format v2, database-scoped).
+pub fn encode_table_index_range_v2(db_id: u64, table_id: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut start = encode_database_data_prefix(db_id);
+    start.extend_from_slice(TABLE_INDEX_PREFIX);
+    start.extend_from_slice(&table_id.to_be_bytes());
+    start.push(b'_');
+
+    let mut end = encode_database_data_prefix(db_id);
+    end.extend_from_slice(TABLE_INDEX_PREFIX);
+    end.extend_from_slice(&(table_id + 1).to_be_bytes());
+
+    (start, end)
+}
+
 /// Get the raw prefix for schema keys (for scanning all tables)
 pub fn encode_schema_prefix() -> Vec<u8> {
     SYS_SCHEMA_PREFIX.to_vec()
@@ -797,6 +1243,44 @@ mod tests {
     }
 
     #[test]
+    fn test_encode_database_name_key() {
+        let key = encode_database_name_key("mydb");
+        assert_eq!(key, b"_sys_dbname_mydb".to_vec());
+    }
+
+    #[test]
+    fn test_encode_database_id_key() {
+        let key = encode_database_id_key(1);
+        assert_eq!(&key[..SYS_DATABASE_BY_ID_PREFIX.len()], SYS_DATABASE_BY_ID_PREFIX);
+        assert_eq!(&key[SYS_DATABASE_BY_ID_PREFIX.len()..], &1_u64.to_be_bytes());
+    }
+
+    #[test]
+    fn test_encode_database_data_prefix() {
+        let key = encode_database_data_prefix(1);
+        assert_eq!(key.len(), 11);
+        assert_eq!(&key[..2], b"d_");
+        assert_eq!(&key[2..10], &1_u64.to_be_bytes());
+        assert_eq!(key[10], b'_');
+    }
+
+    #[test]
+    fn test_encode_database_data_range() {
+        let (start, end) = encode_database_data_range(5);
+        assert_eq!(start, encode_database_data_prefix(5));
+        assert_eq!(end, encode_database_data_prefix(6));
+        assert!(start < end);
+    }
+
+    #[test]
+    fn test_encode_schema_key_v2() {
+        let key = encode_schema_key_v2(1, "public.users");
+        let mut expected = encode_database_data_prefix(1);
+        expected.extend_from_slice(b"sys_schema_public.users");
+        assert_eq!(key, expected);
+    }
+
+    #[test]
     fn test_encode_extension_keys() {
         let key = encode_extension_key("http");
         assert_eq!(key, b"_sys_ext_http".to_vec());
@@ -811,6 +1295,14 @@ mod tests {
         assert!(start.starts_with(b"t_"));
         assert!(end.starts_with(b"t_"));
         assert!(start < end);
+    }
+
+    #[test]
+    fn test_encode_table_data_range_v2() {
+        let (start, end) = encode_table_data_range_v2(5, 7);
+        assert!(start < end);
+        assert!(start.starts_with(&encode_database_data_prefix(5)));
+        assert!(end.starts_with(&encode_database_data_prefix(5)));
     }
 
     #[test]

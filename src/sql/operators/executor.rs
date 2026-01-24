@@ -11,10 +11,11 @@ pub async fn execute_operator_tree(
     operator: &mut BoxedOperator,
     txn: &mut Transaction,
     store: Arc<TikvStore>,
+    db_id: u64,
     search_path: &[String],
     sequence_values: &mut HashMap<String, i64>,
 ) -> Result<Vec<Row>> {
-    let mut ctx = ExecutionContext::new(txn, store, search_path, sequence_values);
+    let mut ctx = ExecutionContext::new(txn, store, db_id, search_path, sequence_values);
 
     operator.open(&mut ctx).await?;
 

@@ -39,6 +39,7 @@ impl SortOperator {
                 sequences::eval_expr_with_sequences(
                     &ctx.store,
                     ctx.txn,
+                    ctx.db_id,
                     ctx.sequence_values,
                     ctx.search_path,
                     &order_expr.expr,

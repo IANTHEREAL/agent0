@@ -102,6 +102,7 @@ fn search_path_schemas<'a>(search_path: &'a [String]) -> Vec<&'a str> {
 pub(crate) async fn resolve_existing_table_name(
     store: &crate::storage::TikvStore,
     txn: &mut Transaction,
+    db_id: u64,
     name: &ObjectName,
     search_path: &[String],
 ) -> Result<Option<ResolvedName>> {
@@ -110,14 +111,14 @@ pub(crate) async fn resolve_existing_table_name(
         Some(schema) => {
             let resolved = ResolvedName::new(schema, obj)?;
             Ok(store
-                .get_schema(txn, &resolved.full)
+                .get_schema(txn, db_id, &resolved.full)
                 .await?
                 .map(|_| resolved))
         }
         None => {
             for schema in search_path_schemas(search_path) {
                 let resolved = ResolvedName::new(schema.to_string(), obj.clone())?;
-                if store.get_schema(txn, &resolved.full).await?.is_some() {
+                if store.get_schema(txn, db_id, &resolved.full).await?.is_some() {
                     return Ok(Some(resolved));
                 }
             }
@@ -129,6 +130,7 @@ pub(crate) async fn resolve_existing_table_name(
 pub(crate) async fn resolve_existing_view_name(
     store: &crate::storage::TikvStore,
     txn: &mut Transaction,
+    db_id: u64,
     name: &ObjectName,
     search_path: &[String],
 ) -> Result<Option<ResolvedName>> {
@@ -136,12 +138,15 @@ pub(crate) async fn resolve_existing_view_name(
     match schema_opt {
         Some(schema) => {
             let resolved = ResolvedName::new(schema, obj)?;
-            Ok(store.get_view(txn, &resolved.full).await?.map(|_| resolved))
+            Ok(store
+                .get_view(txn, db_id, &resolved.full)
+                .await?
+                .map(|_| resolved))
         }
         None => {
             for schema in search_path_schemas(search_path) {
                 let resolved = ResolvedName::new(schema.to_string(), obj.clone())?;
-                if store.get_view(txn, &resolved.full).await?.is_some() {
+                if store.get_view(txn, db_id, &resolved.full).await?.is_some() {
                     return Ok(Some(resolved));
                 }
             }
@@ -153,6 +158,7 @@ pub(crate) async fn resolve_existing_view_name(
 pub(crate) async fn resolve_existing_materialized_view_name(
     store: &crate::storage::TikvStore,
     txn: &mut Transaction,
+    db_id: u64,
     name: &ObjectName,
     search_path: &[String],
 ) -> Result<Option<ResolvedName>> {
@@ -161,7 +167,7 @@ pub(crate) async fn resolve_existing_materialized_view_name(
         Some(schema) => {
             let resolved = ResolvedName::new(schema, obj)?;
             Ok(store
-                .get_materialized_view(txn, &resolved.full)
+                .get_materialized_view(txn, db_id, &resolved.full)
                 .await?
                 .map(|_| resolved))
         }
@@ -169,7 +175,7 @@ pub(crate) async fn resolve_existing_materialized_view_name(
             for schema in search_path_schemas(search_path) {
                 let resolved = ResolvedName::new(schema.to_string(), obj.clone())?;
                 if store
-                    .get_materialized_view(txn, &resolved.full)
+                    .get_materialized_view(txn, db_id, &resolved.full)
                     .await?
                     .is_some()
                 {
@@ -184,6 +190,7 @@ pub(crate) async fn resolve_existing_materialized_view_name(
 pub(crate) async fn resolve_existing_procedure_name(
     store: &crate::storage::TikvStore,
     txn: &mut Transaction,
+    db_id: u64,
     name: &ObjectName,
     search_path: &[String],
 ) -> Result<Option<ResolvedName>> {
@@ -192,14 +199,14 @@ pub(crate) async fn resolve_existing_procedure_name(
         Some(schema) => {
             let resolved = ResolvedName::new(schema, obj)?;
             Ok(store
-                .get_procedure(txn, &resolved.full)
+                .get_procedure(txn, db_id, &resolved.full)
                 .await?
                 .map(|_| resolved))
         }
         None => {
             for schema in search_path_schemas(search_path) {
                 let resolved = ResolvedName::new(schema.to_string(), obj.clone())?;
-                if store.get_procedure(txn, &resolved.full).await?.is_some() {
+                if store.get_procedure(txn, db_id, &resolved.full).await?.is_some() {
                     return Ok(Some(resolved));
                 }
             }
@@ -211,6 +218,7 @@ pub(crate) async fn resolve_existing_procedure_name(
 pub(crate) async fn resolve_existing_function_name(
     store: &crate::storage::TikvStore,
     txn: &mut Transaction,
+    db_id: u64,
     name: &ObjectName,
     search_path: &[String],
 ) -> Result<Option<ResolvedName>> {
@@ -219,14 +227,14 @@ pub(crate) async fn resolve_existing_function_name(
         Some(schema) => {
             let resolved = ResolvedName::new(schema, obj)?;
             Ok(store
-                .get_function(txn, &resolved.full)
+                .get_function(txn, db_id, &resolved.full)
                 .await?
                 .map(|_| resolved))
         }
         None => {
             for schema in search_path_schemas(search_path) {
                 let resolved = ResolvedName::new(schema.to_string(), obj.clone())?;
-                if store.get_function(txn, &resolved.full).await?.is_some() {
+                if store.get_function(txn, db_id, &resolved.full).await?.is_some() {
                     return Ok(Some(resolved));
                 }
             }
@@ -238,6 +246,7 @@ pub(crate) async fn resolve_existing_function_name(
 pub(crate) async fn resolve_existing_sequence_name(
     store: &crate::storage::TikvStore,
     txn: &mut Transaction,
+    db_id: u64,
     name: &ObjectName,
     search_path: &[String],
 ) -> Result<Option<ResolvedName>> {
@@ -246,14 +255,14 @@ pub(crate) async fn resolve_existing_sequence_name(
         Some(schema) => {
             let resolved = ResolvedName::new(schema, obj)?;
             Ok(store
-                .get_sequence(txn, &resolved.full)
+                .get_sequence(txn, db_id, &resolved.full)
                 .await?
                 .map(|_| resolved))
         }
         None => {
             for schema in search_path_schemas(search_path) {
                 let resolved = ResolvedName::new(schema.to_string(), obj.clone())?;
-                if store.get_sequence(txn, &resolved.full).await?.is_some() {
+                if store.get_sequence(txn, db_id, &resolved.full).await?.is_some() {
                     return Ok(Some(resolved));
                 }
             }
@@ -265,6 +274,7 @@ pub(crate) async fn resolve_existing_sequence_name(
 pub(crate) async fn resolve_existing_type_name(
     store: &crate::storage::TikvStore,
     txn: &mut Transaction,
+    db_id: u64,
     name: &ObjectName,
     search_path: &[String],
 ) -> Result<Option<ResolvedName>> {
@@ -272,12 +282,15 @@ pub(crate) async fn resolve_existing_type_name(
     match schema_opt {
         Some(schema) => {
             let resolved = ResolvedName::new(schema, obj)?;
-            Ok(store.get_type(txn, &resolved.full).await?.map(|_| resolved))
+            Ok(store
+                .get_type(txn, db_id, &resolved.full)
+                .await?
+                .map(|_| resolved))
         }
         None => {
             for schema in search_path_schemas(search_path) {
                 let resolved = ResolvedName::new(schema.to_string(), obj.clone())?;
-                if store.get_type(txn, &resolved.full).await?.is_some() {
+                if store.get_type(txn, db_id, &resolved.full).await?.is_some() {
                     return Ok(Some(resolved));
                 }
             }

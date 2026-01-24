@@ -1,8 +1,8 @@
 use super::encoding::*;
 use crate::txn::{txn_delete, txn_put};
 use crate::types::{
-    DataType, FunctionDef, Row, SequenceBacking, SequenceDef, SequenceState, TableSchema,
-    TriggerDef, UserTypeDef, Value, ViewDef,
+    DataType, DatabaseDef, FunctionDef, Row, SequenceBacking, SequenceDef, SequenceState,
+    TableSchema, TriggerDef, UserTypeDef, Value, ViewDef,
 };
 use crate::extensions::InstalledExtension;
 use anyhow::{anyhow, Context, Result};
@@ -109,12 +109,24 @@ pub(crate) struct CommentRecord {
 }
 
 struct SchemaCache {
+    per_db: HashMap<u64, PerDatabaseSchemaCache>,
+}
+
+struct PerDatabaseSchemaCache {
     schemas: Option<(Instant, Vec<String>)>,
     schema_oids: Option<(Instant, HashMap<String, u32>)>,
     tables: Option<(Instant, Vec<String>)>,
 }
 
 impl SchemaCache {
+    fn new() -> Self {
+        Self {
+            per_db: HashMap::new(),
+        }
+    }
+}
+
+impl PerDatabaseSchemaCache {
     fn new() -> Self {
         Self {
             schemas: None,
@@ -151,10 +163,15 @@ impl TikvStore {
             .await
             .context("Failed to connect to TiKV")?;
         info!("Connected to TiKV. Keyspace: {:?}", keyspace);
-        Ok(Self {
+        let store = Self {
             client: Arc::new(client),
             cache: Arc::new(RwLock::new(SchemaCache::new())),
-        })
+        };
+
+        store.check_format_version().await?;
+        store.bootstrap_default_database("admin").await?;
+
+        Ok(store)
     }
 
     fn key(&self, key: &[u8]) -> Vec<u8> {
@@ -178,14 +195,358 @@ impl TikvStore {
             .map_err(|e| anyhow!(e))
     }
 
+    /// Check or initialize the on-disk storage format version for this keyspace.
+    ///
+    /// This is a breaking change boundary: storage format v2 introduces per-database key
+    /// partitioning. If an existing keyspace contains v1 table metadata keys, we refuse to
+    /// initialize v2 and require a re-initialize/migration.
+    pub async fn check_format_version(&self) -> Result<()> {
+        const STORAGE_FORMAT_VERSION: u32 = 2;
+
+        let mut txn = self.begin().await?;
+        let key = self.key(&encode_format_version_key());
+
+        match txn.get(key.clone()).await? {
+            Some(data) => {
+                let bytes: [u8; 4] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Invalid format version value"))?;
+                let version = u32::from_be_bytes(bytes);
+                if version != STORAGE_FORMAT_VERSION {
+                    txn.rollback().await.ok();
+                    return Err(anyhow!(
+                        "Incompatible storage format: found v{}, expected v{}. \
+                         Please re-initialize the keyspace or migrate data.",
+                        version,
+                        STORAGE_FORMAT_VERSION
+                    ));
+                }
+                txn.rollback().await.ok();
+                Ok(())
+            }
+            None => {
+                // New keyspace (or a legacy v1 keyspace). Refuse to auto-upgrade if we detect
+                // v1 table metadata keys.
+                let has_v1_tables = txn
+                    .get(self.key(&encode_next_table_id_key()))
+                    .await?
+                    .is_some()
+                    || self.prefix_has_any(&mut txn, encode_schema_prefix()).await?;
+
+                if has_v1_tables {
+                    txn.rollback().await.ok();
+                    return Err(anyhow!(
+                        "Storage format v1 detected (no format marker, but v1 table keys exist). \
+                         This build requires storage format v2. Please re-initialize the keyspace."
+                    ));
+                }
+
+                txn_put(
+                    &mut txn,
+                    key,
+                    STORAGE_FORMAT_VERSION.to_be_bytes().to_vec(),
+                )
+                .await?;
+                txn.commit().await?;
+                Ok(())
+            }
+        }
+    }
+
+    /// Ensure the default `postgres` database exists (storage format v2).
+    pub async fn bootstrap_default_database(&self, owner: &str) -> Result<()> {
+        const DEFAULT_DB: &str = "postgres";
+
+        let mut txn = self.begin().await?;
+        if self.get_database_id(&mut txn, DEFAULT_DB).await?.is_some() {
+            txn.rollback().await.ok();
+            return Ok(());
+        }
+
+        let db_id = self.next_database_id(&mut txn).await?;
+        let def = DatabaseDef::default_postgres(db_id, owner.to_string());
+
+        let name_key = self.key(&encode_database_name_key(DEFAULT_DB));
+        txn_put(&mut txn, name_key, db_id.to_be_bytes().to_vec()).await?;
+
+        let id_key = self.key(&encode_database_id_key(db_id));
+        let data = bincode::serialize(&def).context("Failed to serialize database definition")?;
+        txn_put(&mut txn, id_key, data).await?;
+
+        txn.commit().await?;
+        info!("Bootstrapped default database 'postgres' with ID {}", db_id);
+        Ok(())
+    }
+
+    /// Allocate and persist the next database ID (storage format v2).
+    pub async fn next_database_id(&self, txn: &mut Transaction) -> Result<u64> {
+        const FIRST_DATABASE_ID: u64 = 1;
+
+        let key = self.key(&encode_next_database_id_key());
+        let current = txn.get(key.clone()).await?;
+        let next_val = match current {
+            Some(data) => {
+                let bytes: [u8; 8] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Invalid database ID format"))?;
+                let id = u64::from_be_bytes(bytes);
+                id.checked_add(1)
+                    .ok_or_else(|| anyhow!("Database ID overflow"))?
+            }
+            None => FIRST_DATABASE_ID,
+        };
+        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
+        Ok(next_val)
+    }
+
+    /// Look up a database ID by name (storage format v2).
+    pub async fn get_database_id(
+        &self,
+        txn: &mut Transaction,
+        db_name: &str,
+    ) -> Result<Option<u64>> {
+        let key = self.key(&encode_database_name_key(db_name));
+        match txn.get(key).await? {
+            Some(data) => {
+                let bytes: [u8; 8] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Invalid database ID format"))?;
+                Ok(Some(u64::from_be_bytes(bytes)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch a database definition by ID (storage format v2).
+    pub async fn get_database_by_id(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<Option<DatabaseDef>> {
+        let key = self.key(&encode_database_id_key(db_id));
+        match txn.get(key).await? {
+            Some(data) => Ok(Some(
+                bincode::deserialize(&data).context("Failed to deserialize database definition")?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// List all databases in the current keyspace (storage format v2).
+    pub async fn list_databases(&self, txn: &mut Transaction) -> Result<Vec<DatabaseDef>> {
+        let prefix = encode_database_id_prefix();
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut dbs = Vec::new();
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&prefix) {
+                continue;
+            }
+            let def: DatabaseDef =
+                bincode::deserialize(pair.value()).context("Failed to deserialize database")?;
+            dbs.push(def);
+        }
+        Ok(dbs)
+    }
+
+    /// Create a new database (storage format v2).
+    ///
+    /// Returns `Ok(None)` if the database exists and `if_not_exists` is true.
+    pub async fn create_database(
+        &self,
+        txn: &mut Transaction,
+        name: &str,
+        owner: &str,
+        if_not_exists: bool,
+    ) -> Result<Option<DatabaseDef>> {
+        let name_key = self.key(&encode_database_name_key(name));
+        if txn.get(name_key.clone()).await?.is_some() {
+            if if_not_exists {
+                return Ok(None);
+            }
+            return Err(anyhow!("database \"{}\" already exists", name));
+        }
+
+        let db_id = self.next_database_id(txn).await?;
+        let def = DatabaseDef::new(db_id, name.to_string(), owner.to_string());
+
+        txn_put(txn, name_key, db_id.to_be_bytes().to_vec()).await?;
+
+        let id_key = self.key(&encode_database_id_key(db_id));
+        let data = bincode::serialize(&def).context("Failed to serialize database definition")?;
+        txn_put(txn, id_key, data).await?;
+
+        info!("Created database '{}' with ID {}", name, db_id);
+        Ok(Some(def))
+    }
+
+    /// Drop database metadata (storage format v2).
+    ///
+    /// Returns `Ok(None)` if the database does not exist and `if_exists` is true.
+    ///
+    /// Note: this does NOT delete the database's data range. Call
+    /// `unsafe_destroy_database_data(db_id)` after committing the transaction.
+    pub async fn drop_database_metadata(
+        &self,
+        txn: &mut Transaction,
+        db_name: &str,
+        if_exists: bool,
+        current_database_id: u64,
+    ) -> Result<Option<u64>> {
+        if db_name.eq_ignore_ascii_case("postgres")
+            || db_name.eq_ignore_ascii_case("template0")
+            || db_name.eq_ignore_ascii_case("template1")
+        {
+            return Err(anyhow!(
+                "cannot drop database \"{}\": it is a system database",
+                db_name
+            ));
+        }
+
+        let name_key = self.key(&encode_database_name_key(db_name));
+        let db_id = match txn.get(name_key.clone()).await? {
+            Some(data) => {
+                let bytes: [u8; 8] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Invalid database ID format"))?;
+                u64::from_be_bytes(bytes)
+            }
+            None => {
+                if if_exists {
+                    return Ok(None);
+                }
+                return Err(anyhow!("database \"{}\" does not exist", db_name));
+            }
+        };
+
+        if db_id == current_database_id {
+            return Err(anyhow!("cannot drop the currently open database"));
+        }
+
+        txn_delete(txn, name_key).await?;
+
+        let id_key = self.key(&encode_database_id_key(db_id));
+        txn_delete(txn, id_key).await?;
+
+        Ok(Some(db_id))
+    }
+
+    /// Rename a database (storage format v2).
+    pub async fn rename_database(
+        &self,
+        txn: &mut Transaction,
+        old_name: &str,
+        new_name: &str,
+        current_database_id: u64,
+    ) -> Result<()> {
+        if old_name.eq_ignore_ascii_case("postgres")
+            || old_name.eq_ignore_ascii_case("template0")
+            || old_name.eq_ignore_ascii_case("template1")
+        {
+            return Err(anyhow!("cannot rename database \"{}\"", old_name));
+        }
+        if new_name.eq_ignore_ascii_case("postgres")
+            || new_name.eq_ignore_ascii_case("template0")
+            || new_name.eq_ignore_ascii_case("template1")
+        {
+            return Err(anyhow!("cannot rename database to \"{}\"", new_name));
+        }
+
+        let old_key = self.key(&encode_database_name_key(old_name));
+        let db_id = match txn.get(old_key.clone()).await? {
+            Some(data) => {
+                let bytes: [u8; 8] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Invalid database ID format"))?;
+                u64::from_be_bytes(bytes)
+            }
+            None => return Err(anyhow!("database \"{}\" does not exist", old_name)),
+        };
+
+        if db_id == current_database_id {
+            return Err(anyhow!("cannot rename the currently open database"));
+        }
+
+        let new_key = self.key(&encode_database_name_key(new_name));
+        if txn.get(new_key.clone()).await?.is_some() {
+            return Err(anyhow!("database \"{}\" already exists", new_name));
+        }
+
+        txn_delete(txn, old_key).await?;
+        txn_put(txn, new_key, db_id.to_be_bytes().to_vec()).await?;
+
+        let id_key = self.key(&encode_database_id_key(db_id));
+        let mut def = self
+            .get_database_by_id(txn, db_id)
+            .await?
+            .ok_or_else(|| anyhow!("database metadata corrupted"))?;
+        def.name = new_name.to_string();
+        let data = bincode::serialize(&def).context("Failed to serialize database definition")?;
+        txn_put(txn, id_key, data).await?;
+
+        Ok(())
+    }
+
+    /// Update the owner for a database (storage format v2).
+    pub async fn set_database_owner(
+        &self,
+        txn: &mut Transaction,
+        db_name: &str,
+        new_owner: &str,
+    ) -> Result<()> {
+        let name_key = self.key(&encode_database_name_key(db_name));
+        let db_id = match txn.get(name_key).await? {
+            Some(data) => {
+                let bytes: [u8; 8] = data
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| anyhow!("Invalid database ID format"))?;
+                u64::from_be_bytes(bytes)
+            }
+            None => return Err(anyhow!("database \"{}\" does not exist", db_name)),
+        };
+
+        let id_key = self.key(&encode_database_id_key(db_id));
+        let mut def = self
+            .get_database_by_id(txn, db_id)
+            .await?
+            .ok_or_else(|| anyhow!("database metadata corrupted"))?;
+        def.owner = new_owner.to_string();
+        let data = bincode::serialize(&def).context("Failed to serialize database definition")?;
+        txn_put(txn, id_key, data).await?;
+        Ok(())
+    }
+
+    /// Efficiently delete all data within a database using TiKV's `unsafe_destroy_range`.
+    ///
+    /// This is a non-transactional, best-effort cleanup step intended for DROP DATABASE/TABLE.
+    pub async fn unsafe_destroy_database_data(&self, db_id: u64) -> Result<()> {
+        let (start, end) = encode_database_data_range(db_id);
+        let range: BoundRange = (start..end).into();
+        self.client
+            .unsafe_destroy_range(range)
+            .await
+            .map_err(|e| anyhow!(e))
+    }
+
     pub async fn lock_rows(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_name: &str,
         rows: &[Row],
     ) -> Result<()> {
         let schema = self
-            .get_schema(txn, table_name)
+            .get_schema(txn, db_id, table_name)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
         let keys: Vec<Vec<u8>> = rows
@@ -193,15 +554,20 @@ impl TikvStore {
             .map(|row| {
                 let pk_values = schema.get_pk_values(row);
                 let row_key = encode_pk_values(&pk_values);
-                self.key(&encode_data_key(schema.table_id, &row_key))
+                self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key))
             })
             .collect();
         txn.lock_keys(keys).await.map_err(|e| anyhow!(e))
     }
 
     /// Check if a table exists (using txn)
-    pub async fn table_exists(&self, txn: &mut Transaction, table_name: &str) -> Result<bool> {
-        let key = self.key(&encode_schema_key(table_name));
+    pub async fn table_exists(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+    ) -> Result<bool> {
+        let key = self.key(&encode_schema_key_v2(db_id, table_name));
         let exists = txn.get(key).await?.is_some();
         Ok(exists)
     }
@@ -210,17 +576,18 @@ impl TikvStore {
         matches!(schema, "public" | "pg_catalog" | "information_schema" | "extensions")
     }
 
-    pub async fn schema_exists(&self, txn: &mut Transaction, schema: &str) -> Result<bool> {
+    pub async fn schema_exists(&self, txn: &mut Transaction, db_id: u64, schema: &str) -> Result<bool> {
         if Self::is_builtin_schema(schema) {
             return Ok(true);
         }
-        let key = self.key(&encode_schema_def_key(schema));
+        let key = self.key(&encode_schema_def_key_v2(db_id, schema));
         Ok(txn.get(key).await?.is_some())
     }
 
     pub async fn create_schema(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         schema: &str,
         if_not_exists: bool,
     ) -> Result<bool> {
@@ -238,41 +605,51 @@ impl TikvStore {
             return Err(anyhow!("Schema '{}' already exists", schema));
         }
 
-        let key = self.key(&encode_schema_def_key(schema));
+        let key = self.key(&encode_schema_def_key_v2(db_id, schema));
         if txn.get(key.clone()).await?.is_some() {
             if if_not_exists {
                 return Ok(false);
             }
             return Err(anyhow!("Schema '{}' already exists", schema));
         }
-        let oid = self.next_schema_oid(txn).await?;
+        let oid = self.next_schema_oid(txn, db_id).await?;
         txn_put(txn, key, oid.to_be_bytes().to_vec()).await?;
-        self.invalidate_schema_cache().await;
+        self.invalidate_schema_cache(db_id).await;
         Ok(true)
     }
 
-    pub async fn invalidate_schema_cache(&self) {
+    pub async fn invalidate_schema_cache(&self, db_id: u64) {
         let mut cache = self.cache.write().await;
-        cache.schemas = None;
-        cache.schema_oids = None;
+        if let Some(entry) = cache.per_db.get_mut(&db_id) {
+            entry.schemas = None;
+            entry.schema_oids = None;
+        }
     }
 
-    pub async fn invalidate_table_cache(&self) {
+    pub async fn invalidate_table_cache(&self, db_id: u64) {
         let mut cache = self.cache.write().await;
-        cache.tables = None;
+        if let Some(entry) = cache.per_db.get_mut(&db_id) {
+            entry.tables = None;
+        }
     }
 
-    pub async fn list_schema_oids(&self, txn: &mut Transaction) -> Result<HashMap<String, u32>> {
+    pub async fn list_schema_oids(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<HashMap<String, u32>> {
         {
             let cache = self.cache.read().await;
-            if let Some((ts, oids)) = &cache.schema_oids {
-                if ts.elapsed() < SCHEMA_CACHE_TTL {
-                    return Ok(oids.clone());
+            if let Some(entry) = cache.per_db.get(&db_id) {
+                if let Some((ts, oids)) = &entry.schema_oids {
+                    if ts.elapsed() < SCHEMA_CACHE_TTL {
+                        return Ok(oids.clone());
+                    }
                 }
             }
         }
 
-        let prefix = encode_schema_def_prefix();
+        let prefix = encode_schema_def_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
@@ -296,8 +673,8 @@ impl TikvStore {
 
             let oid = match pair.value().len() {
                 0 => {
-                    let new_oid = self.next_schema_oid(txn).await?;
-                    let schema_key = self.key(&encode_schema_def_key(&schema));
+                    let new_oid = self.next_schema_oid(txn, db_id).await?;
+                    let schema_key = self.key(&encode_schema_def_key_v2(db_id, &schema));
                     txn_put(txn, schema_key, new_oid.to_be_bytes().to_vec()).await?;
                     new_oid
                 }
@@ -317,7 +694,10 @@ impl TikvStore {
 
         {
             let mut cache = self.cache.write().await;
-            cache.schema_oids = Some((Instant::now(), oids.clone()));
+            cache.per_db
+                .entry(db_id)
+                .or_insert_with(PerDatabaseSchemaCache::new)
+                .schema_oids = Some((Instant::now(), oids.clone()));
         }
 
         Ok(oids)
@@ -334,6 +714,7 @@ impl TikvStore {
     pub async fn drop_schema_restrict(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         schema: &str,
         if_exists: bool,
     ) -> Result<bool> {
@@ -347,7 +728,7 @@ impl TikvStore {
             return Err(anyhow!("cannot drop schema '{}'", schema));
         }
 
-        let key = self.key(&encode_schema_def_key(schema));
+        let key = self.key(&encode_schema_def_key_v2(db_id, schema));
         if txn.get(key.clone()).await?.is_none() {
             if if_exists {
                 return Ok(false);
@@ -355,7 +736,7 @@ impl TikvStore {
             return Err(anyhow!("Schema '{}' does not exist", schema));
         }
 
-        let mut table_prefix = encode_schema_prefix();
+        let mut table_prefix = encode_schema_prefix_v2(db_id);
         table_prefix.extend_from_slice(schema.as_bytes());
         table_prefix.push(b'.');
         if self.prefix_has_any(txn, table_prefix).await? {
@@ -365,7 +746,7 @@ impl TikvStore {
             ));
         }
 
-        let mut view_prefix = encode_view_prefix();
+        let mut view_prefix = encode_view_prefix_v2(db_id);
         view_prefix.extend_from_slice(schema.as_bytes());
         view_prefix.push(b'.');
         if self.prefix_has_any(txn, view_prefix).await? {
@@ -375,7 +756,7 @@ impl TikvStore {
             ));
         }
 
-        let mut matview_prefix = encode_matview_prefix();
+        let mut matview_prefix = encode_matview_prefix_v2(db_id);
         matview_prefix.extend_from_slice(schema.as_bytes());
         matview_prefix.push(b'.');
         if self.prefix_has_any(txn, matview_prefix).await? {
@@ -385,7 +766,7 @@ impl TikvStore {
             ));
         }
 
-        let mut procedure_prefix = encode_procedure_prefix();
+        let mut procedure_prefix = encode_procedure_prefix_v2(db_id);
         procedure_prefix.extend_from_slice(schema.as_bytes());
         procedure_prefix.push(b'.');
         if self.prefix_has_any(txn, procedure_prefix).await? {
@@ -395,7 +776,7 @@ impl TikvStore {
             ));
         }
 
-        let mut function_prefix = encode_function_prefix();
+        let mut function_prefix = encode_function_prefix_v2(db_id);
         function_prefix.extend_from_slice(schema.as_bytes());
         function_prefix.push(b'.');
         if self.prefix_has_any(txn, function_prefix).await? {
@@ -405,7 +786,7 @@ impl TikvStore {
             ));
         }
 
-        let mut trigger_prefix = encode_trigger_prefix();
+        let mut trigger_prefix = encode_trigger_prefix_v2(db_id);
         trigger_prefix.extend_from_slice(schema.as_bytes());
         trigger_prefix.push(b'.');
         if self.prefix_has_any(txn, trigger_prefix).await? {
@@ -415,7 +796,7 @@ impl TikvStore {
             ));
         }
 
-        let mut type_prefix = encode_type_prefix();
+        let mut type_prefix = encode_type_prefix_v2(db_id);
         type_prefix.extend_from_slice(schema.as_bytes());
         type_prefix.push(b'.');
         if self.prefix_has_any(txn, type_prefix).await? {
@@ -425,7 +806,7 @@ impl TikvStore {
             ));
         }
 
-        let mut sequence_prefix = encode_sequence_prefix();
+        let mut sequence_prefix = encode_sequence_def_prefix_v2(db_id);
         sequence_prefix.extend_from_slice(schema.as_bytes());
         sequence_prefix.push(b'.');
         if self.prefix_has_any(txn, sequence_prefix).await? {
@@ -436,23 +817,29 @@ impl TikvStore {
         }
 
         txn_delete(txn, key).await?;
-        self.invalidate_schema_cache().await;
+        self.invalidate_schema_cache(db_id).await;
         Ok(true)
     }
 
-    pub async fn list_schemas(&self, txn: &mut Transaction) -> Result<Vec<String>> {
+    pub async fn list_schemas(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<String>> {
         {
             let cache = self.cache.read().await;
-            if let Some((ts, schemas)) = &cache.schemas {
-                if ts.elapsed() < SCHEMA_CACHE_TTL {
-                    info!("list_schemas: cache HIT ({} schemas, age {}ms)", schemas.len(), ts.elapsed().as_millis());
-                    return Ok(schemas.clone());
+            if let Some(entry) = cache.per_db.get(&db_id) {
+                if let Some((ts, schemas)) = &entry.schemas {
+                    if ts.elapsed() < SCHEMA_CACHE_TTL {
+                        info!(
+                            "list_schemas: cache HIT ({} schemas, age {}ms)",
+                            schemas.len(),
+                            ts.elapsed().as_millis()
+                        );
+                        return Ok(schemas.clone());
+                    }
                 }
             }
         }
         info!("list_schemas: cache MISS");
 
-        let prefix = encode_schema_def_prefix();
+        let prefix = encode_schema_def_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
@@ -477,7 +864,10 @@ impl TikvStore {
 
         {
             let mut cache = self.cache.write().await;
-            cache.schemas = Some((Instant::now(), schemas.clone()));
+            cache.per_db
+                .entry(db_id)
+                .or_insert_with(PerDatabaseSchemaCache::new)
+                .schemas = Some((Instant::now(), schemas.clone()));
         }
 
         Ok(schemas)
@@ -486,9 +876,10 @@ impl TikvStore {
     pub async fn get_extension(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         ext_name: &str,
     ) -> Result<Option<InstalledExtension>> {
-        let key = self.key(&encode_extension_key(ext_name));
+        let key = self.key(&encode_extension_key_v2(db_id, ext_name));
         match txn.get(key).await? {
             Some(data) => Ok(Some(
                 bincode::deserialize(&data).context("Failed to deserialize extension")?,
@@ -497,28 +888,42 @@ impl TikvStore {
         }
     }
 
-    pub async fn put_extension(&self, txn: &mut Transaction, ext: &InstalledExtension) -> Result<()> {
-        let key = self.key(&encode_extension_key(&ext.name));
+    pub async fn put_extension(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        ext: &InstalledExtension,
+    ) -> Result<()> {
+        let key = self.key(&encode_extension_key_v2(db_id, &ext.name));
         let data = bincode::serialize(ext).context("Failed to serialize extension")?;
         txn_put(txn, key, data).await?;
         Ok(())
     }
 
-    pub async fn drop_extension(&self, txn: &mut Transaction, ext_name: &str) -> Result<bool> {
-        let key = self.key(&encode_extension_key(ext_name));
+    pub async fn drop_extension(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        ext_name: &str,
+    ) -> Result<bool> {
+        let key = self.key(&encode_extension_key_v2(db_id, ext_name));
         let existed = txn.get(key.clone()).await?.is_some();
         if !existed {
             return Ok(false);
         }
 
         txn_delete(txn, key).await?;
-        let cfg_key = self.key(&encode_extension_config_key(ext_name));
+        let cfg_key = self.key(&encode_extension_config_key_v2(db_id, ext_name));
         let _ = txn_delete(txn, cfg_key).await;
         Ok(true)
     }
 
-    pub async fn list_extensions(&self, txn: &mut Transaction) -> Result<Vec<InstalledExtension>> {
-        let prefix = encode_extension_prefix();
+    pub async fn list_extensions(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<Vec<InstalledExtension>> {
+        let prefix = encode_extension_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
@@ -541,10 +946,11 @@ impl TikvStore {
     pub(crate) async fn set_extension_comment(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         ext_name: &str,
         comment: Option<&str>,
     ) -> Result<()> {
-        let key = self.key(&encode_comment_extension_key(ext_name));
+        let key = self.key(&encode_comment_extension_key_v2(db_id, ext_name));
         match comment {
             Some(text) => txn_put(txn, key, text.as_bytes().to_vec()).await,
             None => txn_delete(txn, key).await,
@@ -555,10 +961,11 @@ impl TikvStore {
     pub(crate) async fn set_function_comment(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         func_full_name: &str,
         comment: Option<&str>,
     ) -> Result<()> {
-        let key = self.key(&encode_comment_function_key(func_full_name));
+        let key = self.key(&encode_comment_function_key_v2(db_id, func_full_name));
         match comment {
             Some(text) => txn_put(txn, key, text.as_bytes().to_vec()).await,
             None => txn_delete(txn, key).await,
@@ -569,10 +976,11 @@ impl TikvStore {
     pub(crate) async fn set_table_comment(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_full_name: &str,
         comment: Option<&str>,
     ) -> Result<()> {
-        let key = self.key(&encode_comment_table_key(table_full_name));
+        let key = self.key(&encode_comment_table_key_v2(db_id, table_full_name));
         match comment {
             Some(text) => txn_put(txn, key, text.as_bytes().to_vec()).await,
             None => txn_delete(txn, key).await,
@@ -583,11 +991,12 @@ impl TikvStore {
     pub(crate) async fn set_column_comment(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_full_name: &str,
         column_name: &str,
         comment: Option<&str>,
     ) -> Result<()> {
-        let key = self.key(&encode_comment_column_key(table_full_name, column_name));
+        let key = self.key(&encode_comment_column_key_v2(db_id, table_full_name, column_name));
         match comment {
             Some(text) => txn_put(txn, key, text.as_bytes().to_vec()).await,
             None => txn_delete(txn, key).await,
@@ -595,8 +1004,12 @@ impl TikvStore {
     }
 
     /// List all stored comments for the current tenant.
-    pub(crate) async fn list_comments(&self, txn: &mut Transaction) -> Result<Vec<CommentRecord>> {
-        let prefix = encode_comment_prefix();
+    pub(crate) async fn list_comments(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<Vec<CommentRecord>> {
+        let prefix = encode_comment_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
@@ -661,10 +1074,10 @@ impl TikvStore {
         Ok(records)
     }
 
-    pub async fn next_schema_oid(&self, txn: &mut Transaction) -> Result<u32> {
+    pub async fn next_schema_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
         const FIRST_USER_SCHEMA_OID: u32 = 20000;
 
-        let key = self.key(&encode_next_schema_oid_key());
+        let key = self.key(&encode_next_schema_oid_key_v2(db_id));
         let current = txn.get(key.clone()).await?;
         let next_val = match current {
             Some(data) => {
@@ -682,15 +1095,15 @@ impl TikvStore {
     }
 
     /// Get the next table ID (auto-increment)
-    pub async fn next_table_id(&self, txn: &mut Transaction) -> Result<u64> {
-        self.increment_sys_key(txn, encode_next_table_id_key())
+    pub async fn next_table_id(&self, txn: &mut Transaction, db_id: u64) -> Result<u64> {
+        self.increment_sys_key(txn, encode_next_table_id_key_v2(db_id))
             .await
     }
 
-    pub async fn next_type_oid(&self, txn: &mut Transaction) -> Result<u32> {
+    pub async fn next_type_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
         const FIRST_USER_TYPE_OID: u32 = 20000;
 
-        let key = self.key(&encode_next_type_oid_key());
+        let key = self.key(&encode_next_type_oid_key_v2(db_id));
         let current = txn.get(key.clone()).await?;
         let next_val = match current {
             Some(data) => {
@@ -707,10 +1120,10 @@ impl TikvStore {
         Ok(next_val)
     }
 
-    pub async fn next_sequence_oid(&self, txn: &mut Transaction) -> Result<u32> {
+    pub async fn next_sequence_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
         const FIRST_SEQUENCE_OID: u32 = 1;
 
-        let key = self.key(&encode_next_sequence_oid_key());
+        let key = self.key(&encode_next_sequence_oid_key_v2(db_id));
         let current = txn.get(key.clone()).await?;
         let next_val = match current {
             Some(data) => {
@@ -727,10 +1140,10 @@ impl TikvStore {
         Ok(next_val)
     }
 
-    pub async fn next_function_oid(&self, txn: &mut Transaction) -> Result<u32> {
+    pub async fn next_function_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
         const FIRST_FUNCTION_OID: u32 = 1;
 
-        let key = self.key(&encode_next_function_oid_key());
+        let key = self.key(&encode_next_function_oid_key_v2(db_id));
         let current = txn.get(key.clone()).await?;
         let next_val = match current {
             Some(data) => {
@@ -747,10 +1160,10 @@ impl TikvStore {
         Ok(next_val)
     }
 
-    pub async fn next_trigger_oid(&self, txn: &mut Transaction) -> Result<u32> {
+    pub async fn next_trigger_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
         const FIRST_TRIGGER_OID: u32 = 1;
 
-        let key = self.key(&encode_next_trigger_oid_key());
+        let key = self.key(&encode_next_trigger_oid_key_v2(db_id));
         let current = txn.get(key.clone()).await?;
         let next_val = match current {
             Some(data) => {
@@ -767,10 +1180,10 @@ impl TikvStore {
         Ok(next_val)
     }
 
-    pub async fn next_view_oid(&self, txn: &mut Transaction) -> Result<u32> {
+    pub async fn next_view_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
         const FIRST_VIEW_OID: u32 = 1;
 
-        let key = self.key(&encode_next_view_oid_key());
+        let key = self.key(&encode_next_view_oid_key_v2(db_id));
         let current = txn.get(key.clone()).await?;
         let next_val = match current {
             Some(data) => {
@@ -787,9 +1200,13 @@ impl TikvStore {
         Ok(next_val)
     }
 
-    pub async fn next_sequence_value(&self, txn: &mut Transaction, table_id: u64) -> Result<i32> {
-        let mut raw_key = b"_sys_seq_".to_vec();
-        raw_key.extend_from_slice(&table_id.to_be_bytes());
+    pub async fn next_sequence_value(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_id: u64,
+    ) -> Result<i32> {
+        let raw_key = encode_table_sequence_value_key_v2(db_id, table_id);
         let val = self.increment_sys_key(txn, raw_key).await?;
         Ok(val as i32)
     }
@@ -797,12 +1214,11 @@ impl TikvStore {
     pub async fn set_sequence_value(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_id: u64,
         value: u64,
     ) -> Result<()> {
-        let mut raw_key = b"_sys_seq_".to_vec();
-        raw_key.extend_from_slice(&table_id.to_be_bytes());
-        let key = self.key(&raw_key);
+        let key = self.key(&encode_table_sequence_value_key_v2(db_id, table_id));
         txn_put(txn, key, value.to_be_bytes().to_vec()).await?;
         Ok(())
     }
@@ -822,8 +1238,13 @@ impl TikvStore {
         Ok(next_val)
     }
 
-    pub async fn create_table(&self, txn: &mut Transaction, schema: TableSchema) -> Result<()> {
-        let schema_key = self.key(&encode_schema_key(&schema.name));
+    pub async fn create_table(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        schema: TableSchema,
+    ) -> Result<()> {
+        let schema_key = self.key(&encode_schema_key_v2(db_id, &schema.name));
         if txn.get(schema_key.clone()).await?.is_some() {
             return Err(anyhow!("Table '{}' already exists", schema.name));
         }
@@ -833,7 +1254,7 @@ impl TikvStore {
             "Created table '{}' with ID {}",
             schema.name, schema.table_id
         );
-        self.invalidate_table_cache().await;
+        self.invalidate_table_cache(db_id).await;
         Ok(())
     }
 
@@ -841,9 +1262,10 @@ impl TikvStore {
     pub async fn get_schema(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_name: &str,
     ) -> Result<Option<TableSchema>> {
-        let key = self.key(&encode_schema_key(table_name));
+        let key = self.key(&encode_schema_key_v2(db_id, table_name));
         let val = txn.get(key).await?;
         match val {
             Some(data) => Ok(Some(deserialize_schema(&data)?)),
@@ -851,23 +1273,32 @@ impl TikvStore {
         }
     }
 
-    pub async fn drop_table(&self, txn: &mut Transaction, table_name: &str) -> Result<bool> {
-        let schema_opt = self.get_schema(txn, table_name).await?;
+    pub async fn drop_table(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+    ) -> Result<bool> {
+        let schema_opt = self.get_schema(txn, db_id, table_name).await?;
         if let Some(schema) = schema_opt {
-            let schema_key = self.key(&encode_schema_key(table_name));
+            let schema_key = self.key(&encode_schema_key_v2(db_id, table_name));
             txn_delete(txn, schema_key).await?;
-            let (raw_start, raw_end) = encode_table_data_range(schema.table_id);
-            let start = self.key(&raw_start);
-            let end = self.key(&raw_end);
-            let range: BoundRange = (start..end).into();
+            let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
+            let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
             let pairs = txn.scan(range, SCAN_LIMIT).await?;
             for pair in pairs {
-                let key: Vec<u8> = pair.into_key().into();
-                txn_delete(txn, key).await?;
+                txn_delete(txn, pair.into_key().into()).await?;
+            }
+
+            let (raw_start, raw_end) = encode_table_index_range_v2(db_id, schema.table_id);
+            let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
+            let pairs = txn.scan(range, SCAN_LIMIT).await?;
+            for pair in pairs {
+                txn_delete(txn, pair.into_key().into()).await?;
             }
 
             info!("Dropped table '{}'", table_name);
-            self.invalidate_table_cache().await;
+            self.invalidate_table_cache(db_id).await;
             Ok(true)
         } else {
             Ok(false)
@@ -875,9 +1306,15 @@ impl TikvStore {
     }
 
     /// Insert a row into a table
-    pub async fn insert(&self, txn: &mut Transaction, table_name: &str, row: Row) -> Result<()> {
+    pub async fn insert(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+        row: Row,
+    ) -> Result<()> {
         let schema = self
-            .get_schema(txn, table_name)
+            .get_schema(txn, db_id, table_name)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
         if row.values.len() != schema.columns.len() {
@@ -885,7 +1322,7 @@ impl TikvStore {
         }
         let pk_values = schema.get_pk_values(&row);
         let row_key = encode_pk_values(&pk_values);
-        let data_key = self.key(&encode_data_key(schema.table_id, &row_key));
+        let data_key = self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key));
         let row_data = serialize_row(&row)?;
         if txn.get(data_key.clone()).await?.is_some() {
             let short_table = table_name.rsplit('.').next().unwrap_or(table_name);
@@ -921,14 +1358,20 @@ impl TikvStore {
     }
 
     /// Upsert a row into a table
-    pub async fn upsert(&self, txn: &mut Transaction, table_name: &str, row: Row) -> Result<()> {
+    pub async fn upsert(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+        row: Row,
+    ) -> Result<()> {
         let schema = self
-            .get_schema(txn, table_name)
+            .get_schema(txn, db_id, table_name)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
         let pk_values = schema.get_pk_values(&row);
         let row_key = encode_pk_values(&pk_values);
-        let data_key = self.key(&encode_data_key(schema.table_id, &row_key));
+        let data_key = self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key));
         let row_data = serialize_row(&row)?;
         txn_put(txn, data_key, row_data).await?;
         debug!("Upserted row into '{}'", table_name);
@@ -936,15 +1379,18 @@ impl TikvStore {
     }
 
     /// Scan all rows from a table
-    pub async fn scan(&self, txn: &mut Transaction, table_name: &str) -> Result<Vec<Row>> {
+    pub async fn scan(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+    ) -> Result<Vec<Row>> {
         let schema = self
-            .get_schema(txn, table_name)
+            .get_schema(txn, db_id, table_name)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
-        let (raw_start, raw_end) = encode_table_data_range(schema.table_id);
-        let start = self.key(&raw_start);
-        let end = self.key(&raw_end);
-        let range: BoundRange = (start..end).into();
+        let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
+        let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
         let pairs: Vec<_> = txn.scan(range, SCAN_LIMIT).await?.collect();
         let mut rows = Vec::new();
         for pair in pairs {
@@ -959,15 +1405,16 @@ impl TikvStore {
     pub async fn delete_by_pk(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_name: &str,
         pk_values: &[Value],
     ) -> Result<u64> {
         let schema = self
-            .get_schema(txn, table_name)
+            .get_schema(txn, db_id, table_name)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
         let row_key = encode_pk_values(pk_values);
-        let data_key = self.key(&encode_data_key(schema.table_id, &row_key));
+        let data_key = self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key));
         let existed = txn.get(data_key.clone()).await?.is_some();
         if existed {
             txn_delete(txn, data_key).await?;
@@ -981,34 +1428,41 @@ impl TikvStore {
     pub async fn get_by_pk(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_name: &str,
         pk_values: &[Value],
     ) -> Result<Option<Row>> {
         let schema = self
-            .get_schema(txn, table_name)
+            .get_schema(txn, db_id, table_name)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
         let row_key = encode_pk_values(pk_values);
-        let data_key = self.key(&encode_data_key(schema.table_id, &row_key));
+        let data_key = self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key));
         match txn.get(data_key).await? {
             Some(data) => Ok(Some(deserialize_row(&data)?)),
             None => Ok(None),
         }
     }
 
-    pub async fn list_tables(&self, txn: &mut Transaction) -> Result<Vec<String>> {
+    pub async fn list_tables(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<String>> {
         {
             let cache = self.cache.read().await;
-            if let Some((ts, tables)) = &cache.tables {
-                if ts.elapsed() < SCHEMA_CACHE_TTL {
-                    info!("list_tables: cache HIT ({} tables, age {}ms)", tables.len(), ts.elapsed().as_millis());
-                    return Ok(tables.clone());
+            if let Some(entry) = cache.per_db.get(&db_id) {
+                if let Some((ts, tables)) = &entry.tables {
+                    if ts.elapsed() < SCHEMA_CACHE_TTL {
+                        info!(
+                            "list_tables: cache HIT ({} tables, age {}ms)",
+                            tables.len(),
+                            ts.elapsed().as_millis()
+                        );
+                        return Ok(tables.clone());
+                    }
                 }
             }
         }
         info!("list_tables: cache MISS");
 
-        let prefix = encode_schema_prefix();
+        let prefix = encode_schema_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
@@ -1024,15 +1478,18 @@ impl TikvStore {
 
         {
             let mut cache = self.cache.write().await;
-            cache.tables = Some((Instant::now(), tables.clone()));
+            cache.per_db
+                .entry(db_id)
+                .or_insert_with(PerDatabaseSchemaCache::new)
+                .tables = Some((Instant::now(), tables.clone()));
         }
 
         Ok(tables)
     }
 
-    pub async fn create_type(&self, txn: &mut Transaction, def: UserTypeDef) -> Result<()> {
+    pub async fn create_type(&self, txn: &mut Transaction, db_id: u64, def: UserTypeDef) -> Result<()> {
         let full_name = format!("{}.{}", def.schema, def.name);
-        let key = self.key(&encode_type_key(&full_name));
+        let key = self.key(&encode_type_key_v2(db_id, &full_name));
         if txn.get(key.clone()).await?.is_some() {
             return Err(anyhow!("Type '{}' already exists", full_name));
         }
@@ -1044,9 +1501,10 @@ impl TikvStore {
     pub async fn get_type(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         full_name: &str,
     ) -> Result<Option<UserTypeDef>> {
-        let key = self.key(&encode_type_key(full_name));
+        let key = self.key(&encode_type_key_v2(db_id, full_name));
         match txn.get(key).await? {
             Some(data) => Ok(Some(
                 bincode::deserialize(&data).context("Failed to deserialize type definition")?,
@@ -1055,8 +1513,8 @@ impl TikvStore {
         }
     }
 
-    pub async fn list_types(&self, txn: &mut Transaction) -> Result<Vec<UserTypeDef>> {
-        let prefix = encode_type_prefix();
+    pub async fn list_types(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<UserTypeDef>> {
+        let prefix = encode_type_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix..end).into();
@@ -1071,8 +1529,13 @@ impl TikvStore {
         Ok(types)
     }
 
-    pub async fn drop_type(&self, txn: &mut Transaction, full_name: &str) -> Result<bool> {
-        let key = self.key(&encode_type_key(full_name));
+    pub async fn drop_type(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        full_name: &str,
+    ) -> Result<bool> {
+        let key = self.key(&encode_type_key_v2(db_id, full_name));
         if txn.get(key.clone()).await?.is_some() {
             txn_delete(txn, key).await?;
             Ok(true)
@@ -1081,13 +1544,18 @@ impl TikvStore {
         }
     }
 
-    pub async fn create_sequence(&self, txn: &mut Transaction, mut def: SequenceDef) -> Result<()> {
+    pub async fn create_sequence(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        mut def: SequenceDef,
+    ) -> Result<()> {
         if def.oid == 0 {
-            def.oid = self.next_sequence_oid(txn).await?;
+            def.oid = self.next_sequence_oid(txn, db_id).await?;
         }
 
         let full_name = def.full_name();
-        let key = self.key(&encode_sequence_key(&full_name));
+        let key = self.key(&encode_sequence_def_key_v2(db_id, &full_name));
         if txn.get(key.clone()).await?.is_some() {
             return Err(anyhow!("Sequence '{}' already exists", full_name));
         }
@@ -1097,8 +1565,13 @@ impl TikvStore {
     }
 
     /// Persist an updated sequence definition (metadata only; does not touch sequence state).
-    pub async fn update_sequence_def(&self, txn: &mut Transaction, def: &SequenceDef) -> Result<()> {
-        let key = self.key(&encode_sequence_key(&def.full_name()));
+    pub async fn update_sequence_def(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        def: &SequenceDef,
+    ) -> Result<()> {
+        let key = self.key(&encode_sequence_def_key_v2(db_id, &def.full_name()));
         let data = bincode::serialize(def).context("Failed to serialize sequence definition")?;
         txn_put(txn, key, data).await?;
         Ok(())
@@ -1107,16 +1580,17 @@ impl TikvStore {
     pub async fn get_sequence(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         full_name: &str,
     ) -> Result<Option<SequenceDef>> {
-        let key = self.key(&encode_sequence_key(full_name));
+        let key = self.key(&encode_sequence_def_key_v2(db_id, full_name));
         match txn.get(key).await? {
             Some(data) => {
                 let mut def: SequenceDef = bincode::deserialize(&data)
                     .context("Failed to deserialize sequence definition")?;
                 let mut needs_update = false;
                 if def.oid == 0 {
-                    def.oid = self.next_sequence_oid(txn).await?;
+                    def.oid = self.next_sequence_oid(txn, db_id).await?;
                     needs_update = true;
                 }
                 if def.start_value == 0 {
@@ -1130,7 +1604,7 @@ impl TikvStore {
                 if needs_update {
                     let data = bincode::serialize(&def)
                         .context("Failed to serialize sequence definition")?;
-                    txn_put(txn, self.key(&encode_sequence_key(full_name)), data).await?;
+                    txn_put(txn, self.key(&encode_sequence_def_key_v2(db_id, full_name)), data).await?;
                 }
                 Ok(Some(def))
             }
@@ -1138,8 +1612,12 @@ impl TikvStore {
         }
     }
 
-    pub async fn list_sequences(&self, txn: &mut Transaction) -> Result<Vec<SequenceDef>> {
-        let prefix = encode_sequence_prefix();
+    pub async fn list_sequences(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<Vec<SequenceDef>> {
+        let prefix = encode_sequence_def_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix..end).into();
@@ -1151,7 +1629,7 @@ impl TikvStore {
                 bincode::deserialize(pair.value()).context("Failed to deserialize sequence")?;
             let mut needs_update = false;
             if def.oid == 0 {
-                def.oid = self.next_sequence_oid(txn).await?;
+                def.oid = self.next_sequence_oid(txn, db_id).await?;
                 needs_update = true;
             }
             if def.start_value == 0 {
@@ -1164,15 +1642,20 @@ impl TikvStore {
             }
             if needs_update {
                 let data = bincode::serialize(&def).context("Failed to serialize sequence")?;
-                txn_put(txn, self.key(&encode_sequence_key(&def.full_name())), data).await?;
+                txn_put(txn, self.key(&encode_sequence_def_key_v2(db_id, &def.full_name())), data).await?;
             }
             sequences.push(def);
         }
         Ok(sequences)
     }
 
-    pub async fn drop_sequence(&self, txn: &mut Transaction, full_name: &str) -> Result<bool> {
-        let key = self.key(&encode_sequence_key(full_name));
+    pub async fn drop_sequence(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        full_name: &str,
+    ) -> Result<bool> {
+        let key = self.key(&encode_sequence_def_key_v2(db_id, full_name));
         if txn.get(key.clone()).await?.is_some() {
             txn_delete(txn, key).await?;
             Ok(true)
@@ -1181,13 +1664,18 @@ impl TikvStore {
         }
     }
 
-    pub async fn create_function(&self, txn: &mut Transaction, mut def: FunctionDef) -> Result<()> {
+    pub async fn create_function(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        mut def: FunctionDef,
+    ) -> Result<()> {
         if def.oid == 0 {
-            def.oid = self.next_function_oid(txn).await?;
+            def.oid = self.next_function_oid(txn, db_id).await?;
         }
 
         let full_name = format!("{}.{}", def.schema, def.name);
-        let key = self.key(&encode_function_key(&full_name));
+        let key = self.key(&encode_function_key_v2(db_id, &full_name));
         if txn.get(key.clone()).await?.is_some() {
             return Err(anyhow!("Function '{}' already exists", full_name));
         }
@@ -1199,10 +1687,11 @@ impl TikvStore {
     pub async fn replace_function(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         mut def: FunctionDef,
     ) -> Result<()> {
         let full_name = format!("{}.{}", def.schema, def.name);
-        let key = self.key(&encode_function_key(&full_name));
+        let key = self.key(&encode_function_key_v2(db_id, &full_name));
 
         if def.oid == 0 {
             if let Some(existing) = txn.get(key.clone()).await? {
@@ -1213,7 +1702,7 @@ impl TikvStore {
             }
         }
         if def.oid == 0 {
-            def.oid = self.next_function_oid(txn).await?;
+            def.oid = self.next_function_oid(txn, db_id).await?;
         }
 
         let data = serialize_function_def(&def)?;
@@ -1224,16 +1713,17 @@ impl TikvStore {
     pub async fn get_function(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         full_name: &str,
     ) -> Result<Option<FunctionDef>> {
-        let key = self.key(&encode_function_key(full_name));
+        let key = self.key(&encode_function_key_v2(db_id, full_name));
         match txn.get(key).await? {
             Some(data) => {
                 let mut def: FunctionDef = deserialize_function_def(&data)?;
                 if def.oid == 0 {
-                    def.oid = self.next_function_oid(txn).await?;
+                    def.oid = self.next_function_oid(txn, db_id).await?;
                     let data = serialize_function_def(&def)?;
-                    txn_put(txn, self.key(&encode_function_key(full_name)), data).await?;
+                    txn_put(txn, self.key(&encode_function_key_v2(db_id, full_name)), data).await?;
                 }
                 Ok(Some(def))
             }
@@ -1241,8 +1731,12 @@ impl TikvStore {
         }
     }
 
-    pub async fn list_functions(&self, txn: &mut Transaction) -> Result<Vec<FunctionDef>> {
-        let prefix = encode_function_prefix();
+    pub async fn list_functions(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<Vec<FunctionDef>> {
+        let prefix = encode_function_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix..end).into();
@@ -1253,21 +1747,26 @@ impl TikvStore {
             let mut def: FunctionDef = deserialize_function_def(pair.value())?;
             let mut needs_update = false;
             if def.oid == 0 {
-                def.oid = self.next_function_oid(txn).await?;
+                def.oid = self.next_function_oid(txn, db_id).await?;
                 needs_update = true;
             }
             if needs_update {
                 let data = serialize_function_def(&def)?;
                 let full_name = format!("{}.{}", def.schema, def.name);
-                txn_put(txn, self.key(&encode_function_key(&full_name)), data).await?;
+                txn_put(txn, self.key(&encode_function_key_v2(db_id, &full_name)), data).await?;
             }
             funcs.push(def);
         }
         Ok(funcs)
     }
 
-    pub async fn drop_function(&self, txn: &mut Transaction, full_name: &str) -> Result<bool> {
-        let key = self.key(&encode_function_key(full_name));
+    pub async fn drop_function(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        full_name: &str,
+    ) -> Result<bool> {
+        let key = self.key(&encode_function_key_v2(db_id, full_name));
         if txn.get(key.clone()).await?.is_some() {
             txn_delete(txn, key).await?;
             Ok(true)
@@ -1276,12 +1775,17 @@ impl TikvStore {
         }
     }
 
-    pub async fn create_trigger(&self, txn: &mut Transaction, mut def: TriggerDef) -> Result<()> {
+    pub async fn create_trigger(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        mut def: TriggerDef,
+    ) -> Result<()> {
         if def.oid == 0 {
-            def.oid = self.next_trigger_oid(txn).await?;
+            def.oid = self.next_trigger_oid(txn, db_id).await?;
         }
 
-        let key = self.key(&encode_trigger_key(&def.table, def.name.as_str()));
+        let key = self.key(&encode_trigger_key_v2(db_id, &def.table, def.name.as_str()));
         if txn.get(key.clone()).await?.is_some() {
             return Err(anyhow!(
                 "Trigger '{}' already exists on '{}'",
@@ -1297,21 +1801,22 @@ impl TikvStore {
     pub async fn get_trigger(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_full_name: &str,
         trigger_name: &str,
     ) -> Result<Option<TriggerDef>> {
-        let key = self.key(&encode_trigger_key(table_full_name, trigger_name));
+        let key = self.key(&encode_trigger_key_v2(db_id, table_full_name, trigger_name));
         match txn.get(key).await? {
             Some(data) => {
                 let mut def: TriggerDef = bincode::deserialize(&data)
                     .context("Failed to deserialize trigger definition")?;
                 if def.oid == 0 {
-                    def.oid = self.next_trigger_oid(txn).await?;
+                    def.oid = self.next_trigger_oid(txn, db_id).await?;
                     let data = bincode::serialize(&def)
                         .context("Failed to serialize trigger definition")?;
                     txn_put(
                         txn,
-                        self.key(&encode_trigger_key(table_full_name, trigger_name)),
+                        self.key(&encode_trigger_key_v2(db_id, table_full_name, trigger_name)),
                         data,
                     )
                     .await?;
@@ -1322,8 +1827,8 @@ impl TikvStore {
         }
     }
 
-    pub async fn list_triggers(&self, txn: &mut Transaction) -> Result<Vec<TriggerDef>> {
-        let prefix = encode_trigger_prefix();
+    pub async fn list_triggers(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<TriggerDef>> {
+        let prefix = encode_trigger_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix..end).into();
@@ -1334,11 +1839,11 @@ impl TikvStore {
             let mut def: TriggerDef =
                 bincode::deserialize(pair.value()).context("Failed to deserialize trigger")?;
             if def.oid == 0 {
-                def.oid = self.next_trigger_oid(txn).await?;
+                def.oid = self.next_trigger_oid(txn, db_id).await?;
                 let data = bincode::serialize(&def).context("Failed to serialize trigger")?;
                 txn_put(
                     txn,
-                    self.key(&encode_trigger_key(&def.table, def.name.as_str())),
+                    self.key(&encode_trigger_key_v2(db_id, &def.table, def.name.as_str())),
                     data,
                 )
                 .await?;
@@ -1351,9 +1856,10 @@ impl TikvStore {
     pub async fn list_triggers_for_table(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_full_name: &str,
     ) -> Result<Vec<TriggerDef>> {
-        let prefix = encode_trigger_table_prefix(table_full_name);
+        let prefix = encode_trigger_table_prefix_v2(db_id, table_full_name);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix..end).into();
@@ -1371,10 +1877,11 @@ impl TikvStore {
     pub async fn drop_trigger(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_full_name: &str,
         trigger_name: &str,
     ) -> Result<bool> {
-        let key = self.key(&encode_trigger_key(table_full_name, trigger_name));
+        let key = self.key(&encode_trigger_key_v2(db_id, table_full_name, trigger_name));
         if txn.get(key.clone()).await?.is_some() {
             txn_delete(txn, key).await?;
             Ok(true)
@@ -1383,15 +1890,20 @@ impl TikvStore {
         }
     }
 
-    pub async fn nextval_sequence(&self, txn: &mut Transaction, full_name: &str) -> Result<i64> {
+    pub async fn nextval_sequence(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        full_name: &str,
+    ) -> Result<i64> {
         let mut def = self
-            .get_sequence(txn, full_name)
+            .get_sequence(txn, db_id, full_name)
             .await?
             .ok_or_else(|| anyhow!("Sequence '{}' does not exist", full_name))?;
 
         match &mut def.backing {
             SequenceBacking::TableId(table_id) => {
-                Ok(self.next_sequence_value(txn, *table_id).await? as i64)
+                Ok(self.next_sequence_value(txn, db_id, *table_id).await? as i64)
             }
             SequenceBacking::Standalone(state) => {
                 let next = nextval_standalone(
@@ -1403,7 +1915,7 @@ impl TikvStore {
                     state,
                 )?;
 
-                let key = self.key(&encode_sequence_key(full_name));
+                let key = self.key(&encode_sequence_def_key_v2(db_id, full_name));
                 let data =
                     bincode::serialize(&def).context("Failed to serialize sequence definition")?;
                 txn_put(txn, key, data).await?;
@@ -1415,12 +1927,13 @@ impl TikvStore {
     pub async fn setval_sequence(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         full_name: &str,
         value: i64,
         is_called: bool,
     ) -> Result<i64> {
         let mut def = self
-            .get_sequence(txn, full_name)
+            .get_sequence(txn, db_id, full_name)
             .await?
             .ok_or_else(|| anyhow!("Sequence '{}' does not exist", full_name))?;
 
@@ -1451,7 +1964,7 @@ impl TikvStore {
                         )
                     })?
                 };
-                self.set_sequence_value(txn, *table_id, stored).await?;
+                self.set_sequence_value(txn, db_id, *table_id, stored).await?;
                 Ok(value)
             }
             SequenceBacking::Standalone(state) => {
@@ -1464,7 +1977,7 @@ impl TikvStore {
                     is_called,
                 )?;
 
-                let key = self.key(&encode_sequence_key(full_name));
+                let key = self.key(&encode_sequence_def_key_v2(db_id, full_name));
                 let data =
                     bincode::serialize(&def).context("Failed to serialize sequence definition")?;
                 txn_put(txn, key, data).await?;
@@ -1474,17 +1987,26 @@ impl TikvStore {
     }
 
     /// Truncate a table
-    pub async fn truncate_table(&self, txn: &mut Transaction, table_name: &str) -> Result<bool> {
-        let schema_opt = self.get_schema(txn, table_name).await?;
+    pub async fn truncate_table(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+    ) -> Result<bool> {
+        let schema_opt = self.get_schema(txn, db_id, table_name).await?;
         if let Some(schema) = schema_opt {
-            let (raw_start, raw_end) = encode_table_data_range(schema.table_id);
-            let start = self.key(&raw_start);
-            let end = self.key(&raw_end);
-            let range: BoundRange = (start..end).into();
+            let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
+            let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
             let pairs = txn.scan(range, SCAN_LIMIT).await?;
             for pair in pairs {
-                let key: Vec<u8> = pair.into_key().into();
-                txn_delete(txn, key).await?;
+                txn_delete(txn, pair.into_key().into()).await?;
+            }
+
+            let (raw_start, raw_end) = encode_table_index_range_v2(db_id, schema.table_id);
+            let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
+            let pairs = txn.scan(range, SCAN_LIMIT).await?;
+            for pair in pairs {
+                txn_delete(txn, pair.into_key().into()).await?;
             }
             info!("Truncated table '{}'", table_name);
             Ok(true)
@@ -1494,8 +2016,13 @@ impl TikvStore {
     }
 
     /// Update table schema
-    pub async fn update_schema(&self, txn: &mut Transaction, schema: TableSchema) -> Result<()> {
-        let schema_key = self.key(&encode_schema_key(&schema.name));
+    pub async fn update_schema(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        schema: TableSchema,
+    ) -> Result<()> {
+        let schema_key = self.key(&encode_schema_key_v2(db_id, &schema.name));
         let schema_data = serialize_schema(&schema)?;
         txn_put(txn, schema_key, schema_data).await?;
         Ok(())
@@ -1511,6 +2038,7 @@ impl TikvStore {
     pub async fn rename_table_schema(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         old_table: &str,
         new_table: &str,
     ) -> Result<()> {
@@ -1518,8 +2046,8 @@ impl TikvStore {
             return Ok(());
         }
 
-        let old_key = self.key(&encode_schema_key(old_table));
-        let new_key = self.key(&encode_schema_key(new_table));
+        let old_key = self.key(&encode_schema_key_v2(db_id, old_table));
+        let new_key = self.key(&encode_schema_key_v2(db_id, new_table));
 
         if txn.get(new_key.clone()).await?.is_some() {
             return Err(anyhow!("Table '{}' already exists", new_table));
@@ -1546,6 +2074,7 @@ impl TikvStore {
     pub async fn create_index_entry(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_id: u64,
         index_id: u64,
         values: &[Value],
@@ -1553,14 +2082,15 @@ impl TikvStore {
         unique: bool,
     ) -> Result<()> {
         if unique {
-            let idx_key = self.key(&encode_index_key(table_id, index_id, values, None));
+            let idx_key = self.key(&encode_index_key_v2(db_id, table_id, index_id, values, None));
             if txn.get(idx_key.clone()).await?.is_some() {
                 return Err(anyhow!("Duplicate entry for unique index"));
             }
             let idx_val = encode_pk_values(pk_values);
             txn_put(txn, idx_key, idx_val).await?;
         } else {
-            let idx_key = self.key(&encode_index_key(
+            let idx_key = self.key(&encode_index_key_v2(
+                db_id,
                 table_id,
                 index_id,
                 values,
@@ -1575,6 +2105,7 @@ impl TikvStore {
     pub async fn delete_index_entry(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_id: u64,
         index_id: u64,
         values: &[Value],
@@ -1582,10 +2113,11 @@ impl TikvStore {
         unique: bool,
     ) -> Result<()> {
         if unique {
-            let idx_key = self.key(&encode_index_key(table_id, index_id, values, None));
+            let idx_key = self.key(&encode_index_key_v2(db_id, table_id, index_id, values, None));
             txn_delete(txn, idx_key).await?;
         } else {
-            let idx_key = self.key(&encode_index_key(
+            let idx_key = self.key(&encode_index_key_v2(
+                db_id,
                 table_id,
                 index_id,
                 values,
@@ -1600,6 +2132,7 @@ impl TikvStore {
     pub async fn scan_index(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_id: u64,
         index_id: u64,
         values: &[Value],
@@ -1611,7 +2144,7 @@ impl TikvStore {
         }
 
         if unique {
-            let idx_key = self.key(&encode_index_key(table_id, index_id, values, None));
+            let idx_key = self.key(&encode_index_key_v2(db_id, table_id, index_id, values, None));
             if let Some(val) = txn.get(idx_key).await? {
                 let pk = decode_pk_from_index_suffix(&val, pk_types)?;
                 Ok(vec![pk])
@@ -1619,7 +2152,7 @@ impl TikvStore {
                 Ok(vec![])
             }
         } else {
-            let prefix = encode_index_key(table_id, index_id, values, None);
+            let prefix = encode_index_key_v2(db_id, table_id, index_id, values, None);
 
             let mut start_raw = prefix.clone();
             start_raw.push(0x01);
@@ -1654,6 +2187,7 @@ impl TikvStore {
     pub async fn scan_index_prefix(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_id: u64,
         index_id: u64,
         prefix_values: &[Value],
@@ -1665,7 +2199,7 @@ impl TikvStore {
             return Err(anyhow!("PK types required for index scan"));
         }
 
-        let prefix = encode_index_key(table_id, index_id, prefix_values, None);
+        let prefix = encode_index_key_v2(db_id, table_id, index_id, prefix_values, None);
         let start_key = self.key(&prefix);
 
         let mut end_raw = prefix;
@@ -1685,7 +2219,7 @@ impl TikvStore {
             return Ok(pks);
         }
 
-        let fixed_prefix_len = encode_index_key(table_id, index_id, &[], None).len();
+        let fixed_prefix_len = encode_index_key_v2(db_id, table_id, index_id, &[], None).len();
         for pair in pairs {
             let full_key: &[u8] = pair.key().as_ref().into();
             if full_key.len() <= fixed_prefix_len {
@@ -1718,6 +2252,7 @@ impl TikvStore {
     pub async fn create_gin_index_entries(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_id: u64,
         index_id: u64,
         token_hashes: &[u64],
@@ -1729,7 +2264,8 @@ impl TikvStore {
 
         let pk_key = encode_pk_values(pk_values);
         for &token_hash in token_hashes {
-            let key = self.key(&encode_gin_index_key(table_id, index_id, token_hash, &pk_key));
+            let key =
+                self.key(&encode_gin_index_key_v2(db_id, table_id, index_id, token_hash, &pk_key));
             txn_put(txn, key, Vec::new()).await?;
         }
         Ok(())
@@ -1739,6 +2275,7 @@ impl TikvStore {
     pub async fn delete_gin_index_entries(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_id: u64,
         index_id: u64,
         token_hashes: &[u64],
@@ -1750,7 +2287,8 @@ impl TikvStore {
 
         let pk_key = encode_pk_values(pk_values);
         for &token_hash in token_hashes {
-            let key = self.key(&encode_gin_index_key(table_id, index_id, token_hash, &pk_key));
+            let key =
+                self.key(&encode_gin_index_key_v2(db_id, table_id, index_id, token_hash, &pk_key));
             txn_delete(txn, key).await?;
         }
         Ok(())
@@ -1763,6 +2301,7 @@ impl TikvStore {
     pub async fn scan_gin_index_intersection(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_id: u64,
         index_id: u64,
         token_hashes: &[u64],
@@ -1778,7 +2317,8 @@ impl TikvStore {
                 break;
             }
 
-            let (start_raw, end_raw) = encode_gin_index_token_range(table_id, index_id, token_hash);
+            let (start_raw, end_raw) =
+                encode_gin_index_token_range_v2(db_id, table_id, index_id, token_hash);
             let start_key = self.key(&start_raw);
             let end_key = self.key(&end_raw);
             let range: BoundRange = (start_key.clone()..end_key).into();
@@ -1817,6 +2357,7 @@ impl TikvStore {
     pub async fn batch_get_rows(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_id: u64,
         pks: Vec<Vec<Value>>,
         _schema: &TableSchema,
@@ -1824,7 +2365,7 @@ impl TikvStore {
         let mut rows = Vec::new();
         for pk in &pks {
             let row_key = encode_pk_values(pk);
-            let data_key = self.key(&encode_data_key(table_id, &row_key));
+            let data_key = self.key(&encode_data_key_v2(db_id, table_id, &row_key));
             if let Some(val) = txn.get(data_key).await? {
                 let row = deserialize_row(&val)?;
                 rows.push(row);
@@ -1839,12 +2380,13 @@ impl TikvStore {
     pub async fn batch_get_rows_by_pk_keys(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_id: u64,
         pk_keys: Vec<Vec<u8>>,
     ) -> Result<Vec<Row>> {
         let mut rows = Vec::new();
         for pk_key in &pk_keys {
-            let data_key = self.key(&encode_data_key(table_id, pk_key));
+            let data_key = self.key(&encode_data_key_v2(db_id, table_id, pk_key));
             if let Some(val) = txn.get(data_key).await? {
                 rows.push(deserialize_row(&val)?);
             }
@@ -1852,14 +2394,20 @@ impl TikvStore {
         Ok(rows)
     }
 
-    pub async fn create_view(&self, txn: &mut Transaction, name: &str, query: &str) -> Result<()> {
-        let key = self.key(&encode_view_key(name));
+    pub async fn create_view(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        name: &str,
+        query: &str,
+    ) -> Result<()> {
+        let key = self.key(&encode_view_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
             return Err(anyhow!("View '{}' already exists", name));
         }
 
         let (schema, view_name) = name.split_once('.').unwrap_or(("public", name));
-        let oid = self.next_view_oid(txn).await?;
+        let oid = self.next_view_oid(txn, db_id).await?;
         let def = ViewDef {
             oid,
             schema: schema.to_string(),
@@ -1872,13 +2420,18 @@ impl TikvStore {
         Ok(())
     }
 
-    pub async fn get_view(&self, txn: &mut Transaction, name: &str) -> Result<Option<ViewDef>> {
-        let key = self.key(&encode_view_key(name));
+    pub async fn get_view(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        name: &str,
+    ) -> Result<Option<ViewDef>> {
+        let key = self.key(&encode_view_key_v2(db_id, name));
         match txn.get(key.clone()).await? {
             Some(data) => match bincode::deserialize::<ViewDef>(&data) {
                 Ok(mut def) => {
                     if def.oid == 0 {
-                        def.oid = self.next_view_oid(txn).await?;
+                        def.oid = self.next_view_oid(txn, db_id).await?;
                         let updated =
                             bincode::serialize(&def).context("Failed to serialize view")?;
                         txn_put(txn, key, updated).await?;
@@ -1888,7 +2441,7 @@ impl TikvStore {
                 Err(_) => {
                     let query = String::from_utf8(data)?;
                     let (schema, view_name) = name.split_once('.').unwrap_or(("public", name));
-                    let oid = self.next_view_oid(txn).await?;
+                    let oid = self.next_view_oid(txn, db_id).await?;
                     let def = ViewDef {
                         oid,
                         schema: schema.to_string(),
@@ -1904,8 +2457,13 @@ impl TikvStore {
         }
     }
 
-    pub async fn drop_view(&self, txn: &mut Transaction, name: &str) -> Result<bool> {
-        let key = self.key(&encode_view_key(name));
+    pub async fn drop_view(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        name: &str,
+    ) -> Result<bool> {
+        let key = self.key(&encode_view_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
             txn_delete(txn, key).await?;
             info!("Dropped view '{}'", name);
@@ -1915,8 +2473,8 @@ impl TikvStore {
         }
     }
 
-    pub async fn list_views(&self, txn: &mut Transaction) -> Result<Vec<ViewDef>> {
-        let prefix = encode_view_prefix();
+    pub async fn list_views(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<ViewDef>> {
+        let prefix = encode_view_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
@@ -1928,12 +2486,12 @@ impl TikvStore {
                 continue;
             }
             let name = String::from_utf8_lossy(&key_bytes[prefix.len()..]).to_string();
-            let key = self.key(&encode_view_key(&name));
+            let key = self.key(&encode_view_key_v2(db_id, &name));
 
             match bincode::deserialize::<ViewDef>(pair.value()) {
                 Ok(mut def) => {
                     if def.oid == 0 {
-                        def.oid = self.next_view_oid(txn).await?;
+                        def.oid = self.next_view_oid(txn, db_id).await?;
                         let updated =
                             bincode::serialize(&def).context("Failed to serialize view")?;
                         txn_put(txn, key, updated).await?;
@@ -1943,7 +2501,7 @@ impl TikvStore {
                 Err(_) => {
                     let query = String::from_utf8_lossy(pair.value()).to_string();
                     let (schema, view_name) = name.split_once('.').unwrap_or(("public", &name));
-                    let oid = self.next_view_oid(txn).await?;
+                    let oid = self.next_view_oid(txn, db_id).await?;
                     let def = ViewDef {
                         oid,
                         schema: schema.to_string(),
@@ -1962,10 +2520,11 @@ impl TikvStore {
     pub async fn create_materialized_view(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         name: &str,
         query: &str,
     ) -> Result<()> {
-        let key = self.key(&encode_matview_key(name));
+        let key = self.key(&encode_matview_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
             return Err(anyhow!("Materialized view '{}' already exists", name));
         }
@@ -1977,17 +2536,23 @@ impl TikvStore {
     pub async fn get_materialized_view(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         name: &str,
     ) -> Result<Option<String>> {
-        let key = self.key(&encode_matview_key(name));
+        let key = self.key(&encode_matview_key_v2(db_id, name));
         match txn.get(key).await? {
             Some(data) => Ok(Some(String::from_utf8(data)?)),
             None => Ok(None),
         }
     }
 
-    pub async fn drop_materialized_view(&self, txn: &mut Transaction, name: &str) -> Result<bool> {
-        let key = self.key(&encode_matview_key(name));
+    pub async fn drop_materialized_view(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        name: &str,
+    ) -> Result<bool> {
+        let key = self.key(&encode_matview_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
             txn_delete(txn, key).await?;
             info!("Dropped materialized view '{}'", name);
@@ -1998,8 +2563,12 @@ impl TikvStore {
     }
 
     #[allow(dead_code)]
-    pub async fn list_materialized_views(&self, txn: &mut Transaction) -> Result<Vec<String>> {
-        let prefix = encode_matview_prefix();
+    pub async fn list_materialized_views(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<Vec<String>> {
+        let prefix = encode_matview_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
         let range: BoundRange = (prefix.clone()..end).into();
@@ -2018,10 +2587,11 @@ impl TikvStore {
     pub async fn create_procedure(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         name: &str,
         definition: &str,
     ) -> Result<()> {
-        let key = self.key(&encode_procedure_key(name));
+        let key = self.key(&encode_procedure_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
             return Err(anyhow!("Procedure '{}' already exists", name));
         }
@@ -2030,16 +2600,26 @@ impl TikvStore {
         Ok(())
     }
 
-    pub async fn get_procedure(&self, txn: &mut Transaction, name: &str) -> Result<Option<String>> {
-        let key = self.key(&encode_procedure_key(name));
+    pub async fn get_procedure(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        name: &str,
+    ) -> Result<Option<String>> {
+        let key = self.key(&encode_procedure_key_v2(db_id, name));
         match txn.get(key).await? {
             Some(data) => Ok(Some(String::from_utf8(data)?)),
             None => Ok(None),
         }
     }
 
-    pub async fn drop_procedure(&self, txn: &mut Transaction, name: &str) -> Result<bool> {
-        let key = self.key(&encode_procedure_key(name));
+    pub async fn drop_procedure(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        name: &str,
+    ) -> Result<bool> {
+        let key = self.key(&encode_procedure_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
             txn_delete(txn, key).await?;
             info!("Dropped procedure '{}'", name);
@@ -2053,10 +2633,11 @@ impl TikvStore {
     pub async fn replace_procedure(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         name: &str,
         definition: &str,
     ) -> Result<()> {
-        let key = self.key(&encode_procedure_key(name));
+        let key = self.key(&encode_procedure_key_v2(db_id, name));
         txn_put(txn, key, definition.as_bytes().to_vec()).await?;
         info!("Replaced procedure '{}'", name);
         Ok(())

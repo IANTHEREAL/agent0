@@ -20,6 +20,7 @@ pub type EnumLabelCache = HashMap<String, HashSet<String>>;
 pub async fn build_enum_label_cache(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     schema: &TableSchema,
 ) -> Result<EnumLabelCache> {
     let mut required_types: HashSet<&str> = HashSet::new();
@@ -35,7 +36,7 @@ pub async fn build_enum_label_cache(
     let mut cache: EnumLabelCache = HashMap::new();
     for udt_name in required_types {
         let def = store
-            .get_type(txn, udt_name)
+            .get_type(txn, db_id, udt_name)
             .await?
             .ok_or_else(|| anyhow!("Type '{}' does not exist", udt_name))?;
         match def.kind {
@@ -255,6 +256,7 @@ pub fn build_returning_types(
 pub async fn eval_returning_row(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     returning: &Option<Vec<SelectItem>>,
@@ -270,6 +272,7 @@ pub async fn eval_returning_row(
                         sequences::eval_expr_with_sequences(
                             store,
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             e,
@@ -294,6 +297,7 @@ pub async fn eval_returning_row(
 pub async fn execute_insert_row(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     table_name: &str,
     schema: &TableSchema,
     row: Row,
@@ -314,10 +318,10 @@ pub async fn execute_insert_row(
     };
 
     if !schema.foreign_keys.is_empty() {
-        validate_foreign_keys(store, txn, schema, &row).await?;
+        validate_foreign_keys(store, txn, db_id, schema, &row).await?;
     }
 
-    let insert_result = store.insert(txn, table_name, row.clone()).await;
+    let insert_result = store.insert(txn, db_id, table_name, row.clone()).await;
     match insert_result {
         Ok(()) => {
             for index in &schema.indexes {
@@ -332,6 +336,7 @@ pub async fn execute_insert_row(
                 let result = store
                     .create_index_entry(
                         txn,
+                        db_id,
                         schema.table_id,
                         index.id,
                         &idx_values,
@@ -347,6 +352,7 @@ pub async fn execute_insert_row(
                                 let pks = store
                                     .scan_index(
                                         txn,
+                                        db_id,
                                         schema.table_id,
                                         index.id,
                                         &idx_values,
@@ -363,13 +369,16 @@ pub async fn execute_insert_row(
 
                                 match &oc.action {
                                     OnConflictAction::DoNothing => {
-                                        store.delete_by_pk(txn, table_name, &pk_values).await?;
+                                        store
+                                            .delete_by_pk(txn, db_id, table_name, &pk_values)
+                                            .await?;
                                         return Ok(None);
                                     }
                                     OnConflictAction::DoUpdate(do_update) => {
                                         let existing_rows = store
                                             .batch_get_rows(
                                                 txn,
+                                                db_id,
                                                 schema.table_id,
                                                 vec![existing_pk.clone()],
                                                 schema,
@@ -404,18 +413,25 @@ pub async fn execute_insert_row(
                                         let updated_row = Row::new(updated_vals);
                                         validate_enum_values(schema, &updated_row, enum_cache)?;
 
-                                        store.delete_by_pk(txn, table_name, &pk_values).await?;
-                                        store.delete_by_pk(txn, table_name, existing_pk).await?;
+                                        store
+                                            .delete_by_pk(txn, db_id, table_name, &pk_values)
+                                            .await?;
+                                        store
+                                            .delete_by_pk(txn, db_id, table_name, existing_pk)
+                                            .await?;
 
                                         update_row_indexes(
                                             store,
                                             txn,
+                                            db_id,
                                             schema,
                                             existing_row,
                                             &updated_row,
                                         )
                                         .await?;
-                                        store.upsert(txn, table_name, updated_row.clone()).await?;
+                                        store
+                                            .upsert(txn, db_id, table_name, updated_row.clone())
+                                            .await?;
                                         return Ok(Some(updated_row));
                                     }
                                 }
@@ -424,6 +440,7 @@ pub async fn execute_insert_row(
                                 let pks = store
                                     .scan_index(
                                         txn,
+                                        db_id,
                                         schema.table_id,
                                         index.id,
                                         &idx_values,
@@ -441,6 +458,7 @@ pub async fn execute_insert_row(
                                 let existing_rows = store
                                     .batch_get_rows(
                                         txn,
+                                        db_id,
                                         schema.table_id,
                                         vec![existing_pk.clone()],
                                         schema,
@@ -467,12 +485,18 @@ pub async fn execute_insert_row(
                                 let updated_row = Row::new(updated_vals);
                                 validate_enum_values(schema, &updated_row, enum_cache)?;
 
-                                store.delete_by_pk(txn, table_name, &pk_values).await?;
-                                store.delete_by_pk(txn, table_name, existing_pk).await?;
-
-                                update_row_indexes(store, txn, schema, existing_row, &updated_row)
+                                store
+                                    .delete_by_pk(txn, db_id, table_name, &pk_values)
                                     .await?;
-                                store.upsert(txn, table_name, updated_row.clone()).await?;
+                                store
+                                    .delete_by_pk(txn, db_id, table_name, existing_pk)
+                                    .await?;
+
+                                update_row_indexes(store, txn, db_id, schema, existing_row, &updated_row)
+                                    .await?;
+                                store
+                                    .upsert(txn, db_id, table_name, updated_row.clone())
+                                    .await?;
                                 return Ok(Some(updated_row));
                             }
                             None => {
@@ -511,7 +535,14 @@ pub async fn execute_insert_row(
                     continue;
                 }
                 store
-                    .create_gin_index_entries(txn, schema.table_id, index.id, &hashes, &pk_values)
+                    .create_gin_index_entries(
+                        txn,
+                        db_id,
+                        schema.table_id,
+                        index.id,
+                        &hashes,
+                        &pk_values,
+                    )
                     .await?;
             }
             Ok(Some(row))
@@ -525,7 +556,13 @@ pub async fn execute_insert_row(
                     OnConflictAction::DoNothing => Ok(None),
                     OnConflictAction::DoUpdate(do_update) => {
                         let existing_rows = store
-                            .batch_get_rows(txn, schema.table_id, vec![pk_values.clone()], schema)
+                            .batch_get_rows(
+                                txn,
+                                db_id,
+                                schema.table_id,
+                                vec![pk_values.clone()],
+                                schema,
+                            )
                             .await?;
                         if existing_rows.is_empty() {
                             return Err(anyhow!("Failed to fetch existing row for upsert"));
@@ -547,14 +584,23 @@ pub async fn execute_insert_row(
                         }
                         let updated_row = Row::new(updated_vals);
                         validate_enum_values(schema, &updated_row, enum_cache)?;
-                        update_row_indexes(store, txn, schema, existing_row, &updated_row).await?;
-                        store.upsert(txn, table_name, updated_row.clone()).await?;
+                        update_row_indexes(store, txn, db_id, schema, existing_row, &updated_row)
+                            .await?;
+                        store
+                            .upsert(txn, db_id, table_name, updated_row.clone())
+                            .await?;
                         Ok(Some(updated_row))
                     }
                 },
                 Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
                     let existing_rows = store
-                        .batch_get_rows(txn, schema.table_id, vec![pk_values.clone()], schema)
+                        .batch_get_rows(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            vec![pk_values.clone()],
+                            schema,
+                        )
                         .await?;
                     if existing_rows.is_empty() {
                         return Err(anyhow!("Failed to fetch existing row for upsert"));
@@ -576,8 +622,11 @@ pub async fn execute_insert_row(
                     }
                     let updated_row = Row::new(updated_vals);
                     validate_enum_values(schema, &updated_row, enum_cache)?;
-                    update_row_indexes(store, txn, schema, existing_row, &updated_row).await?;
-                    store.upsert(txn, table_name, updated_row.clone()).await?;
+                    update_row_indexes(store, txn, db_id, schema, existing_row, &updated_row)
+                        .await?;
+                    store
+                        .upsert(txn, db_id, table_name, updated_row.clone())
+                        .await?;
                     Ok(Some(updated_row))
                 }
                 None => Err(e),
@@ -591,6 +640,7 @@ pub async fn execute_insert_row(
 async fn update_row_indexes(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     schema: &TableSchema,
     old_row: &Row,
     new_row: &Row,
@@ -603,6 +653,7 @@ async fn update_row_indexes(
             store
                 .delete_gin_index_entries(
                     txn,
+                    db_id,
                     schema.table_id,
                     index.id,
                     &gin_hashes,
@@ -622,6 +673,7 @@ async fn update_row_indexes(
             store
                 .delete_index_entry(
                     txn,
+                    db_id,
                     schema.table_id,
                     index.id,
                     &old_idx,
@@ -638,6 +690,7 @@ async fn update_row_indexes(
             store
                 .create_gin_index_entries(
                     txn,
+                    db_id,
                     schema.table_id,
                     index.id,
                     &gin_hashes,
@@ -657,6 +710,7 @@ async fn update_row_indexes(
             store
                 .create_index_entry(
                     txn,
+                    db_id,
                     schema.table_id,
                     index.id,
                     &new_idx,
@@ -672,19 +726,20 @@ async fn update_row_indexes(
 pub async fn handle_foreign_key_on_delete(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     table_name: &str,
     schema: &TableSchema,
     row: &Row,
 ) -> Result<()> {
     let pk_values = schema.get_pk_values(row);
 
-    let table_names = store.list_tables(txn).await?;
+    let table_names = store.list_tables(txn, db_id).await?;
     let mut table_rows: HashMap<String, Vec<Row>> = HashMap::new();
     let mut table_schemas: HashMap<String, TableSchema> = HashMap::new();
     for t in &table_names {
-        if let Some(s) = store.get_schema(txn, t).await? {
+        if let Some(s) = store.get_schema(txn, db_id, t).await? {
             if !s.foreign_keys.is_empty() {
-                let rows = store.scan(txn, t).await?;
+                let rows = store.scan(txn, db_id, t).await?;
                 table_rows.insert(t.clone(), rows);
                 table_schemas.insert(t.clone(), s);
             }
@@ -696,6 +751,7 @@ pub async fn handle_foreign_key_on_delete(
     Box::pin(cascade_delete_recursive(
         store,
         txn,
+        db_id,
         table_name,
         &pk_values,
         &table_rows,
@@ -708,6 +764,7 @@ pub async fn handle_foreign_key_on_delete(
 async fn cascade_delete_recursive(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     table_name: &str,
     pk_values: &[Value],
     table_rows: &HashMap<String, Vec<Row>>,
@@ -809,6 +866,7 @@ async fn cascade_delete_recursive(
                 Box::pin(cascade_delete_recursive(
                     store,
                     txn,
+                    db_id,
                     other_table,
                     &del_pk,
                     table_rows,
@@ -822,14 +880,15 @@ async fn cascade_delete_recursive(
                     .or_default()
                     .push(del_pk.clone());
 
-                store.delete_by_pk(txn, other_table, &del_pk).await?;
+                store.delete_by_pk(txn, db_id, other_table, &del_pk).await?;
             }
 
-            let enum_cache = build_enum_label_cache(store, txn, other_schema).await?;
+            let enum_cache = build_enum_label_cache(store, txn, db_id, other_schema).await?;
             for (old_row, new_row) in rows_to_update {
                 execute_update_row(
                     store,
                     txn,
+                    db_id,
                     other_table,
                     other_schema,
                     &old_row,
@@ -846,6 +905,7 @@ async fn cascade_delete_recursive(
 pub async fn handle_foreign_key_on_update(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     table_name: &str,
     schema: &TableSchema,
     old_row: &Row,
@@ -860,14 +920,14 @@ pub async fn handle_foreign_key_on_update(
         return Ok(());
     }
 
-    let table_names = store.list_tables(txn).await?;
+    let table_names = store.list_tables(txn, db_id).await?;
 
     for other_table in &table_names {
         if other_table == table_name {
             continue;
         }
 
-        let other_schema = match store.get_schema(txn, other_table).await? {
+        let other_schema = match store.get_schema(txn, db_id, other_table).await? {
             Some(s) => s,
             None => continue,
         };
@@ -877,7 +937,7 @@ pub async fn handle_foreign_key_on_update(
                 continue;
             }
 
-            let all_rows = store.scan(txn, other_table).await?;
+            let all_rows = store.scan(txn, db_id, other_table).await?;
             let mut rows_to_update: Vec<(Row, Row)> = Vec::new();
 
             for other_row in &all_rows {
@@ -954,11 +1014,12 @@ pub async fn handle_foreign_key_on_update(
                 }
             }
 
-            let enum_cache = build_enum_label_cache(store, txn, &other_schema).await?;
+            let enum_cache = build_enum_label_cache(store, txn, db_id, &other_schema).await?;
             for (old_child_row, new_child_row) in rows_to_update {
                 Box::pin(execute_update_row(
                     store,
                     txn,
+                    db_id,
                     other_table,
                     &other_schema,
                     &old_child_row,
@@ -975,19 +1036,20 @@ pub async fn handle_foreign_key_on_update(
 pub async fn execute_delete_row(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     table_name: &str,
     schema: &TableSchema,
     row: &Row,
 ) -> Result<()> {
-    handle_foreign_key_on_delete(store, txn, table_name, schema, row).await?;
+    handle_foreign_key_on_delete(store, txn, db_id, table_name, schema, row).await?;
 
     let pks = schema.get_pk_values(row);
-    store.delete_by_pk(txn, table_name, &pks).await?;
+    store.delete_by_pk(txn, db_id, table_name, &pks).await?;
     for index in &schema.indexes {
         let gin_hashes = extract_gin_token_hashes_from_row(schema, index, row)?;
         if !gin_hashes.is_empty() {
             store
-                .delete_gin_index_entries(txn, schema.table_id, index.id, &gin_hashes, &pks)
+                .delete_gin_index_entries(txn, db_id, schema.table_id, index.id, &gin_hashes, &pks)
                 .await?;
             continue;
         }
@@ -1003,7 +1065,7 @@ pub async fn execute_delete_row(
 
         let idx_values = index_helpers::get_index_values_with_expressions(index, schema, row)?;
         store
-            .delete_index_entry(txn, schema.table_id, index.id, &idx_values, &pks, index.unique)
+            .delete_index_entry(txn, db_id, schema.table_id, index.id, &idx_values, &pks, index.unique)
             .await?;
     }
     Ok(())
@@ -1012,6 +1074,7 @@ pub async fn execute_delete_row(
 pub async fn execute_update_row(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     table_name: &str,
     schema: &TableSchema,
     old_row: &Row,
@@ -1025,14 +1088,14 @@ pub async fn execute_update_row(
     let pk_changed = old_pks != new_pks;
 
     if !schema.foreign_keys.is_empty() {
-        validate_foreign_keys(store, txn, schema, &new_row).await?;
+        validate_foreign_keys(store, txn, db_id, schema, &new_row).await?;
     }
 
-    handle_foreign_key_on_update(store, txn, table_name, schema, old_row, &new_row).await?;
+    handle_foreign_key_on_update(store, txn, db_id, table_name, schema, old_row, &new_row).await?;
 
     if pk_changed {
         let existing = store
-            .batch_get_rows(txn, schema.table_id, vec![new_pks.clone()], schema)
+            .batch_get_rows(txn, db_id, schema.table_id, vec![new_pks.clone()], schema)
             .await?;
         if !existing.is_empty() {
             let pk_cols: Vec<_> = schema.pk_indices.iter().map(|&i| schema.columns[i].name.clone()).collect();
@@ -1058,7 +1121,7 @@ pub async fn execute_update_row(
         let gin_hashes = extract_gin_token_hashes_from_row(schema, index, old_row)?;
         if !gin_hashes.is_empty() {
             store
-                .delete_gin_index_entries(txn, schema.table_id, index.id, &gin_hashes, &old_pks)
+                .delete_gin_index_entries(txn, db_id, schema.table_id, index.id, &gin_hashes, &old_pks)
                 .await?;
             continue;
         }
@@ -1070,22 +1133,22 @@ pub async fn execute_update_row(
         if old_matches {
             let old_idx = index_helpers::get_index_values_with_expressions(index, schema, old_row)?;
             store
-                .delete_index_entry(txn, schema.table_id, index.id, &old_idx, &old_pks, index.unique)
+                .delete_index_entry(txn, db_id, schema.table_id, index.id, &old_idx, &old_pks, index.unique)
                 .await?;
         }
     }
 
     if pk_changed {
-        store.delete_by_pk(txn, table_name, &old_pks).await?;
+        store.delete_by_pk(txn, db_id, table_name, &old_pks).await?;
     }
 
-    store.upsert(txn, table_name, new_row.clone()).await?;
+    store.upsert(txn, db_id, table_name, new_row.clone()).await?;
 
     for index in &schema.indexes {
         let gin_hashes = extract_gin_token_hashes_from_row(schema, index, &new_row)?;
         if !gin_hashes.is_empty() {
             store
-                .create_gin_index_entries(txn, schema.table_id, index.id, &gin_hashes, &new_pks)
+                .create_gin_index_entries(txn, db_id, schema.table_id, index.id, &gin_hashes, &new_pks)
                 .await?;
             continue;
         }
@@ -1098,7 +1161,7 @@ pub async fn execute_update_row(
             let new_idx =
                 index_helpers::get_index_values_with_expressions(index, schema, &new_row)?;
             store
-                .create_index_entry(txn, schema.table_id, index.id, &new_idx, &new_pks, index.unique)
+                .create_index_entry(txn, db_id, schema.table_id, index.id, &new_idx, &new_pks, index.unique)
                 .await?;
         }
     }
@@ -1108,6 +1171,7 @@ pub async fn execute_update_row(
 pub async fn prepare_insert_row(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     schema: &TableSchema,
@@ -1134,6 +1198,7 @@ pub async fn prepare_insert_row(
                     sequences::eval_expr_with_sequences(
                         store,
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         e,
@@ -1167,6 +1232,7 @@ pub async fn prepare_insert_row(
                     sequences::eval_expr_with_sequences(
                         store,
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         &exprs[i],
@@ -1188,6 +1254,7 @@ pub async fn prepare_insert_row(
 async fn eval_default_expr_maybe_sequence(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     expr_str: &str,
@@ -1206,6 +1273,7 @@ async fn eval_default_expr_maybe_sequence(
                     sequences::eval_expr_with_sequences(
                         store,
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         &e,
@@ -1226,6 +1294,7 @@ async fn eval_default_expr_maybe_sequence(
 pub async fn fill_missing_columns(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     schema: &TableSchema,
@@ -1233,16 +1302,23 @@ pub async fn fill_missing_columns(
     indices: &[usize],
 ) -> Result<()> {
     for (i, c) in schema.columns.iter().enumerate() {
-        if !indices.contains(&i) {
-            if c.is_serial {
-                let seq_val = store.next_sequence_value(txn, schema.table_id).await?;
+            if !indices.contains(&i) {
+                if c.is_serial {
+                let seq_val = store.next_sequence_value(txn, db_id, schema.table_id).await?;
                 row_vals[i] = match c.data_type {
                     DataType::Int64 => Value::Int64(seq_val as i64),
                     _ => Value::Int32(seq_val),
                 };
             } else if let Some(def) = &c.default_expr {
                 row_vals[i] =
-                    eval_default_expr_maybe_sequence(store, txn, sequence_values, search_path, def)
+                    eval_default_expr_maybe_sequence(
+                        store,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        def,
+                    )
                         .await?;
             } else if !c.nullable {
                 let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
@@ -1322,6 +1398,7 @@ pub fn validate_check_constraints(schema: &TableSchema, row: &Row) -> Result<()>
 pub async fn validate_foreign_keys(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     schema: &TableSchema,
     row: &Row,
 ) -> Result<()> {
@@ -1344,7 +1421,10 @@ pub async fn validate_foreign_keys(
             continue;
         }
 
-        let ref_schema = store.get_schema(txn, &fk.ref_table).await?.ok_or_else(|| {
+        let ref_schema = store
+            .get_schema(txn, db_id, &fk.ref_table)
+            .await?
+            .ok_or_else(|| {
             anyhow!(
                 "Referenced table '{}' not found for foreign key '{}'",
                 fk.ref_table,
@@ -1355,6 +1435,7 @@ pub async fn validate_foreign_keys(
         let ref_rows = store
             .batch_get_rows(
                 txn,
+                db_id,
                 ref_schema.table_id,
                 vec![fk_values.clone()],
                 &ref_schema,
@@ -1400,6 +1481,7 @@ pub fn validate_update_columns(
 pub async fn compute_update_values(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     schema: &TableSchema,
@@ -1420,6 +1502,7 @@ pub async fn compute_update_values(
             sequences::eval_expr_with_sequences(
                 store,
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 &a.value,

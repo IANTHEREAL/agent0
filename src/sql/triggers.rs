@@ -10,6 +10,7 @@ use tikv_client::Transaction;
 pub async fn apply_before_triggers(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     triggers: &[TriggerDef],
@@ -33,7 +34,7 @@ pub async fn apply_before_triggers(
     let mut current_row = new_row;
 
     for trigger in before_triggers {
-        let func_def = match store.get_function(txn, &trigger.function).await? {
+        let func_def = match store.get_function(txn, db_id, &trigger.function).await? {
             Some(f) => f,
             None => continue,
         };
@@ -41,6 +42,7 @@ pub async fn apply_before_triggers(
         let result = execute_trigger_function(
             store,
             txn,
+            db_id,
             sequence_values,
             search_path,
             &func_def,
@@ -73,6 +75,7 @@ enum TriggerResult {
 async fn execute_trigger_function(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     func_def: &crate::types::FunctionDef,
@@ -88,6 +91,7 @@ async fn execute_trigger_function(
     execute_trigger_body(
         store,
         txn,
+        db_id,
         sequence_values,
         search_path,
         &func_def.body,
@@ -101,6 +105,7 @@ async fn execute_trigger_function(
 async fn execute_trigger_body(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     body: &str,
@@ -197,6 +202,7 @@ async fn execute_trigger_body(
                                     sequences::eval_expr_with_sequences(
                                         store,
                                         txn,
+                                        db_id,
                                         sequence_values,
                                         search_path,
                                         &expr,

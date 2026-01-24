@@ -29,6 +29,7 @@ impl Executor {
     pub(crate) async fn execute_create_materialized_view(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         name: &ObjectName,
@@ -36,7 +37,7 @@ impl Executor {
         or_replace: bool,
     ) -> Result<ExecuteResult> {
         let result = self
-            .execute_query_with_ctes(txn, sequence_values, search_path, query, &HashMap::new())
+            .execute_query_with_ctes(txn, db_id, sequence_values, search_path, query, &HashMap::new())
             .await?;
         let (columns, rows) = match result {
             ExecuteResult::Select {
@@ -48,12 +49,12 @@ impl Executor {
         };
 
         let resolved = names::resolve_ddl_object_name(name, search_path)?;
-        if !self.store().schema_exists(txn, &resolved.schema).await? {
+        if !self.store().schema_exists(txn, db_id, &resolved.schema).await? {
             return Err(anyhow!("schema '{}' does not exist", resolved.schema));
         }
         let view_name = resolved.full;
 
-        let table_id = self.store().next_table_id(txn).await?;
+        let table_id = self.store().next_table_id(txn, db_id).await?;
         let mut col_defs: Vec<ColumnDef> = vec![ColumnDef {
             name: "_mv_rowid".to_string(),
             data_type: DataType::Int64,
@@ -109,6 +110,7 @@ impl Executor {
         ddl::execute_create_materialized_view(
             &self.store(),
             txn,
+            db_id,
             search_path,
             name,
             query,
@@ -143,6 +145,7 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let (txn, sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
@@ -151,6 +154,7 @@ impl Executor {
             let resolved = names::resolve_existing_materialized_view_name(
                 self.store().as_ref(),
                 txn,
+                db_id,
                 &view_obj,
                 search_path,
             )
@@ -160,7 +164,7 @@ impl Executor {
 
             let query_str: String = self
                 .store()
-                .get_materialized_view(txn, &view_full_name)
+                .get_materialized_view(txn, db_id, &view_full_name)
                 .await?
                 .ok_or_else(|| anyhow!("Materialized view '{}' does not exist", view_full_name))?;
 
@@ -171,7 +175,7 @@ impl Executor {
             };
 
             let result = self
-                .execute_query_with_ctes(txn, sequence_values, search_path, &query, &HashMap::new())
+                .execute_query_with_ctes(txn, db_id, sequence_values, search_path, &query, &HashMap::new())
                 .await?;
             let rows = match result {
                 ExecuteResult::Select { rows, .. } => rows,
@@ -191,6 +195,7 @@ impl Executor {
             ddl::execute_refresh_materialized_view(
                 &self.store(),
                 txn,
+                db_id,
                 &view_full_name,
                 rows_with_rowid,
             )
@@ -240,11 +245,19 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let (txn, _sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
             let name = object_name_from_token(&view_name)?;
-            ddl::execute_drop_materialized_view(&self.store(), txn, search_path, &[name], if_exists)
+            ddl::execute_drop_materialized_view(
+                &self.store(),
+                txn,
+                db_id,
+                search_path,
+                &[name],
+                if_exists,
+            )
                 .await
         }
         .await;
@@ -263,13 +276,14 @@ impl Executor {
     pub(crate) async fn execute_create_procedure(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         search_path: &[String],
         name: &ObjectName,
         params: Option<&[sqlparser::ast::ProcedureParam]>,
         body: &[Statement],
     ) -> Result<ExecuteResult> {
         let resolved = names::resolve_ddl_object_name(name, search_path)?;
-        if !self.store().schema_exists(txn, &resolved.schema).await? {
+        if !self.store().schema_exists(txn, db_id, &resolved.schema).await? {
             return Err(anyhow!("schema '{}' does not exist", resolved.schema));
         }
         let proc_name = resolved.full;
@@ -291,7 +305,7 @@ impl Executor {
         );
 
         self.store()
-            .create_procedure(txn, &proc_name, &definition)
+            .create_procedure(txn, db_id, &proc_name, &definition)
             .await?;
 
         Ok(ExecuteResult::CreateProcedure { proc_name })
@@ -325,6 +339,7 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let (txn, sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
@@ -333,6 +348,7 @@ impl Executor {
             let resolved = names::resolve_existing_procedure_name(
                 self.store().as_ref(),
                 txn,
+                db_id,
                 &proc_obj,
                 search_path,
             )
@@ -342,7 +358,7 @@ impl Executor {
 
             let definition: String = self
                 .store()
-                .get_procedure(txn, &proc_full_name)
+                .get_procedure(txn, db_id, &proc_full_name)
                 .await?
                 .ok_or_else(|| anyhow!("Procedure '{}' does not exist", proc_full_name))?;
 
@@ -420,7 +436,7 @@ impl Executor {
 
                 let stmts = parse_sql(&expanded_stmt)?;
                 for stmt in stmts {
-                    self.execute_statement_on_txn(txn, sequence_values, search_path, &stmt)
+                    self.execute_statement_on_txn(txn, db_id, sequence_values, search_path, &stmt)
                         .await?;
                 }
             }
@@ -491,22 +507,23 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let (txn, _sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
             let proc_obj = object_name_from_token(&proc_name)?;
             let resolved = names::resolve_ddl_object_name(&proc_obj, search_path)?;
-            if !self.store().schema_exists(txn, &resolved.schema).await? {
+            if !self.store().schema_exists(txn, db_id, &resolved.schema).await? {
                 return Err(anyhow!("schema '{}' does not exist", resolved.schema));
             }
             let proc_full_name = resolved.full;
             if is_or_replace {
                 self.store()
-                    .replace_procedure(txn, &proc_full_name, &definition)
+                    .replace_procedure(txn, db_id, &proc_full_name, &definition)
                     .await?;
             } else {
                 self.store()
-                    .create_procedure(txn, &proc_full_name, &definition)
+                    .create_procedure(txn, db_id, &proc_full_name, &definition)
                     .await?;
             }
             Ok(ExecuteResult::CreateProcedure {
@@ -556,6 +573,7 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let (txn, _sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
@@ -563,6 +581,7 @@ impl Executor {
             let resolved = names::resolve_existing_procedure_name(
                 self.store().as_ref(),
                 txn,
+                db_id,
                 &proc_obj,
                 search_path,
             )
@@ -573,7 +592,7 @@ impl Executor {
                 None => names::resolve_ddl_object_name(&proc_obj, search_path)?.full,
             };
 
-            let dropped = self.store().drop_procedure(txn, &proc_full_name).await?;
+            let dropped = self.store().drop_procedure(txn, db_id, &proc_full_name).await?;
             if !dropped && !if_exists {
                 return Err(anyhow!("Procedure '{}' does not exist", proc_full_name));
             }

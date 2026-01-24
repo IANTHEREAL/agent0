@@ -211,6 +211,7 @@ impl Executor {
     pub(crate) async fn execute_join_query(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         query: &Query,
@@ -218,6 +219,7 @@ impl Executor {
     ) -> Result<ExecuteResult> {
         self.execute_join_query_with_ctes(
             txn,
+            db_id,
             sequence_values,
             search_path,
             query,
@@ -230,17 +232,28 @@ impl Executor {
     pub(crate) async fn get_table_data(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         table_name: &str,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<(TableSchema, Vec<Row>)> {
-        self.get_table_data_filtered(txn, sequence_values, search_path, table_name, ctes, &VirtualTableFilter::default()).await
+        self.get_table_data_filtered(
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            table_name,
+            ctes,
+            &VirtualTableFilter::default(),
+        )
+        .await
     }
 
     pub(crate) async fn get_table_data_filtered(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         table_name: &str,
@@ -844,6 +857,7 @@ impl Executor {
             return super::information_schema::get_information_schema_data_filtered(
                 &self.store(),
                 txn,
+                db_id,
                 &t_lower,
                 filter,
             )
@@ -862,9 +876,16 @@ impl Executor {
         };
 
         for candidate in &candidates {
-            if let Some(view_def) = self.store().get_view(txn, candidate).await? {
+            if let Some(view_def) = self.store().get_view(txn, db_id, candidate).await? {
                 let result = self
-                    .execute_view_query(txn, sequence_values, search_path, &view_def.query, ctes)
+                    .execute_view_query(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        &view_def.query,
+                        ctes,
+                    )
                     .await?;
                 return match result {
                     ExecuteResult::Select {
@@ -901,8 +922,8 @@ impl Executor {
                 };
             }
 
-            if let Some(schema) = self.store().get_schema(txn, candidate).await? {
-                let rows = self.scan_and_fill(txn, candidate, &schema).await?;
+            if let Some(schema) = self.store().get_schema(txn, db_id, candidate).await? {
+                let rows = self.scan_and_fill(txn, db_id, candidate, &schema).await?;
                 return Ok((schema, rows));
             }
         }
@@ -1013,6 +1034,7 @@ impl Executor {
     pub(crate) fn execute_view_query<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        db_id: u64,
         sequence_values: &'a mut HashMap<String, i64>,
         search_path: &'a [String],
         view_query: &'a str,
@@ -1022,7 +1044,7 @@ impl Executor {
         Box::pin(async move {
             let ast = parse_sql(view_query)?;
             if let Some(Statement::Query(q)) = ast.into_iter().next() {
-                self.execute_query_with_outer_ctes(txn, sequence_values, search_path, &q, ctes)
+                self.execute_query_with_outer_ctes(txn, db_id, sequence_values, search_path, &q, ctes)
                     .await
             } else {
                 Err(anyhow!("Invalid view query"))
@@ -1033,6 +1055,7 @@ impl Executor {
     pub(crate) fn execute_derived_table<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        db_id: u64,
         sequence_values: &'a mut HashMap<String, i64>,
         search_path: &'a [String],
         subquery: &'a Query,
@@ -1044,7 +1067,7 @@ impl Executor {
     > {
         Box::pin(async move {
             let result = self
-                .execute_query_with_outer_ctes(txn, sequence_values, search_path, subquery, ctes)
+                .execute_query_with_outer_ctes(txn, db_id, sequence_values, search_path, subquery, ctes)
                 .await?;
             match result {
                 ExecuteResult::Select {
@@ -1113,6 +1136,7 @@ impl Executor {
     pub(crate) fn resolve_table_factor<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        db_id: u64,
         sequence_values: &'a mut HashMap<String, i64>,
         search_path: &'a [String],
         factor: &'a TableFactor,
@@ -1121,12 +1145,21 @@ impl Executor {
         Box<dyn std::future::Future<Output = Result<(String, TableSchema, Vec<Row>)>> + Send + 'a>,
     > {
         let default_filter = VirtualTableFilter::default();
-        self.resolve_table_factor_impl(txn, sequence_values, search_path, factor, ctes, default_filter)
+        self.resolve_table_factor_impl(
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            factor,
+            ctes,
+            default_filter,
+        )
     }
 
     pub(crate) fn resolve_table_factor_filtered<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        db_id: u64,
         sequence_values: &'a mut HashMap<String, i64>,
         search_path: &'a [String],
         factor: &'a TableFactor,
@@ -1135,12 +1168,21 @@ impl Executor {
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<(String, TableSchema, Vec<Row>)>> + Send + 'a>,
     > {
-        self.resolve_table_factor_impl(txn, sequence_values, search_path, factor, ctes, filter.clone())
+        self.resolve_table_factor_impl(
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            factor,
+            ctes,
+            filter.clone(),
+        )
     }
 
     fn resolve_table_factor_impl<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        db_id: u64,
         sequence_values: &'a mut HashMap<String, i64>,
         search_path: &'a [String],
         factor: &'a TableFactor,
@@ -1176,6 +1218,7 @@ impl Executor {
                         if let Some((schema, rows)) = self
                             .try_execute_extension_table_function(
                                 txn,
+                                db_id,
                                 search_path,
                                 name,
                                 func_args,
@@ -1205,7 +1248,15 @@ impl Executor {
                         }
                     };
                     let (schema, rows) = self
-                        .get_table_data_filtered(txn, sequence_values, search_path, &table_name, ctes, &filter)
+                        .get_table_data_filtered(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            &table_name,
+                            ctes,
+                            &filter,
+                        )
                         .await?;
                     Ok((als, schema, rows))
                 }
@@ -1220,6 +1271,7 @@ impl Executor {
                     let (schema, rows) = self
                         .execute_derived_table(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             subquery,
@@ -1237,6 +1289,7 @@ impl Executor {
                     let (base_alias, base_schema, mut combined_rows) = self
                         .resolve_table_factor(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             &table_with_joins.relation,
@@ -1253,6 +1306,7 @@ impl Executor {
                         let (join_alias, join_schema, join_rows) = self
                             .resolve_table_factor(
                                 txn,
+                                db_id,
                                 sequence_values,
                                 search_path,
                                 &join.relation,
@@ -1418,6 +1472,7 @@ impl Executor {
                                     matches!(
                                         self.eval_expr_join_maybe_sequence(
                                             txn,
+                                            db_id,
                                             sequence_values,
                                             search_path,
                                             cond,
@@ -1517,6 +1572,7 @@ impl Executor {
     pub(crate) async fn execute_join_query_with_ctes(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         query: &Query,
@@ -1528,6 +1584,7 @@ impl Executor {
         let (base_alias, base_schema, base_rows) = self
             .resolve_table_factor_filtered(
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 &select.from[0].relation,
@@ -1569,7 +1626,15 @@ impl Executor {
                             None => obj_name.clone(),
                         };
                         let (schema, rows) = self
-                            .get_table_data_filtered(txn, sequence_values, search_path, &tbl, ctes, &vt_filter)
+                            .get_table_data_filtered(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                &tbl,
+                                ctes,
+                                &vt_filter,
+                            )
                             .await?;
                         (als, schema, rows)
                     }
@@ -1585,6 +1650,7 @@ impl Executor {
                     let (schema, rows) = self
                         .execute_derived_table(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             subquery,
@@ -1598,6 +1664,7 @@ impl Executor {
                 TableFactor::NestedJoin { .. } => {
                     self.resolve_table_factor_filtered(
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         &from_item.relation,
@@ -1649,7 +1716,15 @@ impl Executor {
                                 None => obj_name.clone(),
                             };
                             let (schema, rows) = self
-                                .get_table_data_filtered(txn, sequence_values, search_path, &tbl, ctes, &vt_filter)
+                                .get_table_data_filtered(
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    &tbl,
+                                    ctes,
+                                    &vt_filter,
+                                )
                                 .await?;
                             (als, schema, rows)
                         }
@@ -1666,6 +1741,7 @@ impl Executor {
                         let (schema, rows) = self
                             .execute_derived_table(
                                 txn,
+                                db_id,
                                 sequence_values,
                                 search_path,
                                 subquery,
@@ -1679,6 +1755,7 @@ impl Executor {
                     TableFactor::NestedJoin { .. } => {
                         self.resolve_table_factor_filtered(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             &extra_join.relation,
@@ -1781,7 +1858,7 @@ impl Executor {
                         Some(cond)
                     } else {
                         Some(
-                            self.resolve_subqueries(txn, sequence_values, search_path, &cond, ctes)
+                            self.resolve_subqueries(txn, db_id, sequence_values, search_path, &cond, ctes)
                                 .await?,
                         )
                     }
@@ -1816,6 +1893,7 @@ impl Executor {
                     let (this_schema, right_rows) = self
                         .execute_derived_table(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             &substituted_query,
@@ -1894,6 +1972,7 @@ impl Executor {
                             matches!(
                                 self.eval_expr_join_maybe_sequence(
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     cond,
@@ -1927,6 +2006,7 @@ impl Executor {
                     let (schema, _rows) = self
                         .execute_derived_table(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             subquery,
@@ -1969,7 +2049,7 @@ impl Executor {
                             None => obj_name.clone(),
                         };
                         let (schema, rows) = self
-                            .get_table_data(txn, sequence_values, search_path, &tbl, ctes)
+                            .get_table_data(txn, db_id, sequence_values, search_path, &tbl, ctes)
                             .await?;
                         (als, schema, rows)
                     }
@@ -1985,6 +2065,7 @@ impl Executor {
                     let (schema, rows) = self
                         .execute_derived_table(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             subquery,
@@ -1998,6 +2079,7 @@ impl Executor {
                 TableFactor::NestedJoin { .. } => {
                     self.resolve_table_factor(
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         &join.relation,
@@ -2124,7 +2206,7 @@ impl Executor {
                     Some(cond)
                 } else {
                     Some(
-                        self.resolve_subqueries(txn, sequence_values, search_path, &cond, ctes)
+                        self.resolve_subqueries(txn, db_id, sequence_values, search_path, &cond, ctes)
                             .await?,
                     )
                 }
@@ -2381,6 +2463,7 @@ impl Executor {
                             Some(
                                 self.resolve_subqueries(
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     &substituted,
@@ -2413,6 +2496,7 @@ impl Executor {
                             matches!(
                                 self.eval_expr_join_maybe_sequence(
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     cond,
@@ -2493,7 +2577,7 @@ impl Executor {
         // Resolve subqueries (EXISTS, IN (SELECT ...), scalar subqueries) in WHERE clause
         let resolved_selection = if let Some(sel) = &select.selection {
             Some(
-                self.resolve_subqueries(txn, sequence_values, search_path, sel, ctes)
+                self.resolve_subqueries(txn, db_id, sequence_values, search_path, sel, ctes)
                     .await?,
             )
         } else {
@@ -2512,6 +2596,7 @@ impl Executor {
                 if matches!(
                     self.eval_expr_join_maybe_sequence(
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         sel,
@@ -2532,6 +2617,7 @@ impl Executor {
         let resolved_projection = self
             .resolve_projection_subqueries_for_join(
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 &select.projection,
@@ -2612,6 +2698,7 @@ impl Executor {
                     key.push(
                         self.eval_expr_join_maybe_sequence(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             expr,
@@ -2635,6 +2722,7 @@ impl Executor {
                                                 match self
                                                     .eval_expr_join_maybe_sequence(
                                                         txn,
+                                                        db_id,
                                                         sequence_values,
                                                         search_path,
                                                         e,
@@ -2691,6 +2779,7 @@ impl Executor {
                         let filter_val = self
                             .eval_expr_join_maybe_sequence(
                                 txn,
+                                db_id,
                                 sequence_values,
                                 search_path,
                                 filter,
@@ -2705,6 +2794,7 @@ impl Executor {
                     let val = if let Some(e) = arg_expr {
                         self.eval_expr_join_maybe_sequence(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             e,
@@ -2777,6 +2867,7 @@ impl Executor {
                         sequences::replace_sequence_functions_join(
                             &self.store(),
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             having_expr,
@@ -2806,6 +2897,7 @@ impl Executor {
                             sequences::replace_sequence_functions_join(
                                 &self.store(),
                                 txn,
+                                db_id,
                                 sequence_values,
                                 search_path,
                                 expr,
@@ -2842,6 +2934,7 @@ impl Executor {
                                         sequences::replace_sequence_functions_join(
                                             &self.store(),
                                             txn,
+                                            db_id,
                                             sequence_values,
                                             search_path,
                                             &order_expr.expr,
@@ -2859,6 +2952,7 @@ impl Executor {
                                     sequences::replace_sequence_functions_join(
                                         &self.store(),
                                         txn,
+                                        db_id,
                                         sequence_values,
                                         search_path,
                                         &order_expr.expr,
@@ -3001,6 +3095,7 @@ impl Executor {
                         let val = if sequences::expr_needs_async_eval(expr) {
                             self.eval_expr_join_maybe_sequence(
                                 txn,
+                                db_id,
                                 sequence_values,
                                 search_path,
                                 expr,
@@ -3279,6 +3374,7 @@ impl Executor {
                             let value = if let Expr::Subquery(subquery) = e {
                                 self.eval_scalar_subquery_in_join(
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     subquery,
@@ -3289,6 +3385,7 @@ impl Executor {
                             } else {
                                 self.eval_expr_join_maybe_sequence(
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     e,
@@ -3358,6 +3455,7 @@ impl Executor {
                     let value = if let Expr::Subquery(subquery) = expr {
                         self.eval_scalar_subquery_in_join(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             subquery,
@@ -3368,6 +3466,7 @@ impl Executor {
                     } else {
                         self.eval_expr_join_maybe_sequence(
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             expr,

@@ -118,6 +118,25 @@ def check_tiup() -> bool:
     return True
 
 
+def resolve_tiup_home() -> Path:
+    """
+    Resolve the TiUP home directory used for `tiup playground`.
+
+    Using a shared, persistent TiUP home makes cluster startup reliable and fast:
+    - Avoids re-downloading TiUP manifests/components for every one-time cluster.
+    - Prevents failures when the TiUP mirror is temporarily unavailable.
+
+    Preference order:
+    1) `PGTIKV_TIUP_HOME` (explicit override for pg-tikv tooling)
+    2) `TIUP_HOME` (standard TiUP override)
+    3) `~/.tiup` (default)
+    """
+    env_home = os.environ.get("PGTIKV_TIUP_HOME") or os.environ.get("TIUP_HOME")
+    if env_home:
+        return Path(env_home).expanduser()
+    return Path.home() / ".tiup"
+
+
 def find_free_port(start: int = 2379, end: int = 2479) -> Optional[int]:
     """Find an available port in the given range."""
     for port in range(start, end):
@@ -263,9 +282,12 @@ enable-ttl = true
 """)
     
     log_file = cluster_dir / "playground.log"
-    data_dir = cluster_dir / "data"
-    data_dir.mkdir(exist_ok=True)
-    
+    tiup_home = resolve_tiup_home()
+
+    # TiUP will store data in $TIUP_HOME/data/{tag}
+    # So the actual data directory will be: {tiup_home}/data/pg-tikv-{name}
+    data_dir = tiup_home / "data" / f"pg-tikv-{name}"
+
     cmd = [
         "tiup", "playground",
         "--mode", "tikv-slim",
@@ -274,19 +296,26 @@ enable-ttl = true
         "--pd.host", host,
         "--kv.host", host,
     ]
-    
+
     if pd_port:
         cmd.extend(["--pd.port", str(pd_port)])
-    
+
+    # Set TIUP_HOME to control where playground stores data
+    env = os.environ.copy()
+    env["TIUP_HOME"] = str(tiup_home)
+
     log_info(f"Starting TiKV cluster '{name}' ({mode.value} mode)...")
     log_debug(f"Command: {' '.join(cmd)}", verbose)
-    
+    log_debug(f"TIUP_HOME: {tiup_home}", verbose)
+    log_debug(f"Data directory: {data_dir}", verbose)
+
     with open(log_file, "w") as f:
         proc = subprocess.Popen(
             cmd,
             stdout=f,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            env=env,
         )
     
     log_info(f"Cluster process started (PID: {proc.pid})")
@@ -362,12 +391,28 @@ def stop_cluster(name: str, force: bool = False) -> bool:
         
     except (OSError, ProcessLookupError):
         pass
-    
-    subprocess.run(
-        ["tiup", "clean", f"pg-tikv-{name}"],
-        capture_output=True,
-    )
-    
+
+    # Clean up tiup playground data using the same TIUP_HOME
+    # Derive TIUP_HOME from the recorded data_dir when possible (stable even if env changes).
+    tiup_home: Optional[Path] = None
+    try:
+        data_dir = Path(info.data_dir)
+        if data_dir.parent.name == "data":
+            tiup_home = data_dir.parent.parent
+    except Exception as e:
+        log_warn(f"Failed to derive TIUP_HOME from cluster metadata: {e}")
+        tiup_home = None
+    if tiup_home is None:
+        tiup_home = resolve_tiup_home()
+    if tiup_home.exists():
+        env = os.environ.copy()
+        env["TIUP_HOME"] = str(tiup_home)
+        subprocess.run(
+            ["tiup", "clean", f"pg-tikv-{name}"],
+            capture_output=True,
+            env=env,
+        )
+
     info.status = "stopped"
     save_cluster_info(info)
     

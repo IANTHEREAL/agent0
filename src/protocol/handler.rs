@@ -17,7 +17,8 @@ use pgwire::api::results::{
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::{
-    ClientInfo, NoopErrorHandler, PgWireConnectionState, PgWireServerHandlers, Type, METADATA_USER,
+    ClientInfo, NoopErrorHandler, PgWireConnectionState, PgWireServerHandlers, Type,
+    METADATA_DATABASE, METADATA_USER,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
@@ -625,6 +626,7 @@ fn expr_referenced_column_type<'a>(
 async fn resolve_table_schema_for_object_name(
     store: &TikvStore,
     txn: &mut Transaction,
+    db_id: u64,
     table_name: &ObjectName,
     search_path: &[String],
 ) -> Option<crate::types::TableSchema> {
@@ -632,12 +634,12 @@ async fn resolve_table_schema_for_object_name(
 
     if let Some(schema) = schema_opt {
         let full = format!("{}.{}", schema, name);
-        return store.get_schema(txn, &full).await.ok().flatten();
+        return store.get_schema(txn, db_id, &full).await.ok().flatten();
     }
 
     for schema in search_path {
         let full = format!("{}.{}", schema, name);
-        if let Ok(Some(s)) = store.get_schema(txn, &full).await {
+        if let Ok(Some(s)) = store.get_schema(txn, db_id, &full).await {
             return Some(s);
         }
     }
@@ -645,17 +647,19 @@ async fn resolve_table_schema_for_object_name(
     // As a last resort, try the default schema even if it's not present in the session search_path.
     let default_schema = search_path.first().map(String::as_str).unwrap_or("public");
     let full = format!("{}.{}", default_schema, name);
-    store.get_schema(txn, &full).await.ok().flatten()
+    store.get_schema(txn, db_id, &full).await.ok().flatten()
 }
 
 async fn infer_returning_fields_with_txn(
     store: &TikvStore,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     table_name: &ObjectName,
     returning: &[SelectItem],
 ) -> Option<Vec<FieldInfo>> {
-    let schema = resolve_table_schema_for_object_name(store, txn, table_name, search_path).await?;
+    let schema =
+        resolve_table_schema_for_object_name(store, txn, db_id, table_name, search_path).await?;
 
     let mut fields = Vec::new();
     for item in returning {
@@ -731,15 +735,16 @@ async fn infer_returning_fields_from_statement(
 
     let search_path = session.search_path().to_vec();
     let search_path = search_path.as_slice();
+    let db_id = session.current_database_id();
 
     if let Some(txn) = session.get_mut_txn() {
-        infer_returning_fields_with_txn(store.as_ref(), txn, search_path, table_name, returning)
-            .await
+        infer_returning_fields_with_txn(store.as_ref(), txn, db_id, search_path, table_name, returning).await
     } else {
         let mut temp_txn = store.begin().await.ok()?;
         infer_returning_fields_with_txn(
             store.as_ref(),
             &mut temp_txn,
+            db_id,
             search_path,
             table_name,
             returning,
@@ -836,7 +841,10 @@ impl DynamicPgHandler {
         
         info!("infer_insert_parameter_types: resolved_table={}", resolved_table);
         
-        let schema = store.get_schema(&mut txn, &resolved_table).await.ok()??;
+        let schema = store
+            .get_schema(&mut txn, session.current_database_id(), &resolved_table)
+            .await
+            .ok()??;
         let _ = txn.rollback().await;
         
         info!("infer_insert_parameter_types: got schema with {} columns", schema.columns.len());
@@ -908,7 +916,10 @@ impl DynamicPgHandler {
         
         info!("infer_update_parameter_types: resolved_table={}", resolved_table);
         
-        let schema = store.get_schema(&mut txn, &resolved_table).await.ok()??;
+        let schema = store
+            .get_schema(&mut txn, session.current_database_id(), &resolved_table)
+            .await
+            .ok()??;
         let _ = txn.rollback().await;
         
         info!("infer_update_parameter_types: got schema with {} columns", schema.columns.len());
@@ -982,7 +993,10 @@ impl DynamicPgHandler {
         let search_path = session.search_path();
         let resolved_table = resolve_table_for_insert(&table_name, search_path);
         
-        let schema = store.get_schema(&mut txn, &resolved_table).await.ok()??;
+        let schema = store
+            .get_schema(&mut txn, session.current_database_id(), &resolved_table)
+            .await
+            .ok()??;
         let _ = txn.rollback().await;
         
         let col_types: std::collections::HashMap<String, DataType> = schema
@@ -1184,6 +1198,7 @@ impl DynamicPgHandler {
         keyspace: Option<String>,
         username: Option<String>,
         is_superuser: bool,
+        database: String,
     ) -> Result<(), String> {
         let effective_keyspace = keyspace
             .or_else(|| self.default_keyspace.clone())
@@ -1214,9 +1229,45 @@ impl DynamicPgHandler {
             tenant_obs.clone(),
         ));
 
+        let database_name = database.trim();
+        let database_name = if database_name.is_empty() {
+            "postgres"
+        } else {
+            database_name
+        };
+        let database_name = database_name.to_ascii_lowercase();
+
+        let mut db_txn = store.begin().await.map_err(|e| e.to_string())?;
+        let database_id = match store
+            .get_database_id(&mut db_txn, &database_name)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            Some(id) => id,
+            None => {
+                db_txn.rollback().await.ok();
+                return Err(format!("database \"{}\" does not exist", database_name));
+            }
+        };
+        db_txn.rollback().await.ok();
+
         let session = match username {
-            Some(user) => Session::new_with_user(store, tenant_obs, user, is_superuser, self.connection_id),
-            None => Session::new(store, tenant_obs, self.connection_id),
+            Some(user) => Session::new_with_user_and_database(
+                store,
+                tenant_obs,
+                user,
+                is_superuser,
+                self.connection_id,
+                database_id,
+                database_name,
+            ),
+            None => Session::new_with_database(
+                store,
+                tenant_obs,
+                self.connection_id,
+                database_id,
+                database_name,
+            ),
         };
 
         let _ = self.executor.set(executor);
@@ -1531,6 +1582,11 @@ impl StartupHandler for DynamicPgHandler {
                     .get(METADATA_ACTUAL_USER)
                     .cloned()
                     .unwrap_or_else(|| "admin".to_string());
+                let database = client
+                    .metadata()
+                    .get(METADATA_DATABASE)
+                    .cloned()
+                    .unwrap_or_else(|| "postgres".to_string());
 
                 let auth_result = self
                     .authenticate_user(&keyspace, &actual_user, &provided_password)
@@ -1544,6 +1600,7 @@ impl StartupHandler for DynamicPgHandler {
                                     keyspace.clone(),
                                     Some(actual_user.clone()),
                                     is_superuser,
+                                    database,
                                 )
                                 .await
                             {
@@ -1670,9 +1727,14 @@ impl SimpleQueryHandler for DynamicPgHandler {
                         "Session not initialized".to_string(),
                     )))
                 })?;
+                let db_id = session.current_database_id();
                 session.begin().await.ok();
                 let count = if let Some(txn) = session.get_mut_txn() {
-                    if let Ok(Some(schema)) = executor.store().get_schema(txn, &table_name).await {
+                    if let Ok(Some(schema)) = executor
+                        .store()
+                        .get_schema(txn, db_id, &table_name)
+                        .await
+                    {
                         schema.columns.len()
                     } else {
                         1
@@ -1791,6 +1853,7 @@ impl CopyHandler for DynamicPgHandler {
                 )))
             })?;
 
+            let db_id = session.current_database_id();
             let schema = {
                 let txn = session.get_mut_txn().ok_or_else(|| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -1801,7 +1864,7 @@ impl CopyHandler for DynamicPgHandler {
                 })?;
                 executor
                     .store()
-                    .get_schema(txn, &ctx.table_name)
+                    .get_schema(txn, db_id, &ctx.table_name)
                     .await
                     .map_err(|e| {
                         PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -2419,7 +2482,13 @@ impl PgHandler {
         let connection_id = CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
         Self {
             executor,
-            session: Mutex::new(Session::new(store, observability, connection_id)),
+            session: Mutex::new(Session::new_with_database(
+                store,
+                observability,
+                connection_id,
+                1,
+                "postgres".to_string(),
+            )),
             copy_context: Mutex::new(None),
             query_parser: Arc::new(NoopQueryParser::new()),
             connection_id,
@@ -2631,10 +2700,14 @@ impl SimpleQueryHandler for PgHandler {
 
             let col_count = if columns.is_empty() {
                 let mut session = self.session.lock().await;
+                let db_id = session.current_database_id();
                 session.begin().await.ok();
                 let count = if let Some(txn) = session.get_mut_txn() {
-                    if let Ok(Some(schema)) =
-                        self.executor.store().get_schema(txn, &table_name).await
+                    if let Ok(Some(schema)) = self
+                        .executor
+                        .store()
+                        .get_schema(txn, db_id, &table_name)
+                        .await
                     {
                         schema.columns.len()
                     } else {
@@ -2737,6 +2810,7 @@ impl CopyHandler for PgHandler {
                 )))
             })?;
 
+            let db_id = session.current_database_id();
             let schema = {
                 let txn = session.get_mut_txn().ok_or_else(|| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -2747,7 +2821,7 @@ impl CopyHandler for PgHandler {
                 })?;
                 self.executor
                     .store()
-                    .get_schema(txn, &ctx.table_name)
+                    .get_schema(txn, db_id, &ctx.table_name)
                     .await
                     .map_err(|e| {
                         PgWireError::UserError(Box::new(ErrorInfo::new(

@@ -6,13 +6,21 @@ use rust_decimal::Decimal;
 use sqlparser::ast::{BinaryOperator, Expr, JsonOperator, Value as SqlValue};
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::future::Future;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use super::timezone::parse_timezone_offset_seconds;
 
-// Thread-local storage for connection_id used by pg_backend_pid()
+// Thread-local storage for connection_id used by pg_backend_pid() as a fallback.
 thread_local! {
-    static CONNECTION_ID: Cell<i32> = const { Cell::new(0) };
+    static CONNECTION_ID_FALLBACK: Cell<i32> = const { Cell::new(0) };
+}
+
+// Task-local execution context for correct behavior across async suspension points.
+tokio::task_local! {
+    static CONNECTION_ID: i32;
+    static CURRENT_DATABASE_NAME: Arc<str>;
 }
 
 const VERSION_STRING: &str = concat!(
@@ -23,11 +31,30 @@ const VERSION_STRING: &str = concat!(
 
 /// Set the connection_id for the current thread (call before query execution)
 pub fn set_connection_id(id: i32) {
-    CONNECTION_ID.with(|c| c.set(id));
+    CONNECTION_ID_FALLBACK.with(|c| c.set(id));
 }
 
 fn get_connection_id() -> i32 {
-    CONNECTION_ID.with(|c| c.get())
+    CONNECTION_ID
+        .try_with(|c| *c)
+        .unwrap_or_else(|_| CONNECTION_ID_FALLBACK.with(|c| c.get()))
+}
+
+fn current_database_name() -> Option<Arc<str>> {
+    CURRENT_DATABASE_NAME.try_with(|name| name.clone()).ok()
+}
+
+pub(crate) async fn with_query_context<R, Fut>(
+    connection_id: i32,
+    database_name: Arc<str>,
+    fut: Fut,
+) -> R
+where
+    Fut: Future<Output = R>,
+{
+    CONNECTION_ID
+        .scope(connection_id, CURRENT_DATABASE_NAME.scope(database_name, fut))
+        .await
 }
 
 pub struct JoinContext<'a> {
@@ -2958,8 +2985,23 @@ fn eval_function(
         "SET_CONFIG" => Ok(Value::Text(String::new())),
         "PG_IS_IN_RECOVERY" => Ok(Value::Boolean(false)),
         "PG_BACKEND_PID" => Ok(Value::Int32(get_connection_id())),
+        "PG_ENCODING_TO_CHAR" => {
+            // pg_catalog.pg_encoding_to_char(int) -> name
+            //
+            // pg-tikv only supports UTF8, so we always report UTF8 for non-NULL inputs.
+            // Keep behavior permissive for compatibility with psql meta-commands (e.g. `\\l`).
+            let mut iter = args.into_iter();
+            match iter.next() {
+                Some(Value::Null) | None => Ok(Value::Null),
+                Some(_) => Ok(Value::Text("UTF8".to_string())),
+            }
+        }
         "VERSION" => Ok(Value::Text(VERSION_STRING.to_string())),
-        "CURRENT_DATABASE" => Ok(Value::Text("postgres".to_string())),
+        "CURRENT_DATABASE" => Ok(Value::Text(
+            current_database_name()
+                .map(|name| name.as_ref().to_string())
+                .unwrap_or_else(|| "postgres".to_string()),
+        )),
         "CURRENT_SCHEMA" => Ok(Value::Text("public".to_string())),
         "CURRENT_USER" | "SESSION_USER" | "USER" => Ok(Value::Text("postgres".to_string())),
         "PG_GET_USERBYID" => Ok(Value::Text("postgres".to_string())),
@@ -7800,6 +7842,23 @@ mod tests {
             eval_expr(&parse_expr("PG_TYPEOF(ARRAY[1,2,3])"), None, None).unwrap(),
             Value::Text("integer[]".to_string())
         );
+    }
+
+    #[test]
+    fn test_pg_encoding_to_char_reports_utf8() {
+        let expr = parse_expr("pg_encoding_to_char(6)");
+        let val = eval_expr(&expr, None, None).unwrap();
+        assert_eq!(val, Value::Text("UTF8".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_current_database_reads_task_local_context() {
+        let expr = parse_expr("current_database()");
+        let val = with_query_context(123, Arc::from("mydb"), async {
+            eval_expr(&expr, None, None).unwrap()
+        })
+        .await;
+        assert_eq!(val, Value::Text("mydb".to_string()));
     }
 
     #[tokio::test]

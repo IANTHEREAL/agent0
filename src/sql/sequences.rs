@@ -295,17 +295,18 @@ fn parse_minmax(value: &MinMaxValue) -> Result<Option<i64>> {
 pub(crate) async fn execute_create_sequence(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     name: &ObjectName,
     if_not_exists: bool,
     sequence_options: &[SequenceOptions],
 ) -> Result<ExecuteResult> {
     let (schema, seq_name, full_name) = normalize_sequence_name(name, search_path)?;
-    if !store.schema_exists(txn, &schema).await? {
+    if !store.schema_exists(txn, db_id, &schema).await? {
         return Err(anyhow!("schema '{}' does not exist", schema));
     }
 
-    if if_not_exists && store.get_sequence(txn, &full_name).await?.is_some() {
+    if if_not_exists && store.get_sequence(txn, db_id, &full_name).await?.is_some() {
         return Ok(ExecuteResult::CommandComplete {
             tag: "CREATE SEQUENCE",
         });
@@ -378,7 +379,7 @@ pub(crate) async fn execute_create_sequence(
         }),
     };
 
-    store.create_sequence(txn, def).await?;
+    store.create_sequence(txn, db_id, def).await?;
     Ok(ExecuteResult::CommandComplete {
         tag: "CREATE SEQUENCE",
     })
@@ -387,20 +388,27 @@ pub(crate) async fn execute_create_sequence(
 pub(crate) async fn execute_drop_sequence(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     names: &[ObjectName],
     if_exists: bool,
 ) -> Result<ExecuteResult> {
     for name in names {
-        let resolved =
-            names::resolve_existing_sequence_name(store.as_ref(), txn, name, search_path).await?;
+        let resolved = names::resolve_existing_sequence_name(
+            store.as_ref(),
+            txn,
+            db_id,
+            name,
+            search_path,
+        )
+        .await?;
         let Some(resolved) = resolved else {
             if !if_exists {
                 return Err(anyhow!("Sequence '{}' does not exist", name));
             }
             continue;
         };
-        let existed = store.drop_sequence(txn, &resolved.full).await?;
+        let existed = store.drop_sequence(txn, db_id, &resolved.full).await?;
         if !existed && !if_exists {
             return Err(anyhow!("Sequence '{}' does not exist", resolved.full));
         }
@@ -473,13 +481,14 @@ fn format_indexdef(table_schema: &str, table_name: &str, idx: &IndexDef) -> Stri
 async fn lookup_indexdef_by_oid(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     oid: i64,
 ) -> Result<Option<String>> {
-    let user_tables = store.list_tables(txn).await?;
+    let user_tables = store.list_tables(txn, db_id).await?;
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(&full_table_name);
-        let Some(schema) = store.get_schema(txn, &full_table_name).await? else {
+        let Some(schema) = store.get_schema(txn, db_id, &full_table_name).await? else {
             continue;
         };
 
@@ -516,6 +525,7 @@ async fn lookup_indexdef_by_oid(
 async fn resolve_sequence_full_name_from_value(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     search_path: &[String],
     v: crate::types::Value,
 ) -> Result<String> {
@@ -535,7 +545,7 @@ async fn resolve_sequence_full_name_from_value(
     };
     for schema in candidates {
         let resolved = names::ResolvedName::new(schema.to_string(), seq_name.clone())?;
-        if store.get_sequence(txn, &resolved.full).await?.is_some() {
+        if store.get_sequence(txn, db_id, &resolved.full).await?.is_some() {
             return Ok(resolved.full);
         }
     }
@@ -546,6 +556,7 @@ async fn resolve_sequence_full_name_from_value(
 pub(crate) async fn eval_expr_with_sequences(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     last_sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     expr: &Expr,
@@ -558,6 +569,7 @@ pub(crate) async fn eval_expr_with_sequences(
     let rewritten = replace_sequence_functions(
         store,
         txn,
+        db_id,
         last_sequence_values,
         search_path,
         expr,
@@ -571,6 +583,7 @@ pub(crate) async fn eval_expr_with_sequences(
 pub(crate) async fn eval_expr_join_with_sequences(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     last_sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     expr: &Expr,
@@ -582,6 +595,7 @@ pub(crate) async fn eval_expr_join_with_sequences(
     let rewritten = replace_sequence_functions_join(
         store,
         txn,
+        db_id,
         last_sequence_values,
         search_path,
         expr,
@@ -594,6 +608,7 @@ pub(crate) async fn eval_expr_join_with_sequences(
 pub(crate) fn replace_sequence_functions<'a>(
     store: &'a Arc<TikvStore>,
     txn: &'a mut Transaction,
+    db_id: u64,
     last_sequence_values: &'a mut HashMap<String, i64>,
     search_path: &'a [String],
     expr: &'a Expr,
@@ -613,11 +628,12 @@ pub(crate) fn replace_sequence_functions<'a>(
                         let full_name = resolve_sequence_full_name_from_value(
                             store,
                             txn,
+                            db_id,
                             search_path,
                             eval_expr(arg0, row, schema)?,
                         )
                         .await?;
-                        let val = store.nextval_sequence(txn, &full_name).await?;
+                        let val = store.nextval_sequence(txn, db_id, &full_name).await?;
                         last_sequence_values.insert(full_name, val);
                         Ok(value_to_sql_expr(&crate::types::Value::Int64(val)))
                     }
@@ -626,11 +642,12 @@ pub(crate) fn replace_sequence_functions<'a>(
                         let full_name = resolve_sequence_full_name_from_value(
                             store,
                             txn,
+                            db_id,
                             search_path,
                             eval_expr(arg0, row, schema)?,
                         )
                         .await?;
-                        if store.get_sequence(txn, &full_name).await?.is_none() {
+                        if store.get_sequence(txn, db_id, &full_name).await?.is_none() {
                             return Err(anyhow!("Sequence '{}' does not exist", full_name));
                         }
                         let val =
@@ -651,6 +668,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         let full_name = resolve_sequence_full_name_from_value(
                             store,
                             txn,
+                            db_id,
                             search_path,
                             eval_expr(arg0, row, schema)?,
                         )
@@ -689,7 +707,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                             true
                         };
                         let res = store
-                            .setval_sequence(txn, &full_name, value_i64, is_called)
+                            .setval_sequence(txn, db_id, &full_name, value_i64, is_called)
                             .await?;
                         Ok(value_to_sql_expr(&crate::types::Value::Int64(res)))
                     }
@@ -730,7 +748,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                             }
                         }
 
-                        let indexdef = lookup_indexdef_by_oid(store, txn, oid).await?;
+                        let indexdef = lookup_indexdef_by_oid(store, txn, db_id, oid).await?;
                         Ok(value_to_sql_expr(&Value::Text(
                             indexdef.unwrap_or_else(|| "CREATE INDEX".to_string()),
                         )))
@@ -744,6 +762,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                                     let resolved = replace_sequence_functions(
                                         store,
                                         txn,
+                                        db_id,
                                         last_sequence_values,
                                         search_path,
                                         e,
@@ -771,6 +790,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         if let Ok(Some(result)) = plpgsql::try_execute_user_function(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             &func_name_str,
@@ -786,6 +806,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                                 replace_sequence_functions(
                                     store,
                                     txn,
+                                    db_id,
                                     last_sequence_values,
                                     search_path,
                                     filter,
@@ -803,6 +824,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                             ob.expr = replace_sequence_functions(
                                 store,
                                 txn,
+                                db_id,
                                 last_sequence_values,
                                 search_path,
                                 &ob.expr,
@@ -830,6 +852,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         left,
@@ -843,6 +866,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         right,
@@ -858,6 +882,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -871,6 +896,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                 replace_sequence_functions(
                     store,
                     txn,
+                    db_id,
                     last_sequence_values,
                     search_path,
                     inner,
@@ -883,6 +909,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                 replace_sequence_functions(
                     store,
                     txn,
+                    db_id,
                     last_sequence_values,
                     search_path,
                     inner,
@@ -895,6 +922,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                 replace_sequence_functions(
                     store,
                     txn,
+                    db_id,
                     last_sequence_values,
                     search_path,
                     inner,
@@ -911,6 +939,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                 let resolved_expr = replace_sequence_functions(
                     store,
                     txn,
+                    db_id,
                     last_sequence_values,
                     search_path,
                     expr,
@@ -924,6 +953,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         replace_sequence_functions(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             item,
@@ -949,6 +979,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -962,6 +993,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         low,
@@ -974,6 +1006,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         high,
@@ -994,6 +1027,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         replace_sequence_functions(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             op,
@@ -1011,6 +1045,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         replace_sequence_functions(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             cond,
@@ -1026,6 +1061,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         replace_sequence_functions(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             res,
@@ -1040,6 +1076,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         replace_sequence_functions(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             else_expr,
@@ -1067,6 +1104,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1088,6 +1126,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1101,6 +1140,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         replace_sequence_functions(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             e,
@@ -1116,6 +1156,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         replace_sequence_functions(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             e,
@@ -1138,6 +1179,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1152,6 +1194,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         replace_sequence_functions(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             e,
@@ -1169,6 +1212,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1181,6 +1225,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         r#in,
@@ -1196,6 +1241,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1210,6 +1256,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1225,6 +1272,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1244,6 +1292,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         left,
@@ -1257,6 +1306,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         right,
@@ -1273,6 +1323,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         replace_sequence_functions(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             elem,
@@ -1291,6 +1342,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                 let resolved_obj = replace_sequence_functions(
                     store,
                     txn,
+                    db_id,
                     last_sequence_values,
                     search_path,
                     obj,
@@ -1304,6 +1356,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         replace_sequence_functions(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             idx,
@@ -1327,6 +1380,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         left,
@@ -1340,6 +1394,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         right,
@@ -1358,6 +1413,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         left,
@@ -1371,6 +1427,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                     replace_sequence_functions(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         right,
@@ -1388,6 +1445,7 @@ pub(crate) fn replace_sequence_functions<'a>(
 pub(crate) fn replace_sequence_functions_join<'a>(
     store: &'a Arc<TikvStore>,
     txn: &'a mut Transaction,
+    db_id: u64,
     last_sequence_values: &'a mut HashMap<String, i64>,
     search_path: &'a [String],
     expr: &'a Expr,
@@ -1406,11 +1464,12 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         let full_name = resolve_sequence_full_name_from_value(
                             store,
                             txn,
+                            db_id,
                             search_path,
                             eval_expr_join(arg0, join_ctx)?,
                         )
                         .await?;
-                        let val = store.nextval_sequence(txn, &full_name).await?;
+                        let val = store.nextval_sequence(txn, db_id, &full_name).await?;
                         last_sequence_values.insert(full_name, val);
                         Ok(value_to_sql_expr(&crate::types::Value::Int64(val)))
                     }
@@ -1419,11 +1478,12 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         let full_name = resolve_sequence_full_name_from_value(
                             store,
                             txn,
+                            db_id,
                             search_path,
                             eval_expr_join(arg0, join_ctx)?,
                         )
                         .await?;
-                        if store.get_sequence(txn, &full_name).await?.is_none() {
+                        if store.get_sequence(txn, db_id, &full_name).await?.is_none() {
                             return Err(anyhow!("Sequence '{}' does not exist", full_name));
                         }
                         let val =
@@ -1444,6 +1504,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         let full_name = resolve_sequence_full_name_from_value(
                             store,
                             txn,
+                            db_id,
                             search_path,
                             eval_expr_join(arg0, join_ctx)?,
                         )
@@ -1480,7 +1541,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             true
                         };
                         let res = store
-                            .setval_sequence(txn, &full_name, value_i64, is_called)
+                            .setval_sequence(txn, db_id, &full_name, value_i64, is_called)
                             .await?;
                         Ok(value_to_sql_expr(&crate::types::Value::Int64(res)))
                     }
@@ -1527,7 +1588,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             }
                         }
 
-                        let indexdef = lookup_indexdef_by_oid(store, txn, oid).await?;
+                        let indexdef = lookup_indexdef_by_oid(store, txn, db_id, oid).await?;
                         Ok(value_to_sql_expr(&Value::Text(
                             indexdef.unwrap_or_else(|| "CREATE INDEX".to_string()),
                         )))
@@ -1541,6 +1602,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                                         replace_sequence_functions_join(
                                             store,
                                             txn,
+                                            db_id,
                                             last_sequence_values,
                                             search_path,
                                             e,
@@ -1559,6 +1621,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                                 replace_sequence_functions_join(
                                     store,
                                     txn,
+                                    db_id,
                                     last_sequence_values,
                                     search_path,
                                     filter,
@@ -1588,6 +1651,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         left,
@@ -1600,6 +1664,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         right,
@@ -1614,6 +1679,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         inner,
@@ -1626,6 +1692,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                 replace_sequence_functions_join(
                     store,
                     txn,
+                    db_id,
                     last_sequence_values,
                     search_path,
                     inner,
@@ -1641,6 +1708,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                 let resolved_expr = replace_sequence_functions_join(
                     store,
                     txn,
+                    db_id,
                     last_sequence_values,
                     search_path,
                     expr,
@@ -1653,6 +1721,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         replace_sequence_functions_join(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             item,
@@ -1677,6 +1746,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1689,6 +1759,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         low,
@@ -1700,6 +1771,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         high,
@@ -1719,6 +1791,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         replace_sequence_functions_join(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             op,
@@ -1735,6 +1808,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         replace_sequence_functions_join(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             cond,
@@ -1749,6 +1823,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         replace_sequence_functions_join(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             res,
@@ -1762,6 +1837,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         replace_sequence_functions_join(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             else_expr,
@@ -1788,6 +1864,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1808,6 +1885,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1820,6 +1898,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         replace_sequence_functions_join(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             e,
@@ -1834,6 +1913,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         replace_sequence_functions_join(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             e,
@@ -1855,6 +1935,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1868,6 +1949,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         replace_sequence_functions_join(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             e,
@@ -1884,6 +1966,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1895,6 +1978,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         r#in,
@@ -1909,6 +1993,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1922,6 +2007,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1936,6 +2022,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         expr,
@@ -1954,6 +2041,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         left,
@@ -1966,6 +2054,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         right,
@@ -1981,6 +2070,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         replace_sequence_functions_join(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             elem,
@@ -1998,6 +2088,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                 let resolved_obj = replace_sequence_functions_join(
                     store,
                     txn,
+                    db_id,
                     last_sequence_values,
                     search_path,
                     obj,
@@ -2010,6 +2101,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         replace_sequence_functions_join(
                             store,
                             txn,
+                            db_id,
                             last_sequence_values,
                             search_path,
                             idx,
@@ -2032,6 +2124,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         left,
@@ -2044,6 +2137,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         right,
@@ -2061,6 +2155,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         left,
@@ -2073,6 +2168,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     replace_sequence_functions_join(
                         store,
                         txn,
+                        db_id,
                         last_sequence_values,
                         search_path,
                         right,

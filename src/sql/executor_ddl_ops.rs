@@ -15,6 +15,7 @@ impl Executor {
     pub(crate) async fn execute_create_table_as(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         name: &ObjectName,
@@ -24,16 +25,16 @@ impl Executor {
         _temporary: bool,
     ) -> Result<ExecuteResult> {
         let resolved = names::resolve_ddl_object_name(name, search_path)?;
-        if !self.store().schema_exists(txn, &resolved.schema).await? {
+        if !self.store().schema_exists(txn, db_id, &resolved.schema).await? {
             return Err(anyhow!("schema '{}' does not exist", resolved.schema));
         }
         let table_name = resolved.full;
 
         let ctes = self
-            .build_cte_context(txn, sequence_values, search_path, query)
+            .build_cte_context(txn, db_id, sequence_values, search_path, query)
             .await?;
         let result = self
-            .execute_query_with_ctes(txn, sequence_values, search_path, query, &ctes)
+            .execute_query_with_ctes(txn, db_id, sequence_values, search_path, query, &ctes)
             .await?;
 
         let (result_cols, result_rows) = match result {
@@ -48,6 +49,7 @@ impl Executor {
         ddl::create_table_from_query_result(
             &self.store(),
             txn,
+            db_id,
             &table_name,
             if_not_exists,
             result_cols,
@@ -60,12 +62,13 @@ impl Executor {
     pub(crate) async fn create_table_from_result(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         search_path: &[String],
         target_name: &ObjectName,
         result: ExecuteResult,
     ) -> Result<ExecuteResult> {
         let resolved = names::resolve_ddl_object_name(target_name, search_path)?;
-        if !self.store().schema_exists(txn, &resolved.schema).await? {
+        if !self.store().schema_exists(txn, db_id, &resolved.schema).await? {
             return Err(anyhow!("schema '{}' does not exist", resolved.schema));
         }
         let table_name = resolved.full;
@@ -82,6 +85,7 @@ impl Executor {
         ddl::create_table_from_select_into(
             &self.store(),
             txn,
+            db_id,
             &table_name,
             result_cols,
             result_rows,
@@ -92,6 +96,7 @@ impl Executor {
     pub(crate) async fn execute_create_index(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         search_path: &[String],
         idx_name: &str,
         table_name: &ObjectName,
@@ -102,26 +107,33 @@ impl Executor {
         predicate: Option<&Expr>,
     ) -> Result<ExecuteResult> {
         let resolved =
-            names::resolve_existing_table_name(self.store().as_ref(), txn, table_name, search_path)
+            names::resolve_existing_table_name(
+                self.store().as_ref(),
+                txn,
+                db_id,
+                table_name,
+                search_path,
+            )
                 .await?
                 .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
         let tbl_name = resolved.full;
         let schema = self
             .store()
-            .get_schema(txn, &tbl_name)
+            .get_schema(txn, db_id, &tbl_name)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
         let needs_backfill = using
             .map(|u| u.value.eq_ignore_ascii_case("btree") || u.value.eq_ignore_ascii_case("gin"))
             .unwrap_or(true);
         let rows = if needs_backfill {
-            self.scan_and_fill(txn, &tbl_name, &schema).await?
+            self.scan_and_fill(txn, db_id, &tbl_name, &schema).await?
         } else {
             Vec::new()
         };
         ddl::execute_create_index(
             &self.store(),
             txn,
+            db_id,
             idx_name,
             &tbl_name,
             using,
@@ -137,6 +149,7 @@ impl Executor {
     pub(crate) async fn execute_drop_index(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         _search_path: &[String],
         names: &[ObjectName],
         if_exists: bool,
@@ -146,17 +159,18 @@ impl Executor {
             let idx_name = name.0.last().unwrap().value.clone();
             let mut found = false;
 
-            let tables = self.store().list_tables(txn).await?;
+            let tables = self.store().list_tables(txn, db_id).await?;
             for table_name in &tables {
-                let mut schema = match self.store().get_schema(txn, table_name).await? {
+                let mut schema = match self.store().get_schema(txn, db_id, table_name).await? {
                     Some(s) => s,
                     None => continue,
                 };
 
-                let rows = self.scan_and_fill(txn, table_name, &schema).await?;
+                let rows = self.scan_and_fill(txn, db_id, table_name, &schema).await?;
                 if let Some(dropped) = ddl::execute_drop_index(
                     &self.store(),
                     txn,
+                    db_id,
                     &idx_name,
                     &mut schema,
                     table_name,
@@ -182,10 +196,11 @@ impl Executor {
     pub(crate) async fn execute_alter_table(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         search_path: &[String],
         name: &ObjectName,
         operation: &AlterTableOperation,
     ) -> Result<ExecuteResult> {
-        ddl::execute_alter_table(&self.store(), txn, search_path, name, operation).await
+        ddl::execute_alter_table(&self.store(), txn, db_id, search_path, name, operation).await
     }
 }

@@ -318,6 +318,7 @@ pub(crate) fn spawn_trigger_worker(pool: Arc<TikvClientPool>) {
 /// the per-keyspace limit, enqueue is skipped to avoid blocking DML.
 pub(crate) async fn enqueue_after_triggers(
     txn: &mut Transaction,
+    db_id: u64,
     keyspace: &str,
     table_full_name: &str,
     op: TriggerOp,
@@ -355,6 +356,7 @@ pub(crate) async fn enqueue_after_triggers(
 
         let ev = TriggerEvent::new_pending(
             trigger.name.clone(),
+            db_id,
             table_full_name.to_string(),
             op.clone(),
             old_row.cloned(),
@@ -443,14 +445,15 @@ impl TriggerWorker {
 
         // NOTE: This executes in its own transaction: eventual consistency by design.
         let mut txn = store.begin().await?;
+        let db_id = event.db_id;
 
         let schema = store
-            .get_schema(&mut txn, &event.table_name)
+            .get_schema(&mut txn, db_id, &event.table_name)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Table '{}' not found", event.table_name))?;
 
         let trigger = store
-            .get_trigger(&mut txn, &event.table_name, &event.trigger_name)
+            .get_trigger(&mut txn, db_id, &event.table_name, &event.trigger_name)
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -466,7 +469,7 @@ impl TriggerWorker {
         }
 
         let func = store
-            .get_function(&mut txn, &trigger.function)
+            .get_function(&mut txn, db_id, &trigger.function)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Function '{}' not found", trigger.function))?;
 
@@ -475,6 +478,7 @@ impl TriggerWorker {
         self.execute_trigger_body(
             executor,
             &mut txn,
+            db_id,
             &mut sequence_values,
             &schema,
             &func.body,
@@ -742,6 +746,7 @@ impl TriggerWorker {
         &self,
         executor: &Executor,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         schema: &TableSchema,
         body: &str,
@@ -793,6 +798,7 @@ impl TriggerWorker {
                     self.execute_trigger_statement(
                         executor,
                         txn,
+                        db_id,
                         sequence_values,
                         schema,
                         old_row,
@@ -814,6 +820,7 @@ impl TriggerWorker {
                 .execute_trigger_statement(
                     executor,
                     txn,
+                    db_id,
                     sequence_values,
                     schema,
                     old_row,
@@ -830,6 +837,7 @@ impl TriggerWorker {
         &self,
         executor: &Executor,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         schema: &TableSchema,
         old_row: Option<&Row>,
@@ -868,6 +876,7 @@ impl TriggerWorker {
                                         super::sequences::eval_expr_with_sequences(
                                             &store,
                                             txn,
+                                            db_id,
                                             sequence_values,
                                             &self.default_search_path,
                                             &expr,
@@ -899,7 +908,13 @@ impl TriggerWorker {
         for s in &statements {
             // Ignore result rows; errors propagate.
             let _ = executor
-                .execute_statement_on_txn(txn, sequence_values, &self.default_search_path, s)
+                .execute_statement_on_txn(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    &self.default_search_path,
+                    s,
+                )
                 .await?;
         }
 

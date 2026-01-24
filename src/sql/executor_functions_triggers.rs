@@ -661,20 +661,21 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let (txn, _sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
             let resolved = names::resolve_ddl_object_name(&name, search_path)?;
-            if !self.store().schema_exists(txn, &resolved.schema).await? {
+            if !self.store().schema_exists(txn, db_id, &resolved.schema).await? {
                 return Err(anyhow!("schema '{}' does not exist", resolved.schema));
             }
             def.schema = resolved.schema.clone();
             def.name = resolved.name.clone();
 
             if or_replace {
-                self.store().replace_function(txn, def).await?;
+                self.store().replace_function(txn, db_id, def).await?;
             } else {
-                self.store().create_function(txn, def).await?;
+                self.store().create_function(txn, db_id, def).await?;
             }
             Ok(ExecuteResult::CreateFunction {
                 func_name: resolved.full,
@@ -706,6 +707,7 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let (txn, _sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
@@ -715,6 +717,7 @@ impl Executor {
                 let resolved = names::resolve_existing_function_name(
                     self.store().as_ref(),
                     txn,
+                    db_id,
                     &name,
                     search_path,
                 )
@@ -724,7 +727,7 @@ impl Executor {
                     None => names::resolve_ddl_object_name(&name, search_path)?.full,
                 };
                 last_name = Some(func_full_name.clone());
-                let dropped = self.store().drop_function(txn, &func_full_name).await?;
+                let dropped = self.store().drop_function(txn, db_id, &func_full_name).await?;
                 if !dropped && !if_exists {
                     return Err(anyhow!("Function '{}' does not exist", func_full_name));
                 }
@@ -760,18 +763,26 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let (txn, _sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
 
             let table_resolved =
-                names::resolve_existing_table_name(self.store().as_ref(), txn, &table, search_path)
+                names::resolve_existing_table_name(
+                    self.store().as_ref(),
+                    txn,
+                    db_id,
+                    &table,
+                    search_path,
+                )
                     .await?
                     .ok_or_else(|| anyhow!("Table '{}' not found", table))?;
 
             let func_resolved = names::resolve_existing_function_name(
                 self.store().as_ref(),
                 txn,
+                db_id,
                 &function,
                 search_path,
             )
@@ -791,7 +802,7 @@ impl Executor {
                 function: func_full_name,
             };
 
-            self.store().create_trigger(txn, def).await?;
+            self.store().create_trigger(txn, db_id, def).await?;
             Ok(ExecuteResult::CreateTrigger {
                 trigger_name,
                 table_name: table_resolved.full,
@@ -823,12 +834,19 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let (txn, _sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
 
             let table_resolved =
-                names::resolve_existing_table_name(self.store().as_ref(), txn, &table, search_path)
+                names::resolve_existing_table_name(
+                    self.store().as_ref(),
+                    txn,
+                    db_id,
+                    &table,
+                    search_path,
+                )
                     .await?;
             let table_resolved = match table_resolved {
                 Some(resolved) => resolved,
@@ -849,7 +867,7 @@ impl Executor {
 
             let dropped = self
                 .store()
-                .drop_trigger(txn, &table_resolved.full, &trigger_name)
+                .drop_trigger(txn, db_id, &table_resolved.full, &trigger_name)
                 .await?;
             if !dropped && !if_exists {
                 return Err(anyhow!(

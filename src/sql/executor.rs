@@ -593,27 +593,56 @@ impl Executor {
     pub async fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecuteResults> {
         let statement_ts = statement_time::now_timestamp_millis();
         let savepoints = session.savepoints();
-        statement_time::with_statement_timestamp_millis(
-            statement_ts,
-            crate::txn::with_savepoints(savepoints, async {
-                let sql_stripped = strip_leading_sql_comments(sql);
-            let sql_trimmed = sql_stripped.trim_start();
-            let is_observability_user =
-                session.current_user() == Some(OBSERVABILITY_USER) && !session.is_superuser();
-            let starts_with = |prefix: &str| {
-                sql_trimmed.len() >= prefix.len()
-                    && sql_trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
-            };
+        let connection_id = session.connection_id();
+        let database_name = session.current_database_name_arc();
+        super::expr::with_query_context(
+            connection_id,
+            database_name,
+            statement_time::with_statement_timestamp_millis(
+                statement_ts,
+                crate::txn::with_savepoints(savepoints, async {
+                    let sql_stripped = strip_leading_sql_comments(sql);
+                let sql_trimmed = sql_stripped.trim_start();
+                let is_observability_user =
+                    session.current_user() == Some(OBSERVABILITY_USER) && !session.is_superuser();
+                let starts_with = |prefix: &str| {
+                    sql_trimmed.len() >= prefix.len()
+                        && sql_trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
+                };
 
-            if !is_observability_user {
-                if starts_with("CREATE EXTENSION") {
-                    let start = Instant::now();
-                    let res = self.execute_create_extension_cmd(session, sql).await;
-                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
-                        sql_trimmed.to_string()
-                    });
-                    return res.map(ExecuteResults::single);
-                }
+                if !is_observability_user {
+                    if starts_with("CREATE DATABASE") {
+                        let start = Instant::now();
+                        let res = self.execute_create_database_cmd(session, sql).await;
+                        self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                            sql_trimmed.to_string()
+                        });
+                        return res;
+                    }
+                    if starts_with("DROP DATABASE") {
+                        let start = Instant::now();
+                        let res = self.execute_drop_database_cmd(session, sql).await;
+                        self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                            sql_trimmed.to_string()
+                        });
+                        return res;
+                    }
+                    if starts_with("ALTER DATABASE") {
+                        let start = Instant::now();
+                        let res = self.execute_alter_database_cmd(session, sql).await;
+                        self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                            sql_trimmed.to_string()
+                        });
+                        return res;
+                    }
+                    if starts_with("CREATE EXTENSION") {
+                        let start = Instant::now();
+                        let res = self.execute_create_extension_cmd(session, sql).await;
+                        self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                            sql_trimmed.to_string()
+                        });
+                        return res.map(ExecuteResults::single);
+                    }
                 if starts_with("DROP EXTENSION") {
                     let start = Instant::now();
                     let res = self.execute_drop_extension_cmd(session, sql).await;
@@ -982,6 +1011,7 @@ impl Executor {
                                 }
 
                                 let is_autocommit = !session.is_in_transaction();
+                                let db_id = session.current_database_id();
 
                                 let max_attempts = if is_autocommit { 3usize } else { 1usize };
 
@@ -996,11 +1026,17 @@ impl Executor {
                                             .get_mut_txn_sequence_values_and_search_path()
                                             .expect("Transaction must be active");
                                         let notices = self
-                                            .collect_notices_before_statement(txn, search_path, stmt)
+                                            .collect_notices_before_statement(
+                                                txn,
+                                                db_id,
+                                                search_path,
+                                                stmt,
+                                            )
                                             .await?;
                                         let result = self
                                             .execute_statement_on_txn(
                                                 txn,
+                                                db_id,
                                                 sequence_values,
                                                 search_path,
                                                 stmt,
@@ -1080,7 +1116,8 @@ impl Executor {
             }
 
             Ok(ExecuteResults(results))
-            }),
+                }),
+            ),
         )
         .await
     }
@@ -1088,6 +1125,7 @@ impl Executor {
     async fn collect_notices_before_statement(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         search_path: &[String],
         stmt: &Statement,
     ) -> Result<Vec<ExecuteResult>> {
@@ -1105,6 +1143,7 @@ impl Executor {
                     let exists = super::names::resolve_existing_table_name(
                         self.store.as_ref(),
                         txn,
+                        db_id,
                         name,
                         search_path,
                     )
@@ -1147,6 +1186,7 @@ impl Executor {
             session.begin().await?;
         }
 
+        let db_id = session.current_database_id();
         let result = async {
             let (txn, _sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
@@ -1157,6 +1197,7 @@ impl Executor {
                     let resolved = names::resolve_existing_table_name(
                         self.store.as_ref(),
                         txn,
+                        db_id,
                         &name,
                         search_path,
                     )
@@ -1169,11 +1210,11 @@ impl Executor {
 
                     let mut schema = self
                         .store
-                        .get_schema(txn, &resolved.full)
+                        .get_schema(txn, db_id, &resolved.full)
                         .await?
                         .ok_or_else(|| anyhow!("Table '{}' does not exist", resolved.full))?;
                     schema.owner = new_owner;
-                    self.store.update_schema(txn, schema).await?;
+                    self.store.update_schema(txn, db_id, schema).await?;
                     Ok(ExecuteResult::AlterTable {
                         table_name: resolved.full,
                     })
@@ -1182,6 +1223,7 @@ impl Executor {
                     let resolved = names::resolve_existing_sequence_name(
                         self.store.as_ref(),
                         txn,
+                        db_id,
                         &name,
                         search_path,
                     )
@@ -1194,11 +1236,11 @@ impl Executor {
 
                     let mut seq = self
                         .store
-                        .get_sequence(txn, &resolved.full)
+                        .get_sequence(txn, db_id, &resolved.full)
                         .await?
                         .ok_or_else(|| anyhow!("Sequence '{}' does not exist", resolved.full))?;
                     seq.owner = new_owner;
-                    self.store.update_sequence_def(txn, &seq).await?;
+                    self.store.update_sequence_def(txn, db_id, &seq).await?;
                     Ok(ExecuteResult::AlterSequence {
                         sequence_name: resolved.full,
                     })
@@ -1207,6 +1249,7 @@ impl Executor {
                     let resolved = names::resolve_existing_function_name(
                         self.store.as_ref(),
                         txn,
+                        db_id,
                         &name,
                         search_path,
                     )
@@ -1219,11 +1262,11 @@ impl Executor {
 
                     let mut func = self
                         .store
-                        .get_function(txn, &resolved.full)
+                        .get_function(txn, db_id, &resolved.full)
                         .await?
                         .ok_or_else(|| anyhow!("Function '{}' does not exist", resolved.full))?;
                     func.owner = new_owner;
-                    self.store.replace_function(txn, func).await?;
+                    self.store.replace_function(txn, db_id, func).await?;
                     Ok(ExecuteResult::AlterFunction {
                         function_name: resolved.full,
                     })
@@ -1259,6 +1302,7 @@ impl Executor {
             session.begin().await?;
         }
 
+        let db_id = session.current_database_id();
         let result = async {
             let (txn, _sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
@@ -1267,6 +1311,7 @@ impl Executor {
             let resolved = names::resolve_existing_sequence_name(
                 self.store.as_ref(),
                 txn,
+                db_id,
                 &sequence_name,
                 search_path,
             )
@@ -1279,7 +1324,7 @@ impl Executor {
 
             let mut seq = self
                 .store
-                .get_sequence(txn, &resolved.full)
+                .get_sequence(txn, db_id, &resolved.full)
                 .await?
                 .ok_or_else(|| anyhow!("Sequence '{}' does not exist", resolved.full))?;
 
@@ -1289,6 +1334,7 @@ impl Executor {
                     let resolved_table = names::resolve_existing_table_name(
                         self.store.as_ref(),
                         txn,
+                        db_id,
                         &table_name,
                         search_path,
                     )
@@ -1296,7 +1342,7 @@ impl Executor {
                     .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
                     let schema = self
                         .store
-                        .get_schema(txn, &resolved_table.full)
+                        .get_schema(txn, db_id, &resolved_table.full)
                         .await?
                         .ok_or_else(|| anyhow!("Table '{}' does not exist", resolved_table.full))?;
 
@@ -1312,7 +1358,7 @@ impl Executor {
                 }
             };
 
-            self.store.update_sequence_def(txn, &seq).await?;
+            self.store.update_sequence_def(txn, db_id, &seq).await?;
             Ok(ExecuteResult::AlterSequence {
                 sequence_name: resolved.full,
             })
@@ -1342,6 +1388,7 @@ impl Executor {
             session.begin().await?;
         }
 
+        let db_id = session.current_database_id();
         let result = async {
             let (txn, _sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
@@ -1349,17 +1396,18 @@ impl Executor {
 
             match target {
                 comment_on::CommentOnTarget::Extension { name } => {
-                    if self.store.get_extension(txn, &name).await?.is_none() {
+                    if self.store.get_extension(txn, db_id, &name).await?.is_none() {
                         return Err(anyhow!("extension \"{}\" does not exist", name));
                     }
                     self.store
-                        .set_extension_comment(txn, &name, comment.as_deref())
+                        .set_extension_comment(txn, db_id, &name, comment.as_deref())
                         .await?;
                 }
                 comment_on::CommentOnTarget::Function { name } => {
                     let resolved = names::resolve_existing_function_name(
                         self.store.as_ref(),
                         txn,
+                        db_id,
                         &name,
                         search_path,
                     )
@@ -1367,13 +1415,14 @@ impl Executor {
                     .ok_or_else(|| anyhow!("Function '{}' does not exist", name))?;
 
                     self.store
-                        .set_function_comment(txn, &resolved.full, comment.as_deref())
+                        .set_function_comment(txn, db_id, &resolved.full, comment.as_deref())
                         .await?;
                 }
                 comment_on::CommentOnTarget::Table { name } => {
                     let resolved = names::resolve_existing_table_name(
                         self.store.as_ref(),
                         txn,
+                        db_id,
                         &name,
                         search_path,
                     )
@@ -1381,13 +1430,14 @@ impl Executor {
                     .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?;
 
                     self.store
-                        .set_table_comment(txn, &resolved.full, comment.as_deref())
+                        .set_table_comment(txn, db_id, &resolved.full, comment.as_deref())
                         .await?;
                 }
                 comment_on::CommentOnTarget::Column { table, column } => {
                     let resolved_table = names::resolve_existing_table_name(
                         self.store.as_ref(),
                         txn,
+                        db_id,
                         &table,
                         search_path,
                     )
@@ -1395,7 +1445,7 @@ impl Executor {
                     .ok_or_else(|| anyhow!("Table '{}' does not exist", table))?;
                     let schema = self
                         .store
-                        .get_schema(txn, &resolved_table.full)
+                        .get_schema(txn, db_id, &resolved_table.full)
                         .await?
                         .ok_or_else(|| anyhow!("Table '{}' does not exist", resolved_table.full))?;
 
@@ -1408,7 +1458,7 @@ impl Executor {
                     }
 
                     self.store
-                        .set_column_comment(txn, &resolved_table.full, &column, comment.as_deref())
+                        .set_column_comment(txn, db_id, &resolved_table.full, &column, comment.as_deref())
                         .await?;
                 }
             }
@@ -1432,6 +1482,7 @@ impl Executor {
     pub(crate) async fn execute_statement_on_txn(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         stmt: &Statement,
@@ -1449,6 +1500,7 @@ impl Executor {
                 if let Some(q) = query {
                     self.execute_create_table_as(
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         name,
@@ -1462,6 +1514,7 @@ impl Executor {
                     ddl::execute_create_table(
                         &self.store,
                         txn,
+                        db_id,
                         search_path,
                         name,
                         columns,
@@ -1487,6 +1540,7 @@ impl Executor {
                 let idx_name_str = index_name.0.last().unwrap().value.as_str();
                 self.execute_create_index(
                     txn,
+                    db_id,
                     search_path,
                     idx_name_str,
                     table_name,
@@ -1507,15 +1561,15 @@ impl Executor {
                 use sqlparser::ast::ObjectType;
                 match object_type {
                     ObjectType::Table => {
-                        ddl::execute_drop_table(&self.store, txn, search_path, names, *if_exists)
+                        ddl::execute_drop_table(&self.store, txn, db_id, search_path, names, *if_exists)
                             .await
                     }
                     ObjectType::View => {
-                        ddl::execute_drop_view(&self.store, txn, search_path, names, *if_exists)
+                        ddl::execute_drop_view(&self.store, txn, db_id, search_path, names, *if_exists)
                             .await
                     }
                     ObjectType::Index => {
-                        self.execute_drop_index(txn, search_path, names, *if_exists)
+                        self.execute_drop_index(txn, db_id, search_path, names, *if_exists)
                             .await
                     }
                     ObjectType::Role => {
@@ -1525,6 +1579,7 @@ impl Executor {
                         sequences::execute_drop_sequence(
                             &self.store,
                             txn,
+                            db_id,
                             search_path,
                             names,
                             *if_exists,
@@ -1532,20 +1587,20 @@ impl Executor {
                         .await
                     }
                     ObjectType::Schema => {
-                        self.execute_drop_schema(txn, search_path, names, *if_exists)
+                        self.execute_drop_schema(txn, db_id, search_path, names, *if_exists)
                             .await
                     }
                     _ => Ok(ExecuteResult::Empty),
                 }
             }
             Statement::Truncate { table_name, .. } => {
-                ddl::execute_truncate(&self.store, txn, search_path, table_name).await
+                ddl::execute_truncate(&self.store, txn, db_id, search_path, table_name).await
             }
             Statement::AlterTable {
                 name, operations, ..
             } => {
                 for op in operations {
-                    self.execute_alter_table(txn, search_path, name, op).await?;
+                    self.execute_alter_table(txn, db_id, search_path, name, op).await?;
                 }
                 let table_name = name.0.last().unwrap().value.clone();
                 Ok(ExecuteResult::AlterTable { table_name })
@@ -1560,6 +1615,7 @@ impl Executor {
             } => {
                 self.execute_insert(
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     table_name,
@@ -1580,6 +1636,7 @@ impl Executor {
                 let using = using.as_deref().unwrap_or(&[]);
                 self.execute_delete(
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     from,
@@ -1599,6 +1656,7 @@ impl Executor {
             } => {
                 self.execute_update(
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     table,
@@ -1610,10 +1668,10 @@ impl Executor {
                 .await
             }
             Statement::Query(query) => {
-                self.execute_query(txn, sequence_values, search_path, query)
+                self.execute_query(txn, db_id, sequence_values, search_path, query)
                     .await
             }
-            Statement::ShowTables { .. } => self.execute_show_tables(txn, search_path).await,
+            Statement::ShowTables { .. } => self.execute_show_tables(txn, db_id, search_path).await,
             Statement::SetVariable { .. }
             | Statement::SetTimeZone { .. }
             | Statement::SetNames { .. }
@@ -1622,7 +1680,7 @@ impl Executor {
                 name,
                 representation,
             } => {
-                udt::execute_create_type(&self.store, txn, search_path, name, representation).await
+                udt::execute_create_type(&self.store, txn, db_id, search_path, name, representation).await
             }
             Statement::CreateSchema {
                 schema_name,
@@ -1641,7 +1699,7 @@ impl Executor {
                     return Err(anyhow!("Invalid schema name '{}'", schema_obj));
                 }
                 self.store
-                    .create_schema(txn, &schema, *if_not_exists)
+                    .create_schema(txn, db_id, &schema, *if_not_exists)
                     .await?;
                 Ok(ExecuteResult::Empty)
             }
@@ -1649,7 +1707,7 @@ impl Executor {
             Statement::CreateProcedure {
                 name, params, body, ..
             } => {
-                self.execute_create_procedure(txn, search_path, name, params.as_deref(), body)
+                self.execute_create_procedure(txn, db_id, search_path, name, params.as_deref(), body)
                     .await
             }
             Statement::CreateSequence {
@@ -1661,6 +1719,7 @@ impl Executor {
                 sequences::execute_create_sequence(
                     &self.store,
                     txn,
+                    db_id,
                     search_path,
                     name,
                     *if_not_exists,
@@ -1678,6 +1737,7 @@ impl Executor {
                 if *materialized {
                     self.execute_create_materialized_view(
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         name,
@@ -1689,6 +1749,7 @@ impl Executor {
                     ddl::execute_create_view(
                         &self.store,
                         txn,
+                        db_id,
                         search_path,
                         name,
                         query,
@@ -1768,6 +1829,7 @@ impl Executor {
             } => {
                 self.execute_explain(
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     statement,
@@ -1787,6 +1849,7 @@ impl Executor {
                     let resolved = names::resolve_existing_function_name(
                         self.store.as_ref(),
                         txn,
+                        db_id,
                         func_name,
                         search_path,
                     )
@@ -1796,7 +1859,7 @@ impl Executor {
                         None => names::resolve_ddl_object_name(func_name, search_path)?.full,
                     };
                     last_name = Some(func_full_name.clone());
-                    let dropped = self.store.drop_function(txn, &func_full_name).await?;
+                    let dropped = self.store.drop_function(txn, db_id, &func_full_name).await?;
                     if !dropped && !if_exists {
                         return Err(anyhow!("Function '{}' does not exist", func_full_name));
                     }
@@ -1812,6 +1875,7 @@ impl Executor {
     pub(crate) async fn eval_expr_maybe_sequence(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         expr: &Expr,
@@ -1822,6 +1886,7 @@ impl Executor {
             sequences::eval_expr_with_sequences(
                 &self.store,
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 expr,
@@ -1837,6 +1902,7 @@ impl Executor {
     pub(crate) async fn eval_expr_join_maybe_sequence(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         expr: &Expr,
@@ -1846,6 +1912,7 @@ impl Executor {
             sequences::eval_expr_join_with_sequences(
                 &self.store,
                 txn,
+                db_id,
                 sequence_values,
                 search_path,
                 expr,
@@ -1860,6 +1927,7 @@ impl Executor {
     pub(crate) fn eval_scalar_subquery_in_join<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        db_id: u64,
         sequence_values: &'a mut HashMap<String, i64>,
         search_path: &'a [String],
         subquery: &'a Query,
@@ -1875,6 +1943,7 @@ impl Executor {
             let result = self
                 .execute_query_with_outer_ctes(
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     &substituted_query,
@@ -1899,20 +1968,22 @@ impl Executor {
     pub(crate) async fn execute_query(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         query: &Query,
     ) -> Result<ExecuteResult> {
         let ctes = self
-            .build_cte_context(txn, sequence_values, search_path, query)
+            .build_cte_context(txn, db_id, sequence_values, search_path, query)
             .await?;
-        self.execute_query_with_ctes(txn, sequence_values, search_path, query, &ctes)
+        self.execute_query_with_ctes(txn, db_id, sequence_values, search_path, query, &ctes)
             .await
     }
 
     pub(crate) async fn execute_tableless_query(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         select: &sqlparser::ast::Select,
@@ -1964,6 +2035,7 @@ impl Executor {
         async fn try_pg_sleep(
             store: &Arc<TikvStore>,
             txn: &mut Transaction,
+            db_id: u64,
             sequence_values: &mut HashMap<String, i64>,
             search_path: &[String],
             expr: &Expr,
@@ -1986,6 +2058,7 @@ impl Executor {
                 sequences::eval_expr_with_sequences(
                     store,
                     txn,
+                    db_id,
                     sequence_values,
                     search_path,
                     arg_expr,
@@ -2016,7 +2089,14 @@ impl Executor {
         }
 
         let resolved_projection = self
-            .resolve_projection_subqueries(txn, sequence_values, search_path, &select.projection, ctes)
+            .resolve_projection_subqueries(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                &select.projection,
+                ctes,
+            )
             .await?;
 
         let mut cols = Vec::new();
@@ -2028,7 +2108,8 @@ impl Executor {
                 SelectItem::UnnamedExpr(expr) => {
                     cols.push(get_expr_name(expr));
                     if let Some(val) =
-                        try_pg_sleep(&self.store, txn, sequence_values, search_path, expr).await?
+                        try_pg_sleep(&self.store, txn, db_id, sequence_values, search_path, expr)
+                            .await?
                     {
                         values.push(val);
                         continue;
@@ -2048,6 +2129,7 @@ impl Executor {
                                     match sequences::eval_expr_with_sequences(
                                         &self.store,
                                         txn,
+                                        db_id,
                                         sequence_values,
                                         search_path,
                                         arg_expr,
@@ -2085,6 +2167,7 @@ impl Executor {
                                 let source_val = sequences::eval_expr_with_sequences(
                                     &self.store,
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     arg0,
@@ -2100,6 +2183,7 @@ impl Executor {
                                 let pattern_val = sequences::eval_expr_with_sequences(
                                     &self.store,
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     arg1,
@@ -2118,6 +2202,7 @@ impl Executor {
                                         match sequences::eval_expr_with_sequences(
                                             &self.store,
                                             txn,
+                                            db_id,
                                             sequence_values,
                                             search_path,
                                             arg2,
@@ -2177,6 +2262,7 @@ impl Executor {
                                 let source_val = sequences::eval_expr_with_sequences(
                                     &self.store,
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     arg0,
@@ -2192,6 +2278,7 @@ impl Executor {
                                 let pattern_val = sequences::eval_expr_with_sequences(
                                     &self.store,
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     arg1,
@@ -2210,6 +2297,7 @@ impl Executor {
                                         match sequences::eval_expr_with_sequences(
                                             &self.store,
                                             txn,
+                                            db_id,
                                             sequence_values,
                                             search_path,
                                             arg2,
@@ -2252,6 +2340,7 @@ impl Executor {
                                 match sequences::eval_expr_with_sequences(
                                     &self.store,
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     expr,
@@ -2273,6 +2362,7 @@ impl Executor {
                         let val = sequences::eval_expr_with_sequences(
                             &self.store,
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             expr,
@@ -2286,7 +2376,8 @@ impl Executor {
                 SelectItem::ExprWithAlias { expr, alias } => {
                     cols.push(alias.value.clone());
                     if let Some(val) =
-                        try_pg_sleep(&self.store, txn, sequence_values, search_path, expr).await?
+                        try_pg_sleep(&self.store, txn, db_id, sequence_values, search_path, expr)
+                            .await?
                     {
                         values.push(val);
                         continue;
@@ -2306,6 +2397,7 @@ impl Executor {
                                     match sequences::eval_expr_with_sequences(
                                         &self.store,
                                         txn,
+                                        db_id,
                                         sequence_values,
                                         search_path,
                                         arg_expr,
@@ -2343,6 +2435,7 @@ impl Executor {
                                 let source_val = sequences::eval_expr_with_sequences(
                                     &self.store,
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     arg0,
@@ -2358,6 +2451,7 @@ impl Executor {
                                 let pattern_val = sequences::eval_expr_with_sequences(
                                     &self.store,
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     arg1,
@@ -2376,6 +2470,7 @@ impl Executor {
                                         match sequences::eval_expr_with_sequences(
                                             &self.store,
                                             txn,
+                                            db_id,
                                             sequence_values,
                                             search_path,
                                             arg2,
@@ -2435,6 +2530,7 @@ impl Executor {
                                 let source_val = sequences::eval_expr_with_sequences(
                                     &self.store,
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     arg0,
@@ -2450,6 +2546,7 @@ impl Executor {
                                 let pattern_val = sequences::eval_expr_with_sequences(
                                     &self.store,
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     arg1,
@@ -2468,6 +2565,7 @@ impl Executor {
                                         match sequences::eval_expr_with_sequences(
                                             &self.store,
                                             txn,
+                                            db_id,
                                             sequence_values,
                                             search_path,
                                             arg2,
@@ -2510,6 +2608,7 @@ impl Executor {
                                 match sequences::eval_expr_with_sequences(
                                     &self.store,
                                     txn,
+                                    db_id,
                                     sequence_values,
                                     search_path,
                                     expr,
@@ -2531,6 +2630,7 @@ impl Executor {
                         let val = sequences::eval_expr_with_sequences(
                             &self.store,
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             expr,
@@ -2599,6 +2699,7 @@ impl Executor {
     pub(crate) fn execute_set_operation<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        db_id: u64,
         sequence_values: &'a mut HashMap<String, i64>,
         search_path: &'a [String],
         op: &'a SetOperator,
@@ -2610,10 +2711,10 @@ impl Executor {
     {
         Box::pin(async move {
             let left_result = self
-                .execute_set_expr(txn, sequence_values, search_path, left, ctes)
+                .execute_set_expr(txn, db_id, sequence_values, search_path, left, ctes)
                 .await?;
             let right_result = self
-                .execute_set_expr(txn, sequence_values, search_path, right, ctes)
+                .execute_set_expr(txn, db_id, sequence_values, search_path, right, ctes)
                 .await?;
 
             let (left_cols, left_rows) = match left_result {
@@ -2655,6 +2756,7 @@ impl Executor {
     fn execute_set_expr<'a>(
         &'a self,
         txn: &'a mut Transaction,
+        db_id: u64,
         sequence_values: &'a mut HashMap<String, i64>,
         search_path: &'a [String],
         expr: &'a SetExpr,
@@ -2675,7 +2777,7 @@ impl Executor {
                         limit_by: vec![],
                         for_clause: None,
                     };
-                    self.execute_query_with_ctes(txn, sequence_values, search_path, &query, ctes)
+                    self.execute_query_with_ctes(txn, db_id, sequence_values, search_path, &query, ctes)
                         .await
                 }
                 SetExpr::SetOperation {
@@ -2686,6 +2788,7 @@ impl Executor {
                 } => {
                     self.execute_set_operation(
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         op,
@@ -2704,6 +2807,7 @@ impl Executor {
     async fn execute_drop_schema(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         _search_path: &[String],
         names: &[sqlparser::ast::ObjectName],
         if_exists: bool,
@@ -2714,7 +2818,7 @@ impl Executor {
                 return Err(anyhow!("Invalid schema name '{}'", name));
             }
             self.store
-                .drop_schema_restrict(txn, &schema, if_exists)
+                .drop_schema_restrict(txn, db_id, &schema, if_exists)
                 .await?;
         }
         Ok(ExecuteResult::Empty)
@@ -2722,11 +2826,12 @@ impl Executor {
     async fn execute_show_tables(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         search_path: &[String],
     ) -> Result<ExecuteResult> {
         let current_schema = names::default_schema(search_path);
         let mut tables = Vec::new();
-        for full_name in self.store.list_tables(txn).await? {
+        for full_name in self.store.list_tables(txn, db_id).await? {
             match names::parse_full_name(&full_name) {
                 Ok((schema, name)) => {
                     if schema == current_schema {
@@ -2742,6 +2847,7 @@ impl Executor {
     async fn execute_explain(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         statement: &Statement,
@@ -2753,7 +2859,7 @@ impl Executor {
                 Statement::Query(query) => {
                     let start = Instant::now();
                     let result = self
-                        .execute_query(txn, sequence_values, search_path, query)
+                        .execute_query(txn, db_id, sequence_values, search_path, query)
                         .await?;
                     let elapsed = start.elapsed();
                     let actual_rows = match result {
@@ -2772,11 +2878,11 @@ impl Executor {
             (None, None)
         };
 
-        let tables = self.store.list_tables(txn).await?;
+        let tables = self.store.list_tables(txn, db_id).await?;
         let mut schemas_by_full: HashMap<String, TableSchema> = HashMap::new();
         let mut schemas_by_short: HashMap<String, Option<TableSchema>> = HashMap::new();
         for table_name in &tables {
-            if let Ok(Some(schema)) = self.store.get_schema(txn, table_name).await {
+            if let Ok(Some(schema)) = self.store.get_schema(txn, db_id, table_name).await {
                 schemas_by_full.insert(table_name.clone(), schema.clone());
 
                 // EXPLAIN queries often refer to tables without schema qualification.
@@ -2835,10 +2941,11 @@ impl Executor {
     pub(crate) async fn scan_and_fill(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         table_name: &str,
         schema: &TableSchema,
     ) -> Result<Vec<Row>> {
-        let rows = self.store.scan(txn, table_name).await?;
+        let rows = self.store.scan(txn, db_id, table_name).await?;
         let mut filled_rows = Vec::with_capacity(rows.len());
         for mut row in rows {
             fill_row_defaults(&mut row, schema)?;
@@ -2864,10 +2971,11 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let txn = session.get_mut_txn().expect("Transaction must be active");
             let schema = self
                 .store
-                .get_schema(txn, table_name)
+                .get_schema(txn, db_id, table_name)
                 .await?
                 .ok_or_else(|| anyhow!("Table '{}' not found", table_name))?;
 
@@ -2882,8 +2990,14 @@ impl Executor {
             for (i, col) in schema.columns.iter().enumerate() {
                 if matches!(row_values[i], Value::Null) {
                     if col.is_serial {
-                        let next_id = self.store.next_sequence_value(txn, schema.table_id).await?;
-                        row_values[i] = Value::Int32(next_id);
+                        let next_id = self
+                            .store
+                            .next_sequence_value(txn, db_id, schema.table_id)
+                            .await?;
+                        row_values[i] = match col.data_type {
+                            DataType::Int64 => Value::Int64(next_id as i64),
+                            _ => Value::Int32(next_id),
+                        };
                     } else if let Some(ref default_expr) = col.default_expr {
                         row_values[i] = eval_default_expr(default_expr)?;
                     }
@@ -2893,7 +3007,7 @@ impl Executor {
             let mut row = Row { values: row_values };
             fill_row_defaults(&mut row, &schema)?;
 
-            self.store.insert(txn, &schema.name, row.clone()).await?;
+            self.store.insert(txn, db_id, &schema.name, row.clone()).await?;
 
             let pk_values = schema.get_pk_values(&row);
             for index in &schema.indexes {
@@ -2901,6 +3015,7 @@ impl Executor {
                 self.store
                     .create_index_entry(
                         txn,
+                        db_id,
                         schema.table_id,
                         index.id,
                         &idx_values,

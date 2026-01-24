@@ -272,8 +272,9 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let txn: &mut Transaction = session.get_mut_txn().expect("Transaction must be active");
-            udt::create_enum_type(&self.store(), txn, schema, name, labels).await
+            udt::create_enum_type(&self.store(), txn, db_id, schema, name, labels).await
         }
         .await;
 
@@ -325,8 +326,9 @@ impl Executor {
         }
 
         let result = async {
+            let db_id = session.current_database_id();
             let txn: &mut Transaction = session.get_mut_txn().expect("Transaction must be active");
-            udt::drop_types(&self.store(), txn, &full_names, if_exists).await
+            udt::drop_types(&self.store(), txn, db_id, &full_names, if_exists).await
         }
         .await;
 

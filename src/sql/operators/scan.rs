@@ -56,7 +56,7 @@ impl PhysicalOperator for TableScanOperator {
 
         if !self.preloaded {
             self.buffer.clear();
-            let rows = ctx.store.scan(ctx.txn, &self.schema.name).await?;
+            let rows = ctx.store.scan(ctx.txn, ctx.db_id, &self.schema.name).await?;
             self.buffer = rows
                 .into_iter()
                 .map(|r| fill_row_defaults_scan(r, &self.schema))
@@ -174,6 +174,7 @@ impl PhysicalOperator for IndexScanOperator {
             ctx.store
                 .scan_index_prefix(
                     ctx.txn,
+                    ctx.db_id,
                     self.schema.table_id,
                     self.index_id,
                     &self.lookup_values,
@@ -186,6 +187,7 @@ impl PhysicalOperator for IndexScanOperator {
             ctx.store
                 .scan_index(
                     ctx.txn,
+                    ctx.db_id,
                     self.schema.table_id,
                     self.index_id,
                     &self.lookup_values,
@@ -197,7 +199,7 @@ impl PhysicalOperator for IndexScanOperator {
 
         let rows = ctx
             .store
-            .batch_get_rows(ctx.txn, self.schema.table_id, pks, &self.schema)
+            .batch_get_rows(ctx.txn, ctx.db_id, self.schema.table_id, pks, &self.schema)
             .await?;
 
         self.buffer = rows

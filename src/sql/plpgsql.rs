@@ -470,6 +470,7 @@ fn find_if_blocks(s: &str) -> Result<(&str, &str, &str)> {
 pub fn execute_plpgsql_function<'a>(
     store: &'a Arc<TikvStore>,
     txn: &'a mut Transaction,
+    db_id: u64,
     sequence_values: &'a mut HashMap<String, i64>,
     search_path: &'a [String],
     func_def: &'a FunctionDef,
@@ -503,7 +504,7 @@ pub fn execute_plpgsql_function<'a>(
         }
         for (name, default_expr) in var_defaults {
             let value = if let Some(expr_str) = default_expr {
-                evaluate_expression(store, txn, sequence_values, search_path, &ctx, &expr_str)
+                evaluate_expression(store, txn, db_id, sequence_values, search_path, &ctx, &expr_str)
                     .await?
             } else {
                 Value::Null
@@ -515,6 +516,7 @@ pub fn execute_plpgsql_function<'a>(
         execute_statements(
             store,
             txn,
+            db_id,
             sequence_values,
             search_path,
             &mut ctx,
@@ -561,6 +563,7 @@ fn is_type_keyword(s: &str) -> bool {
 fn execute_statements<'a>(
     store: &'a Arc<TikvStore>,
     txn: &'a mut Transaction,
+    db_id: u64,
     sequence_values: &'a mut HashMap<String, i64>,
     search_path: &'a [String],
     ctx: &'a mut PlpgsqlContext,
@@ -576,6 +579,7 @@ fn execute_statements<'a>(
                     return evaluate_expression(
                         store,
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         ctx,
@@ -588,6 +592,7 @@ fn execute_statements<'a>(
                     let value = evaluate_expression(
                         store,
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         ctx,
@@ -601,6 +606,7 @@ fn execute_statements<'a>(
                     let cond_value = evaluate_expression(
                         store,
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         ctx,
@@ -619,6 +625,7 @@ fn execute_statements<'a>(
                         let result = execute_statements(
                             store,
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             ctx,
@@ -636,6 +643,7 @@ fn execute_statements<'a>(
                         let result = execute_statements(
                             store,
                             txn,
+                            db_id,
                             sequence_values,
                             search_path,
                             ctx,
@@ -755,6 +763,7 @@ fn is_ident_char(b: u8) -> bool {
 async fn evaluate_expression(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     ctx: &PlpgsqlContext,
@@ -771,6 +780,7 @@ async fn evaluate_expression(
                     return sequences::eval_expr_with_sequences(
                         store,
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         &expr,
@@ -789,6 +799,7 @@ async fn evaluate_expression(
 pub async fn try_execute_user_function(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     func_name: &str,
@@ -796,17 +807,18 @@ pub async fn try_execute_user_function(
 ) -> Result<Option<Value>> {
     let func_obj = names::object_name_from_str(func_name)?;
     let resolved =
-        names::resolve_existing_function_name(store.as_ref(), txn, &func_obj, search_path).await?;
+        names::resolve_existing_function_name(store.as_ref(), txn, db_id, &func_obj, search_path).await?;
 
     let full_name = match resolved {
         Some(r) => r.full,
         None => {
             for schema in search_path {
                 let full = format!("{}.{}", schema, func_name.to_lowercase());
-                if store.get_function(txn, &full).await?.is_some() {
+                if store.get_function(txn, db_id, &full).await?.is_some() {
                     return execute_user_function_by_name(
                         store,
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         &full,
@@ -820,7 +832,7 @@ pub async fn try_execute_user_function(
         }
     };
 
-    execute_user_function_by_name(store, txn, sequence_values, search_path, &full_name, args)
+    execute_user_function_by_name(store, txn, db_id, sequence_values, search_path, &full_name, args)
         .await
         .map(Some)
 }
@@ -828,13 +840,14 @@ pub async fn try_execute_user_function(
 async fn execute_user_function_by_name(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     full_name: &str,
     args: Vec<Value>,
 ) -> Result<Value> {
     let func_def = store
-        .get_function(txn, full_name)
+        .get_function(txn, db_id, full_name)
         .await?
         .ok_or_else(|| anyhow!("Function '{}' does not exist", full_name))?;
 
@@ -847,16 +860,17 @@ async fn execute_user_function_by_name(
     }
 
     if lang == "sql" {
-        return execute_sql_function(store, txn, sequence_values, search_path, &func_def, args)
+        return execute_sql_function(store, txn, db_id, sequence_values, search_path, &func_def, args)
             .await;
     }
 
-    execute_plpgsql_function(store, txn, sequence_values, search_path, &func_def, args).await
+    execute_plpgsql_function(store, txn, db_id, sequence_values, search_path, &func_def, args).await
 }
 
 async fn execute_sql_function(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
+    db_id: u64,
     sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     func_def: &FunctionDef,
@@ -896,6 +910,7 @@ async fn execute_sql_function(
                     return sequences::eval_expr_with_sequences(
                         store,
                         txn,
+                        db_id,
                         sequence_values,
                         search_path,
                         &expr,

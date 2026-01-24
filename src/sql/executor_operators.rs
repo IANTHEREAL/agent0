@@ -374,6 +374,7 @@ impl Executor {
     pub(crate) async fn execute_aggregate_with_operators(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         schema: TableSchema,
@@ -408,6 +409,7 @@ impl Executor {
             &mut root,
             txn,
             self.store(),
+            db_id,
             search_path,
             sequence_values,
         )
@@ -582,6 +584,7 @@ impl Executor {
     pub(crate) async fn execute_join_with_operators(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         left_schema: TableSchema,
@@ -661,6 +664,7 @@ impl Executor {
             &mut root,
             txn,
             self.store(),
+            db_id,
             search_path,
             sequence_values,
         )
@@ -710,6 +714,7 @@ impl Executor {
     pub(crate) async fn execute_with_operators(
         &self,
         txn: &mut Transaction,
+        db_id: u64,
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         schema: TableSchema,
@@ -735,6 +740,7 @@ impl Executor {
             &mut operator,
             txn,
             self.store(),
+            db_id,
             search_path,
             sequence_values,
         )
