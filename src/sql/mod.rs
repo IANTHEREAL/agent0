@@ -32,6 +32,7 @@ mod trigger_queue;
 pub(crate) mod trigger_worker;
 mod udt;
 mod window;
+pub mod types;
 
 pub use executor::*;
 pub use parser::*;

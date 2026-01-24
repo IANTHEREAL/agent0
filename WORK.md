@@ -345,3 +345,57 @@ Operators use `eval_expr()` from `src/sql/expr.rs`. This is shared with the curr
 ### Schema Handling
 
 Each operator exposes `schema()` which returns the output schema. This is used by parent operators to know column types and names.
+
+---
+
+# Type Inference System Refactoring
+
+**Started:** 2026-01-24
+**Status:** ✅ COMPLETE
+
+## Overview
+
+Replaced the 350+ line monolithic `infer_expr_type()` function in `helpers.rs` with a modular, extensible type inference system in `src/sql/types/`.
+
+## New Module Structure
+
+```
+src/sql/types/
+├── mod.rs        # Module exports + compatibility API
+├── error.rs      # TypeError enum (column not found, ambiguous, mismatches)
+├── context.rs    # TypeContext for multi-table column resolution
+├── registry.rs   # FunctionRegistry with 150+ PostgreSQL function signatures
+├── coercion.rs   # Type coercion rules (numeric promotion, common_type)
+├── infer.rs      # TypeInferrer core logic
+└── tests.rs      # Unit tests
+```
+
+## Key Design Decisions
+
+1. **Backward compatible**: Old `infer_expr_type(expr, schema)` signature preserved as wrapper in `helpers.rs`
+2. **Fallback to Text**: Unknown expressions return `DataType::Text` (matches old behavior)
+3. **Global function registry**: Uses `OnceLock` singleton with 150+ function signatures
+4. **Fast path optimization**: Single-table queries skip hash lookups in TypeContext
+5. **Multi-table support**: TypeContext handles JOIN scenarios with ambiguous column detection
+
+## Test Results
+
+- Unit tests: 517 passed
+- Integration tests: 107 passed
+- ORM tests: 584 passed
+
+## Files Changed
+
+| File | Change |
+|------|--------|
+| `src/sql/types/*.rs` | New module (7 files) |
+| `src/sql/mod.rs` | Added `pub mod types;` |
+| `src/sql/helpers.rs` | Replaced `infer_expr_type` with delegation to new module |
+
+## Lessons Learned
+
+1. **Keep compatibility wrappers thin**: The old `infer_expr_type(expr, schema)` signature is preserved as a 3-line wrapper that creates a TypeContext and TypeInferrer internally.
+
+2. **Use `#[cfg(test)]` for test-only exports**: Helper functions like `global_registry`, `unify_types`, `binary_op_result_type` are only needed by tests, so export them conditionally.
+
+3. **Suppress dead code warnings for future-ready code**: The `TypeError` enum variants and `ReturnType::NumericPromotion` are prepared for future error handling but not yet used.

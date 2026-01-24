@@ -435,3 +435,13 @@ cd orm-tests && npm test -- --grep "TypeORM"
 - Match aggregates by function name AND arguments: `COUNT(*)` and `COUNT(id)` are different. Compare function name, stringified arguments, and DISTINCT flag.
 - For DISTINCT queries, operator ordering is critical: `Scan → Project → Distinct → Sort → Limit`. Applying DISTINCT to full table rows (before projection) fails when the table has a primary key - all rows appear unique. Use `ProjectOperator` to narrow columns BEFORE `DistinctOperator`.
 - See `WORK.md` for detailed Volcano refactoring progress and per-phase lessons.
+
+## Lessons Learned (Type Inference Refactoring)
+
+- Modular type systems should expose a **compatibility wrapper** that matches the old API signature. The new `src/sql/types/` module exports `infer_expr_type(expr, schema)` that internally creates `TypeContext::single(schema)` and `TypeInferrer::new(ctx)`.
+- Use `OnceLock` for global registries (like `FunctionRegistry` with 150+ function signatures) to avoid repeated initialization.
+- For multi-table (JOIN) scenarios, `TypeContext::join(left_alias, left, right_alias, right)` builds a column index that detects **ambiguous columns** (same name in multiple tables) and returns proper errors.
+- When handling `CompoundIdentifier` (e.g., `table.column`), try multiple resolution strategies in order: (1) full name as single column, (2) qualified lookup, (3) last identifier only. This handles both JOIN schemas with "table.col" column names and regular qualified references.
+- Type coercion rules (`unify_types`, `common_type`, `binary_op_result_type`) should be in a separate module (`coercion.rs`) for reuse in expression evaluation.
+- Function signatures should capture: min/max args, return type resolution strategy (fixed, same-as-arg, first-non-null, custom), and flags for aggregate/window functions.
+- Use `#[cfg(test)]` for re-exporting internal helpers (`global_registry`, `unify_types`) that are only needed by unit tests.
