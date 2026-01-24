@@ -49,19 +49,33 @@ impl std::fmt::Display for StatementTimeoutError {
 impl std::error::Error for StatementTimeoutError {}
 
 fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
-    fn contains_pessimistic_retry(err: &tikv_client::Error) -> bool {
-        const WRITE_CONFLICT_REASON_PESSIMISTIC_RETRY: i32 = 2;
+    fn contains_write_conflict(err: &tikv_client::Error) -> bool {
+        // Retry on ANY WriteConflict, not just PessimisticRetry.
+        // This emulates PostgreSQL's row-lock wait behavior: when concurrent
+        // transactions UPDATE the same row, the second should wait and retry
+        // rather than immediately failing.
+        //
+        // WriteConflict reasons (from kvrpcpb.proto):
+        //   0 = Unknown
+        //   1 = Optimistic (optimistic txn conflict)
+        //   2 = PessimisticRetry (lock wait wakeup or newer version)
+        //   3 = SelfRolledBack (txn rolled back during prewrite)
+        //   4 = RcCheckTs (RC isolation check failure)
+        //   5 = LazyUniquenessCheck (pessimistic unique constraint)
+        //
+        // We retry all of these to maximize compatibility with PostgreSQL
+        // semantics where concurrent UPDATEs on the same row succeed
+        // (second waits for first to commit).
         match err {
-            tikv_client::Error::PessimisticLockError { inner, .. } => contains_pessimistic_retry(inner),
-            tikv_client::Error::UndeterminedError(inner) => contains_pessimistic_retry(inner),
+            tikv_client::Error::PessimisticLockError { inner, .. } => {
+                contains_write_conflict(inner)
+            }
+            tikv_client::Error::UndeterminedError(inner) => contains_write_conflict(inner),
             tikv_client::Error::ExtractedErrors(errors)
             | tikv_client::Error::MultipleKeyErrors(errors) => {
-                errors.iter().any(contains_pessimistic_retry)
+                errors.iter().any(contains_write_conflict)
             }
-            tikv_client::Error::KeyError(key_error) => key_error
-                .conflict
-                .as_ref()
-                .is_some_and(|conflict| conflict.reason == WRITE_CONFLICT_REASON_PESSIMISTIC_RETRY),
+            tikv_client::Error::KeyError(key_error) => key_error.conflict.is_some(),
             _ => false,
         }
     }
@@ -69,7 +83,7 @@ fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         cause
             .downcast_ref::<tikv_client::Error>()
-            .is_some_and(contains_pessimistic_retry)
+            .is_some_and(contains_write_conflict)
     })
 }
 
@@ -1013,7 +1027,8 @@ impl Executor {
                                 let is_autocommit = !session.is_in_transaction();
                                 let db_id = session.current_database_id();
 
-                                let max_attempts = if is_autocommit { 3usize } else { 1usize };
+                                // Retry up to 10 times for autocommit to handle concurrent conflicts
+                                let max_attempts = if is_autocommit { 10usize } else { 1usize };
 
                                 for attempt in 0..max_attempts {
                                     if is_autocommit {
@@ -1084,8 +1099,10 @@ impl Executor {
                                                 let should_retry = attempt + 1 < max_attempts
                                                     && is_retryable_tikv_error(&err);
                                                 if should_retry {
-                                                    let backoff_ms =
-                                                        10u64.saturating_mul(1u64 << attempt.min(8));
+                                                    // Exponential backoff with jitter to reduce contention
+                                                    let base_ms = 5u64.saturating_mul(1u64 << attempt.min(6));
+                                                    let jitter_ms = rand::random::<u64>() % (base_ms + 1);
+                                                    let backoff_ms = base_ms + jitter_ms;
                                                     tokio::time::sleep(Duration::from_millis(backoff_ms))
                                                         .await;
                                                     continue;
@@ -3176,5 +3193,84 @@ mod tests {
         let v = cast_current_setting_value(Value::Text("160000".to_string()), &crate::types::DataType::Int32)
             .unwrap();
         assert_eq!(v, Value::Int32(160000));
+    }
+
+    mod write_conflict_retry_tests {
+        use super::super::is_retryable_tikv_error;
+
+        #[test]
+        fn test_unrelated_tikv_error_not_retryable() {
+            let tikv_err = tikv_client::Error::DuplicateKeyInsertion;
+            let anyhow_err = anyhow::Error::new(tikv_err);
+            assert!(!is_retryable_tikv_error(&anyhow_err));
+        }
+
+        #[test]
+        fn test_non_tikv_error_not_retryable() {
+            let anyhow_err = anyhow::anyhow!("some random error");
+            assert!(!is_retryable_tikv_error(&anyhow_err));
+        }
+
+        #[test]
+        fn test_region_error_not_retryable() {
+            let tikv_err = tikv_client::Error::RegionForKeyNotFound { key: vec![1, 2, 3] };
+            let anyhow_err = anyhow::Error::new(tikv_err);
+            assert!(!is_retryable_tikv_error(&anyhow_err));
+        }
+
+        #[test]
+        fn test_operation_after_commit_not_retryable() {
+            let tikv_err = tikv_client::Error::OperationAfterCommitError;
+            let anyhow_err = anyhow::Error::new(tikv_err);
+            assert!(!is_retryable_tikv_error(&anyhow_err));
+        }
+
+        #[test]
+        fn test_pessimistic_lock_with_non_conflict_inner_not_retryable() {
+            let inner_err = tikv_client::Error::DuplicateKeyInsertion;
+            let tikv_err = tikv_client::Error::PessimisticLockError {
+                inner: Box::new(inner_err),
+                success_keys: vec![],
+            };
+            let anyhow_err = anyhow::Error::new(tikv_err);
+            assert!(!is_retryable_tikv_error(&anyhow_err));
+        }
+
+        #[test]
+        fn test_undetermined_with_non_conflict_inner_not_retryable() {
+            let inner_err = tikv_client::Error::DuplicateKeyInsertion;
+            let tikv_err = tikv_client::Error::UndeterminedError(Box::new(inner_err));
+            let anyhow_err = anyhow::Error::new(tikv_err);
+            assert!(!is_retryable_tikv_error(&anyhow_err));
+        }
+
+        #[test]
+        fn test_multiple_key_errors_all_non_conflict_not_retryable() {
+            let err1 = tikv_client::Error::DuplicateKeyInsertion;
+            let err2 = tikv_client::Error::NoPrimaryKey;
+            let tikv_err = tikv_client::Error::MultipleKeyErrors(vec![err1, err2]);
+            let anyhow_err = anyhow::Error::new(tikv_err);
+            assert!(!is_retryable_tikv_error(&anyhow_err));
+        }
+
+        #[test]
+        fn test_extracted_errors_all_non_conflict_not_retryable() {
+            let err1 = tikv_client::Error::DuplicateKeyInsertion;
+            let tikv_err = tikv_client::Error::ExtractedErrors(vec![err1]);
+            let anyhow_err = anyhow::Error::new(tikv_err);
+            assert!(!is_retryable_tikv_error(&anyhow_err));
+        }
+
+        #[test]
+        fn test_nested_pessimistic_with_non_conflict_not_retryable() {
+            let inner_err = tikv_client::Error::NoPrimaryKey;
+            let multi_err = tikv_client::Error::MultipleKeyErrors(vec![inner_err]);
+            let pessimistic_err = tikv_client::Error::PessimisticLockError {
+                inner: Box::new(multi_err),
+                success_keys: vec![],
+            };
+            let anyhow_err = anyhow::Error::new(pessimistic_err);
+            assert!(!is_retryable_tikv_error(&anyhow_err));
+        }
     }
 }

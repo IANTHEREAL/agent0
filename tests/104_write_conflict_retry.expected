@@ -1,0 +1,23 @@
+counter
+1
+(1 row)
+counter
+4
+(1 row)
+counter
+4
+(1 row)
+counter
+14
+(1 row)
+counter
+14
+(1 row)
+counter
+14
+(1 row)
+id|counter
+1|14
+2|101
+3|200
+(3 rows)
