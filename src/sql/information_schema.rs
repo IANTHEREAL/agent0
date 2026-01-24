@@ -963,6 +963,35 @@ fn pg_depend_schema() -> TableSchema {
     }
 }
 
+fn pg_roles_schema() -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: "pg_roles".to_string(),
+        columns: vec![
+            text_col("rolname"),
+            bool_col("rolsuper"),
+            bool_col("rolinherit"),
+            bool_col("rolcreaterole"),
+            bool_col("rolcreatedb"),
+            bool_col("rolcanlogin"),
+            bool_col("rolreplication"),
+            int_col("rolconnlimit"),
+            text_col("rolpassword"),
+            text_col("rolvaliduntil"),
+            bool_col("rolbypassrls"),
+            text_col("rolconfig"),
+            int_col("oid"),
+        ],
+        version: 1,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+    }
+}
+
 pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
     let lower = table_name.to_lowercase();
     let name = lower
@@ -1002,6 +1031,7 @@ pub fn get_information_schema_schema(table_name: &str) -> Option<TableSchema> {
         "pg_depend" => Some(pg_depend_schema()),
         "pg_indexes" => Some(pg_indexes_schema()),
         "pg_collation" => Some(pg_collation_schema()),
+        "pg_roles" => Some(pg_roles_schema()),
         _ => None,
     }
 }
@@ -1178,7 +1208,7 @@ pub async fn get_information_schema_data_filtered(
         name,
         "schemata" | "pg_namespace" | "pg_type" | "pg_proc" | "pg_extension" | "pg_enum"
             | "pg_range" | "pg_collation" | "pg_am" | "pg_sequence" | "pg_depend" | "pg_views"
-            | "sequences" | "routines" | "pg_description" | "pg_database"
+            | "sequences" | "routines" | "pg_description" | "pg_database" | "pg_roles"
     );
 
     let user_tables = if needs_tables {
@@ -1237,6 +1267,7 @@ pub async fn get_information_schema_data_filtered(
         "pg_depend" => get_pg_depend_rows(store, txn, db_id).await?,
         "pg_indexes" => get_pg_indexes_rows(store, txn, db_id, &user_tables).await?,
         "pg_collation" => get_pg_collation_rows(&schema_oids),
+        "pg_roles" => get_pg_roles_rows(),
         _ => vec![],
     };
 
@@ -2401,6 +2432,26 @@ fn get_pg_collation_rows(schema_oids: &HashMap<String, u32>) -> Vec<Row> {
             null_val(),
             null_val(),
             null_val(),
+        ]),
+    ]
+}
+
+fn get_pg_roles_rows() -> Vec<Row> {
+    vec![
+        Row::new(vec![
+            text_val("postgres"),
+            Value::Boolean(true),  // rolsuper
+            Value::Boolean(true),  // rolinherit
+            Value::Boolean(true),  // rolcreaterole
+            Value::Boolean(true),  // rolcreatedb
+            Value::Boolean(true),  // rolcanlogin
+            Value::Boolean(false), // rolreplication
+            int_val(-1),           // rolconnlimit
+            null_val(),            // rolpassword (always null in pg_roles)
+            null_val(),            // rolvaliduntil
+            Value::Boolean(false), // rolbypassrls
+            null_val(),            // rolconfig
+            int_val(10),           // oid
         ]),
     ]
 }
