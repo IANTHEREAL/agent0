@@ -1,10 +1,10 @@
 //! Subquery resolution for the SQL executor
 
-use super::executor::Executor;
-use super::helpers::{
+use super::core::Executor;
+use super::super::helpers::{
     query_has_outer_reference, substitute_outer_values_in_query, value_to_sql_expr,
 };
-use super::ExecuteResult;
+use super::super::ExecuteResult;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{BinaryOperator, Expr, Query, SelectItem, Value as SqlValue};
@@ -308,7 +308,7 @@ impl Executor {
         for item in projection {
             let resolved_item = match item {
                 SelectItem::UnnamedExpr(e) => {
-                    if super::helpers::expr_has_any_outer_reference(e, outer_aliases) {
+                    if super::super::helpers::expr_has_any_outer_reference(e, outer_aliases) {
                         SelectItem::UnnamedExpr(e.clone())
                     } else {
                         SelectItem::UnnamedExpr(
@@ -318,7 +318,7 @@ impl Executor {
                     }
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
-                    if super::helpers::expr_has_any_outer_reference(expr, outer_aliases) {
+                    if super::super::helpers::expr_has_any_outer_reference(expr, outer_aliases) {
                         SelectItem::ExprWithAlias {
                             expr: expr.clone(),
                             alias: alias.clone(),

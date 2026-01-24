@@ -1,7 +1,7 @@
 # Volcano-Style SQL Engine Refactoring
 
 **Started:** 2026-01-23
-**Status:** In Progress
+**Status:** Phase 1-5, 6 (DISTINCT) Complete. Phases 6.2 (Set Operations), 7 (CTEs) Deferred.
 
 ## Overview
 
@@ -27,7 +27,7 @@ Refactoring pg-tikv's SQL execution engine to use the Volcano iterator model. Th
 | `HashAggregateOperator` | ✅ Complete | GROUP BY with hash table |
 | `NestedLoopJoinOperator` | ✅ Complete | All join types (materializes) |
 | `HashJoinOperator` | 🔶 Skeleton | Has code but never used |
-| `DistinctOperator` | 🔶 Skeleton | Has code but never used |
+| `DistinctOperator` | ✅ Complete | Integrated for SELECT DISTINCT |
 | `WindowOperator` | 🔶 Skeleton | Has code but never used |
 | `SetOperationOperator` | 🔶 Skeleton | Has code but never used |
 | `CTEScanOperator` | 🔶 Skeleton | Has code but never used |
@@ -108,7 +108,7 @@ Tasks:
 - [x] Fix table alias resolution in combined schema
 - [x] All 107 integration tests + 584 ORM tests pass
 
-### Phase 5: Window Functions via Operators
+### Phase 5: Window Functions via Operators ✅ COMPLETED
 **Goal:** Migrate window function execution to `WindowOperator`
 
 Target queries:
@@ -117,24 +117,37 @@ SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM table;
 SELECT id, SUM(amount) OVER (PARTITION BY category) FROM table;
 ```
 
-Tasks:
-- [ ] Complete `WindowOperator` implementation
-- [ ] Integrate with planner
-- [ ] Run window function tests
+**Status:** ✅ Completed. Window function queries now route through `WindowOperator` when they match the `is_window_operator_query()` predicate.
 
-### Phase 6: DISTINCT and Set Operations
+Tasks:
+- [x] Parse window functions from SELECT to build WindowFunctionExpr
+- [x] Integrate WindowOperator with execution path  
+- [x] Run window function tests (107 integration + 584 ORM tests pass)
+
+### Phase 6: DISTINCT and Set Operations ✅ PARTIAL (DISTINCT completed)
 **Goal:** Complete remaining operators
 
-Tasks:
-- [ ] Integrate `DistinctOperator`
-- [ ] Integrate `SetOperationOperator` (UNION, INTERSECT, EXCEPT)
-- [ ] Run all tests
+Target queries:
+```sql
+SELECT DISTINCT col1, col2 FROM table;
+SELECT DISTINCT * FROM table;
+SELECT col FROM a UNION SELECT col FROM b;
+```
 
-### Phase 7: CTE Support
+Tasks:
+- [x] Integrate `DistinctOperator` for SELECT DISTINCT
+- [ ] Integrate `SetOperationOperator` (UNION, INTERSECT, EXCEPT) - deferred, complex recursive tree building
+- [x] All 107 integration tests + 584 ORM tests pass
+
+**Status:** ✅ DISTINCT completed. Set operations deferred due to complexity (requires recursive operator tree building for both sides of the operation).
+
+### Phase 7: CTE Support ⏸️ DEFERRED
 **Goal:** Route CTE queries through operator framework
 
+**Status:** Deferred. Current CTE implementation works well. `CTEScanOperator` exists but integration requires CTE materialization and reference tracking.
+
 Tasks:
-- [ ] Implement `CTEScanOperator` properly
+- [ ] Implement CTE materialization in operator framework
 - [ ] Handle recursive CTEs
 - [ ] Run CTE tests
 
@@ -193,6 +206,22 @@ Tasks:
 - Fixed `eval_expr` to look up columns by qualified name first (e.g., `User.id`)
 - All 107 integration tests + 584 ORM tests pass
 
+**Phase 5 Completed:**
+- Added `is_window_operator_query()` predicate to detect eligible window function queries
+- Implemented `extract_window_function_exprs()` to parse window functions from SELECT clause
+- Implemented `execute_window_with_operators()` to build operator tree: Scan → Window → Sort → Limit
+- Added helper functions for projection mapping (`ProjectionSource`, `project_window_results()`)
+- Integrated at `executor_select.rs` line ~472
+- All 107 integration tests + 584 ORM tests pass
+
+**Phase 6 Completed (DISTINCT only):**
+- Updated `is_simple_operator_query()` to allow plain DISTINCT (only rejects DISTINCT ON)
+- Added `distinct: bool` parameter to `execute_with_operators()`
+- Fixed operator ordering: Scan → Project → Distinct → Sort → Limit (not Scan → Distinct → Project)
+- Used `ProjectOperator` to narrow columns BEFORE DistinctOperator
+- All 107 integration tests + 584 ORM tests pass
+- SetOperationOperator deferred (requires recursive operator tree building)
+
 ## Testing Strategy
 
 After each phase:
@@ -245,6 +274,42 @@ After each phase:
    schema.column_index(&qualified_name).or_else(|| schema.column_index(col_name))
    ```
    This backward-compatible change works for both JOIN (qualified) and non-JOIN (unqualified) queries.
+
+### Phase 5: Window Operator Support
+
+1. **Window functions require separate projection handling**: The output schema from WindowOperator is `[input_columns..., window_columns...]`. When projecting the final result, we need to track whether each projection item comes from:
+   - Input columns (index 0..input_col_count)
+   - Window function results (index input_col_count + window_idx)
+   - Other expressions (evaluate against input portion of row)
+
+2. **Window function type inference**: Each window function has a specific output type:
+   - `row_number`, `rank`, `dense_rank` → Int64
+   - `sum`, `avg` → Float64
+   - `count` → Int64
+   - `min`, `max`, `first_value`, `last_value` → Same as argument type
+   - `lag`, `lead` → Same as argument type (nullable)
+
+3. **Operator ordering for window queries**: The correct order is `Scan → Window → Sort → Limit`. The WindowOperator handles its own internal ordering for PARTITION BY and ORDER BY within each window function.
+
+4. **Keep existing window.rs as fallback**: The `is_window_operator_query()` predicate only routes simple window queries through the operator path. Complex cases (multiple tables, CTEs, subqueries) fall back to the existing `compute_window_functions()` in `src/sql/window.rs`.
+
+### Phase 6: DISTINCT Operator Support
+
+1. **DISTINCT must operate on projected columns, not source table columns**: When executing `SELECT DISTINCT col1, col2 FROM table`, the deduplication must happen on `(col1, col2)` pairs, not on the full row. If the table has a primary key, all rows would be "distinct" when looking at the full row.
+
+2. **Operator ordering matters for DISTINCT**: The correct order is:
+   - For DISTINCT with column projection: `Scan → Project → Distinct → Sort → Limit`
+   - For DISTINCT with wildcard (`SELECT DISTINCT *`): `Scan → Distinct → Sort → Limit`
+   
+   The initial implementation had `Scan → Sort → Limit → Distinct → Project` which was wrong.
+
+3. **Use ProjectOperator to narrow columns before Distinct**: Rather than applying projection after operator execution, inject a `ProjectOperator` into the operator tree when DISTINCT is present. This ensures DISTINCT sees only the projected columns.
+
+4. **Allow plain DISTINCT but reject DISTINCT ON**: The `is_simple_operator_query()` predicate was updated to:
+   - Allow `SELECT DISTINCT ...` (routes through operator path with DistinctOperator)
+   - Reject `SELECT DISTINCT ON (col) ...` (falls back to legacy executor)
+   
+   `DISTINCT ON` has ordering semantics that require different handling.
 
 ---
 

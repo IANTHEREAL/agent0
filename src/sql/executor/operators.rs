@@ -8,14 +8,15 @@ use sqlparser::ast::{
 };
 use tikv_client::Transaction;
 
-use super::expr::eval_expr;
-use super::helpers::infer_expr_type;
-use super::operators::{
-    execute_operator_tree, AggregateExpr, BoxedOperator, FilterOperator, HashAggregateOperator,
-    JoinType, LimitOperator, NestedLoopJoinOperator, PhysicalPlanner, SortOperator,
-    TableScanOperator,
+use super::super::expr::eval_expr;
+use super::super::helpers::infer_expr_type;
+use super::super::operators::{
+    execute_operator_tree, AggregateExpr, BoxedOperator, DistinctOperator, FilterOperator,
+    HashAggregateOperator, JoinType, LimitOperator, NestedLoopJoinOperator, PhysicalPlanner,
+    ProjectOperator, SortOperator, TableScanOperator, WindowFunctionExpr, WindowOperator,
 };
-use super::{ExecuteResult, Executor};
+use super::super::ExecuteResult;
+use super::core::Executor;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use sqlparser::ast::Ident;
 
@@ -275,7 +276,7 @@ fn eval_having_expr_for_operators(
                 eval_having_expr_for_operators(left, row, schema, agg_exprs, group_by_count)?;
             let right_val =
                 eval_having_expr_for_operators(right, row, schema, agg_exprs, group_by_count)?;
-            super::expr::eval_binary_op_public(left_val, op, right_val)
+            super::super::expr::eval_binary_op_public(left_val, op, right_val)
         }
         Expr::UnaryOp { op, expr: inner } => {
             let val =
@@ -343,7 +344,7 @@ fn eval_having_expr_for_operators(
             let inner_val =
                 eval_having_expr_for_operators(inner, row, schema, agg_exprs, group_by_count)?;
             let cast_expr = Expr::Cast {
-                expr: Box::new(super::helpers::value_to_sql_expr(&inner_val)),
+                expr: Box::new(super::super::helpers::value_to_sql_expr(&inner_val)),
                 data_type: data_type.clone(),
                 format: format.clone(),
             };
@@ -619,7 +620,7 @@ impl Executor {
             return false;
         }
 
-        if select.distinct.is_some() {
+        if matches!(&select.distinct, Some(sqlparser::ast::Distinct::On(_))) {
             return false;
         }
 
@@ -725,6 +726,95 @@ impl Executor {
         }
 
         has_aggregates
+    }
+
+    pub(crate) fn is_window_operator_query(query: &Query, select: &sqlparser::ast::Select) -> bool {
+        if select.from.len() != 1 {
+            return false;
+        }
+        if !select.from[0].joins.is_empty() {
+            return false;
+        }
+        if query.with.is_some() {
+            return false;
+        }
+        if !matches!(&*query.body, SetExpr::Select(_)) {
+            return false;
+        }
+
+        if !matches!(
+            &select.group_by,
+            GroupByExpr::Expressions(exprs) if exprs.is_empty()
+        ) {
+            return false;
+        }
+
+        if select.having.is_some() {
+            return false;
+        }
+
+        let has_window_funcs = select.projection.iter().any(|item| {
+            if let SelectItem::UnnamedExpr(Expr::Function(f))
+            | SelectItem::ExprWithAlias {
+                expr: Expr::Function(f),
+                ..
+            } = item
+            {
+                f.over.is_some()
+            } else {
+                false
+            }
+        });
+
+        if !has_window_funcs {
+            return false;
+        }
+
+        let is_supported_window_func = |f: &Function| -> bool {
+            let func_name = f
+                .name
+                .0
+                .last()
+                .map(|n| n.value.to_lowercase())
+                .unwrap_or_default();
+            matches!(
+                func_name.as_str(),
+                "row_number"
+                    | "rank"
+                    | "dense_rank"
+                    | "sum"
+                    | "count"
+                    | "avg"
+                    | "min"
+                    | "max"
+                    | "lag"
+                    | "lead"
+                    | "first_value"
+                    | "last_value"
+            )
+        };
+
+        for item in &select.projection {
+            match item {
+                SelectItem::UnnamedExpr(Expr::Function(f))
+                | SelectItem::ExprWithAlias {
+                    expr: Expr::Function(f),
+                    ..
+                } => {
+                    if f.over.is_some() && !is_supported_window_func(f) {
+                        return false;
+                    }
+                }
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                    if !Self::is_simple_projection_expr(e) {
+                        return false;
+                    }
+                }
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
+            }
+        }
+
+        true
     }
 
     fn extract_aggregate_info(
@@ -908,7 +998,7 @@ impl Executor {
 
         let columns: Vec<String> = projection
             .iter()
-            .map(super::helpers::get_select_item_name)
+            .map(super::super::helpers::get_select_item_name)
             .collect();
 
         #[derive(Clone, Copy, Debug)]
@@ -1174,7 +1264,7 @@ impl Executor {
                     .map(|c| c.name.clone())
                     .collect(),
                 SelectItem::UnnamedExpr(_) => {
-                    vec![super::helpers::get_select_item_name(item)]
+                    vec![super::super::helpers::get_select_item_name(item)]
                 }
                 SelectItem::ExprWithAlias { alias, .. } => vec![alias.value.clone()],
                 SelectItem::QualifiedWildcard(_, _) => combined_schema
@@ -1372,7 +1462,7 @@ impl Executor {
 
             let cols: Vec<String> = rewritten_projection
                 .iter()
-                .map(|item| super::helpers::get_select_item_name(item))
+                .map(|item| super::super::helpers::get_select_item_name(item))
                 .collect();
 
             let types: Vec<DataType> = rewritten_projection
@@ -1420,28 +1510,9 @@ impl Executor {
         limit: Option<usize>,
         offset: usize,
         projection: &[SelectItem],
+        distinct: bool,
     ) -> Result<ExecuteResult> {
         let planner = PhysicalPlanner::new(self.store(), search_path.to_vec());
-
-        let estimated_rows = 1000;
-        let mut operator = planner.plan_simple_select(
-            schema.clone(),
-            filter,
-            order_by.to_vec(),
-            limit,
-            offset,
-            estimated_rows,
-        )?;
-
-        let raw_rows = execute_operator_tree(
-            &mut operator,
-            txn,
-            self.store(),
-            db_id,
-            search_path,
-            sequence_values,
-        )
-        .await?;
 
         let is_wildcard_only = projection.iter().all(|item| {
             matches!(
@@ -1449,17 +1520,6 @@ impl Executor {
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _)
             )
         });
-
-        if is_wildcard_only {
-            let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-            let column_types: Vec<DataType> =
-                schema.columns.iter().map(|c| c.data_type.clone()).collect();
-            return Ok(ExecuteResult::Select {
-                columns,
-                column_types: Some(column_types),
-                rows: raw_rows,
-            });
-        }
 
         let mut columns: Vec<String> = Vec::new();
         let mut column_types: Vec<DataType> = Vec::new();
@@ -1478,7 +1538,7 @@ impl Executor {
                 }
                 SelectItem::UnnamedExpr(expr) => {
                     Self::validate_projection_columns(expr, &schema)?;
-                    columns.push(super::helpers::get_select_item_name(item));
+                    columns.push(super::super::helpers::get_select_item_name(item));
                     column_types.push(infer_expr_type(expr, &schema));
                     projection_exprs.push(expr.clone());
                 }
@@ -1489,6 +1549,90 @@ impl Executor {
                     projection_exprs.push(expr.clone());
                 }
             }
+        }
+
+        let estimated_rows = 1000;
+
+        if distinct && !is_wildcard_only {
+            let scan_operator = planner.plan_simple_select(
+                schema.clone(),
+                filter,
+                Vec::new(),
+                None,
+                0,
+                estimated_rows,
+            )?;
+
+            let project_operator = Box::new(ProjectOperator::new(
+                scan_operator,
+                projection_exprs.clone(),
+                columns.clone(),
+                column_types.clone(),
+            ));
+
+            let distinct_operator = Box::new(DistinctOperator::new(project_operator));
+
+            let mut operator: BoxedOperator = if !order_by.is_empty() {
+                let sort_operator = Box::new(SortOperator::new(distinct_operator, order_by.to_vec()));
+                if limit.is_some() || offset > 0 {
+                    Box::new(LimitOperator::new(sort_operator, limit, offset))
+                } else {
+                    sort_operator
+                }
+            } else if limit.is_some() || offset > 0 {
+                Box::new(LimitOperator::new(distinct_operator, limit, offset))
+            } else {
+                distinct_operator
+            };
+
+            let rows = execute_operator_tree(
+                &mut operator,
+                txn,
+                self.store(),
+                db_id,
+                search_path,
+                sequence_values,
+            )
+            .await?;
+
+            return Ok(ExecuteResult::Select {
+                columns,
+                column_types: Some(column_types),
+                rows,
+            });
+        }
+
+        let base_operator = planner.plan_simple_select(
+            schema.clone(),
+            filter,
+            order_by.to_vec(),
+            limit,
+            offset,
+            estimated_rows,
+        )?;
+
+        let mut operator: BoxedOperator = if distinct {
+            Box::new(DistinctOperator::new(base_operator))
+        } else {
+            base_operator
+        };
+
+        let raw_rows = execute_operator_tree(
+            &mut operator,
+            txn,
+            self.store(),
+            db_id,
+            search_path,
+            sequence_values,
+        )
+        .await?;
+
+        if is_wildcard_only {
+            return Ok(ExecuteResult::Select {
+                columns,
+                column_types: Some(column_types),
+                rows: raw_rows,
+            });
         }
 
         let mut rows: Vec<Row> = Vec::with_capacity(raw_rows.len());
@@ -1506,6 +1650,240 @@ impl Executor {
             rows,
         })
     }
+
+    pub(crate) async fn execute_window_with_operators(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        schema: TableSchema,
+        filter: Option<&Expr>,
+        order_by: &[OrderByExpr],
+        limit: Option<usize>,
+        offset: usize,
+        projection: &[SelectItem],
+    ) -> Result<ExecuteResult> {
+        let planner = PhysicalPlanner::new(self.store(), search_path.to_vec());
+        let estimated_rows = 1000;
+
+        let scan_operator = planner.plan_simple_select(
+            schema.clone(),
+            filter,
+            Vec::new(),
+            None,
+            0,
+            estimated_rows,
+        )?;
+
+        let window_funcs = Self::extract_window_function_exprs(projection, &schema);
+
+        let window_operator = Box::new(WindowOperator::new(scan_operator, window_funcs.clone()));
+
+        let mut operator: BoxedOperator = if !order_by.is_empty() {
+            let sort_op = Box::new(SortOperator::new(window_operator, order_by.to_vec()));
+            if limit.is_some() || offset > 0 {
+                Box::new(LimitOperator::new(sort_op, limit, offset))
+            } else {
+                sort_op
+            }
+        } else if limit.is_some() || offset > 0 {
+            Box::new(LimitOperator::new(window_operator, limit, offset))
+        } else {
+            window_operator
+        };
+
+        let raw_rows = execute_operator_tree(
+            &mut operator,
+            txn,
+            self.store(),
+            db_id,
+            search_path,
+            sequence_values,
+        )
+        .await?;
+
+        let (columns, column_types, projected_rows) =
+            Self::project_window_results(projection, &schema, &window_funcs, raw_rows)?;
+
+        Ok(ExecuteResult::Select {
+            columns,
+            column_types: Some(column_types),
+            rows: projected_rows,
+        })
+    }
+
+    fn extract_window_function_exprs(
+        projection: &[SelectItem],
+        schema: &TableSchema,
+    ) -> Vec<WindowFunctionExpr> {
+        use sqlparser::ast::WindowType;
+
+        let mut result = Vec::new();
+        for (idx, item) in projection.iter().enumerate() {
+            let (func, alias) = match item {
+                SelectItem::UnnamedExpr(Expr::Function(f)) => (Some(f), None),
+                SelectItem::ExprWithAlias {
+                    expr: Expr::Function(f),
+                    alias,
+                } => (Some(f), Some(alias.value.clone())),
+                _ => (None, None),
+            };
+
+            if let Some(f) = func {
+                if let Some(WindowType::WindowSpec(spec)) = &f.over {
+                    let func_name = f
+                        .name
+                        .0
+                        .last()
+                        .map(|i| i.value.to_lowercase())
+                        .unwrap_or_default();
+
+                    let extract_arg = |index: usize| -> Option<Expr> {
+                        f.args.get(index).and_then(|a| match a {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
+                            _ => None,
+                        })
+                    };
+
+                    let arg_expr = extract_arg(0);
+                    let offset_expr = extract_arg(1);
+                    let default_value_expr = extract_arg(2);
+
+                    let output_name = alias.unwrap_or_else(|| format!("window_{}", idx));
+                    let output_type = Self::infer_window_func_type(&func_name, &arg_expr, schema);
+
+                    result.push(WindowFunctionExpr {
+                        func_name,
+                        arg_expr,
+                        partition_by: spec.partition_by.clone(),
+                        order_by: spec.order_by.clone(),
+                        offset_expr,
+                        default_value_expr,
+                        window_frame: spec.window_frame.clone(),
+                        output_name,
+                        output_type,
+                    });
+                }
+            }
+        }
+        result
+    }
+
+    fn infer_window_func_type(
+        func_name: &str,
+        arg_expr: &Option<Expr>,
+        schema: &TableSchema,
+    ) -> DataType {
+        match func_name {
+            "row_number" | "rank" | "dense_rank" | "count" => DataType::Int64,
+            "sum" | "avg" => DataType::Numeric {
+                precision: None,
+                scale: None,
+            },
+            "min" | "max" | "lag" | "lead" | "first_value" | "last_value" => {
+                if let Some(expr) = arg_expr {
+                    infer_expr_type(expr, schema)
+                } else {
+                    DataType::Int64
+                }
+            }
+            _ => DataType::Int64,
+        }
+    }
+
+    fn project_window_results(
+        projection: &[SelectItem],
+        schema: &TableSchema,
+        window_funcs: &[WindowFunctionExpr],
+        rows: Vec<Row>,
+    ) -> Result<(Vec<String>, Vec<DataType>, Vec<Row>)> {
+        let mut columns = Vec::new();
+        let mut column_types = Vec::new();
+        let mut proj_info: Vec<(String, DataType, ProjectionSource)> = Vec::new();
+
+        let input_col_count = schema.columns.len();
+        let mut window_idx = 0;
+
+        for item in projection {
+            match item {
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                    for col in &schema.columns {
+                        proj_info.push((
+                            col.name.clone(),
+                            col.data_type.clone(),
+                            ProjectionSource::InputColumn(col.name.clone()),
+                        ));
+                    }
+                }
+                SelectItem::UnnamedExpr(Expr::Function(f))
+                | SelectItem::ExprWithAlias {
+                    expr: Expr::Function(f),
+                    ..
+                } if f.over.is_some() => {
+                    if window_idx < window_funcs.len() {
+                        let wf = &window_funcs[window_idx];
+                        proj_info.push((
+                            wf.output_name.clone(),
+                            wf.output_type.clone(),
+                            ProjectionSource::WindowColumn(input_col_count + window_idx),
+                        ));
+                        window_idx += 1;
+                    }
+                }
+                SelectItem::UnnamedExpr(e) => {
+                    let name = super::super::helpers::get_select_item_name(item);
+                    let dtype = infer_expr_type(e, schema);
+                    proj_info.push((name, dtype, ProjectionSource::Expression(e.clone())));
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    let dtype = infer_expr_type(expr, schema);
+                    proj_info.push((
+                        alias.value.clone(),
+                        dtype,
+                        ProjectionSource::Expression(expr.clone()),
+                    ));
+                }
+            }
+        }
+
+        for (name, dtype, _) in &proj_info {
+            columns.push(name.clone());
+            column_types.push(dtype.clone());
+        }
+
+        let mut projected_rows = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut values = Vec::with_capacity(proj_info.len());
+            for (_, _, source) in &proj_info {
+                let value = match source {
+                    ProjectionSource::InputColumn(name) => {
+                        if let Some(idx) = schema.column_index(name) {
+                            row.values.get(idx).cloned().unwrap_or(Value::Null)
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    ProjectionSource::WindowColumn(idx) => {
+                        row.values.get(*idx).cloned().unwrap_or(Value::Null)
+                    }
+                    ProjectionSource::Expression(expr) => {
+                        eval_expr(expr, Some(&row), Some(schema))?
+                    }
+                };
+                values.push(value);
+            }
+            projected_rows.push(Row::new(values));
+        }
+
+        Ok((columns, column_types, projected_rows))
+    }
+}
+
+enum ProjectionSource {
+    InputColumn(String),
+    WindowColumn(usize),
+    Expression(Expr),
 }
 
 #[cfg(test)]
@@ -1587,8 +1965,17 @@ mod tests {
     }
 
     #[test]
-    fn test_is_not_simple_query_with_distinct() {
+    fn test_is_simple_query_with_distinct() {
+        // Plain DISTINCT is now supported via DistinctOperator
         let query = parse_query("SELECT DISTINCT name FROM users");
+        let select = get_select(&query);
+        assert!(Executor::is_simple_operator_query(&query, select));
+    }
+
+    #[test]
+    fn test_is_not_simple_query_with_distinct_on() {
+        // DISTINCT ON(...) is not yet supported in operator path
+        let query = parse_query("SELECT DISTINCT ON (name) name, id FROM users");
         let select = get_select(&query);
         assert!(!Executor::is_simple_operator_query(&query, select));
     }

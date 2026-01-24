@@ -433,4 +433,5 @@ cd orm-tests && npm test -- --grep "TypeORM"
 - Expression validation (`is_simple_projection_expr()`, `validate_projection_columns()`) must be recursive to handle nested expressions like `CAST(col AS INT)`, `CASE WHEN`, and binary operations.
 - HAVING expressions reference computed aggregates, not raw data. When evaluating `HAVING COUNT(*) > 5`, the `COUNT(*)` is a reference to an already-computed column value, not a function to execute. Use a special evaluator (`eval_having_expr_for_operators`) that maps aggregate function calls to their column indices in the aggregated row.
 - Match aggregates by function name AND arguments: `COUNT(*)` and `COUNT(id)` are different. Compare function name, stringified arguments, and DISTINCT flag.
+- For DISTINCT queries, operator ordering is critical: `Scan → Project → Distinct → Sort → Limit`. Applying DISTINCT to full table rows (before projection) fails when the table has a primary key - all rows appear unique. Use `ProjectOperator` to narrow columns BEFORE `DistinctOperator`.
 - See `WORK.md` for detailed Volcano refactoring progress and per-phase lessons.

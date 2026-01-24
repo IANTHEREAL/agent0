@@ -256,7 +256,7 @@ fn parse_comment_value(input: &str, idx: &mut usize) -> Result<Option<String>> {
 }
 
 pub(crate) fn parse_comment_on_sql(sql: &str) -> Result<CommentOnCommand> {
-    let sql = super::executor_functions_triggers::strip_leading_sql_comments(sql).trim();
+    let sql = super::executor::triggers::strip_leading_sql_comments(sql).trim();
     let sql = sql.trim_end_matches(';').trim_end();
 
     let mut idx = 0usize;

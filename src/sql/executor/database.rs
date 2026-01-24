@@ -1,6 +1,6 @@
-use super::executor::Executor;
-use super::executor_functions_triggers::strip_leading_sql_comments;
-use super::{ExecuteResult, ExecuteResults, Session};
+use super::core::Executor;
+use super::triggers::strip_leading_sql_comments;
+use super::super::{ExecuteResult, ExecuteResults, Session};
 use anyhow::{anyhow, Result};
 use tracing::warn;
 

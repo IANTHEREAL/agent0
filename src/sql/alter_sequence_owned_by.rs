@@ -143,7 +143,7 @@ fn parse_owned_by_target(input: &str, idx: &mut usize) -> Result<Option<(ObjectN
 }
 
 pub(crate) fn parse_alter_sequence_owned_by_sql(sql: &str) -> Result<AlterSequenceOwnedByCommand> {
-    let sql = super::executor_functions_triggers::strip_leading_sql_comments(sql).trim();
+    let sql = super::executor::triggers::strip_leading_sql_comments(sql).trim();
     let sql = sql.trim_end_matches(';').trim_end();
 
     let mut idx = 0usize;

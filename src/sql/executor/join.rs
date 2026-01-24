@@ -1,17 +1,17 @@
 //! JOIN query execution for the SQL executor
 
-use super::executor::Executor;
-use super::helpers::{
+use super::core::Executor;
+use super::super::helpers::{
     apply_offset_limit_fetch, collect_having_agg_funcs, dedup_rows,
     distinct_on_rows_join_with_indices, eval_having_expr_join, get_select_item_name,
     infer_expr_type, normalize_ident, AggExpr,
 };
-use super::information_schema::VirtualTableFilter;
-use super::names;
-use super::operators::{hash_row_key_for_join, row_key_has_null_for_join, row_keys_equal_for_join, HashJoinConfig};
-use super::sequences;
-use super::window::{compute_window_functions_join, extract_window_functions};
-use super::{
+use super::super::information_schema::VirtualTableFilter;
+use super::super::names;
+use super::super::operators::{hash_row_key_for_join, row_key_has_null_for_join, row_keys_equal_for_join, HashJoinConfig};
+use super::super::sequences;
+use super::super::window::{compute_window_functions_join, extract_window_functions};
+use super::super::{
     expr::{eval_expr_join, JoinContext},
     parse_sql, Aggregator, ExecuteResult,
 };
@@ -476,8 +476,8 @@ impl Executor {
         if t_upper == "_PGTIKV_SYS_TRIGGER_QUEUE_STATS"
             || t_upper.ends_with("._PGTIKV_SYS_TRIGGER_QUEUE_STATS")
         {
-            use super::trigger_queue::{encode_trigger_dlq_prefix, encode_trigger_queue_prefix};
-            use super::trigger_queue::{now_ms_i64, EventStatus, TriggerEvent};
+            use super::super::trigger_queue::{encode_trigger_dlq_prefix, encode_trigger_queue_prefix};
+            use super::super::trigger_queue::{now_ms_i64, EventStatus, TriggerEvent};
             use std::ops::Bound;
             use tikv_client::BoundRange;
 
@@ -675,7 +675,7 @@ impl Executor {
         }
 
         if t_upper == "_PGTIKV_SYS_TRIGGER_DLQ" || t_upper.ends_with("._PGTIKV_SYS_TRIGGER_DLQ") {
-            use super::trigger_queue::{encode_trigger_dlq_prefix, TriggerEvent, TriggerOp};
+            use super::super::trigger_queue::{encode_trigger_dlq_prefix, TriggerEvent, TriggerOp};
             use std::ops::Bound;
             use tikv_client::BoundRange;
 
@@ -853,8 +853,8 @@ impl Executor {
             return Ok((schema.clone(), rows.clone()));
         }
 
-        if super::information_schema::get_information_schema_schema(&t_lower).is_some() {
-            return super::information_schema::get_information_schema_data_filtered(
+        if super::super::information_schema::get_information_schema_schema(&t_lower).is_some() {
+            return super::super::information_schema::get_information_schema_data_filtered(
                 &self.store(),
                 txn,
                 db_id,
@@ -973,7 +973,7 @@ impl Executor {
         alias_name: &str,
         table_alias: Option<&sqlparser::ast::TableAlias>,
     ) -> Result<(TableSchema, Vec<Row>)> {
-        use super::expr::eval_expr;
+        use super::super::expr::eval_expr;
 
         fn extract_expr(arg: &FunctionArg) -> Result<&Expr> {
             match arg {
@@ -1849,7 +1849,7 @@ impl Executor {
 
                 let has_correlated_subquery = join_condition.as_ref().map_or(false, |cond| {
                     combined_schemas.iter().any(|(alias, _)| {
-                        super::helpers::query_has_outer_reference_in_expr(cond, alias)
+                        super::super::helpers::query_has_outer_reference_in_expr(cond, alias)
                     })
                 });
 
@@ -1881,7 +1881,7 @@ impl Executor {
                             [value_offset..value_offset + schema.columns.len()]
                             .to_vec();
                         let outer_row = Row::new(row_values);
-                        substituted_query = super::helpers::substitute_outer_values_in_query(
+                        substituted_query = super::super::helpers::substitute_outer_values_in_query(
                             &substituted_query,
                             alias,
                             schema,
@@ -2197,7 +2197,7 @@ impl Executor {
 
             let has_correlated_subquery = join_condition.as_ref().map_or(false, |cond| {
                 combined_schemas.iter().any(|(alias, _)| {
-                    super::helpers::query_has_outer_reference_in_expr(cond, alias)
+                    super::super::helpers::query_has_outer_reference_in_expr(cond, alias)
                 })
             });
 
@@ -2452,7 +2452,7 @@ impl Executor {
                                     [value_offset..value_offset + schema.columns.len()]
                                     .to_vec();
                                 let outer_row = Row::new(row_values);
-                                substituted = super::helpers::substitute_outer_values(
+                                substituted = super::super::helpers::substitute_outer_values(
                                     &substituted,
                                     alias,
                                     schema,
@@ -2999,7 +2999,7 @@ impl Executor {
                             _ => {}
                         }
 
-                        let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                        let cmp = super::super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
                         if cmp != 0 {
                             return if asc {
                                 if cmp > 0 {
@@ -3114,7 +3114,7 @@ impl Executor {
                     for (idx, order_expr) in query.order_by.iter().enumerate() {
                         let val_a = a_keys.get(idx).cloned().unwrap_or(Value::Null);
                         let val_b = b_keys.get(idx).cloned().unwrap_or(Value::Null);
-                        let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                        let cmp = super::super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
                         if cmp != 0 {
                             let asc = order_expr.asc.unwrap_or(true);
                             return if asc {
@@ -3162,7 +3162,7 @@ impl Executor {
                         };
                         let val_a = eval_expr_join(expr, &ctx_a).unwrap_or(Value::Null);
                         let val_b = eval_expr_join(expr, &ctx_b).unwrap_or(Value::Null);
-                        let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                        let cmp = super::super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
                         if cmp != 0 {
                             let asc = order_expr.asc.unwrap_or(true);
                             return if asc {
@@ -3202,7 +3202,7 @@ impl Executor {
                     &final_schema,
                 );
                 let window_results =
-                    window_results.map(|wr| super::query::reorder_by_indices(&wr, &indices));
+                    window_results.map(|wr| super::super::query::reorder_by_indices(&wr, &indices));
                 (rows, window_results)
             }
             _ => (filtered_rows, window_results),

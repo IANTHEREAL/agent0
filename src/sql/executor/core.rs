@@ -1,22 +1,22 @@
 //! SQL executor
 
-use super::ddl;
-use super::alter_owner;
-use super::alter_sequence_owned_by;
-use super::comment_on;
-use super::executor_functions_triggers::strip_leading_sql_comments;
-use super::explain;
-use super::helpers::{
+use super::super::ddl;
+use super::super::alter_owner;
+use super::super::alter_sequence_owned_by;
+use super::super::comment_on;
+use super::triggers::strip_leading_sql_comments;
+use super::super::explain;
+use super::super::helpers::{
     eval_default_expr, fill_row_defaults, get_expr_name, get_skip_reason, get_unsupported_reason,
     infer_expr_type, normalize_ident, parse_value_for_copy,
 };
-use super::names;
-use super::query;
-use super::rbac;
-use super::sequences;
-use super::statement_time;
-use super::udt;
-use super::{parse_sql, ExecuteResult, ExecuteResults, Session};
+use super::super::names;
+use super::super::query;
+use super::super::rbac;
+use super::super::sequences;
+use super::super::statement_time;
+use super::super::udt;
+use super::super::{parse_sql, ExecuteResult, ExecuteResults, Session};
 use crate::auth::AuthManager;
 use crate::observability::TenantObservability;
 use crate::storage::TikvStore;
@@ -609,7 +609,7 @@ impl Executor {
         let savepoints = session.savepoints();
         let connection_id = session.connection_id();
         let database_name = session.current_database_name_arc();
-        super::expr::with_query_context(
+        super::super::expr::with_query_context(
             connection_id,
             database_name,
             statement_time::with_statement_timestamp_millis(
@@ -1157,7 +1157,7 @@ impl Executor {
             } => {
                 let mut notices = Vec::new();
                 for name in drop_names {
-                    let exists = super::names::resolve_existing_table_name(
+                    let exists = super::super::names::resolve_existing_table_name(
                         self.store.as_ref(),
                         txn,
                         db_id,
@@ -1912,7 +1912,7 @@ impl Executor {
             )
             .await
         } else {
-            super::expr::eval_expr(expr, row, schema)
+            super::super::expr::eval_expr(expr, row, schema)
         }
     }
 
@@ -1923,7 +1923,7 @@ impl Executor {
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         expr: &Expr,
-        join_ctx: &super::expr::JoinContext<'_>,
+        join_ctx: &super::super::expr::JoinContext<'_>,
     ) -> Result<Value> {
         if sequences::expr_needs_async_eval(expr) {
             sequences::eval_expr_join_with_sequences(
@@ -1937,7 +1937,7 @@ impl Executor {
             )
             .await
         } else {
-            super::expr::eval_expr_join(expr, join_ctx)
+            super::super::expr::eval_expr_join(expr, join_ctx)
         }
     }
 
@@ -1948,11 +1948,11 @@ impl Executor {
         sequence_values: &'a mut HashMap<String, i64>,
         search_path: &'a [String],
         subquery: &'a Query,
-        join_ctx: &'a super::expr::JoinContext<'a>,
+        join_ctx: &'a super::super::expr::JoinContext<'a>,
         outer_ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
         Box::pin(async move {
-            let substituted_query = super::helpers::substitute_join_context_values_in_query(
+            let substituted_query = super::super::helpers::substitute_join_context_values_in_query(
                 subquery,
                 &join_ctx.column_offsets,
                 join_ctx.combined_row,

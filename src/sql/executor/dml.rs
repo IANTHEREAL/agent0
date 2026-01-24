@@ -1,14 +1,14 @@
 //! DML operations (INSERT, UPDATE, DELETE) for the SQL executor
 
-use super::dml;
-use super::executor::Executor;
-use super::expr::JoinContext;
-use super::helpers::normalize_ident;
-use super::names;
-use super::trigger_queue::TriggerOp;
-use super::trigger_worker;
-use super::triggers;
-use super::ExecuteResult;
+use super::super::dml;
+use super::core::Executor;
+use super::super::expr::JoinContext;
+use super::super::helpers::normalize_ident;
+use super::super::names;
+use super::super::trigger_queue::TriggerOp;
+use super::super::trigger_worker;
+use super::super::triggers;
+use super::super::ExecuteResult;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
@@ -124,7 +124,7 @@ impl Executor {
                     .execute_query(txn, db_id, sequence_values, search_path, source)
                     .await?;
                 match select_result {
-                    super::ExecuteResult::Select {
+                    super::super::ExecuteResult::Select {
                         rows,
                         columns: select_cols,
                         ..

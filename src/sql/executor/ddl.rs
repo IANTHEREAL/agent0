@@ -1,8 +1,8 @@
 //! DDL operation execution (CREATE TABLE AS, CREATE/DROP INDEX, ALTER TABLE)
 
-use super::ddl;
-use super::names;
-use super::ExecuteResult;
+use super::super::ddl;
+use super::super::names;
+use super::super::ExecuteResult;
 use super::Executor;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{

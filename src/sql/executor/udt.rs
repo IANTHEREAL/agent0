@@ -1,9 +1,9 @@
 use anyhow::{anyhow, Result};
 use tikv_client::Transaction;
 
-use super::executor::Executor;
-use super::udt;
-use super::{ExecuteResult, Session};
+use super::core::Executor;
+use super::super::udt;
+use super::super::{ExecuteResult, Session};
 
 fn trim_sql_end(sql: &str) -> &str {
     sql.trim()

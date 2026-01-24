@@ -1,8 +1,8 @@
-use super::ddl;
-use super::executor::Executor;
-use super::helpers::infer_data_type;
-use super::names;
-use super::{parse_sql, ExecuteResult, Session};
+use super::super::ddl;
+use super::core::Executor;
+use super::super::helpers::infer_data_type;
+use super::super::names;
+use super::super::{parse_sql, ExecuteResult, Session};
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{ObjectName, Query, Statement};

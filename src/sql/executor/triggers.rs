@@ -1,7 +1,7 @@
-use super::executor::Executor;
-use super::names;
-use super::plpgsql;
-use super::{ExecuteResult, Session};
+use super::core::Executor;
+use super::super::names;
+use super::super::plpgsql;
+use super::super::{ExecuteResult, Session};
 use crate::types::{FunctionDef, TriggerDef};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::ObjectName;

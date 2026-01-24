@@ -1,17 +1,18 @@
 //! SELECT query execution
 
-use super::executor_operators::{extract_limit, extract_offset, use_operator_execution};
-use super::helpers::{
+use super::operators::{extract_limit, extract_offset, use_operator_execution};
+use super::super::helpers::{
     apply_offset_limit_fetch, collect_having_agg_funcs, dedup_rows, distinct_on_rows_with_indices,
     eval_having_expr, fill_row_defaults, get_select_item_name, infer_expr_type, AggExpr,
 };
-use super::gin;
-use super::names;
-use super::operators::JoinType;
-use super::planner::{self, ScanType};
-use super::sequences;
-use super::window::{compute_window_functions, extract_window_functions, WindowFuncInfo};
-use super::{expr::eval_expr, Aggregator, ExecuteResult, Executor};
+use super::super::gin;
+use super::super::names;
+use super::super::operators::{execute_operator_tree, JoinType, PhysicalPlanner};
+use super::super::planner::{self, ScanType};
+use super::super::sequences;
+use super::super::window::{compute_window_functions, extract_window_functions, WindowFuncInfo};
+use super::super::{expr::eval_expr, Aggregator, ExecuteResult};
+use super::core::Executor;
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
@@ -373,7 +374,7 @@ impl Executor {
             debug!("Using operator execution path for simple query");
             if has_for_update {
                 let planner =
-                    super::operators::PhysicalPlanner::new(self.store(), search_path.to_vec());
+                    PhysicalPlanner::new(self.store(), search_path.to_vec());
                 let estimated_rows = 1000;
                 let mut lock_operator = planner.plan_simple_select(
                     schema.clone(),
@@ -383,7 +384,7 @@ impl Executor {
                     0,
                     estimated_rows,
                 )?;
-                let lock_rows = super::operators::execute_operator_tree(
+                let lock_rows = execute_operator_tree(
                     &mut lock_operator,
                     txn,
                     self.store(),
@@ -405,9 +406,10 @@ impl Executor {
                     schema,
                     resolved_selection.as_ref(),
                     &query.order_by,
-                    super::executor_operators::extract_limit(query),
-                    super::executor_operators::extract_offset(query),
+                    super::operators::extract_limit(query),
+                    super::operators::extract_offset(query),
                     &resolved_projection,
+                    matches!(&select.distinct, Some(sqlparser::ast::Distinct::Distinct)),
                 )
                 .await;
         }
@@ -422,7 +424,7 @@ impl Executor {
             debug!("Using operator execution path for aggregate query");
             if has_for_update {
                 let planner =
-                    super::operators::PhysicalPlanner::new(self.store(), search_path.to_vec());
+                    PhysicalPlanner::new(self.store(), search_path.to_vec());
                 let estimated_rows = 1000;
                 let mut lock_operator = planner.plan_simple_select(
                     schema.clone(),
@@ -432,7 +434,7 @@ impl Executor {
                     0,
                     estimated_rows,
                 )?;
-                let lock_rows = super::operators::execute_operator_tree(
+                let lock_rows = execute_operator_tree(
                     &mut lock_operator,
                     txn,
                     self.store(),
@@ -456,8 +458,32 @@ impl Executor {
                     &select.group_by,
                     select.having.as_ref(),
                     &query.order_by,
-                    super::executor_operators::extract_limit(query),
-                    super::executor_operators::extract_offset(query),
+                    super::operators::extract_limit(query),
+                    super::operators::extract_offset(query),
+                    &resolved_projection,
+                )
+                .await;
+        }
+
+        if use_operator_execution()
+            && !is_virtual
+            && !rows_loaded
+            && !has_correlated_exists
+            && select_into_target.is_none()
+            && Self::is_window_operator_query(query, select)
+        {
+            debug!("Using operator execution path for window function query");
+            return self
+                .execute_window_with_operators(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    schema,
+                    resolved_selection.as_ref(),
+                    &query.order_by,
+                    super::operators::extract_limit(query),
+                    super::operators::extract_offset(query),
                     &resolved_projection,
                 )
                 .await;
@@ -806,7 +832,7 @@ impl Executor {
                 let (rows, indices) =
                     distinct_on_rows_with_indices(filtered_rows, on_exprs, Some(&schema));
                 let window_results =
-                    window_results.map(|wr| super::query::reorder_by_indices(&wr, &indices));
+                    window_results.map(|wr| super::super::query::reorder_by_indices(&wr, &indices));
                 (rows, window_results)
             }
             _ => (filtered_rows, window_results),
@@ -1058,7 +1084,7 @@ impl Executor {
                             continue;
                         }
                     };
-                    row_values.push(super::helpers::eval_having_expr(
+                    row_values.push(super::super::helpers::eval_having_expr(
                         expr,
                         &empty_row,
                         &empty_schema,
@@ -1121,7 +1147,7 @@ impl Executor {
                     } else {
                         expr.clone()
                     };
-                    row_values.push(super::helpers::eval_having_expr(
+                    row_values.push(super::super::helpers::eval_having_expr(
                         &expr,
                         representative,
                         schema,
@@ -1420,7 +1446,7 @@ impl Executor {
                             } else {
                                 expr.clone()
                             };
-                            row_values.push(super::helpers::eval_having_expr(
+                            row_values.push(super::super::helpers::eval_having_expr(
                                 &expr,
                                 &group_eval_row,
                                 schema,
@@ -1517,7 +1543,7 @@ impl Executor {
                     _ => {}
                 }
 
-                let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                let cmp = super::super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
                 if cmp != 0 {
                     return if asc {
                         if cmp > 0 {
@@ -1539,7 +1565,7 @@ impl Executor {
             for i in 0..max_cols {
                 let va = a.values.get(i).unwrap_or(&Value::Null);
                 let vb = b.values.get(i).unwrap_or(&Value::Null);
-                let cmp = super::expr::compare_values(va, vb).unwrap_or(0);
+                let cmp = super::super::expr::compare_values(va, vb).unwrap_or(0);
                 if cmp != 0 {
                     return if cmp > 0 {
                         std::cmp::Ordering::Greater
@@ -1617,7 +1643,7 @@ impl Executor {
                     let val_b = b_keys.get(idx).cloned().unwrap_or(Value::Null);
                     let asc = order_expr.asc.unwrap_or(true);
                     let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
-                    let ord = super::expr::compare_order_by_values(
+                    let ord = super::super::expr::compare_order_by_values(
                         &val_a,
                         &val_b,
                         asc,
@@ -1649,7 +1675,7 @@ impl Executor {
                         eval_expr(actual_expr, Some(b), Some(schema)).unwrap_or(Value::Null);
                     let asc = order_expr.asc.unwrap_or(true);
                     let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
-                    let ord = super::expr::compare_order_by_values(
+                    let ord = super::super::expr::compare_order_by_values(
                         &val_a,
                         &val_b,
                         asc,
@@ -2134,7 +2160,7 @@ impl Executor {
                 if let Some(idx) = col_idx {
                     let val_a = a.values.get(idx).cloned().unwrap_or(Value::Null);
                     let val_b = b.values.get(idx).cloned().unwrap_or(Value::Null);
-                    let cmp = super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                    let cmp = super::super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
                     if cmp != 0 {
                         let asc = order_expr.asc.unwrap_or(true);
                         return if asc {

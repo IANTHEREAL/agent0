@@ -1,8 +1,8 @@
 //! CTE (Common Table Expression) execution for the SQL executor
 
-use super::executor::Executor;
-use super::helpers::{cte_is_recursive, normalize_ident, set_expr_references_table};
-use super::ExecuteResult;
+use super::core::Executor;
+use super::super::helpers::{cte_is_recursive, normalize_ident, set_expr_references_table};
+use super::super::ExecuteResult;
 use crate::types::{ColumnDef, DataType, Row, TableSchema};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Ident, Query, SetExpr, SetOperator, SetQuantifier};

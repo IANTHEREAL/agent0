@@ -1,9 +1,9 @@
-use super::executor::Executor;
-use super::executor_functions_triggers::strip_leading_sql_comments;
-use super::helpers::normalize_ident;
-use super::names;
-use super::expr::eval_expr;
-use super::Session;
+use super::core::Executor;
+use super::triggers::strip_leading_sql_comments;
+use super::super::helpers::normalize_ident;
+use super::super::names;
+use super::super::expr::eval_expr;
+use super::super::Session;
 use crate::extensions::{descriptor, InstalledExtension};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, ObjectName, TableAlias};
@@ -226,7 +226,7 @@ impl Executor {
         &self,
         session: &mut Session,
         sql: &str,
-    ) -> Result<super::ExecuteResult> {
+    ) -> Result<super::super::ExecuteResult> {
         let (if_not_exists, ext_name) = parse_create_extension_sql(sql)?;
 
         if !session.is_superuser() {
@@ -262,7 +262,7 @@ impl Executor {
                 .is_some()
             {
                 if if_not_exists {
-                    return Ok(super::ExecuteResult::CreateExtension {
+                    return Ok(super::super::ExecuteResult::CreateExtension {
                         ext_name: ext_name.clone(),
                     });
                 }
@@ -272,7 +272,7 @@ impl Executor {
             let ext = InstalledExtension::new(desc);
             self.store().put_extension(txn, db_id, &ext).await?;
 
-            Ok(super::ExecuteResult::CreateExtension {
+            Ok(super::super::ExecuteResult::CreateExtension {
                 ext_name: ext_name.clone(),
             })
         }
@@ -293,7 +293,7 @@ impl Executor {
         &self,
         session: &mut Session,
         sql: &str,
-    ) -> Result<super::ExecuteResult> {
+    ) -> Result<super::super::ExecuteResult> {
         let (if_exists, ext_name) = parse_drop_extension_sql(sql)?;
 
         if !session.is_superuser() {
@@ -316,7 +316,7 @@ impl Executor {
                 return Err(anyhow!("extension \"{}\" does not exist", ext_name));
             }
 
-            Ok(super::ExecuteResult::DropExtension {
+            Ok(super::super::ExecuteResult::DropExtension {
                 ext_name: ext_name.clone(),
             })
         }
