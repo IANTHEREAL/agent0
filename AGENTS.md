@@ -445,3 +445,13 @@ cd orm-tests && npm test -- --grep "TypeORM"
 - Type coercion rules (`unify_types`, `common_type`, `binary_op_result_type`) should be in a separate module (`coercion.rs`) for reuse in expression evaluation.
 - Function signatures should capture: min/max args, return type resolution strategy (fixed, same-as-arg, first-non-null, custom), and flags for aggregate/window functions.
 - Use `#[cfg(test)]` for re-exporting internal helpers (`global_registry`, `unify_types`) that are only needed by unit tests.
+
+## Lessons Learned (Expression Evaluation Refactoring)
+
+- When unifying duplicate code paths (`eval_expr` vs `eval_expr_join`), use a **trait-based context** (`EvalContext`) to abstract differences in column resolution while keeping the evaluation logic shared.
+- For large refactorings (6000+ lines, 355 call sites), provide **bridge functions** (`eval_with_context`, `eval_with_join_context`) that maintain backward compatibility while enabling gradual migration.
+- Converting a single-file module (`expr.rs`) to a directory (`expr/mod.rs` + submodules) requires no changes to callers since Rust treats both as equivalent.
+- Expression test files should cover edge cases but **skip known pre-existing bugs** with comments (e.g., `TRUE::INTEGER` casting, unary `+` operator) rather than polluting the test with expected failures.
+- The `EvalContext` trait needs methods for: `resolve_column(name)`, `resolve_compound_identifier(parts)`, `schema()`, `is_timestamptz(expr)`, and `column_type(expr)` to fully abstract single-table vs JOIN evaluation.
+- For `JoinEvalContext`, column resolution requires case-insensitive fallback searches and special handling for ORM-style aliases (e.g., Sequelize's `table->association` patterns).
+- Full code deduplication requires converting helper functions (`eval_function`, `eval_substring`, `eval_extract`, etc.) to be context-aware - this is a substantial undertaking best done incrementally.

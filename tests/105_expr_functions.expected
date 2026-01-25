@@ -1,0 +1,621 @@
+section
+=== String Functions ===
+(1 row)
+upper_test
+HELLO
+(1 row)
+lower_test
+world
+(1 row)
+length_test
+4
+(1 row)
+concat_test
+abc
+(1 row)
+concat_ws_test
+a-b-c
+(1 row)
+left_test
+hel
+(1 row)
+right_test
+llo
+(1 row)
+substring_test
+ell
+(1 row)
+substr_test
+ell
+(1 row)
+trim_test
+hello
+(1 row)
+ltrim_test
+hello
+(1 row)
+rtrim_test
+hello
+(1 row)
+lpad_test
+00042
+(1 row)
+rpad_test
+42000
+(1 row)
+replace_test
+heLLo
+(1 row)
+reverse_test
+olleh
+(1 row)
+repeat_test
+ababab
+(1 row)
+split_part_test
+b
+(1 row)
+strpos_test
+3
+(1 row)
+position_test
+3
+(1 row)
+ascii_test
+65
+(1 row)
+chr_test
+A
+(1 row)
+initcap_test
+Hello World
+(1 row)
+translate_test
+hippo
+(1 row)
+md5_test
+098f6bcd4621d373cade4e832627b4f6
+(1 row)
+quote_ident_test
+"my table"
+(1 row)
+quote_literal_test
+'it''s'
+(1 row)
+quote_nullable_null_test
+NULL
+(1 row)
+quote_nullable_value_test
+'value'
+(1 row)
+section
+=== Math Functions ===
+(1 row)
+abs_test
+5
+(1 row)
+ceil_test
+5
+(1 row)
+ceiling_test
+5
+(1 row)
+floor_test
+4
+(1 row)
+round_test
+4.57
+(1 row)
+trunc_test
+4.5
+(1 row)
+sqrt_test
+4
+(1 row)
+cbrt_test
+3
+(1 row)
+power_test
+8
+(1 row)
+pow_test
+8
+(1 row)
+exp_test
+t
+(1 row)
+ln_test
+t
+(1 row)
+log_test
+2
+(1 row)
+sign_neg_test
+-1
+(1 row)
+sign_pos_test
+1
+(1 row)
+sign_zero_test
+0
+(1 row)
+mod_test
+1
+(1 row)
+modulo_op_test
+1
+(1 row)
+degrees_test
+t
+(1 row)
+radians_test
+t
+(1 row)
+sin_test
+0
+(1 row)
+cos_test
+1
+(1 row)
+tan_test
+0
+(1 row)
+pi_test
+t
+(1 row)
+random_test
+t
+(1 row)
+section
+=== Date/Time Functions ===
+(1 row)
+now_test
+t
+(1 row)
+current_timestamp_test
+t
+(1 row)
+current_date_test
+t
+(1 row)
+date_trunc_day_test
+2024-06-15 00:00:00
+(1 row)
+date_trunc_hour_test
+2024-06-15 14:00:00
+(1 row)
+date_trunc_month_test
+2024-06-01 00:00:00
+(1 row)
+extract_year_test
+2024
+(1 row)
+extract_month_test
+6
+(1 row)
+extract_day_test
+15
+(1 row)
+extract_hour_test
+14
+(1 row)
+date_literal_test
+2024-06-15
+(1 row)
+to_char_test
+2024-06-15
+(1 row)
+section
+=== JSON Functions ===
+(1 row)
+jsonb_arrow_test
+1
+(1 row)
+jsonb_double_arrow_test
+hello
+(1 row)
+jsonb_array_access_test
+1
+(1 row)
+jsonb_typeof_object_test
+object
+(1 row)
+jsonb_typeof_array_test
+array
+(1 row)
+jsonb_typeof_string_test
+string
+(1 row)
+jsonb_typeof_number_test
+number
+(1 row)
+jsonb_typeof_boolean_test
+boolean
+(1 row)
+jsonb_typeof_null_test
+null
+(1 row)
+jsonb_array_length_test
+3
+(1 row)
+jsonb_build_object_test
+{"a": 1, "b": "hello"}
+(1 row)
+jsonb_build_array_test
+[1, "a", true]
+(1 row)
+to_json_number_test
+123
+(1 row)
+to_jsonb_string_test
+"hello"
+(1 row)
+jsonb_extract_path_test
+1
+(1 row)
+jsonb_extract_path_text_test
+hello
+(1 row)
+jsonb_exists_true_test
+t
+(1 row)
+jsonb_exists_false_test
+f
+(1 row)
+jsonb_contains_test
+t
+(1 row)
+jsonb_contained_test
+t
+(1 row)
+jsonb_question_test
+t
+(1 row)
+section
+=== Array Functions ===
+(1 row)
+array_literal_test
+{1,2,3}
+(1 row)
+array_length_test
+3
+(1 row)
+array_upper_test
+3
+(1 row)
+array_lower_test
+1
+(1 row)
+cardinality_test
+3
+(1 row)
+array_position_test
+2
+(1 row)
+array_cat_test
+{1,2,3,4}
+(1 row)
+array_append_test
+{1,2,3}
+(1 row)
+array_prepend_test
+{0,1,2}
+(1 row)
+array_remove_test
+{1,3}
+(1 row)
+array_to_string_test
+a,b,c
+(1 row)
+string_to_array_test
+{a,b,c}
+(1 row)
+array_contains_test
+t
+(1 row)
+array_contained_test
+t
+(1 row)
+array_overlap_test
+t
+(1 row)
+section
+=== Regex Functions ===
+(1 row)
+regex_match_test
+t
+(1 row)
+regex_imatch_test
+t
+(1 row)
+regex_not_match_test
+t
+(1 row)
+regexp_replace_test
+hello there
+(1 row)
+regexp_replace_global_test
+hi hi
+(1 row)
+regexp_matches_test
+{123}
+(1 row)
+regexp_split_test
+{a,b,c}
+(1 row)
+section
+=== UUID Functions ===
+(1 row)
+uuid_length_test
+36
+(1 row)
+uuid_unique_test
+t
+(1 row)
+section
+=== Misc Functions ===
+(1 row)
+coalesce_test
+default
+(1 row)
+coalesce_first_test
+first
+(1 row)
+nullif_same_test
+NULL
+(1 row)
+nullif_diff_test
+1
+(1 row)
+greatest_test
+3
+(1 row)
+least_test
+1
+(1 row)
+pg_typeof_int_test
+integer
+(1 row)
+pg_typeof_text_test
+text
+(1 row)
+pg_typeof_bool_test
+boolean
+(1 row)
+version_test
+t
+(1 row)
+current_database_test
+t
+(1 row)
+current_schema_test
+public
+(1 row)
+current_user_test
+t
+(1 row)
+section
+=== Binary Operators ===
+(1 row)
+add_test
+3
+(1 row)
+sub_test
+2
+(1 row)
+mul_test
+12
+(1 row)
+div_test
+3
+(1 row)
+float_div_test
+t
+(1 row)
+lt_test
+t
+(1 row)
+gt_test
+t
+(1 row)
+le_test
+t
+(1 row)
+ge_test
+t
+(1 row)
+eq_test
+t
+(1 row)
+ne_test
+t
+(1 row)
+and_true_test
+t
+(1 row)
+and_false_test
+f
+(1 row)
+or_true_test
+t
+(1 row)
+or_false_test
+f
+(1 row)
+not_true_test
+f
+(1 row)
+not_false_test
+t
+(1 row)
+string_concat_test
+hello world
+(1 row)
+section
+=== CASE Expressions ===
+(1 row)
+case_simple_test
+positive
+(1 row)
+case_value_test
+one
+(1 row)
+case_null_test
+not null branch
+(1 row)
+section
+=== NULL Handling ===
+(1 row)
+is_null_test
+t
+(1 row)
+is_not_null_test
+t
+(1 row)
+null_eq_null_test
+NULL
+(1 row)
+coalesce_null_test
+1
+(1 row)
+section
+=== Type Casting ===
+(1 row)
+cast_int_to_text
+123
+(1 row)
+cast_text_to_int
+456
+(1 row)
+cast_float_to_int
+3
+(1 row)
+pg_cast_text_to_int
+123
+(1 row)
+pg_cast_int_to_text
+456
+(1 row)
+cast_int_to_bool
+t
+(1 row)
+section
+=== IN and BETWEEN ===
+(1 row)
+in_list_true_test
+t
+(1 row)
+in_list_false_test
+f
+(1 row)
+in_list_string_test
+t
+(1 row)
+between_true_test
+t
+(1 row)
+between_false_test
+f
+(1 row)
+not_between_test
+t
+(1 row)
+section
+=== LIKE and SIMILAR TO ===
+(1 row)
+like_prefix_test
+t
+(1 row)
+like_suffix_test
+t
+(1 row)
+like_contains_test
+t
+(1 row)
+like_single_char_test
+t
+(1 row)
+ilike_test
+t
+(1 row)
+not_like_test
+t
+(1 row)
+similar_to_test
+t
+(1 row)
+section
+=== Interval Arithmetic ===
+(1 row)
+interval_day_test
+1 day
+(1 row)
+interval_hour_test
+02:00:00
+(1 row)
+interval_minute_test
+00:30:00
+(1 row)
+timestamp_plus_interval_test
+2024-01-02 00:00:00
+(1 row)
+date_plus_interval_test
+2024-02-01 00:00:00
+(1 row)
+date_diff_test
+5
+(1 row)
+section
+=== Unary Operators ===
+(1 row)
+unary_minus_test
+-5
+(1 row)
+not_test
+f
+(1 row)
+section
+=== IS TRUE/FALSE/UNKNOWN ===
+(1 row)
+is_true_test
+t
+(1 row)
+is_false_test
+t
+(1 row)
+is_unknown_test
+t
+(1 row)
+is_not_false_test
+t
+(1 row)
+is_not_true_test
+t
+(1 row)
+section
+=== ANY/ALL Operators ===
+(1 row)
+any_eq_test
+t
+(1 row)
+all_gt_test
+t
+(1 row)
+all_lt_test
+t
+(1 row)
+section
+=== Encode/Decode ===
+(1 row)
+encode_hex_test
+68656c6c6f
+(1 row)
+encode_base64_test
+aGVsbG8=
+(1 row)
+decode_hex_test
+t
+(1 row)
+section
+=== All Expression Tests Complete ===
+(1 row)

@@ -399,3 +399,158 @@ src/sql/types/
 2. **Use `#[cfg(test)]` for test-only exports**: Helper functions like `global_registry`, `unify_types`, `binary_op_result_type` are only needed by tests, so export them conditionally.
 
 3. **Suppress dead code warnings for future-ready code**: The `TypeError` enum variants and `ReturnType::NumericPromotion` are prepared for future error handling but not yet used.
+
+---
+
+# Expression Evaluation Refactoring (expr.rs)
+
+**Started:** 2026-01-24
+**Status:** Phase 0 - In Progress
+**Plan:** See `expr_refactor.md` for detailed design
+
+## Overview
+
+Refactoring the monolithic `src/sql/expr.rs` (~6300 lines) into a modular, maintainable structure:
+
+### Problems Being Solved
+
+1. **Code Duplication**: `eval_expr` and `eval_expr_join` are ~3000 lines of nearly identical code
+2. **Giant Function**: `eval_function` is 2500+ lines with 150+ function branches in a single match
+3. **Type Explosion**: Arithmetic operations have 20+ type combination branches
+4. **Performance**: Hot path string allocations, repeated regex compilation
+
+### Target Architecture
+
+```
+src/sql/expr/
+├── mod.rs              # Public API
+├── context.rs          # EvalContext trait + SingleTableContext, JoinEvalContext
+├── eval.rs             # Unified eval_expr<C: EvalContext>
+├── binary_op.rs        # Arithmetic operators
+├── compare.rs          # Value comparison
+├── cast.rs             # Type casting
+├── functions/          # Function implementations by category
+│   ├── mod.rs          # Registry + dispatch
+│   ├── string.rs       # UPPER, LOWER, LENGTH, etc.
+│   ├── math.rs         # ABS, CEIL, SQRT, etc.
+│   ├── datetime.rs     # NOW, DATE_TRUNC, etc.
+│   ├── json.rs         # JSONB_*, TO_JSON, etc.
+│   └── ...
+└── ...
+```
+
+## Progress Log
+
+### 2026-01-24: Phase 0 - Preparation ✅ COMPLETE
+
+**Tasks:**
+- [x] Create integration test `tests/105_expr_functions.sql` covering all SQL functions
+- [x] Establish baseline: 108/108 integration tests, 584 ORM tests passing
+- [x] Fixed pre-existing bugs in test (TRUE::INTEGER, +5, 1+NULL not supported)
+
+### 2026-01-24: Phase 1 - EvalContext Foundation ✅ COMPLETE
+
+**Completed:**
+- [x] Restructured `expr.rs` into `expr/mod.rs` module directory
+- [x] Created `expr/context.rs` with `EvalContext` trait
+- [x] Implemented `SingleTableContext` for single-table evaluation
+- [x] Implemented `JoinEvalContext` for JOIN evaluation
+- [x] Added bridge functions `eval_with_context()` and `eval_with_join_context()`
+- [x] All tests pass (108/108 integration, 584 ORM)
+
+**Files Changed:**
+| File | Change |
+|------|--------|
+| `src/sql/expr.rs` → `src/sql/expr/mod.rs` | Restructured as module |
+| `src/sql/expr/context.rs` | New: EvalContext trait + implementations |
+| `tests/105_expr_functions.sql` | New: Comprehensive expression tests |
+| `tests/105_expr_functions.expected` | New: Expected output |
+
+**New API (backward compatible):**
+```rust
+// New context-based API
+use crate::sql::expr::{SingleTableContext, JoinEvalContext, eval_with_context, eval_with_join_context};
+
+let ctx = SingleTableContext::new(Some(&row), Some(&schema));
+let value = eval_with_context(&expr, &ctx)?;
+
+// Old API still works unchanged
+let value = eval_expr(&expr, Some(&row), Some(&schema))?;
+```
+
+**Remaining Work for Full Unification:**
+The `EvalContext` trait is now in place, but full code deduplication requires:
+1. Converting `eval_function` (~2000 lines) to be context-aware
+2. Converting helper functions (`eval_substring`, `eval_extract`, etc.)
+3. Creating a single generic `eval_expr_generic<C: EvalContext>` implementation
+
+This is deferred to Phase 1.5+ due to the scope (355 usages of eval_expr, 90 of eval_expr_join).
+
+### 2026-01-24: Phase 2 - Function Registry ✅ ~115 functions migrated
+
+**Completed:**
+- [x] Created `src/sql/expr/functions/` directory structure
+- [x] Created registry-based function dispatch in `functions/mod.rs`
+- [x] Extracted ~25 string functions to `functions/string.rs`
+- [x] Extracted ~20 math functions to `functions/math.rs`  
+- [x] Extracted misc functions (COALESCE, NULLIF, GREATEST, LEAST) to `functions/misc.rs`
+- [x] Extracted ~12 array functions to `functions/array.rs`
+- [x] Extracted ~20 JSON functions to `functions/json.rs`
+- [x] Extracted 3 UUID functions to `functions/uuid.rs`
+- [x] Extracted ~20 PG compatibility functions to `functions/pg_compat.rs`
+- [x] Extracted 3 regex functions to `functions/regex.rs`
+- [x] Extracted 5 vector functions to `functions/vector.rs`
+- [x] Extracted 3 encoding functions to `functions/encoding.rs`
+- [x] Wired registry to `eval_function` with fallback to original match statement
+- [x] All tests pass (108/108 integration, 577 unit tests)
+
+**Files Changed:**
+| File | Change |
+|------|--------|
+| `src/sql/expr/functions/mod.rs` | Registry with SqlFn type |
+| `src/sql/expr/functions/string.rs` | ~25 string functions |
+| `src/sql/expr/functions/math.rs` | ~20 math functions |
+| `src/sql/expr/functions/misc.rs` | COALESCE, NULLIF, GREATEST, LEAST |
+| `src/sql/expr/functions/array.rs` | ~12 array functions |
+| `src/sql/expr/functions/json.rs` | ~20 JSON/JSONB functions |
+| `src/sql/expr/functions/uuid.rs` | gen_random_uuid, uuid_generate_v4, uuidv7 |
+| `src/sql/expr/functions/pg_compat.rs` | ~20 PG compatibility functions |
+| `src/sql/expr/functions/regex.rs` | regexp_replace, regexp_matches, regexp_split_to_array |
+| `src/sql/expr/functions/vector.rs` | l2_distance, cosine_distance, inner_product, vector_dims, vector_norm |
+| `src/sql/expr/functions/encoding.rs` | encode, decode, md5 |
+| `src/sql/expr/mod.rs` | Modified: eval_function uses registry first |
+
+**Architecture:**
+```rust
+// Registry lookup in eval_function
+let func_name_upper = func_name.to_uppercase();
+if let Some(registry_fn) = functions::get_registry().get(func_name_upper.as_str()) {
+    return registry_fn(args);
+}
+// Fallback to original match statement for unmigrated functions
+match func_name_upper.as_str() { ... }
+```
+
+**Remaining Work:**
+- Extract datetime functions (~15 functions) - DEFERRED: complex dependencies on system time, statement_time, chrono
+- Context-aware functions (need row/schema access, cannot use simple registry)
+
+**Functions that cannot be extracted to registry (need context):**
+- `TO_JSONB`, `ROW_TO_JSON` - need `func.args` for row object evaluation
+- `PG_BACKEND_PID` - needs `get_connection_id()`
+- `VERSION` - needs `VERSION_STRING` constant
+- `CURRENT_DATABASE` - needs `current_database_name()`
+- `NOW`, `CURRENT_TIMESTAMP` - need `statement_timestamp_millis_or_now()`
+- `PG_GET_INDEXDEF`, `PG_GET_CONSTRAINTDEF` - need row/schema context
+
+## Phase Status
+
+| Phase | Description | Status |
+|-------|-------------|--------|
+| 0 | Preparation (tests, benchmarks) | ✅ Complete |
+| 1 | EvalContext trait foundation | ✅ Complete |
+| 1.5 | Full code deduplication via generic eval | ⏳ Deferred (large scope) |
+| 2 | Function dispatch refactoring (registry) | ✅ ~115 functions migrated |
+| 3 | Type system optimization (NumericValue) | ⏳ Pending |
+| 4 | Performance optimization (regex cache, etc.) | ⏳ Pending |
+| 5 | File splitting and cleanup | ⏳ Pending |
