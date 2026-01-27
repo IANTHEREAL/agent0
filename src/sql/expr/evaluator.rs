@@ -5,10 +5,111 @@ use super::{
     parse_timezone_offset_seconds, similar_to_match,
 };
 use super::operators::{parse_bool_pg, try_coerce_text_to_numeric};
-use crate::types::Value;
+use crate::types::{DataType, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::BinaryOperator;
 use sqlparser::ast::Expr;
+
+fn ensure_boolean_or_null_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg: &'static str) -> Result<()> {
+    use sqlparser::ast::UnaryOperator;
+    use sqlparser::ast::Value as SqlValue;
+
+    match expr {
+        Expr::Nested(inner) => ensure_boolean_or_null_operand(ctx, inner, err_msg),
+        Expr::Value(SqlValue::Boolean(_)) | Expr::Value(SqlValue::Null) => Ok(()),
+
+        Expr::Value(
+            SqlValue::SingleQuotedString(s)
+            | SqlValue::DoubleQuotedString(s)
+            | SqlValue::EscapedStringLiteral(s),
+        ) => {
+            if parse_bool_pg(s).is_some() {
+                Ok(())
+            } else {
+                Err(anyhow!(err_msg))
+            }
+        }
+
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => match ctx.column_type(expr) {
+            Some(DataType::Boolean) | Some(DataType::Text) => Ok(()),
+            _ => Err(anyhow!(err_msg)),
+        },
+
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: inner,
+        } => ensure_boolean_or_null_operand(ctx, inner, err_msg),
+
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And | BinaryOperator::Or => {
+                ensure_boolean_or_null_operand(ctx, left, err_msg)?;
+                ensure_boolean_or_null_operand(ctx, right, err_msg)
+            }
+
+            // Operators that always return boolean (or NULL), regardless of operand types.
+            BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Gt
+            | BinaryOperator::Lt
+            | BinaryOperator::GtEq
+            | BinaryOperator::LtEq
+            | BinaryOperator::PGOverlap
+            | BinaryOperator::PGRegexMatch
+            | BinaryOperator::PGRegexIMatch
+            | BinaryOperator::PGRegexNotMatch
+            | BinaryOperator::PGRegexNotIMatch => Ok(()),
+
+            // PostgreSQL JSONB existence operator: `jsonb ? text`
+            BinaryOperator::Custom(op) if op == "?" => Ok(()),
+            BinaryOperator::PGCustomBinaryOperator(op) if op.len() == 1 && op[0] == "?" => Ok(()),
+
+            _ => Err(anyhow!(err_msg)),
+        },
+
+        Expr::Like { .. }
+        | Expr::ILike { .. }
+        | Expr::SimilarTo { .. }
+        | Expr::Between { .. }
+        | Expr::InList { .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotFalse(_)
+        | Expr::IsUnknown(_)
+        | Expr::IsNotUnknown(_) => Ok(()),
+
+        Expr::Cast { data_type, .. } => match data_type {
+            sqlparser::ast::DataType::Boolean => Ok(()),
+            _ => Err(anyhow!(err_msg)),
+        },
+
+        Expr::Case {
+            results,
+            else_result,
+            ..
+        } => {
+            for result in results {
+                ensure_boolean_or_null_operand(ctx, result, err_msg)?;
+            }
+            if let Some(else_expr) = else_result {
+                ensure_boolean_or_null_operand(ctx, else_expr, err_msg)?;
+            }
+            Ok(())
+        }
+
+        // Fallback to type inference for expression forms we don't explicitly classify above.
+        other => {
+            let empty_schema = TableSchema::default();
+            let schema = ctx.schema().unwrap_or(&empty_schema);
+            match crate::sql::types::infer_expr_type(other, schema) {
+                DataType::Boolean => Ok(()),
+                _ => Err(anyhow!(err_msg)),
+            }
+        }
+    }
+}
 
 pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
     match expr {
@@ -23,8 +124,17 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => {
                 let left_val = eval_expr_impl(ctx, left)?;
+                let left_val = match left_val {
+                    Value::Text(s) => parse_bool_pg(&s)
+                        .map(Value::Boolean)
+                        .unwrap_or(Value::Text(s)),
+                    other => other,
+                };
                 match &left_val {
-                    Value::Boolean(false) => Ok(Value::Boolean(false)),
+                    Value::Boolean(false) => {
+                        ensure_boolean_or_null_operand(ctx, right, "AND requires boolean operands")?;
+                        Ok(Value::Boolean(false))
+                    }
                     Value::Boolean(true) | Value::Null => {
                         let right_val = eval_expr_impl(ctx, right)?;
                         eval_binary_op(left_val, op, right_val)
@@ -34,8 +144,17 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             }
             BinaryOperator::Or => {
                 let left_val = eval_expr_impl(ctx, left)?;
+                let left_val = match left_val {
+                    Value::Text(s) => parse_bool_pg(&s)
+                        .map(Value::Boolean)
+                        .unwrap_or(Value::Text(s)),
+                    other => other,
+                };
                 match &left_val {
-                    Value::Boolean(true) => Ok(Value::Boolean(true)),
+                    Value::Boolean(true) => {
+                        ensure_boolean_or_null_operand(ctx, right, "OR requires boolean operands")?;
+                        Ok(Value::Boolean(true))
+                    }
                     Value::Boolean(false) | Value::Null => {
                         let right_val = eval_expr_impl(ctx, right)?;
                         eval_binary_op(left_val, op, right_val)

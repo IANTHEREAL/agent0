@@ -2307,6 +2307,25 @@ mod tests {
     }
 
     #[test]
+    fn test_eval_logical_short_circuit_does_not_hide_type_errors() {
+        // Short-circuit must not mask RHS type errors.
+        assert!(eval_expr(&parse_expr("TRUE OR 42"), None, None).is_err());
+        assert!(eval_expr(&parse_expr("FALSE AND 1 / 0"), None, None).is_err());
+        assert!(eval_expr(&parse_expr("TRUE OR (FALSE AND 42)"), None, None).is_err());
+        assert!(eval_expr(&parse_expr("FALSE AND (TRUE OR 42)"), None, None).is_err());
+
+        // Explicit NULL is allowed as a boolean operand.
+        assert_eq!(
+            eval_expr(&parse_expr("FALSE AND NULL"), None, None).unwrap(),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("TRUE OR NULL"), None, None).unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
     fn test_eval_nested() {
         assert_eq!(
             eval_expr(&parse_expr("(1 + 2) * 3"), None, None).unwrap(),
