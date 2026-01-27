@@ -1684,6 +1684,8 @@ impl Executor {
                     new_combined_rows.push(Row::new(combined_values));
                 }
             }
+            let join_group_start = combined_schemas.len();
+            let join_group_base_alias = extra_alias.clone();
             combined_schemas.push((extra_alias, extra_schema));
             combined_rows = new_combined_rows;
 
@@ -1767,16 +1769,296 @@ impl Executor {
                     _ => return Err(anyhow!("Unsupported join table factor")),
                 };
 
-                let mut new_rows = Vec::new();
-                for left_row in &combined_rows {
-                    for right_row in &join_rows {
-                        let mut combined_values = left_row.values.clone();
-                        combined_values.extend(right_row.values.clone());
-                        new_rows.push(Row::new(combined_values));
+                let (join_condition, is_natural) = match &extra_join.join_operator {
+                    JoinOperator::Inner(JoinConstraint::On(expr))
+                    | JoinOperator::LeftOuter(JoinConstraint::On(expr))
+                    | JoinOperator::RightOuter(JoinConstraint::On(expr))
+                    | JoinOperator::FullOuter(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
+                    JoinOperator::Inner(JoinConstraint::Natural)
+                    | JoinOperator::LeftOuter(JoinConstraint::Natural)
+                    | JoinOperator::RightOuter(JoinConstraint::Natural)
+                    | JoinOperator::FullOuter(JoinConstraint::Natural) => {
+                        let left_columns: Vec<String> = combined_schemas[join_group_start..]
+                            .iter()
+                            .flat_map(|(_, s)| s.columns.iter().map(|c| c.name.clone()))
+                            .collect();
+                        let right_columns: HashSet<String> = join_schema
+                            .columns
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .collect();
+                        let common_cols: Vec<String> = left_columns
+                            .iter()
+                            .filter(|c| right_columns.contains(*c))
+                            .cloned()
+                            .collect();
+                        has_natural_join = true;
+                        natural_join_common_cols = common_cols.clone();
+                        if common_cols.is_empty() {
+                            (None, true)
+                        } else {
+                            let cond = common_cols
+                                .iter()
+                                .map(|col| Expr::BinaryOp {
+                                    left: Box::new(Expr::CompoundIdentifier(vec![
+                                        Ident::new(
+                                            combined_schemas[join_group_start..]
+                                                .iter()
+                                                .find(|(_, s)| {
+                                                    s.columns
+                                                        .iter()
+                                                        .any(|c| c.name.eq_ignore_ascii_case(col))
+                                                })
+                                                .map(|(a, _)| a.clone())
+                                                .unwrap_or_else(|| join_group_base_alias.clone()),
+                                        ),
+                                        Ident::new(col.clone()),
+                                    ])),
+                                    op: BinaryOperator::Eq,
+                                    right: Box::new(Expr::CompoundIdentifier(vec![
+                                        Ident::new(join_alias.clone()),
+                                        Ident::new(col.clone()),
+                                    ])),
+                                })
+                                .reduce(|a, b| Expr::BinaryOp {
+                                    left: Box::new(a),
+                                    op: BinaryOperator::And,
+                                    right: Box::new(b),
+                                })
+                                .unwrap();
+                            (Some(cond), true)
+                        }
+                    }
+                    JoinOperator::Inner(JoinConstraint::Using(cols))
+                    | JoinOperator::LeftOuter(JoinConstraint::Using(cols))
+                    | JoinOperator::RightOuter(JoinConstraint::Using(cols))
+                    | JoinOperator::FullOuter(JoinConstraint::Using(cols)) => {
+                        let using_cols: Vec<String> =
+                            cols.iter().map(|c| normalize_ident(c)).collect();
+                        has_natural_join = true;
+                        natural_join_common_cols = using_cols.clone();
+                        if using_cols.is_empty() {
+                            (None, true)
+                        } else {
+                            let left_alias = combined_schemas[join_group_start..]
+                                .iter()
+                                .find(|(_, s)| {
+                                    s.columns
+                                        .iter()
+                                        .any(|c| c.name.eq_ignore_ascii_case(&using_cols[0]))
+                                })
+                                .map(|(a, _)| a.clone())
+                                .unwrap_or_else(|| join_group_base_alias.clone());
+                            let cond = using_cols
+                                .iter()
+                                .map(|col| Expr::BinaryOp {
+                                    left: Box::new(Expr::CompoundIdentifier(vec![
+                                        Ident::new(left_alias.clone()),
+                                        Ident::new(col.clone()),
+                                    ])),
+                                    op: BinaryOperator::Eq,
+                                    right: Box::new(Expr::CompoundIdentifier(vec![
+                                        Ident::new(join_alias.clone()),
+                                        Ident::new(col.clone()),
+                                    ])),
+                                })
+                                .reduce(|a, b| Expr::BinaryOp {
+                                    left: Box::new(a),
+                                    op: BinaryOperator::And,
+                                    right: Box::new(b),
+                                })
+                                .unwrap();
+                            (Some(cond), true)
+                        }
+                    }
+                    JoinOperator::CrossJoin => (None, false),
+                    JoinOperator::Inner(JoinConstraint::None) => (None, false),
+                    _ => return Err(anyhow!("Unsupported JOIN type")),
+                };
+                let _ = is_natural;
+
+                let has_correlated_subquery = join_condition.as_ref().map_or(false, |cond| {
+                    combined_schemas.iter().any(|(alias, _)| {
+                        super::super::helpers::query_has_outer_reference_in_expr(cond, alias)
+                    })
+                });
+
+                let join_condition = if let Some(cond) = join_condition {
+                    if has_correlated_subquery {
+                        Some(cond)
+                    } else {
+                        Some(
+                            self.resolve_subqueries(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                &cond,
+                                ctes,
+                            )
+                            .await?,
+                        )
+                    }
+                } else {
+                    None
+                };
+
+                let is_left_join =
+                    matches!(&extra_join.join_operator, JoinOperator::LeftOuter(_));
+                let is_right_join =
+                    matches!(&extra_join.join_operator, JoinOperator::RightOuter(_));
+                let is_full_join =
+                    matches!(&extra_join.join_operator, JoinOperator::FullOuter(_));
+
+                let left_col_count: usize =
+                    combined_schemas.iter().map(|(_, s)| s.columns.len()).sum();
+
+                let mut column_offsets: HashMap<String, usize> = HashMap::new();
+                let mut offset = 0;
+                for (alias, schema) in &combined_schemas {
+                    for col in &schema.columns {
+                        column_offsets.insert(format!("{}.{}", alias, col.name), offset);
+                        if !column_offsets.contains_key(&col.name) {
+                            column_offsets.insert(col.name.clone(), offset);
+                        }
+                        offset += 1;
                     }
                 }
-                combined_schemas.push((join_alias, join_schema));
-                combined_rows = new_rows;
+                for col in &join_schema.columns {
+                    column_offsets.insert(format!("{}.{}", join_alias, col.name), offset);
+                    if !column_offsets.contains_key(&col.name) {
+                        column_offsets.insert(col.name.clone(), offset);
+                    }
+                    if col.name.contains('.') {
+                        column_offsets.insert(col.name.clone(), offset);
+                    }
+                    offset += 1;
+                }
+
+                let mut combined_col_defs: Vec<ColumnDef> = Vec::new();
+                for (_, schema) in &combined_schemas {
+                    combined_col_defs.extend(schema.columns.clone());
+                }
+                combined_col_defs.extend(join_schema.columns.clone());
+                let temp_combined_schema = TableSchema {
+                    name: "joined".to_string(),
+                    table_id: 0,
+                    columns: combined_col_defs,
+                    version: 1,
+                    pk_constraint_name: None,
+                    pk_indices: vec![],
+                    indexes: vec![],
+                    check_constraints: vec![],
+                    foreign_keys: vec![],
+                    owner: String::new(),
+                };
+
+                let mut right_matched: Vec<bool> = vec![false; join_rows.len()];
+                let mut new_combined_rows = Vec::new();
+
+                for left_row in &combined_rows {
+                    let mut matched = false;
+
+                    let resolved_condition = if has_correlated_subquery {
+                        if let Some(ref cond) = join_condition {
+                            let mut substituted = cond.clone();
+                            let mut value_offset = 0;
+                            for (alias, schema) in &combined_schemas {
+                                let row_values: Vec<Value> = left_row.values
+                                    [value_offset..value_offset + schema.columns.len()]
+                                    .to_vec();
+                                let outer_row = Row::new(row_values);
+                                substituted = super::super::helpers::substitute_outer_values(
+                                    &substituted,
+                                    alias,
+                                    schema,
+                                    &outer_row,
+                                );
+                                value_offset += schema.columns.len();
+                            }
+                            Some(
+                                self.resolve_subqueries(
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    &substituted,
+                                    ctes,
+                                )
+                                .await?,
+                            )
+                        } else {
+                            None
+                        }
+                    } else {
+                        join_condition.clone()
+                    };
+
+                    for (right_idx, right_row) in join_rows.iter().enumerate() {
+                        let mut combined_values = Vec::with_capacity(
+                            left_row.values.len() + right_row.values.len(),
+                        );
+                        combined_values.extend(left_row.values.iter().cloned());
+                        combined_values.extend(right_row.values.iter().cloned());
+                        let combined_row = Row::new(combined_values);
+
+                        let matches = if let Some(ref cond) = resolved_condition {
+                            let ctx = JoinContext {
+                                tables: HashMap::new(),
+                                column_offsets: column_offsets.clone(),
+                                combined_row: &combined_row,
+                                combined_schema: &temp_combined_schema,
+                            };
+                            matches!(
+                                self.eval_expr_join_maybe_sequence(
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    cond,
+                                    &ctx
+                                )
+                                .await?,
+                                Value::Boolean(true)
+                            )
+                        } else {
+                            true
+                        };
+
+                        if matches {
+                            new_combined_rows.push(combined_row);
+                            matched = true;
+                            right_matched[right_idx] = true;
+                        }
+                    }
+
+                    if (is_left_join || is_full_join) && !matched {
+                        let mut combined_values = Vec::with_capacity(
+                            left_row.values.len() + join_schema.columns.len(),
+                        );
+                        combined_values.extend(left_row.values.iter().cloned());
+                        combined_values.extend(
+                            std::iter::repeat(Value::Null).take(join_schema.columns.len()),
+                        );
+                        new_combined_rows.push(Row::new(combined_values));
+                    }
+                }
+
+                if is_right_join || is_full_join {
+                    for (right_idx, right_row) in join_rows.iter().enumerate() {
+                        if !right_matched[right_idx] {
+                            let mut combined_values: Vec<Value> =
+                                Vec::with_capacity(left_col_count + right_row.values.len());
+                            combined_values
+                                .extend(std::iter::repeat(Value::Null).take(left_col_count));
+                            combined_values.extend(right_row.values.iter().cloned());
+                            new_combined_rows.push(Row::new(combined_values));
+                        }
+                    }
+                }
+
+                combined_schemas.push((join_alias.clone(), join_schema));
+                combined_rows = new_combined_rows;
             }
         }
 
