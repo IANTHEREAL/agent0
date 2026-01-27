@@ -1450,6 +1450,12 @@ impl DynamicPgHandler {
         Ok(vec![])
     }
 
+    fn ensure_auth_bootstrapped(
+        bootstrap_result: Result<(), anyhow::Error>,
+    ) -> Result<(), String> {
+        bootstrap_result.map_err(|e| format!("Failed to bootstrap auth: {}", e))
+    }
+
     async fn authenticate_user(
         &self,
         keyspace: &Option<String>,
@@ -1491,7 +1497,7 @@ impl DynamicPgHandler {
 
         let auth_manager = AuthManager::new();
 
-        // Try bootstrap with error handling for gRPC transport issues
+        // Try bootstrap. Any failure must deny authentication.
         let bootstrap_result = async {
             let mut txn = store.begin().await?;
             auth_manager.bootstrap(&mut txn).await?;
@@ -1500,14 +1506,7 @@ impl DynamicPgHandler {
         }
         .await;
 
-        if let Err(e) = bootstrap_result {
-            let err_str = e.to_string();
-            if err_str.contains("gRPC") || err_str.contains("transport") {
-                warn!("Auth bootstrap failed with transport error (TiKV issue), allowing connection: {}", e);
-                return Ok((true, true));
-            }
-            return Err(format!("Failed to bootstrap auth: {}", e));
-        }
+        Self::ensure_auth_bootstrapped(bootstrap_result)?;
 
         let mut txn = store
             .begin()
@@ -3723,6 +3722,15 @@ mod tests {
         let (ks, user) = parse_tenant_username("tenant. user");
         assert_eq!(ks, Some("tenant".to_string()));
         assert_eq!(user, " user");
+    }
+
+    #[test]
+    fn test_auth_bootstrap_transport_errors_do_not_authenticate() {
+        let err = anyhow::anyhow!("gRPC transport error: connection reset");
+        assert!(DynamicPgHandler::ensure_auth_bootstrapped(Err(err)).is_err());
+
+        let err = anyhow::anyhow!("transport error");
+        assert!(DynamicPgHandler::ensure_auth_bootstrapped(Err(err)).is_err());
     }
 
     #[test]
