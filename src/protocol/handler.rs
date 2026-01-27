@@ -2,9 +2,10 @@ use crate::auth::AuthManager;
 use crate::observability;
 use crate::pool::TikvClientPool;
 use crate::sql::expr::set_connection_id;
+use crate::sql::types::{TypeContext, TypeInferrer};
 use crate::sql::{ExecuteResult, Executor, Session};
 use crate::storage::TikvStore;
-use crate::types::{DataType, Value};
+use crate::types::{ColumnDef, DataType, TableSchema, Value};
 use async_trait::async_trait;
 use futures::{stream, Sink, SinkExt};
 use pgwire::api::auth::{ServerParameterProvider, StartupHandler};
@@ -26,7 +27,10 @@ use pgwire::messages::data::DataRow;
 use pgwire::messages::response::{CommandComplete, ErrorResponse, NoticeResponse};
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
-use sqlparser::ast::{Expr, ObjectName, SelectItem, Statement, TableFactor};
+use sqlparser::ast::{
+    Expr, Ident, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
+    TableWithJoins, Values,
+};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -753,6 +757,479 @@ async fn infer_returning_fields_from_statement(
     }
 }
 
+#[derive(Debug, Clone)]
+struct InferredColumn {
+    name: String,
+    data_type: DataType,
+}
+
+#[derive(Debug, Clone)]
+struct SourceSchema {
+    alias: String,
+    schema: TableSchema,
+}
+
+fn stub_describe_field() -> Vec<FieldInfo> {
+    vec![FieldInfo::new(
+        "column".to_string(),
+        None,
+        None,
+        Type::TEXT,
+        FieldFormat::Text,
+    )]
+}
+
+fn select_item_output_name(item: &SelectItem) -> String {
+    match item {
+        SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+        SelectItem::UnnamedExpr(expr) => expr_output_name(expr),
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => "*".to_string(),
+    }
+}
+
+fn expr_output_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Identifier(id) => id.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|p| p.value.clone())
+            .unwrap_or_else(|| "?column?".to_string()),
+        Expr::Function(f) => {
+            if let Some(last_ident) = f.name.0.last() {
+                last_ident.value.to_lowercase()
+            } else {
+                "?column?".to_string()
+            }
+        }
+        Expr::Case { .. } => "case".to_string(),
+        Expr::Cast { data_type, .. } => {
+            use sqlparser::ast::DataType as SqlDataType;
+            match data_type {
+                SqlDataType::Int(_) | SqlDataType::Integer(_) => "int4".to_string(),
+                SqlDataType::BigInt(_) => "int8".to_string(),
+                SqlDataType::SmallInt(_) => "int2".to_string(),
+                SqlDataType::Text => "text".to_string(),
+                SqlDataType::Varchar(_) | SqlDataType::CharVarying(_) => "varchar".to_string(),
+                SqlDataType::Boolean => "bool".to_string(),
+                SqlDataType::Float(_) | SqlDataType::Real => "float4".to_string(),
+                SqlDataType::Double | SqlDataType::DoublePrecision => "float8".to_string(),
+                SqlDataType::Numeric(_) | SqlDataType::Decimal(_) => "numeric".to_string(),
+                SqlDataType::Timestamp(_, _) => "timestamp".to_string(),
+                SqlDataType::Date => "date".to_string(),
+                SqlDataType::Uuid => "uuid".to_string(),
+                SqlDataType::JSON => "json".to_string(),
+                _ => data_type.to_string().to_lowercase(),
+            }
+        }
+        Expr::Substring { .. } => "substring".to_string(),
+        Expr::Trim { .. } => "btrim".to_string(),
+        Expr::Position { .. } => "position".to_string(),
+        Expr::Extract { .. } => "extract".to_string(),
+        Expr::Subquery(_) => "subquery".to_string(),
+        Expr::Nested(inner) => expr_output_name(inner),
+        _ => "?column?".to_string(),
+    }
+}
+
+fn inferred_columns_to_fields(cols: Vec<InferredColumn>) -> Vec<FieldInfo> {
+    cols.into_iter()
+        .map(|c| {
+            FieldInfo::new(
+                c.name,
+                None,
+                None,
+                datatype_to_pgtype(Some(&c.data_type)),
+                FieldFormat::Text,
+            )
+        })
+        .collect()
+}
+
+fn schema_from_inferred_columns(name: String, cols: &[InferredColumn]) -> TableSchema {
+    let columns = cols
+        .iter()
+        .map(|c| ColumnDef {
+            name: c.name.clone(),
+            data_type: c.data_type.clone(),
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        })
+        .collect();
+    TableSchema::new(name, 0, columns, Vec::new())
+}
+
+fn apply_column_aliases(schema: &mut TableSchema, aliases: &[Ident]) {
+    for (idx, ident) in aliases.iter().enumerate() {
+        if let Some(col) = schema.columns.get_mut(idx) {
+            col.name = normalize_sql_ident(ident);
+        }
+    }
+}
+
+fn base_table_name(full: &str) -> &str {
+    full.rsplit('.').next().unwrap_or(full)
+}
+
+async fn infer_query_output_columns(
+    store: &Arc<TikvStore>,
+    session: &mut Session,
+    query: &Query,
+) -> Option<Vec<InferredColumn>> {
+    let search_path = session.search_path().to_vec();
+    let search_path = search_path.as_slice();
+    let db_id = session.current_database_id();
+    let outer_ctes: HashMap<String, TableSchema> = HashMap::new();
+
+    if let Some(txn) = session.get_mut_txn() {
+        infer_query_output_columns_with_txn(store.as_ref(), txn, db_id, search_path, query, &outer_ctes).await
+    } else {
+        let mut temp_txn = store.begin().await.ok()?;
+        let cols = infer_query_output_columns_with_txn(
+            store.as_ref(),
+            &mut temp_txn,
+            db_id,
+            search_path,
+            query,
+            &outer_ctes,
+        )
+        .await;
+        let _ = temp_txn.rollback().await;
+        cols
+    }
+}
+
+async fn build_cte_schemas_with_txn(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    query: &Query,
+    outer_ctes: &HashMap<String, TableSchema>,
+) -> Option<HashMap<String, TableSchema>> {
+    let with = query.with.as_ref()?;
+    if with.recursive {
+        return None;
+    }
+
+    let mut ctes = outer_ctes.clone();
+    for cte in &with.cte_tables {
+        let cte_name = normalize_sql_ident(&cte.alias.name);
+        let mut cols = Box::pin(infer_query_output_columns_with_txn(
+            store,
+            txn,
+            db_id,
+            search_path,
+            &cte.query,
+            &ctes,
+        ))
+        .await?;
+
+        if !cte.alias.columns.is_empty() {
+            for (idx, ident) in cte.alias.columns.iter().enumerate() {
+                if let Some(col) = cols.get_mut(idx) {
+                    col.name = normalize_sql_ident(ident);
+                }
+            }
+        }
+
+        ctes.insert(cte_name.clone(), schema_from_inferred_columns(cte_name, &cols));
+    }
+    Some(ctes)
+}
+
+async fn infer_query_output_columns_with_txn(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    query: &Query,
+    outer_ctes: &HashMap<String, TableSchema>,
+) -> Option<Vec<InferredColumn>> {
+    let ctes = build_cte_schemas_with_txn(store, txn, db_id, search_path, query, outer_ctes)
+        .await
+        .unwrap_or_else(|| outer_ctes.clone());
+
+    infer_setexpr_output_columns_with_txn(store, txn, db_id, search_path, &query.body, &ctes).await
+}
+
+async fn infer_setexpr_output_columns_with_txn(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    body: &SetExpr,
+    ctes: &HashMap<String, TableSchema>,
+) -> Option<Vec<InferredColumn>> {
+    match body {
+        SetExpr::Select(select) => {
+            infer_select_output_columns_with_txn(store, txn, db_id, search_path, select, ctes).await
+        }
+        SetExpr::Values(values) => infer_values_output_columns(values),
+        SetExpr::SetOperation { left, .. } => {
+            Box::pin(infer_setexpr_output_columns_with_txn(
+                store,
+                txn,
+                db_id,
+                search_path,
+                left,
+                ctes,
+            ))
+            .await
+        }
+        _ => None,
+    }
+}
+
+fn infer_values_output_columns(values: &Values) -> Option<Vec<InferredColumn>> {
+    let first = values.rows.first()?;
+    let ctx = TypeContext::empty();
+    let mut inferrer = TypeInferrer::new(ctx);
+
+    Some(
+        first
+            .iter()
+            .enumerate()
+            .map(|(idx, expr)| InferredColumn {
+                name: format!("column{}", idx + 1),
+                data_type: inferrer.infer(expr).unwrap_or(DataType::Text),
+            })
+            .collect(),
+    )
+}
+
+async fn collect_sources_from_table_with_joins(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    twj: &TableWithJoins,
+    ctes: &HashMap<String, TableSchema>,
+    out: &mut Vec<SourceSchema>,
+) -> Option<()> {
+    collect_sources_from_table_factor(store, txn, db_id, search_path, &twj.relation, ctes, out)
+        .await?;
+    for join in &twj.joins {
+        collect_sources_from_table_factor(store, txn, db_id, search_path, &join.relation, ctes, out)
+            .await?;
+    }
+    Some(())
+}
+
+async fn collect_sources_from_table_factor(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    factor: &TableFactor,
+    ctes: &HashMap<String, TableSchema>,
+    out: &mut Vec<SourceSchema>,
+) -> Option<()> {
+    match factor {
+        TableFactor::Table { name, alias, args, .. } => {
+            // Reject table-valued functions (args present).
+            if args.is_some() {
+                return None;
+            }
+
+            let (schema_opt, obj_name_norm) = split_object_name_for_catalog(name)?;
+            let mut schema = if schema_opt.is_none() {
+                match ctes.get(&obj_name_norm) {
+                    Some(cte_schema) => cte_schema.clone(),
+                    None => resolve_table_schema_for_object_name(store, txn, db_id, name, search_path)
+                        .await?,
+                }
+            } else {
+                resolve_table_schema_for_object_name(store, txn, db_id, name, search_path).await?
+            };
+
+            let alias_name = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| name.0.last().map(|i| i.value.clone()).unwrap_or_default());
+            if alias_name.is_empty() {
+                return None;
+            }
+
+            if let Some(alias) = alias {
+                if !alias.columns.is_empty() {
+                    apply_column_aliases(&mut schema, &alias.columns);
+                }
+            }
+
+            out.push(SourceSchema {
+                alias: alias_name,
+                schema,
+            });
+            Some(())
+        }
+        TableFactor::Derived { subquery, alias, .. } => {
+            let alias = alias.as_ref()?;
+            let alias_name = alias.name.value.clone();
+            if alias_name.is_empty() {
+                return None;
+            }
+
+            let cols = infer_query_output_columns_with_txn(
+                store,
+                txn,
+                db_id,
+                search_path,
+                subquery.as_ref(),
+                ctes,
+            );
+            let mut cols = Box::pin(cols).await?;
+
+            if !alias.columns.is_empty() {
+                for (idx, ident) in alias.columns.iter().enumerate() {
+                    if let Some(col) = cols.get_mut(idx) {
+                        col.name = normalize_sql_ident(ident);
+                    }
+                }
+            }
+
+            out.push(SourceSchema {
+                alias: alias_name.clone(),
+                schema: schema_from_inferred_columns(alias_name, &cols),
+            });
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+async fn infer_select_output_columns_with_txn(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    select: &Select,
+    ctes: &HashMap<String, TableSchema>,
+) -> Option<Vec<InferredColumn>> {
+    let mut sources = Vec::new();
+    for twj in &select.from {
+        collect_sources_from_table_with_joins(store, txn, db_id, search_path, twj, ctes, &mut sources).await?;
+    }
+
+    let mut ctx = TypeContext::empty();
+    for src in &sources {
+        ctx.add_table(&src.alias, &src.schema);
+    }
+    let mut inferrer = TypeInferrer::new(ctx);
+
+    let mut out_cols = Vec::new();
+    for item in &select.projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                if sources.is_empty() {
+                    return None;
+                }
+                for src in &sources {
+                    out_cols.extend(src.schema.columns.iter().map(|c| InferredColumn {
+                        name: c.name.clone(),
+                        data_type: c.data_type.clone(),
+                    }));
+                }
+            }
+            SelectItem::QualifiedWildcard(obj, _) => {
+                if sources.is_empty() {
+                    return None;
+                }
+                let target = obj.0.last().map(|i| i.value.as_str())?;
+                let src = sources.iter().find(|s| {
+                    s.alias.eq_ignore_ascii_case(target)
+                        || base_table_name(&s.schema.name).eq_ignore_ascii_case(target)
+                })?;
+                out_cols.extend(src.schema.columns.iter().map(|c| InferredColumn {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                }));
+            }
+            SelectItem::UnnamedExpr(expr) => {
+                out_cols.push(InferredColumn {
+                    name: select_item_output_name(item),
+                    data_type: inferrer.infer(expr).unwrap_or(DataType::Text),
+                });
+            }
+            SelectItem::ExprWithAlias { expr, alias } => {
+                out_cols.push(InferredColumn {
+                    name: alias.value.clone(),
+                    data_type: inferrer.infer(expr).unwrap_or(DataType::Text),
+                });
+            }
+        }
+    }
+
+    Some(out_cols)
+}
+
+async fn infer_result_fields_from_query_ast(
+    store: &Arc<TikvStore>,
+    session: &mut Session,
+    query: &str,
+) -> Vec<FieldInfo> {
+    let query_trimmed = query.trim();
+    if query_trimmed.is_empty() {
+        return vec![];
+    }
+
+    let parsed_stmt = crate::sql::parse_sql(query_trimmed)
+        .ok()
+        .and_then(|stmts| stmts.into_iter().next());
+    let query_upper = query_trimmed.to_uppercase();
+
+    let is_select_str = query_upper.starts_with("SELECT") || query_upper.starts_with("WITH");
+    let has_returning_str = query_upper.contains("RETURNING");
+    let should_infer = matches!(
+        parsed_stmt,
+        Some(Statement::Query(_))
+            | Some(Statement::Insert {
+                returning: Some(_),
+                ..
+            })
+            | Some(Statement::Update {
+                returning: Some(_),
+                ..
+            })
+            | Some(Statement::Delete {
+                returning: Some(_),
+                ..
+            })
+    ) || (parsed_stmt.is_none() && (is_select_str || has_returning_str));
+
+    if !should_infer {
+        return vec![];
+    }
+
+    if let Some(ref stmt) = parsed_stmt {
+        if let Some(fields) = infer_returning_fields_from_statement(store, session, stmt).await {
+            return fields;
+        }
+    }
+
+    // Only infer SELECT (Statement::Query) metadata here; RETURNING is handled above.
+    let is_select = matches!(parsed_stmt, Some(Statement::Query(_)))
+        || (parsed_stmt.is_none() && is_select_str);
+    if !is_select {
+        return stub_describe_field();
+    }
+
+    let stmt = match parsed_stmt {
+        Some(stmt) => stmt,
+        None => return stub_describe_field(),
+    };
+
+    match stmt {
+        Statement::Query(q) => match infer_query_output_columns(store, session, &q).await {
+            Some(cols) => inferred_columns_to_fields(cols),
+            None => stub_describe_field(),
+        },
+        _ => stub_describe_field(),
+    }
+}
+
 pub struct DynamicPgHandler {
     client_pool: Option<Arc<TikvClientPool>>,
     pd_endpoints: Vec<String>,
@@ -1037,51 +1514,12 @@ impl DynamicPgHandler {
     }
 
     async fn infer_result_fields_from_query(&self, query: &str) -> Vec<FieldInfo> {
-        let query_trimmed = query.trim();
-        if query_trimmed.is_empty() {
-            return vec![];
-        }
-
-        let parsed_stmt = crate::sql::parse_sql(query_trimmed)
-            .ok()
-            .and_then(|stmts| stmts.into_iter().next());
-        let query_upper = query_trimmed.to_uppercase();
-
-        let is_select_str = query_upper.starts_with("SELECT") || query_upper.starts_with("WITH");
-        let has_returning_str = query_upper.contains("RETURNING");
-        let should_infer = matches!(
-            parsed_stmt,
-            Some(Statement::Query(_))
-                | Some(Statement::Insert {
-                    returning: Some(_),
-                    ..
-                })
-                | Some(Statement::Update {
-                    returning: Some(_),
-                    ..
-                })
-                | Some(Statement::Delete {
-                    returning: Some(_),
-                    ..
-                })
-        ) || (parsed_stmt.is_none() && (is_select_str || has_returning_str));
-
-        if !should_infer {
-            return vec![];
-        }
-
         // Get the executor if initialized
         let executor = match self.executor.get() {
             Some(exec) => exec,
             None => {
                 // Executor not initialized yet, return stub
-                return vec![FieldInfo::new(
-                    "column".to_string(),
-                    None,
-                    None,
-                    Type::TEXT,
-                    FieldFormat::Text,
-                )];
+                return stub_describe_field();
             }
         };
 
@@ -1091,107 +1529,12 @@ impl DynamicPgHandler {
         // Check if session exists
         if session_guard.is_none() {
             // No session yet, return stub
-            return vec![FieldInfo::new(
-                "column".to_string(),
-                None,
-                None,
-                Type::TEXT,
-                FieldFormat::Text,
-            )];
+            return stub_describe_field();
         }
 
         let store = executor.store();
         let session = session_guard.as_mut().unwrap();
-
-        if let Some(ref stmt) = parsed_stmt {
-            if let Some(fields) = infer_returning_fields_from_statement(&store, session, stmt).await
-            {
-                return fields;
-            }
-        }
-
-        // Only infer SELECT (Statement::Query) metadata here; RETURNING is handled above.
-        let is_select = matches!(parsed_stmt, Some(Statement::Query(_)))
-            || (parsed_stmt.is_none() && is_select_str);
-        if !is_select {
-            return vec![FieldInfo::new(
-                "column".to_string(),
-                None,
-                None,
-                Type::TEXT,
-                FieldFormat::Text,
-            )];
-        }
-
-        // Execute SELECT query with LIMIT 1 to get column metadata without side effects
-        // Replace any parameter placeholders ($1, $2, etc.) with defaults for type inference
-        let query_with_defaults = replace_placeholders_for_inference(query);
-        let metadata_query = if query_upper.contains(" LIMIT ") {
-            query_with_defaults
-        } else {
-            format!("{} LIMIT 1", query_with_defaults)
-        };
-
-        match executor
-            .execute(session, &metadata_query)
-            .await
-            .map(|r| r.last())
-        {
-            Ok(crate::sql::ExecuteResult::Select {
-                columns,
-                column_types,
-                rows,
-            }) => {
-                if let Some(types) = column_types {
-                    columns
-                        .iter()
-                        .enumerate()
-                        .map(|(i, name)| {
-                            FieldInfo::new(
-                                name.clone(),
-                                None,
-                                None,
-                                datatype_to_pgtype(types.get(i)),
-                                FieldFormat::Text,
-                            )
-                        })
-                        .collect()
-                } else if let Some(first_row) = rows.first() {
-                    // Fall back to inferring from first row
-                    columns
-                        .iter()
-                        .enumerate()
-                        .map(|(i, name)| {
-                            let pg_type = if let Some(value) = first_row.values.get(i) {
-                                let dt = value.data_type();
-                                datatype_to_pgtype(dt.as_ref())
-                            } else {
-                                Type::TEXT
-                            };
-                            FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
-                        })
-                        .collect()
-                } else {
-                    // No rows and no types, default to TEXT
-                    columns
-                        .iter()
-                        .map(|name| {
-                            FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text)
-                        })
-                        .collect()
-                }
-            }
-            _ => {
-                // Query didn't return SELECT result, return stub
-                vec![FieldInfo::new(
-                    "column".to_string(),
-                    None,
-                    None,
-                    Type::TEXT,
-                    FieldFormat::Text,
-                )]
-            }
-        }
+        infer_result_fields_from_query_ast(&store, session, query).await
     }
 
     async fn init_executor(
@@ -2497,133 +2840,9 @@ impl PgHandler {
 
     #[allow(dead_code)]
     async fn infer_result_fields_from_query(&self, query: &str) -> Vec<FieldInfo> {
-        let query_trimmed = query.trim();
-        if query_trimmed.is_empty() {
-            return vec![];
-        }
-
-        let parsed_stmt = crate::sql::parse_sql(query_trimmed)
-            .ok()
-            .and_then(|stmts| stmts.into_iter().next());
-        let query_upper = query_trimmed.to_uppercase();
-        let is_select_str = query_upper.starts_with("SELECT") || query_upper.starts_with("WITH");
-        let has_returning_str = query_upper.contains("RETURNING");
-        let should_infer = matches!(
-            parsed_stmt,
-            Some(Statement::Query(_))
-                | Some(Statement::Insert {
-                    returning: Some(_),
-                    ..
-                })
-                | Some(Statement::Update {
-                    returning: Some(_),
-                    ..
-                })
-                | Some(Statement::Delete {
-                    returning: Some(_),
-                    ..
-                })
-        ) || (parsed_stmt.is_none() && (is_select_str || has_returning_str));
-
-        if !should_infer {
-            return vec![];
-        }
-
-        // Get the session
         let mut session_guard = self.session.lock().await;
-
         let store = self.executor.store();
-        if let Some(ref stmt) = parsed_stmt {
-            if let Some(fields) =
-                infer_returning_fields_from_statement(&store, &mut session_guard, stmt).await
-            {
-                return fields;
-            }
-        };
-
-        // Only infer SELECT (Statement::Query) metadata here; RETURNING is handled above.
-        let is_select = matches!(parsed_stmt, Some(Statement::Query(_)))
-            || (parsed_stmt.is_none() && is_select_str);
-        if !is_select {
-            return vec![FieldInfo::new(
-                "column".to_string(),
-                None,
-                None,
-                Type::TEXT,
-                FieldFormat::Text,
-            )];
-        }
-
-        // Execute SELECT query with LIMIT 1 to get column metadata without side effects
-        // Replace any parameter placeholders ($1, $2, etc.) with defaults for type inference
-        let query_with_defaults = replace_placeholders_for_inference(query);
-        let metadata_query = if query_upper.contains(" LIMIT ") {
-            query_with_defaults
-        } else {
-            format!("{} LIMIT 1", query_with_defaults)
-        };
-
-        match self
-            .executor
-            .execute(&mut session_guard, &metadata_query)
-            .await
-            .map(|r| r.last())
-        {
-            Ok(crate::sql::ExecuteResult::Select {
-                columns,
-                column_types,
-                rows,
-            }) => {
-                if let Some(types) = column_types {
-                    columns
-                        .iter()
-                        .enumerate()
-                        .map(|(i, name)| {
-                            FieldInfo::new(
-                                name.clone(),
-                                None,
-                                None,
-                                datatype_to_pgtype(types.get(i)),
-                                FieldFormat::Text,
-                            )
-                        })
-                        .collect()
-                } else if let Some(first_row) = rows.first() {
-                    // Fall back to inferring from first row
-                    columns
-                        .iter()
-                        .enumerate()
-                        .map(|(i, name)| {
-                            let pg_type = if let Some(value) = first_row.values.get(i) {
-                                let dt = value.data_type();
-                                datatype_to_pgtype(dt.as_ref())
-                            } else {
-                                Type::TEXT
-                            };
-                            FieldInfo::new(name.clone(), None, None, pg_type, FieldFormat::Text)
-                        })
-                        .collect()
-                } else {
-                    // No rows and no types, default to TEXT
-                    columns
-                        .iter()
-                        .map(|name| {
-                            FieldInfo::new(name.clone(), None, None, Type::TEXT, FieldFormat::Text)
-                        })
-                        .collect()
-                }
-            }
-            _ => {
-                // Query didn't return SELECT result, return stub
-                vec![FieldInfo::new(
-                    "column".to_string(),
-                    None,
-                    None,
-                    Type::TEXT,
-                    FieldFormat::Text,
-                )]
-            }
-        }
+        infer_result_fields_from_query_ast(&store, &mut session_guard, query).await
     }
 
     #[allow(dead_code)]
