@@ -67,23 +67,31 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
         // Logical
         // SQL three-valued logic for boolean operators
         // https://www.postgresql.org/docs/current/functions-logical.html
-        BinaryOperator::And => match (left, right) {
-            (Value::Boolean(false), _) | (_, Value::Boolean(false)) => Ok(Value::Boolean(false)),
-            (Value::Boolean(true), Value::Boolean(true)) => Ok(Value::Boolean(true)),
-            (Value::Boolean(true), Value::Null) | (Value::Null, Value::Boolean(true)) => {
-                Ok(Value::Null)
+        BinaryOperator::And => {
+            let left = try_coerce_text_to_bool(left);
+            let right = try_coerce_text_to_bool(right);
+            match (left, right) {
+                (Value::Boolean(false), _) | (_, Value::Boolean(false)) => Ok(Value::Boolean(false)),
+                (Value::Boolean(true), Value::Boolean(true)) => Ok(Value::Boolean(true)),
+                (Value::Boolean(true), Value::Null) | (Value::Null, Value::Boolean(true)) => {
+                    Ok(Value::Null)
+                }
+                (Value::Null, Value::Null) => Ok(Value::Null),
+                _ => Err(anyhow!("AND requires boolean operands")),
             }
-            (Value::Null, Value::Null) => Ok(Value::Null),
-            _ => Err(anyhow!("AND requires boolean operands")),
         },
-        BinaryOperator::Or => match (left, right) {
-            (Value::Boolean(true), _) | (_, Value::Boolean(true)) => Ok(Value::Boolean(true)),
-            (Value::Boolean(false), Value::Boolean(false)) => Ok(Value::Boolean(false)),
-            (Value::Boolean(false), Value::Null) | (Value::Null, Value::Boolean(false)) => {
-                Ok(Value::Null)
+        BinaryOperator::Or => {
+            let left = try_coerce_text_to_bool(left);
+            let right = try_coerce_text_to_bool(right);
+            match (left, right) {
+                (Value::Boolean(true), _) | (_, Value::Boolean(true)) => Ok(Value::Boolean(true)),
+                (Value::Boolean(false), Value::Boolean(false)) => Ok(Value::Boolean(false)),
+                (Value::Boolean(false), Value::Null) | (Value::Null, Value::Boolean(false)) => {
+                    Ok(Value::Null)
+                }
+                (Value::Null, Value::Null) => Ok(Value::Null),
+                _ => Err(anyhow!("OR requires boolean operands")),
             }
-            (Value::Null, Value::Null) => Ok(Value::Null),
-            _ => Err(anyhow!("OR requires boolean operands")),
         },
 
         // Arithmetic
@@ -331,7 +339,7 @@ pub(super) fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-fn try_coerce_text_to_numeric(v: Value) -> Value {
+pub(super) fn try_coerce_text_to_numeric(v: Value) -> Value {
     match &v {
         Value::Text(s) => {
             if let Ok(i) = s.trim().parse::<i64>() {
@@ -346,6 +354,34 @@ fn try_coerce_text_to_numeric(v: Value) -> Value {
             v
         }
         _ => v,
+    }
+}
+
+pub(super) fn parse_bool_pg(s: &str) -> Option<bool> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("true")
+        || s.eq_ignore_ascii_case("t")
+        || s.eq_ignore_ascii_case("yes")
+        || s.eq_ignore_ascii_case("y")
+        || s == "1"
+    {
+        Some(true)
+    } else if s.eq_ignore_ascii_case("false")
+        || s.eq_ignore_ascii_case("f")
+        || s.eq_ignore_ascii_case("no")
+        || s.eq_ignore_ascii_case("n")
+        || s == "0"
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn try_coerce_text_to_bool(v: Value) -> Value {
+    match v {
+        Value::Text(s) => parse_bool_pg(&s).map(Value::Boolean).unwrap_or(Value::Text(s)),
+        other => other,
     }
 }
 
@@ -585,6 +621,14 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         }
         (Value::Text(l), Value::Text(r)) => Ok(compare_text_pg(l, r) as i8),
         (Value::Boolean(l), Value::Boolean(r)) => Ok(l.cmp(r) as i8),
+        (Value::Boolean(l), Value::Text(t)) => match parse_bool_pg(t) {
+            Some(r) => Ok(l.cmp(&r) as i8),
+            None => Err(anyhow!("invalid input syntax for type boolean: \"{}\"", t)),
+        },
+        (Value::Text(t), Value::Boolean(r)) => match parse_bool_pg(t) {
+            Some(l) => Ok(l.cmp(r) as i8),
+            None => Err(anyhow!("invalid input syntax for type boolean: \"{}\"", t)),
+        },
         (Value::Timestamp(l), Value::Timestamp(r)) => Ok(l.cmp(r) as i8),
         (Value::Date(l), Value::Date(r)) => Ok(l.cmp(r) as i8),
         (Value::Date(l), Value::Timestamp(r)) => {

@@ -409,6 +409,12 @@ pub fn extract_limit(query: &Query) -> Option<usize> {
             return match v {
                 Value::Int64(n) if n >= 0 => Some(n as usize),
                 Value::Int32(n) if n >= 0 => Some(n as usize),
+                Value::Text(s) => s
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|n| *n >= 0)
+                    .map(|n| n as usize),
                 _ => None,
             };
         }
@@ -419,6 +425,13 @@ pub fn extract_limit(query: &Query) -> Option<usize> {
                 return match v {
                     Value::Int64(n) if n >= 0 => Some(n as usize),
                     Value::Int32(n) if n >= 0 => Some(n as usize),
+                    Value::Text(s) => s
+                        .trim()
+                        .parse::<i64>()
+                        .ok()
+                        .filter(|n| *n >= 0)
+                        .map(|n| n as usize)
+                        .or(Some(1)),
                     _ => Some(1),
                 };
             }
@@ -434,6 +447,13 @@ pub fn extract_offset(query: &Query) -> usize {
             return match v {
                 Value::Int64(n) if n >= 0 => n as usize,
                 Value::Int32(n) if n >= 0 => n as usize,
+                Value::Text(s) => s
+                    .trim()
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|n| *n >= 0)
+                    .map(|n| n as usize)
+                    .unwrap_or(0),
                 _ => 0,
             };
         }
@@ -1927,6 +1947,13 @@ mod tests {
         let query = parse_query("SELECT * FROM users ORDER BY id LIMIT 10 OFFSET 5");
         let select = get_select(&query);
         assert!(Executor::is_simple_operator_query(&query, select));
+    }
+
+    #[test]
+    fn test_extract_limit_offset_from_text_literals() {
+        let query = parse_query("SELECT * FROM users LIMIT '10' OFFSET '5'");
+        assert_eq!(extract_limit(&query), Some(10));
+        assert_eq!(extract_offset(&query), 5);
     }
 
     #[test]

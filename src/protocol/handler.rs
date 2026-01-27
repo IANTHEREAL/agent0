@@ -2599,6 +2599,10 @@ fn substitute_placeholders_outside_strings_and_dollar(query: &str, values: &[Str
 fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
     let mut values: Vec<String> = Vec::with_capacity(portal.parameter_len());
 
+    fn quote_sql_string_literal(value: &str) -> String {
+        format!("'{}'", value.replace("'", "''"))
+    }
+
     for i in 0..portal.parameter_len() {
         let param_type = portal
             .statement
@@ -2663,6 +2667,12 @@ fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
                         .unwrap_or_else(|| "NULL".to_string())
                 }
             }
+            t if *t == Type::TEXT => portal
+                .parameter::<String>(i, &Type::TEXT)
+                .ok()
+                .flatten()
+                .map(|v| quote_sql_string_literal(&v))
+                .unwrap_or_else(|| "NULL".to_string()),
             t if *t == Type::UNKNOWN => {
                 if portal.parameter_format.is_binary(i) {
                     // Binary format - try to decode as common types
@@ -2683,38 +2693,20 @@ fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
                         "NULL".to_string()
                     }
                 } else {
-                    // Text format - read as string and auto-detect
+                    // Text format - treat as string literal (type inference happens in SQL layer)
                     portal
                         .parameter::<String>(i, &Type::TEXT)
                         .ok()
                         .flatten()
-                        .map(|v| {
-                            if v.parse::<i64>().is_ok() || v.parse::<f64>().is_ok() {
-                                v
-                            } else if v.eq_ignore_ascii_case("true")
-                                || v.eq_ignore_ascii_case("false")
-                            {
-                                v.to_lowercase()
-                            } else {
-                                format!("'{}'", v.replace("'", "''"))
-                            }
-                        })
+                        .map(|v| quote_sql_string_literal(&v))
                         .unwrap_or_else(|| "NULL".to_string())
                 }
             }
             _ => portal
-                .parameter::<String>(i, &param_type)
+                .parameter::<String>(i, &Type::TEXT)
                 .ok()
                 .flatten()
-                .map(|v| {
-                    if v.parse::<i64>().is_ok() || v.parse::<f64>().is_ok() {
-                        v
-                    } else if v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("false") {
-                        v.to_lowercase()
-                    } else {
-                        format!("'{}'", v.replace("'", "''"))
-                    }
-                })
+                .map(|v| quote_sql_string_literal(&v))
                 .unwrap_or_else(|| "NULL".to_string()),
         };
 
@@ -3830,6 +3822,8 @@ fn encode_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use pgwire::api::portal::Format;
     use pgwire::messages::response::CommandComplete;
 
     #[test]
@@ -4331,5 +4325,65 @@ mod tests {
     fn test_infer_parameter_types_non_ascii_does_not_panic() {
         let types = infer_parameter_types("SELECT 'ııı' FROM users LIMIT $1", 1);
         assert_eq!(types, vec![Type::INT8]);
+    }
+
+    #[test]
+    fn test_substitute_parameters_text_always_quoted() {
+        let stmt = Arc::new(StoredStatement::new(
+            "stmt".to_string(),
+            "SELECT $1::text".to_string(),
+            vec![Type::TEXT],
+        ));
+        let mut portal: Portal<String> = Portal::default();
+        portal.name = "portal".to_string();
+        portal.statement = stmt;
+        portal.parameter_format = Format::UnifiedText;
+        portal.parameters = vec![Some(Bytes::from_static(b"001"))];
+        portal.result_column_format = Format::UnifiedText;
+
+        assert_eq!(
+            substitute_parameters("SELECT $1::text", &portal),
+            "SELECT '001'::text"
+        );
+    }
+
+    #[test]
+    fn test_substitute_parameters_unknown_text_format_always_quoted() {
+        let stmt = Arc::new(StoredStatement::new(
+            "stmt".to_string(),
+            "SELECT $1::text".to_string(),
+            vec![],
+        ));
+        let mut portal: Portal<String> = Portal::default();
+        portal.name = "portal".to_string();
+        portal.statement = stmt;
+        portal.parameter_format = Format::UnifiedText;
+        portal.parameters = vec![Some(Bytes::from_static(b"001"))];
+        portal.result_column_format = Format::UnifiedText;
+
+        assert_eq!(
+            substitute_parameters("SELECT $1::text", &portal),
+            "SELECT '001'::text"
+        );
+    }
+
+    #[test]
+    fn test_substitute_parameters_escapes_single_quotes() {
+        let stmt = Arc::new(StoredStatement::new(
+            "stmt".to_string(),
+            "SELECT $1".to_string(),
+            vec![Type::TEXT],
+        ));
+        let mut portal: Portal<String> = Portal::default();
+        portal.name = "portal".to_string();
+        portal.statement = stmt;
+        portal.parameter_format = Format::UnifiedText;
+        portal.parameters = vec![Some(Bytes::from_static(b"O'Reilly"))];
+        portal.result_column_format = Format::UnifiedText;
+
+        assert_eq!(
+            substitute_parameters("SELECT $1", &portal),
+            "SELECT 'O''Reilly'"
+        );
     }
 }

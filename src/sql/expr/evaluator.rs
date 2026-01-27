@@ -4,6 +4,7 @@ use super::{
     like_match, parse_interval_from_expr, parse_interval_string, parse_timestamp_string,
     parse_timezone_offset_seconds, similar_to_match,
 };
+use super::operators::{parse_bool_pg, try_coerce_text_to_numeric};
 use crate::types::Value;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::Expr;
@@ -27,15 +28,43 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             let val = eval_expr_impl(ctx, expr)?;
             match op {
                 sqlparser::ast::UnaryOperator::Minus => match val {
-                    Value::Int32(i) => Ok(Value::Int32(-i)),
-                    Value::Int64(i) => Ok(Value::Int64(-i)),
+                    Value::Int32(i) => i
+                        .checked_neg()
+                        .map(Value::Int32)
+                        .ok_or_else(|| anyhow!("integer out of range")),
+                    Value::Int64(i) => i
+                        .checked_neg()
+                        .map(Value::Int64)
+                        .ok_or_else(|| anyhow!("bigint out of range")),
                     Value::Float64(f) => Ok(Value::Float64(-f)),
                     Value::Numeric(d) => Ok(Value::Numeric(-d)),
-                    _ => Err(anyhow!("Cannot negate {:?}", val)),
+                    Value::Text(s) => {
+                        let parsed = try_coerce_text_to_numeric(Value::Text(s.clone()));
+                        match parsed {
+                            Value::Int32(i) => i
+                                .checked_neg()
+                                .map(Value::Int32)
+                                .ok_or_else(|| anyhow!("integer out of range")),
+                            Value::Int64(i) => i
+                                .checked_neg()
+                                .map(Value::Int64)
+                                .ok_or_else(|| anyhow!("bigint out of range")),
+                            Value::Float64(f) => Ok(Value::Float64(-f)),
+                            Value::Text(_) => Err(anyhow!(
+                                "invalid input syntax for type numeric: \"{}\"",
+                                s
+                            )),
+                            other => Err(anyhow!("Cannot negate {:?}", other)),
+                        }
+                    }
+                    other => Err(anyhow!("Cannot negate {:?}", other)),
                 },
                 sqlparser::ast::UnaryOperator::Not => match val {
                     Value::Boolean(b) => Ok(Value::Boolean(!b)),
                     Value::Null => Ok(Value::Null),
+                    Value::Text(s) => parse_bool_pg(&s)
+                        .map(|b| Value::Boolean(!b))
+                        .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
                     _ => Err(anyhow!("NOT requires boolean, got {:?}", val)),
                 },
                 _ => Err(anyhow!("Unsupported unary operator: {:?}", op)),
@@ -53,21 +82,33 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
         Expr::IsTrue(expr) => match eval_expr_impl(ctx, expr)? {
             Value::Boolean(b) => Ok(Value::Boolean(b)),
             Value::Null => Ok(Value::Boolean(false)),
+            Value::Text(s) => parse_bool_pg(&s)
+                .map(Value::Boolean)
+                .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
             other => Err(anyhow!("IS TRUE requires boolean, got {:?}", other)),
         },
         Expr::IsNotTrue(expr) => match eval_expr_impl(ctx, expr)? {
             Value::Boolean(true) => Ok(Value::Boolean(false)),
             Value::Boolean(false) | Value::Null => Ok(Value::Boolean(true)),
+            Value::Text(s) => parse_bool_pg(&s)
+                .map(|b| Value::Boolean(!b))
+                .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
             other => Err(anyhow!("IS NOT TRUE requires boolean, got {:?}", other)),
         },
         Expr::IsFalse(expr) => match eval_expr_impl(ctx, expr)? {
             Value::Boolean(b) => Ok(Value::Boolean(!b)),
             Value::Null => Ok(Value::Boolean(false)),
+            Value::Text(s) => parse_bool_pg(&s)
+                .map(|b| Value::Boolean(!b))
+                .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
             other => Err(anyhow!("IS FALSE requires boolean, got {:?}", other)),
         },
         Expr::IsNotFalse(expr) => match eval_expr_impl(ctx, expr)? {
             Value::Boolean(false) => Ok(Value::Boolean(false)),
             Value::Boolean(true) | Value::Null => Ok(Value::Boolean(true)),
+            Value::Text(s) => parse_bool_pg(&s)
+                .map(Value::Boolean)
+                .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
             other => Err(anyhow!("IS NOT FALSE requires boolean, got {:?}", other)),
         },
         Expr::IsUnknown(expr) => {
@@ -190,7 +231,22 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                 }
             } else {
                 for (i, cond) in conditions.iter().enumerate() {
-                    if matches!(eval_expr_impl(ctx, cond)?, Value::Boolean(true)) {
+                    let cond_val = eval_expr_impl(ctx, cond)?;
+                    let cond_true = match cond_val {
+                        Value::Boolean(b) => b,
+                        Value::Null => false,
+                        Value::Text(s) => parse_bool_pg(&s).ok_or_else(|| {
+                            anyhow!("invalid input syntax for type boolean: \"{}\"", s)
+                        })?,
+                        other => {
+                            return Err(anyhow!(
+                                "CASE WHEN requires boolean condition, got {:?}",
+                                other
+                            ));
+                        }
+                    };
+
+                    if cond_true {
                         return eval_expr_impl(ctx, &results[i]);
                     }
                 }

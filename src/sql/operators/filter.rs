@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use sqlparser::ast::Expr;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::eval_expr;
+use crate::sql::expr::{eval_expr, parse_bool_pg};
 use crate::types::{Row, TableSchema, Value};
 
 #[derive(Debug)]
@@ -27,6 +27,8 @@ impl FilterOperator {
         match result {
             Value::Boolean(b) => Ok(b),
             Value::Null => Ok(false),
+            Value::Text(s) => parse_bool_pg(&s)
+                .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
             _ => Err(anyhow!("Filter predicate must evaluate to boolean")),
         }
     }
@@ -156,5 +158,26 @@ mod tests {
 
         assert!(filter.evaluate_predicate(&row_true).unwrap());
         assert!(!filter.evaluate_predicate(&row_false).unwrap());
+    }
+
+    #[test]
+    fn test_predicate_evaluation_text_boolean_literals() {
+        use super::super::scan::TableScanOperator;
+
+        let schema = test_schema();
+        let child = Box::new(TableScanOperator::new(schema.clone()));
+
+        let predicate =
+            Expr::Value(sqlparser::ast::Value::SingleQuotedString("true".to_string()));
+        let filter = FilterOperator::new(child, predicate);
+
+        let row = Row::new(vec![Value::Int32(1), Value::Boolean(false)]);
+        assert!(filter.evaluate_predicate(&row).unwrap());
+
+        let child = Box::new(TableScanOperator::new(schema));
+        let predicate =
+            Expr::Value(sqlparser::ast::Value::SingleQuotedString("false".to_string()));
+        let filter = FilterOperator::new(child, predicate);
+        assert!(!filter.evaluate_predicate(&row).unwrap());
     }
 }

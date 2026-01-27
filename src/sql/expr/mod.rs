@@ -12,6 +12,10 @@ pub use context::EvalContext;
 #[allow(unused_imports)]
 pub use evaluator::eval_expr_impl as eval_expr_unified;
 
+pub(crate) fn parse_bool_pg(s: &str) -> Option<bool> {
+    operators::parse_bool_pg(s)
+}
+
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Context, Result};
 use rust_decimal::Decimal;
@@ -2294,6 +2298,15 @@ mod tests {
             eval_expr(&parse_expr("-3.14"), None, None).unwrap(),
             Value::Numeric(Decimal::from_str("-3.14").unwrap())
         );
+        assert_eq!(
+            eval_expr(&parse_expr("-'10'"), None, None).unwrap(),
+            Value::Int32(-10)
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("-'1.5'"), None, None).unwrap(),
+            Value::Float64(-1.5)
+        );
+        assert!(eval_expr(&parse_expr("-'nope'"), None, None).is_err());
     }
 
     #[test]
@@ -2392,6 +2405,16 @@ mod tests {
         );
         assert_eq!(compare_values(&Value::Null, &Value::Int32(5)).unwrap(), -1);
         assert_eq!(compare_values(&Value::Int32(5), &Value::Null).unwrap(), 1);
+
+        assert_eq!(
+            compare_values(&Value::Boolean(true), &Value::Text("true".to_string())).unwrap(),
+            0
+        );
+        assert_eq!(
+            compare_values(&Value::Text("false".to_string()), &Value::Boolean(false)).unwrap(),
+            0
+        );
+        assert!(compare_values(&Value::Boolean(true), &Value::Text("nope".to_string())).is_err());
     }
 
     #[test]
@@ -2548,6 +2571,32 @@ mod tests {
             )
             .unwrap(),
             Value::Text("no".to_string())
+        );
+        assert_eq!(
+            eval_expr(
+                &parse_expr("CASE WHEN 'true' THEN 'yes' ELSE 'no' END"),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Text("yes".to_string())
+        );
+        assert_eq!(
+            eval_expr(
+                &parse_expr("CASE WHEN 'false' THEN 'yes' ELSE 'no' END"),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Text("no".to_string())
+        );
+        assert!(
+            eval_expr(
+                &parse_expr("CASE WHEN 'nope' THEN 'yes' ELSE 'no' END"),
+                None,
+                None
+            )
+            .is_err()
         );
         assert_eq!(
             eval_expr(
