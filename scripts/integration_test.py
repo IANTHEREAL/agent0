@@ -906,7 +906,10 @@ def test_alter_table_migration() -> bool:
     out, code = run_sql(
         "INSERT INTO atm_users (id, email, years) VALUES (6, 'f@example.com', 60)"
     )
-    if code == 0 or "cannot be null" not in out.lower():
+    if code == 0 or (
+        "cannot be null" not in out.lower()
+        and "violates not-null constraint" not in out.lower()
+    ):
         log_error("NOT NULL enforcement on INSERT: FAILED")
         print(out[:200])
         return False
