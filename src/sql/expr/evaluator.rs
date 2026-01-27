@@ -7,6 +7,7 @@ use super::{
 use super::operators::{parse_bool_pg, try_coerce_text_to_numeric};
 use crate::types::Value;
 use anyhow::{anyhow, Result};
+use sqlparser::ast::BinaryOperator;
 use sqlparser::ast::Expr;
 
 pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
@@ -19,11 +20,35 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             ctx.resolve_column(&ident.value)
         }
         Expr::CompoundIdentifier(parts) => ctx.resolve_compound_identifier(parts),
-        Expr::BinaryOp { left, op, right } => {
-            let left_val = eval_expr_impl(ctx, left)?;
-            let right_val = eval_expr_impl(ctx, right)?;
-            eval_binary_op(left_val, op, right_val)
-        }
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                let left_val = eval_expr_impl(ctx, left)?;
+                match &left_val {
+                    Value::Boolean(false) => Ok(Value::Boolean(false)),
+                    Value::Boolean(true) | Value::Null => {
+                        let right_val = eval_expr_impl(ctx, right)?;
+                        eval_binary_op(left_val, op, right_val)
+                    }
+                    _ => Err(anyhow!("AND requires boolean operands")),
+                }
+            }
+            BinaryOperator::Or => {
+                let left_val = eval_expr_impl(ctx, left)?;
+                match &left_val {
+                    Value::Boolean(true) => Ok(Value::Boolean(true)),
+                    Value::Boolean(false) | Value::Null => {
+                        let right_val = eval_expr_impl(ctx, right)?;
+                        eval_binary_op(left_val, op, right_val)
+                    }
+                    _ => Err(anyhow!("OR requires boolean operands")),
+                }
+            }
+            _ => {
+                let left_val = eval_expr_impl(ctx, left)?;
+                let right_val = eval_expr_impl(ctx, right)?;
+                eval_binary_op(left_val, op, right_val)
+            }
+        },
         Expr::UnaryOp { op, expr } => {
             let val = eval_expr_impl(ctx, expr)?;
             match op {
@@ -178,11 +203,16 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
         } => {
             let val = eval_expr_impl(ctx, expr)?;
             let pat = eval_expr_impl(ctx, pattern)?;
-            let (Value::Text(s), Value::Text(p)) = (&val, &pat) else {
-                return Ok(Value::Boolean(false));
-            };
-            let matched = like_match(s, p, *escape_char, false);
-            Ok(Value::Boolean(if *negated { !matched } else { matched }))
+            match (&val, &pat) {
+                (Value::Text(s), Value::Text(p)) => {
+                    let matched = like_match(s, p, *escape_char, false);
+                    Ok(Value::Boolean(if *negated { !matched } else { matched }))
+                }
+                (Value::Null, Value::Null)
+                | (Value::Null, Value::Text(_))
+                | (Value::Text(_), Value::Null) => Ok(Value::Null),
+                _ => Err(anyhow!("LIKE requires text operands")),
+            }
         }
         Expr::ILike {
             negated,
@@ -192,11 +222,16 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
         } => {
             let val = eval_expr_impl(ctx, expr)?;
             let pat = eval_expr_impl(ctx, pattern)?;
-            let (Value::Text(s), Value::Text(p)) = (&val, &pat) else {
-                return Ok(Value::Boolean(false));
-            };
-            let matched = like_match(s, p, *escape_char, true);
-            Ok(Value::Boolean(if *negated { !matched } else { matched }))
+            match (&val, &pat) {
+                (Value::Text(s), Value::Text(p)) => {
+                    let matched = like_match(s, p, *escape_char, true);
+                    Ok(Value::Boolean(if *negated { !matched } else { matched }))
+                }
+                (Value::Null, Value::Null)
+                | (Value::Null, Value::Text(_))
+                | (Value::Text(_), Value::Null) => Ok(Value::Null),
+                _ => Err(anyhow!("ILIKE requires text operands")),
+            }
         }
         Expr::SimilarTo {
             negated,

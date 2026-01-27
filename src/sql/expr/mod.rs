@@ -2277,6 +2277,36 @@ mod tests {
     }
 
     #[test]
+    fn test_eval_logical_null_semantics_and_short_circuit() {
+        assert_eq!(
+            eval_expr(&parse_expr("CAST(NULL AS BOOLEAN) AND TRUE"), None, None).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("FALSE AND CAST(NULL AS BOOLEAN)"), None, None).unwrap(),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("CAST(NULL AS BOOLEAN) OR TRUE"), None, None).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("NOT CAST(NULL AS BOOLEAN)"), None, None).unwrap(),
+            Value::Null
+        );
+
+        // Short-circuit: RHS must not be evaluated when LHS determines result
+        assert_eq!(
+            eval_expr(&parse_expr("FALSE AND (1 / 0 = 0)"), None, None).unwrap(),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("TRUE OR (1 / 0 = 0)"), None, None).unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
     fn test_eval_nested() {
         assert_eq!(
             eval_expr(&parse_expr("(1 + 2) * 3"), None, None).unwrap(),
@@ -2755,6 +2785,28 @@ mod tests {
             eval_expr(&parse_expr("'a.b' LIKE '%.%'"), None, None).unwrap(),
             Value::Boolean(true)
         );
+    }
+
+    #[test]
+    fn test_like_null_semantics() {
+        assert_eq!(
+            eval_expr(&parse_expr("CAST(NULL AS TEXT) LIKE 'a%'"), None, None).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("'a' LIKE CAST(NULL AS TEXT)"), None, None).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("CAST(NULL AS TEXT) ILIKE 'a%'"), None, None).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("'a' ILIKE CAST(NULL AS TEXT)"), None, None).unwrap(),
+            Value::Null
+        );
+        assert!(eval_expr(&parse_expr("1 LIKE NULL"), None, None).is_err());
+        assert!(eval_expr(&parse_expr("NULL LIKE 1"), None, None).is_err());
     }
 
     #[test]
