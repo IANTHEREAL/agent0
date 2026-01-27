@@ -23,7 +23,16 @@ pub(crate) async fn with_savepoints<R>(
     savepoints: Arc<SavepointState>,
     future: impl Future<Output = R>,
 ) -> R {
-    SAVEPOINTS.scope(savepoints, future).await
+    // See `sql::expr::with_query_context` for rationale.
+    #[cfg(debug_assertions)]
+    {
+        SAVEPOINTS.scope(savepoints, Box::pin(future)).await
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        SAVEPOINTS.scope(savepoints, future).await
+    }
 }
 
 /// TiKV `put` wrapper that records undo information when SAVEPOINT is active.

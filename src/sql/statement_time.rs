@@ -32,7 +32,16 @@ pub(super) async fn with_statement_timestamp_millis<R, Fut>(ts_millis: i64, fut:
 where
     Fut: Future<Output = R>,
 {
-    STATEMENT_TIMESTAMP_MILLIS.scope(ts_millis, fut).await
+    // See `sql::expr::with_query_context` for rationale.
+    #[cfg(debug_assertions)]
+    {
+        STATEMENT_TIMESTAMP_MILLIS.scope(ts_millis, Box::pin(fut)).await
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        STATEMENT_TIMESTAMP_MILLIS.scope(ts_millis, fut).await
+    }
 }
 
 #[cfg(test)]
@@ -49,4 +58,3 @@ mod tests {
         assert_eq!(got, fixed);
     }
 }
-

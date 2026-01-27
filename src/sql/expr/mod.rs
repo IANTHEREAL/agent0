@@ -64,9 +64,22 @@ pub(crate) async fn with_query_context<R, Fut>(
 where
     Fut: Future<Output = R>,
 {
-    CONNECTION_ID
-        .scope(connection_id, CURRENT_DATABASE_NAME.scope(database_name, fut))
-        .await
+    // In debug builds, nested task-local scopes can create very large async state machines.
+    // Boxing the inner future keeps scope wrappers small and avoids stack overflows.
+    #[cfg(debug_assertions)]
+    {
+        let fut = Box::pin(fut);
+        CONNECTION_ID
+            .scope(connection_id, CURRENT_DATABASE_NAME.scope(database_name, fut))
+            .await
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        CONNECTION_ID
+            .scope(connection_id, CURRENT_DATABASE_NAME.scope(database_name, fut))
+            .await
+    }
 }
 
 pub struct JoinContext<'a> {
