@@ -189,6 +189,7 @@ pg_restore -h 127.0.0.1 -p 5433 -d postgres --no-owner --no-privileges ./backup/
 |---------------------|---------|-------------|
 | `PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD endpoints |
 | `PG_PORT` | `5433` | PostgreSQL protocol port |
+| `PGTIKV_TOKIO_STACK_MB` | `4` | Tokio worker thread stack size (MB) |
 | `PG_KEYSPACE` | `default` | Default TiKV keyspace for multi-tenancy |
 | `PG_TLS_CERT` | (empty) | Path to TLS certificate file |
 | `PG_TLS_KEY` | (empty) | Path to TLS private key file |

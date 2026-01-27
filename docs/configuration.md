@@ -8,6 +8,7 @@ pg-tikv is configured through environment variables.
 |----------|---------|-------------|
 | `PD_ENDPOINTS` | `127.0.0.1:2379` | TiKV PD endpoints (comma-separated) |
 | `PG_PORT` | `5433` | PostgreSQL protocol listen port |
+| `PGTIKV_TOKIO_STACK_MB` | `4` | Tokio worker thread stack size (MB) |
 | `PG_NAMESPACE` | (empty) | Key prefix for data isolation |
 | `PG_KEYSPACE` | (empty) | Default keyspace when not specified in username |
 | `PG_PASSWORD` | (empty) | Fallback password for all users |

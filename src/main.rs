@@ -51,9 +51,14 @@ async fn create_keyspace(pd_endpoint: &str, keyspace_name: &str) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    let stack_mb: usize = env::var("PGTIKV_TOKIO_STACK_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&mb| mb > 0)
+        .unwrap_or(4);
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .thread_stack_size(4 * 1024 * 1024)
+        .thread_stack_size(stack_mb * 1024 * 1024)
         .build()
         .unwrap()
         .block_on(async_main())

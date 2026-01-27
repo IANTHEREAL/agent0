@@ -16,14 +16,21 @@ tokio::task_local! {
 ///
 /// This is task-local to avoid threading session state through all executor layers.
 pub(crate) async fn with_context<R>(is_superuser: bool, future: impl Future<Output = R>) -> R {
-    CTX.scope(
-        ExtensionContext {
-            is_superuser,
-            http_requests: Cell::new(0),
-        },
-        future,
-    )
-    .await
+    let ctx = ExtensionContext {
+        is_superuser,
+        http_requests: Cell::new(0),
+    };
+
+    // See `sql::expr::with_query_context` for rationale.
+    #[cfg(debug_assertions)]
+    {
+        CTX.scope(ctx, Box::pin(future)).await
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        CTX.scope(ctx, future).await
+    }
 }
 
 pub(crate) fn is_superuser() -> bool {
@@ -44,4 +51,3 @@ pub(crate) fn try_consume_http_request(max_per_statement: u32) -> Result<()> {
     })
     .map_err(|_| anyhow!("http: extension context missing"))?
 }
-
