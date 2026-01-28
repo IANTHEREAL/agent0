@@ -1,0 +1,106 @@
+---
+name: local-tipg-up
+description: "Start a local tipg (pg-tikv) instance in sandbox: start TiKV via scripts/tikv_admin.py, build with cargo, run pg-tikv, then smoke-test with pg_isready + a simple SQL (SELECT 1)."
+---
+
+# Local tipg up (sandbox)
+
+Run everything from the repo root (`/home/zhaiyl/Work/tipg`).
+
+## Start TiKV (persistent dev cluster)
+
+```bash
+uv run scripts/tikv_admin.py start --name dev --persistent
+```
+
+Copy the `PD_ENDPOINTS=...` line from the output (example: `127.0.0.1:2379`).
+
+If you already started it (or forgot the port), print it again:
+
+```bash
+uv run scripts/tikv_admin.py status --name dev
+```
+
+## Build tipg (pg-tikv) (confirm it compiles)
+
+```bash
+cargo build --release
+```
+
+## Start pg-tikv
+
+```bash
+PD_ENDPOINTS=127.0.0.1:<pd_port> \
+PG_PORT=5433 \
+./target/release/pg-tikv
+```
+
+If you want to run it in the background (so you can smoke-test in the same terminal):
+
+```bash
+PD_ENDPOINTS=127.0.0.1:<pd_port> \
+PG_PORT=5433 \
+./target/release/pg-tikv > /tmp/pg-tikv.log 2>&1 & echo $! > /tmp/pg-tikv.pid
+```
+
+Optional:
+
+```bash
+PG_KEYSPACE=default ...
+```
+
+TLS (optional):
+
+```bash
+PG_TLS_CERT=/path/server.crt \
+PG_TLS_KEY=/path/server.key \
+./target/release/pg-tikv
+```
+
+## Verify + connect
+
+```bash
+pg_isready -h 127.0.0.1 -p 5433
+PGPASSWORD=admin psql -h 127.0.0.1 -p 5433 -U admin -d postgres
+```
+
+## Smoke test (simple SQL)
+
+```bash
+PGPASSWORD=admin psql -h 127.0.0.1 -p 5433 -U admin -d postgres -v ON_ERROR_STOP=1 -c "SELECT 1;"
+```
+
+Default credentials (per keyspace): `admin / admin`.
+
+## Conflict handling (common)
+
+### TiKV cluster already running / want a clean cluster
+
+- If `start` prints "already running": that's OK; reuse it.
+- If you need a clean state (DESTRUCTIVE):
+
+```bash
+uv run scripts/tikv_admin.py stop --name dev
+uv run scripts/tikv_admin.py clean --name dev
+uv run scripts/tikv_admin.py start --name dev --persistent
+```
+
+### `Address already in use` on port 5433
+
+- Reuse the existing pg-tikv if it’s already listening:
+  - Check listener: `ss -ltnp | rg ':5433'` (or `lsof -iTCP:5433 -sTCP:LISTEN`)
+- Or pick a different port:
+
+```bash
+PG_PORT=5434 PD_ENDPOINTS=127.0.0.1:<pd_port> ./target/release/pg-tikv
+pg_isready -h 127.0.0.1 -p 5434
+```
+
+## Stop
+
+- Stop `pg-tikv`: `Ctrl-C` in the server terminal
+- Stop TiKV cluster:
+
+```bash
+uv run scripts/tikv_admin.py stop --name dev
+```
