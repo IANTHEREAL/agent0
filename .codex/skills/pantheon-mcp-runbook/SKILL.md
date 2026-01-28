@@ -110,7 +110,7 @@ branch_id = parallel_explore(...).branch_id
 
 while true:
   info = get_branch(branch_id)
-  if info.status in {"succeed","failed","finished"} (case-insensitive):
+  if info.status in {"succeed","failed","finished","manifesting","ready_for_manifest"} (case-insensitive):
     out = branch_output(branch_id, full_output=true)
     break
   sleep(poll_interval_seconds)  # typically 60–300 seconds
@@ -118,7 +118,9 @@ while true:
 
 Do not try to interpret success/failure from partial logs while the branch is still running; wait for a terminal status first.
 
-Treat `failed` as failure; treat `succeed` / `finished` as completion (still read `branch_output` to confirm outcome).
+Treat `failed` as failure; treat `succeed` / `finished` / `manifesting` / `ready_for_manifest` as completion (still read `branch_output` to confirm outcome).
+
+Pantheon note: `manifesting` and `ready_for_manifest` mean the branch run is already done; you can fetch `branch_output` and continue to the next step (you do not need to wait for a later `succeed`/`finished` transition).
 
 When polling, actually sleep between checks (e.g., run a local `sleep 300`) so you do not spam `get_branch`.
 
@@ -183,7 +185,7 @@ Then for each run:
 2. Poll with `get_branch(branch_id)` until terminal.
 3. Fetch logs with `branch_output(branch_id, full_output=true)`.
 4. If the branch status is `failed`, do **not** update `chain_parent_branch_id` (rerun from the last known-good parent).
-5. If the branch status is `succeed` or `finished`, update:
+5. If the branch status is `succeed` / `finished` / `manifesting` / `ready_for_manifest`, update:
    - `chain_parent_branch_id = branch_id`
 
 This rule eliminates confusion about where the next run should start.
