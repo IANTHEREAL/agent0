@@ -3904,7 +3904,7 @@ fn generate_series_values(
                 Value::Float64(st) => *st,
                 Value::Int32(st) => *st as f64,
                 Value::Int64(st) => *st as f64,
-                _ => return Err(anyhow!("Invalid step type for numeric generate_series")),
+                _ => return Err(anyhow!("Invalid step type for float8 generate_series")),
             };
             if step_val == 0.0 {
                 return Err(anyhow!("step size cannot equal zero"));
@@ -3914,13 +3914,31 @@ fn generate_series_values(
                 let mut current = *s;
                 while current <= *e + f64::EPSILON {
                     values.push(Value::Float64(current));
-                    current += step_val;
+                    if current >= *e {
+                        break;
+                    }
+                    let next = current + step_val;
+                    if next == current {
+                        return Err(anyhow!(
+                            "generate_series step is too small to make progress for float8"
+                        ));
+                    }
+                    current = next;
                 }
             } else {
                 let mut current = *s;
                 while current >= *e - f64::EPSILON {
                     values.push(Value::Float64(current));
-                    current += step_val;
+                    if current <= *e {
+                        break;
+                    }
+                    let next = current + step_val;
+                    if next == current {
+                        return Err(anyhow!(
+                            "generate_series step is too small to make progress for float8"
+                        ));
+                    }
+                    current = next;
                 }
             }
             Ok((values, DataType::Float64))
@@ -4009,18 +4027,13 @@ fn generate_series_values(
             Ok((values, DataType::TimestampTz))
         }
         (Value::Numeric(s), Value::Numeric(e)) => {
-            use rust_decimal::prelude::ToPrimitive;
-            let _s_f64 = s
-                .to_f64()
-                .ok_or_else(|| anyhow!("Cannot convert start to f64"))?;
-            let _e_f64 = e
-                .to_f64()
-                .ok_or_else(|| anyhow!("Cannot convert end to f64"))?;
             let step_val = match step {
                 Value::Null => rust_decimal::Decimal::ONE,
                 Value::Numeric(st) => *st,
                 Value::Float64(st) => {
-                    rust_decimal::Decimal::try_from(*st).unwrap_or(rust_decimal::Decimal::ONE)
+                    rust_decimal::Decimal::try_from(*st).map_err(|_| {
+                        anyhow!("invalid input syntax for type numeric: \"{}\"", st)
+                    })?
                 }
                 Value::Int32(st) => rust_decimal::Decimal::from(*st),
                 Value::Int64(st) => rust_decimal::Decimal::from(*st),
@@ -4034,13 +4047,25 @@ fn generate_series_values(
                 let mut current = *s;
                 while current <= *e {
                     values.push(Value::Numeric(current));
-                    current += step_val;
+                    if current == *e {
+                        break;
+                    }
+                    current = match current.checked_add(step_val) {
+                        Some(next) => next,
+                        None => break,
+                    };
                 }
             } else {
                 let mut current = *s;
                 while current >= *e {
                     values.push(Value::Numeric(current));
-                    current += step_val;
+                    if current == *e {
+                        break;
+                    }
+                    current = match current.checked_add(step_val) {
+                        Some(next) => next,
+                        None => break,
+                    };
                 }
             }
             Ok((
@@ -4165,5 +4190,63 @@ mod tests {
         let naive = date.and_hms_opt(0, 0, 0).unwrap();
         let local = tz.from_local_datetime(&naive).single().unwrap();
         assert_eq!(values, vec![Value::Timestamp(local.timestamp_millis())]);
+    }
+
+    #[test]
+    fn generate_series_float8_progress_guard_errors() {
+        let err = generate_series_values(
+            &Value::Float64(1e16),
+            &Value::Float64(1e16 + 1e6),
+            &Value::Float64(1.0),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("too small to make progress"));
+    }
+
+    #[test]
+    fn generate_series_numeric_max_does_not_panic_or_loop() {
+        use std::str::FromStr;
+
+        let max = rust_decimal::Decimal::from_str("79228162514264337593543950335").unwrap();
+        let (values, ty) = generate_series_values(
+            &Value::Numeric(max),
+            &Value::Numeric(max),
+            &Value::Numeric(rust_decimal::Decimal::ONE),
+        )
+        .unwrap();
+        assert_eq!(
+            ty,
+            DataType::Numeric {
+                precision: None,
+                scale: None,
+            }
+        );
+        assert_eq!(values, vec![Value::Numeric(max)]);
+    }
+
+    #[test]
+    fn generate_series_numeric_float_step_nan_errors() {
+        let err = generate_series_values(
+            &Value::Numeric(rust_decimal::Decimal::ONE),
+            &Value::Numeric(rust_decimal::Decimal::from(2)),
+            &Value::Float64(f64::NAN),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid input syntax for type numeric"));
+    }
+
+    #[test]
+    fn generate_series_numeric_float_step_infinite_errors() {
+        let err = generate_series_values(
+            &Value::Numeric(rust_decimal::Decimal::ONE),
+            &Value::Numeric(rust_decimal::Decimal::from(2)),
+            &Value::Float64(f64::INFINITY),
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("invalid input syntax for type numeric"));
     }
 }
