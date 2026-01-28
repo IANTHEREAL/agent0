@@ -10,6 +10,47 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::BinaryOperator;
 use sqlparser::ast::Expr;
 
+fn is_explicit_null(expr: &Expr) -> bool {
+    use sqlparser::ast::Value as SqlValue;
+    match expr {
+        Expr::Nested(inner) => is_explicit_null(inner),
+        Expr::Value(SqlValue::Null) => true,
+        _ => false,
+    }
+}
+
+fn infer_expr_type_for_validation<C: EvalContext>(ctx: &C, expr: &Expr) -> DataType {
+    if let Some(data_type) = ctx.column_type(expr) {
+        return data_type.clone();
+    }
+
+    let empty_schema = TableSchema::default();
+    let schema = ctx.schema().unwrap_or(&empty_schema);
+    crate::sql::types::infer_expr_type(expr, schema)
+}
+
+fn ensure_text_or_explicit_null_operand<C: EvalContext>(
+    ctx: &C,
+    expr: &Expr,
+    err_msg: &'static str,
+) -> Result<()> {
+    if is_explicit_null(expr) {
+        return Ok(());
+    }
+
+    match infer_expr_type_for_validation(ctx, expr) {
+        DataType::Text => Ok(()),
+        _ => Err(anyhow!(err_msg)),
+    }
+}
+
+fn ensure_array_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg: &'static str) -> Result<()> {
+    match infer_expr_type_for_validation(ctx, expr) {
+        DataType::Array(_) => Ok(()),
+        _ => Err(anyhow!(err_msg)),
+    }
+}
+
 fn ensure_boolean_or_null_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg: &'static str) -> Result<()> {
     use sqlparser::ast::UnaryOperator;
     use sqlparser::ast::Value as SqlValue;
@@ -46,14 +87,20 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg:
                 ensure_boolean_or_null_operand(ctx, right, err_msg)
             }
 
-            // Operators that always return boolean (or NULL), regardless of operand types.
+            BinaryOperator::PGOverlap => {
+                ensure_array_operand(ctx, left, "&& operator requires array operands")?;
+                ensure_array_operand(ctx, right, "&& operator requires array operands")?;
+                Ok(())
+            }
+
+            // Operators that always return boolean (or NULL) and do not have deterministic
+            // operand type errors (value-dependent errors are still short-circuitable).
             BinaryOperator::Eq
             | BinaryOperator::NotEq
             | BinaryOperator::Gt
             | BinaryOperator::Lt
             | BinaryOperator::GtEq
             | BinaryOperator::LtEq
-            | BinaryOperator::PGOverlap
             | BinaryOperator::PGRegexMatch
             | BinaryOperator::PGRegexIMatch
             | BinaryOperator::PGRegexNotMatch
@@ -66,9 +113,19 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg:
             _ => Err(anyhow!(err_msg)),
         },
 
-        Expr::Like { .. }
-        | Expr::ILike { .. }
-        | Expr::SimilarTo { .. }
+        Expr::Like { expr, pattern, .. } => {
+            ensure_text_or_explicit_null_operand(ctx, expr, "LIKE requires text operands")?;
+            ensure_text_or_explicit_null_operand(ctx, pattern, "LIKE requires text operands")?;
+            Ok(())
+        }
+
+        Expr::ILike { expr, pattern, .. } => {
+            ensure_text_or_explicit_null_operand(ctx, expr, "ILIKE requires text operands")?;
+            ensure_text_or_explicit_null_operand(ctx, pattern, "ILIKE requires text operands")?;
+            Ok(())
+        }
+
+        Expr::SimilarTo { .. }
         | Expr::Between { .. }
         | Expr::InList { .. }
         | Expr::IsNull(_)
