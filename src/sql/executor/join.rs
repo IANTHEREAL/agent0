@@ -3943,13 +3943,19 @@ fn generate_series_values(
                 let mut current = *s;
                 while current <= *e {
                     values.push(Value::Timestamp(current));
-                    current += step_ms;
+                    current = match current.checked_add(step_ms) {
+                        Some(next) => next,
+                        None => break,
+                    };
                 }
             } else {
                 let mut current = *s;
                 while current >= *e {
                     values.push(Value::Timestamp(current));
-                    current += step_ms;
+                    current = match current.checked_add(step_ms) {
+                        Some(next) => next,
+                        None => break,
+                    };
                 }
             }
             Ok((values, DataType::Timestamp))
@@ -3977,7 +3983,10 @@ fn generate_series_values(
                         .single()
                         .ok_or_else(|| anyhow!("Invalid local timestamptz"))?;
                     values.push(Value::Timestamp(local.timestamp_millis()));
-                    current += step_days;
+                    current = match current.checked_add(step_days) {
+                        Some(next) => next,
+                        None => break,
+                    };
                 }
             } else {
                 let mut current = *s;
@@ -3991,7 +4000,10 @@ fn generate_series_values(
                         .single()
                         .ok_or_else(|| anyhow!("Invalid local timestamptz"))?;
                     values.push(Value::Timestamp(local.timestamp_millis()));
-                    current += step_days;
+                    current = match current.checked_add(step_days) {
+                        Some(next) => next,
+                        None => break,
+                    };
                 }
             }
             Ok((values, DataType::TimestampTz))
@@ -4060,6 +4072,7 @@ fn interval_to_days(iv: &crate::types::IntervalValue) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     #[test]
     fn generate_series_int32_edge_overflow_does_not_loop() {
@@ -4124,5 +4137,33 @@ mod tests {
             values,
             vec![Value::Int64(i64::MIN + 1), Value::Int64(i64::MIN)]
         );
+    }
+
+    #[test]
+    fn generate_series_timestamp_overflow_does_not_loop() {
+        let (values, ty) = generate_series_values(
+            &Value::Timestamp(1),
+            &Value::Timestamp(1),
+            &Value::Interval(crate::types::IntervalValue::from_millis(i64::MAX)),
+        )
+        .unwrap();
+        assert_eq!(ty, DataType::Timestamp);
+        assert_eq!(values, vec![Value::Timestamp(1)]);
+    }
+
+    #[test]
+    fn generate_series_date_overflow_does_not_loop() {
+        let step = Value::Interval(crate::types::IntervalValue {
+            months: i32::MAX / 30,
+            millis: 7 * 24 * 60 * 60 * 1000,
+        });
+        let (values, ty) = generate_series_values(&Value::Date(1), &Value::Date(1), &step).unwrap();
+        assert_eq!(ty, DataType::TimestampTz);
+
+        let tz = chrono_tz::America::Los_Angeles;
+        let date = crate::types::date::date_days_to_naive_date(1).unwrap();
+        let naive = date.and_hms_opt(0, 0, 0).unwrap();
+        let local = tz.from_local_datetime(&naive).single().unwrap();
+        assert_eq!(values, vec![Value::Timestamp(local.timestamp_millis())]);
     }
 }
