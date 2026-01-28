@@ -2418,6 +2418,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     }
 }
 
+#[cfg(test)]
 fn replace_placeholders_for_inference(query: &str) -> String {
     let mut result = String::with_capacity(query.len());
     let mut in_single_quote = false;
