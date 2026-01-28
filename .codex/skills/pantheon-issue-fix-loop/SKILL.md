@@ -44,13 +44,19 @@ Do not propose a fix until the claim is supported by code and reachability facts
 ### Step 2 — Fix/Review Iteration Loop (Pantheon branches)
 
 Maintain these variables throughout the loop:
-- `parent_branch_id`: Starts as the selected Pantheon branch ID; updated after each Fix/Review branch.
+- `baseline_parent_branch_id`: The initially selected Pantheon branch ID (the original baseline).
+- `last_fix_branch_id`: ✅ The anchor parent for runs; initialized as `baseline_parent_branch_id`.
+  - Review (and optional Verify) runs start from `last_fix_branch_id`.
+  - Fix runs start from `last_fix_branch_id`, and only on successful Fix do we update `last_fix_branch_id`.
 - `pr_number`, `pr_url`, `pr_head_branch`: Set during the first Fix; reused in all later Fix iterations.
-- `last_review_branch_id`: The most recent Review branch id (same as `parent_branch_id` immediately after Step 2.2).
+
+Initialize at the start of Step 2:
+- `baseline_parent_branch_id = parent_branch_id`
+- `last_fix_branch_id = baseline_parent_branch_id`
 
 #### 2.1 First Fix (codex) — must create PR
 
-Call `functions.mcp__test__parallel_explore` with `agent="codex"`, `num_branches=1`, and prompt:
+Call `functions.mcp__test__parallel_explore` with `agent="codex"`, `num_branches=1`, `parent_branch_id=last_fix_branch_id`, and prompt:
 
 ```
 pull the latest code from master branch, then:
@@ -66,11 +72,11 @@ PR_HEAD_BRANCH=<branch>
 ```
 
 Wait for the branch to finish (see “Waiting / Polling”), then extract and store `PR_URL/PR_NUMBER/PR_HEAD_BRANCH`.
-Set `parent_branch_id = fix_branch_id`.
+Set `last_fix_branch_id = fix_branch_id`.
 
 #### 2.2 Review (review_agent) — P0/P1 bug hunt
 
-Call `functions.mcp__test__parallel_explore` with `agent="review_agent_v1.1"`, `num_branches=1`, and prompt:
+Call `functions.mcp__test__parallel_explore` with `agent="review_agent_v1.1"`, `num_branches=1`, `parent_branch_id=last_fix_branch_id`, and prompt:
 
 ```
 review the code change in PR {pr_number} for issue ({issue_link}), do a bug hunt to find P0/P1 issues only.
@@ -83,12 +89,12 @@ If there is no P0/P1, output exactly: NO_P0_P1
 ```
 
 Wait for the branch to finish (see “Waiting / Polling”), then parse the output.
-Set `parent_branch_id = review_branch_id`.
+Do not update `last_fix_branch_id` in Review runs.
 
 #### 2.3 While review reports any P0/P1
 
 For each iteration:
-1. Fix (codex): `functions.mcp__test__parallel_explore(agent="codex")` with prompt:
+1. Fix (codex): `functions.mcp__test__parallel_explore(agent="codex", parent_branch_id=last_fix_branch_id)` with prompt:
 
 ```
 fix the P0/P1 issue found during coding - {p0p1_issue_descriptions} using linus KISS principle with an accurate, rigorous, and concise solution and don't introduce other issue and regression issue.
@@ -100,8 +106,8 @@ Important: do NOT create a new PR. checkout the existing PR head branch and push
 run the smallest relevant tests/build.
 ```
 
-2. Wait for the branch to finish (see “Waiting / Polling”); set `parent_branch_id = fix_branch_id`.
-3. Review again using Step 2.2; wait; set `parent_branch_id = review_branch_id`.
+2. Wait for the branch to finish (see “Waiting / Polling”); set `last_fix_branch_id = fix_branch_id`.
+3. Review again using Step 2.2 (which uses `parent_branch_id=last_fix_branch_id`); wait and parse.
 
 Stop the loop only when the review output is `NO_P0_P1`.
 
@@ -129,7 +135,7 @@ If squash merge is not allowed by repo settings/policy, fall back to a normal me
 - `gh pr merge {pr_number} --merge` (optionally add `--delete-branch`)
 
 If the merge is blocked due to merge conflicts, start one more Fix exploration to resolve conflicts:
-- Call `functions.mcp__test__parallel_explore` with `agent="codex"`, `num_branches=1`, `parent_branch_id=last_review_branch_id`, and prompt:
+- Call `functions.mcp__test__parallel_explore` with `agent="codex"`, `num_branches=1`, `parent_branch_id=last_fix_branch_id`, and prompt:
 
 ```
 resolve merge conflicts for PR {pr_number} (issue: {issue_link}).
