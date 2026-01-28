@@ -5,9 +5,168 @@ use super::{
     parse_timezone_offset_seconds, similar_to_match,
 };
 use super::operators::{parse_bool_pg, try_coerce_text_to_numeric};
-use crate::types::Value;
+use crate::types::{DataType, TableSchema, Value};
 use anyhow::{anyhow, Result};
+use sqlparser::ast::BinaryOperator;
 use sqlparser::ast::Expr;
+
+fn is_explicit_null(expr: &Expr) -> bool {
+    use sqlparser::ast::Value as SqlValue;
+    match expr {
+        Expr::Nested(inner) => is_explicit_null(inner),
+        Expr::Value(SqlValue::Null) => true,
+        _ => false,
+    }
+}
+
+fn infer_expr_type_for_validation<C: EvalContext>(ctx: &C, expr: &Expr) -> DataType {
+    if let Some(data_type) = ctx.column_type(expr) {
+        return data_type.clone();
+    }
+
+    let empty_schema = TableSchema::default();
+    let schema = ctx.schema().unwrap_or(&empty_schema);
+    crate::sql::types::infer_expr_type(expr, schema)
+}
+
+fn ensure_text_or_explicit_null_operand<C: EvalContext>(
+    ctx: &C,
+    expr: &Expr,
+    err_msg: &'static str,
+) -> Result<()> {
+    if is_explicit_null(expr) {
+        return Ok(());
+    }
+
+    match infer_expr_type_for_validation(ctx, expr) {
+        DataType::Text => Ok(()),
+        _ => Err(anyhow!(err_msg)),
+    }
+}
+
+fn ensure_array_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg: &'static str) -> Result<()> {
+    match infer_expr_type_for_validation(ctx, expr) {
+        DataType::Array(_) => Ok(()),
+        _ => Err(anyhow!(err_msg)),
+    }
+}
+
+fn ensure_boolean_or_null_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg: &'static str) -> Result<()> {
+    use sqlparser::ast::UnaryOperator;
+    use sqlparser::ast::Value as SqlValue;
+
+    match expr {
+        Expr::Nested(inner) => ensure_boolean_or_null_operand(ctx, inner, err_msg),
+        Expr::Value(SqlValue::Boolean(_)) | Expr::Value(SqlValue::Null) => Ok(()),
+
+        Expr::Value(
+            SqlValue::SingleQuotedString(s)
+            | SqlValue::DoubleQuotedString(s)
+            | SqlValue::EscapedStringLiteral(s),
+        ) => {
+            if parse_bool_pg(s).is_some() {
+                Ok(())
+            } else {
+                Err(anyhow!(err_msg))
+            }
+        }
+
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => match ctx.column_type(expr) {
+            Some(DataType::Boolean) | Some(DataType::Text) => Ok(()),
+            _ => Err(anyhow!(err_msg)),
+        },
+
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: inner,
+        } => ensure_boolean_or_null_operand(ctx, inner, err_msg),
+
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And | BinaryOperator::Or => {
+                ensure_boolean_or_null_operand(ctx, left, err_msg)?;
+                ensure_boolean_or_null_operand(ctx, right, err_msg)
+            }
+
+            BinaryOperator::PGOverlap => {
+                ensure_array_operand(ctx, left, "&& operator requires array operands")?;
+                ensure_array_operand(ctx, right, "&& operator requires array operands")?;
+                Ok(())
+            }
+
+            // Operators that always return boolean (or NULL) and do not have deterministic
+            // operand type errors (value-dependent errors are still short-circuitable).
+            BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Gt
+            | BinaryOperator::Lt
+            | BinaryOperator::GtEq
+            | BinaryOperator::LtEq
+            | BinaryOperator::PGRegexMatch
+            | BinaryOperator::PGRegexIMatch
+            | BinaryOperator::PGRegexNotMatch
+            | BinaryOperator::PGRegexNotIMatch => Ok(()),
+
+            // PostgreSQL JSONB existence operator: `jsonb ? text`
+            BinaryOperator::Custom(op) if op == "?" => Ok(()),
+            BinaryOperator::PGCustomBinaryOperator(op) if op.len() == 1 && op[0] == "?" => Ok(()),
+
+            _ => Err(anyhow!(err_msg)),
+        },
+
+        Expr::Like { expr, pattern, .. } => {
+            ensure_text_or_explicit_null_operand(ctx, expr, "LIKE requires text operands")?;
+            ensure_text_or_explicit_null_operand(ctx, pattern, "LIKE requires text operands")?;
+            Ok(())
+        }
+
+        Expr::ILike { expr, pattern, .. } => {
+            ensure_text_or_explicit_null_operand(ctx, expr, "ILIKE requires text operands")?;
+            ensure_text_or_explicit_null_operand(ctx, pattern, "ILIKE requires text operands")?;
+            Ok(())
+        }
+
+        Expr::SimilarTo { .. }
+        | Expr::Between { .. }
+        | Expr::InList { .. }
+        | Expr::IsNull(_)
+        | Expr::IsNotNull(_)
+        | Expr::IsTrue(_)
+        | Expr::IsNotTrue(_)
+        | Expr::IsFalse(_)
+        | Expr::IsNotFalse(_)
+        | Expr::IsUnknown(_)
+        | Expr::IsNotUnknown(_) => Ok(()),
+
+        Expr::Cast { data_type, .. } => match data_type {
+            sqlparser::ast::DataType::Boolean => Ok(()),
+            _ => Err(anyhow!(err_msg)),
+        },
+
+        Expr::Case {
+            results,
+            else_result,
+            ..
+        } => {
+            for result in results {
+                ensure_boolean_or_null_operand(ctx, result, err_msg)?;
+            }
+            if let Some(else_expr) = else_result {
+                ensure_boolean_or_null_operand(ctx, else_expr, err_msg)?;
+            }
+            Ok(())
+        }
+
+        // Fallback to type inference for expression forms we don't explicitly classify above.
+        other => {
+            let empty_schema = TableSchema::default();
+            let schema = ctx.schema().unwrap_or(&empty_schema);
+            match crate::sql::types::infer_expr_type(other, schema) {
+                DataType::Boolean => Ok(()),
+                _ => Err(anyhow!(err_msg)),
+            }
+        }
+    }
+}
 
 pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
     match expr {
@@ -19,11 +178,53 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             ctx.resolve_column(&ident.value)
         }
         Expr::CompoundIdentifier(parts) => ctx.resolve_compound_identifier(parts),
-        Expr::BinaryOp { left, op, right } => {
-            let left_val = eval_expr_impl(ctx, left)?;
-            let right_val = eval_expr_impl(ctx, right)?;
-            eval_binary_op(left_val, op, right_val)
-        }
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                let left_val = eval_expr_impl(ctx, left)?;
+                let left_val = match left_val {
+                    Value::Text(s) => parse_bool_pg(&s)
+                        .map(Value::Boolean)
+                        .unwrap_or(Value::Text(s)),
+                    other => other,
+                };
+                match &left_val {
+                    Value::Boolean(false) => {
+                        ensure_boolean_or_null_operand(ctx, right, "AND requires boolean operands")?;
+                        Ok(Value::Boolean(false))
+                    }
+                    Value::Boolean(true) | Value::Null => {
+                        let right_val = eval_expr_impl(ctx, right)?;
+                        eval_binary_op(left_val, op, right_val)
+                    }
+                    _ => Err(anyhow!("AND requires boolean operands")),
+                }
+            }
+            BinaryOperator::Or => {
+                let left_val = eval_expr_impl(ctx, left)?;
+                let left_val = match left_val {
+                    Value::Text(s) => parse_bool_pg(&s)
+                        .map(Value::Boolean)
+                        .unwrap_or(Value::Text(s)),
+                    other => other,
+                };
+                match &left_val {
+                    Value::Boolean(true) => {
+                        ensure_boolean_or_null_operand(ctx, right, "OR requires boolean operands")?;
+                        Ok(Value::Boolean(true))
+                    }
+                    Value::Boolean(false) | Value::Null => {
+                        let right_val = eval_expr_impl(ctx, right)?;
+                        eval_binary_op(left_val, op, right_val)
+                    }
+                    _ => Err(anyhow!("OR requires boolean operands")),
+                }
+            }
+            _ => {
+                let left_val = eval_expr_impl(ctx, left)?;
+                let right_val = eval_expr_impl(ctx, right)?;
+                eval_binary_op(left_val, op, right_val)
+            }
+        },
         Expr::UnaryOp { op, expr } => {
             let val = eval_expr_impl(ctx, expr)?;
             match op {
@@ -178,11 +379,16 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
         } => {
             let val = eval_expr_impl(ctx, expr)?;
             let pat = eval_expr_impl(ctx, pattern)?;
-            let (Value::Text(s), Value::Text(p)) = (&val, &pat) else {
-                return Ok(Value::Boolean(false));
-            };
-            let matched = like_match(s, p, *escape_char, false);
-            Ok(Value::Boolean(if *negated { !matched } else { matched }))
+            match (&val, &pat) {
+                (Value::Text(s), Value::Text(p)) => {
+                    let matched = like_match(s, p, *escape_char, false);
+                    Ok(Value::Boolean(if *negated { !matched } else { matched }))
+                }
+                (Value::Null, Value::Null)
+                | (Value::Null, Value::Text(_))
+                | (Value::Text(_), Value::Null) => Ok(Value::Null),
+                _ => Err(anyhow!("LIKE requires text operands")),
+            }
         }
         Expr::ILike {
             negated,
@@ -192,11 +398,16 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
         } => {
             let val = eval_expr_impl(ctx, expr)?;
             let pat = eval_expr_impl(ctx, pattern)?;
-            let (Value::Text(s), Value::Text(p)) = (&val, &pat) else {
-                return Ok(Value::Boolean(false));
-            };
-            let matched = like_match(s, p, *escape_char, true);
-            Ok(Value::Boolean(if *negated { !matched } else { matched }))
+            match (&val, &pat) {
+                (Value::Text(s), Value::Text(p)) => {
+                    let matched = like_match(s, p, *escape_char, true);
+                    Ok(Value::Boolean(if *negated { !matched } else { matched }))
+                }
+                (Value::Null, Value::Null)
+                | (Value::Null, Value::Text(_))
+                | (Value::Text(_), Value::Null) => Ok(Value::Null),
+                _ => Err(anyhow!("ILIKE requires text operands")),
+            }
         }
         Expr::SimilarTo {
             negated,
