@@ -61,7 +61,7 @@ pub async fn execute_create_type(
     };
 
     store.create_type(txn, db_id, def).await?;
-    Ok(ExecuteResult::Empty)
+    Ok(ExecuteResult::CommandComplete { tag: "CREATE TYPE" })
 }
 
 pub async fn create_enum_type(
@@ -97,7 +97,7 @@ pub async fn create_enum_type(
     };
 
     store.create_type(txn, db_id, def).await?;
-    Ok(ExecuteResult::Empty)
+    Ok(ExecuteResult::CommandComplete { tag: "CREATE TYPE" })
 }
 
 pub async fn drop_types(
@@ -135,5 +135,5 @@ pub async fn drop_types(
 
         store.drop_type(txn, db_id, full_name).await?;
     }
-    Ok(ExecuteResult::Empty)
+    Ok(ExecuteResult::CommandComplete { tag: "DROP TYPE" })
 }

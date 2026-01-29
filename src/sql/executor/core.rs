@@ -1221,7 +1221,9 @@ impl Executor {
                     .await?;
                     let resolved = match resolved {
                         Some(r) => r,
-                        None if if_exists => return Ok(ExecuteResult::Empty),
+                        None if if_exists => {
+                            return Ok(ExecuteResult::CommandComplete { tag: "ALTER TABLE" });
+                        }
                         None => return Err(anyhow!("Table '{}' does not exist", name)),
                     };
 
@@ -1247,7 +1249,11 @@ impl Executor {
                     .await?;
                     let resolved = match resolved {
                         Some(r) => r,
-                        None if if_exists => return Ok(ExecuteResult::Empty),
+                        None if if_exists => {
+                            return Ok(ExecuteResult::CommandComplete {
+                                tag: "ALTER SEQUENCE",
+                            });
+                        }
                         None => return Err(anyhow!("Sequence '{}' does not exist", name)),
                     };
 
@@ -1273,7 +1279,11 @@ impl Executor {
                     .await?;
                     let resolved = match resolved {
                         Some(r) => r,
-                        None if if_exists => return Ok(ExecuteResult::Empty),
+                        None if if_exists => {
+                            return Ok(ExecuteResult::CommandComplete {
+                                tag: "ALTER FUNCTION",
+                            });
+                        }
                         None => return Err(anyhow!("Function '{}' does not exist", name)),
                     };
 
@@ -1335,7 +1345,9 @@ impl Executor {
             .await?;
             let resolved = match resolved {
                 Some(r) => r,
-                None if if_exists => return Ok(ExecuteResult::Empty),
+                None if if_exists => {
+                    return Ok(ExecuteResult::CommandComplete { tag: "ALTER SEQUENCE" });
+                }
                 None => return Err(anyhow!("Sequence '{}' does not exist", sequence_name)),
             };
 
@@ -1718,7 +1730,7 @@ impl Executor {
                 self.store
                     .create_schema(txn, db_id, &schema, *if_not_exists)
                     .await?;
-                Ok(ExecuteResult::Empty)
+                Ok(ExecuteResult::CommandComplete { tag: "CREATE SCHEMA" })
             }
             Statement::CreateFunction { .. } => Ok(ExecuteResult::Empty),
             Statement::CreateProcedure {
@@ -2838,7 +2850,7 @@ impl Executor {
                 .drop_schema_restrict(txn, db_id, &schema, if_exists)
                 .await?;
         }
-        Ok(ExecuteResult::Empty)
+        Ok(ExecuteResult::CommandComplete { tag: "DROP SCHEMA" })
     }
     async fn execute_show_tables(
         &self,
