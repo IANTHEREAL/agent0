@@ -157,6 +157,14 @@ impl KeyspaceQuota {
             current_depth: AtomicUsize::new(0),
         }
     }
+
+    fn dec_current_depth(&self) {
+        let _ = self
+            .current_depth
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+    }
 }
 
 pub(crate) struct TriggerWorker {
@@ -518,7 +526,7 @@ impl TriggerWorker {
             Ok(()) => {
                 // Success: remove from queue.
                 txn.delete(key.clone()).await?;
-                quota.current_depth.fetch_sub(1, Ordering::Relaxed);
+                quota.dec_current_depth();
             }
             Err(e) => {
                 let Some(val) = txn.get(key.clone()).await? else {
@@ -537,7 +545,7 @@ impl TriggerWorker {
                     let dlq_key = encode_trigger_dlq_key(updated.id);
                     txn.put(dlq_key, bincode::serialize(&updated)?).await?;
                     txn.delete(key).await?;
-                    quota.current_depth.fetch_sub(1, Ordering::Relaxed);
+                    quota.dec_current_depth();
                 } else {
                     updated.status = EventStatus::Pending;
                     updated.worker_id = None;
@@ -667,7 +675,7 @@ impl TriggerWorker {
                     let dlq_key = encode_trigger_dlq_key(ev.id);
                     txn.put(dlq_key, bincode::serialize(&ev)?).await?;
                     txn.delete(key).await?;
-                    quota.current_depth.fetch_sub(1, Ordering::Relaxed);
+                    quota.dec_current_depth();
                 } else {
                     ev.status = EventStatus::Pending;
                     ev.worker_id = None;
@@ -1298,6 +1306,7 @@ fn value_to_sql_literal(value: &crate::types::Value) -> String {
 #[cfg(test)]
 mod tests {
     use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
         case_insensitive_replace, parse_new_assignment, plpgsql_outer_block_range,
@@ -1336,6 +1345,27 @@ mod tests {
         let s = "NEW.col";
         let result = case_insensitive_replace(s, "new.COL", "$1");
         assert_eq!(result, "$1");
+    }
+
+    #[test]
+    fn current_depth_saturating_decrement_does_not_underflow() {
+        let quota = super::KeyspaceQuota {
+            max_queue_depth: 1,
+            max_events_per_batch: 1,
+            max_retries: 1,
+            current_depth: AtomicUsize::new(0),
+        };
+        quota.dec_current_depth();
+        assert_eq!(quota.current_depth.load(Ordering::Relaxed), 0);
+
+        let quota = super::KeyspaceQuota {
+            max_queue_depth: 1,
+            max_events_per_batch: 1,
+            max_retries: 1,
+            current_depth: AtomicUsize::new(2),
+        };
+        quota.dec_current_depth();
+        assert_eq!(quota.current_depth.load(Ordering::Relaxed), 1);
     }
 
     #[test]
