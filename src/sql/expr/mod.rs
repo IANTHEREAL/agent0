@@ -261,34 +261,37 @@ fn eval_function(
     schema: Option<&TableSchema>,
 ) -> Result<Value> {
     let func_name = func.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
-    let args: Vec<Value> = func
-        .args
-        .iter()
-        .filter_map(|arg| {
+    let func_name_upper = func_name.to_uppercase();
+
+    // COALESCE is evaluated left-to-right and must short-circuit.
+    // Do not eagerly evaluate all args, otherwise errors in later args would be surfaced incorrectly.
+    if func_name_upper == "COALESCE" {
+        for arg in &func.args {
             if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) =
                 arg
             {
-                eval_expr(e, row, schema).ok()
-            } else {
-                None
+                let val = eval_expr(e, row, schema)?;
+                if !matches!(val, Value::Null) {
+                    return Ok(val);
+                }
             }
-        })
-        .collect();
+        }
+        return Ok(Value::Null);
+    }
 
-    let func_name_upper = func_name.to_uppercase();
+    let mut args = Vec::with_capacity(func.args.len());
+    for arg in &func.args {
+        if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) = arg
+        {
+            args.push(eval_expr(e, row, schema)?);
+        }
+    }
+
     if let Some(registry_fn) = functions::get_registry().get(func_name_upper.as_str()) {
         return registry_fn(args);
     }
 
     match func_name_upper.as_str() {
-        "COALESCE" => {
-            for val in args {
-                if !matches!(val, Value::Null) {
-                    return Ok(val);
-                }
-            }
-            Ok(Value::Null)
-        }
         "NULLIF" => {
             if args.len() >= 2 && compare_values(&args[0], &args[1]).unwrap_or(1) == 0 {
                 Ok(Value::Null)
@@ -2599,6 +2602,18 @@ mod tests {
     fn test_division_by_zero() {
         assert!(eval_expr(&parse_expr("5 / 0"), None, None).is_err());
         assert!(eval_expr(&parse_expr("5 % 0"), None, None).is_err());
+    }
+
+    #[test]
+    fn test_function_args_do_not_drop_errors() {
+        assert!(eval_expr(&parse_expr("COALESCE(5 / 0, 1)"), None, None).is_err());
+        assert!(eval_expr(&parse_expr("COALESCE(NULL, 5 / 0, 1)"), None, None).is_err());
+        assert_eq!(
+            eval_expr(&parse_expr("COALESCE(1, 5 / 0)"), None, None).unwrap(),
+            Value::Int32(1)
+        );
+        assert!(eval_expr(&parse_expr("NULLIF(5 / 0, 1)"), None, None).is_err());
+        assert!(eval_expr(&parse_expr("GREATEST(1, 5 / 0)"), None, None).is_err());
     }
 
     #[test]
