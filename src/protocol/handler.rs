@@ -2333,7 +2333,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         let query = &portal.statement.statement;
         debug!("Extended query: {}", query);
 
-        let final_query = substitute_parameters(query, portal);
+        let final_query = substitute_parameters(query, portal)?;
         debug!("Final query after substitution: {}", final_query);
 
         let mut session_guard = self.session.lock().await;
@@ -2412,7 +2412,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let final_query = substitute_parameters(&portal.statement.statement, portal);
+        let final_query = substitute_parameters(&portal.statement.statement, portal)?;
         let fields = self.infer_result_fields_from_query(&final_query).await;
         Ok(DescribePortalResponse::new(fields))
     }
@@ -2597,7 +2597,7 @@ fn substitute_placeholders_outside_strings_and_dollar(query: &str, values: &[Str
     String::from_utf8(out).unwrap_or_else(|_| query.to_string())
 }
 
-fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
+fn substitute_parameters(query: &str, portal: &Portal<String>) -> PgWireResult<String> {
     let mut values: Vec<String> = Vec::with_capacity(portal.parameter_len());
 
     fn quote_sql_string_literal(value: &str) -> String {
@@ -2612,109 +2612,165 @@ fn substitute_parameters(query: &str, portal: &Portal<String>) -> String {
             .cloned()
             .unwrap_or(Type::UNKNOWN);
 
-        let value_str = match &param_type {
-            t if *t == Type::BOOL => portal
-                .parameter::<bool>(i, &param_type)
-                .ok()
-                .flatten()
-                .map(|v| if v { "true" } else { "false" }.to_string())
-                .unwrap_or_else(|| "NULL".to_string()),
-            t if *t == Type::INT2 => portal
-                .parameter::<i16>(i, &param_type)
-                .ok()
-                .flatten()
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "NULL".to_string()),
-            t if *t == Type::INT4 => portal
-                .parameter::<i32>(i, &param_type)
-                .ok()
-                .flatten()
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "NULL".to_string()),
-            t if *t == Type::INT8 => portal
-                .parameter::<i64>(i, &param_type)
-                .ok()
-                .flatten()
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "NULL".to_string()),
-            t if *t == Type::FLOAT4 => portal
-                .parameter::<f32>(i, &param_type)
-                .ok()
-                .flatten()
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "NULL".to_string()),
-            t if *t == Type::FLOAT8 => portal
-                .parameter::<f64>(i, &param_type)
-                .ok()
-                .flatten()
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "NULL".to_string()),
-            t if *t == Type::TIMESTAMP || *t == Type::TIMESTAMPTZ => {
-                use chrono::{DateTime, NaiveDateTime, Utc};
-                if portal.parameter_format.is_binary(i) {
-                    if let Ok(Some(ts)) = portal.parameter::<DateTime<Utc>>(i, &param_type) {
-                        format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S%.6f%:z"))
-                    } else if let Ok(Some(ts)) = portal.parameter::<NaiveDateTime>(i, &param_type) {
-                        format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S%.6f"))
-                    } else {
-                        "NULL".to_string()
+        let param = portal
+            .parameters
+            .get(i)
+            .ok_or_else(|| PgWireError::ParameterIndexOutOfBound(i))?;
+
+        let Some(param_bytes) = param.as_ref() else {
+            values.push("NULL".to_string());
+            continue;
+        };
+
+        let invalid_param = |message: String| -> PgWireError {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "22P02".to_string(),
+                format!(
+                    "invalid input syntax for parameter ${} ({}): {}",
+                    i + 1,
+                    param_type.name(),
+                    message
+                ),
+            )))
+        };
+
+        let value_str = if portal.parameter_format.is_binary(i) {
+            match &param_type {
+                t if *t == Type::BOOL => match portal.parameter::<bool>(i, &param_type)? {
+                    Some(v) => {
+                        if v {
+                            "true".to_string()
+                        } else {
+                            "false".to_string()
+                        }
                     }
-                } else {
-                    portal
-                        .parameter::<String>(i, &Type::TEXT)
-                        .ok()
-                        .flatten()
-                        .map(|v| format!("'{}'", v.replace("'", "''")))
-                        .unwrap_or_else(|| "NULL".to_string())
+                    None => "NULL".to_string(),
+                },
+                t if *t == Type::INT2 => match portal.parameter::<i16>(i, &param_type)? {
+                    Some(v) => v.to_string(),
+                    None => "NULL".to_string(),
+                },
+                t if *t == Type::INT4 => match portal.parameter::<i32>(i, &param_type)? {
+                    Some(v) => v.to_string(),
+                    None => "NULL".to_string(),
+                },
+                t if *t == Type::INT8 => match portal.parameter::<i64>(i, &param_type)? {
+                    Some(v) => v.to_string(),
+                    None => "NULL".to_string(),
+                },
+                t if *t == Type::FLOAT4 => match portal.parameter::<f32>(i, &param_type)? {
+                    Some(v) => v.to_string(),
+                    None => "NULL".to_string(),
+                },
+                t if *t == Type::FLOAT8 => match portal.parameter::<f64>(i, &param_type)? {
+                    Some(v) => v.to_string(),
+                    None => "NULL".to_string(),
+                },
+                t if *t == Type::TIMESTAMPTZ => {
+                    use chrono::{DateTime, Utc};
+                    match portal.parameter::<DateTime<Utc>>(i, &param_type)? {
+                        Some(ts) => format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S%.6f%:z")),
+                        None => "NULL".to_string(),
+                    }
+                }
+                t if *t == Type::TIMESTAMP => {
+                    use chrono::NaiveDateTime;
+                    match portal.parameter::<NaiveDateTime>(i, &param_type)? {
+                        Some(ts) => format!("'{}'", ts.format("%Y-%m-%d %H:%M:%S%.6f")),
+                        None => "NULL".to_string(),
+                    }
+                }
+                t if *t == Type::UUID => {
+                    let uuid = uuid::Uuid::from_slice(param_bytes.as_ref())
+                        .map_err(|e| invalid_param(e.to_string()))?;
+                    format!("{}::uuid", quote_sql_string_literal(&uuid.to_string()))
+                }
+                t if *t == Type::BYTEA => {
+                    let hex = hex::encode(param_bytes.as_ref());
+                    let repr = format!("\\x{}", hex);
+                    format!("{}::bytea", quote_sql_string_literal(&repr))
+                }
+                t if *t == Type::TEXT => {
+                    let s = std::str::from_utf8(param_bytes.as_ref())
+                        .map_err(|e| invalid_param(e.to_string()))?;
+                    quote_sql_string_literal(s)
+                }
+                t if *t == Type::JSON => {
+                    let s = std::str::from_utf8(param_bytes.as_ref())
+                        .map_err(|e| invalid_param(e.to_string()))?;
+                    quote_sql_string_literal(s)
+                }
+                _ => {
+                    return Err(invalid_param(format!(
+                        "unsupported binary parameter type {}",
+                        param_type.name()
+                    )));
                 }
             }
-            t if *t == Type::TEXT => portal
-                .parameter::<String>(i, &Type::TEXT)
-                .ok()
-                .flatten()
-                .map(|v| quote_sql_string_literal(&v))
-                .unwrap_or_else(|| "NULL".to_string()),
-            t if *t == Type::UNKNOWN => {
-                if portal.parameter_format.is_binary(i) {
-                    // Binary format - try to decode as common types
-                    // NOTE: Do NOT try timestamp here - timestamps and i64 are both 8 bytes,
-                    // and we can't reliably distinguish them without knowing the actual type.
-                    // Timestamps should only be decoded when param_type is TIMESTAMP/TIMESTAMPTZ.
-                    if let Ok(Some(v)) = portal.parameter::<i32>(i, &Type::INT4) {
-                        v.to_string()
-                    } else if let Ok(Some(v)) = portal.parameter::<i64>(i, &Type::INT8) {
-                        v.to_string()
-                    } else if let Ok(Some(v)) = portal.parameter::<bool>(i, &Type::BOOL) {
-                        if v { "true" } else { "false" }.to_string()
-                    } else if let Ok(Some(v)) = portal.parameter::<f64>(i, &Type::FLOAT8) {
-                        v.to_string()
-                    } else if let Ok(Some(v)) = portal.parameter::<String>(i, &Type::TEXT) {
-                        format!("'{}'", v.replace("'", "''"))
-                    } else {
-                        "NULL".to_string()
+        } else {
+            let raw = std::str::from_utf8(param_bytes.as_ref())
+                .map_err(|e| invalid_param(e.to_string()))?;
+
+            let trimmed = raw.trim();
+
+            match &param_type {
+                t if *t == Type::BOOL => {
+                    let lower = trimmed.to_ascii_lowercase();
+                    match lower.as_str() {
+                        "t" | "true" | "1" => "true".to_string(),
+                        "f" | "false" | "0" => "false".to_string(),
+                        _ => return Err(invalid_param(format!("\"{}\"", raw))),
                     }
-                } else {
-                    // Text format - treat as string literal (type inference happens in SQL layer)
-                    portal
-                        .parameter::<String>(i, &Type::TEXT)
-                        .ok()
-                        .flatten()
-                        .map(|v| quote_sql_string_literal(&v))
-                        .unwrap_or_else(|| "NULL".to_string())
                 }
+                t if *t == Type::INT2 => trimmed
+                    .parse::<i16>()
+                    .map(|v| v.to_string())
+                    .map_err(|e| invalid_param(e.to_string()))?,
+                t if *t == Type::INT4 => trimmed
+                    .parse::<i32>()
+                    .map(|v| v.to_string())
+                    .map_err(|e| invalid_param(e.to_string()))?,
+                t if *t == Type::INT8 => trimmed
+                    .parse::<i64>()
+                    .map(|v| v.to_string())
+                    .map_err(|e| invalid_param(e.to_string()))?,
+                t if *t == Type::FLOAT4 => {
+                    let v = trimmed
+                        .parse::<f32>()
+                        .map_err(|e| invalid_param(e.to_string()))?;
+                    if !v.is_finite() {
+                        return Err(invalid_param(format!(
+                            "non-finite FLOAT4 is not supported: \"{}\"",
+                            raw
+                        )));
+                    }
+                    v.to_string()
+                }
+                t if *t == Type::FLOAT8 => {
+                    let v = trimmed
+                        .parse::<f64>()
+                        .map_err(|e| invalid_param(e.to_string()))?;
+                    if !v.is_finite() {
+                        return Err(invalid_param(format!(
+                            "non-finite FLOAT8 is not supported: \"{}\"",
+                            raw
+                        )));
+                    }
+                    v.to_string()
+                }
+                t if *t == Type::UUID => format!("{}::uuid", quote_sql_string_literal(raw)),
+                t if *t == Type::BYTEA => format!("{}::bytea", quote_sql_string_literal(raw)),
+                _ => quote_sql_string_literal(raw),
             }
-            _ => portal
-                .parameter::<String>(i, &Type::TEXT)
-                .ok()
-                .flatten()
-                .map(|v| quote_sql_string_literal(&v))
-                .unwrap_or_else(|| "NULL".to_string()),
         };
 
         values.push(value_str);
     }
 
-    substitute_placeholders_outside_strings_and_dollar(query, &values)
+    Ok(substitute_placeholders_outside_strings_and_dollar(
+        query, &values,
+    ))
 }
 
 #[allow(dead_code)]
@@ -3159,7 +3215,7 @@ impl ExtendedQueryHandler for PgHandler {
         let query = &portal.statement.statement;
         debug!("Extended query: {}", query);
 
-        let final_query = substitute_parameters(query, portal);
+        let final_query = substitute_parameters(query, portal)?;
         debug!("Final query after substitution: {}", final_query);
 
         let mut session = self.session.lock().await;
@@ -3214,7 +3270,7 @@ impl ExtendedQueryHandler for PgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let final_query = substitute_parameters(&portal.statement.statement, portal);
+        let final_query = substitute_parameters(&portal.statement.statement, portal)?;
         let fields = self.infer_result_fields_from_query(&final_query).await;
         Ok(DescribePortalResponse::new(fields))
     }
@@ -4365,7 +4421,7 @@ mod tests {
         portal.result_column_format = Format::UnifiedText;
 
         assert_eq!(
-            substitute_parameters("SELECT $1::text", &portal),
+            substitute_parameters("SELECT $1::text", &portal).unwrap(),
             "SELECT '001'::text"
         );
     }
@@ -4385,7 +4441,7 @@ mod tests {
         portal.result_column_format = Format::UnifiedText;
 
         assert_eq!(
-            substitute_parameters("SELECT $1::text", &portal),
+            substitute_parameters("SELECT $1::text", &portal).unwrap(),
             "SELECT '001'::text"
         );
     }
@@ -4405,8 +4461,67 @@ mod tests {
         portal.result_column_format = Format::UnifiedText;
 
         assert_eq!(
-            substitute_parameters("SELECT $1", &portal),
+            substitute_parameters("SELECT $1", &portal).unwrap(),
             "SELECT 'O''Reilly'"
+        );
+    }
+
+    #[test]
+    fn test_substitute_parameters_int4_text_format_renders_number() {
+        let stmt = Arc::new(StoredStatement::new(
+            "stmt".to_string(),
+            "SELECT $1".to_string(),
+            vec![Type::INT4],
+        ));
+        let mut portal: Portal<String> = Portal::default();
+        portal.name = "portal".to_string();
+        portal.statement = stmt;
+        portal.parameter_format = Format::UnifiedText;
+        portal.parameters = vec![Some(Bytes::from_static(b"42"))];
+        portal.result_column_format = Format::UnifiedText;
+
+        assert_eq!(
+            substitute_parameters("SELECT $1", &portal).unwrap(),
+            "SELECT 42"
+        );
+    }
+
+    #[test]
+    fn test_substitute_parameters_int4_text_format_invalid_errors() {
+        let stmt = Arc::new(StoredStatement::new(
+            "stmt".to_string(),
+            "SELECT $1".to_string(),
+            vec![Type::INT4],
+        ));
+        let mut portal: Portal<String> = Portal::default();
+        portal.name = "portal".to_string();
+        portal.statement = stmt;
+        portal.parameter_format = Format::UnifiedText;
+        portal.parameters = vec![Some(Bytes::from_static(b"not-a-number"))];
+        portal.result_column_format = Format::UnifiedText;
+
+        assert!(substitute_parameters("SELECT $1", &portal).is_err());
+    }
+
+    #[test]
+    fn test_substitute_parameters_uuid_binary_format_renders_uuid_literal() {
+        let stmt = Arc::new(StoredStatement::new(
+            "stmt".to_string(),
+            "SELECT $1".to_string(),
+            vec![Type::UUID],
+        ));
+        let uuid =
+            uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid");
+        let mut portal: Portal<String> = Portal::default();
+        portal.name = "portal".to_string();
+        portal.statement = stmt;
+        portal.parameter_format = Format::UnifiedBinary;
+        portal.parameters = vec![Some(Bytes::copy_from_slice(uuid.as_bytes()))];
+        portal.result_column_format = Format::UnifiedText;
+
+        assert_eq!(
+            substitute_parameters("SELECT $1", &portal).unwrap(),
+            "SELECT '550e8400-e29b-41d4-a716-446655440000'::uuid"
         );
     }
 
