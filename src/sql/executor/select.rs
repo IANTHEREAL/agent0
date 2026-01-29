@@ -830,7 +830,7 @@ impl Executor {
         let (rows_for_projection, window_results) = match &select.distinct {
             Some(Distinct::On(on_exprs)) => {
                 let (rows, indices) =
-                    distinct_on_rows_with_indices(filtered_rows, on_exprs, Some(&schema));
+                    distinct_on_rows_with_indices(filtered_rows, on_exprs, Some(&schema))?;
                 let window_results =
                     window_results.map(|wr| super::super::query::reorder_by_indices(&wr, &indices));
                 (rows, window_results)

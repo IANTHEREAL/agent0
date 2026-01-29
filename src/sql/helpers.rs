@@ -50,15 +50,15 @@ pub fn distinct_on_rows(
     rows: Vec<Row>,
     on_exprs: &[Expr],
     row_context: Option<&TableSchema>,
-) -> Vec<Row> {
-    distinct_on_rows_with_indices(rows, on_exprs, row_context).0
+) -> Result<Vec<Row>> {
+    Ok(distinct_on_rows_with_indices(rows, on_exprs, row_context)?.0)
 }
 
 pub fn distinct_on_rows_with_indices(
     rows: Vec<Row>,
     on_exprs: &[Expr],
     row_context: Option<&TableSchema>,
-) -> (Vec<Row>, Vec<usize>) {
+) -> Result<(Vec<Row>, Vec<usize>)> {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut result = Vec::new();
     let mut indices = Vec::new();
@@ -66,15 +66,15 @@ pub fn distinct_on_rows_with_indices(
     for (idx, row) in rows.into_iter().enumerate() {
         let key_values: Vec<Value> = on_exprs
             .iter()
-            .filter_map(|expr| eval_expr(expr, Some(&row), row_context).ok())
-            .collect();
-        let key = bincode::serialize(&key_values).unwrap_or_default();
+            .map(|expr| eval_expr(expr, Some(&row), row_context))
+            .collect::<Result<Vec<_>>>()?;
+        let key = bincode::serialize(&key_values)?;
         if seen.insert(key) {
             indices.push(idx);
             result.push(row);
         }
     }
-    (result, indices)
+    Ok((result, indices))
 }
 
 #[allow(dead_code)]
@@ -83,8 +83,8 @@ pub fn distinct_on_rows_join(
     on_exprs: &[Expr],
     column_offsets: &std::collections::HashMap<String, usize>,
     combined_schema: &TableSchema,
-) -> Vec<Row> {
-    distinct_on_rows_join_with_indices(rows, on_exprs, column_offsets, combined_schema).0
+) -> Result<Vec<Row>> {
+    Ok(distinct_on_rows_join_with_indices(rows, on_exprs, column_offsets, combined_schema)?.0)
 }
 
 pub fn distinct_on_rows_join_with_indices(
@@ -92,7 +92,7 @@ pub fn distinct_on_rows_join_with_indices(
     on_exprs: &[Expr],
     column_offsets: &std::collections::HashMap<String, usize>,
     combined_schema: &TableSchema,
-) -> (Vec<Row>, Vec<usize>) {
+) -> Result<(Vec<Row>, Vec<usize>)> {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut result = Vec::new();
     let mut indices = Vec::new();
@@ -106,15 +106,15 @@ pub fn distinct_on_rows_join_with_indices(
         };
         let key_values: Vec<Value> = on_exprs
             .iter()
-            .filter_map(|expr| eval_expr_join(expr, &ctx).ok())
-            .collect();
-        let key = bincode::serialize(&key_values).unwrap_or_default();
+            .map(|expr| eval_expr_join(expr, &ctx))
+            .collect::<Result<Vec<_>>>()?;
+        let key = bincode::serialize(&key_values)?;
         if seen.insert(key) {
             indices.push(idx);
             result.push(row);
         }
     }
-    (result, indices)
+    Ok((result, indices))
 }
 
 pub fn apply_offset_limit_fetch(mut rows: Vec<Row>, query: &Query) -> Vec<Row> {
@@ -1478,11 +1478,38 @@ mod tests {
         let on_exprs = vec![sqlparser::ast::Expr::Identifier(
             sqlparser::ast::Ident::new("a"),
         )];
-        let (result, indices) = distinct_on_rows_with_indices(rows, &on_exprs, Some(&schema));
+        let (result, indices) =
+            distinct_on_rows_with_indices(rows, &on_exprs, Some(&schema)).unwrap();
         assert_eq!(indices, vec![0, 2]);
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].values[1], Value::Text("x".to_string()));
         assert_eq!(result[1].values[1], Value::Text("z".to_string()));
+    }
+
+    #[test]
+    fn test_distinct_on_rows_with_indices_propagates_eval_error() {
+        let schema = TableSchema::new(
+            "t".to_string(),
+            1,
+            vec![ColumnDef {
+                name: "a".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            vec![],
+        );
+
+        let rows = vec![Row::new(vec![Value::Int32(1)]), Row::new(vec![Value::Int32(2)])];
+        let on_exprs = vec![sqlparser::ast::Expr::Identifier(
+            sqlparser::ast::Ident::new("missing_col"),
+        )];
+
+        let result = distinct_on_rows_with_indices(rows, &on_exprs, Some(&schema));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1513,9 +1540,37 @@ mod tests {
             sqlparser::ast::Ident::new("a"),
         )];
         let (result, indices) =
-            distinct_on_rows_join_with_indices(rows, &on_exprs, &offsets, &schema);
+            distinct_on_rows_join_with_indices(rows, &on_exprs, &offsets, &schema).unwrap();
         assert_eq!(indices, vec![0, 2]);
         assert_eq!(result.len(), 2);
+    }
+
+    #[test]
+    fn test_distinct_on_rows_join_with_indices_propagates_eval_error() {
+        let schema = TableSchema::new(
+            "t".to_string(),
+            1,
+            vec![ColumnDef {
+                name: "a".to_string(),
+                data_type: DataType::Int32,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            vec![],
+        );
+        let mut offsets = HashMap::new();
+        offsets.insert("a".to_string(), 0);
+
+        let rows = vec![Row::new(vec![Value::Int32(1)]), Row::new(vec![Value::Int32(2)])];
+        let on_exprs = vec![sqlparser::ast::Expr::Identifier(
+            sqlparser::ast::Ident::new("missing_col"),
+        )];
+
+        let result = distinct_on_rows_join_with_indices(rows, &on_exprs, &offsets, &schema);
+        assert!(result.is_err());
     }
 
     #[test]

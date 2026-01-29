@@ -3491,7 +3491,7 @@ impl Executor {
                     on_exprs,
                     &final_column_offsets,
                     &final_schema,
-                );
+                )?;
                 let window_results =
                     window_results.map(|wr| super::super::query::reorder_by_indices(&wr, &indices));
                 (rows, window_results)
