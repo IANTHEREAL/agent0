@@ -162,6 +162,8 @@ fn hash_single_value<H: Hasher>(hasher: &mut H, value: &Value) {
         Value::Float64(f) => {
             if f.is_nan() {
                 u64::MAX.hash(hasher);
+            } else if *f == 0.0 {
+                0.0f64.to_bits().hash(hasher);
             } else {
                 f.to_bits().hash(hasher);
             }
@@ -204,7 +206,7 @@ fn hash_single_value<H: Hasher>(hasher: &mut H, value: &Value) {
 /// Compare two join keys for equality (SQL semantics).
 ///
 /// - NULL != NULL (returns false)
-/// - NaN != NaN (returns false)
+/// - NaN == NaN (returns true, PostgreSQL-like)
 /// - Handles Int32/Int64 type coercion
 pub fn join_keys_equal(left: &[Value], right: &[Value]) -> bool {
     if left.len() != right.len() {
@@ -220,14 +222,8 @@ fn values_equal_for_join(left: &Value, right: &Value) -> bool {
         // NULL never equals anything
         (Value::Null, _) | (_, Value::Null) => false,
         
-        // Float: NaN != NaN
-        (Value::Float64(a), Value::Float64(b)) => {
-            if a.is_nan() || b.is_nan() {
-                false
-            } else {
-                a == b
-            }
-        }
+        // Float: PostgreSQL-like equality (NaN == NaN)
+        (Value::Float64(a), Value::Float64(b)) => a == b || (a.is_nan() && b.is_nan()),
         
         // Integer type coercion
         (Value::Int32(a), Value::Int64(b)) => (*a as i64) == *b,
@@ -278,9 +274,9 @@ mod hash_tests {
     }
 
     #[test]
-    fn test_nan_not_equal() {
+    fn test_nan_equal() {
         let nan = Value::Float64(f64::NAN);
-        assert!(!join_keys_equal(&[nan.clone()], &[nan]));
+        assert!(join_keys_equal(&[nan.clone()], &[nan]));
     }
 
     #[test]

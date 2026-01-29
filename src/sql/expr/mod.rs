@@ -2485,6 +2485,53 @@ mod tests {
             0
         );
         assert!(compare_values(&Value::Boolean(true), &Value::Text("nope".to_string())).is_err());
+
+        // PostgreSQL-like float NaN semantics:
+        // - NaN compares equal to NaN
+        // - NaN compares greater than all non-NaN values
+        assert_eq!(
+            compare_values(&Value::Float64(f64::NAN), &Value::Float64(1.0)).unwrap(),
+            1
+        );
+        assert_eq!(
+            compare_values(&Value::Float64(1.0), &Value::Float64(f64::NAN)).unwrap(),
+            -1
+        );
+        assert_eq!(
+            compare_values(&Value::Float64(f64::NAN), &Value::Float64(f64::NAN)).unwrap(),
+            0
+        );
+        assert_eq!(
+            compare_values(&Value::Float64(f64::NAN), &Value::Int32(1)).unwrap(),
+            1
+        );
+        assert_eq!(
+            compare_values(&Value::Int32(1), &Value::Float64(f64::NAN)).unwrap(),
+            -1
+        );
+    }
+
+    #[test]
+    fn test_float_nan_comparisons() {
+        assert_eq!(
+            eval_expr(&parse_expr("CAST('NaN' AS DOUBLE PRECISION) = 1"), None, None).unwrap(),
+            Value::Boolean(false)
+        );
+        assert_eq!(
+            eval_expr(
+                &parse_expr(
+                    "CAST('NaN' AS DOUBLE PRECISION) = CAST('NaN' AS DOUBLE PRECISION)"
+                ),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            eval_expr(&parse_expr("CAST('NaN' AS DOUBLE PRECISION) > 1"), None, None).unwrap(),
+            Value::Boolean(true)
+        );
     }
 
     #[test]
@@ -2509,6 +2556,26 @@ mod tests {
         assert_eq!(
             compare_order_by_values(&Value::Date(0), &Value::Null, false, true),
             Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_compare_order_by_values_nan() {
+        use std::cmp::Ordering;
+
+        assert_eq!(
+            compare_order_by_values(&Value::Float64(f64::NAN), &Value::Float64(1.0), true, false),
+            Ordering::Greater
+        );
+        assert_eq!(
+            compare_order_by_values(&Value::Float64(1.0), &Value::Float64(f64::NAN), true, false),
+            Ordering::Less
+        );
+
+        // DESC should put NaN first (since NaN is treated as greatest).
+        assert_eq!(
+            compare_order_by_values(&Value::Float64(f64::NAN), &Value::Float64(1.0), false, false),
+            Ordering::Less
         );
     }
 

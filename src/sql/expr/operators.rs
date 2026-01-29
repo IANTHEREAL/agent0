@@ -611,14 +611,23 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         left.len().cmp(&right.len())
     }
 
+    fn compare_float64_pg(left: f64, right: f64) -> std::cmp::Ordering {
+        match (left.is_nan(), right.is_nan()) {
+            (true, true) => std::cmp::Ordering::Equal,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => left
+                .partial_cmp(&right)
+                .expect("non-NaN floats must be comparable"),
+        }
+    }
+
     match (left, right) {
         (Value::Int32(l), Value::Int32(r)) => Ok(l.cmp(r) as i8),
         (Value::Int64(l), Value::Int64(r)) => Ok(l.cmp(r) as i8),
         (Value::Int32(l), Value::Int64(r)) => Ok((*l as i64).cmp(r) as i8),
         (Value::Int64(l), Value::Int32(r)) => Ok(l.cmp(&(*r as i64)) as i8),
-        (Value::Float64(l), Value::Float64(r)) => {
-            Ok(l.partial_cmp(r).unwrap_or(std::cmp::Ordering::Equal) as i8)
-        }
+        (Value::Float64(l), Value::Float64(r)) => Ok(compare_float64_pg(*l, *r) as i8),
         (Value::Text(l), Value::Text(r)) => Ok(compare_text_pg(l, r) as i8),
         (Value::Boolean(l), Value::Boolean(r)) => Ok(l.cmp(r) as i8),
         (Value::Boolean(l), Value::Text(t)) => match parse_bool_pg(t) {
@@ -714,34 +723,22 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         }
         (Value::Text(t), Value::Float64(f)) => {
             if let Ok(n) = t.parse::<f64>() {
-                Ok(n.partial_cmp(f).unwrap_or(std::cmp::Ordering::Equal) as i8)
+                Ok(compare_float64_pg(n, *f) as i8)
             } else {
                 Err(anyhow!("Cannot compare"))
             }
         }
         (Value::Float64(f), Value::Text(t)) => {
             if let Ok(n) = t.parse::<f64>() {
-                Ok(f.partial_cmp(&n).unwrap_or(std::cmp::Ordering::Equal) as i8)
+                Ok(compare_float64_pg(*f, n) as i8)
             } else {
                 Err(anyhow!("Cannot compare"))
             }
         }
-        (Value::Int32(i), Value::Float64(f)) => Ok(((*i as f64)
-            .partial_cmp(f)
-            .unwrap_or(std::cmp::Ordering::Equal))
-            as i8),
-        (Value::Float64(f), Value::Int32(i)) => {
-            Ok(f.partial_cmp(&(*i as f64))
-                .unwrap_or(std::cmp::Ordering::Equal) as i8)
-        }
-        (Value::Int64(i), Value::Float64(f)) => Ok(((*i as f64)
-            .partial_cmp(f)
-            .unwrap_or(std::cmp::Ordering::Equal))
-            as i8),
-        (Value::Float64(f), Value::Int64(i)) => {
-            Ok(f.partial_cmp(&(*i as f64))
-                .unwrap_or(std::cmp::Ordering::Equal) as i8)
-        }
+        (Value::Int32(i), Value::Float64(f)) => Ok(compare_float64_pg(*i as f64, *f) as i8),
+        (Value::Float64(f), Value::Int32(i)) => Ok(compare_float64_pg(*f, *i as f64) as i8),
+        (Value::Int64(i), Value::Float64(f)) => Ok(compare_float64_pg(*i as f64, *f) as i8),
+        (Value::Float64(f), Value::Int64(i)) => Ok(compare_float64_pg(*f, *i as f64) as i8),
         (Value::Numeric(l), Value::Numeric(r)) => Ok(l.cmp(r) as i8),
         (Value::Numeric(d), Value::Int32(i)) => Ok(d.cmp(&Decimal::from(*i)) as i8),
         (Value::Int32(i), Value::Numeric(d)) => Ok(Decimal::from(*i).cmp(d) as i8),
@@ -752,10 +749,7 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
                 Ok(d.cmp(&fd) as i8)
             } else {
                 use rust_decimal::prelude::ToPrimitive;
-                Ok(d.to_f64()
-                    .unwrap_or(f64::NAN)
-                    .partial_cmp(f)
-                    .unwrap_or(std::cmp::Ordering::Equal) as i8)
+                Ok(compare_float64_pg(d.to_f64().unwrap_or(f64::NAN), *f) as i8)
             }
         }
         (Value::Float64(f), Value::Numeric(d)) => {
@@ -763,8 +757,7 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
                 Ok(fd.cmp(d) as i8)
             } else {
                 use rust_decimal::prelude::ToPrimitive;
-                Ok(f.partial_cmp(&d.to_f64().unwrap_or(f64::NAN))
-                    .unwrap_or(std::cmp::Ordering::Equal) as i8)
+                Ok(compare_float64_pg(*f, d.to_f64().unwrap_or(f64::NAN)) as i8)
             }
         }
         (Value::Numeric(d), Value::Text(t)) => {

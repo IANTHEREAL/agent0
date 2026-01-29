@@ -66,9 +66,13 @@ fn hash_single_value_for_join<H: Hasher>(hasher: &mut H, value: &Value) {
         }
         Value::Float64(f) => {
             3u8.hash(hasher);
+            let f = *f;
             if f.is_nan() {
-                // Keep NaN hashing stable.
+                // PostgreSQL treats NaN = NaN as true for equality, so all NaNs must hash equal.
                 u64::MAX.hash(hasher);
+            } else if f == 0.0 {
+                // -0.0 == 0.0, so they must hash equal as well.
+                0.0f64.to_bits().hash(hasher);
             } else {
                 f.to_bits().hash(hasher);
             }
@@ -116,7 +120,7 @@ fn hash_single_value_for_join<H: Hasher>(hasher: &mut H, value: &Value) {
 /// Compare two join keys for equality with SQL semantics.
 ///
 /// - `NULL != NULL` (returns `false`)
-/// - `NaN != NaN` (returns `false`)
+/// - `NaN == NaN` (returns `true`, PostgreSQL-like)
 /// - `Int32` and `Int64` are compared as `i64`
 /// - `Numeric` is normalized before compare (`1.0 == 1.00`)
 pub fn join_keys_equal(left: &[Value], right: &[Value]) -> bool {
@@ -132,11 +136,7 @@ fn values_equal_for_join(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => false,
         (Value::Float64(a), Value::Float64(b)) => {
-            if a.is_nan() || b.is_nan() {
-                false
-            } else {
-                a == b
-            }
+            a == b || (a.is_nan() && b.is_nan())
         }
         (Value::Int32(a), Value::Int64(b)) => i64::from(*a) == *b,
         (Value::Int64(a), Value::Int32(b)) => *a == i64::from(*b),
@@ -952,6 +952,36 @@ mod tests {
             hash_join_key(&[Value::Numeric(d2)])
         );
         assert!(join_keys_equal(&[Value::Numeric(d1)], &[Value::Numeric(d2)]));
+    }
+
+    #[test]
+    fn test_float64_nan_hash_equal_and_join_equal() {
+        // Use different NaN bit patterns to ensure the join treats all NaNs as equal.
+        let nan1 = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan2 = f64::from_bits(0xfff8_0000_0000_0002);
+        assert!(nan1.is_nan());
+        assert!(nan2.is_nan());
+
+        assert!(join_keys_equal(
+            &[Value::Float64(nan1)],
+            &[Value::Float64(nan2)]
+        ));
+        assert_eq!(
+            hash_join_key(&[Value::Float64(nan1)]),
+            hash_join_key(&[Value::Float64(nan2)])
+        );
+    }
+
+    #[test]
+    fn test_float64_negative_zero_hash_equal_and_join_equal() {
+        assert!(join_keys_equal(
+            &[Value::Float64(-0.0)],
+            &[Value::Float64(0.0)]
+        ));
+        assert_eq!(
+            hash_join_key(&[Value::Float64(-0.0)]),
+            hash_join_key(&[Value::Float64(0.0)])
+        );
     }
 
     #[test]
