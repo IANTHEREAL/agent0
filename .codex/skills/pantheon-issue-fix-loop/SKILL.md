@@ -9,6 +9,10 @@ description: "Validate an issue with code-causal evidence, then run a strict Pan
 
 Follow a strict, evidence-first workflow to (1) decide whether an issue is valid and (2) if valid, iteratively fix it (codex), review it (codex), and verify/triage findings (codex) until no in-scope P0/P1 remain, keeping a single PR updated.
 
+### Golden Rule — One Fix Run at a Time
+
+**One issue, one active Fix exploration, one PR.** Never start a second Fix exploration while the first is still running; always wait for terminal status and read `branch_output` first—impatience creates duplicate PRs.
+
 ## Inputs
 
 - `issue_link` (required): Issue URL or identifier.
@@ -246,3 +250,5 @@ After each `parallel_explore`, wait via a sleep loop:
 4. Otherwise (not terminal), sleep 300s, then poll again
 
 Pantheon note: `manifesting` and `ready_for_manifest` mean the branch run is already done; you can fetch `branch_output` and proceed to the next step (you do not need to wait for a later `succeed`/`finished` transition).
+
+Hard rule: do not launch a second Fix exploration for the same step while the first Fix exploration is still non-terminal—wait (sleep 300) and confirm the outcome from `branch_output` first.
