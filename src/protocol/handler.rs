@@ -3576,12 +3576,12 @@ fn encode_value(
                 
                 let (seconds, micros) = if i.abs() > MAX_REASONABLE_UNIX_MS {
                     let pg_micros = i;
-                    let unix_secs = (pg_micros / 1_000_000) + PG_EPOCH_UNIX_SECS;
-                    let micros = (pg_micros % 1_000_000).unsigned_abs() as u32;
+                    let unix_secs = pg_micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECS;
+                    let micros = pg_micros.rem_euclid(1_000_000) as u32;
                     (unix_secs, micros)
                 } else {
-                    let secs = i / 1000;
-                    let millis = (i % 1000).unsigned_abs() as u32;
+                    let secs = i.div_euclid(1000);
+                    let millis = i.rem_euclid(1000) as u32;
                     (secs, millis * 1000)
                 };
                 
@@ -3635,13 +3635,13 @@ fn encode_value(
             let (seconds, micros) = if ts.abs() > MAX_REASONABLE_UNIX_MS {
                 // Likely PostgreSQL epoch microseconds - convert to Unix seconds
                 let pg_micros = ts;
-                let unix_secs = (pg_micros / 1_000_000) + PG_EPOCH_UNIX_SECS;
-                let micros = (pg_micros % 1_000_000).unsigned_abs() as u32;
+                let unix_secs = pg_micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECS;
+                let micros = pg_micros.rem_euclid(1_000_000) as u32;
                 (unix_secs, micros)
             } else {
                 // Unix epoch milliseconds (our standard format)
-                let secs = ts / 1000;
-                let millis = (ts % 1000).unsigned_abs() as u32;
+                let secs = ts.div_euclid(1000);
+                let millis = ts.rem_euclid(1000) as u32;
                 (secs, millis * 1000)
             };
             
@@ -3823,9 +3823,31 @@ fn encode_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Buf;
     use bytes::Bytes;
     use pgwire::api::portal::Format;
     use pgwire::messages::response::CommandComplete;
+
+    fn encode_value_to_string(value: &Value, col_type: Option<&DataType>) -> String {
+        let fields = vec![FieldInfo::new(
+            "col".to_string(),
+            None,
+            None,
+            Type::TEXT,
+            FieldFormat::Text,
+        )];
+        let fields = Arc::new(fields);
+        let mut encoder = DataRowEncoder::new(fields);
+        encode_value(&mut encoder, value, col_type).unwrap();
+        let row = encoder.finish().unwrap();
+
+        assert_eq!(row.field_count, 1);
+        let mut data = row.data.clone();
+        let len = data.get_i32();
+        assert!(len >= 0);
+        let bytes = data.copy_to_bytes(len as usize);
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
 
     #[test]
     fn test_parse_tenant_username_dot() {
@@ -4385,6 +4407,28 @@ mod tests {
         assert_eq!(
             substitute_parameters("SELECT $1", &portal),
             "SELECT 'O''Reilly'"
+        );
+    }
+
+    #[test]
+    fn test_encode_value_timestamp_negative_millis() {
+        let col_type = DataType::Timestamp;
+        assert_eq!(
+            encode_value_to_string(&Value::Timestamp(-1), Some(&col_type)),
+            "1969-12-31 23:59:59.999000"
+        );
+        assert_eq!(
+            encode_value_to_string(&Value::Timestamp(-1001), Some(&col_type)),
+            "1969-12-31 23:59:58.999000"
+        );
+    }
+
+    #[test]
+    fn test_encode_value_int64_as_timestamp_negative_millis() {
+        let col_type = DataType::Timestamp;
+        assert_eq!(
+            encode_value_to_string(&Value::Int64(-1), Some(&col_type)),
+            "1969-12-31 23:59:59.999000"
         );
     }
 }
