@@ -118,23 +118,27 @@ pub fn distinct_on_rows_join_with_indices(
 }
 
 pub fn apply_offset_limit_fetch(mut rows: Vec<Row>, query: &Query) -> Vec<Row> {
+    let value_to_usize = |v: Value| -> Option<usize> {
+        match v {
+            Value::Int64(n) => usize::try_from(n).ok(),
+            Value::Int32(n) => usize::try_from(n).ok(),
+            Value::Text(s) => s
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .and_then(|n| usize::try_from(n).ok()),
+            _ => None,
+        }
+    };
     if let Some(offset) = &query.offset {
         if let Ok(v) = eval_expr(&offset.value, None, None) {
-            let n = match v {
-                Value::Int64(n) => n as usize,
-                Value::Int32(n) => n as usize,
-                _ => 0,
-            };
+            let n = value_to_usize(v).unwrap_or(0);
             rows = rows.into_iter().skip(n).collect();
         }
     }
     if let Some(limit) = &query.limit {
         if let Ok(v) = eval_expr(limit, None, None) {
-            let n = match v {
-                Value::Int64(n) => n as usize,
-                Value::Int32(n) => n as usize,
-                _ => usize::MAX,
-            };
+            let n = value_to_usize(v).unwrap_or(usize::MAX);
             rows = rows.into_iter().take(n).collect();
         }
     }
@@ -142,11 +146,7 @@ pub fn apply_offset_limit_fetch(mut rows: Vec<Row>, query: &Query) -> Vec<Row> {
     if let Some(fetch) = &query.fetch {
         if let Some(quantity) = &fetch.quantity {
             if let Ok(v) = eval_expr(quantity, None, None) {
-                let n = match v {
-                    Value::Int64(n) => n as usize,
-                    Value::Int32(n) => n as usize,
-                    _ => 1,
-                };
+                let n = value_to_usize(v).unwrap_or(1);
                 rows = rows.into_iter().take(n).collect();
             }
         } else {
@@ -1592,6 +1592,37 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].values[0], Value::Int32(11));
         assert_eq!(result[1].values[0], Value::Int32(12));
+    }
+
+    #[test]
+    fn test_apply_offset_limit_fetch_with_quoted_numeric_literals() {
+        let dialect = PostgreSqlDialect {};
+        let rows = vec![
+            Row::new(vec![Value::Int32(10)]),
+            Row::new(vec![Value::Int32(11)]),
+            Row::new(vec![Value::Int32(12)]),
+        ];
+
+        let statements = Parser::parse_sql(&dialect, "SELECT 1 LIMIT '2' OFFSET '1'").unwrap();
+        let query = match &statements[0] {
+            sqlparser::ast::Statement::Query(q) => q.as_ref(),
+            _ => panic!("expected query"),
+        };
+        let result = apply_offset_limit_fetch(rows.clone(), query);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].values[0], Value::Int32(11));
+        assert_eq!(result[1].values[0], Value::Int32(12));
+
+        let statements =
+            Parser::parse_sql(&dialect, "SELECT 1 FETCH FIRST '2' ROWS ONLY").unwrap();
+        let query = match &statements[0] {
+            sqlparser::ast::Statement::Query(q) => q.as_ref(),
+            _ => panic!("expected query"),
+        };
+        let result = apply_offset_limit_fetch(rows, query);
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].values[0], Value::Int32(10));
+        assert_eq!(result[1].values[0], Value::Int32(11));
     }
 
     fn infer_first_expr(sql: &str) -> DataType {
