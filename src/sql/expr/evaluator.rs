@@ -7,8 +7,7 @@ use super::{
 use super::operators::{parse_bool_pg, try_coerce_text_to_numeric};
 use crate::types::{DataType, TableSchema, Value};
 use anyhow::{anyhow, Result};
-use sqlparser::ast::BinaryOperator;
-use sqlparser::ast::Expr;
+use sqlparser::ast::{BinaryOperator, Expr};
 
 fn is_explicit_null(expr: &Expr) -> bool {
     use sqlparser::ast::Value as SqlValue;

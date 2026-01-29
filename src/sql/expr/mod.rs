@@ -258,6 +258,8 @@ fn interval_from_field(num: i64, field: &sqlparser::ast::DateTimeField) -> Resul
 fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Result<Value> {
     let func_name = func.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
     let func_name_upper = func_name.to_uppercase();
+    let row = ctx.row();
+    let schema = ctx.schema();
 
     // COALESCE is evaluated left-to-right and must short-circuit.
     // Do not eagerly evaluate all args, otherwise errors in later args would be surfaced incorrectly.
@@ -2091,9 +2093,11 @@ fn vector_norm(vec: &[f64]) -> f64 {
 mod tests {
     use super::*;
     use super::super::statement_time;
+    use crate::types::ColumnDef;
     use rust_decimal::Decimal;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
+    use std::collections::HashMap;
     use std::str::FromStr;
 
     fn parse_expr(sql: &str) -> Expr {
@@ -2118,6 +2122,56 @@ mod tests {
         };
         assert!(s.starts_with("PostgreSQL "));
         assert!(s.contains("pg-tikv "));
+    }
+
+    #[test]
+    fn test_eval_expr_join_function_resolves_qualified_column() {
+        let expr = parse_expr("LOWER(b.name)");
+
+        let combined_schema = TableSchema {
+            name: "join".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let combined_row = Row::new(vec![
+            Value::Text("Alice".to_string()),
+            Value::Text("Bob".to_string()),
+        ]);
+
+        let mut column_offsets = HashMap::new();
+        column_offsets.insert("a.name".to_string(), 0);
+        column_offsets.insert("b.name".to_string(), 1);
+        column_offsets.insert("name".to_string(), 0);
+
+        let ctx = JoinContext {
+            tables: HashMap::new(),
+            column_offsets,
+            combined_row: &combined_row,
+            combined_schema: &combined_schema,
+        };
+
+        let val = eval_expr_join(&expr, &ctx).unwrap();
+        assert_eq!(val, Value::Text("bob".to_string()));
     }
 
     #[test]
@@ -2702,6 +2756,17 @@ mod tests {
             )
             .unwrap(),
             Value::Text("NULL".to_string())
+        );
+
+        let row_with_value = Row::new(vec![Value::Text("hi".to_string())]);
+        assert_eq!(
+            eval_expr(
+                &parse_expr("COALESCE(nickname, 'NULL')"),
+                Some(&row_with_value),
+                Some(&schema)
+            )
+            .unwrap(),
+            Value::Text("hi".to_string())
         );
     }
 

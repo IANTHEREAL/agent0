@@ -6,6 +6,8 @@ use sqlparser::ast::Expr;
 use std::collections::HashMap;
 
 pub trait EvalContext {
+    fn row(&self) -> Option<&Row>;
+
     fn resolve_column(&self, name: &str) -> Result<Value>;
 
     fn resolve_compound_identifier(&self, parts: &[sqlparser::ast::Ident]) -> Result<Value>;
@@ -44,6 +46,10 @@ impl<'a> SingleTableContext<'a> {
 }
 
 impl EvalContext for SingleTableContext<'_> {
+    fn row(&self) -> Option<&Row> {
+        self.row
+    }
+
     fn resolve_column(&self, name: &str) -> Result<Value> {
         if name.eq_ignore_ascii_case("DEFAULT") {
             return Ok(Value::Null);
@@ -138,6 +144,10 @@ impl<'a> JoinEvalContext<'a> {
 }
 
 impl EvalContext for JoinEvalContext<'_> {
+    fn row(&self) -> Option<&Row> {
+        Some(self.combined_row)
+    }
+
     fn resolve_column(&self, name: &str) -> Result<Value> {
         if let Some(&offset) = self.column_offsets.get(name) {
             Ok(self.combined_row.values[offset].clone())

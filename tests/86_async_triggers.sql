@@ -8,6 +8,7 @@ CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT);
 
 CREATE OR REPLACE FUNCTION log_user_insert() RETURNS TRIGGER AS $$
 BEGIN
+    NULL;
     INSERT INTO audit_log (action) VALUES ('user_created: ' || NEW.name);
     RETURN NEW;
 END;
@@ -28,4 +29,3 @@ DROP TRIGGER user_insert_audit ON users;
 DROP FUNCTION log_user_insert();
 DROP TABLE users;
 DROP TABLE audit_log;
-

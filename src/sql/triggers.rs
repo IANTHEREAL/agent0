@@ -119,7 +119,7 @@ async fn execute_trigger_body(
     let mut modified_values = new_row.values.clone();
     let mut was_modified = false;
 
-    let body_upper = body.to_uppercase();
+    let body_upper = body.to_ascii_uppercase();
     let begin_pos = match body_upper.find("BEGIN") {
         Some(p) => p + 5,
         None => return Ok(TriggerResult::Unchanged),
@@ -282,20 +282,28 @@ fn substitute_row_references(
 }
 
 fn case_insensitive_replace(s: &str, pattern: &str, replacement: &str) -> String {
-    let s_upper = s.to_uppercase();
-    let pattern_upper = pattern.to_uppercase();
-
-    let mut result = String::new();
-    let mut last_end = 0;
-
-    for (start, _) in s_upper.match_indices(&pattern_upper) {
-        result.push_str(&s[last_end..start]);
-        result.push_str(replacement);
-        last_end = start + pattern.len();
+    if pattern.is_empty() {
+        return s.to_string();
     }
-    result.push_str(&s[last_end..]);
 
-    result
+    // Replace only when `pattern` is not immediately followed by an identifier
+    // continuation (avoid prefix matches like `NEW.id` inside `NEW.id2`).
+    let re_pattern = format!("{}($|[^\\p{{XID_Continue}}$])", regex::escape(pattern));
+    let Ok(re) = regex::RegexBuilder::new(&re_pattern)
+        .case_insensitive(true)
+        .build()
+    else {
+        return s.to_string();
+    };
+
+    re.replace_all(s, |caps: &regex::Captures| {
+        let delim = caps.get(1).map_or("", |m| m.as_str());
+        let mut out = String::with_capacity(replacement.len() + delim.len());
+        out.push_str(replacement);
+        out.push_str(delim);
+        out
+    })
+    .into_owned()
 }
 
 fn value_to_sql_literal(value: &Value) -> String {
@@ -391,6 +399,53 @@ mod tests {
     }
 
     #[test]
+    fn test_substitute_row_references_does_not_prefix_match() {
+        let schema = TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![
+                crate::types::ColumnDef {
+                    name: "id".to_string(),
+                    data_type: crate::types::DataType::Int32,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                crate::types::ColumnDef {
+                    name: "id2".to_string(),
+                    data_type: crate::types::DataType::Int32,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: Some("test_pkey".to_string()),
+            pk_indices: vec![0],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+
+        let new_values = vec![Value::Int32(7), Value::Int32(3)];
+        let old_row = Row::new(vec![Value::Int32(9), Value::Int32(11)]);
+
+        let result = substitute_row_references("NEW.id2 + 1", &schema, &new_values, None);
+        assert_eq!(result, "3 + 1");
+
+        let result = substitute_row_references("NEW.id + NEW.id2", &schema, &new_values, None);
+        assert_eq!(result, "7 + 3");
+
+        let result = substitute_row_references("OLD.id2 + OLD.id", &schema, &new_values, Some(&old_row));
+        assert_eq!(result, "11 + 9");
+    }
+
+    #[test]
     fn test_value_to_sql_literal() {
         assert_eq!(value_to_sql_literal(&Value::Null), "NULL");
         assert_eq!(value_to_sql_literal(&Value::Boolean(true)), "TRUE");
@@ -403,5 +458,19 @@ mod tests {
             value_to_sql_literal(&Value::Text("it's".to_string())),
             "'it''s'"
         );
+    }
+
+    #[test]
+    fn test_case_insensitive_replace_unicode_offsets() {
+        let s = "ıNEW.col";
+        let result = case_insensitive_replace(s, "new.COL", "X");
+        assert_eq!(result, "ıX");
+    }
+
+    #[test]
+    fn test_case_insensitive_replace_does_not_expand_replacement() {
+        let s = "NEW.col";
+        let result = case_insensitive_replace(s, "new.COL", "$1");
+        assert_eq!(result, "$1");
     }
 }
