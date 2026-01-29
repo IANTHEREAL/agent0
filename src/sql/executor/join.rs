@@ -22,8 +22,63 @@ use sqlparser::ast::{
     BinaryOperator, Distinct, Expr, FunctionArg, FunctionArgExpr, GroupByExpr, Ident,
     JoinConstraint, JoinOperator, Query, SelectItem, Statement, TableFactor,
 };
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use tikv_client::Transaction;
+
+tokio::task_local! {
+    static VIEW_EXPANSION_STACK: RefCell<Vec<String>>;
+}
+
+const MAX_VIEW_EXPANSION_DEPTH: usize = 64;
+
+async fn with_view_expansion_stack<T>(future: impl Future<Output = T>) -> T {
+    if VIEW_EXPANSION_STACK.try_with(|_| ()).is_ok() {
+        future.await
+    } else {
+        VIEW_EXPANSION_STACK.scope(RefCell::new(Vec::new()), future).await
+    }
+}
+
+struct ViewExpansionGuard {
+    view_name: String,
+}
+
+impl ViewExpansionGuard {
+    fn push(view_name: String) -> Result<Self> {
+        VIEW_EXPANSION_STACK.with(|stack| -> Result<()> {
+            let mut stack = stack.borrow_mut();
+            if stack.contains(&view_name) {
+                return Err(anyhow!("recursive view detected: {}", view_name));
+            }
+            if stack.len() >= MAX_VIEW_EXPANSION_DEPTH {
+                return Err(anyhow!(
+                    "view expansion depth exceeded ({}): {}",
+                    MAX_VIEW_EXPANSION_DEPTH,
+                    view_name
+                ));
+            }
+            stack.push(view_name.clone());
+            Ok(())
+        })?;
+        Ok(Self { view_name })
+    }
+}
+
+impl Drop for ViewExpansionGuard {
+    fn drop(&mut self) {
+        let view_name = &self.view_name;
+        let _ = VIEW_EXPANSION_STACK.try_with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.last().map(|s| s == view_name).unwrap_or(false) {
+                stack.pop();
+            } else if let Some(pos) = stack.iter().rposition(|s| s == view_name) {
+                stack.remove(pos);
+            }
+        });
+    }
+}
 
 fn extract_virtual_table_filter(where_clause: &Option<Expr>) -> VirtualTableFilter {
     let mut filter = VirtualTableFilter::default();
@@ -877,49 +932,70 @@ impl Executor {
 
         for candidate in &candidates {
             if let Some(view_def) = self.store().get_view(txn, db_id, candidate).await? {
-                let result = self
-                    .execute_view_query(
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        &view_def.query,
-                        ctes,
-                    )
-                    .await?;
-                return match result {
-                    ExecuteResult::Select {
-                        columns,
-                        column_types: _,
-                        rows,
-                    } => {
-                        let schema = TableSchema {
-                            table_id: 0,
-                            name: candidate.clone(),
-                            columns: columns
-                                .iter()
-                                .map(|n| ColumnDef {
-                                    name: n.clone(),
-                                    data_type: DataType::Text,
-                                    nullable: true,
-                                    primary_key: false,
-                                    unique: false,
-                                    is_serial: false,
-                                    default_expr: None,
-                                })
-                                .collect(),
-                            pk_constraint_name: None,
-                            pk_indices: vec![],
-                            indexes: vec![],
-                            version: 1,
-                            check_constraints: vec![],
-                            foreign_keys: vec![],
-                            owner: String::new(),
-                        };
-                        Ok((schema, rows))
+                let candidate = candidate.clone();
+                return with_view_expansion_stack(async move {
+                    let _guard = ViewExpansionGuard::push(candidate.clone())?;
+                    let result = self
+                        .execute_view_query(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            &view_def.query,
+                            ctes,
+                        )
+                        .await?;
+                    match result {
+                        ExecuteResult::Select {
+                            columns,
+                            column_types,
+                            rows,
+                        } => {
+                            let inferred_types = column_types.unwrap_or_else(|| {
+                                if let Some(first) = rows.first() {
+                                    first
+                                        .values
+                                        .iter()
+                                        .map(|v| v.data_type().unwrap_or(DataType::Text))
+                                        .collect()
+                                } else {
+                                    vec![DataType::Text; columns.len()]
+                                }
+                            });
+
+                            let schema = TableSchema {
+                                table_id: 0,
+                                name: candidate.clone(),
+                                columns: columns
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, n)| ColumnDef {
+                                        name: n.clone(),
+                                        data_type: inferred_types
+                                            .get(i)
+                                            .cloned()
+                                            .unwrap_or(DataType::Text),
+                                        nullable: true,
+                                        primary_key: false,
+                                        unique: false,
+                                        is_serial: false,
+                                        default_expr: None,
+                                    })
+                                    .collect(),
+                                pk_constraint_name: None,
+                                pk_indices: vec![],
+                                indexes: vec![],
+                                version: 1,
+                                check_constraints: vec![],
+                                foreign_keys: vec![],
+                                owner: String::new(),
+                            };
+                            Ok((schema, rows))
+                        }
+                        _ => Err(anyhow!("View must return SELECT result")),
                     }
-                    _ => Err(anyhow!("View must return SELECT result")),
-                };
+                })
+                .await;
             }
 
             if let Some(schema) = self.store().get_schema(txn, db_id, candidate).await? {
@@ -4248,5 +4324,30 @@ mod tests {
         assert!(err
             .to_string()
             .contains("invalid input syntax for type numeric"));
+    }
+
+    #[tokio::test]
+    async fn view_expansion_guard_detects_recursion() {
+        let err = with_view_expansion_stack(async {
+            let _outer = ViewExpansionGuard::push("public.v".to_string())?;
+            let _inner = ViewExpansionGuard::push("public.v".to_string())?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("recursive view detected"));
+    }
+
+    #[tokio::test]
+    async fn view_expansion_guard_allows_reuse_after_drop() {
+        with_view_expansion_stack(async {
+            {
+                let _guard = ViewExpansionGuard::push("public.v".to_string())?;
+            }
+            let _guard = ViewExpansionGuard::push("public.v".to_string())?;
+            Ok::<(), anyhow::Error>(())
+        })
+        .await
+        .unwrap();
     }
 }
