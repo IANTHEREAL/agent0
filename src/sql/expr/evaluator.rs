@@ -699,8 +699,7 @@ fn eval_function_with_context<C: EvalContext>(
     ctx: &C,
     func: &sqlparser::ast::Function,
 ) -> Result<Value> {
-    let schema = ctx.schema();
-    super::eval_function(func, None, schema)
+    super::eval_function(ctx, func)
 }
 
 fn eval_substring_with_context<C: EvalContext>(

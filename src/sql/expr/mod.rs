@@ -255,11 +255,7 @@ fn interval_from_field(num: i64, field: &sqlparser::ast::DateTimeField) -> Resul
     Ok(Value::Interval(iv))
 }
 
-fn eval_function(
-    func: &sqlparser::ast::Function,
-    row: Option<&Row>,
-    schema: Option<&TableSchema>,
-) -> Result<Value> {
+fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Result<Value> {
     let func_name = func.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
     let func_name_upper = func_name.to_uppercase();
 
@@ -270,7 +266,7 @@ fn eval_function(
             if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) =
                 arg
             {
-                let val = eval_expr(e, row, schema)?;
+                let val = evaluator::eval_expr_impl(ctx, e)?;
                 if !matches!(val, Value::Null) {
                     return Ok(val);
                 }
@@ -283,7 +279,7 @@ fn eval_function(
     for arg in &func.args {
         if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) = arg
         {
-            args.push(eval_expr(e, row, schema)?);
+            args.push(evaluator::eval_expr_impl(ctx, e)?);
         }
     }
 
@@ -622,15 +618,15 @@ fn eval_function(
         "CURRENT_USER" | "SESSION_USER" | "USER" => Ok(Value::Text("postgres".to_string())),
         "PG_GET_USERBYID" => Ok(Value::Text("postgres".to_string())),
         "PG_GET_INDEXDEF" => {
-            if let (Some(row), Some(schema)) = (row, schema) {
-                if let Some(idx) = schema
+            if let Some(schema) = ctx.schema() {
+                if let Some(col) = schema
                     .columns
                     .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case("indexdef"))
+                    .find(|c| c.name.eq_ignore_ascii_case("indexdef"))
                 {
-                    if let Some(val) = row.values.get(idx) {
+                    if let Ok(val) = ctx.resolve_column(&col.name) {
                         if !matches!(val, Value::Null) {
-                            return Ok(val.clone());
+                            return Ok(val);
                         }
                     }
                 }
@@ -638,15 +634,15 @@ fn eval_function(
             Ok(Value::Text("CREATE INDEX".to_string()))
         }
         "PG_GET_CONSTRAINTDEF" => {
-            if let (Some(row), Some(schema)) = (row, schema) {
-                if let Some(idx) = schema
+            if let Some(schema) = ctx.schema() {
+                if let Some(col) = schema
                     .columns
                     .iter()
-                    .position(|c| c.name.eq_ignore_ascii_case("constraintdef"))
+                    .find(|c| c.name.eq_ignore_ascii_case("constraintdef"))
                 {
-                    if let Some(val) = row.values.get(idx) {
+                    if let Ok(val) = ctx.resolve_column(&col.name) {
                         if !matches!(val, Value::Null) {
-                            return Ok(val.clone());
+                            return Ok(val);
                         }
                     }
                 }
@@ -693,22 +689,20 @@ fn eval_function(
         // JSON_OBJECT_KEYS, JSONB_EXTRACT_PATH, JSON_EXTRACT_PATH, JSONB_EXTRACT_PATH_TEXT, JSON_EXTRACT_PATH_TEXT,
         // JSONB_PRETTY, TO_JSON are handled by the registry (functions/json.rs)
         "TO_JSONB" => {
-            fn eval_row_object(
+            fn eval_row_object<C: EvalContext>(
+                ctx: &C,
                 expr: &Expr,
-                row: Option<&Row>,
-                schema: Option<&TableSchema>,
             ) -> Result<Option<serde_json::Value>> {
-                fn row_values(
+                fn row_values<C: EvalContext>(
+                    ctx: &C,
                     expr: &Expr,
-                    row: Option<&Row>,
-                    schema: Option<&TableSchema>,
                 ) -> Result<Option<Vec<Value>>> {
                     match expr {
-                        Expr::Nested(inner) => row_values(inner, row, schema),
+                        Expr::Nested(inner) => row_values(ctx, inner),
                         Expr::Tuple(exprs) => {
                             let mut vals = Vec::with_capacity(exprs.len());
                             for e in exprs {
-                                vals.push(eval_expr(e, row, schema)?);
+                                vals.push(evaluator::eval_expr_impl(ctx, e)?);
                             }
                             Ok(Some(vals))
                         }
@@ -722,7 +716,7 @@ fn eval_function(
                                 match arg {
                                     sqlparser::ast::FunctionArg::Unnamed(
                                         sqlparser::ast::FunctionArgExpr::Expr(e),
-                                    ) => vals.push(eval_expr(e, row, schema)?),
+                                    ) => vals.push(evaluator::eval_expr_impl(ctx, e)?),
                                     _ => return Ok(None),
                                 }
                             }
@@ -732,7 +726,7 @@ fn eval_function(
                     }
                 }
 
-                let Some(values) = row_values(expr, row, schema)? else {
+                let Some(values) = row_values(ctx, expr)? else {
                     return Ok(None);
                 };
                 let mut obj = serde_json::Map::new();
@@ -747,7 +741,7 @@ fn eval_function(
                     sqlparser::ast::FunctionArgExpr::Expr(expr),
                 ) = &func.args[0]
                 {
-                    if let Some(obj) = eval_row_object(expr, row, schema)? {
+                    if let Some(obj) = eval_row_object(ctx, expr)? {
                         return Ok(Value::Jsonb(obj.to_string()));
                     }
                 }
@@ -805,22 +799,20 @@ fn eval_function(
         // JSONB_SET, JSON_SET, JSONB_ARRAY_ELEMENTS, JSON_ARRAY_ELEMENTS, JSONB_ARRAY_ELEMENTS_TEXT,
         // JSON_ARRAY_ELEMENTS_TEXT, JSONB_EACH, JSON_EACH, JSONB_EACH_TEXT, JSON_EACH_TEXT are handled by the registry (functions/json.rs)
         "ROW_TO_JSON" => {
-            fn eval_row_object(
+            fn eval_row_object<C: EvalContext>(
+                ctx: &C,
                 expr: &Expr,
-                row: Option<&Row>,
-                schema: Option<&TableSchema>,
             ) -> Result<Option<serde_json::Value>> {
-                fn row_values(
+                fn row_values<C: EvalContext>(
+                    ctx: &C,
                     expr: &Expr,
-                    row: Option<&Row>,
-                    schema: Option<&TableSchema>,
                 ) -> Result<Option<Vec<Value>>> {
                     match expr {
-                        Expr::Nested(inner) => row_values(inner, row, schema),
+                        Expr::Nested(inner) => row_values(ctx, inner),
                         Expr::Tuple(exprs) => {
                             let mut vals = Vec::with_capacity(exprs.len());
                             for e in exprs {
-                                vals.push(eval_expr(e, row, schema)?);
+                                vals.push(evaluator::eval_expr_impl(ctx, e)?);
                             }
                             Ok(Some(vals))
                         }
@@ -834,7 +826,7 @@ fn eval_function(
                                 match arg {
                                     sqlparser::ast::FunctionArg::Unnamed(
                                         sqlparser::ast::FunctionArgExpr::Expr(e),
-                                    ) => vals.push(eval_expr(e, row, schema)?),
+                                    ) => vals.push(evaluator::eval_expr_impl(ctx, e)?),
                                     _ => return Ok(None),
                                 }
                             }
@@ -844,7 +836,7 @@ fn eval_function(
                     }
                 }
 
-                let Some(values) = row_values(expr, row, schema)? else {
+                let Some(values) = row_values(ctx, expr)? else {
                     return Ok(None);
                 };
                 let mut obj = serde_json::Map::new();
@@ -859,7 +851,7 @@ fn eval_function(
                     sqlparser::ast::FunctionArgExpr::Expr(expr),
                 ) = &func.args[0]
                 {
-                    if let Some(obj) = eval_row_object(expr, row, schema)? {
+                    if let Some(obj) = eval_row_object(ctx, expr)? {
                         return Ok(Value::Json(obj.to_string()));
                     }
                 }
@@ -2681,6 +2673,36 @@ mod tests {
         );
         assert!(eval_expr(&parse_expr("NULLIF(5 / 0, 1)"), None, None).is_err());
         assert!(eval_expr(&parse_expr("GREATEST(1, 5 / 0)"), None, None).is_err());
+    }
+
+    #[test]
+    fn test_function_column_references_use_row_context() {
+        use crate::types::ColumnDef;
+
+        let schema = TableSchema::new(
+            "public.atm_users".to_string(),
+            1,
+            vec![ColumnDef {
+                name: "nickname".to_string(),
+                data_type: DataType::Text,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            vec![],
+        );
+        let row = Row::new(vec![Value::Null]);
+        assert_eq!(
+            eval_expr(
+                &parse_expr("COALESCE(nickname, 'NULL')"),
+                Some(&row),
+                Some(&schema),
+            )
+            .unwrap(),
+            Value::Text("NULL".to_string())
+        );
     }
 
     #[test]
