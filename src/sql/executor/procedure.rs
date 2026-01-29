@@ -5,7 +5,9 @@ use super::super::names;
 use super::super::{parse_sql, ExecuteResult, Session};
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{ObjectName, Query, Statement};
+use sqlparser::ast::{Ident, ObjectName, Query, Statement};
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::tokenizer::{Token, Tokenizer};
 use std::collections::HashMap;
 use tikv_client::Transaction;
 
@@ -22,6 +24,208 @@ fn object_name_from_token(token: &str) -> Result<ObjectName> {
             sqlparser::ast::Ident::new(*name),
         ])),
         _ => Err(anyhow!("Invalid object name '{}'", token)),
+    }
+}
+
+fn tokenize_non_whitespace(sql: &str) -> Result<Vec<Token>> {
+    let dialect = PostgreSqlDialect {};
+    let mut tokenizer = Tokenizer::new(&dialect, sql);
+    let tokens = tokenizer
+        .tokenize()
+        .map_err(|e| anyhow!("SQL tokenize error: {}", e))?;
+    Ok(tokens
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect())
+}
+
+fn is_unquoted_keyword(token: &Token, keyword: &str) -> bool {
+    match token {
+        Token::Word(w) => w.quote_style.is_none() && w.value.eq_ignore_ascii_case(keyword),
+        _ => false,
+    }
+}
+
+fn parse_object_name(tokens: &[Token]) -> Result<(ObjectName, usize)> {
+    let mut parts: Vec<Ident> = Vec::new();
+    let mut i = 0usize;
+
+    let Token::Word(w) = tokens
+        .get(i)
+        .ok_or_else(|| anyhow!("Missing object name"))?
+    else {
+        return Err(anyhow!("Missing object name"));
+    };
+    parts.push(Ident {
+        value: w.value.clone(),
+        quote_style: w.quote_style,
+    });
+    i += 1;
+
+    if matches!(tokens.get(i), Some(Token::Period)) {
+        i += 1;
+        let Token::Word(w) = tokens
+            .get(i)
+            .ok_or_else(|| anyhow!("Invalid object name"))?
+        else {
+            return Err(anyhow!("Invalid object name"));
+        };
+        parts.push(Ident {
+            value: w.value.clone(),
+            quote_style: w.quote_style,
+        });
+        i += 1;
+    }
+
+    if matches!(tokens.get(i), Some(Token::Period)) {
+        return Err(anyhow!("Invalid object name"));
+    }
+
+    Ok((ObjectName(parts), i))
+}
+
+fn parse_refresh_materialized_view_name(sql: &str) -> Result<ObjectName> {
+    let tokens = tokenize_non_whitespace(sql)?;
+    let mut i = 0usize;
+
+    if !is_unquoted_keyword(
+        tokens
+            .get(i)
+            .ok_or_else(|| anyhow!("Invalid REFRESH MATERIALIZED VIEW syntax"))?,
+        "REFRESH",
+    ) || !is_unquoted_keyword(
+        tokens
+            .get(i + 1)
+            .ok_or_else(|| anyhow!("Invalid REFRESH MATERIALIZED VIEW syntax"))?,
+        "MATERIALIZED",
+    ) || !is_unquoted_keyword(
+        tokens
+            .get(i + 2)
+            .ok_or_else(|| anyhow!("Invalid REFRESH MATERIALIZED VIEW syntax"))?,
+        "VIEW",
+    )
+    {
+        return Err(anyhow!("Invalid REFRESH MATERIALIZED VIEW syntax"));
+    }
+    i += 3;
+
+    if tokens.get(i).is_some_and(|t| is_unquoted_keyword(t, "CONCURRENTLY")) {
+        i += 1;
+    }
+
+    if !matches!(tokens.get(i), Some(Token::Word(_))) {
+        return Err(anyhow!("Missing view name"));
+    }
+    let (name, _) = parse_object_name(tokens.get(i..).unwrap_or_default())?;
+    Ok(name)
+}
+
+fn parse_drop_materialized_view(sql: &str) -> Result<(Vec<ObjectName>, bool)> {
+    let tokens = tokenize_non_whitespace(sql)?;
+    let mut i = 0usize;
+
+    if !is_unquoted_keyword(
+        tokens
+            .get(i)
+            .ok_or_else(|| anyhow!("Invalid DROP MATERIALIZED VIEW syntax"))?,
+        "DROP",
+    ) || !is_unquoted_keyword(
+        tokens
+            .get(i + 1)
+            .ok_or_else(|| anyhow!("Invalid DROP MATERIALIZED VIEW syntax"))?,
+        "MATERIALIZED",
+    ) || !is_unquoted_keyword(
+        tokens
+            .get(i + 2)
+            .ok_or_else(|| anyhow!("Invalid DROP MATERIALIZED VIEW syntax"))?,
+        "VIEW",
+    )
+    {
+        return Err(anyhow!("Invalid DROP MATERIALIZED VIEW syntax"));
+    }
+    i += 3;
+
+    let mut if_exists = false;
+    if tokens.get(i).is_some_and(|t| is_unquoted_keyword(t, "IF"))
+        && tokens.get(i + 1).is_some_and(|t| is_unquoted_keyword(t, "EXISTS"))
+    {
+        if_exists = true;
+        i += 2;
+    }
+
+    if !matches!(tokens.get(i), Some(Token::Word(_))) {
+        return Err(anyhow!("Missing view name"));
+    }
+
+    let mut names = Vec::new();
+    let (name, consumed) = parse_object_name(tokens.get(i..).unwrap_or_default())?;
+    names.push(name);
+    i += consumed;
+
+    while matches!(tokens.get(i), Some(Token::Comma)) {
+        i += 1;
+        if !matches!(tokens.get(i), Some(Token::Word(_))) {
+            return Err(anyhow!("Missing view name"));
+        }
+        let (name, consumed) = parse_object_name(tokens.get(i..).unwrap_or_default())?;
+        names.push(name);
+        i += consumed;
+    }
+
+    Ok((names, if_exists))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_refresh_materialized_view_preserves_quoted_ident_case() {
+        let name = parse_refresh_materialized_view_name(r#"REFRESH MATERIALIZED VIEW "MyMV";"#)
+            .unwrap();
+        assert_eq!(name.0.len(), 1);
+        assert_eq!(name.0[0].value, "MyMV");
+        assert_eq!(name.0[0].quote_style, Some('"'));
+    }
+
+    #[test]
+    fn parse_drop_materialized_view_preserves_quoted_ident_case() {
+        let (names, if_exists) =
+            parse_drop_materialized_view(r#"DROP MATERIALIZED VIEW IF EXISTS "MyMV";"#).unwrap();
+        assert!(if_exists);
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].0.len(), 1);
+        assert_eq!(names[0].0[0].value, "MyMV");
+        assert_eq!(names[0].0[0].quote_style, Some('"'));
+    }
+
+    #[test]
+    fn parse_refresh_materialized_view_supports_concurrently() {
+        let name = parse_refresh_materialized_view_name(
+            r#"REFRESH MATERIALIZED VIEW CONCURRENTLY public."MyMV";"#,
+        )
+        .unwrap();
+        assert_eq!(name.0.len(), 2);
+        assert_eq!(name.0[0].value, "public");
+        assert_eq!(name.0[0].quote_style, None);
+        assert_eq!(name.0[1].value, "MyMV");
+        assert_eq!(name.0[1].quote_style, Some('"'));
+    }
+
+    #[test]
+    fn parse_drop_materialized_view_supports_multiple_names() {
+        let (names, if_exists) = parse_drop_materialized_view(
+            r#"DROP MATERIALIZED VIEW IF EXISTS public."MyMV", "Other";"#,
+        )
+        .unwrap();
+        assert!(if_exists);
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].0.len(), 2);
+        assert_eq!(names[0].0[1].value, "MyMV");
+        assert_eq!(names[0].0[1].quote_style, Some('"'));
+        assert_eq!(names[1].0.len(), 1);
+        assert_eq!(names[1].0[0].value, "Other");
+        assert_eq!(names[1].0[0].quote_style, Some('"'));
     }
 }
 
@@ -126,18 +330,8 @@ impl Executor {
         session: &mut Session,
         sql: &str,
     ) -> Result<ExecuteResult> {
-        let sql_upper = sql.trim().to_uppercase();
-        let rest = sql_upper
-            .strip_prefix("REFRESH MATERIALIZED VIEW")
-            .ok_or_else(|| anyhow!("Invalid REFRESH MATERIALIZED VIEW syntax"))?
-            .trim();
-
-        let view_name = rest
-            .split_whitespace()
-            .next()
-            .ok_or_else(|| anyhow!("Missing view name"))?
-            .trim_end_matches(';')
-            .to_lowercase();
+        let view_obj = parse_refresh_materialized_view_name(sql)?;
+        let view_name_for_error = view_obj.to_string();
 
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {
@@ -150,7 +344,6 @@ impl Executor {
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
 
-            let view_obj = object_name_from_token(&view_name)?;
             let resolved = names::resolve_existing_materialized_view_name(
                 self.store().as_ref(),
                 txn,
@@ -159,7 +352,12 @@ impl Executor {
                 search_path,
             )
             .await?
-            .ok_or_else(|| anyhow!("Materialized view '{}' does not exist", view_name))?;
+            .ok_or_else(|| {
+                anyhow!(
+                    "Materialized view '{}' does not exist",
+                    view_name_for_error
+                )
+            })?;
             let view_full_name = resolved.full;
 
             let query_str: String = self
@@ -219,25 +417,7 @@ impl Executor {
         session: &mut Session,
         sql: &str,
     ) -> Result<ExecuteResult> {
-        let sql_upper = sql.trim().to_uppercase();
-        let rest = sql_upper
-            .strip_prefix("DROP MATERIALIZED VIEW")
-            .ok_or_else(|| anyhow!("Invalid DROP MATERIALIZED VIEW syntax"))?
-            .trim();
-
-        let if_exists = rest.starts_with("IF EXISTS");
-        let name_part = if if_exists {
-            rest.strip_prefix("IF EXISTS").unwrap().trim()
-        } else {
-            rest
-        };
-
-        let view_name = name_part
-            .split_whitespace()
-            .next()
-            .ok_or_else(|| anyhow!("Missing view name"))?
-            .trim_end_matches(';')
-            .to_lowercase();
+        let (names, if_exists) = parse_drop_materialized_view(sql)?;
 
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {
@@ -249,13 +429,12 @@ impl Executor {
             let (txn, _sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
-            let name = object_name_from_token(&view_name)?;
             ddl::execute_drop_materialized_view(
                 &self.store(),
                 txn,
                 db_id,
                 search_path,
-                &[name],
+                &names,
                 if_exists,
             )
                 .await

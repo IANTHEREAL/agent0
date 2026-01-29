@@ -739,7 +739,12 @@ impl Executor {
                     return res.map(ExecuteResults::single);
                 }
 
-                if sql_upper.starts_with("REFRESH MATERIALIZED VIEW") {
+                let mut words = sql_upper.split_whitespace();
+                let is_refresh_materialized_view = matches!(
+                    (words.next(), words.next(), words.next()),
+                    (Some("REFRESH"), Some("MATERIALIZED"), Some("VIEW"))
+                );
+                if is_refresh_materialized_view {
                     let start = Instant::now();
                     let res = self.execute_refresh_materialized_view_cmd(session, sql).await;
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
@@ -748,7 +753,12 @@ impl Executor {
                     return res.map(ExecuteResults::single);
                 }
 
-                if sql_upper.starts_with("DROP MATERIALIZED VIEW") {
+                let mut words = sql_upper.split_whitespace();
+                let is_drop_materialized_view = matches!(
+                    (words.next(), words.next(), words.next()),
+                    (Some("DROP"), Some("MATERIALIZED"), Some("VIEW"))
+                );
+                if is_drop_materialized_view {
                     let start = Instant::now();
                     let res = self.execute_drop_materialized_view_cmd(session, sql).await;
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
