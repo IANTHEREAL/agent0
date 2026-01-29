@@ -11,6 +11,7 @@ use tikv_client::Transaction;
 use super::helpers::{
     coerce_value_for_column, convert_data_type, fill_row_defaults, infer_data_type, normalize_ident,
 };
+use super::dml;
 use super::gin;
 use super::index_helpers;
 use super::names;
@@ -1277,9 +1278,10 @@ pub async fn execute_refresh_materialized_view(
     if !store.truncate_table(txn, db_id, name).await? {
         return Err(anyhow!("Materialized view '{}' does not exist", name));
     }
+    let enum_cache = dml::build_enum_label_cache(store, txn, db_id, &schema).await?;
     let row_count = rows.len();
     for row in rows {
-        store.insert(txn, db_id, name, row).await?;
+        dml::execute_insert_row(store, txn, db_id, name, &schema, row, &None, &enum_cache).await?;
     }
     if row_count > 0 {
         store
