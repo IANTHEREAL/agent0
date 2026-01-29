@@ -1,13 +1,13 @@
 ---
 name: pantheon-issue-fix-loop
-description: "Validate an issue with code-causal evidence, then run a strict Pantheon parallel_explore fix+review loop (codex + review_agent) until no P0/P1, then run a required local build+smoke test before merging."
+description: "Validate an issue with code-causal evidence, then run a strict Pantheon parallel_explore fix+review+verify loop (codex + review_agent) until no in-scope P0/P1, then run a required local build+smoke test before merging."
 ---
 
 # Pantheon Issue Fix Loop
 
 ## Overview
 
-Follow a strict, evidence-first workflow to (1) decide whether an issue is valid and (2) if valid, iteratively fix it (codex) and review it (review_agent) until no P0/P1 remain, keeping a single PR updated.
+Follow a strict, evidence-first workflow to (1) decide whether an issue is valid and (2) if valid, iteratively fix it (codex), review it (review_agent), and verify/triage findings (codex) until no in-scope P0/P1 remain, keeping a single PR updated.
 
 ## Inputs
 
@@ -15,7 +15,8 @@ Follow a strict, evidence-first workflow to (1) decide whether an issue is valid
 - `project_name` (required): Pantheon project name.
 - `parent_branch_id` (required): Starting Pantheon branch ID (sandbox baseline).
 - `fix_agent`: default to use `codex`.
-- `review_agent`:default to use `review_agent` (or the configured review agent name).
+- `review_agent`: default to use `review_agent_v1.1`.
+- `verify_agent`: default to use `codex` (used to triage review findings).
 - `poll_interval_seconds`: default to use `300`.
 
 Assumption: If the user did not specify a git branch, treat branch IDs as Pantheon branches/sandboxes. Only the first Fix creates a PR; all subsequent Fix iterations push commits to the same PR head git branch.
@@ -41,12 +42,12 @@ Do not propose a fix until the claim is supported by code and reachability facts
    - `INVALID`: Provide the key code evidence/counter-evidence and stop.
    - `VALID`: Proceed to Step 2.
 
-### Step 2 — Fix/Review Iteration Loop (Pantheon branches)
+### Step 2 — Fix/Review/Verify Iteration Loop (Pantheon branches)
 
 Maintain these variables throughout the loop:
 - `baseline_parent_branch_id`: The initially selected Pantheon branch ID (the original baseline).
 - `last_fix_branch_id`: ✅ The anchor parent for runs; initialized as `baseline_parent_branch_id`.
-  - Review (and optional Verify) runs start from `last_fix_branch_id`.
+  - Review and Verify runs start from `last_fix_branch_id`.
   - Fix runs start from `last_fix_branch_id`, and only on successful Fix do we update `last_fix_branch_id`.
 - `pr_number`, `pr_url`, `pr_head_branch`: Set during the first Fix; reused in all later Fix iterations.
 
@@ -80,9 +81,13 @@ Call `functions.mcp__test__parallel_explore` with `agent="review_agent_v1.1"`, `
 
 ```
 review the code change in PR {pr_number} for issue ({issue_link}), do a bug hunt to find P0/P1 issues only.
+Do NOT post comments and do NOT create issues in this step.
 If you find any P0/P1:
-- post them to the PR as a permanent record using `gh pr comment {pr_number} --body "<your review>"`.
-- then output the P0/P1 list in plain text so the orchestrator can feed it into the next Fix iteration.
+- output exactly:
+P0_P1_FINDINGS
+BEGIN_P0_P1_FINDINGS
+<P0/P1 list>
+END_P0_P1_FINDINGS
 Each P0/P1 must include: (1) severity P0 or P1, (2) code-causal evidence, (3) reachability statement, (4) explicit blast-radius.
 Do NOT create or merge PRs in this step.
 If there is no P0/P1, output exactly: NO_P0_P1
@@ -90,14 +95,69 @@ If there is no P0/P1, output exactly: NO_P0_P1
 
 Wait for the branch to finish (see “Waiting / Polling”), then parse the output.
 Do not update `last_fix_branch_id` in Review runs.
+If the Review output is `NO_P0_P1`, skip Verify and proceed to Step 2.5.
 
-#### 2.3 While review reports any P0/P1
+#### 2.3 Verify (codex) — validate + scope review findings
+
+Goal: ensure Fix only works on *valid* issues, and decide whether each valid issue must be fixed inside this PR or can be deferred into a separate GitHub issue.
+
+Call `functions.mcp__test__parallel_explore` with `agent="codex"`, `num_branches=1`, `parent_branch_id=last_fix_branch_id`, and prompt:
+
+```
+verify the P0/P1 findings from the latest review for PR {pr_number} (issue: {issue_link}).
+
+Inputs:
+- Review findings: {p0p1_issue_descriptions} (the content between `BEGIN_P0_P1_FINDINGS` and `END_P0_P1_FINDINGS` from Step 2.2 output)
+
+For EACH finding, do triage:
+1) Validity: confirm it is real on the current PR head (or explain why it is invalid / already fixed).
+2) Origin: best-effort decide whether it is introduced by this PR vs pre-existing on master.
+3) Difficulty: estimate fix difficulty (S/M/L) and risk (low/med/high).
+4) Scope decision (choose exactly ONE):
+   - FIX_IN_THIS_PR: valid and should block merge (e.g. introduced by PR, or merging makes things worse, or must-fix P0/P1).
+   - DEFER_CREATE_ISSUE: valid but does NOT need to be fixed in this PR (e.g. not introduced by PR and merge doesn't worsen, or fix is large/risky and better separated).
+   - INVALID_OR_ALREADY_FIXED: not valid, duplicate, not reachable, not actually P0/P1, or already fixed by current head.
+
+For every DEFER_CREATE_ISSUE item:
+- create a GitHub issue in the same repo as the PR (avoid duplicates by searching first).
+  - using `gh`:
+    - `REPO=$(gh pr view {pr_number} --json baseRepository --jq .baseRepository.nameWithOwner)`
+    - `gh issue list -R "$REPO" --search "<keywords> in:title,body state:open" --limit 10`
+- if a matching open issue already exists, do NOT create a new one; reuse the existing issue link (optionally add a short comment with new evidence + link back to PR #{pr_number}).
+- include a link back to PR #{pr_number} and include code-causal evidence + repro/impact.
+
+Post ONE PR issue comment summarizing this triage (idempotent per PR head SHA):
+- compute PR head SHA: `HEAD_SHA=$(gh pr view {pr_number} --json headRefOid --jq .headRefOid)`
+- if there is already an issue comment containing `<!-- pantheon-verify:{HEAD_SHA} -->`, do NOT post again.
+- post via stdin (shell-safe, preserves backticks):
+  - `gh pr comment {pr_number} --body-file - <<'EOF'`
+  - first line MUST be: `<!-- pantheon-verify:{HEAD_SHA} -->`
+  - include THREE sections so it is unambiguous what must be fixed in this PR vs not:
+    - FIX_IN_THIS_PR: each item includes severity + brief rationale + difficulty/risk.
+    - DEFER_CREATE_ISSUE: each item includes the created/existing issue link + brief rationale.
+    - INVALID_OR_ALREADY_FIXED: brief rationale.
+  - `EOF`
+
+Output:
+- If there is NO item marked FIX_IN_THIS_PR, output exactly: NO_IN_SCOPE_P0_P1
+- Otherwise output exactly:
+IN_SCOPE_P0_P1
+BEGIN_IN_SCOPE_P0_P1
+<the in-scope P0/P1 list to feed into the next Fix step as {in_scope_p0p1_issue_descriptions}>
+END_IN_SCOPE_P0_P1
+```
+
+Wait for the branch to finish (see “Waiting / Polling”), then parse the output.
+Do not update `last_fix_branch_id` in Verify runs.
+If the Verify output is `NO_IN_SCOPE_P0_P1`, skip Fix iterations and proceed to Step 2.5.
+
+#### 2.4 While verify reports any in-scope P0/P1
 
 For each iteration:
 1. Fix (codex): `functions.mcp__test__parallel_explore(agent="codex", parent_branch_id=last_fix_branch_id)` with prompt:
 
 ```
-fix the P0/P1 issue found during coding - {p0p1_issue_descriptions} using linus KISS principle with an accurate, rigorous, and concise solution and don't introduce other issue and regression issue.
+fix the verified in-scope P0/P1 issue(s) - {in_scope_p0p1_issue_descriptions} (the content between `BEGIN_IN_SCOPE_P0_P1` and `END_IN_SCOPE_P0_P1` from Step 2.3 output) using linus KISS principle with an accurate, rigorous, and concise solution and don't introduce other issue and regression issue.
 
 Important: do NOT create a new PR. checkout the existing PR head branch and push commits to it:
 - gh pr checkout {pr_number} (or git checkout {pr_head_branch})
@@ -108,10 +168,14 @@ run the smallest relevant tests/build.
 
 2. Wait for the branch to finish (see “Waiting / Polling”); set `last_fix_branch_id = fix_branch_id`.
 3. Review again using Step 2.2 (which uses `parent_branch_id=last_fix_branch_id`); wait and parse.
+4. If Review output is `NO_P0_P1`, stop the loop.
+5. Otherwise Verify again using Step 2.3; wait and parse.
 
-Stop the loop only when the review output is `NO_P0_P1`.
+Stop the loop when either:
+- Review outputs `NO_P0_P1`, or
+- Verify outputs `NO_IN_SCOPE_P0_P1` (i.e., remaining findings were invalid or deferred into separate GitHub issues).
 
-#### 2.4 Pre-merge build + smoke test (required)
+#### 2.5 Pre-merge build + smoke test (required)
 
 Before merging, run a quick local validation on the PR head branch:
 1. `cargo build --release` succeeds
@@ -122,11 +186,14 @@ Use the `local-tipg-up` skill for the exact commands. Run it on the PR head bran
 - `gh pr checkout {pr_number}` (or `git checkout {pr_head_branch}`)
 - Follow `local-tipg-up/SKILL.md`
 
-If this step fails, do NOT merge. Start another Fix exploration to address the failure, then rerun Step 2.2 Review (and repeat this Step 2.4 check) before merging.
+If this step fails, do NOT merge. Start another Fix exploration to address the failure, then rerun Step 2.2 Review (and Step 2.3 Verify if needed), and repeat this Step 2.5 check before merging.
 
-#### 2.5 Merge PR
+#### 2.6 Merge PR
 
-When the latest review output is `NO_P0_P1`, merge the PR using `gh` directly (this does NOT need to happen inside an exploration), or stop and report if merging is blocked by permissions/CI/review policy.
+When either:
+- the latest Review output is `NO_P0_P1`, OR
+- the latest Verify output is `NO_IN_SCOPE_P0_P1` (i.e., remaining findings were invalid or deferred into separate GitHub issues),
+merge the PR using `gh` directly (this does NOT need to happen inside an exploration), or stop and report if merging is blocked by permissions/CI/review policy.
 
 Preferred merge method: squash merge (if the repo allows it):
 - `gh pr merge {pr_number} --squash` (optionally add `--delete-branch`)
@@ -146,9 +213,9 @@ Important: do NOT create a new PR. checkout the existing PR head branch and push
 - commit and push
 ```
 
-After the conflict-resolution Fix finishes, run Step 2.2 Review again (and keep the Fix/Review loop if any P0/P1 are found). Only merge after Review returns `NO_P0_P1`.
+After the conflict-resolution Fix finishes, run Step 2.2 Review again; if it finds any P0/P1, run Step 2.3 Verify and keep the Fix loop for any `IN_SCOPE_P0_P1`. Only merge after Review returns `NO_P0_P1` OR Verify returns `NO_IN_SCOPE_P0_P1`.
 
-After Review returns `NO_P0_P1`, rerun Step 2.4 (pre-merge build + smoke test), then merge.
+After Review returns `NO_P0_P1` OR Verify returns `NO_IN_SCOPE_P0_P1`, rerun Step 2.5 (pre-merge build + smoke test), then merge.
 
 ## Waiting / Polling (required between stages)
 
