@@ -1,22 +1,19 @@
 ---
 name: pantheon-issue-fix-loop
-description: "Validate an issue with code-causal evidence, then run a strict Pantheon parallel_explore fix+review+verify loop (codex + review_agent) until no in-scope P0/P1, then run a required local build+smoke test before merging."
+description: "Validate an issue with code-causal evidence, then run a strict Pantheon parallel_explore fix+review+verify loop (codex) until no in-scope P0/P1, then run a required local build+smoke test before merging."
 ---
 
 # Pantheon Issue Fix Loop
 
 ## Overview
 
-Follow a strict, evidence-first workflow to (1) decide whether an issue is valid and (2) if valid, iteratively fix it (codex), review it (review_agent), and verify/triage findings (codex) until no in-scope P0/P1 remain, keeping a single PR updated.
+Follow a strict, evidence-first workflow to (1) decide whether an issue is valid and (2) if valid, iteratively fix it (codex), review it (codex), and verify/triage findings (codex) until no in-scope P0/P1 remain, keeping a single PR updated.
 
 ## Inputs
 
 - `issue_link` (required): Issue URL or identifier.
 - `project_name` (required): Pantheon project name.
 - `parent_branch_id` (required): Starting Pantheon branch ID (sandbox baseline).
-- `fix_agent`: default to use `codex`.
-- `review_agent`: default to use `review_agent_v1.1`.
-- `verify_agent`: default to use `codex` (used to triage review findings).
 - `poll_interval_seconds`: default to use `300`.
 
 Assumption: If the user did not specify a git branch, treat branch IDs as Pantheon branches/sandboxes. Only the first Fix creates a PR; all subsequent Fix iterations push commits to the same PR head git branch.
@@ -29,18 +26,28 @@ Assumption: If the user did not specify a git branch, treat branch IDs as Panthe
 
 ## Workflow (Strict)
 
-### Step 1 — Check Issue Validity (default stance: may be invalid)
+### Step 1 — Sync master + Check Issue Validity (codex) (default stance: may be invalid)
 
-Do not propose a fix until the claim is supported by code and reachability facts.
+Before doing anything else, sync the code to the latest master, then do not propose a fix until the claim is supported by code and reachability facts.
 
-1. Restate the issue claim precisely (expected vs actual, triggering inputs/config).
-2. Locate the relevant code path(s) and identify the exact conditions required to reach them.
-3. Determine reachability under **default production configuration** (or clearly-common configs).
-4. Assess concrete impact and blast radius (unavailability, correctness, data safety, security, severe perf).
-5. Actively search for counter-evidence (feature gates, existing guards, fallbacks, isolation boundaries, test-only behavior, unreachable branches).
-6. Output a verdict:
-   - `INVALID`: Provide the key code evidence/counter-evidence and stop.
-   - `VALID`: Proceed to Step 2.
+Call `functions.mcp__test__parallel_explore` with `agent="codex"`, `num_branches=1`, `parent_branch_id=parent_branch_id`, and prompt:
+
+```
+pull the latest code from master branch, then:
+1) Restate the issue claim precisely (expected vs actual, triggering inputs/config).
+2) Locate the relevant code path(s) and identify the exact conditions required to reach them.
+3) Determine reachability under default production configuration (or clearly-common configs).
+4) Assess concrete impact and blast radius (unavailability, correctness, data safety, security, severe perf).
+5) Actively search for counter-evidence (feature gates, existing guards, fallbacks, isolation boundaries, test-only behavior, unreachable branches).
+
+Output exactly one of:
+VERDICT=INVALID
+VERDICT=VALID
+```
+
+Wait for the branch to finish (see “Waiting / Polling”), then parse the output.
+If the verdict is `VERDICT=INVALID`, stop.
+If the verdict is `VERDICT=VALID`, set `synced_master_branch_id = validity_branch_id` and proceed to Step 2.
 
 ### Step 2 — Fix/Review/Verify Iteration Loop (Pantheon branches)
 
@@ -52,7 +59,7 @@ Maintain these variables throughout the loop:
 - `pr_number`, `pr_url`, `pr_head_branch`: Set during the first Fix; reused in all later Fix iterations.
 
 Initialize at the start of Step 2:
-- `baseline_parent_branch_id = parent_branch_id`
+- `baseline_parent_branch_id = synced_master_branch_id`
 - `last_fix_branch_id = baseline_parent_branch_id`
 
 #### 2.1 First Fix (codex) — must create PR
@@ -60,7 +67,6 @@ Initialize at the start of Step 2:
 Call `functions.mcp__test__parallel_explore` with `agent="codex"`, `num_branches=1`, `parent_branch_id=last_fix_branch_id`, and prompt:
 
 ```
-pull the latest code from master branch, then:
 1) fix this issue ({issue_link}) using Linus KISS principle with an accurate, rigorous, and concise solution and don't introduce other issue and regression issue.
 2) self-review your own diff (correctness, edge cases, compatibility, and obvious regressions).
 3) run the smallest relevant tests/build.
@@ -75,12 +81,13 @@ PR_HEAD_BRANCH=<branch>
 Wait for the branch to finish (see “Waiting / Polling”), then extract and store `PR_URL/PR_NUMBER/PR_HEAD_BRANCH`.
 Set `last_fix_branch_id = fix_branch_id`.
 
-#### 2.2 Review (review_agent) — P0/P1 bug hunt
+#### 2.2 Review (codex) — P0/P1 bug hunt
 
-Call `functions.mcp__test__parallel_explore` with `agent="review_agent_v1.1"`, `num_branches=1`, `parent_branch_id=last_fix_branch_id`, and prompt:
+Call `functions.mcp__test__parallel_explore` with `agent="codex"`, `num_branches=1`, `parent_branch_id=last_fix_branch_id`, and prompt:
 
 ```
-review the code change in PR {pr_number} for issue ({issue_link}), do a bug hunt to find P0/P1 issues only.
+Review the code change in PR {pr_number} for issue ({issue_link}); do a P0/P1-only bug hunt.
+Principle: treat the review like a scientific investigation—read as much as needed, explain what the code does (don’t guess), and only accept a P0/P1 when code evidence + reachability justify it.
 Do NOT post comments and do NOT create issues in this step.
 If you find any P0/P1:
 - output exactly:
@@ -108,6 +115,9 @@ verify the P0/P1 findings from the latest review for PR {pr_number} (issue: {iss
 
 Inputs:
 - Review findings: {p0p1_issue_descriptions} (the content between `BEGIN_P0_P1_FINDINGS` and `END_P0_P1_FINDINGS` from Step 2.2 output)
+
+Principle: Your default stance is: each issue may be a misread, a misunderstanding, or an edge case--unless the code evidence forces you to accept it. Read as much as needed, and treat code/issue analysis like a scientific experiment—explain what the code actually does (don’t guess), challenge assumptions, and explicitly confront any gaps in understanding.
+
 
 For EACH finding, do triage:
 1) Validity: confirm it is real on the current PR head (or explain why it is invalid / already fixed).
@@ -181,10 +191,17 @@ Before merging, run a quick local validation on the PR head branch:
 1. `cargo build --release` succeeds
 2. tipg (pg-tikv) starts successfully against a local TiKV cluster
 3. `pg_isready` succeeds and `SELECT 1;` works
+4. CI required checks are green for the PR head
 
-Use the `local-tipg-up` skill for the exact commands. Run it on the PR head branch:
+Use the `local-tipg-up` skill for the exact commands. It starts a local TiKV cluster (via `scripts/tikv_admin.py` / tiup), builds `pg-tikv` in release mode, starts the server, and runs a smoke test (`pg_isready` + `SELECT 1`). Run it on the PR head branch:
 - `gh pr checkout {pr_number}` (or `git checkout {pr_head_branch}`)
 - Follow `local-tipg-up/SKILL.md`
+
+Then ensure CI is green (required):
+- Wait for required checks: `gh pr checks {pr_number} --required --watch --fail-fast`
+- If any required check fails, do NOT merge. Inspect the failure output and use it to drive the next Fix.
+  - List checks: `gh pr checks {pr_number} --required`
+  - If it is a GitHub Actions failure: `gh run list --branch {pr_head_branch} --limit 20` then `gh run view <run-id> --log-failed`
 
 If this step fails, do NOT merge. Start another Fix exploration to address the failure, then rerun Step 2.2 Review (and Step 2.3 Verify if needed), and repeat this Step 2.5 check before merging.
 
@@ -193,13 +210,15 @@ If this step fails, do NOT merge. Start another Fix exploration to address the f
 When either:
 - the latest Review output is `NO_P0_P1`, OR
 - the latest Verify output is `NO_IN_SCOPE_P0_P1` (i.e., remaining findings were invalid or deferred into separate GitHub issues),
-merge the PR using `gh` directly (this does NOT need to happen inside an exploration), or stop and report if merging is blocked by permissions/CI/review policy.
+and Step 2.5 passed (local validation + CI green), merge the PR using `gh` directly (this does NOT need to happen inside an exploration), or stop and report if merging is blocked by permissions/review policy.
 
 Preferred merge method: squash merge (if the repo allows it):
-- `gh pr merge {pr_number} --squash` (optionally add `--delete-branch`)
+- `HEAD_SHA=$(gh pr view {pr_number} --json headRefOid --jq .headRefOid)`
+- `gh pr merge {pr_number} --squash --match-head-commit $HEAD_SHA` (optionally add `--delete-branch`)
 
 If squash merge is not allowed by repo settings/policy, fall back to a normal merge:
-- `gh pr merge {pr_number} --merge` (optionally add `--delete-branch`)
+- `HEAD_SHA=$(gh pr view {pr_number} --json headRefOid --jq .headRefOid)`
+- `gh pr merge {pr_number} --merge --match-head-commit $HEAD_SHA` (optionally add `--delete-branch`)
 
 If the merge is blocked due to merge conflicts, start one more Fix exploration to resolve conflicts:
 - Call `functions.mcp__test__parallel_explore` with `agent="codex"`, `num_branches=1`, `parent_branch_id=last_fix_branch_id`, and prompt:
@@ -215,7 +234,7 @@ Important: do NOT create a new PR. checkout the existing PR head branch and push
 
 After the conflict-resolution Fix finishes, run Step 2.2 Review again; if it finds any P0/P1, run Step 2.3 Verify and keep the Fix loop for any `IN_SCOPE_P0_P1`. Only merge after Review returns `NO_P0_P1` OR Verify returns `NO_IN_SCOPE_P0_P1`.
 
-After Review returns `NO_P0_P1` OR Verify returns `NO_IN_SCOPE_P0_P1`, rerun Step 2.5 (pre-merge build + smoke test), then merge.
+After Review returns `NO_P0_P1` OR Verify returns `NO_IN_SCOPE_P0_P1`, rerun Step 2.5 (pre-merge build + smoke test + CI), then merge.
 
 ## Waiting / Polling (required between stages)
 
@@ -223,6 +242,6 @@ After each `parallel_explore`, wait via a sleep loop:
 1. Poll `functions.mcp__test__get_branch(branch_id)` until `status` is terminal (case-insensitive match): `failed`, `succeed`, `finished`, `manifesting`, or `ready_for_manifest`.
 2. Call `functions.mcp__test__branch_output(branch_id, full_output=true)` to retrieve logs/results.
 3. If terminal status is `failed`, stop the workflow and report the failing `branch_id` + the relevant output snippet.
-4. otherwise if it is running, sleep 300s, then poll again
+4. Otherwise (not terminal), sleep 300s, then poll again
 
 Pantheon note: `manifesting` and `ready_for_manifest` mean the branch run is already done; you can fetch `branch_output` and proceed to the next step (you do not need to wait for a later `succeed`/`finished` transition).
