@@ -197,11 +197,12 @@ Use the `local-tipg-up` skill for the exact commands. It starts a local TiKV clu
 - `gh pr checkout {pr_number}` (or `git checkout {pr_head_branch}`)
 - Follow `local-tipg-up/SKILL.md`
 
-Then ensure CI is green (required):
+Then ensure CI is green (required). CI failures are merge blockers (treat as `MERGE_BLOCKER=CI_FAILED`, not a P0/P1 review finding):
 - Wait for required checks: `gh pr checks {pr_number} --required --watch --fail-fast`
 - If any required check fails, do NOT merge. Inspect the failure output and use it to drive the next Fix.
   - List checks: `gh pr checks {pr_number} --required`
   - If it is a GitHub Actions failure: `gh run list --branch {pr_head_branch} --limit 20` then `gh run view <run-id> --log-failed`
+- If CI is red due to flaky/infra (best-effort judged as not introduced by this PR), create or reuse a GitHub issue to track it (use the same dedupe workflow as Step 2.3 `DEFER_CREATE_ISSUE`), then stop; do NOT merge until required checks are green.
 
 If this step fails, do NOT merge. Start another Fix exploration to address the failure, then rerun Step 2.2 Review (and Step 2.3 Verify if needed), and repeat this Step 2.5 check before merging.
 
