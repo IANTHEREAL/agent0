@@ -915,6 +915,8 @@ impl TikvStore {
         txn_delete(txn, key).await?;
         let cfg_key = self.key(&encode_extension_config_key_v2(db_id, ext_name));
         let _ = txn_delete(txn, cfg_key).await;
+        let comment_key = self.key(&encode_comment_extension_key_v2(db_id, ext_name));
+        txn_delete(txn, comment_key).await?;
         Ok(true)
     }
 
@@ -1769,6 +1771,8 @@ impl TikvStore {
         let key = self.key(&encode_function_key_v2(db_id, full_name));
         if txn.get(key.clone()).await?.is_some() {
             txn_delete(txn, key).await?;
+            let comment_key = self.key(&encode_comment_function_key_v2(db_id, full_name));
+            txn_delete(txn, comment_key).await?;
             Ok(true)
         } else {
             Ok(false)
