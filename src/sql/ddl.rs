@@ -2013,6 +2013,9 @@ pub async fn execute_alter_table(
             }
             schema.version += 1;
             store.update_schema(txn, db_id, schema).await?;
+            store
+                .rename_column_metadata(txn, db_id, &t, &old_name, &new_name)
+                .await?;
         }
         AlterTableOperation::RenameTable { table_name } => {
             let new_table = table_name
@@ -2024,6 +2027,9 @@ pub async fn execute_alter_table(
             let (schema_name, _) = names::parse_full_name(&t)?;
             let new_full = format!("{}.{}", schema_name, new_table);
             store.rename_table_schema(txn, db_id, &t, &new_full).await?;
+            store
+                .rename_table_metadata(txn, db_id, &t, &new_full)
+                .await?;
             result_table_name = new_full.clone();
 
             // Update referencing-side metadata (FKs store ref_table as a string).

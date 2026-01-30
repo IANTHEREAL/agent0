@@ -20,6 +20,15 @@ const SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
 /// Maximum scan limit for TiKV operations.
 const SCAN_LIMIT: u32 = u32::MAX;
 
+fn column_comment_table_prefix_v2(db_id: u64, table_full_name: &str) -> Vec<u8> {
+    let mut prefix = encode_comment_prefix_v2(db_id);
+    prefix.push(b'c');
+    prefix.push(0);
+    prefix.extend_from_slice(table_full_name.as_bytes());
+    prefix.push(0);
+    prefix
+}
+
 fn nextval_standalone(
     full_name: &str,
     increment: i64,
@@ -1873,6 +1882,9 @@ impl TikvStore {
         for pair in pairs {
             let def: TriggerDef =
                 bincode::deserialize(pair.value()).context("Failed to deserialize trigger")?;
+            if def.table != table_full_name {
+                continue;
+            }
             triggers.push(def);
         }
         Ok(triggers)
@@ -2071,6 +2083,310 @@ impl TikvStore {
 
         txn_put(txn, new_key, serialize_schema(&schema)?).await?;
         txn_delete(txn, old_key).await?;
+        Ok(())
+    }
+
+    /// Rewrite name-keyed metadata for a renamed table.
+    ///
+    /// This updates (moves) trigger keys, table/column comment keys, and rewrites
+    /// `SequenceDef.owned_by` string references that point at the renamed table.
+    pub async fn rename_table_metadata(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        old_table: &str,
+        new_table: &str,
+    ) -> Result<()> {
+        if old_table == new_table {
+            return Ok(());
+        }
+
+        self.rename_table_triggers(txn, db_id, old_table, new_table)
+            .await?;
+        self.rename_table_comments(txn, db_id, old_table, new_table)
+            .await?;
+        self.rewrite_sequences_owned_by_table(txn, db_id, old_table, new_table)
+            .await?;
+        Ok(())
+    }
+
+    /// Rewrite name-keyed metadata for a renamed column.
+    ///
+    /// This updates column comment keys and rewrites `SequenceDef.owned_by` column
+    /// references for sequences owned by the renamed column.
+    pub async fn rename_column_metadata(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_full_name: &str,
+        old_column: &str,
+        new_column: &str,
+    ) -> Result<()> {
+        if old_column == new_column {
+            return Ok(());
+        }
+
+        self.rename_column_comment(txn, db_id, table_full_name, old_column, new_column)
+            .await?;
+        self.rewrite_sequences_owned_by_column(
+            txn,
+            db_id,
+            table_full_name,
+            old_column,
+            new_column,
+        )
+        .await?;
+        Ok(())
+    }
+
+    fn plan_trigger_rename_ops(
+        db_id: u64,
+        old_table: &str,
+        new_table: &str,
+        triggers: Vec<(Vec<u8>, TriggerDef)>,
+    ) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>)> {
+        let mut puts = Vec::new();
+        let mut old_keys = Vec::new();
+        let mut new_keys = HashSet::new();
+
+        for (old_key, mut def) in triggers {
+            if def.table != old_table {
+                continue;
+            }
+
+            def.table = new_table.to_string();
+            if let Some((schema, _)) = new_table.split_once('.') {
+                def.schema = schema.to_string();
+            }
+
+            let new_key = encode_trigger_key_v2(db_id, new_table, def.name.as_str());
+            let data = bincode::serialize(&def).context("Failed to serialize trigger")?;
+            new_keys.insert(new_key.clone());
+            puts.push((new_key, data));
+            old_keys.push(old_key);
+        }
+
+        let deletes = old_keys
+            .into_iter()
+            .filter(|old_key| !new_keys.contains(old_key))
+            .collect();
+
+        Ok((puts, deletes))
+    }
+
+    fn validate_trigger_rename_puts(
+        old_table: &str,
+        new_table: &str,
+        puts: &[(Vec<u8>, Vec<u8>)],
+        old_keys: &HashSet<Vec<u8>>,
+        existing_triggers: &HashMap<Vec<u8>, TriggerDef>,
+    ) -> Result<()> {
+        for (key, data) in puts {
+            if old_keys.contains(key) {
+                continue;
+            }
+
+            if let Some(existing) = existing_triggers.get(key) {
+                let new_def: TriggerDef =
+                    bincode::deserialize(data).context("Failed to deserialize trigger")?;
+                return Err(anyhow!(
+                    "Renaming table '{}' to '{}' would overwrite trigger '{}' on '{}' (key collision with trigger '{}' on '{}')",
+                    old_table,
+                    new_table,
+                    existing.name,
+                    existing.table,
+                    new_def.name,
+                    new_def.table
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn rename_table_triggers(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        old_table: &str,
+        new_table: &str,
+    ) -> Result<()> {
+        // If orphan triggers exist under the target name (e.g. from a previous bug),
+        // remove them so the renamed table doesn't "inherit" unrelated triggers.
+        let new_prefix = encode_trigger_table_prefix_v2(db_id, new_table);
+        let mut new_end = new_prefix.clone();
+        new_end.push(0xFF);
+        let range: BoundRange = (new_prefix..new_end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let mut existing_triggers = HashMap::new();
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            let def: TriggerDef =
+                bincode::deserialize(pair.value()).context("Failed to deserialize trigger")?;
+            if def.table == new_table {
+                txn_delete(txn, self.key(key)).await?;
+                continue;
+            }
+            existing_triggers.insert(self.key(key), def);
+        }
+
+        let old_prefix = encode_trigger_table_prefix_v2(db_id, old_table);
+        let mut old_end = old_prefix.clone();
+        old_end.push(0xFF);
+        let range: BoundRange = (old_prefix.clone()..old_end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut triggers = Vec::new();
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&old_prefix) {
+                continue;
+            }
+            let def: TriggerDef =
+                bincode::deserialize(pair.value()).context("Failed to deserialize trigger")?;
+            if def.table != old_table {
+                continue;
+            }
+            triggers.push((self.key(key), def));
+        }
+
+        let old_keys: HashSet<Vec<u8>> = triggers.iter().map(|(key, _)| key.clone()).collect();
+        let (puts, deletes) = Self::plan_trigger_rename_ops(db_id, old_table, new_table, triggers)?;
+
+        Self::validate_trigger_rename_puts(old_table, new_table, &puts, &old_keys, &existing_triggers)?;
+
+        for (key, data) in puts {
+            txn_put(txn, key, data).await?;
+        }
+
+        for key in deletes {
+            txn_delete(txn, key).await?;
+        }
+        Ok(())
+    }
+
+    async fn rename_table_comments(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        old_table: &str,
+        new_table: &str,
+    ) -> Result<()> {
+        // Clean up any orphan comments under the target name.
+        txn_delete(
+            txn,
+            self.key(&encode_comment_table_key_v2(db_id, new_table)),
+        )
+        .await?;
+        self.delete_column_comments_for_table(txn, db_id, new_table)
+            .await?;
+
+        // Move table comment, if present.
+        let old_table_key = self.key(&encode_comment_table_key_v2(db_id, old_table));
+        if let Some(value) = txn.get(old_table_key.clone()).await? {
+            let new_table_key = self.key(&encode_comment_table_key_v2(db_id, new_table));
+            txn_put(txn, new_table_key, value).await?;
+            txn_delete(txn, old_table_key).await?;
+        }
+
+        // Move column comments, if present.
+        let old_prefix = column_comment_table_prefix_v2(db_id, old_table);
+        let mut end = old_prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (old_prefix.clone()..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if !key.starts_with(&old_prefix) {
+                continue;
+            }
+            let column_name = std::str::from_utf8(&key[old_prefix.len()..])
+                .context("comment key: invalid column name")?;
+            let new_key = self.key(&encode_comment_column_key_v2(db_id, new_table, column_name));
+            txn_put(txn, new_key, pair.value().to_vec()).await?;
+            txn_delete(txn, self.key(key)).await?;
+        }
+        Ok(())
+    }
+
+    async fn rename_column_comment(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_full_name: &str,
+        old_column: &str,
+        new_column: &str,
+    ) -> Result<()> {
+        let old_key = self.key(&encode_comment_column_key_v2(db_id, table_full_name, old_column));
+        let Some(value) = txn.get(old_key.clone()).await? else {
+            return Ok(());
+        };
+        let new_key = self.key(&encode_comment_column_key_v2(db_id, table_full_name, new_column));
+        txn_put(txn, new_key, value).await?;
+        txn_delete(txn, old_key).await?;
+        Ok(())
+    }
+
+    async fn delete_column_comments_for_table(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_full_name: &str,
+    ) -> Result<()> {
+        let prefix = column_comment_table_prefix_v2(db_id, table_full_name);
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        for pair in pairs {
+            txn_delete(txn, pair.into_key().into()).await?;
+        }
+        Ok(())
+    }
+
+    async fn rewrite_sequences_owned_by_table(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        old_table: &str,
+        new_table: &str,
+    ) -> Result<()> {
+        let sequences = self.list_sequences(txn, db_id).await?;
+        for mut def in sequences {
+            let mut changed = false;
+            if let Some((owned_table, _)) = def.owned_by.as_mut() {
+                if owned_table == old_table {
+                    *owned_table = new_table.to_string();
+                    changed = true;
+                }
+            }
+            if changed {
+                self.update_sequence_def(txn, db_id, &def).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn rewrite_sequences_owned_by_column(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_full_name: &str,
+        old_column: &str,
+        new_column: &str,
+    ) -> Result<()> {
+        let sequences = self.list_sequences(txn, db_id).await?;
+        for mut def in sequences {
+            let mut changed = false;
+            if let Some((owned_table, owned_column)) = def.owned_by.as_mut() {
+                if owned_table == table_full_name && owned_column == old_column {
+                    *owned_column = new_column.to_string();
+                    changed = true;
+                }
+            }
+            if changed {
+                self.update_sequence_def(txn, db_id, &def).await?;
+            }
+        }
         Ok(())
     }
 
@@ -2714,5 +3030,180 @@ mod sequence_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("reached maximum value"));
+    }
+}
+
+#[cfg(test)]
+mod trigger_rename_tests {
+    use super::*;
+
+    #[test]
+    fn trigger_rename_keeps_reused_old_keys() {
+        let db_id = 1;
+        let old_table = "public.t";
+        let new_table = "public.t/a";
+
+        let trigger_a = TriggerDef {
+            oid: 1,
+            schema: "public".to_string(),
+            name: "a".to_string(),
+            table: old_table.to_string(),
+            timing: "BEFORE".to_string(),
+            events: vec!["INSERT".to_string()],
+            function: "public.f".to_string(),
+        };
+        let trigger_nested = TriggerDef {
+            oid: 2,
+            schema: "public".to_string(),
+            name: "a/a".to_string(),
+            table: old_table.to_string(),
+            timing: "BEFORE".to_string(),
+            events: vec!["INSERT".to_string()],
+            function: "public.f".to_string(),
+        };
+
+        let old_key_a = encode_trigger_key_v2(db_id, old_table, "a");
+        let old_key_nested = encode_trigger_key_v2(db_id, old_table, "a/a");
+
+        let new_key_a = encode_trigger_key_v2(db_id, new_table, "a");
+        let new_key_nested = encode_trigger_key_v2(db_id, new_table, "a/a");
+        assert_eq!(new_key_a, old_key_nested);
+
+        let (puts, deletes) = TikvStore::plan_trigger_rename_ops(
+            db_id,
+            old_table,
+            new_table,
+            vec![(old_key_a.clone(), trigger_a), (old_key_nested.clone(), trigger_nested)],
+        )
+        .unwrap();
+
+        let put_keys: HashSet<Vec<u8>> = puts.iter().map(|(key, _)| key.clone()).collect();
+        assert!(put_keys.contains(&new_key_a));
+        assert!(put_keys.contains(&new_key_nested));
+
+        assert!(deletes.contains(&old_key_a));
+        assert!(!deletes.contains(&old_key_nested));
+
+        for (key, data) in puts {
+            let def: TriggerDef = bincode::deserialize(&data).unwrap();
+            assert_eq!(def.table, new_table);
+            assert_eq!(def.schema, "public");
+
+            if key == new_key_a {
+                assert_eq!(def.name, "a");
+            } else if key == new_key_nested {
+                assert_eq!(def.name, "a/a");
+            } else {
+                panic!("unexpected trigger key");
+            }
+        }
+    }
+
+    #[test]
+    fn trigger_rename_allows_overwriting_reused_old_keys() {
+        let db_id = 1;
+        let old_table = "public.t";
+        let new_table = "public.t/a";
+
+        let trigger_a = TriggerDef {
+            oid: 1,
+            schema: "public".to_string(),
+            name: "a".to_string(),
+            table: old_table.to_string(),
+            timing: "BEFORE".to_string(),
+            events: vec!["INSERT".to_string()],
+            function: "public.f".to_string(),
+        };
+        let trigger_nested = TriggerDef {
+            oid: 2,
+            schema: "public".to_string(),
+            name: "a/a".to_string(),
+            table: old_table.to_string(),
+            timing: "BEFORE".to_string(),
+            events: vec!["INSERT".to_string()],
+            function: "public.f".to_string(),
+        };
+
+        let old_key_a = encode_trigger_key_v2(db_id, old_table, "a");
+        let old_key_nested = encode_trigger_key_v2(db_id, old_table, "a/a");
+        let new_key_a = encode_trigger_key_v2(db_id, new_table, "a");
+        assert_eq!(new_key_a, old_key_nested);
+
+        let (puts, _) = TikvStore::plan_trigger_rename_ops(
+            db_id,
+            old_table,
+            new_table,
+            vec![(old_key_a.clone(), trigger_a), (old_key_nested.clone(), trigger_nested.clone())],
+        )
+        .unwrap();
+
+        let old_keys: HashSet<Vec<u8>> = vec![old_key_a, old_key_nested.clone()].into_iter().collect();
+        let existing_triggers = HashMap::from([(old_key_nested, trigger_nested)]);
+
+        TikvStore::validate_trigger_rename_puts(
+            old_table,
+            new_table,
+            &puts,
+            &old_keys,
+            &existing_triggers,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn trigger_rename_errors_on_unrelated_key_collision() {
+        let db_id = 1;
+        let old_table = "public.other";
+        let new_table = "public.t/a";
+
+        let trigger_a = TriggerDef {
+            oid: 1,
+            schema: "public".to_string(),
+            name: "a".to_string(),
+            table: old_table.to_string(),
+            timing: "BEFORE".to_string(),
+            events: vec!["INSERT".to_string()],
+            function: "public.f".to_string(),
+        };
+
+        let old_key = encode_trigger_key_v2(db_id, old_table, "a");
+        let old_keys: HashSet<Vec<u8>> = vec![old_key.clone()].into_iter().collect();
+
+        let (puts, _) = TikvStore::plan_trigger_rename_ops(
+            db_id,
+            old_table,
+            new_table,
+            vec![(old_key, trigger_a)],
+        )
+        .unwrap();
+
+        let collision_key = encode_trigger_key_v2(db_id, "public.t", "a/a");
+        let expected_new_key = encode_trigger_key_v2(db_id, new_table, "a");
+        assert_eq!(collision_key, expected_new_key);
+
+        let existing_triggers = HashMap::from([(
+            collision_key,
+            TriggerDef {
+                oid: 99,
+                schema: "public".to_string(),
+                name: "a/a".to_string(),
+                table: "public.t".to_string(),
+                timing: "BEFORE".to_string(),
+                events: vec!["INSERT".to_string()],
+                function: "public.f".to_string(),
+            },
+        )]);
+
+        let err = TikvStore::validate_trigger_rename_puts(
+            old_table,
+            new_table,
+            &puts,
+            &old_keys,
+            &existing_triggers,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("would overwrite trigger"));
+        assert!(err.contains("public.t"));
     }
 }
