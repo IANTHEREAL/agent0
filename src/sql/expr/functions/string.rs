@@ -17,7 +17,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("LEFT", left);
     map.insert("RIGHT", right);
     map.insert("TRIM", trim);
-    map.insert("BTRIM", trim);
+    map.insert("BTRIM", btrim);
     map.insert("LTRIM", ltrim);
     map.insert("RTRIM", rtrim);
     map.insert("LPAD", lpad);
@@ -141,6 +141,29 @@ pub fn trim(args: Vec<Value>) -> Result<Value> {
         Some(Value::Text(s)) => Ok(Value::Text(s.trim().to_string())),
         Some(Value::Null) => Ok(Value::Null),
         _ => Ok(Value::Null),
+    }
+}
+
+pub fn btrim(args: Vec<Value>) -> Result<Value> {
+    let mut iter = args.into_iter();
+    let s = match iter.next() {
+        Some(Value::Text(s)) => s,
+        Some(Value::Null) => return Ok(Value::Null),
+        _ => return Ok(Value::Null),
+    };
+    let chars_to_trim: Option<String> = iter.next().and_then(|v| match v {
+        Value::Text(s) => Some(s),
+        _ => None,
+    });
+
+    match chars_to_trim {
+        Some(chars) => {
+            let char_set: std::collections::HashSet<char> = chars.chars().collect();
+            Ok(Value::Text(
+                s.trim_matches(|c| char_set.contains(&c)).to_string(),
+            ))
+        }
+        None => Ok(Value::Text(s.trim().to_string())),
     }
 }
 
