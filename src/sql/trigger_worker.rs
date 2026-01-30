@@ -374,7 +374,7 @@ pub(crate) async fn enqueue_after_triggers(
 
         let key = encode_trigger_queue_key(ev.id);
         let val = bincode::serialize(&ev)?;
-        txn.put(key, val).await?;
+        crate::txn::txn_put(txn, key, val).await?;
 
         quota.current_depth.fetch_add(1, Ordering::Relaxed);
         remaining -= 1;
