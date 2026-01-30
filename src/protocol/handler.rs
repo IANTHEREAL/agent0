@@ -3,7 +3,7 @@ use crate::observability;
 use crate::pool::TikvClientPool;
 use crate::sql::expr::set_connection_id;
 use crate::sql::types::{TypeContext, TypeInferrer};
-use crate::sql::{ExecuteResult, Executor, Session};
+use crate::sql::{ExecuteResult, Executor, InFailedSqlTransaction, Session};
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, TableSchema, Value};
 use async_trait::async_trait;
@@ -11,6 +11,7 @@ use futures::{stream, Sink, SinkExt};
 use pgwire::api::auth::{ServerParameterProvider, StartupHandler};
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::Portal;
+use pgwire::api::store::PortalStore;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
     CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
@@ -18,13 +19,16 @@ use pgwire::api::results::{
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::{
-    ClientInfo, NoopErrorHandler, PgWireConnectionState, PgWireServerHandlers, Type,
+    ClientInfo, ClientPortalStore, NoopErrorHandler, PgWireConnectionState, PgWireServerHandlers,
+    Type,
     METADATA_DATABASE, METADATA_USER,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::DataRow;
-use pgwire::messages::response::{CommandComplete, ErrorResponse, NoticeResponse};
+use pgwire::messages::response::{
+    CommandComplete, EmptyQueryResponse, ErrorResponse, NoticeResponse, TransactionStatus,
+};
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use sqlparser::ast::{
@@ -46,6 +50,212 @@ const METADATA_ACTUAL_USER: &str = "actual_user";
 
 /// Global atomic counter for generating unique connection IDs
 static CONNECTION_ID_COUNTER: AtomicI32 = AtomicI32::new(1);
+
+fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
+    if err.is::<InFailedSqlTransaction>() {
+        "25P02"
+    } else {
+        "XX000"
+    }
+}
+
+fn in_failed_sql_transaction_pgwire_error() -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        "25P02".to_string(),
+        InFailedSqlTransaction.to_string(),
+    )))
+}
+
+async fn rollback_autocommit_or_mark_failed(session: &mut Session, started_txn: bool) {
+    if started_txn {
+        let _ = session.rollback().await;
+    } else {
+        session.mark_transaction_failed();
+    }
+}
+
+fn is_empty_simple_query(query: &str) -> bool {
+    let trimmed = query.trim();
+    trimmed.is_empty() || trimmed == ";"
+}
+
+fn update_tx_status_after_execution(status: TransactionStatus, tag: &Tag) -> TransactionStatus {
+    if *tag == Tag::new("ROLLBACK") {
+        // `ROLLBACK TO SAVEPOINT` clears the failed-transaction state without ending the
+        // transaction block, so ReadyForQuery must move from `E` -> `T`.
+        TransactionStatus::Transaction
+    } else {
+        status
+    }
+}
+
+async fn on_query_with_tx_status_fix<H, C>(
+    handler: &H,
+    client: &mut C,
+    query: pgwire::messages::simplequery::Query,
+) -> PgWireResult<()>
+where
+    H: SimpleQueryHandler,
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+        return Err(PgWireError::NotReadyForQuery);
+    }
+
+    let mut transaction_status = client.transaction_status();
+    client.set_state(PgWireConnectionState::QueryInProgress);
+    let query_string = query.query;
+
+    if is_empty_simple_query(&query_string) {
+        client
+            .feed(PgWireBackendMessage::EmptyQueryResponse(
+                EmptyQueryResponse::new(),
+            ))
+            .await?;
+    } else {
+        let resp = <H as SimpleQueryHandler>::do_query(handler, client, &query_string).await?;
+        for r in resp {
+            match r {
+                Response::EmptyQuery => {
+                    client
+                        .feed(PgWireBackendMessage::EmptyQueryResponse(
+                            EmptyQueryResponse::new(),
+                        ))
+                        .await?;
+                }
+                Response::Query(results) => {
+                    pgwire::api::query::send_query_response(client, results, true).await?;
+                }
+                Response::Execution(tag) => {
+                    transaction_status = update_tx_status_after_execution(transaction_status, &tag);
+                    pgwire::api::query::send_execution_response(client, tag).await?;
+                }
+                Response::TransactionStart(tag) => {
+                    pgwire::api::query::send_execution_response(client, tag).await?;
+                    transaction_status = transaction_status.to_in_transaction_state();
+                }
+                Response::TransactionEnd(tag) => {
+                    pgwire::api::query::send_execution_response(client, tag).await?;
+                    transaction_status = transaction_status.to_idle_state();
+                }
+                Response::Error(e) => {
+                    client
+                        .feed(PgWireBackendMessage::ErrorResponse((*e).into()))
+                        .await?;
+                    transaction_status = transaction_status.to_error_state();
+                }
+                Response::CopyIn(result) => {
+                    pgwire::api::copy::send_copy_in_response(client, result).await?;
+                    client.set_state(PgWireConnectionState::CopyInProgress(false));
+                }
+                Response::CopyOut(result) => {
+                    pgwire::api::copy::send_copy_out_response(client, result).await?;
+                    client.set_state(PgWireConnectionState::CopyInProgress(false));
+                }
+                Response::CopyBoth(result) => {
+                    pgwire::api::copy::send_copy_both_response(client, result).await?;
+                    client.set_state(PgWireConnectionState::CopyInProgress(false));
+                }
+            }
+        }
+    }
+
+    if !matches!(client.state(), PgWireConnectionState::CopyInProgress(_)) {
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        client.set_transaction_status(transaction_status);
+        pgwire::api::query::send_ready_for_query(client, transaction_status).await?;
+    }
+
+    Ok(())
+}
+
+async fn on_execute_with_tx_status_fix<H, C>(
+    handler: &H,
+    client: &mut C,
+    message: pgwire::messages::extendedquery::Execute,
+) -> PgWireResult<()>
+where
+    H: ExtendedQueryHandler,
+    C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::PortalStore: PortalStore<Statement = H::Statement>,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+        return Err(PgWireError::NotReadyForQuery);
+    }
+    let mut transaction_status = client.transaction_status();
+
+    client.set_state(PgWireConnectionState::QueryInProgress);
+
+    let portal_name = message
+        .name
+        .as_deref()
+        .unwrap_or(pgwire::api::DEFAULT_NAME);
+    if let Some(portal) = client.portal_store().get_portal(portal_name) {
+        match <H as ExtendedQueryHandler>::do_query(
+            handler,
+            client,
+            portal.as_ref(),
+            message.max_rows as usize,
+        )
+        .await?
+        {
+            Response::EmptyQuery => {
+                client
+                    .feed(PgWireBackendMessage::EmptyQueryResponse(
+                        EmptyQueryResponse::new(),
+                    ))
+                    .await?;
+            }
+            Response::Query(results) => {
+                pgwire::api::query::send_query_response(client, results, false).await?;
+            }
+            Response::Execution(tag) => {
+                transaction_status = update_tx_status_after_execution(transaction_status, &tag);
+                pgwire::api::query::send_execution_response(client, tag).await?;
+            }
+            Response::TransactionStart(tag) => {
+                pgwire::api::query::send_execution_response(client, tag).await?;
+                transaction_status = transaction_status.to_in_transaction_state();
+            }
+            Response::TransactionEnd(tag) => {
+                pgwire::api::query::send_execution_response(client, tag).await?;
+                transaction_status = transaction_status.to_idle_state();
+            }
+            Response::Error(err) => {
+                client
+                    .send(PgWireBackendMessage::ErrorResponse((*err).into()))
+                    .await?;
+                transaction_status = transaction_status.to_error_state();
+            }
+            Response::CopyIn(result) => {
+                client.set_state(PgWireConnectionState::CopyInProgress(true));
+                pgwire::api::copy::send_copy_in_response(client, result).await?;
+            }
+            Response::CopyOut(result) => {
+                client.set_state(PgWireConnectionState::CopyInProgress(true));
+                pgwire::api::copy::send_copy_out_response(client, result).await?;
+            }
+            Response::CopyBoth(result) => {
+                client.set_state(PgWireConnectionState::CopyInProgress(true));
+                pgwire::api::copy::send_copy_both_response(client, result).await?;
+            }
+        }
+
+        if !matches!(client.state(), PgWireConnectionState::CopyInProgress(_)) {
+            client.set_state(PgWireConnectionState::ReadyForQuery);
+            client.set_transaction_status(transaction_status);
+        };
+
+        Ok(())
+    } else {
+        Err(PgWireError::PortalNotFound(portal_name.to_owned()))
+    }
+}
 
 pub struct PgServerParameterProvider;
 
@@ -2031,6 +2241,19 @@ impl StartupHandler for DynamicPgHandler {
 
 #[async_trait]
 impl SimpleQueryHandler for DynamicPgHandler {
+    async fn on_query<C>(
+        &self,
+        client: &mut C,
+        query: pgwire::messages::simplequery::Query,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        on_query_with_tx_status_fix(self, client, query).await
+    }
+
     async fn do_query<'a, C>(
         &self,
         client: &mut C,
@@ -2061,7 +2284,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
                 table_name, columns
             );
 
-            let col_count = if columns.is_empty() {
+            let col_count = {
                 let mut session_guard = self.session.lock().await;
                 let session = session_guard.as_mut().ok_or_else(|| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -2070,25 +2293,37 @@ impl SimpleQueryHandler for DynamicPgHandler {
                         "Session not initialized".to_string(),
                     )))
                 })?;
-                let db_id = session.current_database_id();
-                session.begin().await.ok();
-                let count = if let Some(txn) = session.get_mut_txn() {
-                    if let Ok(Some(schema)) = executor
-                        .store()
-                        .get_schema(txn, db_id, &table_name)
-                        .await
-                    {
-                        schema.columns.len()
+
+                if session.is_transaction_failed() {
+                    return Err(in_failed_sql_transaction_pgwire_error());
+                }
+
+                if columns.is_empty() {
+                    let db_id = session.current_database_id();
+                    let started_txn = !session.is_in_transaction();
+                    if started_txn {
+                        session.begin().await.ok();
+                    }
+                    let count = if let Some(txn) = session.get_mut_txn() {
+                        if let Ok(Some(schema)) = executor
+                            .store()
+                            .get_schema(txn, db_id, &table_name)
+                            .await
+                        {
+                            schema.columns.len()
+                        } else {
+                            1
+                        }
                     } else {
                         1
+                    };
+                    if started_txn {
+                        session.rollback().await.ok();
                     }
+                    count
                 } else {
-                    1
-                };
-                session.rollback().await.ok();
-                count
-            } else {
-                columns.len()
+                    columns.len()
+                }
             };
 
             let mut ctx = self.copy_context.lock().await;
@@ -2142,7 +2377,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
                 error!("Query execution error: {}", e);
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_string(),
-                    "XX000".to_string(),
+                    sqlstate_for_executor_error(&e).to_string(),
                     e.to_string(),
                 ))))
             }
@@ -2188,94 +2423,123 @@ impl CopyHandler for DynamicPgHandler {
                 )))
             })?;
 
-            session.begin().await.map_err(|e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    e.to_string(),
-                )))
-            })?;
+            if session.is_transaction_failed() {
+                return Err(in_failed_sql_transaction_pgwire_error());
+            }
 
-            let db_id = session.current_database_id();
-            let schema = {
-                let txn = session.get_mut_txn().ok_or_else(|| {
+            let started_txn = !session.is_in_transaction();
+            if started_txn {
+                session.begin().await.map_err(|e| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_string(),
                         "XX000".to_string(),
-                        "No transaction".to_string(),
+                        e.to_string(),
                     )))
                 })?;
-                executor
-                    .store()
-                    .get_schema(txn, db_id, &ctx.table_name)
-                    .await
-                    .map_err(|e| {
+            }
+
+            let count_res: PgWireResult<usize> = async {
+                let db_id = session.current_database_id();
+                let schema = {
+                    let txn = session.get_mut_txn().ok_or_else(|| {
                         PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".to_string(),
                             "XX000".to_string(),
-                            e.to_string(),
+                            "No transaction".to_string(),
                         )))
-                    })?
-                    .ok_or_else(|| {
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "42P01".to_string(),
-                            format!("relation \"{}\" does not exist", ctx.table_name),
-                        )))
-                    })?
-            };
-            session.rollback().await.ok();
+                    })?;
+                    executor
+                        .store()
+                        .get_schema(txn, db_id, &ctx.table_name)
+                        .await
+                        .map_err(|e| {
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "XX000".to_string(),
+                                e.to_string(),
+                            )))
+                        })?
+                        .ok_or_else(|| {
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "42P01".to_string(),
+                                format!("relation \"{}\" does not exist", ctx.table_name),
+                            )))
+                        })?
+                };
 
-            let columns: Vec<String> = if ctx.columns.is_empty() {
-                schema.columns.iter().map(|c| c.name.clone()).collect()
-            } else {
-                ctx.columns.clone()
-            };
+                let columns: Vec<String> = if ctx.columns.is_empty() {
+                    schema.columns.iter().map(|c| c.name.clone()).collect()
+                } else {
+                    ctx.columns.clone()
+                };
 
-            let mut all_data = Vec::new();
-            for chunk in &ctx.data_buffer {
-                all_data.extend_from_slice(chunk);
-            }
-
-            let data_str = String::from_utf8_lossy(&all_data);
-            let lines: Vec<&str> = data_str.lines().filter(|l| !l.is_empty()).collect();
-
-            let mut count = 0usize;
-
-            for line in lines {
-                let values: Vec<&str> = line.split('\t').collect();
-
-                if values.len() != columns.len() {
-                    continue;
+                let mut all_data = Vec::new();
+                for chunk in &ctx.data_buffer {
+                    all_data.extend_from_slice(chunk);
                 }
 
-                let mut col_values: Vec<(String, Value)> = Vec::new();
-                for (col_name, val) in columns.iter().zip(values.iter()) {
-                    let value = if *val == "\\N" {
-                        Value::Null
-                    } else {
-                        let col_schema = schema.columns.iter().find(|c| c.name == *col_name);
-                        if let Some(cs) = col_schema {
-                            executor.parse_value_for_copy(val, &cs.data_type)
+                let data_str = String::from_utf8_lossy(&all_data);
+                let lines: Vec<&str> = data_str.lines().filter(|l| !l.is_empty()).collect();
+
+                let mut count = 0usize;
+
+                for line in lines {
+                    let values: Vec<&str> = line.split('\t').collect();
+
+                    if values.len() != columns.len() {
+                        continue;
+                    }
+
+                    let mut col_values: Vec<(String, Value)> = Vec::new();
+                    for (col_name, val) in columns.iter().zip(values.iter()) {
+                        let value = if *val == "\\N" {
+                            Value::Null
                         } else {
-                            Value::Text(val.to_string())
-                        }
-                    };
-                    col_values.push((col_name.clone(), value));
+                            let col_schema = schema.columns.iter().find(|c| c.name == *col_name);
+                            if let Some(cs) = col_schema {
+                                executor.parse_value_for_copy(val, &cs.data_type)
+                            } else {
+                                Value::Text(val.to_string())
+                            }
+                        };
+                        col_values.push((col_name.clone(), value));
+                    }
+
+                    executor
+                        .execute_copy_insert(session, &ctx.table_name, col_values)
+                        .await
+                        .map_err(|e| {
+                            error!("COPY insert error: {}", e);
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "XX000".to_string(),
+                                e.to_string(),
+                            )))
+                        })?;
+                    count += 1;
                 }
 
-                if let Err(e) = executor
-                    .execute_copy_insert(session, &ctx.table_name, col_values)
-                    .await
-                {
-                    error!("COPY insert error: {}", e);
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                Ok(count)
+            }
+            .await;
+
+            let count = match count_res {
+                Ok(count) => count,
+                Err(e) => {
+                    rollback_autocommit_or_mark_failed(session, started_txn).await;
+                    return Err(e);
+                }
+            };
+
+            if started_txn {
+                session.commit().await.map_err(|e| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_string(),
                         "XX000".to_string(),
                         e.to_string(),
-                    ))));
-                }
-                count += 1;
+                    )))
+                })?;
             }
 
             count
@@ -2320,6 +2584,20 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         self.query_parser.clone()
     }
 
+    async fn on_execute<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Execute,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        on_execute_with_tx_status_fix(self, client, message).await
+    }
+
     async fn do_query<'a, 'b: 'a, C>(
         &'b self,
         _client: &mut C,
@@ -2353,7 +2631,7 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                 error!("Extended query execution error: {}", e);
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_string(),
-                    "XX000".to_string(),
+                    sqlstate_for_executor_error(&e).to_string(),
                     e.to_string(),
                 ))))
             }
@@ -2948,6 +3226,19 @@ impl StartupHandler for PgHandler {
 
 #[async_trait]
 impl SimpleQueryHandler for PgHandler {
+    async fn on_query<C>(
+        &self,
+        client: &mut C,
+        query: pgwire::messages::simplequery::Query,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        on_query_with_tx_status_fix(self, client, query).await
+    }
+
     async fn do_query<'a, C>(
         &self,
         client: &mut C,
@@ -2966,28 +3257,39 @@ impl SimpleQueryHandler for PgHandler {
                 table_name, columns
             );
 
-            let col_count = if columns.is_empty() {
+            let col_count = {
                 let mut session = self.session.lock().await;
-                let db_id = session.current_database_id();
-                session.begin().await.ok();
-                let count = if let Some(txn) = session.get_mut_txn() {
-                    if let Ok(Some(schema)) = self
-                        .executor
-                        .store()
-                        .get_schema(txn, db_id, &table_name)
-                        .await
-                    {
-                        schema.columns.len()
+                if session.is_transaction_failed() {
+                    return Err(in_failed_sql_transaction_pgwire_error());
+                }
+
+                if columns.is_empty() {
+                    let db_id = session.current_database_id();
+                    let started_txn = !session.is_in_transaction();
+                    if started_txn {
+                        session.begin().await.ok();
+                    }
+                    let count = if let Some(txn) = session.get_mut_txn() {
+                        if let Ok(Some(schema)) = self
+                            .executor
+                            .store()
+                            .get_schema(txn, db_id, &table_name)
+                            .await
+                        {
+                            schema.columns.len()
+                        } else {
+                            1
+                        }
                     } else {
                         1
+                    };
+                    if started_txn {
+                        session.rollback().await.ok();
                     }
+                    count
                 } else {
-                    1
-                };
-                session.rollback().await.ok();
-                count
-            } else {
-                columns.len()
+                    columns.len()
+                }
             };
 
             let mut ctx = self.copy_context.lock().await;
@@ -3034,7 +3336,7 @@ impl SimpleQueryHandler for PgHandler {
                 error!("Query execution error: {}", e);
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_string(),
-                    "XX000".to_string(),
+                    sqlstate_for_executor_error(&e).to_string(),
                     e.to_string(),
                 ))))
             }
@@ -3070,95 +3372,124 @@ impl CopyHandler for PgHandler {
 
         let row_count = if let Some(ctx) = ctx_opt {
             let mut session = self.session.lock().await;
-            session.begin().await.map_err(|e| {
-                PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    e.to_string(),
-                )))
-            })?;
 
-            let db_id = session.current_database_id();
-            let schema = {
-                let txn = session.get_mut_txn().ok_or_else(|| {
+            if session.is_transaction_failed() {
+                return Err(in_failed_sql_transaction_pgwire_error());
+            }
+
+            let started_txn = !session.is_in_transaction();
+            if started_txn {
+                session.begin().await.map_err(|e| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_string(),
                         "XX000".to_string(),
-                        "No transaction".to_string(),
+                        e.to_string(),
                     )))
                 })?;
-                self.executor
-                    .store()
-                    .get_schema(txn, db_id, &ctx.table_name)
-                    .await
-                    .map_err(|e| {
+            }
+
+            let count_res: PgWireResult<usize> = async {
+                let db_id = session.current_database_id();
+                let schema = {
+                    let txn = session.get_mut_txn().ok_or_else(|| {
                         PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".to_string(),
                             "XX000".to_string(),
-                            e.to_string(),
+                            "No transaction".to_string(),
                         )))
-                    })?
-                    .ok_or_else(|| {
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "42P01".to_string(),
-                            format!("relation \"{}\" does not exist", ctx.table_name),
-                        )))
-                    })?
-            };
-            session.rollback().await.ok();
+                    })?;
+                    self.executor
+                        .store()
+                        .get_schema(txn, db_id, &ctx.table_name)
+                        .await
+                        .map_err(|e| {
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "XX000".to_string(),
+                                e.to_string(),
+                            )))
+                        })?
+                        .ok_or_else(|| {
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "42P01".to_string(),
+                                format!("relation \"{}\" does not exist", ctx.table_name),
+                            )))
+                        })?
+                };
 
-            let columns: Vec<String> = if ctx.columns.is_empty() {
-                schema.columns.iter().map(|c| c.name.clone()).collect()
-            } else {
-                ctx.columns.clone()
-            };
+                let columns: Vec<String> = if ctx.columns.is_empty() {
+                    schema.columns.iter().map(|c| c.name.clone()).collect()
+                } else {
+                    ctx.columns.clone()
+                };
 
-            let mut all_data = Vec::new();
-            for chunk in &ctx.data_buffer {
-                all_data.extend_from_slice(chunk);
-            }
-
-            let data_str = String::from_utf8_lossy(&all_data);
-            let lines: Vec<&str> = data_str.lines().filter(|l| !l.is_empty()).collect();
-
-            let mut count = 0usize;
-
-            for line in lines {
-                let values: Vec<&str> = line.split('\t').collect();
-
-                if values.len() != columns.len() {
-                    continue;
+                let mut all_data = Vec::new();
+                for chunk in &ctx.data_buffer {
+                    all_data.extend_from_slice(chunk);
                 }
 
-                let mut col_values: Vec<(String, Value)> = Vec::new();
-                for (col_name, val) in columns.iter().zip(values.iter()) {
-                    let value = if *val == "\\N" {
-                        Value::Null
-                    } else {
-                        let col_schema = schema.columns.iter().find(|c| c.name == *col_name);
-                        if let Some(cs) = col_schema {
-                            self.executor.parse_value_for_copy(val, &cs.data_type)
+                let data_str = String::from_utf8_lossy(&all_data);
+                let lines: Vec<&str> = data_str.lines().filter(|l| !l.is_empty()).collect();
+
+                let mut count = 0usize;
+
+                for line in lines {
+                    let values: Vec<&str> = line.split('\t').collect();
+
+                    if values.len() != columns.len() {
+                        continue;
+                    }
+
+                    let mut col_values: Vec<(String, Value)> = Vec::new();
+                    for (col_name, val) in columns.iter().zip(values.iter()) {
+                        let value = if *val == "\\N" {
+                            Value::Null
                         } else {
-                            Value::Text(val.to_string())
-                        }
-                    };
-                    col_values.push((col_name.clone(), value));
+                            let col_schema = schema.columns.iter().find(|c| c.name == *col_name);
+                            if let Some(cs) = col_schema {
+                                self.executor.parse_value_for_copy(val, &cs.data_type)
+                            } else {
+                                Value::Text(val.to_string())
+                            }
+                        };
+                        col_values.push((col_name.clone(), value));
+                    }
+
+                    self.executor
+                        .execute_copy_insert(&mut session, &ctx.table_name, col_values)
+                        .await
+                        .map_err(|e| {
+                            error!("COPY insert error: {}", e);
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "XX000".to_string(),
+                                e.to_string(),
+                            )))
+                        })?;
+                    count += 1;
                 }
 
-                if let Err(e) = self
-                    .executor
-                    .execute_copy_insert(&mut session, &ctx.table_name, col_values)
-                    .await
-                {
-                    error!("COPY insert error: {}", e);
-                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                Ok(count)
+            }
+            .await;
+
+            let count = match count_res {
+                Ok(count) => count,
+                Err(e) => {
+                    rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                    return Err(e);
+                }
+            };
+
+            if started_txn {
+                session.commit().await.map_err(|e| {
+                    PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_string(),
                         "XX000".to_string(),
                         e.to_string(),
-                    ))));
-                }
-                count += 1;
+                    )))
+                })?;
             }
 
             count
@@ -3203,6 +3534,20 @@ impl ExtendedQueryHandler for PgHandler {
         self.query_parser.clone()
     }
 
+    async fn on_execute<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Execute,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        on_execute_with_tx_status_fix(self, client, message).await
+    }
+
     async fn do_query<'a, 'b: 'a, C>(
         &'b self,
         _client: &mut C,
@@ -3228,7 +3573,7 @@ impl ExtendedQueryHandler for PgHandler {
                 error!("Extended query execution error: {}", e);
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                     "ERROR".to_string(),
-                    "XX000".to_string(),
+                    sqlstate_for_executor_error(&e).to_string(),
                     e.to_string(),
                 ))))
             }
@@ -3903,6 +4248,35 @@ mod tests {
         assert!(len >= 0);
         let bytes = data.copy_to_bytes(len as usize);
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[test]
+    fn test_sqlstate_for_executor_error() {
+        let failed = anyhow::Error::new(InFailedSqlTransaction);
+        assert_eq!(sqlstate_for_executor_error(&failed), "25P02");
+
+        let other = anyhow::anyhow!("boom");
+        assert_eq!(sqlstate_for_executor_error(&other), "XX000");
+    }
+
+    #[test]
+    fn test_update_tx_status_after_execution_clears_error_on_rollback_to_savepoint() {
+        let status = TransactionStatus::Error;
+        let tag = Tag::new("ROLLBACK");
+        assert_eq!(
+            update_tx_status_after_execution(status, &tag),
+            TransactionStatus::Transaction
+        );
+    }
+
+    #[test]
+    fn test_update_tx_status_after_execution_keeps_status_for_other_commands() {
+        let status = TransactionStatus::Error;
+        let tag = Tag::new("SET");
+        assert_eq!(
+            update_tx_status_after_execution(status, &tag),
+            TransactionStatus::Error
+        );
     }
 
     #[test]

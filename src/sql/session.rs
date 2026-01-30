@@ -9,9 +9,24 @@ use std::sync::Arc;
 use std::time::Duration;
 use tikv_client::Transaction;
 
+#[derive(Debug)]
+pub struct InFailedSqlTransaction;
+
+impl std::fmt::Display for InFailedSqlTransaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "current transaction is aborted, commands ignored until end of transaction block"
+        )
+    }
+}
+
+impl std::error::Error for InFailedSqlTransaction {}
+
 pub enum TransactionState {
     Idle,
     Active(Transaction),
+    Failed(Transaction),
 }
 
 /// A small, per-connection container for session-level settings (GUCs).
@@ -291,7 +306,25 @@ impl Session {
 
     /// Check if currently in a transaction block
     pub fn is_in_transaction(&self) -> bool {
-        matches!(self.state, TransactionState::Active(_))
+        matches!(self.state, TransactionState::Active(_) | TransactionState::Failed(_))
+    }
+
+    pub fn is_transaction_failed(&self) -> bool {
+        matches!(self.state, TransactionState::Failed(_))
+    }
+
+    pub(crate) fn mark_transaction_failed(&mut self) {
+        match std::mem::replace(&mut self.state, TransactionState::Idle) {
+            TransactionState::Active(txn) => self.state = TransactionState::Failed(txn),
+            other => self.state = other,
+        }
+    }
+
+    pub(crate) fn clear_failed_transaction(&mut self) {
+        match std::mem::replace(&mut self.state, TransactionState::Idle) {
+            TransactionState::Failed(txn) => self.state = TransactionState::Active(txn),
+            other => self.state = other,
+        }
     }
 
     pub(crate) fn savepoints(&self) -> Arc<SavepointState> {
@@ -301,7 +334,7 @@ impl Session {
     /// Get mutable reference to active transaction
     pub fn get_mut_txn(&mut self) -> Option<&mut Transaction> {
         match &mut self.state {
-            TransactionState::Active(txn) => Some(txn),
+            TransactionState::Active(txn) | TransactionState::Failed(txn) => Some(txn),
             _ => None,
         }
     }
@@ -310,7 +343,7 @@ impl Session {
         &mut self,
     ) -> Option<(&mut Transaction, &mut HashMap<String, i64>, &[String])> {
         match &mut self.state {
-            TransactionState::Active(txn) => {
+            TransactionState::Active(txn) | TransactionState::Failed(txn) => {
                 Some((txn, &mut self.last_sequence_values, self.settings.search_path()))
             }
             _ => None,
@@ -342,6 +375,9 @@ impl Session {
         if !self.is_in_transaction() {
             return Err(anyhow!("SAVEPOINT can only be used in transaction blocks"));
         }
+        if self.is_transaction_failed() {
+            return Err(anyhow::Error::new(InFailedSqlTransaction));
+        }
         self.savepoints.create(name)
     }
 
@@ -350,6 +386,9 @@ impl Session {
             return Err(anyhow!(
                 "RELEASE SAVEPOINT can only be used in transaction blocks"
             ));
+        }
+        if self.is_transaction_failed() {
+            return Err(anyhow::Error::new(InFailedSqlTransaction));
         }
         self.savepoints.release(name)
     }
@@ -394,6 +433,7 @@ impl Session {
             let _ = self.rollback().await;
             return Err(e);
         }
+        self.clear_failed_transaction();
         Ok(())
     }
 
@@ -406,7 +446,7 @@ impl Session {
                 self.state = TransactionState::Active(txn);
                 Ok(())
             }
-            TransactionState::Active(_) => {
+            TransactionState::Active(_) | TransactionState::Failed(_) => {
                 // Already in transaction, ignore
                 Ok(())
             }
@@ -423,6 +463,10 @@ impl Session {
                 self.observability.record_commit();
                 Ok(())
             }
+            TransactionState::Failed(mut txn) => {
+                self.savepoints.reset()?;
+                txn.rollback().await.map_err(|e| anyhow!(e))
+            }
             TransactionState::Idle => {
                 Ok(()) // No-op
             }
@@ -436,6 +480,10 @@ impl Session {
                 self.savepoints.reset()?;
                 txn.rollback().await.map_err(|e| anyhow!(e))
             }
+            TransactionState::Failed(mut txn) => {
+                self.savepoints.reset()?;
+                txn.rollback().await.map_err(|e| anyhow!(e))
+            }
             TransactionState::Idle => {
                 Ok(()) // No-op
             }
@@ -445,7 +493,7 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionSettings;
+    use super::{InFailedSqlTransaction, SessionSettings};
 
     #[test]
     fn test_session_settings_defaults_and_overrides() {
@@ -524,5 +572,13 @@ mod tests {
         assert!(settings
             .set_known_setting("statement_timeout", "1unknown".to_string())
             .is_err());
+    }
+
+    #[test]
+    fn test_in_failed_sql_transaction_message() {
+        assert_eq!(
+            InFailedSqlTransaction.to_string(),
+            "current transaction is aborted, commands ignored until end of transaction block"
+        );
     }
 }

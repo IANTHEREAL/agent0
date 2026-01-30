@@ -16,7 +16,7 @@ use super::super::rbac;
 use super::super::sequences;
 use super::super::statement_time;
 use super::super::udt;
-use super::super::{parse_sql, ExecuteResult, ExecuteResults, Session};
+use super::super::{parse_sql, ExecuteResult, ExecuteResults, InFailedSqlTransaction, Session};
 use crate::auth::AuthManager;
 use crate::observability::TenantObservability;
 use crate::storage::TikvStore;
@@ -36,6 +36,14 @@ use tikv_client::Transaction;
 use tracing::debug;
 
 const OBSERVABILITY_USER: &str = "_pgtikv_sys_observer";
+
+fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    let haystack = haystack.as_bytes();
+    let prefix = prefix.as_bytes();
+    haystack
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
 
 #[derive(Debug)]
 struct StatementTimeoutError;
@@ -615,19 +623,35 @@ impl Executor {
             statement_time::with_statement_timestamp_millis(
                 statement_ts,
                 crate::txn::with_savepoints(savepoints, async {
-                    let sql_stripped = strip_leading_sql_comments(sql);
+                let sql_stripped = strip_leading_sql_comments(sql);
                 let sql_trimmed = sql_stripped.trim_start();
                 let is_observability_user =
                     session.current_user() == Some(OBSERVABILITY_USER) && !session.is_superuser();
-                let starts_with = |prefix: &str| {
-                    sql_trimmed.len() >= prefix.len()
-                        && sql_trimmed[..prefix.len()].eq_ignore_ascii_case(prefix)
-                };
+                let starts_with = |prefix: &str| starts_with_ignore_ascii_case(sql_trimmed, prefix);
+
+                if session.is_transaction_failed()
+                    && !sql_trimmed.trim().is_empty()
+                    && !starts_with("ROLLBACK")
+                    && !starts_with("COMMIT")
+                    && !starts_with("END")
+                {
+                    if !is_observability_user {
+                        self.observability.record_statement(
+                            Duration::from_millis(0),
+                            false,
+                            || sql_trimmed.to_string(),
+                        );
+                    }
+                    return Err(anyhow::Error::new(InFailedSqlTransaction));
+                }
 
                 if !is_observability_user {
                     if starts_with("CREATE DATABASE") {
                         let start = Instant::now();
                         let res = self.execute_create_database_cmd(session, sql).await;
+                        if res.is_err() && session.is_in_transaction() {
+                            session.mark_transaction_failed();
+                        }
                         self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                             sql_trimmed.to_string()
                         });
@@ -636,6 +660,9 @@ impl Executor {
                     if starts_with("DROP DATABASE") {
                         let start = Instant::now();
                         let res = self.execute_drop_database_cmd(session, sql).await;
+                        if res.is_err() && session.is_in_transaction() {
+                            session.mark_transaction_failed();
+                        }
                         self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                             sql_trimmed.to_string()
                         });
@@ -644,6 +671,9 @@ impl Executor {
                     if starts_with("ALTER DATABASE") {
                         let start = Instant::now();
                         let res = self.execute_alter_database_cmd(session, sql).await;
+                        if res.is_err() && session.is_in_transaction() {
+                            session.mark_transaction_failed();
+                        }
                         self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                             sql_trimmed.to_string()
                         });
@@ -652,6 +682,9 @@ impl Executor {
                     if starts_with("CREATE EXTENSION") {
                         let start = Instant::now();
                         let res = self.execute_create_extension_cmd(session, sql).await;
+                        if res.is_err() && session.is_in_transaction() {
+                            session.mark_transaction_failed();
+                        }
                         self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                             sql_trimmed.to_string()
                         });
@@ -660,6 +693,9 @@ impl Executor {
                 if starts_with("DROP EXTENSION") {
                     let start = Instant::now();
                     let res = self.execute_drop_extension_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -668,6 +704,9 @@ impl Executor {
                 if starts_with("COMMENT ON") {
                     let start = Instant::now();
                     let res = self.execute_comment_on_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -676,6 +715,9 @@ impl Executor {
                 if starts_with("CREATE OR REPLACE FUNCTION") || starts_with("CREATE FUNCTION") {
                     let start = Instant::now();
                     let res = self.execute_create_function_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -684,6 +726,9 @@ impl Executor {
                 if starts_with("DROP FUNCTION") {
                     let start = Instant::now();
                     let res = self.execute_drop_function_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -692,6 +737,9 @@ impl Executor {
                 if starts_with("CREATE CONSTRAINT TRIGGER") || starts_with("CREATE TRIGGER") {
                     let start = Instant::now();
                     let res = self.execute_create_trigger_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -700,6 +748,9 @@ impl Executor {
                 if starts_with("DROP TRIGGER") {
                     let start = Instant::now();
                     let res = self.execute_drop_trigger_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -724,6 +775,9 @@ impl Executor {
                 {
                     let start = Instant::now();
                     let res = self.execute_alter_owner_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -733,6 +787,9 @@ impl Executor {
                 if sql_upper.starts_with("ALTER SEQUENCE") && sql_upper.contains("OWNED") {
                     let start = Instant::now();
                     let res = self.execute_alter_sequence_owned_by_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -747,6 +804,9 @@ impl Executor {
                 if is_refresh_materialized_view {
                     let start = Instant::now();
                     let res = self.execute_refresh_materialized_view_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -761,6 +821,9 @@ impl Executor {
                 if is_drop_materialized_view {
                     let start = Instant::now();
                     let res = self.execute_drop_materialized_view_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -770,6 +833,9 @@ impl Executor {
                 if sql_upper.starts_with("CALL ") {
                     let start = Instant::now();
                     let res = self.execute_call_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -779,6 +845,9 @@ impl Executor {
                 if sql_upper.starts_with("DROP PROCEDURE") {
                     let start = Instant::now();
                     let res = self.execute_drop_procedure_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -788,6 +857,9 @@ impl Executor {
                 if sql_upper.starts_with("CREATE PROCEDURE") {
                     let start = Instant::now();
                     let res = self.execute_create_procedure_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -807,6 +879,9 @@ impl Executor {
                     if is_enum {
                         let start = Instant::now();
                         let res = self.execute_create_type_enum_cmd(session, sql).await;
+                        if res.is_err() && session.is_in_transaction() {
+                            session.mark_transaction_failed();
+                        }
                         self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                             sql_trimmed.to_string()
                         });
@@ -817,6 +892,9 @@ impl Executor {
                 if sql_upper.starts_with("DROP TYPE") {
                     let start = Instant::now();
                     let res = self.execute_drop_type_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
                     self.observability.record_statement(start.elapsed(), res.is_ok(), || {
                         sql_trimmed.to_string()
                     });
@@ -839,6 +917,9 @@ impl Executor {
                             false,
                             || sql_trimmed.to_string(),
                         );
+                    }
+                    if session.is_in_transaction() {
+                        session.mark_transaction_failed();
                     }
                     return Err(e);
                 }
@@ -896,8 +977,13 @@ impl Executor {
                                 Ok(vec![ExecuteResult::TransactionStart { tag: "BEGIN" }])
                             }
                             Statement::Commit { .. } => {
+                                let tag = if session.is_transaction_failed() {
+                                    "ROLLBACK"
+                                } else {
+                                    "COMMIT"
+                                };
                                 session.commit().await?;
-                                Ok(vec![ExecuteResult::TransactionEnd { tag: "COMMIT" }])
+                                Ok(vec![ExecuteResult::TransactionEnd { tag }])
                             }
                             Statement::Savepoint { name } => {
                                 session.create_savepoint(normalize_ident(name))?;
@@ -1133,6 +1219,10 @@ impl Executor {
                         }
                     })
                     .await;
+
+                if stmt_exec.is_err() && session.is_in_transaction() {
+                    session.mark_transaction_failed();
+                }
 
                 if !is_observability_query {
                     self.observability
@@ -3084,11 +3174,17 @@ impl Executor {
 mod tests {
     use super::{
         cast_current_setting_value, is_current_setting_function, is_set_config_function,
-        parse_search_path_guc_value, set_variable_value_to_string, try_parse_const_bool,
-        try_parse_const_text, unwrap_top_level_cast,
+        parse_search_path_guc_value, set_variable_value_to_string, starts_with_ignore_ascii_case,
+        try_parse_const_bool, try_parse_const_text, unwrap_top_level_cast,
     };
     use crate::types::Value;
     use sqlparser::ast::{DataType, DateTimeField, Expr, Ident, Interval, ObjectName, Value as SqlValue};
+
+    #[test]
+    fn test_starts_with_ignore_ascii_case_is_byte_safe() {
+        assert!(starts_with_ignore_ascii_case("rollback;", "ROLLBACK"));
+        assert!(!starts_with_ignore_ascii_case("é💩€ROLLBACK", "ROLLBACK"));
+    }
 
     #[test]
     fn test_set_variable_value_to_string_basic() {
