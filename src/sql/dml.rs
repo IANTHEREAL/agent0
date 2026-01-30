@@ -306,7 +306,6 @@ pub async fn execute_insert_row(
 ) -> Result<Option<Row>> {
     validate_enum_values(schema, &row, enum_cache)?;
 
-    let pk_values = schema.get_pk_values(&row);
     let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
         vec![DataType::Uuid]
     } else {
@@ -323,7 +322,7 @@ pub async fn execute_insert_row(
 
     let insert_result = store.insert(txn, db_id, table_name, row.clone()).await;
     match insert_result {
-        Ok(()) => {
+        Ok(pk_values) => {
             for index in &schema.indexes {
                 if !index_helpers::is_index_materializable(index) {
                     continue;
@@ -425,13 +424,26 @@ pub async fn execute_insert_row(
                                             txn,
                                             db_id,
                                             schema,
+                                            existing_pk,
                                             existing_row,
                                             &updated_row,
                                         )
                                         .await?;
-                                        store
-                                            .upsert(txn, db_id, table_name, updated_row.clone())
-                                            .await?;
+                                        if schema.pk_indices.is_empty() {
+                                            store
+                                                .upsert_by_pk(
+                                                    txn,
+                                                    db_id,
+                                                    table_name,
+                                                    existing_pk,
+                                                    updated_row.clone(),
+                                                )
+                                                .await?;
+                                        } else {
+                                            store
+                                                .upsert(txn, db_id, table_name, updated_row.clone())
+                                                .await?;
+                                        }
                                         return Ok(Some(updated_row));
                                     }
                                 }
@@ -492,11 +504,31 @@ pub async fn execute_insert_row(
                                     .delete_by_pk(txn, db_id, table_name, existing_pk)
                                     .await?;
 
-                                update_row_indexes(store, txn, db_id, schema, existing_row, &updated_row)
+                                update_row_indexes(
+                                    store,
+                                    txn,
+                                    db_id,
+                                    schema,
+                                    existing_pk,
+                                    existing_row,
+                                    &updated_row,
+                                )
                                     .await?;
-                                store
-                                    .upsert(txn, db_id, table_name, updated_row.clone())
-                                    .await?;
+                                if schema.pk_indices.is_empty() {
+                                    store
+                                        .upsert_by_pk(
+                                            txn,
+                                            db_id,
+                                            table_name,
+                                            existing_pk,
+                                            updated_row.clone(),
+                                        )
+                                        .await?;
+                                } else {
+                                    store
+                                        .upsert(txn, db_id, table_name, updated_row.clone())
+                                        .await?;
+                                }
                                 return Ok(Some(updated_row));
                             }
                             None => {
@@ -551,6 +583,10 @@ pub async fn execute_insert_row(
             if e.to_string()
                 .contains("duplicate key value violates unique constraint") =>
         {
+            if schema.pk_indices.is_empty() {
+                return Err(e);
+            }
+            let pk_values = schema.get_pk_values(&row);
             match on_conflict {
                 Some(OnInsert::OnConflict(oc)) => match &oc.action {
                     OnConflictAction::DoNothing => Ok(None),
@@ -584,7 +620,15 @@ pub async fn execute_insert_row(
                         }
                         let updated_row = Row::new(updated_vals);
                         validate_enum_values(schema, &updated_row, enum_cache)?;
-                        update_row_indexes(store, txn, db_id, schema, existing_row, &updated_row)
+                        update_row_indexes(
+                            store,
+                            txn,
+                            db_id,
+                            schema,
+                            &pk_values,
+                            existing_row,
+                            &updated_row,
+                        )
                             .await?;
                         store
                             .upsert(txn, db_id, table_name, updated_row.clone())
@@ -622,7 +666,15 @@ pub async fn execute_insert_row(
                     }
                     let updated_row = Row::new(updated_vals);
                     validate_enum_values(schema, &updated_row, enum_cache)?;
-                    update_row_indexes(store, txn, db_id, schema, existing_row, &updated_row)
+                    update_row_indexes(
+                        store,
+                        txn,
+                        db_id,
+                        schema,
+                        &pk_values,
+                        existing_row,
+                        &updated_row,
+                    )
                         .await?;
                     store
                         .upsert(txn, db_id, table_name, updated_row.clone())
@@ -642,11 +694,10 @@ async fn update_row_indexes(
     txn: &mut Transaction,
     db_id: u64,
     schema: &TableSchema,
+    pk_values: &[Value],
     old_row: &Row,
     new_row: &Row,
 ) -> Result<()> {
-    let pk_values = schema.get_pk_values(old_row);
-
     for index in &schema.indexes {
         let gin_hashes = extract_gin_token_hashes_from_row(schema, index, old_row)?;
         if !gin_hashes.is_empty() {

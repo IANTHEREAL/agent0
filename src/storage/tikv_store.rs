@@ -558,6 +558,12 @@ impl TikvStore {
             .get_schema(txn, db_id, table_name)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
+        if schema.pk_indices.is_empty() {
+            return Err(anyhow!(
+                "cannot lock rows: table '{}' has no primary key",
+                table_name
+            ));
+        }
         let keys: Vec<Vec<u8>> = rows
             .iter()
             .map(|row| {
@@ -1323,7 +1329,7 @@ impl TikvStore {
         db_id: u64,
         table_name: &str,
         row: Row,
-    ) -> Result<()> {
+    ) -> Result<Vec<Value>> {
         let schema = self
             .get_schema(txn, db_id, table_name)
             .await?
@@ -1365,7 +1371,7 @@ impl TikvStore {
         }
         txn_put(txn, data_key, row_data).await?;
         debug!("Inserted row into '{}'", table_name);
-        Ok(())
+        Ok(pk_values)
     }
 
     /// Upsert a row into a table
@@ -1387,6 +1393,56 @@ impl TikvStore {
         txn_put(txn, data_key, row_data).await?;
         debug!("Upserted row into '{}'", table_name);
         Ok(())
+    }
+
+    /// Upsert a row into a table with an explicit physical PK value.
+    ///
+    /// This is required for tables without an explicit primary key, where the
+    /// physical row key is not derivable from row values.
+    pub async fn upsert_by_pk(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+        pk_values: &[Value],
+        row: Row,
+    ) -> Result<()> {
+        let schema = self
+            .get_schema(txn, db_id, table_name)
+            .await?
+            .ok_or_else(|| anyhow!("Table not found"))?;
+        if row.values.len() != schema.columns.len() {
+            return Err(anyhow!("Column count mismatch"));
+        }
+        let row_key = encode_pk_values(pk_values);
+        let data_key = self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key));
+        let row_data = serialize_row(&row)?;
+        txn_put(txn, data_key, row_data).await?;
+        debug!("Upserted row into '{}' (explicit PK)", table_name);
+        Ok(())
+    }
+
+    /// Scan all rows from a table, returning both the row key and row value.
+    pub async fn scan_with_keys(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+    ) -> Result<Vec<(Vec<u8>, Row)>> {
+        let schema = self
+            .get_schema(txn, db_id, table_name)
+            .await?
+            .ok_or_else(|| anyhow!("Table not found"))?;
+        let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
+        let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
+        let pairs: Vec<_> = txn.scan(range, SCAN_LIMIT).await?.collect();
+        let mut rows = Vec::with_capacity(pairs.len());
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            let row = deserialize_row(pair.value())?;
+            rows.push((key.to_vec(), row));
+        }
+        Ok(rows)
     }
 
     /// Scan all rows from a table

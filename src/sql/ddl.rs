@@ -1057,35 +1057,126 @@ pub async fn execute_create_index(
     };
 
     if index_helpers::is_index_materializable(&new_index) {
-        for row in rows {
-            if !index_helpers::eval_index_predicate(&new_index, &schema, &row)? {
-                continue;
+        if !rows.is_empty() {
+            if schema.pk_indices.is_empty() {
+                let pk_types: Vec<DataType> = vec![DataType::Uuid];
+                let (start, end) =
+                    crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                let data_key_prefix = start.clone();
+                let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+                while let Some(batch) = scanner.next_batch(txn).await? {
+                    for pair in batch {
+                        let key: &[u8] = pair.key().as_ref().into();
+                        let pk_bytes = key.strip_prefix(data_key_prefix.as_slice()).ok_or_else(|| {
+                            anyhow!("corrupted row key while backfilling index '{}'", idx_name_str)
+                        })?;
+                        let pk_values =
+                            crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
+
+                        let mut row = crate::storage::deserialize_row(pair.value())?;
+                        fill_row_defaults(&mut row, &schema)?;
+
+                        if !index_helpers::eval_index_predicate(&new_index, &schema, &row)? {
+                            continue;
+                        }
+                        let idx_values = index_helpers::get_index_values_with_expressions(
+                            &new_index,
+                            &schema,
+                            &row,
+                        )?;
+                        store
+                            .create_index_entry(
+                                txn,
+                                db_id,
+                                schema.table_id,
+                                index_id,
+                                &idx_values,
+                                &pk_values,
+                                unique,
+                            )
+                            .await?;
+                    }
+                }
+            } else {
+                for row in rows {
+                    if !index_helpers::eval_index_predicate(&new_index, &schema, &row)? {
+                        continue;
+                    }
+                    let idx_values = index_helpers::get_index_values_with_expressions(
+                        &new_index,
+                        &schema,
+                        &row,
+                    )?;
+                    let pk_values = schema.get_pk_values(&row);
+                    store
+                        .create_index_entry(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            index_id,
+                            &idx_values,
+                            &pk_values,
+                            unique,
+                        )
+                        .await?;
+                }
             }
-            let idx_values =
-                index_helpers::get_index_values_with_expressions(&new_index, &schema, &row)?;
-            let pk_values = schema.get_pk_values(&row);
-            store
-                .create_index_entry(
-                    txn,
-                    db_id,
-                    schema.table_id,
-                    index_id,
-                    &idx_values,
-                    &pk_values,
-                    unique,
-                )
-                .await?;
         }
     } else if supported_gin_index_column(&schema, &new_index).is_some() {
-        for row in rows {
-            let hashes = extract_gin_token_hashes_from_row(&schema, &new_index, &row)?;
-            if hashes.is_empty() {
-                continue;
+        if !rows.is_empty() {
+            if schema.pk_indices.is_empty() {
+                let pk_types: Vec<DataType> = vec![DataType::Uuid];
+                let (start, end) =
+                    crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                let data_key_prefix = start.clone();
+                let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+                while let Some(batch) = scanner.next_batch(txn).await? {
+                    for pair in batch {
+                        let key: &[u8] = pair.key().as_ref().into();
+                        let pk_bytes = key.strip_prefix(data_key_prefix.as_slice()).ok_or_else(|| {
+                            anyhow!("corrupted row key while backfilling index '{}'", idx_name_str)
+                        })?;
+                        let pk_values =
+                            crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
+
+                        let mut row = crate::storage::deserialize_row(pair.value())?;
+                        fill_row_defaults(&mut row, &schema)?;
+
+                        let hashes = extract_gin_token_hashes_from_row(&schema, &new_index, &row)?;
+                        if hashes.is_empty() {
+                            continue;
+                        }
+                        store
+                            .create_gin_index_entries(
+                                txn,
+                                db_id,
+                                schema.table_id,
+                                index_id,
+                                &hashes,
+                                &pk_values,
+                            )
+                            .await?;
+                    }
+                }
+            } else {
+                for row in rows {
+                    let hashes = extract_gin_token_hashes_from_row(&schema, &new_index, &row)?;
+                    if hashes.is_empty() {
+                        continue;
+                    }
+                    let pk_values = schema.get_pk_values(&row);
+                    store
+                        .create_gin_index_entries(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            index_id,
+                            &hashes,
+                            &pk_values,
+                        )
+                        .await?;
+                }
             }
-            let pk_values = schema.get_pk_values(&row);
-            store
-                .create_gin_index_entries(txn, db_id, schema.table_id, index_id, &hashes, &pk_values)
-                .await?;
         }
     }
 
@@ -1360,43 +1451,100 @@ pub async fn execute_drop_index(
 ) -> Result<Option<String>> {
     if let Some(pos) = schema.indexes.iter().position(|i| i.name == idx_name) {
         let index = schema.indexes.remove(pos);
-        for row in rows {
-            let pk_values = schema.get_pk_values(&row);
+        if schema.pk_indices.is_empty() {
+            let pk_types: Vec<DataType> = vec![DataType::Uuid];
+            let (start, end) =
+                crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+            let data_key_prefix = start.clone();
+            let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+            while let Some(batch) = scanner.next_batch(txn).await? {
+                for pair in batch {
+                    let key: &[u8] = pair.key().as_ref().into();
+                    let pk_bytes = key.strip_prefix(data_key_prefix.as_slice()).ok_or_else(|| {
+                        anyhow!("corrupted row key while dropping index '{}'", idx_name)
+                    })?;
+                    let pk_values = crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
 
-            let gin_hashes = extract_gin_token_hashes_from_row(schema, &index, &row)?;
-            if !gin_hashes.is_empty() {
+                    let mut row = crate::storage::deserialize_row(pair.value())?;
+                    fill_row_defaults(&mut row, schema)?;
+
+                    let gin_hashes = extract_gin_token_hashes_from_row(schema, &index, &row)?;
+                    if !gin_hashes.is_empty() {
+                        store
+                            .delete_gin_index_entries(
+                                txn,
+                                db_id,
+                                schema.table_id,
+                                index.id,
+                                &gin_hashes,
+                                &pk_values,
+                            )
+                            .await?;
+                        continue;
+                    }
+
+                    if !index_helpers::is_index_materializable(&index) {
+                        continue;
+                    }
+
+                    if !index_helpers::eval_index_predicate(&index, schema, &row)? {
+                        continue;
+                    }
+                    let idx_values =
+                        index_helpers::get_index_values_with_expressions(&index, schema, &row)?;
+                    store
+                        .delete_index_entry(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            index.id,
+                            &idx_values,
+                            &pk_values,
+                            index.unique,
+                        )
+                        .await?;
+                }
+            }
+        } else {
+            for row in rows {
+                let pk_values = schema.get_pk_values(&row);
+
+                let gin_hashes = extract_gin_token_hashes_from_row(schema, &index, &row)?;
+                if !gin_hashes.is_empty() {
+                    store
+                        .delete_gin_index_entries(
+                            txn,
+                            db_id,
+                            schema.table_id,
+                            index.id,
+                            &gin_hashes,
+                            &pk_values,
+                        )
+                        .await?;
+                    continue;
+                }
+
+                if !index_helpers::is_index_materializable(&index) {
+                    continue;
+                }
+
+                if !index_helpers::eval_index_predicate(&index, schema, &row)? {
+                    continue;
+                }
+                let idx_values =
+                    index_helpers::get_index_values_with_expressions(&index, schema, &row)?;
                 store
-                    .delete_gin_index_entries(
+                    .delete_index_entry(
                         txn,
                         db_id,
                         schema.table_id,
                         index.id,
-                        &gin_hashes,
+                        &idx_values,
                         &pk_values,
+                        index.unique,
                     )
                     .await?;
-                continue;
             }
-
-            if !index_helpers::is_index_materializable(&index) {
-                continue;
-            }
-
-            if !index_helpers::eval_index_predicate(&index, schema, &row)? {
-                continue;
-            }
-            let idx_values = index_helpers::get_index_values_with_expressions(&index, schema, &row)?;
-            store
-                .delete_index_entry(
-                    txn,
-                    db_id,
-                    schema.table_id,
-                    index.id,
-                    &idx_values,
-                    &pk_values,
-                    index.unique,
-                )
-                .await?;
         }
         store.update_schema(txn, db_id, schema.clone()).await?;
         return Ok(Some(idx_name.to_string()));
@@ -1564,6 +1712,16 @@ pub async fn execute_alter_table(
                 };
 
                 let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                let data_key_prefix = start.clone();
+                let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
+                    vec![DataType::Uuid]
+                } else {
+                    schema
+                        .pk_indices
+                        .iter()
+                        .map(|&idx| schema.columns[idx].data_type.clone())
+                        .collect()
+                };
                 let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                 while let Some(batch) = scanner.next_batch(txn).await? {
                     for pair in batch {
@@ -1571,7 +1729,18 @@ pub async fn execute_alter_table(
                         fill_row_defaults(&mut row, &schema)?;
 
                         let idx_values = schema.get_index_values(&new_index, &row);
-                        let pk_values = schema.get_pk_values(&row);
+                        let pk_values = if schema.pk_indices.is_empty() {
+                            let key: &[u8] = pair.key().as_ref().into();
+                            let pk_bytes = key.strip_prefix(data_key_prefix.as_slice()).ok_or_else(|| {
+                                anyhow!(
+                                    "corrupted row key while backfilling constraint '{}'",
+                                    new_index.name
+                                )
+                            })?;
+                            crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
+                        } else {
+                            schema.get_pk_values(&row)
+                        };
                         store
                             .create_index_entry(
                                 txn,
@@ -2200,6 +2369,16 @@ pub async fn execute_alter_table(
                     target_col.data_type = new_type.clone();
 
                     let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                    let data_key_prefix = start.clone();
+                    let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
+                        vec![DataType::Uuid]
+                    } else {
+                        schema
+                            .pk_indices
+                            .iter()
+                            .map(|&idx| schema.columns[idx].data_type.clone())
+                            .collect()
+                    };
                     let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                     while let Some(batch) = scanner.next_batch(txn).await? {
                         for pair in batch {
@@ -2217,7 +2396,20 @@ pub async fn execute_alter_table(
                             };
                             row.values[col_idx] = new_val;
 
-                            let pk_values = schema.get_pk_values(&row);
+                            let pk_values = if schema.pk_indices.is_empty() {
+                                let key_bytes: &[u8] = key.as_ref().into();
+                                let pk_bytes = key_bytes
+                                    .strip_prefix(data_key_prefix.as_slice())
+                                    .ok_or_else(|| {
+                                    anyhow!(
+                                        "corrupted row key while rebuilding indexes for '{}'",
+                                        schema.name
+                                    )
+                                })?;
+                                crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
+                            } else {
+                                schema.get_pk_values(&row)
+                            };
                             for idx in &affected_indexes {
                                 let idx_values = schema.get_index_values(idx, &row);
                                 store

@@ -3136,9 +3136,10 @@ impl Executor {
             let mut row = Row { values: row_values };
             fill_row_defaults(&mut row, &schema)?;
 
-            self.store.insert(txn, db_id, &schema.name, row.clone()).await?;
-
-            let pk_values = schema.get_pk_values(&row);
+            let pk_values = self
+                .store
+                .insert(txn, db_id, &schema.name, row.clone())
+                .await?;
             for index in &schema.indexes {
                 let idx_values = schema.get_index_values(index, &row);
                 self.store

@@ -368,6 +368,7 @@ impl Executor {
             && !is_virtual
             && !rows_loaded
             && !has_correlated_exists
+            && !(has_for_update && schema.pk_indices.is_empty())
             && select_into_target.is_none()
             && Self::is_simple_operator_query(query, select)
         {
@@ -418,6 +419,7 @@ impl Executor {
             && !is_virtual
             && !rows_loaded
             && !has_correlated_exists
+            && !(has_for_update && schema.pk_indices.is_empty())
             && select_into_target.is_none()
             && Self::is_aggregate_operator_query(query, select)
         {
@@ -469,6 +471,7 @@ impl Executor {
             && !is_virtual
             && !rows_loaded
             && !has_correlated_exists
+            && !(has_for_update && schema.pk_indices.is_empty())
             && select_into_target.is_none()
             && Self::is_window_operator_query(query, select)
         {
@@ -489,12 +492,30 @@ impl Executor {
                 .await;
         }
 
+        let pkless_for_update = has_for_update && schema.pk_indices.is_empty();
+        if pkless_for_update && (is_virtual || rows_loaded) {
+            return Err(anyhow!(
+                "FOR UPDATE not supported for '{}': table has no primary key",
+                t
+            ));
+        }
+
+        let mut pkless_row_keys: Option<Vec<Vec<u8>>> = None;
+
         let all_rows = if is_virtual {
             all_rows_base
         } else if rows_loaded {
             // Rows are already materialized (CTE, derived table, view, etc). Index scans
             // are only applicable to base tables.
             all_rows_base
+        } else if pkless_for_update {
+            let mut rows_with_keys = self.store().scan_with_keys(txn, db_id, &t).await?;
+            for (_, row) in &mut rows_with_keys {
+                fill_row_defaults(row, &schema)?;
+            }
+            let (keys, rows) = rows_with_keys.into_iter().unzip();
+            pkless_row_keys = Some(keys);
+            rows
         } else {
             let estimated_rows = 1000;
 
@@ -625,7 +646,58 @@ impl Executor {
             }
         };
 
-        let filtered_rows = if let Some(ref sel) = resolved_selection {
+        let (filtered_rows, lock_keys) = if pkless_for_update {
+            let all_keys = pkless_row_keys
+                .take()
+                .ok_or_else(|| anyhow!("missing row keys for FOR UPDATE"))?;
+
+            if let Some(ref sel) = resolved_selection {
+                let mut rows = Vec::new();
+                let mut keys = Vec::new();
+                if has_correlated_exists {
+                    for (key, r) in all_keys.into_iter().zip(all_rows.into_iter()) {
+                        let result = self
+                            .eval_selection_with_correlated_exists(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                sel,
+                                search_path,
+                                &outer_alias,
+                                &schema,
+                                &r,
+                            )
+                            .await?;
+                        if matches!(result, Value::Boolean(true)) {
+                            rows.push(r);
+                            keys.push(key);
+                        }
+                    }
+                } else {
+                    for (key, r) in all_keys.into_iter().zip(all_rows.into_iter()) {
+                        if matches!(
+                            self.eval_expr_maybe_sequence(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                sel,
+                                Some(&r),
+                                Some(&schema),
+                            )
+                            .await?,
+                            Value::Boolean(true)
+                        ) {
+                            rows.push(r);
+                            keys.push(key);
+                        }
+                    }
+                }
+                (rows, keys)
+            } else {
+                (all_rows, all_keys)
+            }
+        } else if let Some(ref sel) = resolved_selection {
             let mut v = Vec::new();
             if has_correlated_exists {
                 for r in all_rows {
@@ -664,19 +736,21 @@ impl Executor {
                     }
                 }
             }
-            v
+            (v, Vec::new())
         } else {
-            all_rows
+            (all_rows, Vec::new())
         };
 
-        let has_for_update = query
-            .locks
-            .iter()
-            .any(|l| matches!(l.lock_type, LockType::Update));
         if has_for_update && !filtered_rows.is_empty() {
-            self.store()
-                .lock_rows(txn, db_id, &t, &filtered_rows)
-                .await?;
+            if pkless_for_update {
+                txn.lock_keys(lock_keys)
+                    .await
+                    .map_err(|e| anyhow!(e))?;
+            } else {
+                self.store()
+                    .lock_rows(txn, db_id, &t, &filtered_rows)
+                    .await?;
+            }
         }
 
         let group_keys_exprs = match &select.group_by {
