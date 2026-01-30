@@ -884,8 +884,20 @@ pub fn eval_having_expr_join(
     }
 }
 
-/// Check if two function arguments match
+/// Check if two function calls match (args + relevant modifiers).
 pub fn args_match(f1: &sqlparser::ast::Function, f2: &sqlparser::ast::Function) -> bool {
+    // Aggregate modifiers must be part of the match key; otherwise we can accidentally
+    // substitute/dedup e.g. COUNT(x) vs COUNT(DISTINCT x), or COUNT(*) vs COUNT(*) FILTER (...).
+    if f1.distinct != f2.distinct {
+        return false;
+    }
+    if format!("{:?}", f1.filter) != format!("{:?}", f2.filter) {
+        return false;
+    }
+    if format!("{:?}", f1.order_by) != format!("{:?}", f2.order_by) {
+        return false;
+    }
+
     if f1.args.len() != f2.args.len() {
         return false;
     }
@@ -1116,6 +1128,105 @@ mod tests {
         ];
         let result = dedup_rows(rows);
         assert_eq!(result.len(), 2);
+    }
+
+    fn parse_first_projection_function(sql: &str) -> sqlparser::ast::Function {
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = &statements[0] else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = &*query.body else {
+            panic!("expected select");
+        };
+        match &select.projection[0] {
+            sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Function(f))
+            | sqlparser::ast::SelectItem::ExprWithAlias {
+                expr: sqlparser::ast::Expr::Function(f),
+                ..
+            } => f.clone(),
+            other => panic!("expected function projection, got: {other:?}"),
+        }
+    }
+
+    fn parse_first_projection_expr(sql: &str) -> sqlparser::ast::Expr {
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = &statements[0] else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = &*query.body else {
+            panic!("expected select");
+        };
+        match &select.projection[0] {
+            sqlparser::ast::SelectItem::UnnamedExpr(expr)
+            | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => expr.clone(),
+            other => panic!("expected projection expr, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_args_match_considers_distinct_filter_and_order_by() {
+        let count_x = parse_first_projection_function("SELECT COUNT(x)");
+        let count_distinct_x = parse_first_projection_function("SELECT COUNT(DISTINCT x)");
+        assert!(!args_match(&count_x, &count_distinct_x));
+
+        let count_star = parse_first_projection_function("SELECT COUNT(*)");
+        let count_star_filter = parse_first_projection_function("SELECT COUNT(*) FILTER (WHERE x > 0)");
+        assert!(!args_match(&count_star, &count_star_filter));
+
+        let count_star_filter_same =
+            parse_first_projection_function("SELECT COUNT(*) FILTER (WHERE x > 0)");
+        assert!(args_match(&count_star_filter, &count_star_filter_same));
+
+        let string_agg_order_asc =
+            parse_first_projection_function("SELECT STRING_AGG(x, ',' ORDER BY x)");
+        let string_agg_order_desc =
+            parse_first_projection_function("SELECT STRING_AGG(x, ',' ORDER BY x DESC)");
+        assert!(!args_match(&string_agg_order_asc, &string_agg_order_desc));
+    }
+
+    #[test]
+    fn test_collect_having_agg_funcs_does_not_dedup_distinct_or_filtered_aggregates() {
+        let count_x = parse_first_projection_function("SELECT COUNT(x)");
+        let mut agg_funcs = vec![(0, AggExpr::Function(count_x))];
+
+        let count_distinct_x_expr = parse_first_projection_expr("SELECT COUNT(DISTINCT x) > 0");
+        collect_having_agg_funcs(&count_distinct_x_expr, &mut agg_funcs, 1);
+        assert_eq!(agg_funcs.len(), 2);
+
+        let count_star = parse_first_projection_function("SELECT COUNT(*)");
+        let mut agg_funcs = vec![(0, AggExpr::Function(count_star))];
+        let count_star_filter_expr =
+            parse_first_projection_expr("SELECT COUNT(*) FILTER (WHERE x > 0) > 0");
+        collect_having_agg_funcs(&count_star_filter_expr, &mut agg_funcs, 1);
+        assert_eq!(agg_funcs.len(), 2);
+    }
+
+    #[test]
+    fn test_eval_having_expr_matches_filtered_aggregate_call() {
+        let count_star = parse_first_projection_function("SELECT COUNT(*)");
+        let count_star_filter = parse_first_projection_function("SELECT COUNT(*) FILTER (WHERE x > 0)");
+
+        let agg_funcs = vec![
+            (0, AggExpr::Function(count_star)),
+            (1, AggExpr::Function(count_star_filter.clone())),
+        ];
+
+        let mut count_all = Aggregator::new("COUNT").unwrap();
+        for _ in 0..10 {
+            count_all.update(&Value::Int32(1)).unwrap();
+        }
+
+        let mut count_filtered = Aggregator::new("COUNT").unwrap();
+        count_filtered.update(&Value::Int32(1)).unwrap();
+
+        let row = Row::new(vec![]);
+        let schema = TableSchema::default();
+        let expr = sqlparser::ast::Expr::Function(count_star_filter);
+        let result = eval_having_expr(&expr, &row, &schema, &agg_funcs, &[count_all, count_filtered])
+            .unwrap();
+        assert_eq!(result, Value::Int64(1));
     }
 
     #[test]

@@ -3131,6 +3131,10 @@ impl Executor {
                 } => {
                     agg_funcs.push((i, AggExpr::ArrayAgg(arr.clone())));
                 }
+                // Handle expressions containing nested aggregates (e.g., 'X=' || count(*))
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    collect_having_agg_funcs(expr, &mut agg_funcs, extra_start);
+                }
                 _ => {}
             }
         }
