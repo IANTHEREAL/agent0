@@ -71,6 +71,7 @@ static CLIENT: OnceLock<Client> = OnceLock::new();
 fn client() -> &'static Client {
     CLIENT.get_or_init(|| {
         Client::builder()
+            .no_proxy()
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
