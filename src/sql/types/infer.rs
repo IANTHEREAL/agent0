@@ -57,6 +57,17 @@ impl<'a> TypeInferrer<'a> {
                     return Ok(col.column_def.data_type.clone());
                 }
 
+                // For schema-qualified identifiers ("schema.table.col"), JOIN type inference often
+                // stores columns as "table.col". Try resolving using the last two parts before
+                // falling back to unqualified lookup.
+                if parts.len() > 2 {
+                    let n = parts.len();
+                    let last_two = format!("{}.{}", parts[n - 2].value, parts[n - 1].value);
+                    if let Ok(col) = self.ctx.resolve_column(&last_two) {
+                        return Ok(col.column_def.data_type.clone());
+                    }
+                }
+
                 // Second try: qualified lookup
                 if parts.len() == 2 {
                     if let Ok(col) = self.ctx.resolve_qualified(&parts[0].value, &parts[1].value) {

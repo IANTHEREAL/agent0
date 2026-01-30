@@ -115,6 +115,100 @@ fn extract_filter_from_expr(expr: &Expr, filter: &mut VirtualTableFilter) {
     }
 }
 
+fn build_type_infer_schema_for_join(combined_schemas: &[(String, TableSchema)]) -> TableSchema {
+    let mut columns: Vec<ColumnDef> = Vec::new();
+
+    for (_, schema) in combined_schemas {
+        columns.extend(schema.columns.clone());
+    }
+
+    for (alias, schema) in combined_schemas {
+        for col in &schema.columns {
+            let mut qualified = col.clone();
+            qualified.name = format!("{}.{}", alias, col.name);
+            columns.push(qualified);
+        }
+    }
+
+    TableSchema {
+        name: "joined_infer".to_string(),
+        table_id: 0,
+        columns,
+        version: 1,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+    }
+}
+
+fn project_wildcard_natural_join(
+    combined_schemas: &[(String, TableSchema)],
+    natural_join_common_cols: &[String],
+    rows_to_project: Vec<Row>,
+) -> (Vec<String>, Vec<DataType>, Vec<Row>) {
+    let mut cols: Vec<String> = natural_join_common_cols.iter().cloned().collect();
+
+    let mut common_offsets: HashMap<String, usize> = HashMap::new();
+    let mut common_types: HashMap<String, DataType> = HashMap::new();
+
+    let mut non_common_offsets: Vec<usize> = Vec::new();
+    let mut non_common_types: Vec<DataType> = Vec::new();
+
+    let mut offset = 0;
+    for (_, schema) in combined_schemas {
+        for col in &schema.columns {
+            if natural_join_common_cols.contains(&col.name) {
+                if !common_offsets.contains_key(&col.name) {
+                    common_offsets.insert(col.name.clone(), offset);
+                    common_types.insert(col.name.clone(), col.data_type.clone());
+                }
+            } else {
+                cols.push(col.name.clone());
+                non_common_types.push(col.data_type.clone());
+                non_common_offsets.push(offset);
+            }
+            offset += 1;
+        }
+    }
+
+    let mut column_types: Vec<DataType> = Vec::new();
+    for common_col in natural_join_common_cols {
+        column_types.push(
+            common_types
+                .get(common_col)
+                .cloned()
+                .unwrap_or(DataType::Text),
+        );
+    }
+    column_types.extend(non_common_types);
+
+    let mut col_indices_to_keep: Vec<Option<usize>> =
+        Vec::with_capacity(natural_join_common_cols.len() + non_common_offsets.len());
+    for common_col in natural_join_common_cols {
+        col_indices_to_keep.push(common_offsets.get(common_col).copied());
+    }
+    col_indices_to_keep.extend(non_common_offsets.into_iter().map(Some));
+
+    let result_rows = rows_to_project
+        .into_iter()
+        .map(|row| {
+            let vals: Vec<Value> = col_indices_to_keep
+                .iter()
+                .map(|idx| {
+                    idx.and_then(|idx| row.values.get(idx).cloned())
+                        .unwrap_or(Value::Null)
+                })
+                .collect();
+            Row::new(vals)
+        })
+        .collect();
+
+    (cols, column_types, result_rows)
+}
+
 fn get_column_name(expr: &Expr) -> Option<String> {
     match expr {
         Expr::Identifier(ident) => Some(ident.value.clone()),
@@ -2940,6 +3034,7 @@ impl Executor {
             foreign_keys: vec![],
             owner: String::new(),
         };
+        let type_infer_schema = build_type_infer_schema_for_join(&combined_schemas);
 
         // Resolve subqueries (EXISTS, IN (SELECT ...), scalar subqueries) in WHERE clause
         let resolved_selection = if let Some(sel) = &select.selection {
@@ -3400,7 +3495,7 @@ impl Executor {
                         .map(|item| match item {
                             SelectItem::UnnamedExpr(expr)
                             | SelectItem::ExprWithAlias { expr, .. } => {
-                                infer_expr_type(expr, &final_schema)
+                                infer_expr_type(expr, &type_infer_schema)
                             }
                             _ => DataType::Text,
                         })
@@ -3577,6 +3672,7 @@ impl Executor {
 
         let mut cols = Vec::new();
         let mut result_rows = Vec::new();
+        let mut column_types: Vec<DataType> = Vec::new();
 
         let has_wildcard = select
             .projection
@@ -3588,44 +3684,16 @@ impl Executor {
             .any(|p| matches!(p, SelectItem::QualifiedWildcard(..)));
         if has_wildcard {
             if has_natural_join && !natural_join_common_cols.is_empty() {
-                let mut col_indices_to_keep: Vec<usize> = Vec::new();
-                let mut seen_common_cols: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-
-                for common_col in &natural_join_common_cols {
-                    cols.push(common_col.clone());
-                }
-
-                let mut offset = 0;
-                for (_, schema) in &combined_schemas {
-                    for col in &schema.columns {
-                        if natural_join_common_cols.contains(&col.name) {
-                            if !seen_common_cols.contains(&col.name) {
-                                col_indices_to_keep.push(offset);
-                                seen_common_cols.insert(col.name.clone());
-                            }
-                        } else {
-                            cols.push(col.name.clone());
-                            col_indices_to_keep.push(offset);
-                        }
-                        offset += 1;
-                    }
-                }
-
-                result_rows = rows_to_project
-                    .into_iter()
-                    .map(|row| {
-                        let vals: Vec<Value> = col_indices_to_keep
-                            .iter()
-                            .map(|&idx| row.values.get(idx).cloned().unwrap_or(Value::Null))
-                            .collect();
-                        Row::new(vals)
-                    })
-                    .collect();
+                (cols, column_types, result_rows) = project_wildcard_natural_join(
+                    &combined_schemas,
+                    &natural_join_common_cols,
+                    rows_to_project,
+                );
             } else {
                 for (alias, schema) in &combined_schemas {
                     for col in &schema.columns {
                         cols.push(format!("{}.{}", alias, col.name));
+                        column_types.push(col.data_type.clone());
                     }
                 }
                 result_rows = rows_to_project;
@@ -3692,6 +3760,26 @@ impl Executor {
 
             for (name, _) in &expanded_items {
                 cols.push(name.clone());
+            }
+
+            for item in resolved_projection.iter() {
+                match item {
+                    SelectItem::QualifiedWildcard(prefix, _) => {
+                        let table_alias =
+                            prefix.0.last().map(|i| i.value.clone()).unwrap_or_default();
+                        if let Some((_, schema)) = combined_schemas
+                            .iter()
+                            .find(|(a, _)| a.eq_ignore_ascii_case(&table_alias))
+                        {
+                            column_types
+                                .extend(schema.columns.iter().map(|col| col.data_type.clone()));
+                        }
+                    }
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                        column_types.push(infer_expr_type(expr, &type_infer_schema));
+                    }
+                    _ => column_types.push(DataType::Text),
+                }
             }
 
             let has_window_funcs = !window_funcs.is_empty();
@@ -3794,6 +3882,16 @@ impl Executor {
                 }
             }
 
+            column_types = resolved_projection
+                .iter()
+                .map(|item| match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                        infer_expr_type(expr, &type_infer_schema)
+                    }
+                    _ => DataType::Text,
+                })
+                .collect();
+
             let has_window_funcs = !window_funcs.is_empty();
             for (row_idx, row) in rows_to_project.iter().enumerate() {
                 let ctx = JoinContext {
@@ -3854,7 +3952,7 @@ impl Executor {
         result_rows = apply_offset_limit_fetch(result_rows, query);
 
         Ok(ExecuteResult::Select {
-            column_types: None,
+            column_types: Some(column_types),
             columns: cols,
             rows: result_rows,
         })
@@ -4174,6 +4272,193 @@ fn interval_to_days(iv: &crate::types::IntervalValue) -> i32 {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn natural_join_wildcard_projection_keeps_common_cols_first_and_in_order() {
+        let schema_a = TableSchema {
+            name: "a".to_string(),
+            table_id: 1,
+            columns: vec![
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "a1".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+
+        let schema_b = TableSchema {
+            name: "b".to_string(),
+            table_id: 2,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "b1".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+
+        let combined_schemas = vec![("a".to_string(), schema_a), ("b".to_string(), schema_b)];
+        let using_cols = vec!["id".to_string(), "name".to_string()];
+
+        let rows = vec![Row::new(vec![
+            Value::Text("alice".to_string()), // a.name
+            Value::Int32(1),                  // a.id
+            Value::Text("a1".to_string()),    // a.a1
+            Value::Int32(1),                  // b.id
+            Value::Text("alice".to_string()), // b.name
+            Value::Text("b1".to_string()),    // b.b1
+        ])];
+
+        let (cols, types, projected) =
+            project_wildcard_natural_join(&combined_schemas, &using_cols, rows);
+
+        assert_eq!(cols, vec!["id", "name", "a1", "b1"]);
+        assert_eq!(
+            types,
+            vec![DataType::Int32, DataType::Text, DataType::Text, DataType::Text]
+        );
+        assert_eq!(
+            projected[0].values,
+            vec![
+                Value::Int32(1),
+                Value::Text("alice".to_string()),
+                Value::Text("a1".to_string()),
+                Value::Text("b1".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn join_type_inference_schema_resolves_qualified_columns() {
+        let col_a_id = ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        };
+        let col_b_id = ColumnDef {
+            name: "id".to_string(),
+            data_type: DataType::Text,
+            nullable: false,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        };
+
+        let schema_a = TableSchema {
+            name: "a".to_string(),
+            table_id: 1,
+            columns: vec![col_a_id],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+        let schema_b = TableSchema {
+            name: "b".to_string(),
+            table_id: 2,
+            columns: vec![col_b_id],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+
+        let combined_schemas = vec![("a".to_string(), schema_a), ("b".to_string(), schema_b)];
+        let schema = build_type_infer_schema_for_join(&combined_schemas);
+
+        let a_id = Expr::CompoundIdentifier(vec![Ident::new("a"), Ident::new("id")]);
+        let b_id = Expr::CompoundIdentifier(vec![Ident::new("b"), Ident::new("id")]);
+        let schema_a_id = Expr::CompoundIdentifier(vec![
+            Ident::new("public"),
+            Ident::new("a"),
+            Ident::new("id"),
+        ]);
+        let unqualified_id = Expr::Identifier(Ident::new("id"));
+
+        assert_eq!(infer_expr_type(&a_id, &schema), DataType::Int32);
+        assert_eq!(infer_expr_type(&b_id, &schema), DataType::Text);
+        assert_eq!(
+            infer_expr_type(&schema_a_id, &schema),
+            DataType::Int32,
+            "schema-qualified identifiers should resolve using the table alias",
+        );
+        assert_eq!(
+            infer_expr_type(&unqualified_id, &schema),
+            DataType::Int32,
+            "Unqualified columns should resolve to the left-most match",
+        );
+    }
 
     #[test]
     fn generate_series_int32_edge_overflow_does_not_loop() {
