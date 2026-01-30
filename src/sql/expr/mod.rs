@@ -255,20 +255,98 @@ fn interval_from_field(num: i64, field: &sqlparser::ast::DateTimeField) -> Resul
     Ok(Value::Interval(iv))
 }
 
+fn eval_function_args<C: EvalContext>(
+    ctx: &C,
+    func: &sqlparser::ast::Function,
+) -> Result<Vec<Value>> {
+    let mut args = Vec::with_capacity(func.args.len());
+    for arg in &func.args {
+        match arg {
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                args.push(evaluator::eval_expr_impl(ctx, e)?);
+            }
+            sqlparser::ast::FunctionArg::Named {
+                arg: sqlparser::ast::FunctionArgExpr::Expr(e),
+                ..
+            } => {
+                args.push(evaluator::eval_expr_impl(ctx, e)?);
+            }
+            sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard) => {
+                args.push(Value::Text("*".to_string()));
+            }
+            _ => {}
+        }
+    }
+    Ok(args)
+}
+
+fn eval_row_object_expr<C: EvalContext>(
+    ctx: &C,
+    expr: &Expr,
+) -> Result<Option<serde_json::Value>> {
+    fn row_values<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Option<Vec<Value>>> {
+        match expr {
+            Expr::Nested(inner) => row_values(ctx, inner),
+            Expr::Tuple(exprs) => {
+                let mut vals = Vec::with_capacity(exprs.len());
+                for e in exprs {
+                    vals.push(evaluator::eval_expr_impl(ctx, e)?);
+                }
+                Ok(Some(vals))
+            }
+            Expr::Function(func) => {
+                let name = func.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
+                if !name.eq_ignore_ascii_case("ROW") {
+                    return Ok(None);
+                }
+                let mut vals = Vec::with_capacity(func.args.len());
+                for arg in &func.args {
+                    match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(
+                            sqlparser::ast::FunctionArgExpr::Expr(e),
+                        ) => vals.push(evaluator::eval_expr_impl(ctx, e)?),
+                        _ => return Ok(None),
+                    }
+                }
+                Ok(Some(vals))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    let Some(values) = row_values(ctx, expr)? else {
+        return Ok(None);
+    };
+    let mut obj = serde_json::Map::new();
+    for (idx, v) in values.into_iter().enumerate() {
+        obj.insert(format!("f{}", idx + 1), value_to_json(&v));
+    }
+    Ok(Some(serde_json::Value::Object(obj)))
+}
+
 fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Result<Value> {
     let func_name = func.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
     let func_name_upper = func_name.to_uppercase();
-    let row = ctx.row();
-    let schema = ctx.schema();
 
     // COALESCE is evaluated left-to-right and must short-circuit.
     // Do not eagerly evaluate all args, otherwise errors in later args would be surfaced incorrectly.
     if func_name_upper == "COALESCE" {
         for arg in &func.args {
-            if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) =
-                arg
-            {
-                let val = evaluator::eval_expr_impl(ctx, e)?;
+            let val = match arg {
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
+                    Some(evaluator::eval_expr_impl(ctx, e)?)
+                }
+                sqlparser::ast::FunctionArg::Named {
+                    arg: sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ..
+                } => Some(evaluator::eval_expr_impl(ctx, e)?),
+                sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Wildcard) => {
+                    Some(Value::Text("*".to_string()))
+                }
+                _ => None,
+            };
+
+            if let Some(val) = val {
                 if !matches!(val, Value::Null) {
                     return Ok(val);
                 }
@@ -277,14 +355,49 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
         return Ok(Value::Null);
     }
 
-    let mut args = Vec::with_capacity(func.args.len());
-    for arg in &func.args {
-        if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) = arg
-        {
-            args.push(evaluator::eval_expr_impl(ctx, e)?);
+    match func_name_upper.as_str() {
+        "TO_JSONB" => {
+            if func.args.len() == 1 {
+                if let sqlparser::ast::FunctionArg::Unnamed(
+                    sqlparser::ast::FunctionArgExpr::Expr(expr),
+                ) = &func.args[0]
+                {
+                    if let Some(obj) = eval_row_object_expr(ctx, expr)? {
+                        return Ok(Value::Jsonb(obj.to_string()));
+                    }
+                }
+            }
+
+            let val = eval_function_args(ctx, func)?
+                .into_iter()
+                .next()
+                .unwrap_or(Value::Null);
+            let json_val = value_to_json(&val);
+            return Ok(Value::Jsonb(json_val.to_string()));
         }
+        "ROW_TO_JSON" => {
+            if func.args.len() == 1 {
+                if let sqlparser::ast::FunctionArg::Unnamed(
+                    sqlparser::ast::FunctionArgExpr::Expr(expr),
+                ) = &func.args[0]
+                {
+                    if let Some(obj) = eval_row_object_expr(ctx, expr)? {
+                        return Ok(Value::Json(obj.to_string()));
+                    }
+                }
+            }
+
+            let val = eval_function_args(ctx, func)?
+                .into_iter()
+                .next()
+                .unwrap_or(Value::Null);
+            let json_val = value_to_json(&val);
+            return Ok(Value::Json(json_val.to_string()));
+        }
+        _ => {}
     }
 
+    let args = eval_function_args(ctx, func)?;
     if let Some(registry_fn) = functions::get_registry().get(func_name_upper.as_str()) {
         return registry_fn(args);
     }
@@ -690,69 +803,6 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
         // JSONB_BUILD_ARRAY, JSON_BUILD_ARRAY, JSONB_EXISTS, JSONB_EXISTS_ANY, JSONB_EXISTS_ALL, JSONB_OBJECT_KEYS,
         // JSON_OBJECT_KEYS, JSONB_EXTRACT_PATH, JSON_EXTRACT_PATH, JSONB_EXTRACT_PATH_TEXT, JSON_EXTRACT_PATH_TEXT,
         // JSONB_PRETTY, TO_JSON are handled by the registry (functions/json.rs)
-        "TO_JSONB" => {
-            fn eval_row_object<C: EvalContext>(
-                ctx: &C,
-                expr: &Expr,
-            ) -> Result<Option<serde_json::Value>> {
-                fn row_values<C: EvalContext>(
-                    ctx: &C,
-                    expr: &Expr,
-                ) -> Result<Option<Vec<Value>>> {
-                    match expr {
-                        Expr::Nested(inner) => row_values(ctx, inner),
-                        Expr::Tuple(exprs) => {
-                            let mut vals = Vec::with_capacity(exprs.len());
-                            for e in exprs {
-                                vals.push(evaluator::eval_expr_impl(ctx, e)?);
-                            }
-                            Ok(Some(vals))
-                        }
-                        Expr::Function(func) => {
-                            let name = func.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
-                            if !name.eq_ignore_ascii_case("ROW") {
-                                return Ok(None);
-                            }
-                            let mut vals = Vec::with_capacity(func.args.len());
-                            for arg in &func.args {
-                                match arg {
-                                    sqlparser::ast::FunctionArg::Unnamed(
-                                        sqlparser::ast::FunctionArgExpr::Expr(e),
-                                    ) => vals.push(evaluator::eval_expr_impl(ctx, e)?),
-                                    _ => return Ok(None),
-                                }
-                            }
-                            Ok(Some(vals))
-                        }
-                        _ => Ok(None),
-                    }
-                }
-
-                let Some(values) = row_values(ctx, expr)? else {
-                    return Ok(None);
-                };
-                let mut obj = serde_json::Map::new();
-                for (idx, v) in values.into_iter().enumerate() {
-                    obj.insert(format!("f{}", idx + 1), value_to_json(&v));
-                }
-                Ok(Some(serde_json::Value::Object(obj)))
-            }
-
-            if func.args.len() == 1 {
-                if let sqlparser::ast::FunctionArg::Unnamed(
-                    sqlparser::ast::FunctionArgExpr::Expr(expr),
-                ) = &func.args[0]
-                {
-                    if let Some(obj) = eval_row_object(ctx, expr)? {
-                        return Ok(Value::Jsonb(obj.to_string()));
-                    }
-                }
-            }
-
-            let val = args.into_iter().next().unwrap_or(Value::Null);
-            let json_val = value_to_json(&val);
-            Ok(Value::Jsonb(json_val.to_string()))
-        }
         "L2_DISTANCE" => {
             if args.len() != 2 {
                 return Err(anyhow!("l2_distance requires exactly 2 arguments"));
@@ -800,69 +850,6 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
         // TRANSACTION_TIMESTAMP, TXID_CURRENT, PG_COLUMN_SIZE, PG_TABLE_IS_VISIBLE are handled by the registry (functions/pg_compat.rs)
         // JSONB_SET, JSON_SET, JSONB_ARRAY_ELEMENTS, JSON_ARRAY_ELEMENTS, JSONB_ARRAY_ELEMENTS_TEXT,
         // JSON_ARRAY_ELEMENTS_TEXT, JSONB_EACH, JSON_EACH, JSONB_EACH_TEXT, JSON_EACH_TEXT are handled by the registry (functions/json.rs)
-        "ROW_TO_JSON" => {
-            fn eval_row_object<C: EvalContext>(
-                ctx: &C,
-                expr: &Expr,
-            ) -> Result<Option<serde_json::Value>> {
-                fn row_values<C: EvalContext>(
-                    ctx: &C,
-                    expr: &Expr,
-                ) -> Result<Option<Vec<Value>>> {
-                    match expr {
-                        Expr::Nested(inner) => row_values(ctx, inner),
-                        Expr::Tuple(exprs) => {
-                            let mut vals = Vec::with_capacity(exprs.len());
-                            for e in exprs {
-                                vals.push(evaluator::eval_expr_impl(ctx, e)?);
-                            }
-                            Ok(Some(vals))
-                        }
-                        Expr::Function(func) => {
-                            let name = func.name.0.last().map(|i| i.value.as_str()).unwrap_or("");
-                            if !name.eq_ignore_ascii_case("ROW") {
-                                return Ok(None);
-                            }
-                            let mut vals = Vec::with_capacity(func.args.len());
-                            for arg in &func.args {
-                                match arg {
-                                    sqlparser::ast::FunctionArg::Unnamed(
-                                        sqlparser::ast::FunctionArgExpr::Expr(e),
-                                    ) => vals.push(evaluator::eval_expr_impl(ctx, e)?),
-                                    _ => return Ok(None),
-                                }
-                            }
-                            Ok(Some(vals))
-                        }
-                        _ => Ok(None),
-                    }
-                }
-
-                let Some(values) = row_values(ctx, expr)? else {
-                    return Ok(None);
-                };
-                let mut obj = serde_json::Map::new();
-                for (idx, v) in values.into_iter().enumerate() {
-                    obj.insert(format!("f{}", idx + 1), value_to_json(&v));
-                }
-                Ok(Some(serde_json::Value::Object(obj)))
-            }
-
-            if func.args.len() == 1 {
-                if let sqlparser::ast::FunctionArg::Unnamed(
-                    sqlparser::ast::FunctionArgExpr::Expr(expr),
-                ) = &func.args[0]
-                {
-                    if let Some(obj) = eval_row_object(ctx, expr)? {
-                        return Ok(Value::Json(obj.to_string()));
-                    }
-                }
-            }
-
-            let val = args.into_iter().next().unwrap_or(Value::Null);
-            let json_val = value_to_json(&val);
-            Ok(Value::Json(json_val.to_string()))
-        }
 
         _ => Err(anyhow!("Unsupported function: {}", func_name)),
     }
