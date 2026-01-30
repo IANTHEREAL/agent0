@@ -125,7 +125,7 @@ export function TenantDetailPage() {
   const copyConnectionString = async (endpoint?: { host: string; port: number }) => {
     const host = endpoint?.host || tenant?.endpoints?.[0]?.host || '127.0.0.1'
     const port = endpoint?.port || tenant?.endpoints?.[0]?.port || 5433
-    const connStr = `psql -h ${host} -p ${port} -U t${tenantId}.admin`
+    const connStr = `psql -h ${host} -p ${port} -U t${tenantId}.admin -d postgres`
     
     try {
       await navigator.clipboard.writeText(connStr)
@@ -248,7 +248,7 @@ export function TenantDetailPage() {
                     </div>
                     <div className="flex items-center gap-2">
                       <code className="flex-1 bg-background/60 border border-border/30 px-3 py-2 rounded-md text-xs font-mono text-muted-foreground">
-                        psql -h {endpoint.host} -p {endpoint.port} -U t{tenantId}.admin
+                        psql -h {endpoint.host} -p {endpoint.port} -U t{tenantId}.admin -d postgres
                       </code>
                       <Button
                         variant="ghost"
