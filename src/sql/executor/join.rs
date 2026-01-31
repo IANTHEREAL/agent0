@@ -147,11 +147,12 @@ fn project_wildcard_natural_join(
     combined_schemas: &[(String, TableSchema)],
     natural_join_common_cols: &[String],
     rows_to_project: Vec<Row>,
+    merged_column_offsets: Option<&HashMap<String, Vec<usize>>>,
 ) -> (Vec<String>, Vec<DataType>, Vec<Row>) {
     let mut cols: Vec<String> = natural_join_common_cols.iter().cloned().collect();
 
-    let mut common_offsets: HashMap<String, usize> = HashMap::new();
     let mut common_types: HashMap<String, DataType> = HashMap::new();
+    let mut fallback_common_offsets: HashMap<String, usize> = HashMap::new();
 
     let mut non_common_offsets: Vec<usize> = Vec::new();
     let mut non_common_types: Vec<DataType> = Vec::new();
@@ -159,16 +160,26 @@ fn project_wildcard_natural_join(
     let mut offset = 0;
     for (_, schema) in combined_schemas {
         for col in &schema.columns {
-            if natural_join_common_cols.contains(&col.name) {
-                if !common_offsets.contains_key(&col.name) {
-                    common_offsets.insert(col.name.clone(), offset);
-                    common_types.insert(col.name.clone(), col.data_type.clone());
+            let common_col = natural_join_common_cols
+                .iter()
+                .find(|common| col.name.eq_ignore_ascii_case(common));
+            if let Some(common_col) = common_col {
+                let is_join_side_common = merged_column_offsets
+                    .and_then(|merged| merged.get(common_col))
+                    .map(|offsets| offsets.contains(&offset))
+                    .unwrap_or(true);
+                if is_join_side_common {
+                    if !fallback_common_offsets.contains_key(common_col) {
+                        fallback_common_offsets.insert(common_col.clone(), offset);
+                        common_types.insert(common_col.clone(), col.data_type.clone());
+                    }
+                    offset += 1;
+                    continue;
                 }
-            } else {
-                cols.push(col.name.clone());
-                non_common_types.push(col.data_type.clone());
-                non_common_offsets.push(offset);
             }
+            cols.push(col.name.clone());
+            non_common_types.push(col.data_type.clone());
+            non_common_offsets.push(offset);
             offset += 1;
         }
     }
@@ -184,23 +195,34 @@ fn project_wildcard_natural_join(
     }
     column_types.extend(non_common_types);
 
-    let mut col_indices_to_keep: Vec<Option<usize>> =
-        Vec::with_capacity(natural_join_common_cols.len() + non_common_offsets.len());
-    for common_col in natural_join_common_cols {
-        col_indices_to_keep.push(common_offsets.get(common_col).copied());
-    }
-    col_indices_to_keep.extend(non_common_offsets.into_iter().map(Some));
-
     let result_rows = rows_to_project
         .into_iter()
         .map(|row| {
-            let vals: Vec<Value> = col_indices_to_keep
-                .iter()
-                .map(|idx| {
-                    idx.and_then(|idx| row.values.get(idx).cloned())
-                        .unwrap_or(Value::Null)
-                })
-                .collect();
+            let mut vals: Vec<Value> =
+                Vec::with_capacity(natural_join_common_cols.len() + non_common_offsets.len());
+
+            for common_col in natural_join_common_cols {
+                let merged_val = merged_column_offsets
+                    .and_then(|merged| merged.get(common_col))
+                    .and_then(|offsets| {
+                        offsets
+                            .iter()
+                            .filter_map(|&idx| row.values.get(idx).cloned())
+                            .find(|v| !matches!(v, Value::Null))
+                    })
+                    .or_else(|| {
+                        fallback_common_offsets
+                            .get(common_col)
+                            .and_then(|&idx| row.values.get(idx).cloned())
+                    })
+                    .unwrap_or(Value::Null);
+                vals.push(merged_val);
+            }
+
+            for &idx in &non_common_offsets {
+                vals.push(row.values.get(idx).cloned().unwrap_or(Value::Null));
+            }
+
             Row::new(vals)
         })
         .collect();
@@ -1637,6 +1659,7 @@ impl Executor {
                                     let ctx = JoinContext {
                                         tables: HashMap::new(),
                                         column_offsets: column_offsets.clone(),
+                                        merged_column_offsets: None,
                                         combined_row: &combined_row,
                                         combined_schema: &temp_combined_schema,
                                     };
@@ -1769,6 +1792,7 @@ impl Executor {
         let mut combined_rows: Vec<Row> = base_rows;
         let mut has_natural_join = false;
         let mut natural_join_common_cols: Vec<String> = Vec::new();
+        let mut natural_join_column_sources: HashMap<String, (String, String)> = HashMap::new();
 
         let mut extra_from_items: Vec<(Vec<(String, TableSchema)>, Vec<Row>)> = Vec::new();
 
@@ -1956,6 +1980,18 @@ impl Executor {
                             .collect();
                         has_natural_join = true;
                         natural_join_common_cols = common_cols.clone();
+                        natural_join_column_sources.clear();
+                        for col in &common_cols {
+                            let left_alias_for_col = item_schemas
+                                .iter()
+                                .find(|(_, s)| {
+                                    s.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col))
+                                })
+                                .map(|(a, _)| a.clone())
+                                .unwrap_or_else(|| extra_alias.clone());
+                            natural_join_column_sources
+                                .insert(col.clone(), (left_alias_for_col, join_alias.clone()));
+                        }
                         if common_cols.is_empty() {
                             (None, true)
                         } else {
@@ -1999,6 +2035,7 @@ impl Executor {
                             cols.iter().map(|c| normalize_ident(c)).collect();
                         has_natural_join = true;
                         natural_join_common_cols = using_cols.clone();
+                        natural_join_column_sources.clear();
                         if using_cols.is_empty() {
                             (None, true)
                         } else {
@@ -2011,6 +2048,10 @@ impl Executor {
                                 })
                                 .map(|(a, _)| a.clone())
                                 .unwrap_or_else(|| extra_alias.clone());
+                            for col in &using_cols {
+                                natural_join_column_sources
+                                    .insert(col.clone(), (left_alias.clone(), join_alias.clone()));
+                            }
                             let cond = using_cols
                                 .iter()
                                 .map(|col| Expr::BinaryOp {
@@ -2168,6 +2209,7 @@ impl Executor {
                             let ctx = JoinContext {
                                 tables: HashMap::new(),
                                 column_offsets: column_offsets.clone(),
+                                merged_column_offsets: None,
                                 combined_row: &combined_row,
                                 combined_schema: &temp_combined_schema,
                             };
@@ -2410,6 +2452,7 @@ impl Executor {
                         let ctx = JoinContext {
                             tables: HashMap::new(),
                             column_offsets: final_column_offsets.clone(),
+                            merged_column_offsets: None,
                             combined_row: &combined_row,
                             combined_schema: final_schema,
                         };
@@ -2559,6 +2602,16 @@ impl Executor {
                         .collect();
                     has_natural_join = true;
                     natural_join_common_cols = common_cols.clone();
+                    natural_join_column_sources.clear();
+                    for col in &common_cols {
+                        let left_alias_for_col = combined_schemas
+                            .iter()
+                            .find(|(_, s)| s.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)))
+                            .map(|(a, _)| a.clone())
+                            .unwrap_or_else(|| base_alias.clone());
+                        natural_join_column_sources
+                            .insert(col.clone(), (left_alias_for_col, join_alias.clone()));
+                    }
                     if common_cols.is_empty() {
                         (None, true)
                     } else {
@@ -2601,6 +2654,7 @@ impl Executor {
                     let using_cols: Vec<String> = cols.iter().map(|c| normalize_ident(c)).collect();
                     has_natural_join = true;
                     natural_join_common_cols = using_cols.clone();
+                    natural_join_column_sources.clear();
                     if using_cols.is_empty() {
                         (None, true)
                     } else {
@@ -2613,6 +2667,10 @@ impl Executor {
                             })
                             .map(|(a, _)| a.clone())
                             .unwrap_or_else(|| base_alias.clone());
+                        for col in &using_cols {
+                            natural_join_column_sources
+                                .insert(col.clone(), (left_alias.clone(), join_alias.clone()));
+                        }
                         let cond = using_cols
                             .iter()
                             .map(|col| Expr::BinaryOp {
@@ -2936,6 +2994,7 @@ impl Executor {
                             let ctx = JoinContext {
                                 tables: HashMap::new(),
                                 column_offsets: column_offsets.clone(),
+                                merged_column_offsets: None,
                                 combined_row: &combined_row,
                                 combined_schema: &temp_combined_schema,
                             };
@@ -3037,6 +3096,60 @@ impl Executor {
         };
         let type_infer_schema = build_type_infer_schema_for_join(&combined_schemas);
 
+        // For `USING`/`NATURAL` joins, common columns are merged in the output. For outer joins,
+        // the merged join key should behave like `COALESCE(left, right)` so that right-only rows
+        // in `RIGHT/FULL` joins expose the right-side key instead of NULL.
+        //
+        // Keep qualified column access intact by computing merged values only for unqualified
+        // identifier resolution.
+        let merged_column_offsets = if has_natural_join && !natural_join_common_cols.is_empty() {
+            let mut merged: HashMap<String, Vec<usize>> = HashMap::new();
+
+            let find_offset = |table_alias: &str, col_name: &str| -> Option<usize> {
+                let mut offset = 0;
+                for (alias, schema) in &combined_schemas {
+                    if alias.eq_ignore_ascii_case(table_alias) {
+                        if let Some((col_idx, _)) = schema
+                            .columns
+                            .iter()
+                            .enumerate()
+                            .find(|(_, c)| c.name.eq_ignore_ascii_case(col_name))
+                        {
+                            return Some(offset + col_idx);
+                        }
+                    }
+                    offset += schema.columns.len();
+                }
+                None
+            };
+
+            for common_col in &natural_join_common_cols {
+                let Some((left_alias, right_alias)) = natural_join_column_sources.get(common_col)
+                else {
+                    continue;
+                };
+
+                let mut offsets = Vec::with_capacity(2);
+                if let Some(offset) = find_offset(left_alias, common_col) {
+                    offsets.push(offset);
+                }
+                if let Some(offset) = find_offset(right_alias, common_col) {
+                    offsets.push(offset);
+                }
+
+                offsets.sort_unstable();
+                offsets.dedup();
+                if offsets.len() >= 2 {
+                    merged.insert(common_col.clone(), offsets);
+                }
+            }
+
+            if merged.is_empty() { None } else { Some(merged) }
+        } else {
+            None
+        };
+        let merged_column_offsets_ref = merged_column_offsets.as_ref();
+
         // Resolve subqueries (EXISTS, IN (SELECT ...), scalar subqueries) in WHERE clause
         let resolved_selection = if let Some(sel) = &select.selection {
             Some(
@@ -3053,6 +3166,7 @@ impl Executor {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
                     column_offsets: final_column_offsets.clone(),
+                    merged_column_offsets: merged_column_offsets_ref,
                     combined_row: &row,
                     combined_schema: &final_schema,
                 };
@@ -3156,6 +3270,7 @@ impl Executor {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
                     column_offsets: final_column_offsets.clone(),
+                    merged_column_offsets: merged_column_offsets_ref,
                     combined_row: &row,
                     combined_schema: &final_schema,
                 };
@@ -3325,6 +3440,7 @@ impl Executor {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
                     column_offsets: final_column_offsets.clone(),
+                    merged_column_offsets: merged_column_offsets_ref,
                     combined_row: representative,
                     combined_schema: &final_schema,
                 };
@@ -3517,6 +3633,7 @@ impl Executor {
             Some(compute_window_functions_join(
                 &filtered_rows,
                 &final_column_offsets,
+                merged_column_offsets_ref,
                 &final_schema,
                 &window_funcs,
             )?)
@@ -3554,6 +3671,7 @@ impl Executor {
                     let ctx = JoinContext {
                         tables: HashMap::new(),
                         column_offsets: final_column_offsets.clone(),
+                        merged_column_offsets: merged_column_offsets_ref,
                         combined_row: &row,
                         combined_schema: &final_schema,
                     };
@@ -3619,12 +3737,14 @@ impl Executor {
                         let ctx_a = JoinContext {
                             tables: HashMap::new(),
                             column_offsets: final_column_offsets.clone(),
+                            merged_column_offsets: merged_column_offsets_ref,
                             combined_row: a,
                             combined_schema: &final_schema,
                         };
                         let ctx_b = JoinContext {
                             tables: HashMap::new(),
                             column_offsets: final_column_offsets.clone(),
+                            merged_column_offsets: merged_column_offsets_ref,
                             combined_row: b,
                             combined_schema: &final_schema,
                         };
@@ -3668,6 +3788,7 @@ impl Executor {
                     on_exprs,
                     &final_column_offsets,
                     &final_schema,
+                    merged_column_offsets_ref,
                 )?;
                 let window_results =
                     window_results.map(|wr| super::super::query::reorder_by_indices(&wr, &indices));
@@ -3694,6 +3815,7 @@ impl Executor {
                     &combined_schemas,
                     &natural_join_common_cols,
                     rows_to_project,
+                    merged_column_offsets_ref,
                 );
             } else {
                 for (alias, schema) in &combined_schemas {
@@ -3793,6 +3915,7 @@ impl Executor {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
                     column_offsets: final_column_offsets.clone(),
+                    merged_column_offsets: merged_column_offsets_ref,
                     combined_row: row,
                     combined_schema: &final_schema,
                 };
@@ -3903,6 +4026,7 @@ impl Executor {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
                     column_offsets: final_column_offsets.clone(),
+                    merged_column_offsets: merged_column_offsets_ref,
                     combined_row: row,
                     combined_schema: &final_schema,
                 };
@@ -4374,7 +4498,7 @@ mod tests {
         ])];
 
         let (cols, types, projected) =
-            project_wildcard_natural_join(&combined_schemas, &using_cols, rows);
+            project_wildcard_natural_join(&combined_schemas, &using_cols, rows, None);
 
         assert_eq!(cols, vec!["id", "name", "a1", "b1"]);
         assert_eq!(

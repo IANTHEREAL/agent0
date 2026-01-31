@@ -366,6 +366,7 @@ impl Executor {
                         let ctx = JoinContext {
                             tables: HashMap::new(),
                             column_offsets,
+                            merged_column_offsets: None,
                             combined_row: &combined_row,
                             combined_schema: &combined_schema,
                         };
@@ -568,6 +569,7 @@ impl Executor {
                         let ctx = JoinContext {
                             tables: HashMap::new(),
                             column_offsets: column_offsets.clone(),
+                            merged_column_offsets: None,
                             combined_row: &combined_row,
                             combined_schema: &combined_schema,
                         };

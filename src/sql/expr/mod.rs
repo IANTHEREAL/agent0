@@ -90,6 +90,14 @@ pub struct JoinContext<'a> {
     #[allow(dead_code)]
     pub tables: HashMap<String, (&'a TableSchema, &'a Row)>,
     pub column_offsets: HashMap<String, usize>,
+    /// Offsets for merged output columns produced by `USING`/`NATURAL` joins.
+    ///
+    /// For outer joins, the merged join key should behave like `COALESCE(left, right)` so that
+    /// right-only rows in `RIGHT/FULL` joins expose the right-side key when the left side is NULL.
+    ///
+    /// This must not affect qualified column access (e.g. `left_alias.key`), which should still
+    /// read the underlying left/right columns directly.
+    pub merged_column_offsets: Option<&'a HashMap<String, Vec<usize>>>,
     pub combined_row: &'a Row,
     #[allow(dead_code)]
     pub combined_schema: &'a TableSchema,
@@ -208,6 +216,7 @@ pub fn eval_with_join_context(expr: &Expr, ctx: &JoinEvalContext) -> Result<Valu
     let join_ctx = JoinContext {
         tables: HashMap::new(),
         column_offsets: ctx.column_offsets.clone(),
+        merged_column_offsets: ctx.merged_column_offsets,
         combined_row: ctx.combined_row,
         combined_schema: ctx.combined_schema,
     };
@@ -2153,6 +2162,7 @@ mod tests {
         let ctx = JoinContext {
             tables: HashMap::new(),
             column_offsets,
+            merged_column_offsets: None,
             combined_row: &combined_row,
             combined_schema: &combined_schema,
         };

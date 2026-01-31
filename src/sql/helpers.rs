@@ -83,8 +83,18 @@ pub fn distinct_on_rows_join(
     on_exprs: &[Expr],
     column_offsets: &std::collections::HashMap<String, usize>,
     combined_schema: &TableSchema,
+    merged_column_offsets: Option<&std::collections::HashMap<String, Vec<usize>>>,
 ) -> Result<Vec<Row>> {
-    Ok(distinct_on_rows_join_with_indices(rows, on_exprs, column_offsets, combined_schema)?.0)
+    Ok(
+        distinct_on_rows_join_with_indices(
+            rows,
+            on_exprs,
+            column_offsets,
+            combined_schema,
+            merged_column_offsets,
+        )?
+        .0,
+    )
 }
 
 pub fn distinct_on_rows_join_with_indices(
@@ -92,6 +102,7 @@ pub fn distinct_on_rows_join_with_indices(
     on_exprs: &[Expr],
     column_offsets: &std::collections::HashMap<String, usize>,
     combined_schema: &TableSchema,
+    merged_column_offsets: Option<&std::collections::HashMap<String, Vec<usize>>>,
 ) -> Result<(Vec<Row>, Vec<usize>)> {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut result = Vec::new();
@@ -101,6 +112,7 @@ pub fn distinct_on_rows_join_with_indices(
         let ctx = JoinContext {
             tables: std::collections::HashMap::new(),
             column_offsets: column_offsets.clone(),
+            merged_column_offsets,
             combined_row: &row,
             combined_schema,
         };
@@ -1770,7 +1782,7 @@ mod tests {
             sqlparser::ast::Ident::new("a"),
         )];
         let (result, indices) =
-            distinct_on_rows_join_with_indices(rows, &on_exprs, &offsets, &schema).unwrap();
+            distinct_on_rows_join_with_indices(rows, &on_exprs, &offsets, &schema, None).unwrap();
         assert_eq!(indices, vec![0, 2]);
         assert_eq!(result.len(), 2);
     }
@@ -1799,7 +1811,7 @@ mod tests {
             sqlparser::ast::Ident::new("missing_col"),
         )];
 
-        let result = distinct_on_rows_join_with_indices(rows, &on_exprs, &offsets, &schema);
+        let result = distinct_on_rows_join_with_indices(rows, &on_exprs, &offsets, &schema, None);
         assert!(result.is_err());
     }
 

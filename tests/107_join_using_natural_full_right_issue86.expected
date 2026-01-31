@@ -1,0 +1,26 @@
+id|b_id|c_id
+NULL|NULL|NULL
+NULL|NULL|NULL
+1|1|1
+2|NULL|2
+(4 rows)
+id|b_id|c_id
+NULL|NULL|NULL
+1|1|1
+2|NULL|2
+(3 rows)
+id|b_id|c_id
+NULL|NULL|NULL
+NULL|NULL|NULL
+1|1|1
+2|NULL|2
+(4 rows)
+id|b_id|c_id
+NULL|NULL|NULL
+1|1|1
+2|NULL|2
+(3 rows)
+id|b_id|c_id|extra_id
+NULL|NULL|NULL|999
+NULL|NULL|NULL|999
+(2 rows)

@@ -562,6 +562,7 @@ fn compute_last_value(
 pub(crate) fn compute_window_functions_join(
     rows: &[Row],
     column_offsets: &HashMap<String, usize>,
+    merged_column_offsets: Option<&HashMap<String, Vec<usize>>>,
     combined_schema: &TableSchema,
     window_funcs: &[WindowFuncInfo],
 ) -> Result<Vec<Vec<Value>>> {
@@ -574,6 +575,7 @@ pub(crate) fn compute_window_functions_join(
             let ctx = JoinContext {
                 tables: HashMap::new(),
                 column_offsets: column_offsets.clone(),
+                merged_column_offsets,
                 combined_row: row,
                 combined_schema,
             };
@@ -593,12 +595,14 @@ pub(crate) fn compute_window_functions_join(
                         let ctx_a = JoinContext {
                             tables: HashMap::new(),
                             column_offsets: column_offsets.clone(),
+                            merged_column_offsets,
                             combined_row: &rows[a],
                             combined_schema,
                         };
                         let ctx_b = JoinContext {
                             tables: HashMap::new(),
                             column_offsets: column_offsets.clone(),
+                            merged_column_offsets,
                             combined_row: &rows[b],
                             combined_schema,
                         };
@@ -621,6 +625,7 @@ pub(crate) fn compute_window_functions_join(
                 "rank" => compute_rank_join(
                     rows,
                     column_offsets,
+                    merged_column_offsets,
                     combined_schema,
                     wf,
                     &row_indices,
@@ -630,6 +635,7 @@ pub(crate) fn compute_window_functions_join(
                 "dense_rank" => compute_dense_rank_join(
                     rows,
                     column_offsets,
+                    merged_column_offsets,
                     combined_schema,
                     wf,
                     &row_indices,
@@ -639,6 +645,7 @@ pub(crate) fn compute_window_functions_join(
                 "sum" => compute_sum_join(
                     rows,
                     column_offsets,
+                    merged_column_offsets,
                     combined_schema,
                     wf,
                     &row_indices,
@@ -649,6 +656,7 @@ pub(crate) fn compute_window_functions_join(
                 "avg" => compute_avg_join(
                     rows,
                     column_offsets,
+                    merged_column_offsets,
                     combined_schema,
                     wf,
                     &row_indices,
@@ -658,6 +666,7 @@ pub(crate) fn compute_window_functions_join(
                 "min" => compute_min_join(
                     rows,
                     column_offsets,
+                    merged_column_offsets,
                     combined_schema,
                     wf,
                     &row_indices,
@@ -667,6 +676,7 @@ pub(crate) fn compute_window_functions_join(
                 "max" => compute_max_join(
                     rows,
                     column_offsets,
+                    merged_column_offsets,
                     combined_schema,
                     wf,
                     &row_indices,
@@ -676,6 +686,7 @@ pub(crate) fn compute_window_functions_join(
                 "lag" => compute_lag_join(
                     rows,
                     column_offsets,
+                    merged_column_offsets,
                     combined_schema,
                     wf,
                     &row_indices,
@@ -685,6 +696,7 @@ pub(crate) fn compute_window_functions_join(
                 "lead" => compute_lead_join(
                     rows,
                     column_offsets,
+                    merged_column_offsets,
                     combined_schema,
                     wf,
                     &row_indices,
@@ -702,6 +714,7 @@ pub(crate) fn compute_window_functions_join(
 fn compute_rank_join(
     rows: &[Row],
     column_offsets: &HashMap<String, usize>,
+    merged_column_offsets: Option<&HashMap<String, Vec<usize>>>,
     combined_schema: &TableSchema,
     wf: &WindowFuncInfo,
     row_indices: &[usize],
@@ -714,6 +727,7 @@ fn compute_rank_join(
         let ctx = JoinContext {
             tables: HashMap::new(),
             column_offsets: column_offsets.clone(),
+            merged_column_offsets,
             combined_row: &rows[row_idx],
             combined_schema,
         };
@@ -735,6 +749,7 @@ fn compute_rank_join(
 fn compute_dense_rank_join(
     rows: &[Row],
     column_offsets: &HashMap<String, usize>,
+    merged_column_offsets: Option<&HashMap<String, Vec<usize>>>,
     combined_schema: &TableSchema,
     wf: &WindowFuncInfo,
     row_indices: &[usize],
@@ -747,6 +762,7 @@ fn compute_dense_rank_join(
         let ctx = JoinContext {
             tables: HashMap::new(),
             column_offsets: column_offsets.clone(),
+            merged_column_offsets,
             combined_row: &rows[row_idx],
             combined_schema,
         };
@@ -768,6 +784,7 @@ fn compute_dense_rank_join(
 fn compute_sum_join(
     rows: &[Row],
     column_offsets: &HashMap<String, usize>,
+    merged_column_offsets: Option<&HashMap<String, Vec<usize>>>,
     combined_schema: &TableSchema,
     wf: &WindowFuncInfo,
     row_indices: &[usize],
@@ -782,6 +799,7 @@ fn compute_sum_join(
                 let ctx = JoinContext {
                     tables: HashMap::new(),
                     column_offsets: column_offsets.clone(),
+                    merged_column_offsets,
                     combined_row: &rows[row_idx],
                     combined_schema,
                 };
@@ -806,6 +824,7 @@ fn compute_sum_join(
                 let ctx = JoinContext {
                     tables: HashMap::new(),
                     column_offsets: column_offsets.clone(),
+                    merged_column_offsets,
                     combined_row: &rows[row_idx],
                     combined_schema,
                 };
@@ -827,6 +846,7 @@ fn compute_sum_join(
 fn compute_avg_join(
     rows: &[Row],
     column_offsets: &HashMap<String, usize>,
+    merged_column_offsets: Option<&HashMap<String, Vec<usize>>>,
     combined_schema: &TableSchema,
     wf: &WindowFuncInfo,
     row_indices: &[usize],
@@ -841,6 +861,7 @@ fn compute_avg_join(
                 let ctx = JoinContext {
                     tables: HashMap::new(),
                     column_offsets: column_offsets.clone(),
+                    merged_column_offsets,
                     combined_row: &rows[row_idx],
                     combined_schema,
                 };
@@ -885,6 +906,7 @@ fn compute_avg_join(
                 let ctx = JoinContext {
                     tables: HashMap::new(),
                     column_offsets: column_offsets.clone(),
+                    merged_column_offsets,
                     combined_row: &rows[row_idx],
                     combined_schema,
                 };
@@ -925,6 +947,7 @@ fn compute_avg_join(
 fn compute_min_join(
     rows: &[Row],
     column_offsets: &HashMap<String, usize>,
+    merged_column_offsets: Option<&HashMap<String, Vec<usize>>>,
     combined_schema: &TableSchema,
     wf: &WindowFuncInfo,
     row_indices: &[usize],
@@ -937,6 +960,7 @@ fn compute_min_join(
             let ctx = JoinContext {
                 tables: HashMap::new(),
                 column_offsets: column_offsets.clone(),
+                merged_column_offsets,
                 combined_row: &rows[row_idx],
                 combined_schema,
             };
@@ -970,6 +994,7 @@ fn compute_min_join(
 fn compute_max_join(
     rows: &[Row],
     column_offsets: &HashMap<String, usize>,
+    merged_column_offsets: Option<&HashMap<String, Vec<usize>>>,
     combined_schema: &TableSchema,
     wf: &WindowFuncInfo,
     row_indices: &[usize],
@@ -982,6 +1007,7 @@ fn compute_max_join(
             let ctx = JoinContext {
                 tables: HashMap::new(),
                 column_offsets: column_offsets.clone(),
+                merged_column_offsets,
                 combined_row: &rows[row_idx],
                 combined_schema,
             };
@@ -1015,6 +1041,7 @@ fn compute_max_join(
 fn compute_lag_join(
     rows: &[Row],
     column_offsets: &HashMap<String, usize>,
+    merged_column_offsets: Option<&HashMap<String, Vec<usize>>>,
     combined_schema: &TableSchema,
     wf: &WindowFuncInfo,
     row_indices: &[usize],
@@ -1042,6 +1069,7 @@ fn compute_lag_join(
                 let ctx = JoinContext {
                     tables: HashMap::new(),
                     column_offsets: column_offsets.clone(),
+                    merged_column_offsets,
                     combined_row: &rows[lag_row_idx],
                     combined_schema,
                 };
@@ -1060,6 +1088,7 @@ fn compute_lag_join(
 fn compute_lead_join(
     rows: &[Row],
     column_offsets: &HashMap<String, usize>,
+    merged_column_offsets: Option<&HashMap<String, Vec<usize>>>,
     combined_schema: &TableSchema,
     wf: &WindowFuncInfo,
     row_indices: &[usize],
@@ -1087,6 +1116,7 @@ fn compute_lead_join(
                 let ctx = JoinContext {
                     tables: HashMap::new(),
                     column_offsets: column_offsets.clone(),
+                    merged_column_offsets,
                     combined_row: &rows[lead_row_idx],
                     combined_schema,
                 };

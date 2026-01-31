@@ -117,6 +117,7 @@ impl EvalContext for SingleTableContext<'_> {
 
 pub struct JoinEvalContext<'a> {
     pub column_offsets: &'a HashMap<String, usize>,
+    pub merged_column_offsets: Option<&'a HashMap<String, Vec<usize>>>,
     pub combined_row: &'a Row,
     pub combined_schema: &'a TableSchema,
 }
@@ -124,11 +125,13 @@ pub struct JoinEvalContext<'a> {
 impl<'a> JoinEvalContext<'a> {
     pub fn new(
         column_offsets: &'a HashMap<String, usize>,
+        merged_column_offsets: Option<&'a HashMap<String, Vec<usize>>>,
         combined_row: &'a Row,
         combined_schema: &'a TableSchema,
     ) -> Self {
         Self {
             column_offsets,
+            merged_column_offsets,
             combined_row,
             combined_schema,
         }
@@ -137,6 +140,7 @@ impl<'a> JoinEvalContext<'a> {
     pub fn from_join_context(ctx: &'a super::JoinContext<'a>) -> Self {
         Self {
             column_offsets: &ctx.column_offsets,
+            merged_column_offsets: ctx.merged_column_offsets,
             combined_row: ctx.combined_row,
             combined_schema: ctx.combined_schema,
         }
@@ -149,6 +153,34 @@ impl EvalContext for JoinEvalContext<'_> {
     }
 
     fn resolve_column(&self, name: &str) -> Result<Value> {
+        if let Some(merged) = self.merged_column_offsets {
+            if let Some(offsets) = merged.get(name) {
+                for &offset in offsets {
+                    if let Some(val) = self.combined_row.values.get(offset) {
+                        if !matches!(val, Value::Null) {
+                            return Ok(val.clone());
+                        }
+                    }
+                }
+                return Ok(Value::Null);
+            }
+
+            // Case-insensitive fallback to match the behavior used for qualified identifiers.
+            let name_lower = name.to_lowercase();
+            for (k, offsets) in merged {
+                if k.to_lowercase() == name_lower {
+                    for &offset in offsets {
+                        if let Some(val) = self.combined_row.values.get(offset) {
+                            if !matches!(val, Value::Null) {
+                                return Ok(val.clone());
+                            }
+                        }
+                    }
+                    return Ok(Value::Null);
+                }
+            }
+        }
+
         if let Some(&offset) = self.column_offsets.get(name) {
             Ok(self.combined_row.values[offset].clone())
         } else {
