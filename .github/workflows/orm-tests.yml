@@ -36,8 +36,14 @@ jobs:
 
       - name: Install tiup
         run: |
+          # Isolate TiUP state to avoid flaky/corrupted manifests on runners.
+          export TIUP_HOME="$RUNNER_TEMP/tiup"
+          echo "TIUP_HOME=$TIUP_HOME" >> "$GITHUB_ENV"
+
+          rm -rf "$TIUP_HOME"
+          mkdir -p "$TIUP_HOME"
           curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
-          echo "$HOME/.tiup/bin" >> $GITHUB_PATH
+          echo "$TIUP_HOME/bin" >> $GITHUB_PATH
 
       - name: Build pg-tikv
         run: cargo build --release
@@ -53,7 +59,7 @@ jobs:
           enable-ttl = true
           EOF
 
-          ~/.tiup/bin/tiup playground \
+          tiup playground \
             --mode tikv-slim \
             --without-monitor \
             --pd.host 127.0.0.1 \

@@ -54,6 +54,7 @@ impl Executor {
                             columns,
                             column_types,
                             rows,
+                            timezone: _,
                         } => {
                             let col_names: Vec<String> = if cte.alias.columns.is_empty() {
                                 columns
@@ -175,6 +176,7 @@ impl Executor {
                 columns,
                 column_types,
                 rows,
+                timezone: _,
             } => (columns, column_types, rows),
             _ => return Err(anyhow!("Recursive CTE base must be SELECT")),
         };

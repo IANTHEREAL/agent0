@@ -4246,7 +4246,9 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
             columns,
             column_types,
             rows,
+            timezone,
         } => {
+            let tz = crate::types::timestamp::TimeZoneSpec::parse(timezone.as_ref());
             let inferred_types: Vec<Type> = if let Some(types) = column_types.as_ref() {
                 types
                     .iter()
@@ -4315,7 +4317,7 @@ fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> 
                 let mut encoder = DataRowEncoder::new(fields.clone());
                 for (i, value) in row.values.iter().enumerate() {
                     let col_type = internal_types.get(i);
-                    encode_value(&mut encoder, value, col_type)?;
+                    encode_value(&mut encoder, value, col_type, tz)?;
                 }
                 data_rows.push(encoder.finish());
             }
@@ -4528,6 +4530,7 @@ fn encode_value(
     encoder: &mut DataRowEncoder,
     value: &Value,
     col_type: Option<&DataType>,
+    tz: crate::types::timestamp::TimeZoneSpec,
 ) -> PgWireResult<()> {
     match value {
         Value::Null => encoder.encode_field(&None::<String>),
@@ -4541,7 +4544,7 @@ fn encode_value(
                 Some(DataType::Timestamp) | Some(DataType::TimestampTz)
             ) {
                 // Treat as timestamp - reuse the timestamp encoding logic
-                use chrono::{DateTime, Offset, Utc};
+                use chrono::{DateTime, Utc};
                 const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
                 const MAX_REASONABLE_UNIX_MS: i64 = 10_000_000_000_000;
 
@@ -4560,23 +4563,7 @@ fn encode_value(
                 if let Some(dt) = DateTime::<Utc>::from_timestamp(seconds, nanos) {
                     let is_timestamptz = matches!(col_type, Some(DataType::TimestampTz));
                     if is_timestamptz {
-                        let local = dt.with_timezone(&chrono_tz::America::Los_Angeles);
-                        let base = if micros == 0 {
-                            local.format("%Y-%m-%d %H:%M:%S").to_string()
-                        } else {
-                            local.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-                        };
-                        let offset_secs = local.offset().fix().local_minus_utc();
-                        let sign = if offset_secs >= 0 { '+' } else { '-' };
-                        let abs = offset_secs.unsigned_abs();
-                        let hours = abs / 3600;
-                        let minutes = (abs % 3600) / 60;
-                        let tz = if minutes == 0 {
-                            format!("{sign}{:02}", hours)
-                        } else {
-                            format!("{sign}{:02}:{:02}", hours, minutes)
-                        };
-                        encoder.encode_field(&format!("{base}{tz}"))
+                        encoder.encode_field(&tz.format_timestamptz(dt, micros))
                     } else if micros == 0 {
                         encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S").to_string())
                     } else {
@@ -4593,7 +4580,7 @@ fn encode_value(
         Value::Text(s) => encoder.encode_field(s),
         Value::Bytes(b) => encoder.encode_field(&format!("\\x{}", hex::encode(b))),
         Value::Timestamp(ts) => {
-            use chrono::{DateTime, Offset, Utc};
+            use chrono::{DateTime, Utc};
 
             // Detect timestamp format:
             // - Unix epoch milliseconds: typical values 1.0e12 to 2.5e12 (years 2001-2049)
@@ -4621,23 +4608,7 @@ fn encode_value(
                 let is_timestamptz = matches!(col_type, Some(DataType::TimestampTz));
 
                 if is_timestamptz {
-                    let local = dt.with_timezone(&chrono_tz::America::Los_Angeles);
-                    let base = if micros == 0 {
-                        local.format("%Y-%m-%d %H:%M:%S").to_string()
-                    } else {
-                        local.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-                    };
-                    let offset_secs = local.offset().fix().local_minus_utc();
-                    let sign = if offset_secs >= 0 { '+' } else { '-' };
-                    let abs = offset_secs.unsigned_abs();
-                    let hours = abs / 3600;
-                    let minutes = (abs % 3600) / 60;
-                    let tz = if minutes == 0 {
-                        format!("{sign}{:02}", hours)
-                    } else {
-                        format!("{sign}{:02}:{:02}", hours, minutes)
-                    };
-                    encoder.encode_field(&format!("{base}{tz}"))
+                    encoder.encode_field(&tz.format_timestamptz(dt, micros))
                 } else if micros == 0 {
                     encoder.encode_field(&dt.format("%Y-%m-%d %H:%M:%S").to_string())
                 } else {
@@ -4836,7 +4807,8 @@ mod tests {
         )];
         let fields = Arc::new(fields);
         let mut encoder = DataRowEncoder::new(fields);
-        encode_value(&mut encoder, value, col_type).unwrap();
+        let tz = crate::types::timestamp::TimeZoneSpec::parse("UTC");
+        encode_value(&mut encoder, value, col_type, tz).unwrap();
         let row = encoder.finish().unwrap();
 
         assert_eq!(row.field_count, 1);

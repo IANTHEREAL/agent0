@@ -17,7 +17,6 @@ use super::super::{
 };
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
-use chrono::TimeZone;
 use sqlparser::ast::{
     BinaryOperator, Distinct, Expr, FunctionArg, FunctionArgExpr, GroupByExpr, Ident,
     JoinConstraint, JoinOperator, Query, SelectItem, Statement, TableFactor,
@@ -1044,6 +1043,7 @@ impl Executor {
                             columns,
                             column_types,
                             rows,
+                            timezone: _,
                         } => {
                             let inferred_types = column_types.unwrap_or_else(|| {
                                 if let Some(first) = rows.first() {
@@ -1244,6 +1244,7 @@ impl Executor {
                     columns,
                     column_types,
                     rows,
+                    timezone: _,
                 } => {
                     let column_names = if alias_columns.is_empty() {
                         columns
@@ -3507,6 +3508,7 @@ impl Executor {
                 ),
                 columns: col_names,
                 rows: final_rows,
+                timezone: crate::session_context::current_timezone(),
             });
         }
 
@@ -3959,6 +3961,7 @@ impl Executor {
             column_types: Some(column_types),
             columns: cols,
             rows: result_rows,
+            timezone: crate::session_context::current_timezone(),
         })
     }
 }
@@ -4166,7 +4169,9 @@ fn generate_series_values(
                 return Err(anyhow!("step size cannot equal zero"));
             }
             let mut values = Vec::new();
-            let tz = chrono_tz::America::Los_Angeles;
+            let tz = crate::types::timestamp::TimeZoneSpec::parse(
+                crate::session_context::current_timezone().as_ref(),
+            );
             if step_days > 0 {
                 let mut current = *s;
                 while current <= *e {
@@ -4174,11 +4179,9 @@ fn generate_series_values(
                     let naive = date
                         .and_hms_opt(0, 0, 0)
                         .ok_or_else(|| anyhow!("Invalid date"))?;
-                    let local = tz
-                        .from_local_datetime(&naive)
-                        .single()
-                        .ok_or_else(|| anyhow!("Invalid local timestamptz"))?;
-                    values.push(Value::Timestamp(local.timestamp_millis()));
+                    values.push(Value::Timestamp(
+                        tz.timestamp_millis_from_local_datetime(naive)?,
+                    ));
                     current = match current.checked_add(step_days) {
                         Some(next) => next,
                         None => break,
@@ -4191,11 +4194,9 @@ fn generate_series_values(
                     let naive = date
                         .and_hms_opt(0, 0, 0)
                         .ok_or_else(|| anyhow!("Invalid date"))?;
-                    let local = tz
-                        .from_local_datetime(&naive)
-                        .single()
-                        .ok_or_else(|| anyhow!("Invalid local timestamptz"))?;
-                    values.push(Value::Timestamp(local.timestamp_millis()));
+                    values.push(Value::Timestamp(
+                        tz.timestamp_millis_from_local_datetime(naive)?,
+                    ));
                     current = match current.checked_add(step_days) {
                         Some(next) => next,
                         None => break,
@@ -4275,7 +4276,6 @@ fn interval_to_days(iv: &crate::types::IntervalValue) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
 
     #[test]
     fn natural_join_wildcard_projection_keeps_common_cols_first_and_in_order() {
@@ -4550,11 +4550,13 @@ mod tests {
         let (values, ty) = generate_series_values(&Value::Date(1), &Value::Date(1), &step).unwrap();
         assert_eq!(ty, DataType::TimestampTz);
 
-        let tz = chrono_tz::America::Los_Angeles;
+        let tz = crate::types::timestamp::TimeZoneSpec::parse(
+            crate::session_context::current_timezone().as_ref(),
+        );
         let date = crate::types::date::date_days_to_naive_date(1).unwrap();
         let naive = date.and_hms_opt(0, 0, 0).unwrap();
-        let local = tz.from_local_datetime(&naive).single().unwrap();
-        assert_eq!(values, vec![Value::Timestamp(local.timestamp_millis())]);
+        let expected = tz.timestamp_millis_from_local_datetime(naive).unwrap();
+        assert_eq!(values, vec![Value::Timestamp(expected)]);
     }
 
     #[test]

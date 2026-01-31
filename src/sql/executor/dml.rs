@@ -248,6 +248,7 @@ impl Executor {
                 column_types,
                 columns: ret_cols,
                 rows: ret_rows,
+                timezone: crate::session_context::current_timezone(),
             })
         } else {
             Ok(ExecuteResult::Insert {
@@ -446,6 +447,7 @@ impl Executor {
                 column_types,
                 columns: ret_cols,
                 rows: ret_rows,
+                timezone: crate::session_context::current_timezone(),
             })
         } else {
             Ok(ExecuteResult::Delete { affected_rows: cnt })
@@ -737,6 +739,7 @@ impl Executor {
                 column_types,
                 columns: ret_cols,
                 rows: ret_rows,
+                timezone: crate::session_context::current_timezone(),
             })
         } else {
             Ok(ExecuteResult::Update { affected_rows: cnt })

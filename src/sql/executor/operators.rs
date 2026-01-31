@@ -1102,6 +1102,7 @@ impl Executor {
             columns,
             column_types: Some(column_types),
             rows: projected_rows,
+            timezone: crate::session_context::current_timezone(),
         })
     }
 
@@ -1313,6 +1314,7 @@ impl Executor {
             columns,
             column_types: Some(column_types),
             rows,
+            timezone: crate::session_context::current_timezone(),
         })
     }
 
@@ -1515,6 +1517,7 @@ impl Executor {
             columns,
             column_types: Some(column_types),
             rows: projected_rows,
+            timezone: crate::session_context::current_timezone(),
         })
     }
 
@@ -1619,6 +1622,7 @@ impl Executor {
                 columns,
                 column_types: Some(column_types),
                 rows,
+                timezone: crate::session_context::current_timezone(),
             });
         }
 
@@ -1652,6 +1656,7 @@ impl Executor {
                 columns,
                 column_types: Some(column_types),
                 rows: raw_rows,
+                timezone: crate::session_context::current_timezone(),
             });
         }
 
@@ -1668,6 +1673,7 @@ impl Executor {
             columns,
             column_types: Some(column_types),
             rows,
+            timezone: crate::session_context::current_timezone(),
         })
     }
 
@@ -1730,6 +1736,7 @@ impl Executor {
             columns,
             column_types: Some(column_types),
             rows: projected_rows,
+            timezone: crate::session_context::current_timezone(),
         })
     }
 

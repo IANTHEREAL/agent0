@@ -248,6 +248,7 @@ impl Executor {
                 columns,
                 column_types: _,
                 rows,
+                timezone: _,
             } => (columns, rows),
             _ => return Err(anyhow!("Materialized view must be a SELECT query")),
         };

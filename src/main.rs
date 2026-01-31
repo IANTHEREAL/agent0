@@ -3,6 +3,7 @@ mod extensions;
 mod observability;
 mod pool;
 mod protocol;
+mod session_context;
 mod sql;
 mod storage;
 mod tls;

@@ -19,6 +19,7 @@ use super::super::udt;
 use super::super::{parse_sql, ExecuteResult, ExecuteResults, InFailedSqlTransaction, Session};
 use crate::auth::AuthManager;
 use crate::observability::TenantObservability;
+use crate::session_context;
 use crate::storage::TikvStore;
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
@@ -361,6 +362,7 @@ fn try_execute_set_config_select(session: &mut Session, query: &Query) -> Result
             columns: vec![alias.unwrap_or_else(|| "set_config".to_string())],
             column_types: Some(vec![DataType::Text]),
             rows: vec![Row::new(vec![Value::Text(prev)])],
+            timezone: session_context::current_timezone(),
         }));
     }
 
@@ -371,6 +373,7 @@ fn try_execute_set_config_select(session: &mut Session, query: &Query) -> Result
             columns: vec![alias.unwrap_or_else(|| "set_config".to_string())],
             column_types: Some(vec![DataType::Text]),
             rows: vec![Row::new(vec![Value::Text(prev)])],
+            timezone: session_context::current_timezone(),
         }));
     }
 
@@ -467,6 +470,7 @@ fn try_execute_current_setting_select(
         columns: vec![alias.unwrap_or_else(|| "current_setting".to_string())],
         column_types: Some(vec![output_type]),
         rows: vec![Row::new(vec![value])],
+        timezone: session_context::current_timezone(),
     }))
 }
 
@@ -968,7 +972,13 @@ impl Executor {
                 }
                 let start = Instant::now();
                 let is_superuser = session.is_superuser();
-                let stmt_exec: Result<Vec<ExecuteResult>> =
+                let timezone = Arc::from(
+                    session
+                        .show_setting_value("timezone")
+                        .unwrap_or_else(|| "UTC".to_string()),
+                );
+                let stmt_exec: Result<Vec<ExecuteResult>> = session_context::with_timezone(
+                    timezone,
                     crate::extensions::context::with_context(is_superuser, async {
                         match stmt {
                             // Transaction Control
@@ -1103,6 +1113,7 @@ impl Executor {
                                     columns: vec![var_name],
                                     column_types: Some(vec![DataType::Text]),
                                     rows: vec![Row::new(vec![Value::Text(value)])],
+                                    timezone: session_context::current_timezone(),
                                 }])
                             }
                             // DDL/DML - delegated to session transaction management
@@ -1217,8 +1228,9 @@ impl Executor {
                                 unreachable!("retry loop must return")
                             }
                         }
-                    })
-                    .await;
+                    }),
+                )
+                .await;
 
                 if stmt_exec.is_err() && session.is_in_transaction() {
                     session.mark_transaction_failed();
@@ -2821,6 +2833,7 @@ impl Executor {
             column_types: Some(column_types),
             columns: cols,
             rows,
+            timezone: session_context::current_timezone(),
         })
     }
 
@@ -2850,6 +2863,7 @@ impl Executor {
                     columns,
                     column_types: _,
                     rows,
+                    timezone: _,
                 } => (columns, rows),
                 _ => return Err(anyhow!("Left side of set operation must be SELECT")),
             };
@@ -2858,6 +2872,7 @@ impl Executor {
                     columns,
                     column_types: _,
                     rows,
+                    timezone: _,
                 } => (columns, rows),
                 _ => return Err(anyhow!("Right side of set operation must be SELECT")),
             };
@@ -2877,6 +2892,7 @@ impl Executor {
                 column_types: None,
                 columns: left_cols,
                 rows,
+                timezone: session_context::current_timezone(),
             })
         })
     }
@@ -3063,6 +3079,7 @@ impl Executor {
             column_types: None,
             columns: vec!["QUERY PLAN".to_string()],
             rows: lines,
+            timezone: session_context::current_timezone(),
         })
     }
 

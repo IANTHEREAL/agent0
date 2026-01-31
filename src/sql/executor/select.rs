@@ -115,6 +115,7 @@ impl Executor {
                 columns,
                 column_types,
                 rows,
+                timezone,
             } = result
             {
                 let mut rows = rows;
@@ -126,6 +127,7 @@ impl Executor {
                     columns,
                     column_types,
                     rows,
+                    timezone,
                 });
             }
 
@@ -976,6 +978,7 @@ impl Executor {
             column_types,
             columns: cols,
             rows: result_rows,
+            timezone: crate::session_context::current_timezone(),
         };
         if let Some((target_name, _temp)) = select_into_target {
             return self
@@ -1265,6 +1268,7 @@ impl Executor {
             ),
             columns: col_names,
             rows: final_rows,
+            timezone: crate::session_context::current_timezone(),
         };
         if let Some((target_name, _temp)) = select_into_target {
             return self
@@ -1568,6 +1572,7 @@ impl Executor {
             ),
             columns: col_names,
             rows: final_rows,
+            timezone: crate::session_context::current_timezone(),
         };
         if let Some((target_name, _temp)) = select_into_target {
             return self

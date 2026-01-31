@@ -3814,10 +3814,15 @@ mod tests {
         assert_eq!(val, Value::Text("2024-01-15 10:30:00".to_string()));
     }
 
-    #[test]
-    fn test_cast_timestamptz_to_text_includes_offset() {
+    #[tokio::test]
+    async fn test_cast_timestamptz_to_text_includes_offset() {
+        use std::sync::Arc;
+
         let expr = parse_expr("TIMESTAMPTZ '2024-01-15T10:00:00Z'::text");
-        let val = eval_expr(&expr, None, None).unwrap();
+        let val = crate::session_context::with_timezone(Arc::from("America/Los_Angeles"), async {
+            eval_expr(&expr, None, None).unwrap()
+        })
+        .await;
         assert_eq!(val, Value::Text("2024-01-15 02:00:00-08".to_string()));
     }
 }
