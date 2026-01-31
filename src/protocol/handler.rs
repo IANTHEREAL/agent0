@@ -393,6 +393,35 @@ fn count_sql_parameters(sql: &str) -> usize {
             continue;
         }
 
+        if !in_single_quote && !in_double_quote {
+            // SQL comments
+            if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                i += 2;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                i += 2;
+                let mut depth = 1usize;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                        depth += 1;
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                        depth -= 1;
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
         if !in_single_quote && !in_double_quote && b == b'$' {
             // Prepared-statement placeholder: $1, $2, ...
             let mut j = i + 1;
@@ -406,9 +435,13 @@ fn count_sql_parameters(sql: &str) -> usize {
                 j += 1;
             }
             if saw_digit {
-                max_param = max_param.max(num);
-                i = j;
-                continue;
+                let before_ok = i == 0 || !is_ident_char_or_dollar(bytes[i - 1]);
+                let after_ok = j == bytes.len() || !is_ident_char_or_dollar(bytes[j]);
+                if before_ok && after_ok {
+                    max_param = max_param.max(num);
+                    i = j;
+                    continue;
+                }
             }
 
             // PostgreSQL dollar-quoted strings ($tag$...$tag$ or $$...$$)
@@ -434,6 +467,10 @@ fn count_sql_parameters(sql: &str) -> usize {
 
 fn is_ident_char(b: u8) -> bool {
     matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+}
+
+fn is_ident_char_or_dollar(b: u8) -> bool {
+    is_ident_char(b) || b == b'$'
 }
 
 fn resolve_table_for_insert(table_name: &str, search_path: &[String]) -> String {
@@ -3279,6 +3316,49 @@ fn substitute_placeholders_outside_strings_and_dollar(query: &str, values: &[Str
             continue;
         }
 
+        if !in_single_quote && !in_double_quote {
+            // SQL comments
+            if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                out.push(b'-');
+                out.push(b'-');
+                i += 2;
+                while i < bytes.len() {
+                    out.push(bytes[i]);
+                    let is_newline = bytes[i] == b'\n';
+                    i += 1;
+                    if is_newline {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                out.push(b'/');
+                out.push(b'*');
+                i += 2;
+                let mut depth = 1usize;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                        out.push(b'/');
+                        out.push(b'*');
+                        depth += 1;
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                        out.push(b'*');
+                        out.push(b'/');
+                        depth -= 1;
+                        i += 2;
+                        continue;
+                    }
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+                continue;
+            }
+        }
+
         if !in_single_quote && !in_double_quote && b == b'$' {
             // Prepared-statement placeholder: $1, $2, ...
             let mut j = i + 1;
@@ -3292,13 +3372,17 @@ fn substitute_placeholders_outside_strings_and_dollar(query: &str, values: &[Str
                 j += 1;
             }
             if saw_digit {
-                if num >= 1 && num <= values.len() {
-                    out.extend_from_slice(values[num - 1].as_bytes());
-                } else {
-                    out.extend_from_slice(&bytes[i..j]);
+                let before_ok = i == 0 || !is_ident_char_or_dollar(bytes[i - 1]);
+                let after_ok = j == bytes.len() || !is_ident_char_or_dollar(bytes[j]);
+                if before_ok && after_ok {
+                    if num >= 1 && num <= values.len() {
+                        out.extend_from_slice(values[num - 1].as_bytes());
+                    } else {
+                        out.extend_from_slice(&bytes[i..j]);
+                    }
+                    i = j;
+                    continue;
                 }
-                i = j;
-                continue;
             }
 
             // PostgreSQL dollar-quoted strings ($tag$ ... $tag$ or $$ ... $$)
@@ -5259,6 +5343,15 @@ mod tests {
     }
 
     #[test]
+    fn test_count_sql_parameters_ignores_comments_and_identifier_tokens() {
+        assert_eq!(count_sql_parameters("SELECT 1 /* $10 */;"), 0);
+        assert_eq!(count_sql_parameters("SELECT 1 -- $10\n;"), 0);
+        assert_eq!(count_sql_parameters("SELECT a$1 FROM t WHERE id = $1;"), 1);
+        assert_eq!(count_sql_parameters("SELECT 1 /* $10 */ , $2;"), 2);
+        assert_eq!(count_sql_parameters("SELECT /* outer /* $10 */ inner */ $1;"), 1);
+    }
+
+    #[test]
     fn test_find_keyword_outside_strings_ignores_dollar_quoted_strings() {
         let query = "INSERT INTO t VALUES (1) $$ RETURNING $$ RETURNING id";
         let pos = find_keyword_outside_strings(query, "RETURNING").unwrap();
@@ -5309,6 +5402,33 @@ mod tests {
         assert_eq!(
             substitute_placeholders_outside_strings_and_dollar("SELECT $$ $10 $$, $10", &values),
             "SELECT $$ $10 $$, 10"
+        );
+    }
+
+    #[test]
+    fn test_substitute_placeholders_ignores_comments_and_identifier_tokens() {
+        let values = vec!["42".to_string()];
+        assert_eq!(
+            substitute_placeholders_outside_strings_and_dollar("SELECT 1 /* $1 */ , $1;", &values),
+            "SELECT 1 /* $1 */ , 42;"
+        );
+        assert_eq!(
+            substitute_placeholders_outside_strings_and_dollar("SELECT 1 -- $1\n, $1;", &values),
+            "SELECT 1 -- $1\n, 42;"
+        );
+        assert_eq!(
+            substitute_placeholders_outside_strings_and_dollar(
+                "SELECT a$1 FROM t WHERE id = $1;",
+                &values
+            ),
+            "SELECT a$1 FROM t WHERE id = 42;"
+        );
+        assert_eq!(
+            substitute_placeholders_outside_strings_and_dollar(
+                "SELECT /* outer /* $1 */ inner */ $1;",
+                &values
+            ),
+            "SELECT /* outer /* $1 */ inner */ 42;"
         );
     }
 
