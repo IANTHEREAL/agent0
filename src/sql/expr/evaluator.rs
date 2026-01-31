@@ -433,8 +433,17 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
         } => {
             if let Some(op) = operand {
                 let op_val = eval_expr_impl(ctx, op)?;
+                if matches!(op_val, Value::Null) {
+                    if let Some(else_expr) = else_result {
+                        return eval_expr_impl(ctx, else_expr);
+                    }
+                    return Ok(Value::Null);
+                }
                 for (i, cond) in conditions.iter().enumerate() {
                     let cond_val = eval_expr_impl(ctx, cond)?;
+                    if matches!(cond_val, Value::Null) {
+                        continue;
+                    }
                     if compare_values(&op_val, &cond_val).unwrap_or(1) == 0 {
                         return eval_expr_impl(ctx, &results[i]);
                     }

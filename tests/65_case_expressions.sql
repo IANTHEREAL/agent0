@@ -24,6 +24,18 @@ SELECT id, score,
     END AS grade
 FROM case_test ORDER BY id;
 
+-- Simple CASE NULL semantics (NULL never matches, even against NULL)
+SELECT CASE NULL
+    WHEN NULL THEN 'then_branch'
+    ELSE 'else_branch'
+END AS simple_case_null_operand;
+
+SELECT CASE score
+    WHEN NULL THEN 'then_branch'
+    ELSE 'else_branch'
+END AS simple_case_null_when
+FROM case_test WHERE id = 5;
+
 -- Searched CASE
 SELECT id, score,
     CASE 

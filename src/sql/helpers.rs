@@ -28,7 +28,7 @@ pub fn normalize_ident(ident: &Ident) -> String {
 use rust_decimal::Decimal;
 use std::str::FromStr;
 
-use super::expr::{eval_expr, eval_expr_join, JoinContext};
+use super::expr::{eval_expr, eval_expr_join, parse_bool_pg, JoinContext};
 use super::Aggregator;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
@@ -630,6 +630,25 @@ pub fn collect_having_agg_funcs(
             collect_having_agg_funcs(left, agg_funcs, extra_start);
             collect_having_agg_funcs(right, agg_funcs, extra_start);
         }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(op) = operand.as_deref() {
+                collect_having_agg_funcs(op, agg_funcs, extra_start);
+            }
+            for cond in conditions {
+                collect_having_agg_funcs(cond, agg_funcs, extra_start);
+            }
+            for res in results {
+                collect_having_agg_funcs(res, agg_funcs, extra_start);
+            }
+            if let Some(e) = else_result.as_deref() {
+                collect_having_agg_funcs(e, agg_funcs, extra_start);
+            }
+        }
         Expr::Nested(e) => collect_having_agg_funcs(e, agg_funcs, extra_start),
         Expr::Cast { expr, .. } => collect_having_agg_funcs(expr, agg_funcs, extra_start),
         _ => {}
@@ -745,6 +764,56 @@ pub fn eval_having_expr(
                     _ => eval_expr(expr, Some(row), Some(schema)),
                 }
             }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(op) = operand.as_deref() {
+                let operand_val = eval_having_expr(op, row, schema, agg_funcs, aggs)?;
+                if matches!(operand_val, Value::Null) {
+                    return else_result
+                        .as_deref()
+                        .map(|e| eval_having_expr(e, row, schema, agg_funcs, aggs))
+                        .unwrap_or(Ok(Value::Null));
+                }
+                for (cond, res) in conditions.iter().zip(results.iter()) {
+                    let cond_val = eval_having_expr(cond, row, schema, agg_funcs, aggs)?;
+                    if matches!(cond_val, Value::Null) {
+                        continue;
+                    }
+                    if super::expr::compare_values(&operand_val, &cond_val).unwrap_or(1) == 0 {
+                        return eval_having_expr(res, row, schema, agg_funcs, aggs);
+                    }
+                }
+            } else {
+                for (cond, res) in conditions.iter().zip(results.iter()) {
+                    let cond_val = eval_having_expr(cond, row, schema, agg_funcs, aggs)?;
+                    let cond_true = match cond_val {
+                        Value::Boolean(b) => b,
+                        Value::Null => false,
+                        Value::Text(s) => parse_bool_pg(&s).ok_or_else(|| {
+                            anyhow!("invalid input syntax for type boolean: \"{}\"", s)
+                        })?,
+                        other => {
+                            return Err(anyhow!(
+                                "CASE WHEN requires boolean condition, got {:?}",
+                                other
+                            ));
+                        }
+                    };
+                    if cond_true {
+                        return eval_having_expr(res, row, schema, agg_funcs, aggs);
+                    }
+                }
+            }
+
+            else_result
+                .as_deref()
+                .map(|e| eval_having_expr(e, row, schema, agg_funcs, aggs))
+                .unwrap_or(Ok(Value::Null))
         }
         Expr::ArrayAgg(arr) => {
             for (i, (_, agg_expr)) in agg_funcs.iter().enumerate() {
@@ -866,6 +935,56 @@ pub fn eval_having_expr_join(
                     _ => eval_expr_join(expr, ctx),
                 }
             }
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(op) = operand.as_deref() {
+                let operand_val = eval_having_expr_join(op, ctx, agg_funcs, aggs)?;
+                if matches!(operand_val, Value::Null) {
+                    return else_result
+                        .as_deref()
+                        .map(|e| eval_having_expr_join(e, ctx, agg_funcs, aggs))
+                        .unwrap_or(Ok(Value::Null));
+                }
+                for (cond, res) in conditions.iter().zip(results.iter()) {
+                    let cond_val = eval_having_expr_join(cond, ctx, agg_funcs, aggs)?;
+                    if matches!(cond_val, Value::Null) {
+                        continue;
+                    }
+                    if super::expr::compare_values(&operand_val, &cond_val).unwrap_or(1) == 0 {
+                        return eval_having_expr_join(res, ctx, agg_funcs, aggs);
+                    }
+                }
+            } else {
+                for (cond, res) in conditions.iter().zip(results.iter()) {
+                    let cond_val = eval_having_expr_join(cond, ctx, agg_funcs, aggs)?;
+                    let cond_true = match cond_val {
+                        Value::Boolean(b) => b,
+                        Value::Null => false,
+                        Value::Text(s) => parse_bool_pg(&s).ok_or_else(|| {
+                            anyhow!("invalid input syntax for type boolean: \"{}\"", s)
+                        })?,
+                        other => {
+                            return Err(anyhow!(
+                                "CASE WHEN requires boolean condition, got {:?}",
+                                other
+                            ));
+                        }
+                    };
+                    if cond_true {
+                        return eval_having_expr_join(res, ctx, agg_funcs, aggs);
+                    }
+                }
+            }
+
+            else_result
+                .as_deref()
+                .map(|e| eval_having_expr_join(e, ctx, agg_funcs, aggs))
+                .unwrap_or(Ok(Value::Null))
         }
         Expr::ArrayAgg(arr) => {
             for (i, (_, agg_expr)) in agg_funcs.iter().enumerate() {

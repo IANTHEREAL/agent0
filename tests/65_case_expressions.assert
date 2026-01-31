@@ -3,6 +3,10 @@ id|score|grade
 2|75|C
 3|55|Other
 4|85|B
+simple_case_null_operand
+else_branch
+simple_case_null_when
+else_branch
 id|score|performance
 1|95|Excellent
 2|75|Average
