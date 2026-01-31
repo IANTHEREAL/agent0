@@ -23,6 +23,229 @@ use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
 use tracing::debug;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GenerateSeriesOffsetLimitPushdownPlan {
+    offset: usize,
+    limit: Option<usize>,
+    /// When true, the executor must clear query-level OFFSET/LIMIT/FETCH so the slice
+    /// is not applied twice.
+    clear_query_offset_limit_fetch: bool,
+}
+
+fn select_item_expr(item: &SelectItem) -> Option<&Expr> {
+    match item {
+        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => None,
+    }
+}
+
+fn expr_is_select_list_srf(expr: &Expr) -> bool {
+    let Expr::Function(f) = expr else {
+        return false;
+    };
+    let Some(name) = f.name.0.last() else {
+        return false;
+    };
+    name.value.eq_ignore_ascii_case("UNNEST")
+        || name
+            .value
+            .eq_ignore_ascii_case("REGEXP_SPLIT_TO_TABLE")
+        || name.value.eq_ignore_ascii_case("REGEXP_MATCHES")
+        || name.value.eq_ignore_ascii_case("JSONB_OBJECT_KEYS")
+        || name.value.eq_ignore_ascii_case("JSONB_ARRAY_ELEMENTS")
+        || name
+            .value
+            .eq_ignore_ascii_case("JSONB_ARRAY_ELEMENTS_TEXT")
+        || name.value.eq_ignore_ascii_case("JSONB_EACH")
+        || name.value.eq_ignore_ascii_case("JSONB_EACH_TEXT")
+}
+
+fn projection_has_select_list_srf(projection: &[SelectItem]) -> bool {
+    projection
+        .iter()
+        .filter_map(select_item_expr)
+        .any(expr_is_select_list_srf)
+}
+
+fn expr_is_trivial_projection(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::Value(_) => true,
+        Expr::Nested(inner) => expr_is_trivial_projection(inner),
+        _ => false,
+    }
+}
+
+fn projection_is_trivial(projection: &[SelectItem]) -> bool {
+    projection.iter().all(|item| match item {
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => true,
+        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+            expr_is_trivial_projection(expr)
+        }
+    })
+}
+
+fn generate_series_offset_limit_pushdown_eligible(
+    query: &Query,
+    select: &sqlparser::ast::Select,
+) -> bool {
+    let group_by_is_empty = matches!(
+        &select.group_by,
+        GroupByExpr::Expressions(exprs) if exprs.is_empty()
+    );
+    let has_window_funcs = !extract_window_functions(&select.projection).is_empty();
+    let has_agg_funcs = {
+        let extra_start = select.projection.len();
+        let mut agg_funcs: Vec<(usize, AggExpr)> = Vec::new();
+        for item in &select.projection {
+            match item {
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    collect_having_agg_funcs(expr, &mut agg_funcs, extra_start);
+                }
+                _ => {}
+            }
+        }
+        !agg_funcs.is_empty()
+    };
+
+    let eligible_shape = select.selection.is_none()
+        && select.distinct.is_none()
+        && group_by_is_empty
+        && select.having.is_none()
+        && query.order_by.is_empty()
+        && !has_window_funcs
+        && !has_agg_funcs
+        && (query.offset.is_some() || query.limit.is_some() || query.fetch.is_some());
+    eligible_shape && !projection_has_select_list_srf(&select.projection)
+}
+
+fn normalize_query_offset_limit_fetch_expressions(query: &Query) -> Query {
+    let value_to_usize = |v: Value| -> Option<usize> {
+        match v {
+            Value::Int64(n) if n >= 0 => usize::try_from(n).ok(),
+            Value::Int32(n) if n >= 0 => usize::try_from(n).ok(),
+            Value::Text(s) => s
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .and_then(|n| usize::try_from(n).ok()),
+            _ => None,
+        }
+    };
+
+    let mut q = query.clone();
+
+    if let Some(offset) = q.offset.as_mut() {
+        if let Ok(v) = eval_expr(&offset.value, None, None) {
+            if let Some(n) = value_to_usize(v) {
+                offset.value = Expr::Value(SqlValue::Number(n.to_string(), false));
+            }
+        }
+    }
+
+    if let Some(limit) = q.limit.as_mut() {
+        if let Ok(v) = eval_expr(limit, None, None) {
+            if let Some(n) = value_to_usize(v) {
+                *limit = Expr::Value(SqlValue::Number(n.to_string(), false));
+            }
+        }
+    }
+
+    if let Some(fetch) = q.fetch.as_mut() {
+        if let Some(quantity) = fetch.quantity.as_mut() {
+            if let Ok(v) = eval_expr(quantity, None, None) {
+                if let Some(n) = value_to_usize(v) {
+                    *quantity = Expr::Value(SqlValue::Number(n.to_string(), false));
+                }
+            }
+        }
+    }
+
+    q
+}
+
+fn plan_generate_series_offset_limit_pushdown(
+    query: &Query,
+    select: &sqlparser::ast::Select,
+) -> GenerateSeriesOffsetLimitPushdownPlan {
+    if !generate_series_offset_limit_pushdown_eligible(query, select) {
+        return GenerateSeriesOffsetLimitPushdownPlan {
+            offset: 0,
+            limit: None,
+            clear_query_offset_limit_fetch: false,
+        };
+    }
+
+    let value_to_usize = |v: Value| -> Option<usize> {
+        match v {
+            Value::Int64(n) if n >= 0 => usize::try_from(n).ok(),
+            Value::Int32(n) if n >= 0 => usize::try_from(n).ok(),
+            Value::Text(s) => s
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .and_then(|n| usize::try_from(n).ok()),
+            _ => None,
+        }
+    };
+
+    let mut offset = 0usize;
+    if let Some(offset_expr) = &query.offset {
+        if let Ok(v) = eval_expr(&offset_expr.value, None, None) {
+            offset = value_to_usize(v).unwrap_or(0);
+        }
+    }
+
+    let mut limit_n = usize::MAX;
+    if let Some(limit_expr) = &query.limit {
+        if let Ok(v) = eval_expr(limit_expr, None, None) {
+            limit_n = value_to_usize(v).unwrap_or(usize::MAX);
+        }
+    }
+
+    let mut fetch_n = usize::MAX;
+    if let Some(fetch) = &query.fetch {
+        if let Some(quantity) = &fetch.quantity {
+            if let Ok(v) = eval_expr(quantity, None, None) {
+                fetch_n = value_to_usize(v).unwrap_or(1);
+            }
+        } else {
+            fetch_n = 1;
+        }
+    }
+
+    let effective_limit = limit_n.min(fetch_n);
+
+    // OFFSET pushdown is only safe when the projection is trivial, because SQL applies
+    // OFFSET after projection and skipped rows must still be evaluated (errors/side effects).
+    // Keep this conservative: only allow OFFSET pushdown for identifiers / wildcards /
+    // literal values.
+    let offset_pushdown_safe = offset == 0 || projection_is_trivial(&select.projection);
+
+    if offset > 0 && !offset_pushdown_safe {
+        let limit = if effective_limit == usize::MAX {
+            None
+        } else {
+            Some(offset.saturating_add(effective_limit))
+        };
+        return GenerateSeriesOffsetLimitPushdownPlan {
+            offset: 0,
+            limit,
+            clear_query_offset_limit_fetch: false,
+        };
+    }
+
+    let limit = if effective_limit == usize::MAX {
+        None
+    } else {
+        Some(effective_limit)
+    };
+    GenerateSeriesOffsetLimitPushdownPlan {
+        offset,
+        limit,
+        clear_query_offset_limit_fetch: offset != 0 || limit.is_some(),
+    }
+}
+
 const JOIN_LOCKING_CLAUSE_UNSUPPORTED: &str =
     "SELECT ... FOR UPDATE/SHARE with JOIN or multiple FROM items is not supported yet";
 
@@ -200,6 +423,8 @@ impl Executor {
             return Ok(result);
         }
 
+        let mut generate_series_offset_limit_pushed_down = false;
+        let mut query_with_evaluated_offset_limit_fetch: Option<Query> = None;
         let (t, outer_alias, schema, all_rows_base, is_virtual, rows_loaded) =
             match &select.from[0].relation {
             TableFactor::Table {
@@ -215,8 +440,24 @@ impl Executor {
                             .as_ref()
                             .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| obj_name.clone());
+                        let query_for_pushdown = if generate_series_offset_limit_pushdown_eligible(query, select) {
+                            query_with_evaluated_offset_limit_fetch =
+                                Some(normalize_query_offset_limit_fetch_expressions(query));
+                            query_with_evaluated_offset_limit_fetch.as_ref().unwrap()
+                        } else {
+                            query
+                        };
+                        let pushdown = plan_generate_series_offset_limit_pushdown(
+                            query_for_pushdown,
+                            select,
+                        );
+                        let offset = pushdown.offset;
+                        let limit = pushdown.limit;
+                        generate_series_offset_limit_pushed_down =
+                            pushdown.clear_query_offset_limit_fetch;
+
                         let (schema, rows) = self
-                            .execute_generate_series(func_args, &als, alias.as_ref())
+                            .execute_generate_series(func_args, &als, alias.as_ref(), offset, limit)
                             .await?;
                         (schema.name.clone(), als, schema, rows, true, true)
                     } else {
@@ -954,7 +1195,21 @@ impl Executor {
             result_rows = dedup_rows(result_rows);
         }
 
-        result_rows = apply_offset_limit_fetch(result_rows, query);
+        let query_base_for_offset_limit_fetch =
+            query_with_evaluated_offset_limit_fetch.as_ref().unwrap_or(query);
+        let query_no_offset_limit = if generate_series_offset_limit_pushed_down {
+            let mut q = query_base_for_offset_limit_fetch.clone();
+            q.offset = None;
+            q.limit = None;
+            q.fetch = None;
+            Some(q)
+        } else {
+            None
+        };
+        let query_for_offset_limit_fetch = query_no_offset_limit
+            .as_ref()
+            .unwrap_or(query_base_for_offset_limit_fetch);
+        result_rows = apply_offset_limit_fetch(result_rows, query_for_offset_limit_fetch);
 
         let column_types = Some(
             select
@@ -2472,9 +2727,20 @@ fn expr_matches(pattern: &Expr, target: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
 
     fn ident(name: &str) -> Expr {
         Expr::Identifier(sqlparser::ast::Ident::new(name))
+    }
+
+    fn parse_query(sql: &str) -> Box<Query> {
+        let dialect = PostgreSqlDialect {};
+        let mut statements = Parser::parse_sql(&dialect, sql).unwrap();
+        match statements.remove(0) {
+            sqlparser::ast::Statement::Query(q) => q,
+            other => panic!("expected query, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2526,5 +2792,139 @@ mod tests {
         assert!(sets.iter().any(|s| s.is_empty()));
         assert!(sets.iter().any(|s| s.len() == 2));
         assert!(sets.iter().any(|s| s.len() == 3));
+    }
+
+    #[test]
+    fn generate_series_pushdown_is_disabled_with_select_list_srf() {
+        let query = parse_query(
+            "SELECT unnest(ARRAY[1,2]) FROM generate_series(1, 10) LIMIT 1",
+        );
+        let SetExpr::Select(select) = &*query.body else {
+            panic!("expected SELECT");
+        };
+
+        let plan = plan_generate_series_offset_limit_pushdown(query.as_ref(), select.as_ref());
+        assert_eq!(
+            plan,
+            GenerateSeriesOffsetLimitPushdownPlan {
+                offset: 0,
+                limit: None,
+                clear_query_offset_limit_fetch: false,
+            }
+        );
+    }
+
+    #[test]
+    fn generate_series_offset_is_not_pushed_down_with_volatile_projection() {
+        let query = parse_query(
+            "SELECT nextval('s') FROM generate_series(1, 100) OFFSET 10 LIMIT 5",
+        );
+        let SetExpr::Select(select) = &*query.body else {
+            panic!("expected SELECT");
+        };
+
+        let plan = plan_generate_series_offset_limit_pushdown(query.as_ref(), select.as_ref());
+        assert_eq!(
+            plan,
+            GenerateSeriesOffsetLimitPushdownPlan {
+                offset: 0,
+                limit: Some(15),
+                clear_query_offset_limit_fetch: false,
+            }
+        );
+    }
+
+    #[test]
+    fn generate_series_offset_is_not_pushed_down_with_nontrivial_projection() {
+        let query = parse_query(
+            "SELECT 1/(n-1) FROM generate_series(1, 100) AS g(n) OFFSET 10 LIMIT 5",
+        );
+        let SetExpr::Select(select) = &*query.body else {
+            panic!("expected SELECT");
+        };
+
+        let plan = plan_generate_series_offset_limit_pushdown(query.as_ref(), select.as_ref());
+        assert_eq!(
+            plan,
+            GenerateSeriesOffsetLimitPushdownPlan {
+                offset: 0,
+                limit: Some(15),
+                clear_query_offset_limit_fetch: false,
+            }
+        );
+    }
+
+    #[test]
+    fn generate_series_offset_limit_are_pushed_down_for_simple_projection() {
+        let query = parse_query("SELECT * FROM generate_series(1, 100) OFFSET 10 LIMIT 5");
+        let SetExpr::Select(select) = &*query.body else {
+            panic!("expected SELECT");
+        };
+
+        let plan = plan_generate_series_offset_limit_pushdown(query.as_ref(), select.as_ref());
+        assert_eq!(
+            plan,
+            GenerateSeriesOffsetLimitPushdownPlan {
+                offset: 10,
+                limit: Some(5),
+                clear_query_offset_limit_fetch: true,
+            }
+        );
+    }
+
+    #[test]
+    fn generate_series_limit_is_pushed_down_without_offset() {
+        let query = parse_query("SELECT random() FROM generate_series(1, 100) LIMIT 5");
+        let SetExpr::Select(select) = &*query.body else {
+            panic!("expected SELECT");
+        };
+
+        let plan = plan_generate_series_offset_limit_pushdown(query.as_ref(), select.as_ref());
+        assert_eq!(
+            plan,
+            GenerateSeriesOffsetLimitPushdownPlan {
+                offset: 0,
+                limit: Some(5),
+                clear_query_offset_limit_fetch: true,
+            }
+        );
+    }
+
+    #[test]
+    fn generate_series_pushdown_normalizes_offset_limit_expressions() {
+        let query = parse_query(
+            "SELECT nextval('s') FROM generate_series(1, 100) OFFSET (txid_current() % 5 + 1) LIMIT 1",
+        );
+        let SetExpr::Select(select) = &*query.body else {
+            panic!("expected SELECT");
+        };
+
+        assert!(generate_series_offset_limit_pushdown_eligible(
+            query.as_ref(),
+            select.as_ref()
+        ));
+
+        let normalized = normalize_query_offset_limit_fetch_expressions(query.as_ref());
+        let offset_expr = &normalized.offset.as_ref().unwrap().value;
+        let Expr::Value(SqlValue::Number(n_str, _)) = offset_expr else {
+            panic!("expected numeric OFFSET expr, got {offset_expr:?}");
+        };
+        let offset_n: usize = n_str.parse().unwrap();
+
+        let plan = plan_generate_series_offset_limit_pushdown(&normalized, select.as_ref());
+        assert_eq!(
+            plan,
+            GenerateSeriesOffsetLimitPushdownPlan {
+                offset: 0,
+                limit: Some(offset_n + 1),
+                clear_query_offset_limit_fetch: false,
+            }
+        );
+
+        let rows: Vec<Row> = (0..10)
+            .map(|i| Row::new(vec![Value::Int32(i)]))
+            .collect();
+        let result = apply_offset_limit_fetch(rows, &normalized);
+        assert_eq!(result.len(), 1);
     }
 }

@@ -1164,6 +1164,8 @@ impl Executor {
         args: &[FunctionArg],
         alias_name: &str,
         table_alias: Option<&sqlparser::ast::TableAlias>,
+        offset: usize,
+        limit: Option<usize>,
     ) -> Result<(TableSchema, Vec<Row>)> {
         use super::super::expr::eval_expr;
 
@@ -1186,7 +1188,15 @@ impl Executor {
             Value::Null
         };
 
-        let (values, data_type) = generate_series_values(&start_val, &stop_val, &step_val)?;
+        let max_rows = max_generate_series_rows();
+        let (values, data_type) = generate_series_values_limited(
+            &start_val,
+            &stop_val,
+            &step_val,
+            offset,
+            limit,
+            max_rows,
+        )?;
 
         let col_name = if let Some(ta) = table_alias {
             if !ta.columns.is_empty() {
@@ -1399,7 +1409,7 @@ impl Executor {
                     if tbl_upper == "GENERATE_SERIES" {
                         if let Some(func_args) = args {
                             let (schema, rows) = self
-                                .execute_generate_series(func_args, &als, alias.as_ref())
+                                .execute_generate_series(func_args, &als, alias.as_ref(), 0, None)
                                 .await?;
                             return Ok((als, schema, rows));
                         } else {
@@ -1811,7 +1821,7 @@ impl Executor {
                     if tbl_upper == "GENERATE_SERIES" {
                         if let Some(func_args) = args {
                             let (schema, rows) = self
-                                .execute_generate_series(func_args, &als, alias.as_ref())
+                                .execute_generate_series(func_args, &als, alias.as_ref(), 0, None)
                                 .await?;
                             (als, schema, rows)
                         } else {
@@ -1892,7 +1902,7 @@ impl Executor {
                         if tbl_upper == "GENERATE_SERIES" {
                             if let Some(func_args) = args {
                                 let (schema, rows) = self
-                                    .execute_generate_series(func_args, &als, alias.as_ref())
+                                    .execute_generate_series(func_args, &als, alias.as_ref(), 0, None)
                                     .await?;
                                 (als, schema, rows)
                             } else {
@@ -2526,7 +2536,7 @@ impl Executor {
                     if tbl_upper == "GENERATE_SERIES" {
                         if let Some(func_args) = args {
                             let (schema, rows) = self
-                                .execute_generate_series(func_args, &als, alias.as_ref())
+                                .execute_generate_series(func_args, &als, alias.as_ref(), 0, None)
                                 .await?;
                             (als, schema, rows)
                         } else {
@@ -4090,37 +4100,95 @@ impl Executor {
     }
 }
 
+const DEFAULT_MAX_GENERATE_SERIES_ROWS: usize = 1_000_000;
+const FLOAT8_OFFSET_ADVANCE_MAX_ITER: usize = 1024;
+
+fn max_generate_series_rows() -> usize {
+    std::env::var("PGTIKV_MAX_GENERATE_SERIES_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_GENERATE_SERIES_ROWS)
+}
+
 fn generate_series_values(
     start: &Value,
     stop: &Value,
     step: &Value,
 ) -> Result<(Vec<Value>, DataType)> {
+    generate_series_values_limited(start, stop, step, 0, None, usize::MAX)
+}
+
+fn generate_series_values_limited(
+    start: &Value,
+    stop: &Value,
+    step: &Value,
+    offset: usize,
+    limit: Option<usize>,
+    max_rows: usize,
+) -> Result<(Vec<Value>, DataType)> {
+    let too_many_rows = || {
+        anyhow!(
+            "generate_series exceeded max rows ({}); set PGTIKV_MAX_GENERATE_SERIES_ROWS to override",
+            max_rows
+        )
+    };
+
+    let mut remaining = limit.unwrap_or(usize::MAX);
+
     match (start, stop) {
-        (Value::Int32(s), Value::Int32(e)) => {
-            let step_val = match step {
-                Value::Null => 1,
-                Value::Int32(st) => *st,
-                Value::Int64(st) => i32::try_from(*st)
-                    .map_err(|_| anyhow!("step out of range for integer generate_series"))?,
-                _ => return Err(anyhow!("Invalid step type for integer generate_series")),
-            };
+	        (Value::Int32(s), Value::Int32(e)) => {
+	            let step_val = match step {
+	                Value::Null => 1,
+	                Value::Int32(st) => *st,
+	                Value::Int64(st) => i32::try_from(*st)
+	                    .map_err(|_| anyhow!("step out of range for integer generate_series"))?,
+	                _ => return Err(anyhow!("Invalid step type for integer generate_series")),
+	            };
             if step_val == 0 {
                 return Err(anyhow!("step size cannot equal zero"));
             }
+            if remaining == 0 {
+                return Ok((Vec::new(), DataType::Int32));
+            }
+
+	            let mut current = *s;
+	            if offset > 0 {
+	                let offset_i128 = offset as i128;
+	                let delta_i128 = i128::from(step_val) * offset_i128;
+	                let current_i128 = i128::from(*s) + delta_i128;
+	                let Ok(cur) = i32::try_from(current_i128) else {
+	                    return Ok((Vec::new(), DataType::Int32));
+	                };
+	                current = cur;
+	            }
+
             let mut values = Vec::new();
             if step_val > 0 {
-                let mut current = *s;
                 while current <= *e {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     values.push(Value::Int32(current));
+                    remaining = remaining.saturating_sub(1);
                     current = match current.checked_add(step_val) {
                         Some(next) => next,
                         None => break,
                     };
                 }
             } else {
-                let mut current = *s;
                 while current >= *e {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     values.push(Value::Int32(current));
+                    remaining = remaining.saturating_sub(1);
                     current = match current.checked_add(step_val) {
                         Some(next) => next,
                         None => break,
@@ -4129,30 +4197,57 @@ fn generate_series_values(
             }
             Ok((values, DataType::Int32))
         }
-        (Value::Int64(s), Value::Int64(e)) => {
-            let step_val = match step {
-                Value::Null => 1i64,
-                Value::Int32(st) => *st as i64,
-                Value::Int64(st) => *st,
-                _ => return Err(anyhow!("Invalid step type for bigint generate_series")),
-            };
+	        (Value::Int64(s), Value::Int64(e)) => {
+	            let step_val = match step {
+	                Value::Null => 1i64,
+	                Value::Int32(st) => *st as i64,
+	                Value::Int64(st) => *st,
+	                _ => return Err(anyhow!("Invalid step type for bigint generate_series")),
+	            };
             if step_val == 0 {
                 return Err(anyhow!("step size cannot equal zero"));
             }
+            if remaining == 0 {
+                return Ok((Vec::new(), DataType::Int64));
+            }
+
+	            let mut current = *s;
+	            if offset > 0 {
+	                let offset_i128 = offset as i128;
+	                let delta_i128 = i128::from(step_val) * offset_i128;
+	                let current_i128 = i128::from(*s) + delta_i128;
+	                let Ok(cur) = i64::try_from(current_i128) else {
+	                    return Ok((Vec::new(), DataType::Int64));
+	                };
+	                current = cur;
+	            }
+
             let mut values = Vec::new();
             if step_val > 0 {
-                let mut current = *s;
                 while current <= *e {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     values.push(Value::Int64(current));
+                    remaining = remaining.saturating_sub(1);
                     current = match current.checked_add(step_val) {
                         Some(next) => next,
                         None => break,
                     };
                 }
             } else {
-                let mut current = *s;
                 while current >= *e {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     values.push(Value::Int64(current));
+                    remaining = remaining.saturating_sub(1);
                     current = match current.checked_add(step_val) {
                         Some(next) => next,
                         None => break,
@@ -4161,7 +4256,7 @@ fn generate_series_values(
             }
             Ok((values, DataType::Int64))
         }
-        (Value::Int32(_), Value::Int64(_)) | (Value::Int64(_), Value::Int32(_)) => {
+	        (Value::Int32(_), Value::Int64(_)) | (Value::Int64(_), Value::Int32(_)) => {
             let s64 = match start {
                 Value::Int32(v) => *v as i64,
                 Value::Int64(v) => *v,
@@ -4181,20 +4276,47 @@ fn generate_series_values(
             if step_val == 0 {
                 return Err(anyhow!("step size cannot equal zero"));
             }
+            if remaining == 0 {
+                return Ok((Vec::new(), DataType::Int64));
+            }
+
+	            let mut current = s64;
+	            if offset > 0 {
+	                let offset_i128 = offset as i128;
+	                let delta_i128 = i128::from(step_val) * offset_i128;
+	                let current_i128 = i128::from(s64) + delta_i128;
+	                let Ok(cur) = i64::try_from(current_i128) else {
+	                    return Ok((Vec::new(), DataType::Int64));
+	                };
+	                current = cur;
+	            }
+
             let mut values = Vec::new();
             if step_val > 0 {
-                let mut current = s64;
                 while current <= e64 {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     values.push(Value::Int64(current));
+                    remaining = remaining.saturating_sub(1);
                     current = match current.checked_add(step_val) {
                         Some(next) => next,
                         None => break,
                     };
                 }
             } else {
-                let mut current = s64;
                 while current >= e64 {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     values.push(Value::Int64(current));
+                    remaining = remaining.saturating_sub(1);
                     current = match current.checked_add(step_val) {
                         Some(next) => next,
                         None => break,
@@ -4214,11 +4336,114 @@ fn generate_series_values(
             if step_val == 0.0 {
                 return Err(anyhow!("step size cannot equal zero"));
             }
-            let mut values = Vec::new();
+
+            if remaining == 0 {
+                return Ok((Vec::new(), DataType::Float64));
+            }
+
+            let mut current = *s;
+            if offset > 0 {
+                if !step_val.is_finite() {
+                    return Ok((Vec::new(), DataType::Float64));
+                }
+                if offset <= FLOAT8_OFFSET_ADVANCE_MAX_ITER {
+                    if step_val > 0.0 {
+                        for _ in 0..offset {
+                            if current > *e + f64::EPSILON {
+                                return Ok((Vec::new(), DataType::Float64));
+                            }
+                            if current >= *e {
+                                return Ok((Vec::new(), DataType::Float64));
+                            }
+                            let next = current + step_val;
+                            if next == current {
+                                return Err(anyhow!(
+                                    "generate_series step is too small to make progress for float8"
+                                ));
+                            }
+                            current = next;
+                        }
+                    } else {
+                        for _ in 0..offset {
+                            if current < *e - f64::EPSILON {
+                                return Ok((Vec::new(), DataType::Float64));
+                            }
+                            if current <= *e {
+                                return Ok((Vec::new(), DataType::Float64));
+                            }
+                            let next = current + step_val;
+                            if next == current {
+                                return Err(anyhow!(
+                                    "generate_series step is too small to make progress for float8"
+                                ));
+                            }
+                            current = next;
+                        }
+                    }
+	                } else {
+	                    if step_val > 0.0 {
+	                        if current < *e {
+	                            let next = current + step_val;
+	                            if next == current {
+	                                return Err(anyhow!(
+	                                    "generate_series step is too small to make progress for float8"
+	                                ));
+	                            }
+	                        }
+	                    } else {
+	                        if current > *e {
+	                            let next = current + step_val;
+	                            if next == current {
+	                                return Err(anyhow!(
+	                                    "generate_series step is too small to make progress for float8"
+	                                ));
+	                            }
+	                        }
+	                    }
+
+	                    let prev = step_val.mul_add((offset - 1) as f64, current);
+	                    if step_val > 0.0 {
+	                        if prev >= *e {
+	                            return Ok((Vec::new(), DataType::Float64));
+	                        }
+                    } else {
+                        if prev <= *e {
+                            return Ok((Vec::new(), DataType::Float64));
+                        }
+                    }
+
+                    current = step_val.mul_add(offset as f64, current);
+                    if step_val > 0.0 {
+                        if current > *e + f64::EPSILON {
+                            return Ok((Vec::new(), DataType::Float64));
+                        }
+                    } else {
+                        if current < *e - f64::EPSILON {
+                            return Ok((Vec::new(), DataType::Float64));
+                        }
+                    }
+                }
+            }
+
             if step_val > 0.0 {
-                let mut current = *s;
+                if current < *e {
+                    let next = current + step_val;
+                    if next == current {
+                        return Err(anyhow!(
+                            "generate_series step is too small to make progress for float8"
+                        ));
+                    }
+                }
+                let mut values = Vec::new();
                 while current <= *e + f64::EPSILON {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     values.push(Value::Float64(current));
+                    remaining = remaining.saturating_sub(1);
                     if current >= *e {
                         break;
                     }
@@ -4230,10 +4455,26 @@ fn generate_series_values(
                     }
                     current = next;
                 }
+                Ok((values, DataType::Float64))
             } else {
-                let mut current = *s;
+                if current > *e {
+                    let next = current + step_val;
+                    if next == current {
+                        return Err(anyhow!(
+                            "generate_series step is too small to make progress for float8"
+                        ));
+                    }
+                }
+                let mut values = Vec::new();
                 while current >= *e - f64::EPSILON {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     values.push(Value::Float64(current));
+                    remaining = remaining.saturating_sub(1);
                     if current <= *e {
                         break;
                     }
@@ -4245,10 +4486,10 @@ fn generate_series_values(
                     }
                     current = next;
                 }
+                Ok((values, DataType::Float64))
             }
-            Ok((values, DataType::Float64))
         }
-        (Value::Timestamp(s), Value::Timestamp(e)) => {
+	        (Value::Timestamp(s), Value::Timestamp(e)) => {
             let step_interval = match step {
                 Value::Interval(iv) => iv.clone(),
                 _ => {
@@ -4261,20 +4502,48 @@ fn generate_series_values(
             if step_ms == 0 {
                 return Err(anyhow!("step size cannot equal zero"));
             }
+
+            if remaining == 0 {
+                return Ok((Vec::new(), DataType::Timestamp));
+            }
+
+	            let mut current = *s;
+	            if offset > 0 {
+	                let offset_i128 = offset as i128;
+	                let delta_i128 = i128::from(step_ms) * offset_i128;
+	                let current_i128 = i128::from(*s) + delta_i128;
+	                let Ok(cur) = i64::try_from(current_i128) else {
+	                    return Ok((Vec::new(), DataType::Timestamp));
+	                };
+	                current = cur;
+	            }
+
             let mut values = Vec::new();
             if step_ms > 0 {
-                let mut current = *s;
                 while current <= *e {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     values.push(Value::Timestamp(current));
+                    remaining = remaining.saturating_sub(1);
                     current = match current.checked_add(step_ms) {
                         Some(next) => next,
                         None => break,
                     };
                 }
             } else {
-                let mut current = *s;
                 while current >= *e {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     values.push(Value::Timestamp(current));
+                    remaining = remaining.saturating_sub(1);
                     current = match current.checked_add(step_ms) {
                         Some(next) => next,
                         None => break,
@@ -4283,7 +4552,7 @@ fn generate_series_values(
             }
             Ok((values, DataType::Timestamp))
         }
-        (Value::Date(s), Value::Date(e)) => {
+	        (Value::Date(s), Value::Date(e)) => {
             let step_interval = match step {
                 Value::Interval(iv) => iv.clone(),
                 _ => return Err(anyhow!("generate_series with dates requires interval step")),
@@ -4292,13 +4561,34 @@ fn generate_series_values(
             if step_days == 0 {
                 return Err(anyhow!("step size cannot equal zero"));
             }
+
+            if remaining == 0 {
+                return Ok((Vec::new(), DataType::TimestampTz));
+            }
+
+	            let mut current = *s;
+	            if offset > 0 {
+	                let offset_i128 = offset as i128;
+	                let delta_i128 = i128::from(step_days) * offset_i128;
+	                let current_i128 = i128::from(*s) + delta_i128;
+	                let Ok(cur_i32) = i32::try_from(current_i128) else {
+	                    return Ok((Vec::new(), DataType::TimestampTz));
+	                };
+	                current = cur_i32;
+	            }
+
             let mut values = Vec::new();
             let tz = crate::types::timestamp::TimeZoneSpec::parse(
                 crate::session_context::current_timezone().as_ref(),
             );
             if step_days > 0 {
-                let mut current = *s;
                 while current <= *e {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     let date = crate::types::date::date_days_to_naive_date(current)?;
                     let naive = date
                         .and_hms_opt(0, 0, 0)
@@ -4306,14 +4596,20 @@ fn generate_series_values(
                     values.push(Value::Timestamp(
                         tz.timestamp_millis_from_local_datetime(naive)?,
                     ));
+                    remaining = remaining.saturating_sub(1);
                     current = match current.checked_add(step_days) {
                         Some(next) => next,
                         None => break,
                     };
                 }
             } else {
-                let mut current = *s;
                 while current >= *e {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     let date = crate::types::date::date_days_to_naive_date(current)?;
                     let naive = date
                         .and_hms_opt(0, 0, 0)
@@ -4321,6 +4617,7 @@ fn generate_series_values(
                     values.push(Value::Timestamp(
                         tz.timestamp_millis_from_local_datetime(naive)?,
                     ));
+                    remaining = remaining.saturating_sub(1);
                     current = match current.checked_add(step_days) {
                         Some(next) => next,
                         None => break,
@@ -4345,11 +4642,42 @@ fn generate_series_values(
             if step_val.is_zero() {
                 return Err(anyhow!("step size cannot equal zero"));
             }
+
+            let data_type = DataType::Numeric {
+                precision: None,
+                scale: None,
+            };
+
+            if remaining == 0 {
+                return Ok((Vec::new(), data_type));
+            }
+
+            let mut current = *s;
+            if offset > 0 {
+                let Ok(offset_i128) = i128::try_from(offset) else {
+                    return Ok((Vec::new(), data_type));
+                };
+                let offset_dec = rust_decimal::Decimal::from_i128_with_scale(offset_i128, 0);
+                let Some(delta) = step_val.checked_mul(offset_dec) else {
+                    return Ok((Vec::new(), data_type));
+                };
+                let Some(cur) = current.checked_add(delta) else {
+                    return Ok((Vec::new(), data_type));
+                };
+                current = cur;
+            }
+
             let mut values = Vec::new();
             if step_val > rust_decimal::Decimal::ZERO {
-                let mut current = *s;
                 while current <= *e {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     values.push(Value::Numeric(current));
+                    remaining = remaining.saturating_sub(1);
                     if current == *e {
                         break;
                     }
@@ -4359,9 +4687,15 @@ fn generate_series_values(
                     };
                 }
             } else {
-                let mut current = *s;
                 while current >= *e {
+                    if remaining == 0 {
+                        break;
+                    }
+                    if values.len() >= max_rows {
+                        return Err(too_many_rows());
+                    }
                     values.push(Value::Numeric(current));
+                    remaining = remaining.saturating_sub(1);
                     if current == *e {
                         break;
                     }
@@ -4371,13 +4705,7 @@ fn generate_series_values(
                     };
                 }
             }
-            Ok((
-                values,
-                DataType::Numeric {
-                    precision: None,
-                    scale: None,
-                },
-            ))
+            Ok((values, data_type))
         }
         _ => Err(anyhow!(
             "generate_series requires numeric or timestamp arguments, got {:?} and {:?}",
@@ -4616,6 +4944,98 @@ mod tests {
     }
 
     #[test]
+    fn generate_series_limited_applies_offset_limit_int32() {
+        let (values, ty) = generate_series_values_limited(
+            &Value::Int32(1),
+            &Value::Int32(10),
+            &Value::Null,
+            2,
+            Some(3),
+            100,
+        )
+        .unwrap();
+        assert_eq!(ty, DataType::Int32);
+        assert_eq!(
+            values,
+            vec![Value::Int32(3), Value::Int32(4), Value::Int32(5)]
+        );
+    }
+
+    #[test]
+    fn generate_series_limited_large_offset_is_fast_and_correct() {
+        let (values, ty) = generate_series_values_limited(
+            &Value::Int32(1),
+            &Value::Int32(1_000_000_000),
+            &Value::Null,
+            999_999_999,
+            Some(1),
+            10,
+        )
+        .unwrap();
+        assert_eq!(ty, DataType::Int32);
+        assert_eq!(values, vec![Value::Int32(1_000_000_000)]);
+    }
+
+    #[test]
+    fn generate_series_limited_large_offset_is_fast_and_correct_float8() {
+        let (values, ty) = generate_series_values_limited(
+            &Value::Float64(1.0),
+            &Value::Float64(1e16),
+            &Value::Float64(1.0),
+            1_000_000_000,
+            Some(1),
+            10,
+        )
+        .unwrap();
+        assert_eq!(ty, DataType::Float64);
+        assert_eq!(values, vec![Value::Float64(1_000_000_001.0)]);
+    }
+
+    #[test]
+    fn generate_series_limited_large_offset_beyond_range_float8_returns_empty() {
+        let (values, ty) = generate_series_values_limited(
+            &Value::Float64(0.0),
+            &Value::Float64(1e-16),
+            &Value::Float64(1e-19),
+            2000,
+            Some(1),
+            10,
+        )
+        .unwrap();
+        assert_eq!(ty, DataType::Float64);
+        assert!(values.is_empty());
+    }
+
+    #[test]
+    fn generate_series_limited_enforces_max_rows() {
+        let err = generate_series_values_limited(
+            &Value::Int32(1),
+            &Value::Int32(100),
+            &Value::Null,
+            0,
+            None,
+            10,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("exceeded max rows"));
+    }
+
+    #[test]
+    fn generate_series_limited_limit_avoids_max_rows_error() {
+        let (values, ty) = generate_series_values_limited(
+            &Value::Int32(1),
+            &Value::Int32(1_000_000_000),
+            &Value::Null,
+            0,
+            Some(1),
+            10,
+        )
+        .unwrap();
+        assert_eq!(ty, DataType::Int32);
+        assert_eq!(values, vec![Value::Int32(1)]);
+    }
+
+    #[test]
     fn generate_series_int32_step_out_of_range_errors() {
         let err = generate_series_values(
             &Value::Int32(1),
@@ -4627,10 +5047,10 @@ mod tests {
     }
 
     #[test]
-    fn generate_series_int64_edge_overflow_does_not_loop() {
-        let (values, ty) = generate_series_values(
-            &Value::Int64(i64::MAX - 1),
-            &Value::Int64(i64::MAX),
+	    fn generate_series_int64_edge_overflow_does_not_loop() {
+	        let (values, ty) = generate_series_values(
+	            &Value::Int64(i64::MAX - 1),
+	            &Value::Int64(i64::MAX),
             &Value::Int64(1),
         )
         .unwrap();
@@ -4647,16 +5067,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ty, DataType::Int64);
-        assert_eq!(
-            values,
-            vec![Value::Int64(i64::MIN + 1), Value::Int64(i64::MIN)]
-        );
-    }
+	        assert_eq!(
+	            values,
+	            vec![Value::Int64(i64::MIN + 1), Value::Int64(i64::MIN)]
+	        );
+	    }
 
-    #[test]
-    fn generate_series_timestamp_overflow_does_not_loop() {
-        let (values, ty) = generate_series_values(
-            &Value::Timestamp(1),
+	    #[test]
+	    #[cfg(target_pointer_width = "64")]
+	    fn generate_series_limited_offset_mul_overflow_still_returns_rows() {
+	        let (values, ty) = generate_series_values_limited(
+	            &Value::Int64(-9_000_000_000_000_000_000i64),
+	            &Value::Int64(9_000_000_000_000_000_000i64),
+	            &Value::Int64(2),
+	            5_000_000_000_000_000_000usize,
+	            Some(1),
+	            10,
+	        )
+	        .unwrap();
+	        assert_eq!(ty, DataType::Int64);
+	        assert_eq!(values, vec![Value::Int64(1_000_000_000_000_000_000i64)]);
+	    }
+
+	    #[test]
+	    fn generate_series_timestamp_overflow_does_not_loop() {
+	        let (values, ty) = generate_series_values(
+	            &Value::Timestamp(1),
             &Value::Timestamp(1),
             &Value::Interval(crate::types::IntervalValue::from_millis(i64::MAX)),
         )
@@ -4695,8 +5131,54 @@ mod tests {
     }
 
     #[test]
-    fn generate_series_numeric_max_does_not_panic_or_loop() {
-        use std::str::FromStr;
+    fn generate_series_limited_offset_matches_non_pushdown_float8() {
+        let start = Value::Float64(0.0);
+        let stop = Value::Float64(2.0);
+        let step = Value::Float64(0.1);
+
+        let (all, all_ty) = generate_series_values(&start, &stop, &step).unwrap();
+        assert_eq!(all_ty, DataType::Float64);
+
+        let offset = 10;
+        let limit = 3;
+        let (limited, limited_ty) =
+            generate_series_values_limited(&start, &stop, &step, offset, Some(limit), 100).unwrap();
+        assert_eq!(limited_ty, DataType::Float64);
+
+        assert_eq!(limited, all[offset..offset + limit].to_vec());
+    }
+
+    #[test]
+	    fn generate_series_float8_progress_guard_errors_even_with_limit() {
+	        let err = generate_series_values_limited(
+	            &Value::Float64(1e16),
+	            &Value::Float64(1e16 + 1e6),
+	            &Value::Float64(1.0),
+	            0,
+	            Some(1),
+	            10,
+	        )
+	        .unwrap_err();
+	        assert!(err.to_string().contains("too small to make progress"));
+	    }
+
+	    #[test]
+	    fn generate_series_float8_progress_guard_errors_even_with_large_offset() {
+	        let err = generate_series_values_limited(
+	            &Value::Float64(1e16),
+	            &Value::Float64(1e16 + 1e6),
+	            &Value::Float64(1.0),
+	            999_998,
+	            Some(1),
+	            10,
+	        )
+	        .unwrap_err();
+	        assert!(err.to_string().contains("too small to make progress"));
+	    }
+
+	    #[test]
+	    fn generate_series_numeric_max_does_not_panic_or_loop() {
+	        use std::str::FromStr;
 
         let max = rust_decimal::Decimal::from_str("79228162514264337593543950335").unwrap();
         let (values, ty) = generate_series_values(
