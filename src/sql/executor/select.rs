@@ -23,6 +23,16 @@ use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
 use tracing::debug;
 
+const JOIN_LOCKING_CLAUSE_UNSUPPORTED: &str =
+    "SELECT ... FOR UPDATE/SHARE with JOIN or multiple FROM items is not supported yet";
+
+fn ensure_no_locking_clauses_for_join(query: &Query) -> Result<()> {
+    if query.locks.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(JOIN_LOCKING_CLAUSE_UNSUPPORTED))
+}
+
 impl Executor {
     pub(crate) fn execute_query_with_outer_ctes<'a>(
         &'a self,
@@ -147,6 +157,7 @@ impl Executor {
         let has_joins = !select.from[0].joins.is_empty() || select.from.len() > 1;
 
         if has_joins {
+            ensure_no_locking_clauses_for_join(query)?;
             if Self::is_simple_join_operator_query(query, select) {
                 if let Some(result) = self
                     .try_execute_simple_join_with_operators(
@@ -2345,6 +2356,53 @@ impl Executor {
             .await?;
 
         Ok(Some(result))
+    }
+}
+
+#[cfg(test)]
+mod join_locking_clause_tests {
+    use super::*;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse_query(sql: &str) -> Query {
+        let dialect = PostgreSqlDialect {};
+        let mut statements = Parser::parse_sql(&dialect, sql).expect("parse SQL");
+        assert_eq!(statements.len(), 1);
+        match statements.remove(0) {
+            sqlparser::ast::Statement::Query(query) => *query,
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_for_update_on_join_queries() {
+        let query = parse_query(
+            "SELECT a.* FROM a JOIN b ON b.a_id = a.id WHERE a.id = 1 FOR UPDATE",
+        );
+        let select = match &*query.body {
+            SetExpr::Select(select) => select,
+            other => panic!("expected Select, got {other:?}"),
+        };
+        let has_joins = !select.from[0].joins.is_empty() || select.from.len() > 1;
+        assert!(has_joins);
+
+        let err = ensure_no_locking_clauses_for_join(&query).unwrap_err();
+        assert_eq!(err.to_string(), JOIN_LOCKING_CLAUSE_UNSUPPORTED);
+    }
+
+    #[test]
+    fn allows_join_queries_without_locking_clauses() {
+        let query =
+            parse_query("SELECT a.* FROM a JOIN b ON b.a_id = a.id WHERE a.id = 1");
+        let select = match &*query.body {
+            SetExpr::Select(select) => select,
+            other => panic!("expected Select, got {other:?}"),
+        };
+        let has_joins = !select.from[0].joins.is_empty() || select.from.len() > 1;
+        assert!(has_joins);
+
+        ensure_no_locking_clauses_for_join(&query).expect("no lock clauses");
     }
 }
 
