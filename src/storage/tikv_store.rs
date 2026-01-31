@@ -1314,6 +1314,32 @@ impl TikvStore {
                 txn_delete(txn, pair.into_key().into()).await?;
             }
 
+            // Remove the per-table sequence counter (used by TableId-backed sequences),
+            // but only if no sequence definition still references this table_id.
+            //
+            // `ALTER SEQUENCE ... OWNED BY NONE` preserves the sequence while leaving it
+            // backed by the historical per-table `_sys_seq_ + table_id` key.
+            let table_id = schema.table_id;
+            let has_table_id_sequence = self
+                .list_sequences(txn, db_id)
+                .await?
+                .iter()
+                .any(|def| matches!(&def.backing, SequenceBacking::TableId(id) if *id == table_id));
+            if !has_table_id_sequence {
+                let seq_key = self.key(&encode_table_sequence_value_key_v2(db_id, table_id));
+                txn_delete(txn, seq_key).await?;
+            }
+
+            // Comments are stored under name-keyed keys; ensure they do not resurrect after
+            // DROP + recreate with the same name.
+            txn_delete(
+                txn,
+                self.key(&encode_comment_table_key_v2(db_id, table_name)),
+            )
+            .await?;
+            self.delete_column_comments_for_table(txn, db_id, table_name)
+                .await?;
+
             info!("Dropped table '{}'", table_name);
             self.invalidate_table_cache(db_id).await;
             Ok(true)
