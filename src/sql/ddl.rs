@@ -986,7 +986,7 @@ pub async fn execute_create_index(
     predicate: Option<&Expr>,
     rows: Vec<Row>,
 ) -> Result<ExecuteResult> {
-    let idx_name_str = idx_name.to_lowercase();
+    let idx_name_str = idx_name.to_string();
     let tbl_name = table_name;
 
     let mut schema = store

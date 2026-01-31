@@ -1666,12 +1666,11 @@ impl Executor {
                 let index_name = name
                     .as_ref()
                     .ok_or_else(|| anyhow!("Index name required"))?;
-                let idx_name_str = index_name.0.last().unwrap().value.as_str();
                 self.execute_create_index(
                     txn,
                     db_id,
                     search_path,
-                    idx_name_str,
+                    index_name,
                     table_name,
                     using.as_ref(),
                     columns,

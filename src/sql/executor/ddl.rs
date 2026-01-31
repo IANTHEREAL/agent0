@@ -11,6 +11,57 @@ use sqlparser::ast::{
 use std::collections::HashMap;
 use tikv_client::Transaction;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropIndexResolutionError {
+    Ambiguous,
+}
+
+fn pick_drop_index_target(
+    explicit_schema: Option<&str>,
+    search_path: &[String],
+    matching_tables: &[String],
+) -> std::result::Result<Option<String>, DropIndexResolutionError> {
+    if let Some(schema) = explicit_schema {
+        let mut found: Option<&String> = None;
+        for table in matching_tables {
+            let table_schema = table.splitn(2, '.').next().unwrap_or("");
+            if table_schema != schema {
+                continue;
+            }
+            if found.is_some() {
+                return Err(DropIndexResolutionError::Ambiguous);
+            }
+            found = Some(table);
+        }
+        return Ok(found.cloned());
+    }
+
+    let schemas: Vec<&str> = if search_path.is_empty() {
+        vec!["public"]
+    } else {
+        search_path.iter().map(|s| s.as_str()).collect()
+    };
+
+    for schema in schemas {
+        let mut found: Option<&String> = None;
+        for table in matching_tables {
+            let table_schema = table.splitn(2, '.').next().unwrap_or("");
+            if table_schema != schema {
+                continue;
+            }
+            if found.is_some() {
+                return Err(DropIndexResolutionError::Ambiguous);
+            }
+            found = Some(table);
+        }
+        if let Some(table) = found {
+            return Ok(Some(table.clone()));
+        }
+    }
+
+    Ok(None)
+}
+
 impl Executor {
     pub(crate) async fn execute_create_table_as(
         &self,
@@ -98,7 +149,7 @@ impl Executor {
         txn: &mut Transaction,
         db_id: u64,
         search_path: &[String],
-        idx_name: &str,
+        idx_name: &ObjectName,
         table_name: &ObjectName,
         using: Option<&Ident>,
         columns: &[OrderByExpr],
@@ -117,6 +168,16 @@ impl Executor {
                 .await?
                 .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
         let tbl_name = resolved.full;
+        let (idx_schema_opt, idx_name_str) = names::split_object_name(idx_name)?;
+        if let Some(idx_schema) = idx_schema_opt {
+            if idx_schema != resolved.schema {
+                return Err(anyhow!(
+                    "index schema '{}' does not match table schema '{}'",
+                    idx_schema,
+                    resolved.schema
+                ));
+            }
+        }
         let schema = self
             .store()
             .get_schema(txn, db_id, &tbl_name)
@@ -134,7 +195,7 @@ impl Executor {
             &self.store(),
             txn,
             db_id,
-            idx_name,
+            &idx_name_str,
             &tbl_name,
             using,
             columns,
@@ -150,43 +211,81 @@ impl Executor {
         &self,
         txn: &mut Transaction,
         db_id: u64,
-        _search_path: &[String],
-        names: &[ObjectName],
+        search_path: &[String],
+        index_names: &[ObjectName],
         if_exists: bool,
     ) -> Result<ExecuteResult> {
         let mut last_index = String::new();
-        for name in names {
-            let idx_name = name.0.last().unwrap().value.clone();
-            let mut found = false;
+        let tables = self.store().list_tables(txn, db_id).await?;
+        for name in index_names {
+            let (schema_opt, idx_name) = names::split_object_name(name)?;
+            let explicit_schema = schema_opt.as_deref();
+            let schema_filter: Vec<&str> = match explicit_schema {
+                Some(schema) => vec![schema],
+                None => {
+                    if search_path.is_empty() {
+                        vec!["public"]
+                    } else {
+                        search_path.iter().map(|s| s.as_str()).collect()
+                    }
+                }
+            };
 
-            let tables = self.store().list_tables(txn, db_id).await?;
+            let mut matching_tables = Vec::new();
             for table_name in &tables {
-                let mut schema = match self.store().get_schema(txn, db_id, table_name).await? {
+                let table_schema = table_name.splitn(2, '.').next().unwrap_or("");
+                if !schema_filter.iter().any(|s| *s == table_schema) {
+                    continue;
+                }
+                let schema = match self.store().get_schema(txn, db_id, table_name).await? {
                     Some(s) => s,
                     None => continue,
                 };
-
-                let rows = self.scan_and_fill(txn, db_id, table_name, &schema).await?;
-                if let Some(dropped) = ddl::execute_drop_index(
-                    &self.store(),
-                    txn,
-                    db_id,
-                    &idx_name,
-                    &mut schema,
-                    table_name,
-                    rows,
-                )
-                .await?
-                {
-                    found = true;
-                    last_index = dropped;
-                    break;
+                if schema.indexes.iter().any(|i| i.name == idx_name) {
+                    matching_tables.push(table_name.clone());
                 }
             }
 
-            if !found && !if_exists {
+            let table_name = match pick_drop_index_target(explicit_schema, search_path, &matching_tables)
+            {
+                Ok(table_name) => table_name,
+                Err(DropIndexResolutionError::Ambiguous) => {
+                    return Err(anyhow!("Index '{}' is ambiguous", idx_name));
+                }
+            };
+
+            let Some(table_name) = table_name else {
+                if if_exists {
+                    continue;
+                }
                 return Err(anyhow!("Index '{}' does not exist", idx_name));
-            }
+            };
+
+            let mut schema = self
+                .store()
+                .get_schema(txn, db_id, &table_name)
+                .await?
+                .ok_or_else(|| anyhow!("Table '{}' not found", table_name))?;
+            let rows = if schema.pk_indices.is_empty() {
+                Vec::new()
+            } else {
+                self.scan_and_fill(txn, db_id, &table_name, &schema).await?
+            };
+
+            let dropped = ddl::execute_drop_index(
+                &self.store(),
+                txn,
+                db_id,
+                &idx_name,
+                &mut schema,
+                &table_name,
+                rows,
+            )
+            .await?;
+            let Some(dropped) = dropped else {
+                return Err(anyhow!("Index '{}' does not exist", idx_name));
+            };
+            last_index = dropped;
         }
         Ok(ExecuteResult::DropIndex {
             index_name: last_index,
@@ -202,5 +301,72 @@ impl Executor {
         operation: &AlterTableOperation,
     ) -> Result<ExecuteResult> {
         ddl::execute_alter_table(&self.store(), txn, db_id, search_path, name, operation).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pick_drop_index_target, DropIndexResolutionError};
+
+    #[test]
+    fn pick_drop_index_target_prefers_explicit_schema() {
+        let target = pick_drop_index_target(
+            Some("public"),
+            &["other".to_string(), "public".to_string()],
+            &["public.t".to_string(), "other.t".to_string()],
+        )
+        .unwrap();
+        assert_eq!(target.as_deref(), Some("public.t"));
+    }
+
+    #[test]
+    fn pick_drop_index_target_explicit_schema_ambiguity_errors() {
+        let err = pick_drop_index_target(
+            Some("public"),
+            &["public".to_string()],
+            &["public.t1".to_string(), "public.t2".to_string()],
+        )
+        .unwrap_err();
+        assert_eq!(err, DropIndexResolutionError::Ambiguous);
+    }
+
+    #[test]
+    fn pick_drop_index_target_uses_search_path_order() {
+        let target = pick_drop_index_target(
+            None,
+            &["public".to_string(), "other".to_string()],
+            &["other.t".to_string()],
+        )
+        .unwrap();
+        assert_eq!(target.as_deref(), Some("other.t"));
+
+        let target = pick_drop_index_target(
+            None,
+            &["public".to_string(), "other".to_string()],
+            &["other.t".to_string(), "public.t".to_string()],
+        )
+        .unwrap();
+        assert_eq!(target.as_deref(), Some("public.t"));
+    }
+
+    #[test]
+    fn pick_drop_index_target_search_path_ambiguity_errors() {
+        let err = pick_drop_index_target(
+            None,
+            &["public".to_string(), "other".to_string()],
+            &[
+                "public.t1".to_string(),
+                "public.t2".to_string(),
+                "other.t".to_string(),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err, DropIndexResolutionError::Ambiguous);
+    }
+
+    #[test]
+    fn pick_drop_index_target_defaults_to_public() {
+        let target = pick_drop_index_target(None, &[], &["other.t".to_string()]).unwrap();
+        assert!(target.is_none());
     }
 }
