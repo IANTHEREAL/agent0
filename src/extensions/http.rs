@@ -3,8 +3,8 @@ use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use reqwest::header::{CONTENT_TYPE, LOCATION};
 use reqwest::{Client, Method, Url};
-use serde::Serialize;
 use serde::ser::{SerializeSeq, Serializer};
+use serde::Serialize;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -34,9 +34,15 @@ const MAX_REQUEST_BYTES: usize = 256 * 1024;
 const MAX_REDIRECTS: usize = 3;
 
 pub(crate) enum HttpTableFunctionCall {
-    Get { url: String },
-    Head { url: String },
-    Delete { url: String },
+    Get {
+        url: String,
+    },
+    Head {
+        url: String,
+    },
+    Delete {
+        url: String,
+    },
     Post {
         url: String,
         body: String,
@@ -135,6 +141,16 @@ fn http_response_schema(name: &str) -> TableSchema {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+    }
+}
+
+pub(crate) fn table_function_schema(func_name: &str) -> Option<TableSchema> {
+    let name = func_name.trim().to_ascii_lowercase();
+    match name.as_str() {
+        "http_get" | "http_head" | "http_delete" | "http_post" | "http_put" => {
+            Some(http_response_schema(&name))
+        }
+        _ => None,
     }
 }
 
@@ -261,7 +277,9 @@ fn redirect_target(base: &Url, location: &str) -> Result<Url> {
     Ok(base.join(loc)?)
 }
 
-async fn read_response(mut resp: reqwest::Response) -> Result<(i32, Option<String>, String, String)> {
+async fn read_response(
+    mut resp: reqwest::Response,
+) -> Result<(i32, Option<String>, String, String)> {
     let status = resp.status().as_u16() as i32;
     let content_type = resp
         .headers()
@@ -277,12 +295,16 @@ async fn read_response(mut resp: reqwest::Response) -> Result<(i32, Option<Strin
         .map_err(|e| anyhow!("http: response stream error: {}", e))?
     {
         if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
-            return Err(anyhow!("http: response too large (max {} bytes)", MAX_RESPONSE_BYTES));
+            return Err(anyhow!(
+                "http: response too large (max {} bytes)",
+                MAX_RESPONSE_BYTES
+            ));
         }
         body.extend_from_slice(&chunk);
     }
 
-    let content = String::from_utf8(body).map_err(|_| anyhow!("http: response is not valid UTF-8"))?;
+    let content =
+        String::from_utf8(body).map_err(|_| anyhow!("http: response is not valid UTF-8"))?;
     Ok((status, content_type, headers_json, content))
 }
 
@@ -297,7 +319,10 @@ async fn execute_request(
     context::try_consume_http_request(MAX_REQUESTS_PER_STATEMENT)?;
 
     let semaphore = limiters().semaphore(tenant);
-    let _permit = semaphore.acquire().await.map_err(|_| anyhow!("http: limiter closed"))?;
+    let _permit = semaphore
+        .acquire()
+        .await
+        .map_err(|_| anyhow!("http: limiter closed"))?;
 
     for redirect_count in 0..=MAX_REDIRECTS {
         validate_url(&url).await?;
@@ -316,7 +341,10 @@ async fn execute_request(
             req = req.body(b.clone());
         }
 
-        let resp = req.send().await.map_err(|e| anyhow!("http: request failed: {}", e))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| anyhow!("http: request failed: {}", e))?;
 
         if follow_redirects && resp.status().is_redirection() {
             if redirect_count == MAX_REDIRECTS {
@@ -361,7 +389,9 @@ pub(crate) async fn execute_table_function(
     let (schema_name, method, url, body, content_type, follow_redirects) = match call {
         HttpTableFunctionCall::Get { url } => ("http_get", Method::GET, url, None, None, true),
         HttpTableFunctionCall::Head { url } => ("http_head", Method::HEAD, url, None, None, false),
-        HttpTableFunctionCall::Delete { url } => ("http_delete", Method::DELETE, url, None, None, true),
+        HttpTableFunctionCall::Delete { url } => {
+            ("http_delete", Method::DELETE, url, None, None, true)
+        }
         HttpTableFunctionCall::Post {
             url,
             body,
@@ -390,15 +420,8 @@ pub(crate) async fn execute_table_function(
 
     let url = Url::parse(&url).map_err(|e| anyhow!("http: invalid url: {}", e))?;
 
-    let (status, content_type_out, headers_json, content) = execute_request(
-        tenant,
-        method,
-        url,
-        body,
-        content_type,
-        follow_redirects,
-    )
-    .await?;
+    let (status, content_type_out, headers_json, content) =
+        execute_request(tenant, method, url, body, content_type, follow_redirects).await?;
 
     let schema = http_response_schema(schema_name);
     let row = Row::new(vec![
@@ -474,6 +497,9 @@ mod tests {
         let url = Url::parse("https://localhost/api").unwrap();
         let result = validate_url(&url).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("host is not allowed"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("host is not allowed"));
     }
 }

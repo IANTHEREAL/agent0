@@ -11,17 +11,16 @@ use futures::{stream, Sink, SinkExt};
 use pgwire::api::auth::{ServerParameterProvider, StartupHandler};
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::Portal;
-use pgwire::api::store::PortalStore;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
     CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
     FieldInfo, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, NoopErrorHandler, PgWireConnectionState, PgWireServerHandlers,
-    Type,
-    METADATA_DATABASE, METADATA_USER,
+    Type, METADATA_DATABASE, METADATA_USER,
 };
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
@@ -32,11 +31,13 @@ use pgwire::messages::response::{
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use sqlparser::ast::{
-    Expr, Ident, ObjectName, Query, Select, SelectItem, SetExpr, Statement, TableFactor,
-    TableWithJoins, Values,
+    Expr, FunctionArg, FunctionArgExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Query,
+    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Values,
 };
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
+use std::future::Future;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use tikv_client::Transaction;
@@ -50,6 +51,53 @@ const METADATA_ACTUAL_USER: &str = "actual_user";
 
 /// Global atomic counter for generating unique connection IDs
 static CONNECTION_ID_COUNTER: AtomicI32 = AtomicI32::new(1);
+
+tokio::task_local! {
+    static VIEW_INFERENCE_STACK: RefCell<Vec<String>>;
+}
+
+const MAX_VIEW_INFERENCE_DEPTH: usize = 64;
+
+async fn with_view_inference_stack<T>(future: impl Future<Output = T>) -> T {
+    if VIEW_INFERENCE_STACK.try_with(|_| ()).is_ok() {
+        future.await
+    } else {
+        VIEW_INFERENCE_STACK
+            .scope(RefCell::new(Vec::new()), future)
+            .await
+    }
+}
+
+struct ViewInferenceGuard {
+    view_name: String,
+}
+
+impl ViewInferenceGuard {
+    fn push(view_name: String) -> Option<Self> {
+        VIEW_INFERENCE_STACK.with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.contains(&view_name) || stack.len() >= MAX_VIEW_INFERENCE_DEPTH {
+                return None;
+            }
+            stack.push(view_name.clone());
+            Some(Self { view_name })
+        })
+    }
+}
+
+impl Drop for ViewInferenceGuard {
+    fn drop(&mut self) {
+        let view_name = &self.view_name;
+        let _ = VIEW_INFERENCE_STACK.try_with(|stack| {
+            let mut stack = stack.borrow_mut();
+            if stack.last().map(|s| s == view_name).unwrap_or(false) {
+                stack.pop();
+            } else if let Some(pos) = stack.iter().rposition(|s| s == view_name) {
+                stack.remove(pos);
+            }
+        });
+    }
+}
 
 fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
     if err.is::<InFailedSqlTransaction>() {
@@ -191,10 +239,7 @@ where
 
     client.set_state(PgWireConnectionState::QueryInProgress);
 
-    let portal_name = message
-        .name
-        .as_deref()
-        .unwrap_or(pgwire::api::DEFAULT_NAME);
+    let portal_name = message.name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
     if let Some(portal) = client.portal_store().get_portal(portal_name) {
         match <H as ExtendedQueryHandler>::do_query(
             handler,
@@ -393,10 +438,8 @@ fn is_ident_char(b: u8) -> bool {
 
 fn resolve_table_for_insert(table_name: &str, search_path: &[String]) -> String {
     // Strip quotes from table name (GORM uses quoted identifiers)
-    let strip_quotes = |s: &str| -> String {
-        s.trim_matches('"').to_string()
-    };
-    
+    let strip_quotes = |s: &str| -> String { s.trim_matches('"').to_string() };
+
     if table_name.contains('.') {
         // Split on . and strip quotes from each part
         let parts: Vec<&str> = table_name.splitn(2, '.').collect();
@@ -430,9 +473,10 @@ fn count_placeholders_in_expr(expr: &Expr) -> usize {
                 sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(e)) => {
                     count_placeholders_in_expr(e)
                 }
-                sqlparser::ast::FunctionArg::Named { arg: sqlparser::ast::FunctionArgExpr::Expr(e), .. } => {
-                    count_placeholders_in_expr(e)
-                }
+                sqlparser::ast::FunctionArg::Named {
+                    arg: sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ..
+                } => count_placeholders_in_expr(e),
                 _ => 0,
             }
         }),
@@ -447,56 +491,70 @@ fn infer_types_from_expr(
     types: &mut Vec<Type>,
 ) {
     match expr {
-        Expr::BinaryOp { left, op, right } => {
-            match op {
-                sqlparser::ast::BinaryOperator::Eq
-                | sqlparser::ast::BinaryOperator::NotEq
-                | sqlparser::ast::BinaryOperator::Lt
-                | sqlparser::ast::BinaryOperator::LtEq
-                | sqlparser::ast::BinaryOperator::Gt
-                | sqlparser::ast::BinaryOperator::GtEq => {
-                    if let (Expr::Identifier(ident), Expr::Value(sqlparser::ast::Value::Placeholder(p))) = (left.as_ref(), right.as_ref()) {
-                        if let Some(idx) = extract_placeholder_index(p) {
-                            let col_name = ident.value.to_lowercase();
+        Expr::BinaryOp { left, op, right } => match op {
+            sqlparser::ast::BinaryOperator::Eq
+            | sqlparser::ast::BinaryOperator::NotEq
+            | sqlparser::ast::BinaryOperator::Lt
+            | sqlparser::ast::BinaryOperator::LtEq
+            | sqlparser::ast::BinaryOperator::Gt
+            | sqlparser::ast::BinaryOperator::GtEq => {
+                if let (
+                    Expr::Identifier(ident),
+                    Expr::Value(sqlparser::ast::Value::Placeholder(p)),
+                ) = (left.as_ref(), right.as_ref())
+                {
+                    if let Some(idx) = extract_placeholder_index(p) {
+                        let col_name = ident.value.to_lowercase();
+                        if let Some(col_type) = col_types.get(&col_name) {
+                            if idx < types.len() {
+                                types[idx] = datatype_to_pgtype(Some(col_type));
+                            }
+                        }
+                    }
+                } else if let (
+                    Expr::Value(sqlparser::ast::Value::Placeholder(p)),
+                    Expr::Identifier(ident),
+                ) = (left.as_ref(), right.as_ref())
+                {
+                    if let Some(idx) = extract_placeholder_index(p) {
+                        let col_name = ident.value.to_lowercase();
+                        if let Some(col_type) = col_types.get(&col_name) {
+                            if idx < types.len() {
+                                types[idx] = datatype_to_pgtype(Some(col_type));
+                            }
+                        }
+                    }
+                } else if let (
+                    Expr::CompoundIdentifier(parts),
+                    Expr::Value(sqlparser::ast::Value::Placeholder(p)),
+                ) = (left.as_ref(), right.as_ref())
+                {
+                    if let Some(idx) = extract_placeholder_index(p) {
+                        if let Some(last) = parts.last() {
+                            let col_name = last.value.to_lowercase();
                             if let Some(col_type) = col_types.get(&col_name) {
                                 if idx < types.len() {
                                     types[idx] = datatype_to_pgtype(Some(col_type));
-                                }
-                            }
-                        }
-                    } else if let (Expr::Value(sqlparser::ast::Value::Placeholder(p)), Expr::Identifier(ident)) = (left.as_ref(), right.as_ref()) {
-                        if let Some(idx) = extract_placeholder_index(p) {
-                            let col_name = ident.value.to_lowercase();
-                            if let Some(col_type) = col_types.get(&col_name) {
-                                if idx < types.len() {
-                                    types[idx] = datatype_to_pgtype(Some(col_type));
-                                }
-                            }
-                        }
-                    } else if let (Expr::CompoundIdentifier(parts), Expr::Value(sqlparser::ast::Value::Placeholder(p))) = (left.as_ref(), right.as_ref()) {
-                        if let Some(idx) = extract_placeholder_index(p) {
-                            if let Some(last) = parts.last() {
-                                let col_name = last.value.to_lowercase();
-                                if let Some(col_type) = col_types.get(&col_name) {
-                                    if idx < types.len() {
-                                        types[idx] = datatype_to_pgtype(Some(col_type));
-                                    }
                                 }
                             }
                         }
                     }
-                    infer_types_from_expr(left, col_types, types);
-                    infer_types_from_expr(right, col_types, types);
                 }
-                sqlparser::ast::BinaryOperator::And | sqlparser::ast::BinaryOperator::Or => {
-                    infer_types_from_expr(left, col_types, types);
-                    infer_types_from_expr(right, col_types, types);
-                }
-                _ => {}
+                infer_types_from_expr(left, col_types, types);
+                infer_types_from_expr(right, col_types, types);
             }
-        }
+            sqlparser::ast::BinaryOperator::And | sqlparser::ast::BinaryOperator::Or => {
+                infer_types_from_expr(left, col_types, types);
+                infer_types_from_expr(right, col_types, types);
+            }
+            _ => {}
+        },
         Expr::Nested(inner) => infer_types_from_expr(inner, col_types, types),
-        Expr::InList { expr: left_expr, list, .. } => {
+        Expr::InList {
+            expr: left_expr,
+            list,
+            ..
+        } => {
             if let Expr::Identifier(ident) = left_expr.as_ref() {
                 let col_name = ident.value.to_lowercase();
                 if let Some(col_type) = col_types.get(&col_name) {
@@ -846,13 +904,55 @@ async fn resolve_table_schema_for_object_name(
 ) -> Option<crate::types::TableSchema> {
     let (schema_opt, name) = split_object_name_for_catalog(table_name)?;
 
+    async fn infer_view_schema(
+        store: &TikvStore,
+        txn: &mut Transaction,
+        db_id: u64,
+        search_path: &[String],
+        full_name: &str,
+    ) -> Option<crate::types::TableSchema> {
+        let view_def = store.get_view(txn, db_id, full_name).await.ok()??;
+        let view_query = view_def.query;
+        with_view_inference_stack(async move {
+            let _guard = ViewInferenceGuard::push(full_name.to_string())?;
+            let parsed = crate::sql::parse_sql(&view_query).ok()?;
+            let stmt = parsed.into_iter().next()?;
+            let Statement::Query(q) = stmt else {
+                return None;
+            };
+            let ctes: HashMap<String, TableSchema> = HashMap::new();
+            let cols =
+                infer_query_output_columns_with_txn(store, txn, db_id, search_path, &q, &ctes)
+                    .await?;
+            Some(schema_from_inferred_columns(full_name.to_string(), &cols))
+        })
+        .await
+    }
+
     if let Some(schema) = schema_opt {
         let full = format!("{}.{}", schema, name);
+        if let Some(schema) = crate::sql::get_information_schema_schema(&full) {
+            return Some(schema);
+        }
+        if let Some(schema) =
+            Box::pin(infer_view_schema(store, txn, db_id, search_path, &full)).await
+        {
+            return Some(schema);
+        }
         return store.get_schema(txn, db_id, &full).await.ok().flatten();
+    }
+
+    if let Some(schema) = crate::sql::get_information_schema_schema(&name) {
+        return Some(schema);
     }
 
     for schema in search_path {
         let full = format!("{}.{}", schema, name);
+        if let Some(schema) =
+            Box::pin(infer_view_schema(store, txn, db_id, search_path, &full)).await
+        {
+            return Some(schema);
+        }
         if let Ok(Some(s)) = store.get_schema(txn, db_id, &full).await {
             return Some(s);
         }
@@ -861,6 +961,9 @@ async fn resolve_table_schema_for_object_name(
     // As a last resort, try the default schema even if it's not present in the session search_path.
     let default_schema = search_path.first().map(String::as_str).unwrap_or("public");
     let full = format!("{}.{}", default_schema, name);
+    if let Some(schema) = Box::pin(infer_view_schema(store, txn, db_id, search_path, &full)).await {
+        return Some(schema);
+    }
     store.get_schema(txn, db_id, &full).await.ok().flatten()
 }
 
@@ -952,7 +1055,15 @@ async fn infer_returning_fields_from_statement(
     let db_id = session.current_database_id();
 
     if let Some(txn) = session.get_mut_txn() {
-        infer_returning_fields_with_txn(store.as_ref(), txn, db_id, search_path, table_name, returning).await
+        infer_returning_fields_with_txn(
+            store.as_ref(),
+            txn,
+            db_id,
+            search_path,
+            table_name,
+            returning,
+        )
+        .await
     } else {
         let mut temp_txn = store.begin().await.ok()?;
         infer_returning_fields_with_txn(
@@ -1094,7 +1205,15 @@ async fn infer_query_output_columns(
     let outer_ctes: HashMap<String, TableSchema> = HashMap::new();
 
     if let Some(txn) = session.get_mut_txn() {
-        infer_query_output_columns_with_txn(store.as_ref(), txn, db_id, search_path, query, &outer_ctes).await
+        infer_query_output_columns_with_txn(
+            store.as_ref(),
+            txn,
+            db_id,
+            search_path,
+            query,
+            &outer_ctes,
+        )
+        .await
     } else {
         let mut temp_txn = store.begin().await.ok()?;
         let cols = infer_query_output_columns_with_txn(
@@ -1145,7 +1264,10 @@ async fn build_cte_schemas_with_txn(
             }
         }
 
-        ctes.insert(cte_name.clone(), schema_from_inferred_columns(cte_name, &cols));
+        ctes.insert(
+            cte_name.clone(),
+            schema_from_inferred_columns(cte_name, &cols),
+        );
     }
     Some(ctes)
 }
@@ -1222,8 +1344,16 @@ async fn collect_sources_from_table_with_joins(
     collect_sources_from_table_factor(store, txn, db_id, search_path, &twj.relation, ctes, out)
         .await?;
     for join in &twj.joins {
-        collect_sources_from_table_factor(store, txn, db_id, search_path, &join.relation, ctes, out)
-            .await?;
+        collect_sources_from_table_factor(
+            store,
+            txn,
+            db_id,
+            search_path,
+            &join.relation,
+            ctes,
+            out,
+        )
+        .await?;
     }
     Some(())
 }
@@ -1237,24 +1367,106 @@ async fn collect_sources_from_table_factor(
     ctes: &HashMap<String, TableSchema>,
     out: &mut Vec<SourceSchema>,
 ) -> Option<()> {
-    match factor {
-        TableFactor::Table { name, alias, args, .. } => {
-            // Reject table-valued functions (args present).
-            if args.is_some() {
-                return None;
+    fn infer_generate_series_schema(
+        args: &[FunctionArg],
+        alias_name: &str,
+        table_alias: Option<&sqlparser::ast::TableAlias>,
+    ) -> Option<TableSchema> {
+        if args.len() < 2 {
+            return None;
+        }
+
+        fn extract_expr(arg: &FunctionArg) -> Option<&Expr> {
+            match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(expr),
+                FunctionArg::Named {
+                    arg: FunctionArgExpr::Expr(expr),
+                    ..
+                } => Some(expr),
+                _ => None,
             }
+        }
 
-            let (schema_opt, obj_name_norm) = split_object_name_for_catalog(name)?;
-            let mut schema = if schema_opt.is_none() {
-                match ctes.get(&obj_name_norm) {
-                    Some(cte_schema) => cte_schema.clone(),
-                    None => resolve_table_schema_for_object_name(store, txn, db_id, name, search_path)
-                        .await?,
-                }
+        let start_expr = extract_expr(&args[0])?;
+        let stop_expr = extract_expr(&args[1])?;
+
+        let mut inferrer = TypeInferrer::new(TypeContext::empty());
+        let start_type = inferrer.infer(start_expr).ok()?;
+        let stop_type = inferrer.infer(stop_expr).ok()?;
+
+        let data_type = match (&start_type, &stop_type) {
+            (DataType::Int32, DataType::Int32) => DataType::Int32,
+            (DataType::Int64, DataType::Int64) => DataType::Int64,
+            (DataType::Int32, DataType::Int64) | (DataType::Int64, DataType::Int32) => {
+                DataType::Int64
+            }
+            (DataType::Float64, DataType::Float64) => DataType::Float64,
+            (DataType::Numeric { .. }, DataType::Numeric { .. }) => DataType::Numeric {
+                precision: None,
+                scale: None,
+            },
+            (DataType::Date, DataType::Date) => DataType::TimestampTz,
+            (DataType::Timestamp, DataType::Timestamp)
+            | (DataType::TimestampTz, DataType::Timestamp)
+            | (DataType::Timestamp, DataType::TimestampTz)
+            | (DataType::TimestampTz, DataType::TimestampTz) => DataType::Timestamp,
+            _ => DataType::Text,
+        };
+
+        let col_name = if let Some(ta) = table_alias {
+            if !ta.columns.is_empty() {
+                normalize_sql_ident(&ta.columns[0])
             } else {
-                resolve_table_schema_for_object_name(store, txn, db_id, name, search_path).await?
-            };
+                alias_name.to_string()
+            }
+        } else {
+            "generate_series".to_string()
+        };
 
+        Some(TableSchema {
+            table_id: 0,
+            name: "generate_series".to_string(),
+            columns: vec![ColumnDef {
+                name: col_name,
+                data_type,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            version: 1,
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        })
+    }
+
+    fn infer_extension_table_function_schema(
+        search_path: &[String],
+        schema_opt: Option<&str>,
+        func_name: &str,
+    ) -> Option<TableSchema> {
+        let in_extensions_schema = match schema_opt {
+            Some(schema) => schema.eq_ignore_ascii_case(crate::extensions::EXTENSIONS_SCHEMA),
+            None => search_path
+                .iter()
+                .any(|s| s.eq_ignore_ascii_case(crate::extensions::EXTENSIONS_SCHEMA)),
+        };
+        if !in_extensions_schema {
+            return None;
+        }
+        crate::extensions::http::table_function_schema(func_name)
+    }
+
+    match factor {
+        TableFactor::Table {
+            name, alias, args, ..
+        } => {
+            let (schema_opt, obj_name_norm) = split_object_name_for_catalog(name)?;
             let alias_name = alias
                 .as_ref()
                 .map(|a| a.name.value.clone())
@@ -1262,6 +1474,28 @@ async fn collect_sources_from_table_factor(
             if alias_name.is_empty() {
                 return None;
             }
+
+            let mut schema = if let Some(args) = args {
+                if obj_name_norm.eq_ignore_ascii_case("generate_series") {
+                    infer_generate_series_schema(args, &alias_name, alias.as_ref())?
+                } else {
+                    infer_extension_table_function_schema(
+                        search_path,
+                        schema_opt.as_deref(),
+                        &obj_name_norm,
+                    )?
+                }
+            } else if schema_opt.is_none() {
+                match ctes.get(&obj_name_norm) {
+                    Some(cte_schema) => cte_schema.clone(),
+                    None => {
+                        resolve_table_schema_for_object_name(store, txn, db_id, name, search_path)
+                            .await?
+                    }
+                }
+            } else {
+                resolve_table_schema_for_object_name(store, txn, db_id, name, search_path).await?
+            };
 
             if let Some(alias) = alias {
                 if !alias.columns.is_empty() {
@@ -1275,7 +1509,9 @@ async fn collect_sources_from_table_factor(
             });
             Some(())
         }
-        TableFactor::Derived { subquery, alias, .. } => {
+        TableFactor::Derived {
+            subquery, alias, ..
+        } => {
             let alias = alias.as_ref()?;
             let alias_name = alias.name.value.clone();
             if alias_name.is_empty() {
@@ -1320,8 +1556,19 @@ async fn infer_select_output_columns_with_txn(
 ) -> Option<Vec<InferredColumn>> {
     let mut sources = Vec::new();
     for twj in &select.from {
-        collect_sources_from_table_with_joins(store, txn, db_id, search_path, twj, ctes, &mut sources).await?;
+        collect_sources_from_table_with_joins(
+            store,
+            txn,
+            db_id,
+            search_path,
+            twj,
+            ctes,
+            &mut sources,
+        )
+        .await?;
     }
+
+    let natural_join_common_cols = infer_natural_join_common_cols_for_wildcard(select, &sources);
 
     let mut ctx = TypeContext::empty();
     for src in &sources {
@@ -1336,12 +1583,11 @@ async fn infer_select_output_columns_with_txn(
                 if sources.is_empty() {
                     return None;
                 }
-                for src in &sources {
-                    out_cols.extend(src.schema.columns.iter().map(|c| InferredColumn {
-                        name: c.name.clone(),
-                        data_type: c.data_type.clone(),
-                    }));
-                }
+
+                out_cols.extend(infer_wildcard_output_columns(
+                    &sources,
+                    natural_join_common_cols.as_deref(),
+                ));
             }
             SelectItem::QualifiedWildcard(obj, _) => {
                 if sources.is_empty() {
@@ -1373,6 +1619,129 @@ async fn infer_select_output_columns_with_txn(
     }
 
     Some(out_cols)
+}
+
+fn infer_natural_join_common_cols_for_wildcard(
+    select: &Select,
+    sources: &[SourceSchema],
+) -> Option<Vec<String>> {
+    if select.from.is_empty() {
+        return None;
+    }
+
+    let mut from_source_starts = Vec::with_capacity(select.from.len());
+    let mut next_idx = 0usize;
+    for twj in &select.from {
+        from_source_starts.push(next_idx);
+        next_idx = next_idx.saturating_add(1 + twj.joins.len());
+    }
+    if next_idx != sources.len() {
+        return None;
+    }
+
+    let mut natural_join_common_cols: Option<Vec<String>> = None;
+
+    let process_from_item =
+        |twj: &TableWithJoins, start_idx: usize, current: &mut Option<Vec<String>>| {
+            let mut left_schemas: Vec<&TableSchema> = vec![&sources[start_idx].schema];
+            for (join_idx, join) in twj.joins.iter().enumerate() {
+                let right_schema = &sources[start_idx + 1 + join_idx].schema;
+
+                match &join.join_operator {
+                    JoinOperator::Inner(JoinConstraint::Natural)
+                    | JoinOperator::LeftOuter(JoinConstraint::Natural)
+                    | JoinOperator::RightOuter(JoinConstraint::Natural)
+                    | JoinOperator::FullOuter(JoinConstraint::Natural) => {
+                        let right_set: HashSet<&str> = right_schema
+                            .columns
+                            .iter()
+                            .map(|c| c.name.as_str())
+                            .collect();
+                        let common_cols: Vec<String> = left_schemas
+                            .iter()
+                            .flat_map(|schema| schema.columns.iter().map(|c| c.name.clone()))
+                            .filter(|c| right_set.contains(c.as_str()))
+                            .collect();
+                        *current = Some(common_cols);
+                    }
+                    JoinOperator::Inner(JoinConstraint::Using(cols))
+                    | JoinOperator::LeftOuter(JoinConstraint::Using(cols))
+                    | JoinOperator::RightOuter(JoinConstraint::Using(cols))
+                    | JoinOperator::FullOuter(JoinConstraint::Using(cols)) => {
+                        *current = Some(cols.iter().map(normalize_sql_ident).collect());
+                    }
+                    _ => {}
+                }
+
+                left_schemas.push(right_schema);
+            }
+        };
+
+    if select.from.len() > 1 {
+        for (idx, twj) in select.from.iter().enumerate().skip(1) {
+            process_from_item(twj, from_source_starts[idx], &mut natural_join_common_cols);
+        }
+    }
+    process_from_item(
+        &select.from[0],
+        from_source_starts[0],
+        &mut natural_join_common_cols,
+    );
+
+    natural_join_common_cols
+}
+
+fn infer_wildcard_output_columns(
+    sources: &[SourceSchema],
+    natural_join_common_cols: Option<&[String]>,
+) -> Vec<InferredColumn> {
+    if sources.is_empty() {
+        return Vec::new();
+    }
+
+    if let Some(common_cols) = natural_join_common_cols.filter(|c| !c.is_empty()) {
+        let common_set: HashSet<&str> = common_cols.iter().map(|c| c.as_str()).collect();
+        let mut common_types: HashMap<String, DataType> = HashMap::new();
+        for src in sources {
+            for col in &src.schema.columns {
+                if common_set.contains(col.name.as_str()) && !common_types.contains_key(&col.name) {
+                    common_types.insert(col.name.clone(), col.data_type.clone());
+                }
+            }
+        }
+
+        let mut out_cols = Vec::new();
+        for name in common_cols {
+            out_cols.push(InferredColumn {
+                name: name.clone(),
+                data_type: common_types.get(name).cloned().unwrap_or(DataType::Text),
+            });
+        }
+
+        for src in sources {
+            for col in &src.schema.columns {
+                if common_set.contains(col.name.as_str()) {
+                    continue;
+                }
+                out_cols.push(InferredColumn {
+                    name: col.name.clone(),
+                    data_type: col.data_type.clone(),
+                });
+            }
+        }
+
+        out_cols
+    } else {
+        sources
+            .iter()
+            .flat_map(|src| {
+                src.schema.columns.iter().map(|c| InferredColumn {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                })
+            })
+            .collect()
+    }
 }
 
 async fn infer_result_fields_from_query_ast(
@@ -1490,16 +1859,25 @@ impl DynamicPgHandler {
         self.connection_id
     }
 
-    async fn infer_insert_parameter_types(&self, sql: &str, param_count: usize) -> Option<Vec<Type>> {
+    async fn infer_insert_parameter_types(
+        &self,
+        sql: &str,
+        param_count: usize,
+    ) -> Option<Vec<Type>> {
         if param_count == 0 {
             return Some(vec![]);
         }
 
         let parsed = crate::sql::parse_sql(sql).ok()?;
         let stmt = parsed.into_iter().next()?;
-        
+
         let (table_name, columns, values_list): (String, Vec<String>, Vec<Vec<Expr>>) = match stmt {
-            Statement::Insert { table_name, columns, source, .. } => {
+            Statement::Insert {
+                table_name,
+                columns,
+                source,
+                ..
+            } => {
                 let table_name_str = table_name.to_string();
                 let columns: Vec<String> = columns.iter().map(|c| c.value.clone()).collect();
                 let values = match source.as_ref() {
@@ -1515,48 +1893,61 @@ impl DynamicPgHandler {
             _ => return None,
         };
 
-        info!("infer_insert_parameter_types: table={}, columns={:?}, param_count={}", table_name, columns, param_count);
+        info!(
+            "infer_insert_parameter_types: table={}, columns={:?}, param_count={}",
+            table_name, columns, param_count
+        );
 
         let executor = self.executor.get()?;
         let store = executor.store();
-        
+
         let mut session_guard = self.session.lock().await;
         let session = session_guard.as_mut()?;
         let mut txn = store.begin().await.ok()?;
-        
+
         let search_path = session.search_path();
         let resolved_table = resolve_table_for_insert(&table_name, search_path);
-        
-        info!("infer_insert_parameter_types: resolved_table={}", resolved_table);
-        
+
+        info!(
+            "infer_insert_parameter_types: resolved_table={}",
+            resolved_table
+        );
+
         let schema = store
             .get_schema(&mut txn, session.current_database_id(), &resolved_table)
             .await
             .ok()??;
         let _ = txn.rollback().await;
-        
-        info!("infer_insert_parameter_types: got schema with {} columns", schema.columns.len());
-        
+
+        info!(
+            "infer_insert_parameter_types: got schema with {} columns",
+            schema.columns.len()
+        );
+
         let col_types: std::collections::HashMap<String, DataType> = schema
             .columns
             .iter()
             .map(|c| (c.name.to_lowercase(), c.data_type.clone()))
             .collect();
-        
+
         let column_order: Vec<String> = if !columns.is_empty() {
             columns.iter().map(|c: &String| c.to_lowercase()).collect()
         } else {
-            schema.columns.iter().map(|c| c.name.to_lowercase()).collect()
+            schema
+                .columns
+                .iter()
+                .map(|c| c.name.to_lowercase())
+                .collect()
         };
-        
+
         let mut types = vec![Type::TEXT; param_count];
-        
+
         if let Some(first_row) = values_list.first() {
             let mut param_idx = 0usize;
             for (col_idx, expr) in first_row.iter().enumerate() {
                 let col_name = column_order.get(col_idx)?;
                 let col_type = col_types.get(col_name);
-                
+
                 let placeholders = count_placeholders_in_expr(expr);
                 for _ in 0..placeholders {
                     if param_idx < param_count {
@@ -1566,20 +1957,26 @@ impl DynamicPgHandler {
                 }
             }
         }
-        
+
         Some(types)
     }
 
-    async fn infer_update_parameter_types(&self, sql: &str, param_count: usize) -> Option<Vec<Type>> {
+    async fn infer_update_parameter_types(
+        &self,
+        sql: &str,
+        param_count: usize,
+    ) -> Option<Vec<Type>> {
         if param_count == 0 {
             return Some(vec![]);
         }
 
         let parsed = crate::sql::parse_sql(sql).ok()?;
         let stmt = parsed.into_iter().next()?;
-        
+
         let (table_name, assignments) = match stmt {
-            Statement::Update { table, assignments, .. } => {
+            Statement::Update {
+                table, assignments, ..
+            } => {
                 let table_name = match &table.relation {
                     sqlparser::ast::TableFactor::Table { name, .. } => name.to_string(),
                     _ => return None,
@@ -1589,47 +1986,59 @@ impl DynamicPgHandler {
             _ => return None,
         };
 
-        info!("infer_update_parameter_types: table={}, assignments={}, param_count={}", 
-              table_name, assignments.len(), param_count);
+        info!(
+            "infer_update_parameter_types: table={}, assignments={}, param_count={}",
+            table_name,
+            assignments.len(),
+            param_count
+        );
 
         let executor = self.executor.get()?;
         let store = executor.store();
-        
+
         let mut session_guard = self.session.lock().await;
         let session = session_guard.as_mut()?;
         let mut txn = store.begin().await.ok()?;
-        
+
         let search_path = session.search_path();
         let resolved_table = resolve_table_for_insert(&table_name, search_path);
-        
-        info!("infer_update_parameter_types: resolved_table={}", resolved_table);
-        
+
+        info!(
+            "infer_update_parameter_types: resolved_table={}",
+            resolved_table
+        );
+
         let schema = store
             .get_schema(&mut txn, session.current_database_id(), &resolved_table)
             .await
             .ok()??;
         let _ = txn.rollback().await;
-        
-        info!("infer_update_parameter_types: got schema with {} columns", schema.columns.len());
-        
+
+        info!(
+            "infer_update_parameter_types: got schema with {} columns",
+            schema.columns.len()
+        );
+
         let col_types: std::collections::HashMap<String, DataType> = schema
             .columns
             .iter()
             .map(|c| (c.name.to_lowercase(), c.data_type.clone()))
             .collect();
-        
+
         let mut types = vec![Type::TEXT; param_count];
         let mut param_idx = 0usize;
-        
+
         for assignment in &assignments {
-            let col_names: Vec<String> = assignment.id.iter()
+            let col_names: Vec<String> = assignment
+                .id
+                .iter()
                 .map(|ident| ident.value.to_lowercase())
                 .collect();
-            
+
             if let Some(col_name) = col_names.last() {
                 let col_type = col_types.get(col_name);
                 let placeholders = count_placeholders_in_expr(&assignment.value);
-                
+
                 for _ in 0..placeholders {
                     if param_idx < param_count {
                         types[param_idx] = datatype_to_pgtype(col_type);
@@ -1638,30 +2047,41 @@ impl DynamicPgHandler {
                 }
             }
         }
-        
-        info!("infer_update_parameter_types: inferred {} types, remaining {} as TEXT", param_idx, param_count - param_idx);
-        
+
+        info!(
+            "infer_update_parameter_types: inferred {} types, remaining {} as TEXT",
+            param_idx,
+            param_count - param_idx
+        );
+
         Some(types)
     }
 
-    async fn infer_select_parameter_types(&self, sql: &str, param_count: usize) -> Option<Vec<Type>> {
+    async fn infer_select_parameter_types(
+        &self,
+        sql: &str,
+        param_count: usize,
+    ) -> Option<Vec<Type>> {
         if param_count == 0 {
             return Some(vec![]);
         }
 
         let parsed = crate::sql::parse_sql(sql).ok()?;
         let stmt = parsed.into_iter().next()?;
-        
+
         let (table_name, selection, limit_expr, offset_expr) = match stmt {
             Statement::Query(query) => {
                 if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
-                    let table_name = select.from.first().and_then(|f| {
-                        match &f.relation {
-                            sqlparser::ast::TableFactor::Table { name, .. } => Some(name.to_string()),
-                            _ => None,
-                        }
+                    let table_name = select.from.first().and_then(|f| match &f.relation {
+                        sqlparser::ast::TableFactor::Table { name, .. } => Some(name.to_string()),
+                        _ => None,
                     })?;
-                    (table_name, select.selection.clone(), query.limit.clone(), query.offset.clone())
+                    (
+                        table_name,
+                        select.selection.clone(),
+                        query.limit.clone(),
+                        query.offset.clone(),
+                    )
                 } else {
                     return None;
                 }
@@ -1669,37 +2089,40 @@ impl DynamicPgHandler {
             _ => return None,
         };
 
-        info!("infer_select_parameter_types: table={}, param_count={}", table_name, param_count);
+        info!(
+            "infer_select_parameter_types: table={}, param_count={}",
+            table_name, param_count
+        );
 
         let executor = self.executor.get()?;
         let store = executor.store();
-        
+
         let mut session_guard = self.session.lock().await;
         let session = session_guard.as_mut()?;
         let mut txn = store.begin().await.ok()?;
-        
+
         let search_path = session.search_path();
         let resolved_table = resolve_table_for_insert(&table_name, search_path);
-        
+
         let schema = store
             .get_schema(&mut txn, session.current_database_id(), &resolved_table)
             .await
             .ok()??;
         let _ = txn.rollback().await;
-        
+
         let col_types: std::collections::HashMap<String, DataType> = schema
             .columns
             .iter()
             .map(|c| (c.name.to_lowercase(), c.data_type.clone()))
             .collect();
-        
+
         let mut types = vec![Type::TEXT; param_count];
-        
+
         // Infer types from WHERE clause
         if let Some(ref sel) = selection {
             infer_types_from_expr(sel, &col_types, &mut types);
         }
-        
+
         // LIMIT placeholder should be INT8
         if let Some(ref limit) = limit_expr {
             if let Some(idx) = extract_placeholder_index_from_expr(limit) {
@@ -1708,7 +2131,7 @@ impl DynamicPgHandler {
                 }
             }
         }
-        
+
         // OFFSET placeholder should be INT8
         if let Some(ref offset) = offset_expr {
             if let Some(idx) = extract_placeholder_index_from_expr(&offset.value) {
@@ -1717,9 +2140,9 @@ impl DynamicPgHandler {
                 }
             }
         }
-        
+
         info!("infer_select_parameter_types: inferred types={:?}", types);
-        
+
         Some(types)
     }
 
@@ -1772,8 +2195,8 @@ impl DynamicPgHandler {
                 self.pd_endpoints.clone(),
                 Some(effective_keyspace.clone()),
             )
-                    .await
-                    .map_err(|e| format!("Failed to connect to TiKV: {}", e))?;
+            .await
+            .map_err(|e| format!("Failed to connect to TiKV: {}", e))?;
             Arc::new(s)
         };
 
@@ -2003,9 +2426,7 @@ impl DynamicPgHandler {
         Ok(vec![])
     }
 
-    fn ensure_auth_bootstrapped(
-        bootstrap_result: Result<(), anyhow::Error>,
-    ) -> Result<(), String> {
+    fn ensure_auth_bootstrapped(bootstrap_result: Result<(), anyhow::Error>) -> Result<(), String> {
         bootstrap_result.map_err(|e| format!("Failed to bootstrap auth: {}", e))
     }
 
@@ -2172,14 +2593,10 @@ impl StartupHandler for DynamicPgHandler {
                             if let Some(session) = session_guard.as_mut() {
                                 if let Some(options) = client.metadata().get("options") {
                                     for (key, value) in parse_startup_options(options) {
-                                        if let Err(e) = session.set_known_setting(
-                                            &key.to_ascii_lowercase(),
-                                            value,
-                                        ) {
-                                            warn!(
-                                                "Failed to apply startup option {}: {}",
-                                                key, e
-                                            );
+                                        if let Err(e) = session
+                                            .set_known_setting(&key.to_ascii_lowercase(), value)
+                                        {
+                                            warn!("Failed to apply startup option {}: {}", key, e);
                                         }
                                     }
                                 }
@@ -2305,10 +2722,8 @@ impl SimpleQueryHandler for DynamicPgHandler {
                         session.begin().await.ok();
                     }
                     let count = if let Some(txn) = session.get_mut_txn() {
-                        if let Ok(Some(schema)) = executor
-                            .store()
-                            .get_schema(txn, db_id, &table_name)
-                            .await
+                        if let Ok(Some(schema)) =
+                            executor.store().get_schema(txn, db_id, &table_name).await
                         {
                             schema.columns.len()
                         } else {
@@ -2649,17 +3064,40 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         let param_count = count_sql_parameters(&stmt.statement);
         let mut param_types: Vec<Type> = stmt.parameter_types.clone();
 
-        info!("do_describe_statement: sql={}, param_count={}, initial_types={:?}", stmt.statement.chars().take(100).collect::<String>(), param_count, param_types);
-        
+        info!(
+            "do_describe_statement: sql={}, param_count={}, initial_types={:?}",
+            stmt.statement.chars().take(100).collect::<String>(),
+            param_count,
+            param_types
+        );
+
         if param_types.len() < param_count || param_types.iter().any(|t| *t == Type::UNKNOWN) {
-            let inferred = if let Some(insert_types) = self.infer_insert_parameter_types(&stmt.statement, param_count).await {
-                info!("do_describe_statement: inferred INSERT types={:?}", insert_types);
+            let inferred = if let Some(insert_types) = self
+                .infer_insert_parameter_types(&stmt.statement, param_count)
+                .await
+            {
+                info!(
+                    "do_describe_statement: inferred INSERT types={:?}",
+                    insert_types
+                );
                 insert_types
-            } else if let Some(update_types) = self.infer_update_parameter_types(&stmt.statement, param_count).await {
-                info!("do_describe_statement: inferred UPDATE types={:?}", update_types);
+            } else if let Some(update_types) = self
+                .infer_update_parameter_types(&stmt.statement, param_count)
+                .await
+            {
+                info!(
+                    "do_describe_statement: inferred UPDATE types={:?}",
+                    update_types
+                );
                 update_types
-            } else if let Some(select_types) = self.infer_select_parameter_types(&stmt.statement, param_count).await {
-                info!("do_describe_statement: inferred SELECT types={:?}", select_types);
+            } else if let Some(select_types) = self
+                .infer_select_parameter_types(&stmt.statement, param_count)
+                .await
+            {
+                info!(
+                    "do_describe_statement: inferred SELECT types={:?}",
+                    select_types
+                );
                 select_types
             } else {
                 let fallback = infer_parameter_types(&stmt.statement, param_count);
@@ -2675,10 +3113,22 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                 }
             }
         }
-        
+
         info!("do_describe_statement: final_types={:?}", param_types);
 
-        let fields = self.infer_result_fields_from_query(&stmt.statement).await;
+        let query_for_inference = if param_count == 0 {
+            stmt.statement.clone()
+        } else {
+            let mut values: Vec<String> = Vec::with_capacity(param_count);
+            for i in 0..param_count {
+                let t = param_types.get(i).cloned().unwrap_or(Type::UNKNOWN);
+                values.push(dummy_sql_expr_for_param_type(&t));
+            }
+            substitute_placeholders_outside_strings_and_dollar(&stmt.statement, &values)
+        };
+        let fields = self
+            .infer_result_fields_from_query(&query_for_inference)
+            .await;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -2873,6 +3323,27 @@ fn substitute_placeholders_outside_strings_and_dollar(query: &str, values: &[Str
     }
 
     String::from_utf8(out).unwrap_or_else(|_| query.to_string())
+}
+
+fn dummy_sql_expr_for_param_type(param_type: &Type) -> String {
+    match param_type {
+        t if *t == Type::BOOL => "NULL::bool".to_string(),
+        t if *t == Type::INT2 => "NULL::int2".to_string(),
+        t if *t == Type::INT4 => "NULL::int4".to_string(),
+        t if *t == Type::INT8 => "NULL::int8".to_string(),
+        t if *t == Type::FLOAT4 => "NULL::float4".to_string(),
+        t if *t == Type::FLOAT8 => "NULL::float8".to_string(),
+        t if *t == Type::TEXT || *t == Type::VARCHAR => "NULL::text".to_string(),
+        t if *t == Type::TIMESTAMP => "NULL::timestamp".to_string(),
+        t if *t == Type::TIMESTAMPTZ => "NULL::timestamptz".to_string(),
+        t if *t == Type::UUID => "NULL::uuid".to_string(),
+        t if *t == Type::DATE => "NULL::date".to_string(),
+        t if *t == Type::BYTEA => "NULL::bytea".to_string(),
+        t if *t == Type::JSON => "NULL::json".to_string(),
+        t if *t == Type::JSONB => "NULL::jsonb".to_string(),
+        t if *t == Type::NUMERIC => "NULL::numeric".to_string(),
+        _ => "NULL".to_string(),
+    }
 }
 
 fn substitute_parameters(query: &str, portal: &Portal<String>) -> PgWireResult<String> {
@@ -3603,7 +4074,19 @@ impl ExtendedQueryHandler for PgHandler {
             }
         }
 
-        let fields = self.infer_result_fields_from_query(&stmt.statement).await;
+        let query_for_inference = if param_count == 0 {
+            stmt.statement.clone()
+        } else {
+            let mut values: Vec<String> = Vec::with_capacity(param_count);
+            for i in 0..param_count {
+                let t = param_types.get(i).cloned().unwrap_or(Type::UNKNOWN);
+                values.push(dummy_sql_expr_for_param_type(&t));
+            }
+            substitute_placeholders_outside_strings_and_dollar(&stmt.statement, &values)
+        };
+        let fields = self
+            .infer_result_fields_from_query(&query_for_inference)
+            .await;
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -3969,12 +4452,15 @@ fn encode_value(
         Value::Int64(i) => {
             // Check if this Int64 should be interpreted as a timestamp based on column type
             // This handles the case where timestamps were incorrectly stored as Int64
-            if matches!(col_type, Some(DataType::Timestamp) | Some(DataType::TimestampTz)) {
+            if matches!(
+                col_type,
+                Some(DataType::Timestamp) | Some(DataType::TimestampTz)
+            ) {
                 // Treat as timestamp - reuse the timestamp encoding logic
                 use chrono::{DateTime, Offset, Utc};
                 const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
                 const MAX_REASONABLE_UNIX_MS: i64 = 10_000_000_000_000;
-                
+
                 let (seconds, micros) = if i.abs() > MAX_REASONABLE_UNIX_MS {
                     let pg_micros = i;
                     let unix_secs = pg_micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECS;
@@ -3985,7 +4471,7 @@ fn encode_value(
                     let millis = i.rem_euclid(1000) as u32;
                     (secs, millis * 1000)
                 };
-                
+
                 let nanos = micros * 1000;
                 if let Some(dt) = DateTime::<Utc>::from_timestamp(seconds, nanos) {
                     let is_timestamptz = matches!(col_type, Some(DataType::TimestampTz));
@@ -4024,7 +4510,7 @@ fn encode_value(
         Value::Bytes(b) => encoder.encode_field(&format!("\\x{}", hex::encode(b))),
         Value::Timestamp(ts) => {
             use chrono::{DateTime, Offset, Utc};
-            
+
             // Detect timestamp format:
             // - Unix epoch milliseconds: typical values 1.0e12 to 2.5e12 (years 2001-2049)
             // - PostgreSQL epoch microseconds: typical values 0 to 1.6e15 (years 2000-2050)
@@ -4032,7 +4518,7 @@ fn encode_value(
             // PostgreSQL epoch is 2000-01-01 00:00:00 UTC = 946684800 seconds since Unix epoch.
             const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
             const MAX_REASONABLE_UNIX_MS: i64 = 10_000_000_000_000; // year ~2286
-            
+
             let (seconds, micros) = if ts.abs() > MAX_REASONABLE_UNIX_MS {
                 // Likely PostgreSQL epoch microseconds - convert to Unix seconds
                 let pg_micros = ts;
@@ -4045,7 +4531,7 @@ fn encode_value(
                 let millis = ts.rem_euclid(1000) as u32;
                 (secs, millis * 1000)
             };
-            
+
             let nanos = micros * 1000;
             if let Some(dt) = DateTime::<Utc>::from_timestamp(seconds, nanos) {
                 let is_timestamptz = matches!(col_type, Some(DataType::TimestampTz));
@@ -4087,9 +4573,8 @@ fn encode_value(
             fn needs_array_quotes(s: &str) -> bool {
                 s.is_empty()
                     || s.eq_ignore_ascii_case("NULL")
-                    || s.chars().any(|c| {
-                        c.is_whitespace() || matches!(c, '{' | '}' | ',' | '"' | '\\')
-                    })
+                    || s.chars()
+                        .any(|c| c.is_whitespace() || matches!(c, '{' | '}' | ',' | '"' | '\\'))
             }
 
             fn escape_array_element(s: &str) -> String {
@@ -4171,7 +4656,8 @@ fn encode_value(
             match serde_json::from_str::<serde_json::Value>(s) {
                 Ok(val) => {
                     let mut buf = Vec::new();
-                    let mut ser = serde_json::Serializer::with_formatter(&mut buf, PgJsonbFormatter);
+                    let mut ser =
+                        serde_json::Serializer::with_formatter(&mut buf, PgJsonbFormatter);
                     if val.serialize(&mut ser).is_ok() {
                         if let Ok(formatted) = String::from_utf8(buf) {
                             return encoder.encode_field(&formatted);
@@ -4229,6 +4715,33 @@ mod tests {
     use pgwire::api::portal::Format;
     use pgwire::messages::response::CommandComplete;
 
+    fn test_column(name: &str, data_type: DataType) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable: false,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        }
+    }
+
+    fn test_schema(name: &str, columns: Vec<ColumnDef>) -> TableSchema {
+        TableSchema {
+            name: name.to_string(),
+            table_id: 0,
+            columns,
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        }
+    }
+
     fn encode_value_to_string(value: &Value, col_type: Option<&DataType>) -> String {
         let fields = vec![FieldInfo::new(
             "col".to_string(),
@@ -4277,6 +4790,140 @@ mod tests {
             update_tx_status_after_execution(status, &tag),
             TransactionStatus::Error
         );
+    }
+
+    #[test]
+    fn test_infer_wildcard_multiway_natural_join_dedups_columns() {
+        let stmts =
+            crate::sql::parse_sql("SELECT * FROM a NATURAL JOIN b NATURAL JOIN c").expect("parse");
+        let stmt = stmts.first().expect("stmt");
+        let Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+
+        let schema_a = test_schema(
+            "a",
+            vec![
+                test_column("id", DataType::Int32),
+                test_column("a1", DataType::Text),
+            ],
+        );
+        let schema_b = test_schema("b", vec![test_column("b1", DataType::Text)]);
+        let schema_c = test_schema(
+            "c",
+            vec![
+                test_column("id", DataType::Int32),
+                test_column("c1", DataType::Text),
+            ],
+        );
+        let sources = vec![
+            SourceSchema {
+                alias: "a".to_string(),
+                schema: schema_a,
+            },
+            SourceSchema {
+                alias: "b".to_string(),
+                schema: schema_b,
+            },
+            SourceSchema {
+                alias: "c".to_string(),
+                schema: schema_c,
+            },
+        ];
+
+        let common_cols = infer_natural_join_common_cols_for_wildcard(select, &sources);
+        let inferred = infer_wildcard_output_columns(&sources, common_cols.as_deref());
+        let names: Vec<String> = inferred.into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["id", "a1", "b1", "c1"]);
+    }
+
+    #[test]
+    fn test_infer_wildcard_multiway_using_join_dedups_columns() {
+        let stmts = crate::sql::parse_sql("SELECT * FROM a JOIN b USING (id) JOIN c USING (id)")
+            .expect("parse");
+        let stmt = stmts.first().expect("stmt");
+        let Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+
+        let schema_a = test_schema(
+            "a",
+            vec![
+                test_column("id", DataType::Int32),
+                test_column("a1", DataType::Text),
+            ],
+        );
+        let schema_b = test_schema(
+            "b",
+            vec![
+                test_column("id", DataType::Int32),
+                test_column("b1", DataType::Text),
+            ],
+        );
+        let schema_c = test_schema(
+            "c",
+            vec![
+                test_column("id", DataType::Int32),
+                test_column("c1", DataType::Text),
+            ],
+        );
+        let sources = vec![
+            SourceSchema {
+                alias: "a".to_string(),
+                schema: schema_a,
+            },
+            SourceSchema {
+                alias: "b".to_string(),
+                schema: schema_b,
+            },
+            SourceSchema {
+                alias: "c".to_string(),
+                schema: schema_c,
+            },
+        ];
+
+        let common_cols = infer_natural_join_common_cols_for_wildcard(select, &sources);
+        let inferred = infer_wildcard_output_columns(&sources, common_cols.as_deref());
+        let names: Vec<String> = inferred.into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["id", "a1", "b1", "c1"]);
+    }
+
+    #[test]
+    fn test_infer_wildcard_natural_join_common_cols_is_case_sensitive() {
+        let stmts = crate::sql::parse_sql("SELECT * FROM a NATURAL JOIN b").expect("parse");
+        let stmt = stmts.first().expect("stmt");
+        let Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+
+        let schema_a = test_schema("a", vec![test_column("Foo", DataType::Int32)]);
+        let schema_b = test_schema("b", vec![test_column("foo", DataType::Int32)]);
+        let sources = vec![
+            SourceSchema {
+                alias: "a".to_string(),
+                schema: schema_a,
+            },
+            SourceSchema {
+                alias: "b".to_string(),
+                schema: schema_b,
+            },
+        ];
+
+        let common_cols = infer_natural_join_common_cols_for_wildcard(select, &sources);
+        assert_eq!(common_cols, Some(Vec::new()));
+
+        let inferred = infer_wildcard_output_columns(&sources, common_cols.as_deref());
+        let names: Vec<String> = inferred.into_iter().map(|c| c.name).collect();
+        assert_eq!(names, vec!["Foo", "foo"]);
     }
 
     #[test]

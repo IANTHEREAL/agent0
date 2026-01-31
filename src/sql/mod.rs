@@ -41,3 +41,5 @@ mod session;
 pub use session::*;
 mod aggregate;
 pub use aggregate::*;
+
+pub(crate) use information_schema::get_information_schema_schema;
