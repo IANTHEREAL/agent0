@@ -7,7 +7,7 @@ use crate::sql::{ExecuteResult, Executor, InFailedSqlTransaction, Session};
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, TableSchema, Value};
 use async_trait::async_trait;
-use futures::{stream, Sink, SinkExt};
+use futures::{stream, Sink, SinkExt, StreamExt};
 use pgwire::api::auth::{ServerParameterProvider, StartupHandler};
 use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::Portal;
@@ -35,7 +35,7 @@ use sqlparser::ast::{
     Statement, TableFactor, TableWithJoins, Values,
 };
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -222,6 +222,7 @@ where
 
 async fn on_execute_with_tx_status_fix<H, C>(
     handler: &H,
+    suspended_portals: &Mutex<HashMap<String, SuspendedPortalState>>,
     client: &mut C,
     message: pgwire::messages::extendedquery::Execute,
 ) -> PgWireResult<()>
@@ -240,15 +241,36 @@ where
     client.set_state(PgWireConnectionState::QueryInProgress);
 
     let portal_name = message.name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
+    let max_rows = if message.max_rows <= 0 {
+        0
+    } else {
+        message.max_rows as usize
+    };
+
     if let Some(portal) = client.portal_store().get_portal(portal_name) {
-        match <H as ExtendedQueryHandler>::do_query(
-            handler,
-            client,
-            portal.as_ref(),
-            message.max_rows as usize,
-        )
-        .await?
+        if let Some((command_tag, chunk, still_suspended, total_rows_sent)) =
+            take_suspended_rows(suspended_portals, portal_name, max_rows).await
         {
+            for row in chunk {
+                client.feed(PgWireBackendMessage::DataRow(row)).await?;
+            }
+
+            if still_suspended {
+                client
+                    .send(PgWireBackendMessage::PortalSuspended(
+                        pgwire::messages::extendedquery::PortalSuspended::new(),
+                    ))
+                    .await?;
+            } else {
+                let tag = Tag::new(&command_tag).with_rows(total_rows_sent);
+                client
+                    .send(PgWireBackendMessage::CommandComplete(tag.into()))
+                    .await?;
+            }
+        } else {
+            match <H as ExtendedQueryHandler>::do_query(handler, client, portal.as_ref(), max_rows)
+                .await?
+            {
             Response::EmptyQuery => {
                 client
                     .feed(PgWireBackendMessage::EmptyQueryResponse(
@@ -257,7 +279,18 @@ where
                     .await?;
             }
             Response::Query(results) => {
-                pgwire::api::query::send_query_response(client, results, false).await?;
+                if max_rows == 0 {
+                    pgwire::api::query::send_query_response(client, results, false).await?;
+                } else {
+                    send_limited_query_response(
+                        client,
+                        suspended_portals,
+                        portal_name,
+                        results,
+                        max_rows,
+                    )
+                    .await?;
+                }
             }
             Response::Execution(tag) => {
                 transaction_status = update_tx_status_after_execution(transaction_status, &tag);
@@ -289,6 +322,7 @@ where
                 client.set_state(PgWireConnectionState::CopyInProgress(true));
                 pgwire::api::copy::send_copy_both_response(client, result).await?;
             }
+            }
         }
 
         if !matches!(client.state(), PgWireConnectionState::CopyInProgress(_)) {
@@ -300,6 +334,150 @@ where
     } else {
         Err(PgWireError::PortalNotFound(portal_name.to_owned()))
     }
+}
+
+#[derive(Debug)]
+struct SuspendedPortalState {
+    command_tag: String,
+    remaining_rows: VecDeque<DataRow>,
+    rows_sent_so_far: usize,
+}
+
+const DEFAULT_MAX_SUSPENDED_PORTALS: usize = 32;
+const DEFAULT_MAX_SUSPENDED_PORTAL_BUFFER_ROWS: usize = 10_000;
+const DEFAULT_MAX_SUSPENDED_PORTAL_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
+fn max_suspended_portals() -> usize {
+    std::env::var("PGTIKV_MAX_SUSPENDED_PORTALS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_SUSPENDED_PORTALS)
+}
+
+fn max_suspended_portal_buffer_rows() -> usize {
+    std::env::var("PGTIKV_MAX_SUSPENDED_PORTAL_BUFFER_ROWS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_SUSPENDED_PORTAL_BUFFER_ROWS)
+}
+
+fn max_suspended_portal_buffer_bytes() -> usize {
+    std::env::var("PGTIKV_MAX_SUSPENDED_PORTAL_BUFFER_BYTES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_MAX_SUSPENDED_PORTAL_BUFFER_BYTES)
+}
+
+async fn take_suspended_rows(
+    suspended_portals: &Mutex<HashMap<String, SuspendedPortalState>>,
+    portal_name: &str,
+    max_rows: usize,
+) -> Option<(String, Vec<DataRow>, bool, usize)> {
+    let mut guard = suspended_portals.lock().await;
+    let state = guard.get_mut(portal_name)?;
+
+    let to_take = if max_rows == 0 {
+        state.remaining_rows.len()
+    } else {
+        max_rows.min(state.remaining_rows.len())
+    };
+
+    let mut chunk = Vec::with_capacity(to_take);
+    for _ in 0..to_take {
+        if let Some(row) = state.remaining_rows.pop_front() {
+            chunk.push(row);
+        }
+    }
+
+    state.rows_sent_so_far = state.rows_sent_so_far.saturating_add(chunk.len());
+    let still_suspended = !state.remaining_rows.is_empty();
+    let command_tag = state.command_tag.clone();
+    let total_rows_sent = state.rows_sent_so_far;
+
+    if !still_suspended {
+        guard.remove(portal_name);
+    }
+
+    Some((command_tag, chunk, still_suspended, total_rows_sent))
+}
+
+async fn send_limited_query_response<C>(
+    client: &mut C,
+    suspended_portals: &Mutex<HashMap<String, SuspendedPortalState>>,
+    portal_name: &str,
+    results: QueryResponse<'_>,
+    max_rows: usize,
+) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let command_tag = results.command_tag().to_owned();
+    let mut data_rows = results.data_rows();
+
+    let mut rows_sent = 0usize;
+    let mut remainder: VecDeque<DataRow> = VecDeque::new();
+    let mut buffered_bytes: usize = 0;
+    let max_buffered_rows = max_suspended_portal_buffer_rows();
+    let max_buffered_bytes = max_suspended_portal_buffer_bytes();
+
+    while let Some(row) = data_rows.next().await {
+        let row = row?;
+        if rows_sent < max_rows {
+            rows_sent += 1;
+            client.feed(PgWireBackendMessage::DataRow(row)).await?;
+        } else {
+            buffered_bytes = buffered_bytes.saturating_add(row.data.len());
+            remainder.push_back(row);
+            if remainder.len() > max_buffered_rows || buffered_bytes > max_buffered_bytes {
+                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_owned(),
+                    "54000".to_owned(),
+                    format!(
+                        "portal suspension buffer exceeded (portal={portal_name}, max_rows={max_rows}, buffer_rows_limit={max_buffered_rows}, buffer_bytes_limit={max_buffered_bytes}); re-run with max_rows=0 or reduce result size; set PGTIKV_MAX_SUSPENDED_PORTAL_BUFFER_ROWS/BYTES to override"
+                    ),
+                ))));
+            }
+        }
+    }
+
+    if !remainder.is_empty() {
+        let max_suspended = max_suspended_portals();
+        let mut guard = suspended_portals.lock().await;
+        if !guard.contains_key(portal_name) && guard.len() >= max_suspended {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "54000".to_owned(),
+                format!(
+                    "too many suspended portals (portal={portal_name}, max_rows={max_rows}, suspended_portals_limit={max_suspended}); close portals to free resources or re-run with max_rows=0; set PGTIKV_MAX_SUSPENDED_PORTALS to override"
+                ),
+            ))));
+        }
+        guard.insert(
+            portal_name.to_owned(),
+            SuspendedPortalState {
+                command_tag,
+                remaining_rows: remainder,
+                rows_sent_so_far: rows_sent,
+            },
+        );
+        client
+            .send(PgWireBackendMessage::PortalSuspended(
+                pgwire::messages::extendedquery::PortalSuspended::new(),
+            ))
+            .await?;
+    } else {
+        let tag = Tag::new(&command_tag).with_rows(rows_sent);
+        client
+            .send(PgWireBackendMessage::CommandComplete(tag.into()))
+            .await?;
+    }
+
+    Ok(())
 }
 
 pub struct PgServerParameterProvider;
@@ -1778,6 +1956,7 @@ pub struct DynamicPgHandler {
     session: Mutex<Option<Session>>,
     connection_guard: OnceCell<observability::ConnectionGuard>,
     copy_context: Mutex<Option<CopyContext>>,
+    suspended_portals: Mutex<HashMap<String, SuspendedPortalState>>,
     query_parser: Arc<NoopQueryParser>,
     connection_id: i32,
 }
@@ -1793,6 +1972,7 @@ impl DynamicPgHandler {
             session: Mutex::new(None),
             connection_guard: OnceCell::new(),
             copy_context: Mutex::new(None),
+            suspended_portals: Mutex::new(HashMap::new()),
             query_parser: Arc::new(NoopQueryParser::new()),
             connection_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
@@ -1810,6 +1990,7 @@ impl DynamicPgHandler {
             session: Mutex::new(None),
             connection_guard: OnceCell::new(),
             copy_context: Mutex::new(None),
+            suspended_portals: Mutex::new(HashMap::new()),
             query_parser: Arc::new(NoopQueryParser::new()),
             connection_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
@@ -2971,7 +3152,78 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        on_execute_with_tx_status_fix(self, client, message).await
+        on_execute_with_tx_status_fix(self, &self.suspended_portals, client, message).await
+    }
+
+    async fn on_bind<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Bind,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let portal_name = message
+            .portal_name
+            .as_deref()
+            .unwrap_or(pgwire::api::DEFAULT_NAME);
+        {
+            let mut guard = self.suspended_portals.lock().await;
+            guard.remove(portal_name);
+        }
+
+        let statement_name = message
+            .statement_name
+            .as_deref()
+            .unwrap_or(pgwire::api::DEFAULT_NAME);
+
+        if let Some(statement) = client.portal_store().get_statement(statement_name) {
+            let portal = Portal::try_new(&message, statement)?;
+            client.portal_store().put_portal(Arc::new(portal));
+            client
+                .send(PgWireBackendMessage::BindComplete(
+                    pgwire::messages::extendedquery::BindComplete::new(),
+                ))
+                .await?;
+            Ok(())
+        } else {
+            Err(PgWireError::StatementNotFound(statement_name.to_owned()))
+        }
+    }
+
+    async fn on_close<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Close,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = message.name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
+        match message.target_type {
+            pgwire::messages::extendedquery::TARGET_TYPE_BYTE_STATEMENT => {
+                client.portal_store().rm_statement(name);
+            }
+            pgwire::messages::extendedquery::TARGET_TYPE_BYTE_PORTAL => {
+                client.portal_store().rm_portal(name);
+                let mut guard = self.suspended_portals.lock().await;
+                guard.remove(name);
+            }
+            _ => {}
+        }
+
+        client
+            .send(PgWireBackendMessage::CloseComplete(
+                pgwire::messages::extendedquery::CloseComplete::new(),
+            ))
+            .await?;
+        Ok(())
     }
 
     async fn do_query<'a, 'b: 'a, C>(
@@ -3626,6 +3878,7 @@ pub struct PgHandler {
     executor: Arc<Executor>,
     session: Mutex<Session>,
     copy_context: Mutex<Option<CopyContext>>,
+    suspended_portals: Mutex<HashMap<String, SuspendedPortalState>>,
     query_parser: Arc<NoopQueryParser>,
     connection_id: i32,
 }
@@ -3646,6 +3899,7 @@ impl PgHandler {
                 "postgres".to_string(),
             )),
             copy_context: Mutex::new(None),
+            suspended_portals: Mutex::new(HashMap::new()),
             query_parser: Arc::new(NoopQueryParser::new()),
             connection_id,
         }
@@ -4031,7 +4285,78 @@ impl ExtendedQueryHandler for PgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        on_execute_with_tx_status_fix(self, client, message).await
+        on_execute_with_tx_status_fix(self, &self.suspended_portals, client, message).await
+    }
+
+    async fn on_bind<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Bind,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let portal_name = message
+            .portal_name
+            .as_deref()
+            .unwrap_or(pgwire::api::DEFAULT_NAME);
+        {
+            let mut guard = self.suspended_portals.lock().await;
+            guard.remove(portal_name);
+        }
+
+        let statement_name = message
+            .statement_name
+            .as_deref()
+            .unwrap_or(pgwire::api::DEFAULT_NAME);
+
+        if let Some(statement) = client.portal_store().get_statement(statement_name) {
+            let portal = Portal::try_new(&message, statement)?;
+            client.portal_store().put_portal(Arc::new(portal));
+            client
+                .send(PgWireBackendMessage::BindComplete(
+                    pgwire::messages::extendedquery::BindComplete::new(),
+                ))
+                .await?;
+            Ok(())
+        } else {
+            Err(PgWireError::StatementNotFound(statement_name.to_owned()))
+        }
+    }
+
+    async fn on_close<C>(
+        &self,
+        client: &mut C,
+        message: pgwire::messages::extendedquery::Close,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore<Statement = Self::Statement>,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let name = message.name.as_deref().unwrap_or(pgwire::api::DEFAULT_NAME);
+        match message.target_type {
+            pgwire::messages::extendedquery::TARGET_TYPE_BYTE_STATEMENT => {
+                client.portal_store().rm_statement(name);
+            }
+            pgwire::messages::extendedquery::TARGET_TYPE_BYTE_PORTAL => {
+                client.portal_store().rm_portal(name);
+                let mut guard = self.suspended_portals.lock().await;
+                guard.remove(name);
+            }
+            _ => {}
+        }
+
+        client
+            .send(PgWireBackendMessage::CloseComplete(
+                pgwire::messages::extendedquery::CloseComplete::new(),
+            ))
+            .await?;
+        Ok(())
     }
 
     async fn do_query<'a, 'b: 'a, C>(
@@ -4706,7 +5031,10 @@ mod tests {
     use bytes::Buf;
     use bytes::Bytes;
     use pgwire::api::portal::Format;
+    use pgwire::api::DefaultClient;
     use pgwire::messages::response::CommandComplete;
+    use std::collections::HashMap;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::pin::Pin;
     use std::task::{Context, Poll};
 
@@ -4821,6 +5149,462 @@ mod tests {
             update_tx_status_after_execution(status, &tag),
             TransactionStatus::Error
         );
+    }
+
+    #[derive(Debug)]
+    struct TestClient {
+        inner: DefaultClient<String>,
+        sent: Vec<PgWireBackendMessage>,
+    }
+
+    impl TestClient {
+        fn new() -> Self {
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+            Self {
+                inner: DefaultClient::new(addr, false),
+                sent: Vec::new(),
+            }
+        }
+    }
+
+    impl ClientInfo for TestClient {
+        fn socket_addr(&self) -> SocketAddr {
+            self.inner.socket_addr
+        }
+
+        fn is_secure(&self) -> bool {
+            self.inner.is_secure
+        }
+
+        fn state(&self) -> PgWireConnectionState {
+            self.inner.state
+        }
+
+        fn set_state(&mut self, new_state: PgWireConnectionState) {
+            self.inner.state = new_state;
+        }
+
+        fn transaction_status(&self) -> TransactionStatus {
+            self.inner.transaction_status
+        }
+
+        fn set_transaction_status(&mut self, new_status: TransactionStatus) {
+            self.inner.transaction_status = new_status;
+        }
+
+        fn metadata(&self) -> &HashMap<String, String> {
+            &self.inner.metadata
+        }
+
+        fn metadata_mut(&mut self) -> &mut HashMap<String, String> {
+            &mut self.inner.metadata
+        }
+    }
+
+    impl ClientPortalStore for TestClient {
+        type PortalStore = pgwire::api::store::MemPortalStore<String>;
+
+        fn portal_store(&self) -> &Self::PortalStore {
+            &self.inner.portal_store
+        }
+    }
+
+    impl Sink<PgWireBackendMessage> for TestClient {
+        type Error = PgWireError;
+
+        fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: PgWireBackendMessage) -> Result<(), Self::Error> {
+            self.get_mut().sent.push(item);
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[derive(Debug)]
+    struct StubExtendedQueryHandler {
+        query_parser: Arc<NoopQueryParser>,
+        rows: usize,
+    }
+
+    impl StubExtendedQueryHandler {
+        fn new() -> Self {
+            Self::new_with_rows(5)
+        }
+
+        fn new_with_rows(rows: usize) -> Self {
+            Self {
+                query_parser: Arc::new(NoopQueryParser::new()),
+                rows,
+            }
+        }
+
+        fn select_range_response(rows: usize) -> Response<'static> {
+            let fields = Arc::new(vec![FieldInfo::new(
+                "n".to_owned(),
+                None,
+                None,
+                Type::INT4,
+                FieldFormat::Text,
+            )]);
+
+            let row_fields = fields.clone();
+            let row_stream = stream::iter(0..rows).map(move |v| {
+                let mut encoder = DataRowEncoder::new(row_fields.clone());
+                let value = i32::try_from(v).unwrap_or(i32::MAX);
+                encoder.encode_field(&value)?;
+                encoder.finish()
+            });
+
+            Response::Query(QueryResponse::new(fields, row_stream))
+        }
+    }
+
+    #[async_trait]
+    impl ExtendedQueryHandler for StubExtendedQueryHandler {
+        type Statement = String;
+        type QueryParser = NoopQueryParser;
+
+        fn query_parser(&self) -> Arc<Self::QueryParser> {
+            self.query_parser.clone()
+        }
+
+        async fn do_query<'a, 'b: 'a, C>(
+            &'b self,
+            _client: &mut C,
+            _portal: &'a Portal<Self::Statement>,
+            _max_rows: usize,
+        ) -> PgWireResult<Response<'a>>
+        where
+            C: ClientInfo + Unpin + Send + Sync,
+        {
+            Ok(Self::select_range_response(self.rows))
+        }
+
+        async fn do_describe_statement<C>(
+            &self,
+            _client: &mut C,
+            _target: &StoredStatement<Self::Statement>,
+        ) -> PgWireResult<DescribeStatementResponse>
+        where
+            C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+            C::PortalStore: PortalStore<Statement = Self::Statement>,
+            C::Error: Debug,
+            PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+        {
+            Ok(DescribeStatementResponse::new(vec![], vec![]))
+        }
+
+        async fn do_describe_portal<C>(
+            &self,
+            _client: &mut C,
+            _target: &Portal<Self::Statement>,
+        ) -> PgWireResult<DescribePortalResponse>
+        where
+            C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+            C::PortalStore: PortalStore<Statement = Self::Statement>,
+            C::Error: Debug,
+            PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+        {
+            Ok(DescribePortalResponse::new(vec![]))
+        }
+    }
+
+    fn decode_single_text_field(row: &DataRow) -> String {
+        let mut data = row.data.clone();
+        let len = data.get_i32();
+        assert!(len >= 0);
+        let bytes = data.copy_to_bytes(len as usize);
+        String::from_utf8(bytes.to_vec()).expect("utf8")
+    }
+
+    #[tokio::test]
+    async fn execute_honors_max_rows_and_suspends_portal() {
+        let handler = StubExtendedQueryHandler::new();
+        let suspended = Mutex::new(HashMap::<String, SuspendedPortalState>::new());
+
+        let statement = Arc::new(StoredStatement::new(
+            "stmt".to_owned(),
+            "SELECT 1".to_owned(),
+            vec![],
+        ));
+        let bind = pgwire::messages::extendedquery::Bind::new(
+            Some("portal".to_owned()),
+            Some("stmt".to_owned()),
+            vec![],
+            vec![],
+            vec![],
+        );
+        let portal = Portal::try_new(&bind, statement).expect("portal");
+
+        let mut client = TestClient::new();
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        client
+            .portal_store()
+            .put_portal(Arc::new(portal.clone()));
+
+        on_execute_with_tx_status_fix(
+            &handler,
+            &suspended,
+            &mut client,
+            pgwire::messages::extendedquery::Execute::new(Some("portal".to_owned()), 2),
+        )
+        .await
+        .expect("execute 1");
+
+        let msgs = std::mem::take(&mut client.sent);
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(msgs[2], PgWireBackendMessage::PortalSuspended(_)));
+        assert_eq!(
+            msgs.iter()
+                .filter_map(|m| match m {
+                    PgWireBackendMessage::DataRow(r) => Some(decode_single_text_field(r)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["0", "1"]
+        );
+
+        on_execute_with_tx_status_fix(
+            &handler,
+            &suspended,
+            &mut client,
+            pgwire::messages::extendedquery::Execute::new(Some("portal".to_owned()), 2),
+        )
+        .await
+        .expect("execute 2");
+
+        let msgs = std::mem::take(&mut client.sent);
+        assert_eq!(msgs.len(), 3);
+        assert!(matches!(msgs[2], PgWireBackendMessage::PortalSuspended(_)));
+        assert_eq!(
+            msgs.iter()
+                .filter_map(|m| match m {
+                    PgWireBackendMessage::DataRow(r) => Some(decode_single_text_field(r)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["2", "3"]
+        );
+
+        on_execute_with_tx_status_fix(
+            &handler,
+            &suspended,
+            &mut client,
+            pgwire::messages::extendedquery::Execute::new(Some("portal".to_owned()), 2),
+        )
+        .await
+        .expect("execute 3");
+
+        let msgs = std::mem::take(&mut client.sent);
+        assert_eq!(msgs.len(), 2);
+        assert!(matches!(msgs[1], PgWireBackendMessage::CommandComplete(_)));
+        let PgWireBackendMessage::CommandComplete(complete) = &msgs[1] else {
+            panic!("expected CommandComplete");
+        };
+        assert_eq!(complete.tag, "SELECT 5");
+        assert_eq!(
+            msgs.iter()
+                .filter_map(|m| match m {
+                    PgWireBackendMessage::DataRow(r) => Some(decode_single_text_field(r)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["4"]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_errors_when_suspended_portal_count_exceeds_limit() {
+        let max_suspended = max_suspended_portals();
+        let handler = StubExtendedQueryHandler::new_with_rows(2);
+        let suspended = Mutex::new(HashMap::<String, SuspendedPortalState>::new());
+
+        let statement = Arc::new(StoredStatement::new(
+            "stmt".to_owned(),
+            "SELECT 1".to_owned(),
+            vec![],
+        ));
+
+        let mut client = TestClient::new();
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+
+        for i in 0..max_suspended {
+            let portal_name = format!("portal_{i}");
+            let bind = pgwire::messages::extendedquery::Bind::new(
+                Some(portal_name.clone()),
+                Some("stmt".to_owned()),
+                vec![],
+                vec![],
+                vec![],
+            );
+            let portal = Portal::try_new(&bind, statement.clone()).expect("portal");
+            client.portal_store().put_portal(Arc::new(portal));
+
+            on_execute_with_tx_status_fix(
+                &handler,
+                &suspended,
+                &mut client,
+                pgwire::messages::extendedquery::Execute::new(Some(portal_name.clone()), 1),
+            )
+            .await
+            .expect("execute should suspend");
+
+            let msgs = std::mem::take(&mut client.sent);
+            assert!(msgs.iter().any(|m| matches!(m, PgWireBackendMessage::DataRow(_))));
+            assert!(msgs
+                .iter()
+                .any(|m| matches!(m, PgWireBackendMessage::PortalSuspended(_))));
+        }
+
+        assert_eq!(suspended.lock().await.len(), max_suspended);
+
+        let portal_name = "portal_over_limit".to_owned();
+        let bind = pgwire::messages::extendedquery::Bind::new(
+            Some(portal_name.clone()),
+            Some("stmt".to_owned()),
+            vec![],
+            vec![],
+            vec![],
+        );
+        let portal = Portal::try_new(&bind, statement).expect("portal");
+        client.portal_store().put_portal(Arc::new(portal));
+
+        let err = on_execute_with_tx_status_fix(
+            &handler,
+            &suspended,
+            &mut client,
+            pgwire::messages::extendedquery::Execute::new(Some(portal_name.clone()), 1),
+        )
+        .await
+        .expect_err("expected suspended portal count limit error");
+
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "54000");
+                assert!(info.message.contains("too many suspended portals"));
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
+
+        // The server should not retain suspended portal rows after failing.
+        let guard = suspended.lock().await;
+        assert_eq!(guard.len(), max_suspended);
+        assert!(!guard.contains_key(&portal_name));
+    }
+
+    #[tokio::test]
+    async fn execute_max_rows_zero_returns_all_rows() {
+        let handler = StubExtendedQueryHandler::new();
+        let suspended = Mutex::new(HashMap::<String, SuspendedPortalState>::new());
+
+        let statement = Arc::new(StoredStatement::new(
+            "stmt".to_owned(),
+            "SELECT 1".to_owned(),
+            vec![],
+        ));
+        let bind = pgwire::messages::extendedquery::Bind::new(
+            Some("portal".to_owned()),
+            Some("stmt".to_owned()),
+            vec![],
+            vec![],
+            vec![],
+        );
+        let portal = Portal::try_new(&bind, statement).expect("portal");
+
+        let mut client = TestClient::new();
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        client.portal_store().put_portal(Arc::new(portal));
+
+        on_execute_with_tx_status_fix(
+            &handler,
+            &suspended,
+            &mut client,
+            pgwire::messages::extendedquery::Execute::new(Some("portal".to_owned()), 0),
+        )
+        .await
+        .expect("execute");
+
+        let msgs = std::mem::take(&mut client.sent);
+        assert!(matches!(msgs.last(), Some(PgWireBackendMessage::CommandComplete(_))));
+        assert_eq!(
+            msgs.iter()
+                .filter_map(|m| match m {
+                    PgWireBackendMessage::DataRow(r) => Some(decode_single_text_field(r)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["0", "1", "2", "3", "4"]
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_errors_when_suspension_buffer_exceeds_limit() {
+        let max_buffered_rows = max_suspended_portal_buffer_rows();
+        let max_rows = 2usize;
+        let handler = StubExtendedQueryHandler::new_with_rows(max_rows + max_buffered_rows + 1);
+        let suspended = Mutex::new(HashMap::<String, SuspendedPortalState>::new());
+
+        let statement = Arc::new(StoredStatement::new(
+            "stmt".to_owned(),
+            "SELECT 1".to_owned(),
+            vec![],
+        ));
+        let bind = pgwire::messages::extendedquery::Bind::new(
+            Some("portal".to_owned()),
+            Some("stmt".to_owned()),
+            vec![],
+            vec![],
+            vec![],
+        );
+        let portal = Portal::try_new(&bind, statement).expect("portal");
+
+        let mut client = TestClient::new();
+        client.set_state(PgWireConnectionState::ReadyForQuery);
+        client.portal_store().put_portal(Arc::new(portal));
+
+        let err = on_execute_with_tx_status_fix(
+            &handler,
+            &suspended,
+            &mut client,
+            pgwire::messages::extendedquery::Execute::new(Some("portal".to_owned()), max_rows as i32),
+        )
+        .await
+        .expect_err("expected buffer limit error");
+
+        match err {
+            PgWireError::UserError(info) => {
+                assert!(info.message.contains("portal suspension buffer exceeded"));
+            }
+            other => panic!("expected user error, got {other:?}"),
+        }
+
+        // The server should not retain suspended portal rows after failing.
+        assert!(suspended.lock().await.is_empty());
+
+        let data_rows = client
+            .sent
+            .iter()
+            .filter(|m| matches!(m, PgWireBackendMessage::DataRow(_)))
+            .count();
+        assert_eq!(data_rows, max_rows);
+        assert!(!client
+            .sent
+            .iter()
+            .any(|m| matches!(m, PgWireBackendMessage::PortalSuspended(_))));
+        assert!(!client
+            .sent
+            .iter()
+            .any(|m| matches!(m, PgWireBackendMessage::CommandComplete(_))));
     }
 
     #[test]
