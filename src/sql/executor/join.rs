@@ -5060,13 +5060,18 @@ fn generate_series_values_limited(
             }
             Ok((values, DataType::Timestamp))
         }
-	        (Value::Date(s), Value::Date(e)) => {
+        (Value::Date(s), Value::Date(e)) => {
             let step_interval = match step {
                 Value::Interval(iv) => iv.clone(),
                 _ => return Err(anyhow!("generate_series with dates requires interval step")),
             };
-            let step_days = interval_to_days(&step_interval);
-            if step_days == 0 {
+            if step_interval.months == 0 && step_interval.millis == 0 {
+                return Err(anyhow!("step size cannot equal zero"));
+            }
+
+            // Validate step size before honoring LIMIT/OFFSET.
+            let step_ms = interval_to_millis(&step_interval);
+            if step_ms == 0 {
                 return Err(anyhow!("step size cannot equal zero"));
             }
 
@@ -5074,64 +5079,225 @@ fn generate_series_values_limited(
                 return Ok((Vec::new(), DataType::TimestampTz));
             }
 
-	            let mut current = *s;
-	            if offset > 0 {
-	                let offset_i128 = offset as i128;
-	                let delta_i128 = i128::from(step_days) * offset_i128;
-	                let current_i128 = i128::from(*s) + delta_i128;
-	                let Ok(cur_i32) = i32::try_from(current_i128) else {
-	                    return Ok((Vec::new(), DataType::TimestampTz));
-	                };
-	                current = cur_i32;
-	            }
-
-            let mut values = Vec::new();
             let tz = crate::types::timestamp::TimeZoneSpec::parse(
                 crate::session_context::current_timezone().as_ref(),
             );
-            if step_days > 0 {
-                while current <= *e {
-                    if remaining == 0 {
-                        break;
-                    }
-                    if values.len() >= max_rows {
-                        return Err(too_many_rows());
-                    }
-                    let date = crate::types::date::date_days_to_naive_date(current)?;
-                    let naive = date
-                        .and_hms_opt(0, 0, 0)
-                        .ok_or_else(|| anyhow!("Invalid date"))?;
-                    values.push(Value::Timestamp(
-                        tz.timestamp_millis_from_local_datetime(naive)?,
-                    ));
-                    remaining = remaining.saturating_sub(1);
-                    current = match current.checked_add(step_days) {
-                        Some(next) => next,
-                        None => break,
+            let naive_date_midnight_timestamptz = |date: chrono::NaiveDate| -> Result<i64> {
+                let naive = date
+                    .and_hms_opt(0, 0, 0)
+                    .ok_or_else(|| anyhow!("Invalid date"))?;
+                tz.timestamp_millis_from_local_datetime(naive)
+            };
+            let date_midnight_timestamptz = |days: i32| -> Result<i64> {
+                let date = crate::types::date::date_days_to_naive_date(days)?;
+                naive_date_midnight_timestamptz(date)
+            };
+
+            let mut values = Vec::new();
+
+            const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
+            let has_subday_component = step_interval.millis % MILLIS_PER_DAY != 0;
+            // For calendar steps (month/day), advance by calendar months/days instead of fixed
+            // milliseconds. This avoids month length drift and DST drift.
+            if !has_subday_component {
+                let step_days_i64 = step_interval.millis / MILLIS_PER_DAY;
+                if step_interval.months == 0 {
+                    let Ok(step_days) = i32::try_from(step_days_i64) else {
+                        return Ok((Vec::new(), DataType::TimestampTz));
                     };
+                    if step_days == 0 {
+                        return Err(anyhow!("step size cannot equal zero"));
+                    }
+
+                    let mut current = *s;
+                    if offset > 0 {
+                        let offset_i128 = offset as i128;
+                        let delta_i128 = i128::from(step_days) * offset_i128;
+                        let current_i128 = i128::from(*s) + delta_i128;
+                        let Ok(cur_i32) = i32::try_from(current_i128) else {
+                            return Ok((Vec::new(), DataType::TimestampTz));
+                        };
+                        current = cur_i32;
+                    }
+
+                    if step_days > 0 {
+                        while current <= *e {
+                            if remaining == 0 {
+                                break;
+                            }
+                            if values.len() >= max_rows {
+                                return Err(too_many_rows());
+                            }
+                            values.push(Value::Timestamp(date_midnight_timestamptz(current)?));
+                            remaining = remaining.saturating_sub(1);
+                            current = match current.checked_add(step_days) {
+                                Some(next) => next,
+                                None => break,
+                            };
+                        }
+                    } else {
+                        while current >= *e {
+                            if remaining == 0 {
+                                break;
+                            }
+                            if values.len() >= max_rows {
+                                return Err(too_many_rows());
+                            }
+                            values.push(Value::Timestamp(date_midnight_timestamptz(current)?));
+                            remaining = remaining.saturating_sub(1);
+                            current = match current.checked_add(step_days) {
+                                Some(next) => next,
+                                None => break,
+                            };
+                        }
+                    }
+                } else {
+                    use chrono::Datelike;
+
+                    let step_days = step_days_i64;
+                    let add_months_clamped =
+                        |date: chrono::NaiveDate, months: i32| -> Option<chrono::NaiveDate> {
+                            if months == 0 {
+                                return Some(date);
+                            }
+
+                            let year = i64::from(date.year());
+                            let month0 = i64::from(date.month0());
+                            let total_months = year
+                                .checked_mul(12)?
+                                .checked_add(month0)?
+                                .checked_add(i64::from(months))?;
+                            let new_year = i32::try_from(total_months.div_euclid(12)).ok()?;
+                            let new_month0 = total_months.rem_euclid(12);
+                            let new_month = u32::try_from(new_month0 + 1).ok()?;
+
+                            let day = date.day();
+                            let first_of_next_month = if new_month == 12 {
+                                chrono::NaiveDate::from_ymd_opt(new_year.checked_add(1)?, 1, 1)?
+                            } else {
+                                chrono::NaiveDate::from_ymd_opt(new_year, new_month + 1, 1)?
+                            };
+                            let last_day = first_of_next_month.pred_opt()?.day();
+                            chrono::NaiveDate::from_ymd_opt(new_year, new_month, day.min(last_day))
+                        };
+
+                    let apply_step = |date: chrono::NaiveDate| -> Option<chrono::NaiveDate> {
+                        let with_months = add_months_clamped(date, step_interval.months)?;
+                        with_months.checked_add_signed(chrono::Duration::days(step_days))
+                    };
+
+                    let mut current = crate::types::date::date_days_to_naive_date(*s)?;
+                    let stop = crate::types::date::date_days_to_naive_date(*e)?;
+                    let step_forward = step_interval.months > 0
+                        || (step_interval.months == 0 && step_days > 0);
+
+                    if offset > 0 {
+                        for _ in 0..offset {
+                            let Some(next) = apply_step(current) else {
+                                return Ok((Vec::new(), DataType::TimestampTz));
+                            };
+                            current = next;
+                        }
+                    }
+
+	                    if step_forward {
+	                        while current <= stop {
+	                            if remaining == 0 {
+	                                break;
+	                            }
+	                            if values.len() >= max_rows {
+	                                return Err(too_many_rows());
+	                            }
+	                            values.push(Value::Timestamp(naive_date_midnight_timestamptz(current)?));
+	                            remaining = remaining.saturating_sub(1);
+	                            if current == stop {
+	                                break;
+	                            }
+	                            let next = match apply_step(current) {
+	                                Some(next) => next,
+	                                None => break,
+	                            };
+	                            if next <= current {
+	                                return Err(anyhow!(
+                                    "generate_series interval step does not make forward progress for date"
+                                ));
+                            }
+                            current = next;
+                        }
+	                    } else {
+	                        while current >= stop {
+	                            if remaining == 0 {
+	                                break;
+	                            }
+	                            if values.len() >= max_rows {
+	                                return Err(too_many_rows());
+	                            }
+	                            values.push(Value::Timestamp(naive_date_midnight_timestamptz(current)?));
+	                            remaining = remaining.saturating_sub(1);
+	                            if current == stop {
+	                                break;
+	                            }
+	                            let next = match apply_step(current) {
+	                                Some(next) => next,
+	                                None => break,
+	                            };
+	                            if next >= current {
+	                                return Err(anyhow!(
+                                    "generate_series interval step does not make backward progress for date"
+                                ));
+	                            }
+	                            current = next;
+	                        }
+	                    }
                 }
             } else {
-                while current >= *e {
-                    if remaining == 0 {
-                        break;
-                    }
-                    if values.len() >= max_rows {
-                        return Err(too_many_rows());
-                    }
-                    let date = crate::types::date::date_days_to_naive_date(current)?;
-                    let naive = date
-                        .and_hms_opt(0, 0, 0)
-                        .ok_or_else(|| anyhow!("Invalid date"))?;
-                    values.push(Value::Timestamp(
-                        tz.timestamp_millis_from_local_datetime(naive)?,
-                    ));
-                    remaining = remaining.saturating_sub(1);
-                    current = match current.checked_add(step_days) {
-                        Some(next) => next,
-                        None => break,
+                let start_ms = date_midnight_timestamptz(*s)?;
+                let stop_ms = date_midnight_timestamptz(*e)?;
+
+                let mut current = start_ms;
+                if offset > 0 {
+                    let offset_i128 = offset as i128;
+                    let delta_i128 = i128::from(step_ms) * offset_i128;
+                    let current_i128 = i128::from(current) + delta_i128;
+                    let Ok(cur) = i64::try_from(current_i128) else {
+                        return Ok((Vec::new(), DataType::TimestampTz));
                     };
+                    current = cur;
+                }
+
+                if step_ms > 0 {
+                    while current <= stop_ms {
+                        if remaining == 0 {
+                            break;
+                        }
+                        if values.len() >= max_rows {
+                            return Err(too_many_rows());
+                        }
+                        values.push(Value::Timestamp(current));
+                        remaining = remaining.saturating_sub(1);
+                        current = match current.checked_add(step_ms) {
+                            Some(next) => next,
+                            None => break,
+                        };
+                    }
+                } else {
+                    while current >= stop_ms {
+                        if remaining == 0 {
+                            break;
+                        }
+                        if values.len() >= max_rows {
+                            return Err(too_many_rows());
+                        }
+                        values.push(Value::Timestamp(current));
+                        remaining = remaining.saturating_sub(1);
+                        current = match current.checked_add(step_ms) {
+                            Some(next) => next,
+                            None => break,
+                        };
+                    }
                 }
             }
+
             Ok((values, DataType::TimestampTz))
         }
         (Value::Numeric(s), Value::Numeric(e)) => {
@@ -5224,17 +5390,24 @@ fn interval_to_millis(iv: &crate::types::IntervalValue) -> i64 {
     iv.to_millis_approx()
 }
 
-fn interval_to_days(iv: &crate::types::IntervalValue) -> i32 {
-    let months_days = iv.months * 30;
-    let millis_days = (iv.millis / (1000 * 60 * 60 * 24)) as i32;
-    months_days + millis_days
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
+    use std::sync::Arc;
+
+    fn with_session_timezone<T>(timezone: &str, f: impl FnOnce() -> T) -> T {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(crate::session_context::with_timezone(
+            Arc::from(timezone),
+            async move { f() },
+        ))
+    }
 
     fn parse_query(sql: &str) -> Query {
         let dialect = PostgreSqlDialect {};
@@ -5830,10 +6003,8 @@ mod tests {
 
     #[test]
     fn generate_series_date_overflow_does_not_loop() {
-        let step = Value::Interval(crate::types::IntervalValue {
-            months: i32::MAX / 30,
-            millis: 7 * 24 * 60 * 60 * 1000,
-        });
+        let step =
+            Value::Interval(crate::types::IntervalValue::from_millis(i64::MAX));
         let (values, ty) = generate_series_values(&Value::Date(1), &Value::Date(1), &step).unwrap();
         assert_eq!(ty, DataType::TimestampTz);
 
@@ -6046,6 +6217,215 @@ mod tests {
         );
 
         assert_eq!(types, vec![DataType::Timestamp]);
+    }
+
+    #[test]
+    fn generate_series_date_sub_day_step_includes_intermediate() {
+        let start_days = crate::types::date::parse_date_days("2024-01-01").unwrap();
+        let stop_days = crate::types::date::parse_date_days("2024-01-02").unwrap();
+        let step = Value::Interval(crate::types::IntervalValue::from_millis(12 * 60 * 60 * 1000));
+
+        let (values, ty) = with_session_timezone("America/Los_Angeles", || {
+            generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
+                .unwrap()
+        });
+
+        assert_eq!(ty, DataType::TimestampTz);
+
+        let tz = chrono_tz::America::Los_Angeles;
+        let d1 = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let d2 = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        let t0 = tz
+            .from_local_datetime(&d1.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let t12 = tz
+            .from_local_datetime(&d1.and_hms_opt(12, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let t24 = tz
+            .from_local_datetime(&d2.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(
+            values,
+            vec![
+                Value::Timestamp(t0),
+                Value::Timestamp(t12),
+                Value::Timestamp(t24)
+            ]
+        );
+    }
+
+    #[test]
+    fn generate_series_date_interval_does_not_truncate_remainder() {
+        let start_days = crate::types::date::parse_date_days("2024-01-01").unwrap();
+        let stop_days = crate::types::date::parse_date_days("2024-01-03").unwrap();
+        let step = Value::Interval(crate::types::IntervalValue::from_millis(36 * 60 * 60 * 1000));
+
+        let (values, ty) = with_session_timezone("America/Los_Angeles", || {
+            generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
+                .unwrap()
+        });
+
+        assert_eq!(ty, DataType::TimestampTz);
+
+        let tz = chrono_tz::America::Los_Angeles;
+        let d1 = chrono::NaiveDate::from_ymd_opt(2024, 1, 1).unwrap();
+        let d2 = chrono::NaiveDate::from_ymd_opt(2024, 1, 2).unwrap();
+        let t0 = tz
+            .from_local_datetime(&d1.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let t36 = tz
+            .from_local_datetime(&d2.and_hms_opt(12, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(values, vec![Value::Timestamp(t0), Value::Timestamp(t36)]);
+    }
+
+    #[test]
+    fn generate_series_date_month_step_across_dst_start_keeps_local_midnight() {
+        let start_days = crate::types::date::parse_date_days("2024-03-01").unwrap();
+        let stop_days = crate::types::date::parse_date_days("2024-05-01").unwrap();
+        let step = Value::Interval(crate::types::IntervalValue::from_months(1));
+
+        let (values, ty) = with_session_timezone("America/Los_Angeles", || {
+            generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
+                .unwrap()
+        });
+
+        assert_eq!(ty, DataType::TimestampTz);
+
+        let tz = chrono_tz::America::Los_Angeles;
+        let d1 = chrono::NaiveDate::from_ymd_opt(2024, 3, 1).unwrap();
+        let d2 = chrono::NaiveDate::from_ymd_opt(2024, 4, 1).unwrap();
+        let d3 = chrono::NaiveDate::from_ymd_opt(2024, 5, 1).unwrap();
+
+        let t1 = tz
+            .from_local_datetime(&d1.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let t2 = tz
+            .from_local_datetime(&d2.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let t3 = tz
+            .from_local_datetime(&d3.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(
+            values,
+            vec![Value::Timestamp(t1), Value::Timestamp(t2), Value::Timestamp(t3)]
+        );
+    }
+
+    #[test]
+    fn generate_series_date_day_step_across_dst_start_keeps_local_midnight() {
+        let start_days = crate::types::date::parse_date_days("2024-03-09").unwrap();
+        let stop_days = crate::types::date::parse_date_days("2024-03-11").unwrap();
+        let step = Value::Interval(crate::types::IntervalValue::from_millis(24 * 60 * 60 * 1000));
+
+        let (values, ty) = with_session_timezone("America/Los_Angeles", || {
+            generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
+                .unwrap()
+        });
+
+        assert_eq!(ty, DataType::TimestampTz);
+
+        let tz = chrono_tz::America::Los_Angeles;
+        let d1 = chrono::NaiveDate::from_ymd_opt(2024, 3, 9).unwrap();
+        let d2 = chrono::NaiveDate::from_ymd_opt(2024, 3, 10).unwrap();
+        let d3 = chrono::NaiveDate::from_ymd_opt(2024, 3, 11).unwrap();
+
+        let t1 = tz
+            .from_local_datetime(&d1.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let t2 = tz
+            .from_local_datetime(&d2.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let t3 = tz
+            .from_local_datetime(&d3.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(
+            values,
+            vec![Value::Timestamp(t1), Value::Timestamp(t2), Value::Timestamp(t3)]
+        );
+    }
+
+    #[test]
+    fn generate_series_date_day_step_across_dst_end_keeps_local_midnight() {
+        let start_days = crate::types::date::parse_date_days("2024-11-02").unwrap();
+        let stop_days = crate::types::date::parse_date_days("2024-11-04").unwrap();
+        let step = Value::Interval(crate::types::IntervalValue::from_millis(24 * 60 * 60 * 1000));
+
+        let (values, ty) = with_session_timezone("America/Los_Angeles", || {
+            generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
+                .unwrap()
+        });
+
+        assert_eq!(ty, DataType::TimestampTz);
+
+        let tz = chrono_tz::America::Los_Angeles;
+        let d1 = chrono::NaiveDate::from_ymd_opt(2024, 11, 2).unwrap();
+        let d2 = chrono::NaiveDate::from_ymd_opt(2024, 11, 3).unwrap();
+        let d3 = chrono::NaiveDate::from_ymd_opt(2024, 11, 4).unwrap();
+
+        let t1 = tz
+            .from_local_datetime(&d1.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let t2 = tz
+            .from_local_datetime(&d2.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let t3 = tz
+            .from_local_datetime(&d3.and_hms_opt(0, 0, 0).unwrap())
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(
+            values,
+            vec![Value::Timestamp(t1), Value::Timestamp(t2), Value::Timestamp(t3)]
+        );
+    }
+
+    #[test]
+    fn generate_series_date_mixed_sign_month_day_step_progress_guard_errors() {
+        let start_days = crate::types::date::parse_date_days("2024-01-01").unwrap();
+        let stop_days = crate::types::date::parse_date_days("2024-01-03").unwrap();
+        let step = Value::Interval(crate::types::IntervalValue::new(
+            1,
+            -31_i64 * 24 * 60 * 60 * 1000,
+        ));
+
+        let err =
+            generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
+                .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("does not make forward progress for date"));
     }
 
     #[test]

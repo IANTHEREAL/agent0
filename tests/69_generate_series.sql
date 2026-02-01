@@ -17,6 +17,18 @@ SELECT * FROM generate_series(
 ) AS d ORDER BY d;
 
 SELECT * FROM generate_series(
+    '2024-01-01'::DATE,
+    '2024-01-02'::DATE,
+    '12 hours'::INTERVAL
+) AS d ORDER BY d;
+
+SELECT * FROM generate_series(
+    '2024-01-01'::DATE,
+    '2024-01-03'::DATE,
+    '36 hours'::INTERVAL
+) AS d ORDER BY d;
+
+SELECT * FROM generate_series(
     '2024-01-01 00:00:00'::TIMESTAMP,
     '2024-01-01 03:00:00'::TIMESTAMP,
     '1 hour'::INTERVAL
