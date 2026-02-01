@@ -1,0 +1,6 @@
+foo|id|a1|b1|c1
+10|1|a1|b1|c1
+(1 row)
+id|name|a1|b1|c1
+1|alice|a1|b1|c1
+(1 row)

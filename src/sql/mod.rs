@@ -31,6 +31,7 @@ mod triggers;
 mod trigger_queue;
 pub(crate) mod trigger_worker;
 mod udt;
+pub(crate) mod wildcard;
 mod window;
 pub mod types;
 

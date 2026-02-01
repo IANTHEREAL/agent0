@@ -10,6 +10,7 @@ use super::super::information_schema::VirtualTableFilter;
 use super::super::names;
 use super::super::operators::{hash_row_key_for_join, row_key_has_null_for_join, row_keys_equal_for_join, HashJoinConfig};
 use super::super::sequences;
+use super::super::wildcard::{build_join_wildcard_plan, JoinWildcardColumn};
 use super::super::window::{compute_window_functions_join, extract_window_functions};
 use super::super::{
     expr::{eval_expr_join, JoinContext},
@@ -327,6 +328,43 @@ fn project_wildcard_natural_join(
                 vals.push(row.values.get(idx).cloned().unwrap_or(Value::Null));
             }
 
+            Row::new(vals)
+        })
+        .collect();
+
+    (cols, column_types, result_rows)
+}
+
+fn project_rows_by_join_wildcard_plan(
+    combined_schemas: &[(String, TableSchema)],
+    plan_cols: &[JoinWildcardColumn],
+    rows_to_project: Vec<Row>,
+) -> (Vec<String>, Vec<DataType>, Vec<Row>) {
+    let mut source_offsets: Vec<usize> = Vec::with_capacity(combined_schemas.len());
+    let mut offset = 0usize;
+    for (_, schema) in combined_schemas {
+        source_offsets.push(offset);
+        offset = offset.saturating_add(schema.columns.len());
+    }
+
+    let col_indices: Vec<usize> = plan_cols
+        .iter()
+        .map(|c| {
+            let base = source_offsets.get(c.source_idx).copied().unwrap_or(0);
+            base.saturating_add(c.col_idx)
+        })
+        .collect();
+
+    let cols: Vec<String> = plan_cols.iter().map(|c| c.name.clone()).collect();
+    let column_types: Vec<DataType> = plan_cols.iter().map(|c| c.data_type.clone()).collect();
+
+    let result_rows = rows_to_project
+        .into_iter()
+        .map(|row| {
+            let vals: Vec<Value> = col_indices
+                .iter()
+                .map(|&idx| row.values.get(idx).cloned().unwrap_or(Value::Null))
+                .collect();
             Row::new(vals)
         })
         .collect();
@@ -3915,7 +3953,21 @@ impl Executor {
             .iter()
             .any(|p| matches!(p, SelectItem::QualifiedWildcard(..)));
         if has_wildcard {
-            if has_natural_join && !natural_join_common_cols.is_empty() {
+            let plan = if has_natural_join {
+                let schema_refs: Vec<&TableSchema> =
+                    combined_schemas.iter().map(|(_, s)| s).collect();
+                build_join_wildcard_plan(select, &schema_refs)
+            } else {
+                None
+            };
+
+            if let Some(plan) = plan.filter(|p| p.any_merge) {
+                (cols, column_types, result_rows) = project_rows_by_join_wildcard_plan(
+                    &combined_schemas,
+                    &plan.columns,
+                    rows_to_project,
+                );
+            } else if has_natural_join && !natural_join_common_cols.is_empty() {
                 (cols, column_types, result_rows) = project_wildcard_natural_join(
                     &combined_schemas,
                     &natural_join_common_cols,
@@ -4859,6 +4911,167 @@ mod tests {
             foreign_keys: vec![],
             owner: String::new(),
         }
+    }
+
+    #[test]
+    fn chained_using_join_wildcard_projection_dedups_and_orders_columns() {
+        let schema_a = TableSchema {
+            name: "a".to_string(),
+            table_id: 1,
+            columns: vec![
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "foo".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "a1".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+
+        let schema_b = TableSchema {
+            name: "b".to_string(),
+            table_id: 2,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "b1".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+
+        let schema_c = TableSchema {
+            name: "c".to_string(),
+            table_id: 3,
+            columns: vec![
+                ColumnDef {
+                    name: "foo".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "c1".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+
+        let combined_schemas =
+            vec![("a".to_string(), schema_a), ("b".to_string(), schema_b), ("c".to_string(), schema_c)];
+
+        let stmts =
+            crate::sql::parse_sql("SELECT * FROM a JOIN b USING (id) JOIN c USING (foo)").unwrap();
+        let stmt = stmts.first().expect("stmt");
+        let Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+
+        let schema_refs: Vec<&TableSchema> = combined_schemas.iter().map(|(_, s)| s).collect();
+        let plan = build_join_wildcard_plan(select, &schema_refs).expect("plan");
+        assert!(plan.any_merge);
+
+        let rows = vec![Row::new(vec![
+            Value::Text("alice".to_string()),         // a.name
+            Value::Int32(1),                          // a.id
+            Value::Text("foo_left".to_string()),      // a.foo
+            Value::Text("a1".to_string()),            // a.a1
+            Value::Int32(999),                        // b.id (should be ignored)
+            Value::Text("b1".to_string()),            // b.b1
+            Value::Text("foo_right".to_string()),     // c.foo (should be ignored)
+            Value::Text("c1".to_string()),            // c.c1
+        ])];
+
+        let (cols, _types, projected) =
+            project_rows_by_join_wildcard_plan(&combined_schemas, &plan.columns, rows);
+
+        assert_eq!(cols, vec!["foo", "id", "name", "a1", "b1", "c1"]);
+        assert_eq!(
+            projected[0].values,
+            vec![
+                Value::Text("foo_left".to_string()),
+                Value::Int32(1),
+                Value::Text("alice".to_string()),
+                Value::Text("a1".to_string()),
+                Value::Text("b1".to_string()),
+                Value::Text("c1".to_string()),
+            ]
+        );
     }
 
     #[test]

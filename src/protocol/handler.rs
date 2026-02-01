@@ -31,11 +31,11 @@ use pgwire::messages::response::{
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, Ident, JoinConstraint, JoinOperator, ObjectName, Query,
-    Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins, Values,
+    Expr, FunctionArg, FunctionArgExpr, Ident, ObjectName, Query, Select, SelectItem, SetExpr,
+    Statement, TableFactor, TableWithJoins, Values,
 };
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -1639,7 +1639,12 @@ async fn infer_select_output_columns_with_txn(
         .await?;
     }
 
-    let natural_join_common_cols = infer_natural_join_common_cols_for_wildcard(select, &sources);
+    let join_wildcard_plan = if sources.is_empty() {
+        None
+    } else {
+        let schema_refs: Vec<&TableSchema> = sources.iter().map(|s| &s.schema).collect();
+        crate::sql::wildcard::build_join_wildcard_plan(select, &schema_refs)
+    };
 
     let mut ctx = TypeContext::empty();
     for src in &sources {
@@ -1654,11 +1659,19 @@ async fn infer_select_output_columns_with_txn(
                 if sources.is_empty() {
                     return None;
                 }
-
-                out_cols.extend(infer_wildcard_output_columns(
-                    &sources,
-                    natural_join_common_cols.as_deref(),
-                ));
+                if let Some(plan) = join_wildcard_plan.as_ref().filter(|p| p.any_merge) {
+                    out_cols.extend(plan.columns.iter().map(|c| InferredColumn {
+                        name: c.name.clone(),
+                        data_type: c.data_type.clone(),
+                    }));
+                } else {
+                    for src in &sources {
+                        out_cols.extend(src.schema.columns.iter().map(|c| InferredColumn {
+                            name: c.name.clone(),
+                            data_type: c.data_type.clone(),
+                        }));
+                    }
+                }
             }
             SelectItem::QualifiedWildcard(obj, _) => {
                 if sources.is_empty() {
@@ -1690,129 +1703,6 @@ async fn infer_select_output_columns_with_txn(
     }
 
     Some(out_cols)
-}
-
-fn infer_natural_join_common_cols_for_wildcard(
-    select: &Select,
-    sources: &[SourceSchema],
-) -> Option<Vec<String>> {
-    if select.from.is_empty() {
-        return None;
-    }
-
-    let mut from_source_starts = Vec::with_capacity(select.from.len());
-    let mut next_idx = 0usize;
-    for twj in &select.from {
-        from_source_starts.push(next_idx);
-        next_idx = next_idx.saturating_add(1 + twj.joins.len());
-    }
-    if next_idx != sources.len() {
-        return None;
-    }
-
-    let mut natural_join_common_cols: Option<Vec<String>> = None;
-
-    let process_from_item =
-        |twj: &TableWithJoins, start_idx: usize, current: &mut Option<Vec<String>>| {
-            let mut left_schemas: Vec<&TableSchema> = vec![&sources[start_idx].schema];
-            for (join_idx, join) in twj.joins.iter().enumerate() {
-                let right_schema = &sources[start_idx + 1 + join_idx].schema;
-
-                match &join.join_operator {
-                    JoinOperator::Inner(JoinConstraint::Natural)
-                    | JoinOperator::LeftOuter(JoinConstraint::Natural)
-                    | JoinOperator::RightOuter(JoinConstraint::Natural)
-                    | JoinOperator::FullOuter(JoinConstraint::Natural) => {
-                        let right_set: HashSet<&str> = right_schema
-                            .columns
-                            .iter()
-                            .map(|c| c.name.as_str())
-                            .collect();
-                        let common_cols: Vec<String> = left_schemas
-                            .iter()
-                            .flat_map(|schema| schema.columns.iter().map(|c| c.name.clone()))
-                            .filter(|c| right_set.contains(c.as_str()))
-                            .collect();
-                        *current = Some(common_cols);
-                    }
-                    JoinOperator::Inner(JoinConstraint::Using(cols))
-                    | JoinOperator::LeftOuter(JoinConstraint::Using(cols))
-                    | JoinOperator::RightOuter(JoinConstraint::Using(cols))
-                    | JoinOperator::FullOuter(JoinConstraint::Using(cols)) => {
-                        *current = Some(cols.iter().map(normalize_sql_ident).collect());
-                    }
-                    _ => {}
-                }
-
-                left_schemas.push(right_schema);
-            }
-        };
-
-    if select.from.len() > 1 {
-        for (idx, twj) in select.from.iter().enumerate().skip(1) {
-            process_from_item(twj, from_source_starts[idx], &mut natural_join_common_cols);
-        }
-    }
-    process_from_item(
-        &select.from[0],
-        from_source_starts[0],
-        &mut natural_join_common_cols,
-    );
-
-    natural_join_common_cols
-}
-
-fn infer_wildcard_output_columns(
-    sources: &[SourceSchema],
-    natural_join_common_cols: Option<&[String]>,
-) -> Vec<InferredColumn> {
-    if sources.is_empty() {
-        return Vec::new();
-    }
-
-    if let Some(common_cols) = natural_join_common_cols.filter(|c| !c.is_empty()) {
-        let common_set: HashSet<&str> = common_cols.iter().map(|c| c.as_str()).collect();
-        let mut common_types: HashMap<String, DataType> = HashMap::new();
-        for src in sources {
-            for col in &src.schema.columns {
-                if common_set.contains(col.name.as_str()) && !common_types.contains_key(&col.name) {
-                    common_types.insert(col.name.clone(), col.data_type.clone());
-                }
-            }
-        }
-
-        let mut out_cols = Vec::new();
-        for name in common_cols {
-            out_cols.push(InferredColumn {
-                name: name.clone(),
-                data_type: common_types.get(name).cloned().unwrap_or(DataType::Text),
-            });
-        }
-
-        for src in sources {
-            for col in &src.schema.columns {
-                if common_set.contains(col.name.as_str()) {
-                    continue;
-                }
-                out_cols.push(InferredColumn {
-                    name: col.name.clone(),
-                    data_type: col.data_type.clone(),
-                });
-            }
-        }
-
-        out_cols
-    } else {
-        sources
-            .iter()
-            .flat_map(|src| {
-                src.schema.columns.iter().map(|c| InferredColumn {
-                    name: c.name.clone(),
-                    data_type: c.data_type.clone(),
-                })
-            })
-            .collect()
-    }
 }
 
 async fn infer_result_fields_from_query_ast(
@@ -4975,9 +4865,11 @@ mod tests {
             },
         ];
 
-        let common_cols = infer_natural_join_common_cols_for_wildcard(select, &sources);
-        let inferred = infer_wildcard_output_columns(&sources, common_cols.as_deref());
-        let names: Vec<String> = inferred.into_iter().map(|c| c.name).collect();
+        let schema_refs: Vec<&TableSchema> = sources.iter().map(|s| &s.schema).collect();
+        let plan =
+            crate::sql::wildcard::build_join_wildcard_plan(select, &schema_refs).expect("plan");
+        assert!(plan.any_merge);
+        let names: Vec<String> = plan.columns.into_iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["id", "a1", "b1", "c1"]);
     }
 
@@ -5029,9 +4921,11 @@ mod tests {
             },
         ];
 
-        let common_cols = infer_natural_join_common_cols_for_wildcard(select, &sources);
-        let inferred = infer_wildcard_output_columns(&sources, common_cols.as_deref());
-        let names: Vec<String> = inferred.into_iter().map(|c| c.name).collect();
+        let schema_refs: Vec<&TableSchema> = sources.iter().map(|s| &s.schema).collect();
+        let plan =
+            crate::sql::wildcard::build_join_wildcard_plan(select, &schema_refs).expect("plan");
+        assert!(plan.any_merge);
+        let names: Vec<String> = plan.columns.into_iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["id", "a1", "b1", "c1"]);
     }
 
@@ -5059,11 +4953,11 @@ mod tests {
             },
         ];
 
-        let common_cols = infer_natural_join_common_cols_for_wildcard(select, &sources);
-        assert_eq!(common_cols, Some(Vec::new()));
-
-        let inferred = infer_wildcard_output_columns(&sources, common_cols.as_deref());
-        let names: Vec<String> = inferred.into_iter().map(|c| c.name).collect();
+        let schema_refs: Vec<&TableSchema> = sources.iter().map(|s| &s.schema).collect();
+        let plan =
+            crate::sql::wildcard::build_join_wildcard_plan(select, &schema_refs).expect("plan");
+        assert!(!plan.any_merge);
+        let names: Vec<String> = plan.columns.into_iter().map(|c| c.name).collect();
         assert_eq!(names, vec!["Foo", "foo"]);
     }
 
