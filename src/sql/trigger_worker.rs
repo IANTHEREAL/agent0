@@ -1280,7 +1280,7 @@ fn value_to_sql_literal(value: &crate::types::Value) -> String {
             let u = uuid::Uuid::from_bytes(*bytes);
             format!("'{}'", u)
         }
-        crate::types::Value::Bytes(b) => format!("'\\\\x{}'", hex::encode(b)),
+        crate::types::Value::Bytes(b) => format!("'\\x{}'", hex::encode(b)),
         crate::types::Value::Json(s) | crate::types::Value::Jsonb(s) => {
             format!("'{}'", s.replace('\'', "''"))
         }
@@ -1310,7 +1310,7 @@ mod tests {
 
     use super::{
         case_insensitive_replace, parse_new_assignment, plpgsql_outer_block_range,
-        substitute_row_references,
+        substitute_row_references, value_to_sql_literal,
     };
 
     #[test]
@@ -1331,6 +1331,12 @@ mod tests {
         assert_eq!(parse_new_assignment("NEW.a <= 1"), None);
         assert_eq!(parse_new_assignment("NEW.a >= 1"), None);
         assert_eq!(parse_new_assignment("NEW.a == 1"), None);
+    }
+
+    #[test]
+    fn value_to_sql_literal_bytes_uses_single_backslash_x_prefix() {
+        let value = Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(value_to_sql_literal(&value), "'\\xdeadbeef'");
     }
 
     #[test]

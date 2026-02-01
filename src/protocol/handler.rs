@@ -35,7 +35,7 @@ use sqlparser::ast::{
     Statement, TableFactor, TableWithJoins, Values,
 };
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::atomic::{AtomicI32, Ordering};
