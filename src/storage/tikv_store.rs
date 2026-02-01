@@ -2712,36 +2712,117 @@ impl TikvStore {
             return Ok(Vec::new());
         }
 
-        let mut candidates: HashSet<Vec<u8>> = HashSet::new();
+        // Probe posting sizes to scan the smallest posting list first.
+        //
+        // This avoids materializing a high-cardinality token into `candidates` (memory spikes),
+        // and increases the chance we can early-exit before scanning large postings when the
+        // intersection becomes empty.
+        const GIN_POSTING_PROBE_LIMIT: u32 = 4096;
 
-        for (i, &token_hash) in token_hashes.iter().enumerate() {
-            if i > 0 && candidates.is_empty() {
-                break;
+        struct TokenProbe {
+            orig_pos: usize,
+            token_hash: u64,
+            estimated_postings: usize,
+            cached_pk_keys: Option<Vec<Vec<u8>>>,
+        }
+
+        fn pk_suffix<'a>(full_key: &'a [u8], prefix_len: usize) -> Option<&'a [u8]> {
+            if full_key.len() <= prefix_len {
+                None
+            } else {
+                Some(&full_key[prefix_len..])
             }
+        }
 
+        let probe_scan_limit = GIN_POSTING_PROBE_LIMIT.saturating_add(1);
+        let mut probes = Vec::with_capacity(token_hashes.len());
+        for (orig_pos, &token_hash) in token_hashes.iter().enumerate() {
             let (start_raw, end_raw) =
                 encode_gin_index_token_range_v2(db_id, table_id, index_id, token_hash);
             let start_key = self.key(&start_raw);
             let end_key = self.key(&end_raw);
+            let prefix_len = start_key.len();
+
             let range: BoundRange = (start_key.clone()..end_key).into();
-            let pairs = txn.scan(range, SCAN_LIMIT).await?;
+            let keys: Vec<_> = txn.scan_keys(range, probe_scan_limit).await?.collect();
+            let estimated_postings = keys.len();
+
+            let cached_pk_keys = if estimated_postings < probe_scan_limit as usize {
+                let mut pk_keys = Vec::with_capacity(estimated_postings);
+                for key in keys {
+                    let full_key: &[u8] = key.as_ref().into();
+                    let Some(pk_bytes) = pk_suffix(full_key, prefix_len) else {
+                        continue;
+                    };
+                    pk_keys.push(pk_bytes.to_vec());
+                }
+                Some(pk_keys)
+            } else {
+                None
+            };
+
+            probes.push(TokenProbe {
+                orig_pos,
+                token_hash,
+                estimated_postings,
+                cached_pk_keys,
+            });
+        }
+
+        probes.sort_by_key(|p| (p.estimated_postings, p.orig_pos));
+
+        let mut candidates: HashSet<Vec<u8>> = HashSet::with_capacity(
+            probes
+                .first()
+                .map(|p| p.estimated_postings)
+                .unwrap_or_default(),
+        );
+
+        for (i, probe) in probes.into_iter().enumerate() {
+            if i > 0 && candidates.is_empty() {
+                break;
+            }
+
+            if let Some(pk_keys) = probe.cached_pk_keys {
+                if i == 0 {
+                    candidates.extend(pk_keys);
+                } else {
+                    let mut next: HashSet<Vec<u8>> = HashSet::with_capacity(candidates.len());
+                    for pk_key in pk_keys {
+                        if candidates.contains(&pk_key) {
+                            next.insert(pk_key);
+                        }
+                    }
+                    candidates = next;
+                }
+                continue;
+            }
+
+            let (start_raw, end_raw) =
+                encode_gin_index_token_range_v2(db_id, table_id, index_id, probe.token_hash);
+            let start_key = self.key(&start_raw);
+            let end_key = self.key(&end_raw);
+            let prefix_len = start_key.len();
 
             if i == 0 {
-                for pair in pairs {
-                    let full_key: &[u8] = pair.key().as_ref().into();
-                    if full_key.len() <= start_key.len() {
+                let range: BoundRange = (start_key..end_key).into();
+                let keys = txn.scan_keys(range, SCAN_LIMIT).await?;
+                for key in keys {
+                    let full_key: &[u8] = key.as_ref().into();
+                    let Some(pk_bytes) = pk_suffix(full_key, prefix_len) else {
                         continue;
-                    }
-                    candidates.insert(full_key[start_key.len()..].to_vec());
+                    };
+                    candidates.insert(pk_bytes.to_vec());
                 }
             } else {
                 let mut next: HashSet<Vec<u8>> = HashSet::with_capacity(candidates.len());
-                for pair in pairs {
-                    let full_key: &[u8] = pair.key().as_ref().into();
-                    if full_key.len() <= start_key.len() {
+                let range: BoundRange = (start_key..end_key).into();
+                let keys = txn.scan_keys(range, SCAN_LIMIT).await?;
+                for key in keys {
+                    let full_key: &[u8] = key.as_ref().into();
+                    let Some(pk_bytes) = pk_suffix(full_key, prefix_len) else {
                         continue;
-                    }
-                    let pk_bytes = &full_key[start_key.len()..];
+                    };
                     if candidates.contains(pk_bytes) {
                         next.insert(pk_bytes.to_vec());
                     }
