@@ -39,7 +39,13 @@ DROP DATABASE createdb_103_b;
 -- CREATE/DROP/ALTER DATABASE cannot run inside a transaction block.
 BEGIN;
 CREATE DATABASE createdb_103_txn;
+ROLLBACK;
+
+BEGIN;
 DROP DATABASE createdb_103_opts;
+ROLLBACK;
+
+BEGIN;
 ALTER DATABASE createdb_103_opts RENAME TO createdb_103_opts2;
 ROLLBACK;
 
@@ -72,4 +78,3 @@ DROP DATABASE IF EXISTS createdb_103_opts;
 
 -- Ensure we cleaned up all test databases.
 SELECT datname FROM pg_catalog.pg_database WHERE datname LIKE 'createdb_103_%' ORDER BY datname;
-

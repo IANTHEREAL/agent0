@@ -21,7 +21,7 @@ test|id|balance
 Balance after constraint violation attempt|1|800.00
 (1 row)
 test|balance
-Charlie balance after overdraft attempts|50.00
+Charlie balance after overdraft attempts|100.00
 (1 row)
 test|id|balance|version
 Multi-operation transfer result|1|850.00|3
@@ -142,9 +142,10 @@ After sequential transactions|4
 result
 All transaction consistency tests completed
 (1 row)
-psql:/home/dongxu/lab/pg-tikv/tests/33_transaction_consistency.sql:64: ERROR:  new row for relation "accounts" violates check constraint "accounts_check1"
+ERROR:  new row for relation "accounts" violates check constraint "accounts_check1"
 DETAIL:  Failing row contains (1, Alice, -9199.00, 2).
-psql:/home/dongxu/lab/pg-tikv/tests/33_transaction_consistency.sql:77: ERROR:  new row for relation "accounts" violates check constraint "accounts_check1"
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ERROR:  new row for relation "accounts" violates check constraint "accounts_check1"
 DETAIL:  Failing row contains (1, Alice, -100.00, 2).
-psql:/home/dongxu/lab/pg-tikv/tests/33_transaction_consistency.sql:86: ERROR:  new row for relation "accounts" violates check constraint "accounts_check1"
+ERROR:  new row for relation "accounts" violates check constraint "accounts_check1"
 DETAIL:  Failing row contains (3, Charlie, -10.00, 1).

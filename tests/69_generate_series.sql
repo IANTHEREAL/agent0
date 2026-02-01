@@ -1,5 +1,7 @@
 -- GENERATE_SERIES Tests
 
+SET TIME ZONE 'America/Los_Angeles';
+
 SELECT * FROM generate_series(1, 5) AS n ORDER BY n;
 
 SELECT * FROM generate_series(0, 10, 2) AS n ORDER BY n;

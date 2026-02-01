@@ -1,5 +1,7 @@
 -- PRD-D01: AT TIME ZONE timezone conversion (Dify compatibility)
 
+SET TIME ZONE 'America/Los_Angeles';
+
 -- timestamp -> timestamptz (interpret timestamp in the given zone)
 SELECT TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'UTC' AS ts_utc;
 SELECT TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'Asia/Shanghai' AS ts_shanghai;
@@ -18,4 +20,3 @@ SELECT TIMESTAMPTZ '2024-01-15T10:00:00Z' AT TIME ZONE 'America/New_York' AS tz_
 SELECT DATE(DATE_TRUNC('day',
     TIMESTAMP '2024-01-15 10:30:00' AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York'
 )) AS dify_date;
-
