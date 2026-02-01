@@ -675,6 +675,40 @@ fn client_allows_notice(client_min_messages: Option<String>) -> bool {
     notice_rank >= min_rank
 }
 
+async fn send_notices_and_get_last_response<C>(
+    client: &mut C,
+    client_min_messages: Option<String>,
+    results: crate::sql::ExecuteResults,
+) -> PgWireResult<Response<'static>>
+where
+    C: Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let allow_notice = client_allows_notice(client_min_messages);
+    let mut last: Option<Response<'static>> = None;
+    for result in results.into_vec() {
+        match result {
+            ExecuteResult::Notice { message } => {
+                if allow_notice {
+                    let notice = NoticeResponse::from(ErrorInfo::new(
+                        "NOTICE".to_string(),
+                        "00000".to_string(),
+                        message,
+                    ));
+                    client
+                        .send(PgWireBackendMessage::NoticeResponse(notice))
+                        .await?;
+                }
+            }
+            other => {
+                last = Some(result_to_response(other)?);
+            }
+        }
+    }
+    Ok(last.unwrap_or(Response::EmptyQuery))
+}
+
 fn infer_parameter_types(sql: &str, param_count: usize) -> Vec<Type> {
     // Default to TEXT: drivers can encode any value to TEXT, server does implicit conversion.
     // UNKNOWN (OID 705) breaks pgx/GORM which cannot encode time.Time to unknown type.
@@ -3052,12 +3086,14 @@ impl ExtendedQueryHandler for DynamicPgHandler {
 
     async fn do_query<'a, 'b: 'a, C>(
         &'b self,
-        _client: &mut C,
+        client: &mut C,
         portal: &'a Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response<'a>>
     where
-        C: ClientInfo + Unpin + Send + Sync,
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let executor = self.get_executor()?;
         let query = &portal.statement.statement;
@@ -3078,7 +3114,12 @@ impl ExtendedQueryHandler for DynamicPgHandler {
         set_connection_id(session.connection_id());
 
         match executor.execute(session, &final_query).await {
-            Ok(results) => result_to_response(results.last()),
+            Ok(results) => Ok(send_notices_and_get_last_response(
+                client,
+                session.show_setting_value("client_min_messages"),
+                results,
+            )
+            .await?),
             Err(e) => {
                 error!("Extended query execution error: {}", e);
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -4105,12 +4146,14 @@ impl ExtendedQueryHandler for PgHandler {
 
     async fn do_query<'a, 'b: 'a, C>(
         &'b self,
-        _client: &mut C,
+        client: &mut C,
         portal: &'a Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response<'a>>
     where
-        C: ClientInfo + Unpin + Send + Sync,
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let query = &portal.statement.statement;
         debug!("Extended query: {}", query);
@@ -4123,7 +4166,12 @@ impl ExtendedQueryHandler for PgHandler {
         set_connection_id(session.connection_id());
 
         match self.executor.execute(&mut session, &final_query).await {
-            Ok(results) => result_to_response(results.last()),
+            Ok(results) => Ok(send_notices_and_get_last_response(
+                client,
+                session.show_setting_value("client_min_messages"),
+                results,
+            )
+            .await?),
             Err(e) => {
                 error!("Extended query execution error: {}", e);
                 Err(PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -4769,6 +4817,43 @@ mod tests {
     use bytes::Bytes;
     use pgwire::api::portal::Format;
     use pgwire::messages::response::CommandComplete;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    #[derive(Default)]
+    struct RecordingSink {
+        messages: Vec<PgWireBackendMessage>,
+    }
+
+    impl Sink<PgWireBackendMessage> for RecordingSink {
+        type Error = PgWireError;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(self: Pin<&mut Self>, item: PgWireBackendMessage) -> Result<(), Self::Error> {
+            self.get_mut().messages.push(item);
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn test_column(name: &str, data_type: DataType) -> ColumnDef {
         ColumnDef {
@@ -5444,6 +5529,68 @@ mod tests {
     fn test_result_to_response_empty_is_empty_query() {
         let resp = result_to_response(ExecuteResult::Empty).unwrap();
         assert!(matches!(resp, Response::EmptyQuery));
+    }
+
+    #[tokio::test]
+    async fn test_extended_query_notice_emits_notice_response() {
+        let mut client = RecordingSink::default();
+        let results = crate::sql::ExecuteResults(vec![
+            ExecuteResult::Notice {
+                message: "table \"flow3_notice_test\" does not exist, skipping".to_string(),
+            },
+            ExecuteResult::CommandComplete { tag: "DROP TABLE" },
+        ]);
+
+        let resp = send_notices_and_get_last_response(&mut client, None, results)
+            .await
+            .unwrap();
+
+        match resp {
+            Response::Execution(tag) => {
+                let complete = CommandComplete::from(tag);
+                assert_eq!(complete.tag, "DROP TABLE");
+            }
+            _ => panic!("expected Execution"),
+        }
+
+        assert_eq!(client.messages.len(), 1);
+        match &client.messages[0] {
+            PgWireBackendMessage::NoticeResponse(notice) => {
+                assert!(notice
+                    .fields
+                    .iter()
+                    .any(|(code, value)| *code == b'S' && value == "NOTICE"));
+                assert!(notice
+                    .fields
+                    .iter()
+                    .any(|(code, value)| *code == b'C' && value == "00000"));
+                assert!(notice.fields.iter().any(|(code, value)| {
+                    *code == b'M' && value.contains("does not exist, skipping")
+                }));
+            }
+            other => panic!("expected NoticeResponse, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_extended_query_notice_respects_client_min_messages() {
+        let mut client = RecordingSink::default();
+        let results = crate::sql::ExecuteResults(vec![
+            ExecuteResult::Notice {
+                message: "test notice".to_string(),
+            },
+            ExecuteResult::CommandComplete { tag: "DROP TABLE" },
+        ]);
+
+        let _resp = send_notices_and_get_last_response(
+            &mut client,
+            Some("warning".to_string()),
+            results,
+        )
+        .await
+        .unwrap();
+
+        assert!(client.messages.is_empty());
     }
 
     #[test]
