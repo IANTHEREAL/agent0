@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Result};
+use sqlparser::ast::{Ident, ObjectName};
 use tikv_client::Transaction;
 
 use super::core::Executor;
+use super::super::names;
 use super::super::udt;
 use super::super::{ExecuteResult, Session};
 
@@ -46,21 +48,21 @@ fn next_token(input: &str) -> Option<(&str, &str)> {
     Some((s, ""))
 }
 
-fn parse_type_name_token(token: &str) -> Result<(String, String, String)> {
-    fn push_part(parts: &mut Vec<String>, raw: &str, quoted: bool) -> Result<()> {
+fn parse_object_name_token(token: &str) -> Result<ObjectName> {
+    fn push_part(parts: &mut Vec<Ident>, raw: &str, quoted: bool) -> Result<()> {
         let trimmed = if quoted { raw } else { raw.trim() };
         if trimmed.is_empty() {
             return Err(anyhow!("Invalid type name"));
         }
+        let mut ident = Ident::new(trimmed);
         if quoted {
-            parts.push(trimmed.to_string());
-        } else {
-            parts.push(trimmed.to_lowercase());
+            ident.quote_style = Some('"');
         }
+        parts.push(ident);
         Ok(())
     }
 
-    let mut parts: Vec<String> = Vec::new();
+    let mut parts: Vec<Ident> = Vec::new();
     let mut buf = String::new();
     let mut in_quotes = false;
     let mut part_quoted = false;
@@ -95,16 +97,17 @@ fn parse_type_name_token(token: &str) -> Result<(String, String, String)> {
     }
     push_part(&mut parts, &buf, part_quoted)?;
 
-    let (schema, name) = if parts.len() >= 2 {
-        (
-            parts[parts.len() - 2].clone(),
-            parts[parts.len() - 1].clone(),
-        )
+    if parts.is_empty() {
+        return Err(anyhow!("Invalid type name"));
+    }
+
+    let parts = if parts.len() >= 2 {
+        vec![parts[parts.len() - 2].clone(), parts[parts.len() - 1].clone()]
     } else {
-        ("public".to_string(), parts[0].clone())
+        vec![parts[0].clone()]
     };
 
-    Ok((schema.clone(), name.clone(), format!("{}.{}", schema, name)))
+    Ok(ObjectName(parts))
 }
 
 fn parse_enum_labels(input: &str) -> Result<(Vec<String>, &str)> {
@@ -263,8 +266,9 @@ impl Executor {
         rest = consume_keyword(rest, "ENUM")
             .ok_or_else(|| anyhow!("Invalid CREATE TYPE AS ENUM syntax"))?;
 
-        let (schema, name, _full_name) = parse_type_name_token(type_token)?;
+        let type_name = parse_object_name_token(type_token)?;
         let (labels, _tail) = parse_enum_labels(rest)?;
+        let search_path: Vec<String> = session.search_path().to_vec();
 
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {
@@ -274,7 +278,12 @@ impl Executor {
         let result = async {
             let db_id = session.current_database_id();
             let txn: &mut Transaction = session.get_mut_txn().expect("Transaction must be active");
-            udt::create_enum_type(&self.store(), txn, db_id, schema, name, labels).await
+            let resolved = names::resolve_ddl_object_name(&type_name, &search_path)?;
+            let store = self.store();
+            if !store.schema_exists(txn, db_id, &resolved.schema).await? {
+                return Err(anyhow!("schema '{}' does not exist", resolved.schema));
+            }
+            udt::create_enum_type(&store, txn, db_id, resolved.schema, resolved.name, labels).await
         }
         .await;
 
@@ -312,13 +321,11 @@ impl Executor {
 
         let names_part = strip_trailing_drop_behavior(names_part);
         let raw_names = split_names_list(names_part)?;
-        let mut full_names = Vec::with_capacity(raw_names.len());
+        let mut type_names = Vec::with_capacity(raw_names.len());
         for raw in raw_names {
-            let (schema, name, full_name) = parse_type_name_token(raw)?;
-            let _ = schema;
-            let _ = name;
-            full_names.push(full_name);
+            type_names.push(parse_object_name_token(raw)?);
         }
+        let search_path: Vec<String> = session.search_path().to_vec();
 
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {
@@ -328,7 +335,26 @@ impl Executor {
         let result = async {
             let db_id = session.current_database_id();
             let txn: &mut Transaction = session.get_mut_txn().expect("Transaction must be active");
-            udt::drop_types(&self.store(), txn, db_id, &full_names, if_exists).await
+            let store = self.store();
+            let mut full_names = Vec::with_capacity(type_names.len());
+            for name in &type_names {
+                let resolved = names::resolve_existing_type_name(
+                    store.as_ref(),
+                    txn,
+                    db_id,
+                    name,
+                    &search_path,
+                )
+                .await?;
+                let Some(resolved) = resolved else {
+                    if !if_exists {
+                        return Err(anyhow!("Type '{}' does not exist", name));
+                    }
+                    continue;
+                };
+                full_names.push(resolved.full);
+            }
+            udt::drop_types(&store, txn, db_id, &full_names, if_exists).await
         }
         .await;
 
@@ -356,32 +382,36 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_type_name_token_default_schema_lowercase() {
-        let (schema, name, full) = parse_type_name_token("Role").unwrap();
-        assert_eq!(schema, "public");
-        assert_eq!(name, "role");
-        assert_eq!(full, "public.role");
+    fn test_parse_object_name_token_defaults_schema_via_search_path() {
+        let name = parse_object_name_token("Role").unwrap();
+        let resolved = names::resolve_ddl_object_name(&name, &["app".to_string()]).unwrap();
+        assert_eq!(resolved.schema, "app");
+        assert_eq!(resolved.name, "role");
+        assert_eq!(resolved.full, "app.role");
     }
 
     #[test]
-    fn test_parse_type_name_token_quoted_preserves_case() {
-        let (schema, name, full) = parse_type_name_token("\"Role\"").unwrap();
-        assert_eq!(schema, "public");
-        assert_eq!(name, "Role");
-        assert_eq!(full, "public.Role");
+    fn test_parse_object_name_token_quoted_preserves_case() {
+        let name = parse_object_name_token("\"Role\"").unwrap();
+        let resolved = names::resolve_ddl_object_name(&name, &["app".to_string()]).unwrap();
+        assert_eq!(resolved.schema, "app");
+        assert_eq!(resolved.name, "Role");
+        assert_eq!(resolved.full, "app.Role");
     }
 
     #[test]
-    fn test_parse_type_name_token_schema_qualified() {
-        let (schema, name, full) = parse_type_name_token("MySchema.Role").unwrap();
-        assert_eq!(schema, "myschema");
-        assert_eq!(name, "role");
-        assert_eq!(full, "myschema.role");
+    fn test_parse_object_name_token_schema_qualified() {
+        let name = parse_object_name_token("MySchema.Role").unwrap();
+        let resolved = names::resolve_ddl_object_name(&name, &["public".to_string()]).unwrap();
+        assert_eq!(resolved.schema, "myschema");
+        assert_eq!(resolved.name, "role");
+        assert_eq!(resolved.full, "myschema.role");
 
-        let (schema, name, full) = parse_type_name_token("\"MySchema\".\"Role\"").unwrap();
-        assert_eq!(schema, "MySchema");
-        assert_eq!(name, "Role");
-        assert_eq!(full, "MySchema.Role");
+        let name = parse_object_name_token("\"MySchema\".\"Role\"").unwrap();
+        let resolved = names::resolve_ddl_object_name(&name, &["public".to_string()]).unwrap();
+        assert_eq!(resolved.schema, "MySchema");
+        assert_eq!(resolved.name, "Role");
+        assert_eq!(resolved.full, "MySchema.Role");
     }
 
     #[test]
