@@ -391,25 +391,58 @@ pub(crate) async fn enqueue_after_triggers(
 impl TriggerWorker {
     async fn claim_events(&self, txn: &mut Transaction, limit: usize) -> Result<Vec<TriggerEvent>> {
         use super::trigger_queue::{encode_trigger_queue_prefix, now_ms_i64, EventStatus};
+        use std::ops::Bound;
 
         let prefix = encode_trigger_queue_prefix();
         let mut end = prefix.clone();
         end.push(0xFF);
-        let range: BoundRange = (prefix..end).into();
 
         let scan_limit: u32 = u32::try_from(limit.saturating_mul(4).max(16)).unwrap_or(u32::MAX);
         let mut candidate_keys: Vec<Vec<u8>> = Vec::new();
-        for pair in txn.scan(range, scan_limit).await? {
+
+        let mut start: Option<Vec<u8>> = None;
+        loop {
             if candidate_keys.len() >= limit {
                 break;
             }
-            let ev: TriggerEvent = match bincode::deserialize(pair.value()) {
-                Ok(v) => v,
-                Err(_) => continue,
+
+            let range: BoundRange = match start.as_ref() {
+                None => (prefix.clone()..end.clone()).into(),
+                Some(last) => BoundRange::new(
+                    Bound::Excluded(last.clone().into()),
+                    Bound::Excluded(end.clone().into()),
+                ),
             };
-            if ev.status == EventStatus::Pending {
-                let key_bytes: &[u8] = pair.key().as_ref().into();
-                candidate_keys.push(key_bytes.to_vec());
+
+            let mut batch_last = None;
+            let mut scanned = 0usize;
+            for pair in txn.scan(range, scan_limit).await? {
+                scanned += 1;
+
+                if candidate_keys.len() >= limit {
+                    break;
+                }
+
+                let key_slice: &[u8] = pair.key().as_ref().into();
+                let key_bytes = key_slice.to_vec();
+                batch_last = Some(key_bytes.clone());
+
+                let ev: TriggerEvent = match bincode::deserialize(pair.value()) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if ev.status == EventStatus::Pending {
+                    candidate_keys.push(key_bytes);
+                }
+            }
+
+            if scanned < scan_limit as usize {
+                break;
+            }
+
+            start = batch_last;
+            if start.is_none() {
+                break;
             }
         }
 
