@@ -1,13 +1,13 @@
 ---
-name: pantheon-issue-fix-loop
-description: "Validate an issue with code-causal evidence, then run a strict Pantheon parallel_explore fix+review+verify loop (codex) until no in-scope P0/P1, then run a required local build+smoke test before merging."
+name: pantheon-issue-resolve-loop
+description: "Resolve an issue (create a new PR or reuse an existing PR) with evidence-first validation, then run a strict Pantheon parallel_explore fix+review+verify loop (codex) until no in-scope P0/P1 remain; finish with required local build+smoke test before merging."
 ---
 
-# Pantheon Issue Fix Loop
+# Pantheon Issue Resolve Loop
 
 ## Overview
 
-Follow a strict, evidence-first workflow to (1) decide whether an issue is valid and (2) if valid, iteratively fix it (codex), review it (codex), and verify/triage findings (codex) until no in-scope P0/P1 remain, keeping a single PR updated.
+Follow a strict, evidence-first workflow to (1) decide whether an issue is valid and (2) if valid, iteratively resolve it via Fix/Review/Verify (codex) until no in-scope P0/P1 remain, keeping a single PR updated (create one if needed, or reuse an existing PR).
 
 ### Golden Rule — One Fix Run at a Time
 
@@ -15,12 +15,14 @@ Follow a strict, evidence-first workflow to (1) decide whether an issue is valid
 
 ## Inputs
 
-- `issue_link` (required): Issue URL or identifier.
+- `issue_link` (Issue URL or identifier)  Or `existing_pr_link` (Existing PR URL or number).
+  - Provide exactly ONE of `issue_link` or `existing_pr_link`.
+  - If you start from `existing_pr_link`, derive `issue_link` from the PR (or use the PR link as the issue identifier) for the rest of this workflow.
 - `project_name` (required): Pantheon project name.
 - `parent_branch_id` (required): Starting Pantheon branch ID (sandbox baseline).
 - `poll_interval_seconds`: default to use `300`.
 
-Assumption: If the user did not specify a git branch, treat branch IDs as Pantheon branches/sandboxes. Only the first Fix creates a PR; all subsequent Fix iterations push commits to the same PR head git branch.
+Assumption: If the user did not specify a git branch, treat branch IDs as Pantheon branches/sandboxes. If `existing_pr_link` is provided, reuse that PR (skip PR creation). Otherwise, only the first Fix creates a PR; all subsequent Fix iterations push commits to the same PR head git branch.
 
 ## P0/P1 Standard (must be evidence-backed)
 
@@ -37,7 +39,11 @@ Before doing anything else, sync the code to the latest master, then do not prop
 Call `functions.mcp__test__parallel_explore` with `agent="codex"`, `num_branches=1`, `parent_branch_id=parent_branch_id`, and prompt:
 
 ```
-pull the latest code from master branch, then:
+pull the latest code from master branch or Existing PR: {existing_pr_link} (if having), then validate the target:
+- Issue: {issue_link}
+- Existing PR: {existing_pr_link} if having
+
+0) If the issue/PR report is based on a failing test case, identify the minimal failing case from the issue/PR/CI record and rerun it on master to confirm repro (or prove non-repro) and capture the exact failure.
 1) Restate the issue claim precisely (expected vs actual, triggering inputs/config).
 2) Locate the relevant code path(s) and identify the exact conditions required to reach them.
 3) Determine reachability under default production configuration (or clearly-common configs).
@@ -66,15 +72,17 @@ Initialize at the start of Step 2:
 - `baseline_parent_branch_id = synced_master_branch_id`
 - `last_fix_branch_id = baseline_parent_branch_id`
 
-#### 2.1 First Fix (codex) — must create PR
+#### 2.1 First Fix (codex) — create PR; if pr is existing, skip it
 
 Call `functions.mcp__test__parallel_explore` with `agent="codex"`, `num_branches=1`, `parent_branch_id=last_fix_branch_id`, and prompt:
 
 ```
-1) fix this issue ({issue_link}) using Linus KISS principle with an accurate, rigorous, and concise solution and don't introduce other issue and regression issue.
+1) fix this issue ({issue_link}) using Linus KISS principle with an accurate, rigorous, and concise solut
+ion and don't introduce other issue and regression issue.
 2) self-review your own diff (correctness, edge cases, compatibility, and obvious regressions).
 3) run the smallest relevant tests/build.
-4) create a PR using `gh` (MUST be created in this exploration; do NOT delegate PR creation to the user or to later steps).
+4) create a PR using `gh` (MUST be created in this exploration; do NOT delegate PR creation to the user o
+r to later steps).
 
 Output exactly:
 PR_URL=<url>
@@ -92,6 +100,7 @@ Call `functions.mcp__test__parallel_explore` with `agent="codex"`, `num_branches
 ```
 Review the code change in PR {pr_number} for issue ({issue_link}); do a P0/P1-only bug hunt.
 Principle: treat the review like a scientific investigation—read as much as needed, explain what the code does (don’t guess), and only accept a P0/P1 when code evidence + reachability justify it.
+Extra: if the issue/PR report is based on a failing test case (CI), rerun the minimal failing case/command (from the issue/PR/CI record) on the current PR head before concluding.
 Do NOT post comments and do NOT create issues in this step.
 If you find any P0/P1:
 - output exactly:
