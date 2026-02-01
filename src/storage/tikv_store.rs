@@ -2802,10 +2802,24 @@ impl TikvStore {
         db_id: u64,
         name: &str,
         query: &str,
+        or_replace: bool,
     ) -> Result<()> {
         let key = self.key(&encode_view_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
-            return Err(anyhow!("View '{}' already exists", name));
+            if !or_replace {
+                return Err(anyhow!("View '{}' already exists", name));
+            }
+
+            let mut def = self
+                .get_view(txn, db_id, name)
+                .await?
+                .ok_or_else(|| anyhow!("View '{}' does not exist", name))?;
+            def.query = query.to_string();
+            let data =
+                bincode::serialize(&def).context("Failed to serialize view definition")?;
+            txn_put(txn, key, data).await?;
+            info!("Replaced view '{}'", name);
+            return Ok(());
         }
 
         let (schema, view_name) = name.split_once('.').unwrap_or(("public", name));

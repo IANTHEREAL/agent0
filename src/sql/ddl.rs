@@ -1203,17 +1203,9 @@ pub async fn execute_create_view(
     }
     let view_name = resolved.full;
 
-    if store.get_view(txn, db_id, &view_name).await?.is_some() {
-        if or_replace {
-            store.drop_view(txn, db_id, &view_name).await?;
-        } else {
-            return Err(anyhow!("View '{}' already exists", view_name));
-        }
-    }
-
     let query_str = query.to_string();
     store
-        .create_view(txn, db_id, &view_name, &query_str)
+        .create_view(txn, db_id, &view_name, &query_str, or_replace)
         .await?;
 
     Ok(ExecuteResult::CreateView { view_name })
