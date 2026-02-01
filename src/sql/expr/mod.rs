@@ -2366,6 +2366,16 @@ mod tests {
 	                .contains("LIKE requires text operands")
 	        );
 	        assert!(
+	            eval_expr(
+	                &parse_expr("TRUE OR (CASE WHEN 1 LIKE 'a%' THEN TRUE ELSE FALSE END)"),
+	                None,
+	                None
+	            )
+	            .unwrap_err()
+	            .to_string()
+	            .contains("LIKE requires text operands")
+	        );
+	        assert!(
 	            eval_expr(&parse_expr("FALSE AND (1 ILIKE 'a%')"), None, None)
 	                .unwrap_err()
 	                .to_string()

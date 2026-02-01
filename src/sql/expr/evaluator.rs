@@ -142,10 +142,18 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg:
         },
 
         Expr::Case {
+            operand,
+            conditions,
             results,
             else_result,
-            ..
         } => {
+            // Searched CASE (`CASE WHEN ...`) requires boolean conditions. Validate them so
+            // short-circuit OR/AND cannot mask deterministic type errors inside WHEN.
+            if operand.is_none() {
+                for condition in conditions {
+                    ensure_boolean_or_null_operand(ctx, condition, "CASE WHEN requires boolean operands")?;
+                }
+            }
             for result in results {
                 ensure_boolean_or_null_operand(ctx, result, err_msg)?;
             }
