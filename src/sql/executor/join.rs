@@ -202,6 +202,77 @@ fn resolve_order_by_exprs_for_join_non_agg(
         .collect()
 }
 
+fn natural_join_wildcard_output_columns_and_indices(
+    combined_schemas: &[(String, TableSchema)],
+    natural_join_common_cols: &[String],
+) -> (Vec<String>, Vec<usize>) {
+    let common_set: HashSet<String> = natural_join_common_cols
+        .iter()
+        .map(|c| c.to_lowercase())
+        .collect();
+
+    let mut first_common_idx: HashMap<String, usize> = HashMap::new();
+    let mut non_common: Vec<(String, usize)> = Vec::new();
+
+    let mut offset = 0;
+    for (_, schema) in combined_schemas {
+        for col in &schema.columns {
+            let lower = col.name.to_lowercase();
+            if common_set.contains(&lower) {
+                first_common_idx.entry(lower).or_insert(offset);
+            } else {
+                non_common.push((col.name.clone(), offset));
+            }
+            offset += 1;
+        }
+    }
+
+    let mut cols = Vec::with_capacity(
+        natural_join_common_cols
+            .len()
+            .saturating_add(non_common.len()),
+    );
+    let mut indices = Vec::with_capacity(
+        natural_join_common_cols
+            .len()
+            .saturating_add(non_common.len()),
+    );
+
+    for common_col in natural_join_common_cols {
+        cols.push(common_col.clone());
+        let idx = first_common_idx
+            .get(&common_col.to_lowercase())
+            .copied()
+            .unwrap_or(usize::MAX);
+        indices.push(idx);
+    }
+
+    for (name, idx) in non_common {
+        cols.push(name);
+        indices.push(idx);
+    }
+
+    (cols, indices)
+}
+
+fn infer_expr_type_with_join_context(
+    expr: &Expr,
+    combined_schemas: &[(String, TableSchema)],
+    fallback_schema: &TableSchema,
+) -> DataType {
+    use super::super::types::{TypeContext, TypeInferrer};
+
+    let mut ctx = TypeContext::empty();
+    for (alias, schema) in combined_schemas {
+        ctx.add_table(alias.as_str(), schema);
+    }
+
+    let mut inferrer = TypeInferrer::new(ctx);
+    inferrer
+        .infer(expr)
+        .unwrap_or_else(|_| infer_expr_type(expr, fallback_schema))
+}
+
 fn extract_virtual_table_filter(where_clause: &Option<Expr>) -> VirtualTableFilter {
     let mut filter = VirtualTableFilter::default();
     if let Some(expr) = where_clause {
@@ -3934,7 +4005,11 @@ impl Executor {
                         .map(|item| match item {
                             SelectItem::UnnamedExpr(expr)
                             | SelectItem::ExprWithAlias { expr, .. } => {
-                                infer_expr_type(expr, &type_infer_schema)
+                                infer_expr_type_with_join_context(
+                                    expr,
+                                    &combined_schemas,
+                                    &final_schema,
+                                )
                             }
                             _ => DataType::Text,
                         })
@@ -4118,14 +4193,14 @@ impl Executor {
             .projection
             .iter()
             .any(|p| matches!(p, SelectItem::QualifiedWildcard(..)));
-        if has_wildcard {
-            let plan = if has_natural_join {
-                let schema_refs: Vec<&TableSchema> =
-                    combined_schemas.iter().map(|(_, s)| s).collect();
-                build_join_wildcard_plan(select, &schema_refs)
-            } else {
-                None
-            };
+	        if has_wildcard {
+	            let plan = if has_natural_join {
+	                let schema_refs: Vec<&TableSchema> =
+	                    combined_schemas.iter().map(|(_, s)| s).collect();
+	                build_join_wildcard_plan(select, &schema_refs)
+	            } else {
+	                None
+	            };
 
             if let Some(plan) = plan.filter(|p| p.any_merge) {
                 (cols, column_types, result_rows) = project_rows_by_join_wildcard_plan(
@@ -4137,13 +4212,13 @@ impl Executor {
                 (cols, column_types, result_rows) = project_wildcard_natural_join(
                     &combined_schemas,
                     &natural_join_common_cols,
-                    rows_to_project,
-                    merged_column_offsets_ref,
-                );
-            } else {
-                for (alias, schema) in &combined_schemas {
-                    for col in &schema.columns {
-                        cols.push(format!("{}.{}", alias, col.name));
+	                    rows_to_project,
+	                    merged_column_offsets_ref,
+	                );
+	            } else {
+	                for (alias, schema) in &combined_schemas {
+	                    for col in &schema.columns {
+	                        cols.push(format!("{}.{}", alias, col.name));
                         column_types.push(col.data_type.clone());
                     }
                 }
@@ -4404,6 +4479,21 @@ impl Executor {
 
         result_rows = apply_offset_limit_fetch(result_rows, query);
 
+        let mut column_types = infer_join_result_column_types(
+            &select.projection,
+            &resolved_projection,
+            &combined_schemas,
+            &final_schema,
+            has_natural_join,
+            &natural_join_common_cols,
+        );
+
+        if column_types.len() < cols.len() {
+            column_types.resize(cols.len(), DataType::Text);
+        } else if column_types.len() > cols.len() {
+            column_types.truncate(cols.len());
+        }
+
         Ok(ExecuteResult::Select {
             column_types: Some(column_types),
             columns: cols,
@@ -4422,6 +4512,85 @@ fn max_generate_series_rows() -> usize {
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)
         .unwrap_or(DEFAULT_MAX_GENERATE_SERIES_ROWS)
+}
+
+fn infer_join_result_column_types(
+    select_projection: &[SelectItem],
+    resolved_projection: &[SelectItem],
+    combined_schemas: &[(String, TableSchema)],
+    final_schema: &TableSchema,
+    has_natural_join: bool,
+    natural_join_common_cols: &[String],
+) -> Vec<DataType> {
+    // This helper exists to preserve static type metadata (especially TIMESTAMPTZ) even when
+    // runtime values are represented without that metadata (e.g. `Value::Timestamp`).
+    let has_wildcard = select_projection
+        .iter()
+        .any(|p| matches!(p, SelectItem::Wildcard(_)));
+    let has_qualified_wildcard = select_projection
+        .iter()
+        .any(|p| matches!(p, SelectItem::QualifiedWildcard(..)));
+
+    let combined_types: Vec<DataType> = combined_schemas
+        .iter()
+        .flat_map(|(_, schema)| schema.columns.iter().map(|c| c.data_type.clone()))
+        .collect();
+
+    if has_wildcard {
+        if has_natural_join && !natural_join_common_cols.is_empty() {
+            let (_, col_indices_to_keep) = natural_join_wildcard_output_columns_and_indices(
+                combined_schemas,
+                natural_join_common_cols,
+            );
+
+            return col_indices_to_keep
+                .into_iter()
+                .map(|idx| combined_types.get(idx).cloned().unwrap_or(DataType::Text))
+                .collect();
+        }
+
+        return combined_types;
+    }
+
+    if has_qualified_wildcard {
+        return resolved_projection
+            .iter()
+            .flat_map(|item| match item {
+                SelectItem::QualifiedWildcard(prefix, _) => {
+                    let table_alias = prefix.0.last().map(|i| i.value.clone()).unwrap_or_default();
+                    combined_schemas
+                        .iter()
+                        .find(|(a, _)| a.eq_ignore_ascii_case(&table_alias))
+                        .map(|(_, schema)| {
+                            schema
+                                .columns
+                                .iter()
+                                .map(|c| c.data_type.clone())
+                                .collect::<Vec<DataType>>()
+                        })
+                        .unwrap_or_default()
+                }
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    vec![infer_expr_type_with_join_context(
+                        expr,
+                        combined_schemas,
+                        final_schema,
+                    )]
+                }
+                _ => Vec::new(),
+            })
+            .collect();
+    }
+
+    resolved_projection
+        .iter()
+        .map(|item| match item {
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                infer_expr_type_with_join_context(expr, combined_schemas, final_schema)
+            }
+            _ => DataType::Text,
+        })
+        .collect()
 }
 
 fn generate_series_values(
@@ -5428,6 +5597,25 @@ mod tests {
             "Unqualified columns should resolve to the left-most match",
         );
     }
+    fn col(name: &str, data_type: DataType) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        }
+    }
+
+    fn schema(name: &str, cols: Vec<ColumnDef>) -> TableSchema {
+        TableSchema {
+            name: name.to_string(),
+            columns: cols,
+            ..TableSchema::default()
+        }
+    }
 
     #[test]
     fn generate_series_int32_edge_overflow_does_not_loop() {
@@ -5630,6 +5818,208 @@ mod tests {
         let naive = date.and_hms_opt(0, 0, 0).unwrap();
         let expected = tz.timestamp_millis_from_local_datetime(naive).unwrap();
         assert_eq!(values, vec![Value::Timestamp(expected)]);
+    }
+
+    #[test]
+    fn infer_join_result_column_types_wildcard_preserves_timestamptz() {
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, "SELECT * FROM t").unwrap();
+        let Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+
+        let combined_schemas = vec![
+            (
+                "a".to_string(),
+                schema(
+                    "a",
+                    vec![col("ts", DataType::TimestampTz), col("id", DataType::Int32)],
+                ),
+            ),
+            ("b".to_string(), schema("b", vec![col("x", DataType::Text)])),
+        ];
+
+        let types = infer_join_result_column_types(
+            &select.projection,
+            &select.projection,
+            &combined_schemas,
+            &TableSchema::default(),
+            false,
+            &[],
+        );
+
+        assert_eq!(
+            types,
+            vec![DataType::TimestampTz, DataType::Int32, DataType::Text]
+        );
+    }
+
+    #[test]
+    fn infer_join_result_column_types_qualified_wildcard_preserves_timestamptz() {
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, "SELECT a.* FROM t a").unwrap();
+        let Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+
+        let combined_schemas = vec![
+            (
+                "a".to_string(),
+                schema(
+                    "a",
+                    vec![col("ts", DataType::TimestampTz), col("id", DataType::Int32)],
+                ),
+            ),
+            ("b".to_string(), schema("b", vec![col("x", DataType::Text)])),
+        ];
+
+        let types = infer_join_result_column_types(
+            &select.projection,
+            &select.projection,
+            &combined_schemas,
+            &TableSchema::default(),
+            false,
+            &[],
+        );
+
+        assert_eq!(types, vec![DataType::TimestampTz, DataType::Int32]);
+    }
+
+    #[test]
+    fn infer_join_result_column_types_natural_join_dedup_preserves_timestamptz() {
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, "SELECT * FROM t").unwrap();
+        let Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+
+        let combined_schemas = vec![
+            (
+                "a".to_string(),
+                schema(
+                    "a",
+                    vec![col("ts", DataType::TimestampTz), col("id", DataType::Int32)],
+                ),
+            ),
+            (
+                "b".to_string(),
+                schema(
+                    "b",
+                    vec![col("ts", DataType::Timestamp), col("x", DataType::Text)],
+                ),
+            ),
+        ];
+
+        let common_cols = vec!["ts".to_string()];
+        let types = infer_join_result_column_types(
+            &select.projection,
+            &select.projection,
+            &combined_schemas,
+            &TableSchema::default(),
+            true,
+            &common_cols,
+        );
+
+        assert_eq!(
+            types,
+            vec![DataType::TimestampTz, DataType::Int32, DataType::Text]
+        );
+    }
+
+    #[test]
+    fn natural_join_wildcard_orders_common_columns_first() {
+        let combined_schemas = vec![
+            (
+                "a".to_string(),
+                schema(
+                    "a",
+                    vec![col("id", DataType::Int32), col("ts", DataType::TimestampTz)],
+                ),
+            ),
+            (
+                "b".to_string(),
+                schema(
+                    "b",
+                    vec![col("ts", DataType::Timestamp), col("x", DataType::Text)],
+                ),
+            ),
+        ];
+
+        let common_cols = vec!["ts".to_string()];
+        let (cols, indices) =
+            natural_join_wildcard_output_columns_and_indices(&combined_schemas, &common_cols);
+
+        assert_eq!(cols, vec!["ts", "id", "x"]);
+        assert_eq!(indices, vec![1, 0, 3]);
+
+        let combined_row = Row::new(vec![
+            Value::Int32(1),
+            Value::Timestamp(111),
+            Value::Timestamp(222),
+            Value::Text("ok".to_string()),
+        ]);
+        let projected: Vec<Value> = indices
+            .iter()
+            .map(|&idx| combined_row.values.get(idx).cloned().unwrap_or(Value::Null))
+            .collect();
+        assert_eq!(
+            projected,
+            vec![
+                Value::Timestamp(111),
+                Value::Int32(1),
+                Value::Text("ok".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn infer_join_result_column_types_qualified_ref_uses_correct_table() {
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, "SELECT b.ts FROM t b").unwrap();
+        let Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+
+        let combined_schemas = vec![
+            (
+                "a".to_string(),
+                schema("a", vec![col("ts", DataType::TimestampTz)]),
+            ),
+            (
+                "b".to_string(),
+                schema("b", vec![col("ts", DataType::Timestamp)]),
+            ),
+        ];
+
+        let fallback_schema = schema(
+            "joined",
+            vec![
+                col("ts", DataType::TimestampTz),
+                col("ts", DataType::Timestamp),
+            ],
+        );
+        let types = infer_join_result_column_types(
+            &select.projection,
+            &select.projection,
+            &combined_schemas,
+            &fallback_schema,
+            false,
+            &[],
+        );
+
+        assert_eq!(types, vec![DataType::Timestamp]);
     }
 
     #[test]
