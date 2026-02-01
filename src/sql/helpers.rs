@@ -28,7 +28,7 @@ pub fn normalize_ident(ident: &Ident) -> String {
 use rust_decimal::Decimal;
 use std::str::FromStr;
 
-use super::expr::{eval_expr, eval_expr_join, parse_bool_pg, JoinContext};
+use super::expr::{coerce_text_literal_to_bool, eval_expr, eval_expr_join, JoinContext};
 use super::Aggregator;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
@@ -803,12 +803,10 @@ pub fn eval_having_expr(
             } else {
                 for (cond, res) in conditions.iter().zip(results.iter()) {
                     let cond_val = eval_having_expr(cond, row, schema, agg_funcs, aggs)?;
+                    let cond_val = coerce_text_literal_to_bool(cond, cond_val)?;
                     let cond_true = match cond_val {
                         Value::Boolean(b) => b,
                         Value::Null => false,
-                        Value::Text(s) => parse_bool_pg(&s).ok_or_else(|| {
-                            anyhow!("invalid input syntax for type boolean: \"{}\"", s)
-                        })?,
                         other => {
                             return Err(anyhow!(
                                 "CASE WHEN requires boolean condition, got {:?}",
@@ -974,12 +972,10 @@ pub fn eval_having_expr_join(
             } else {
                 for (cond, res) in conditions.iter().zip(results.iter()) {
                     let cond_val = eval_having_expr_join(cond, ctx, agg_funcs, aggs)?;
+                    let cond_val = coerce_text_literal_to_bool(cond, cond_val)?;
                     let cond_true = match cond_val {
                         Value::Boolean(b) => b,
                         Value::Null => false,
-                        Value::Text(s) => parse_bool_pg(&s).ok_or_else(|| {
-                            anyhow!("invalid input syntax for type boolean: \"{}\"", s)
-                        })?,
                         other => {
                             return Err(anyhow!(
                                 "CASE WHEN requires boolean condition, got {:?}",

@@ -8,7 +8,7 @@ use sqlparser::ast::{
 };
 use tikv_client::Transaction;
 
-use super::super::expr::eval_expr;
+use super::super::expr::{coerce_text_literal_to_bool, eval_expr};
 use super::super::helpers::infer_expr_type;
 use super::super::operators::{
     execute_operator_tree, AggregateExpr, BoxedOperator, DistinctOperator, FilterOperator,
@@ -1007,8 +1007,16 @@ impl Executor {
                     &agg_exprs,
                     group_by_count,
                 )?;
-                if matches!(having_val, Value::Boolean(true)) {
-                    filtered_rows.push(row);
+                let having_val = coerce_text_literal_to_bool(having_expr, having_val)?;
+                match having_val {
+                    Value::Boolean(true) => filtered_rows.push(row),
+                    Value::Boolean(false) | Value::Null => {}
+                    other => {
+                        return Err(anyhow!(
+                            "HAVING clause must evaluate to boolean, got {:?}",
+                            other
+                        ));
+                    }
                 }
             }
             filtered_rows

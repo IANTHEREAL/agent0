@@ -68,8 +68,6 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
         // SQL three-valued logic for boolean operators
         // https://www.postgresql.org/docs/current/functions-logical.html
         BinaryOperator::And => {
-            let left = try_coerce_text_to_bool(left);
-            let right = try_coerce_text_to_bool(right);
             match (left, right) {
                 (Value::Boolean(false), _) | (_, Value::Boolean(false)) => Ok(Value::Boolean(false)),
                 (Value::Boolean(true), Value::Boolean(true)) => Ok(Value::Boolean(true)),
@@ -81,8 +79,6 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
             }
         },
         BinaryOperator::Or => {
-            let left = try_coerce_text_to_bool(left);
-            let right = try_coerce_text_to_bool(right);
             match (left, right) {
                 (Value::Boolean(true), _) | (_, Value::Boolean(true)) => Ok(Value::Boolean(true)),
                 (Value::Boolean(false), Value::Boolean(false)) => Ok(Value::Boolean(false)),
@@ -377,13 +373,6 @@ pub(super) fn parse_bool_pg(s: &str) -> Option<bool> {
         Some(false)
     } else {
         None
-    }
-}
-
-fn try_coerce_text_to_bool(v: Value) -> Value {
-    match v {
-        Value::Text(s) => parse_bool_pg(&s).map(Value::Boolean).unwrap_or(Value::Text(s)),
-        other => other,
     }
 }
 

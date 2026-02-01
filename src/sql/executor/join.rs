@@ -1,6 +1,5 @@
 //! JOIN query execution for the SQL executor
 
-use super::core::Executor;
 use super::super::helpers::{
     apply_offset_limit_fetch, collect_having_agg_funcs, dedup_rows,
     distinct_on_rows_join_with_indices, eval_having_expr_join, get_select_item_name,
@@ -8,14 +7,20 @@ use super::super::helpers::{
 };
 use super::super::information_schema::VirtualTableFilter;
 use super::super::names;
-use super::super::operators::{hash_row_key_for_join, row_key_has_null_for_join, row_keys_equal_for_join, HashJoinConfig};
+use super::super::operators::{
+    hash_row_key_for_join, row_key_has_null_for_join, row_keys_equal_for_join, HashJoinConfig,
+};
 use super::super::sequences;
 use super::super::wildcard::{build_join_wildcard_plan, JoinWildcardColumn};
 use super::super::window::{compute_window_functions_join, extract_window_functions};
 use super::super::{
-    expr::{eval_expr_join, JoinContext},
+    expr::{
+        coerce_text_literal_to_bool, eval_expr_join, validate_bool_expr_in_boolean_context,
+        JoinContext,
+    },
     parse_sql, Aggregator, ExecuteResult,
 };
+use super::core::Executor;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
@@ -32,11 +37,24 @@ tokio::task_local! {
 
 const MAX_VIEW_EXPANSION_DEPTH: usize = 64;
 
+const JOIN_CONDITION_ERR_MSG: &str = "Join condition must evaluate to boolean";
+
+fn join_condition_value_to_bool(expr: &Expr, value: Value) -> Result<bool> {
+    let value = coerce_text_literal_to_bool(expr, value)?;
+    match value {
+        Value::Boolean(b) => Ok(b),
+        Value::Null => Ok(false),
+        other => Err(anyhow!("{}, got {:?}", JOIN_CONDITION_ERR_MSG, other)),
+    }
+}
+
 async fn with_view_expansion_stack<T>(future: impl Future<Output = T>) -> T {
     if VIEW_EXPANSION_STACK.try_with(|_| ()).is_ok() {
         future.await
     } else {
-        VIEW_EXPANSION_STACK.scope(RefCell::new(Vec::new()), future).await
+        VIEW_EXPANSION_STACK
+            .scope(RefCell::new(Vec::new()), future)
+            .await
     }
 }
 
@@ -205,7 +223,9 @@ fn extract_filter_from_expr(expr: &Expr, filter: &mut VirtualTableFilter) {
                         "table_schema" | "nspname" => filter.table_schema = Some(val),
                         _ => {}
                     }
-                } else if let (Some(col), Some(val)) = (get_column_name(right), get_string_value(left)) {
+                } else if let (Some(col), Some(val)) =
+                    (get_column_name(right), get_string_value(left))
+                {
                     match col.to_lowercase().as_str() {
                         "table_name" | "relname" => filter.table_name = Some(val),
                         "table_schema" | "nspname" => filter.table_schema = Some(val),
@@ -432,7 +452,8 @@ fn resolve_join_expr_offset(expr: &Expr, column_offsets: &HashMap<String, usize>
                 let direct_suffix = format!("{}.{}", table_alias, col_name).to_lowercase();
                 for (k, &offset) in column_offsets {
                     let k_lower = k.to_lowercase();
-                    if k_lower == direct_suffix || k_lower.ends_with(&format!(".{}", direct_suffix)) {
+                    if k_lower == direct_suffix || k_lower.ends_with(&format!(".{}", direct_suffix))
+                    {
                         return Some(offset);
                     }
                 }
@@ -576,8 +597,7 @@ impl Executor {
 
         // Check if this is a known scalar function (with or without parentheses)
         let t_upper = table_name.trim_end_matches("()").to_uppercase();
-        if t_upper == "_PGTIKV_SYS_OBSERVABILITY"
-            || t_upper.ends_with("._PGTIKV_SYS_OBSERVABILITY")
+        if t_upper == "_PGTIKV_SYS_OBSERVABILITY" || t_upper.ends_with("._PGTIKV_SYS_OBSERVABILITY")
         {
             let snap = self.observability().snapshot_summary();
             let schema = TableSchema {
@@ -788,7 +808,9 @@ impl Executor {
         if t_upper == "_PGTIKV_SYS_TRIGGER_QUEUE_STATS"
             || t_upper.ends_with("._PGTIKV_SYS_TRIGGER_QUEUE_STATS")
         {
-            use super::super::trigger_queue::{encode_trigger_dlq_prefix, encode_trigger_queue_prefix};
+            use super::super::trigger_queue::{
+                encode_trigger_dlq_prefix, encode_trigger_queue_prefix,
+            };
             use super::super::trigger_queue::{now_ms_i64, EventStatus, TriggerEvent};
             use std::ops::Bound;
             use tikv_client::BoundRange;
@@ -1388,8 +1410,15 @@ impl Executor {
         Box::pin(async move {
             let ast = parse_sql(view_query)?;
             if let Some(Statement::Query(q)) = ast.into_iter().next() {
-                self.execute_query_with_outer_ctes(txn, db_id, sequence_values, search_path, &q, ctes)
-                    .await
+                self.execute_query_with_outer_ctes(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    &q,
+                    ctes,
+                )
+                .await
             } else {
                 Err(anyhow!("Invalid view query"))
             }
@@ -1411,7 +1440,14 @@ impl Executor {
     > {
         Box::pin(async move {
             let result = self
-                .execute_query_with_outer_ctes(txn, db_id, sequence_values, search_path, subquery, ctes)
+                .execute_query_with_outer_ctes(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    subquery,
+                    ctes,
+                )
                 .await?;
             match result {
                 ExecuteResult::Select {
@@ -1452,10 +1488,7 @@ impl Executor {
                             .enumerate()
                             .map(|(i, n)| ColumnDef {
                                 name: n.clone(),
-                                data_type: inferred_types
-                                    .get(i)
-                                    .cloned()
-                                    .unwrap_or(DataType::Text),
+                                data_type: inferred_types.get(i).cloned().unwrap_or(DataType::Text),
                                 nullable: true,
                                 primary_key: false,
                                 unique: false,
@@ -1646,6 +1679,8 @@ impl Executor {
                         vec![(base_alias.clone(), base_schema.columns.clone())];
 
                     let mut combined_schema = base_schema;
+                    let mut combined_schemas_for_infer: Vec<(String, TableSchema)> =
+                        vec![(base_alias.clone(), combined_schema.clone())];
 
                     for join in &table_with_joins.joins {
                         let (join_alias, join_schema, join_rows) = self
@@ -1685,8 +1720,9 @@ impl Executor {
                                     let left_alias = all_table_aliases
                                         .iter()
                                         .find(|(_, cols)| {
-                                            cols.iter()
-                                                .any(|c| c.name.eq_ignore_ascii_case(&using_cols[0]))
+                                            cols.iter().any(|c| {
+                                                c.name.eq_ignore_ascii_case(&using_cols[0])
+                                            })
                                         })
                                         .map(|(a, _)| a.clone())
                                         .unwrap_or_else(|| base_alias.clone());
@@ -1715,11 +1751,8 @@ impl Executor {
                             | JoinOperator::LeftOuter(JoinConstraint::Natural)
                             | JoinOperator::RightOuter(JoinConstraint::Natural)
                             | JoinOperator::FullOuter(JoinConstraint::Natural) => {
-                                let right_columns: Vec<String> = join_schema
-                                    .columns
-                                    .iter()
-                                    .map(|c| c.name.clone())
-                                    .collect();
+                                let right_columns: Vec<String> =
+                                    join_schema.columns.iter().map(|c| c.name.clone()).collect();
                                 let common_cols: Vec<String> = left_columns
                                     .iter()
                                     .filter(|c| right_columns.contains(c))
@@ -1751,6 +1784,18 @@ impl Executor {
                             }
                             _ => None,
                         };
+
+                        if let Some(cond) = join_condition.as_ref() {
+                            let mut schemas_for_validation = combined_schemas_for_infer.clone();
+                            schemas_for_validation.push((join_alias.clone(), join_schema.clone()));
+                            let type_infer_schema =
+                                build_type_infer_schema_for_join(&schemas_for_validation);
+                            validate_bool_expr_in_boolean_context(
+                                cond,
+                                &type_infer_schema,
+                                JOIN_CONDITION_ERR_MSG,
+                            )?;
+                        }
 
                         let is_left_join = matches!(
                             join.join_operator,
@@ -1815,18 +1860,17 @@ impl Executor {
                                         combined_row: &combined_row,
                                         combined_schema: &temp_combined_schema,
                                     };
-                                    matches!(
-                                        self.eval_expr_join_maybe_sequence(
+                                    let value = self
+                                        .eval_expr_join_maybe_sequence(
                                             txn,
                                             db_id,
                                             sequence_values,
                                             search_path,
                                             cond,
-                                            &ctx
+                                            &ctx,
                                         )
-                                        .await?,
-                                        Value::Boolean(true)
-                                    )
+                                        .await?;
+                                    join_condition_value_to_bool(cond, value)?
                                 } else {
                                     true
                                 };
@@ -1857,6 +1901,7 @@ impl Executor {
                         }
 
                         all_table_aliases.push((join_alias.clone(), join_schema.columns.clone()));
+                        combined_schemas_for_infer.push((join_alias.clone(), join_schema.clone()));
 
                         let mut new_columns = combined_schema.columns.clone();
                         new_columns.extend(join_schema.columns.clone());
@@ -2118,9 +2163,15 @@ impl Executor {
 
                 let (join_condition, is_natural) = match &extra_join.join_operator {
                     JoinOperator::Inner(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
-                    JoinOperator::LeftOuter(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
-                    JoinOperator::RightOuter(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
-                    JoinOperator::FullOuter(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
+                    JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
+                        (Some(expr.clone()), false)
+                    }
+                    JoinOperator::RightOuter(JoinConstraint::On(expr)) => {
+                        (Some(expr.clone()), false)
+                    }
+                    JoinOperator::FullOuter(JoinConstraint::On(expr)) => {
+                        (Some(expr.clone()), false)
+                    }
                     JoinOperator::Inner(JoinConstraint::Natural)
                     | JoinOperator::LeftOuter(JoinConstraint::Natural)
                     | JoinOperator::RightOuter(JoinConstraint::Natural)
@@ -2258,15 +2309,12 @@ impl Executor {
                     None
                 };
 
-                let is_left_join =
-                    matches!(&extra_join.join_operator, JoinOperator::LeftOuter(_));
+                let is_left_join = matches!(&extra_join.join_operator, JoinOperator::LeftOuter(_));
                 let is_right_join =
                     matches!(&extra_join.join_operator, JoinOperator::RightOuter(_));
-                let is_full_join =
-                    matches!(&extra_join.join_operator, JoinOperator::FullOuter(_));
+                let is_full_join = matches!(&extra_join.join_operator, JoinOperator::FullOuter(_));
 
-                let left_col_count: usize =
-                    item_schemas.iter().map(|(_, s)| s.columns.len()).sum();
+                let left_col_count: usize = item_schemas.iter().map(|(_, s)| s.columns.len()).sum();
 
                 let mut column_offsets: HashMap<String, usize> = HashMap::new();
                 let mut offset = 0;
@@ -2307,6 +2355,21 @@ impl Executor {
                     foreign_keys: vec![],
                     owner: String::new(),
                 };
+
+                let type_infer_schema = {
+                    let mut schemas_for_validation = item_schemas.clone();
+                    schemas_for_validation.push((join_alias.clone(), join_schema.clone()));
+                    build_type_infer_schema_for_join(&schemas_for_validation)
+                };
+                if !has_correlated_subquery {
+                    if let Some(cond) = join_condition.as_ref() {
+                        validate_bool_expr_in_boolean_context(
+                            cond,
+                            &type_infer_schema,
+                            JOIN_CONDITION_ERR_MSG,
+                        )?;
+                    }
+                }
 
                 let mut new_item_rows = Vec::new();
                 let mut right_matched: Vec<bool> = vec![false; join_rows.len()];
@@ -2349,10 +2412,19 @@ impl Executor {
                         join_condition.clone()
                     };
 
+                    if has_correlated_subquery {
+                        if let Some(cond) = resolved_condition.as_ref() {
+                            validate_bool_expr_in_boolean_context(
+                                cond,
+                                &type_infer_schema,
+                                JOIN_CONDITION_ERR_MSG,
+                            )?;
+                        }
+                    }
+
                     for (right_idx, right_row) in join_rows.iter().enumerate() {
-                        let mut combined_values = Vec::with_capacity(
-                            left_row.values.len() + right_row.values.len(),
-                        );
+                        let mut combined_values =
+                            Vec::with_capacity(left_row.values.len() + right_row.values.len());
                         combined_values.extend(left_row.values.iter().cloned());
                         combined_values.extend(right_row.values.iter().cloned());
                         let combined_row = Row::new(combined_values);
@@ -2365,18 +2437,17 @@ impl Executor {
                                 combined_row: &combined_row,
                                 combined_schema: &temp_combined_schema,
                             };
-                            matches!(
-                                self.eval_expr_join_maybe_sequence(
+                            let value = self
+                                .eval_expr_join_maybe_sequence(
                                     txn,
                                     db_id,
                                     sequence_values,
                                     search_path,
                                     cond,
-                                    &ctx
+                                    &ctx,
                                 )
-                                .await?,
-                                Value::Boolean(true)
-                            )
+                                .await?;
+                            join_condition_value_to_bool(cond, value)?
                         } else {
                             true
                         };
@@ -2389,13 +2460,11 @@ impl Executor {
                     }
 
                     if (is_left_join || is_full_join) && !matched {
-                        let mut combined_values = Vec::with_capacity(
-                            left_row.values.len() + join_schema.columns.len(),
-                        );
+                        let mut combined_values =
+                            Vec::with_capacity(left_row.values.len() + join_schema.columns.len());
                         combined_values.extend(left_row.values.iter().cloned());
-                        combined_values.extend(
-                            std::iter::repeat(Value::Null).take(join_schema.columns.len()),
-                        );
+                        combined_values
+                            .extend(std::iter::repeat(Value::Null).take(join_schema.columns.len()));
                         new_item_rows.push(Row::new(combined_values));
                     }
                 }
@@ -2441,7 +2510,9 @@ impl Executor {
 
                 let (join_condition, is_natural) = match &join.join_operator {
                     JoinOperator::Inner(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
-                    JoinOperator::LeftOuter(JoinConstraint::On(expr)) => (Some(expr.clone()), false),
+                    JoinOperator::LeftOuter(JoinConstraint::On(expr)) => {
+                        (Some(expr.clone()), false)
+                    }
                     JoinOperator::Inner(JoinConstraint::None) => (None, false),
                     JoinOperator::CrossJoin => (None, false),
                     JoinOperator::Inner(JoinConstraint::Using(cols))
@@ -2498,8 +2569,15 @@ impl Executor {
                         Some(cond)
                     } else {
                         Some(
-                            self.resolve_subqueries(txn, db_id, sequence_values, search_path, &cond, ctes)
-                                .await?,
+                            self.resolve_subqueries(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                &cond,
+                                ctes,
+                            )
+                            .await?,
                         )
                     }
                 } else {
@@ -2545,6 +2623,21 @@ impl Executor {
 
                     if join_schema.is_none() {
                         join_schema = Some(this_schema.clone());
+                        if !has_correlated_subquery {
+                            let type_infer_schema = {
+                                let mut schemas_for_validation = combined_schemas.clone();
+                                schemas_for_validation
+                                    .push((join_alias.clone(), this_schema.clone()));
+                                build_type_infer_schema_for_join(&schemas_for_validation)
+                            };
+                            if let Some(cond) = join_condition.as_ref() {
+                                validate_bool_expr_in_boolean_context(
+                                    cond,
+                                    &type_infer_schema,
+                                    JOIN_CONDITION_ERR_MSG,
+                                )?;
+                            }
+                        }
 
                         let mut column_offsets: HashMap<String, usize> = HashMap::new();
                         let mut offset = 0;
@@ -2610,18 +2703,17 @@ impl Executor {
                         };
 
                         let matches = if let Some(ref cond) = join_condition {
-                            matches!(
-                                self.eval_expr_join_maybe_sequence(
+                            let value = self
+                                .eval_expr_join_maybe_sequence(
                                     txn,
                                     db_id,
                                     sequence_values,
                                     search_path,
                                     cond,
-                                    &ctx
+                                    &ctx,
                                 )
-                                .await?,
-                                Value::Boolean(true)
-                            )
+                                .await?;
+                            join_condition_value_to_bool(cond, value)?
                         } else {
                             true
                         };
@@ -2633,10 +2725,7 @@ impl Executor {
                     }
 
                     if is_left_join && !matched {
-                        let right_cols = join_schema
-                            .as_ref()
-                            .map(|s| s.columns.len())
-                            .unwrap_or(0);
+                        let right_cols = join_schema.as_ref().map(|s| s.columns.len()).unwrap_or(0);
                         let mut combined_values = left_row.values.clone();
                         combined_values.extend(std::iter::repeat(Value::Null).take(right_cols));
                         new_combined_rows.push(Row::new(combined_values));
@@ -2656,6 +2745,20 @@ impl Executor {
                             ctes,
                         )
                         .await?;
+                    if !has_correlated_subquery {
+                        let type_infer_schema = {
+                            let mut schemas_for_validation = combined_schemas.clone();
+                            schemas_for_validation.push((join_alias.clone(), schema.clone()));
+                            build_type_infer_schema_for_join(&schemas_for_validation)
+                        };
+                        if let Some(cond) = join_condition.as_ref() {
+                            validate_bool_expr_in_boolean_context(
+                                cond,
+                                &type_infer_schema,
+                                JOIN_CONDITION_ERR_MSG,
+                            )?;
+                        }
+                    }
                     join_schema = Some(schema);
                 }
 
@@ -2862,8 +2965,15 @@ impl Executor {
                     Some(cond)
                 } else {
                     Some(
-                        self.resolve_subqueries(txn, db_id, sequence_values, search_path, &cond, ctes)
-                            .await?,
+                        self.resolve_subqueries(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            &cond,
+                            ctes,
+                        )
+                        .await?,
                     )
                 }
             } else {
@@ -2916,6 +3026,21 @@ impl Executor {
                 foreign_keys: vec![],
                 owner: String::new(),
             };
+
+            let type_infer_schema = {
+                let mut schemas_for_validation = combined_schemas.clone();
+                schemas_for_validation.push((join_alias.clone(), join_schema.clone()));
+                build_type_infer_schema_for_join(&schemas_for_validation)
+            };
+            if !has_correlated_subquery {
+                if let Some(cond) = join_condition.as_ref() {
+                    validate_bool_expr_in_boolean_context(
+                        cond,
+                        &type_infer_schema,
+                        JOIN_CONDITION_ERR_MSG,
+                    )?;
+                }
+            }
 
             let hash_join_config = HashJoinConfig::default();
             let join_key_indices = if !has_correlated_subquery {
@@ -3086,7 +3211,8 @@ impl Executor {
                 if right_outer {
                     for (ri, right_row) in join_rows.iter().enumerate() {
                         if !right_matched[ri] {
-                            let mut values = Vec::with_capacity(left_col_count + right_row.values.len());
+                            let mut values =
+                                Vec::with_capacity(left_col_count + right_row.values.len());
                             values.extend(std::iter::repeat(Value::Null).take(left_col_count));
                             values.extend(right_row.values.iter().cloned());
                             new_combined_rows.push(Row::new(values));
@@ -3134,10 +3260,19 @@ impl Executor {
                         join_condition.clone()
                     };
 
+                    if has_correlated_subquery {
+                        if let Some(cond) = resolved_condition.as_ref() {
+                            validate_bool_expr_in_boolean_context(
+                                cond,
+                                &type_infer_schema,
+                                JOIN_CONDITION_ERR_MSG,
+                            )?;
+                        }
+                    }
+
                     for (right_idx, right_row) in join_rows.iter().enumerate() {
-                        let mut combined_values = Vec::with_capacity(
-                            left_row.values.len() + right_row.values.len(),
-                        );
+                        let mut combined_values =
+                            Vec::with_capacity(left_row.values.len() + right_row.values.len());
                         combined_values.extend(left_row.values.iter().cloned());
                         combined_values.extend(right_row.values.iter().cloned());
                         let combined_row = Row::new(combined_values);
@@ -3150,18 +3285,17 @@ impl Executor {
                                 combined_row: &combined_row,
                                 combined_schema: &temp_combined_schema,
                             };
-                            matches!(
-                                self.eval_expr_join_maybe_sequence(
+                            let value = self
+                                .eval_expr_join_maybe_sequence(
                                     txn,
                                     db_id,
                                     sequence_values,
                                     search_path,
                                     cond,
-                                    &ctx
+                                    &ctx,
                                 )
-                                .await?,
-                                Value::Boolean(true)
-                            )
+                                .await?;
+                            join_condition_value_to_bool(cond, value)?
                         } else {
                             true
                         };
@@ -3173,13 +3307,11 @@ impl Executor {
                         }
                     }
                     if (is_left_join || is_full_join) && !matched {
-                        let mut combined_values = Vec::with_capacity(
-                            left_row.values.len() + join_schema.columns.len(),
-                        );
+                        let mut combined_values =
+                            Vec::with_capacity(left_row.values.len() + join_schema.columns.len());
                         combined_values.extend(left_row.values.iter().cloned());
-                        combined_values.extend(
-                            std::iter::repeat(Value::Null).take(join_schema.columns.len()),
-                        );
+                        combined_values
+                            .extend(std::iter::repeat(Value::Null).take(join_schema.columns.len()));
                         new_combined_rows.push(Row::new(combined_values));
                     }
                 }
@@ -3312,6 +3444,14 @@ impl Executor {
             None
         };
 
+        if let Some(sel) = resolved_selection.as_ref() {
+            validate_bool_expr_in_boolean_context(
+                sel,
+                &type_infer_schema,
+                "Filter predicate must evaluate to boolean",
+            )?;
+        }
+
         let filtered_rows = if let Some(ref sel) = resolved_selection {
             let mut v = Vec::new();
             for row in combined_rows {
@@ -3322,19 +3462,26 @@ impl Executor {
                     combined_row: &row,
                     combined_schema: &final_schema,
                 };
-                if matches!(
-                    self.eval_expr_join_maybe_sequence(
+                let result = self
+                    .eval_expr_join_maybe_sequence(
                         txn,
                         db_id,
                         sequence_values,
                         search_path,
                         sel,
-                        &ctx
+                        &ctx,
                     )
-                    .await?,
-                    Value::Boolean(true)
-                ) {
-                    v.push(row);
+                    .await?;
+                let result = coerce_text_literal_to_bool(sel, result)?;
+                match result {
+                    Value::Boolean(true) => v.push(row),
+                    Value::Boolean(false) | Value::Null => {}
+                    other => {
+                        return Err(anyhow!(
+                            "Filter predicate must evaluate to boolean, got {:?}",
+                            other
+                        ));
+                    }
                 }
             }
             v
@@ -3520,8 +3667,16 @@ impl Executor {
                                 &ctx,
                             )
                             .await?;
-                        if !matches!(filter_val, Value::Boolean(true)) {
-                            continue;
+                        let filter_val = coerce_text_literal_to_bool(filter, filter_val)?;
+                        match filter_val {
+                            Value::Boolean(true) => {}
+                            Value::Boolean(false) | Value::Null => continue,
+                            other => {
+                                return Err(anyhow!(
+                                    "FILTER clause must evaluate to boolean, got {:?}",
+                                    other
+                                ));
+                            }
                         }
                     }
 
@@ -3613,8 +3768,16 @@ impl Executor {
                         having_expr.clone()
                     };
                     let having_val = eval_having_expr_join(&having_expr, &ctx, &agg_funcs, &aggs)?;
-                    if !matches!(having_val, Value::Boolean(true)) {
-                        continue;
+                    let having_val = coerce_text_literal_to_bool(&having_expr, having_val)?;
+                    match having_val {
+                        Value::Boolean(true) => {}
+                        Value::Boolean(false) | Value::Null => continue,
+                        other => {
+                            return Err(anyhow!(
+                                "HAVING clause must evaluate to boolean, got {:?}",
+                                other
+                            ));
+                        }
                     }
                 }
 
@@ -3665,7 +3828,8 @@ impl Executor {
                                 {
                                     keys.push(row.values.get(idx).cloned().unwrap_or(Value::Null));
                                 } else {
-                                    let expr = if sequences::expr_needs_async_eval(&order_expr.expr) {
+                                    let expr = if sequences::expr_needs_async_eval(&order_expr.expr)
+                                    {
                                         sequences::replace_sequence_functions_join(
                                             &self.store(),
                                             txn,
@@ -3679,7 +3843,9 @@ impl Executor {
                                     } else {
                                         order_expr.expr.clone()
                                     };
-                                    keys.push(eval_having_expr_join(&expr, &ctx, &agg_funcs, &aggs)?);
+                                    keys.push(eval_having_expr_join(
+                                        &expr, &ctx, &agg_funcs, &aggs,
+                                    )?);
                                 }
                             }
                             _ => {
@@ -4777,11 +4943,8 @@ fn generate_series_values_limited(
             let step_val = match step {
                 Value::Null => rust_decimal::Decimal::ONE,
                 Value::Numeric(st) => *st,
-                Value::Float64(st) => {
-                    rust_decimal::Decimal::try_from(*st).map_err(|_| {
-                        anyhow!("invalid input syntax for type numeric: \"{}\"", st)
-                    })?
-                }
+                Value::Float64(st) => rust_decimal::Decimal::try_from(*st)
+                    .map_err(|_| anyhow!("invalid input syntax for type numeric: \"{}\"", st))?,
                 Value::Int32(st) => rust_decimal::Decimal::from(*st),
                 Value::Int64(st) => rust_decimal::Decimal::from(*st),
                 _ => return Err(anyhow!("Invalid step type for numeric generate_series")),
@@ -5176,7 +5339,12 @@ mod tests {
         assert_eq!(cols, vec!["id", "name", "a1", "b1"]);
         assert_eq!(
             types,
-            vec![DataType::Int32, DataType::Text, DataType::Text, DataType::Text]
+            vec![
+                DataType::Int32,
+                DataType::Text,
+                DataType::Text,
+                DataType::Text
+            ]
         );
         assert_eq!(
             projected[0].values,

@@ -11,7 +11,10 @@ use super::super::operators::{execute_operator_tree, JoinType, PhysicalPlanner};
 use super::super::planner::{self, ScanType};
 use super::super::sequences;
 use super::super::window::{compute_window_functions, extract_window_functions, WindowFuncInfo};
-use super::super::{expr::eval_expr, Aggregator, ExecuteResult};
+use super::super::{
+    expr::{coerce_text_literal_to_bool, eval_expr, validate_bool_expr_in_boolean_context},
+    Aggregator, ExecuteResult,
+};
 use super::core::Executor;
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
@@ -657,6 +660,14 @@ impl Executor {
             None
         };
 
+        if let Some(sel) = resolved_selection.as_ref() {
+            validate_bool_expr_in_boolean_context(
+                sel,
+                &schema,
+                "Filter predicate must evaluate to boolean",
+            )?;
+        }
+
         let resolved_projection = self
             .resolve_projection_subqueries_with_outer_context(
                 txn,
@@ -978,15 +989,25 @@ impl Executor {
                                 &r,
                             )
                             .await?;
-                        if matches!(result, Value::Boolean(true)) {
-                            rows.push(r);
-                            keys.push(key);
+                        let result = coerce_text_literal_to_bool(sel, result)?;
+                        match result {
+                            Value::Boolean(true) => {
+                                rows.push(r);
+                                keys.push(key);
+                            }
+                            Value::Boolean(false) | Value::Null => {}
+                            other => {
+                                return Err(anyhow!(
+                                    "Filter predicate must evaluate to boolean, got {:?}",
+                                    other
+                                ));
+                            }
                         }
                     }
                 } else {
                     for (key, r) in all_keys.into_iter().zip(all_rows.into_iter()) {
-                        if matches!(
-                            self.eval_expr_maybe_sequence(
+                        let result = self
+                            .eval_expr_maybe_sequence(
                                 txn,
                                 db_id,
                                 sequence_values,
@@ -995,11 +1016,20 @@ impl Executor {
                                 Some(&r),
                                 Some(&schema),
                             )
-                            .await?,
-                            Value::Boolean(true)
-                        ) {
-                            rows.push(r);
-                            keys.push(key);
+                            .await?;
+                        let result = coerce_text_literal_to_bool(sel, result)?;
+                        match result {
+                            Value::Boolean(true) => {
+                                rows.push(r);
+                                keys.push(key);
+                            }
+                            Value::Boolean(false) | Value::Null => {}
+                            other => {
+                                return Err(anyhow!(
+                                    "Filter predicate must evaluate to boolean, got {:?}",
+                                    other
+                                ));
+                            }
                         }
                     }
                 }
@@ -1023,14 +1053,22 @@ impl Executor {
                             &r,
                         )
                         .await?;
-                    if matches!(result, Value::Boolean(true)) {
-                        v.push(r);
+                    let result = coerce_text_literal_to_bool(sel, result)?;
+                    match result {
+                        Value::Boolean(true) => v.push(r),
+                        Value::Boolean(false) | Value::Null => {}
+                        other => {
+                            return Err(anyhow!(
+                                "Filter predicate must evaluate to boolean, got {:?}",
+                                other
+                            ));
+                        }
                     }
                 }
             } else {
                 for r in all_rows {
-                    if matches!(
-                        self.eval_expr_maybe_sequence(
+                    let result = self
+                        .eval_expr_maybe_sequence(
                             txn,
                             db_id,
                             sequence_values,
@@ -1039,10 +1077,17 @@ impl Executor {
                             Some(&r),
                             Some(&schema),
                         )
-                        .await?,
-                        Value::Boolean(true)
-                    ) {
-                        v.push(r);
+                        .await?;
+                    let result = coerce_text_literal_to_bool(sel, result)?;
+                    match result {
+                        Value::Boolean(true) => v.push(r),
+                        Value::Boolean(false) | Value::Null => {}
+                        other => {
+                            return Err(anyhow!(
+                                "Filter predicate must evaluate to boolean, got {:?}",
+                                other
+                            ));
+                        }
                     }
                 }
             }
@@ -1432,8 +1477,16 @@ impl Executor {
                             Some(schema),
                         )
                         .await?;
-                    if !matches!(filter_val, Value::Boolean(true)) {
-                        continue;
+                    let filter_val = coerce_text_literal_to_bool(filter, filter_val)?;
+                    match filter_val {
+                        Value::Boolean(true) => {}
+                        Value::Boolean(false) | Value::Null => continue,
+                        other => {
+                            return Err(anyhow!(
+                                "FILTER clause must evaluate to boolean, got {:?}",
+                                other
+                            ));
+                        }
                     }
                 }
 
@@ -1532,8 +1585,16 @@ impl Executor {
                 };
                 let having_val =
                     eval_having_expr(&having_expr, representative, schema, &agg_funcs, &aggs)?;
-                if !matches!(having_val, Value::Boolean(true)) {
-                    continue;
+                let having_val = coerce_text_literal_to_bool(&having_expr, having_val)?;
+                match having_val {
+                    Value::Boolean(true) => {}
+                    Value::Boolean(false) | Value::Null => continue,
+                    other => {
+                        return Err(anyhow!(
+                            "HAVING clause must evaluate to boolean, got {:?}",
+                            other
+                        ));
+                    }
                 }
             }
 
@@ -1734,8 +1795,16 @@ impl Executor {
                                 Some(schema),
                             )
                             .await?;
-                        if !matches!(filter_val, Value::Boolean(true)) {
-                            continue;
+                        let filter_val = coerce_text_literal_to_bool(filter, filter_val)?;
+                        match filter_val {
+                            Value::Boolean(true) => {}
+                            Value::Boolean(false) | Value::Null => continue,
+                            other => {
+                                return Err(anyhow!(
+                                    "FILTER clause must evaluate to boolean, got {:?}",
+                                    other
+                                ));
+                            }
                         }
                     }
 
@@ -1805,8 +1874,16 @@ impl Executor {
                     };
                     let having_val =
                         eval_having_expr(&having_expr, &group_eval_row, schema, &agg_funcs, &aggs)?;
-                    if !matches!(having_val, Value::Boolean(true)) {
-                        continue;
+                    let having_val = coerce_text_literal_to_bool(&having_expr, having_val)?;
+                    match having_val {
+                        Value::Boolean(true) => {}
+                        Value::Boolean(false) | Value::Null => continue,
+                        other => {
+                            return Err(anyhow!(
+                                "HAVING clause must evaluate to boolean, got {:?}",
+                                other
+                            ));
+                        }
                     }
                 }
 

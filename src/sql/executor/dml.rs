@@ -1,14 +1,16 @@
 //! DML operations (INSERT, UPDATE, DELETE) for the SQL executor
 
 use super::super::dml;
-use super::core::Executor;
-use super::super::expr::JoinContext;
+use super::super::expr::{
+    coerce_text_literal_to_bool, validate_bool_expr_in_boolean_context, JoinContext,
+};
 use super::super::helpers::normalize_ident;
 use super::super::names;
 use super::super::trigger_queue::TriggerOp;
 use super::super::trigger_worker;
 use super::super::triggers;
 use super::super::ExecuteResult;
+use super::core::Executor;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
@@ -17,6 +19,53 @@ use sqlparser::ast::{
 };
 use std::collections::HashMap;
 use tikv_client::Transaction;
+
+const BOOLEAN_CONTEXT_ERR_MSG: &str = "Filter predicate must evaluate to boolean";
+
+fn build_type_infer_schema_for_two_table_join(
+    left_alias: &str,
+    left_schema: &TableSchema,
+    right_alias: &str,
+    right_schema: &TableSchema,
+) -> TableSchema {
+    let mut columns = Vec::new();
+    columns.extend(left_schema.columns.clone());
+    columns.extend(right_schema.columns.clone());
+
+    for col in &left_schema.columns {
+        let mut qualified = col.clone();
+        qualified.name = format!("{}.{}", left_alias, col.name);
+        columns.push(qualified);
+    }
+
+    for col in &right_schema.columns {
+        let mut qualified = col.clone();
+        qualified.name = format!("{}.{}", right_alias, col.name);
+        columns.push(qualified);
+    }
+
+    TableSchema {
+        name: "joined_infer".to_string(),
+        table_id: 0,
+        columns,
+        version: 1,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+    }
+}
+
+fn predicate_value_to_bool(expr: &Expr, value: Value) -> Result<bool> {
+    let value = coerce_text_literal_to_bool(expr, value)?;
+    match value {
+        Value::Boolean(b) => Ok(b),
+        Value::Null => Ok(false),
+        other => Err(anyhow!("{}, got {:?}", BOOLEAN_CONTEXT_ERR_MSG, other)),
+    }
+}
 
 fn value_to_expr(val: Value, _col_name: Option<&str>) -> Result<Expr> {
     Ok(match val {
@@ -105,10 +154,7 @@ impl Executor {
             .await?
             .ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
-        let trigger_defs = self
-            .store()
-            .list_triggers_for_table(txn, db_id, &t)
-            .await?;
+        let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
         let source = source
             .as_ref()
             .ok_or_else(|| anyhow!("INSERT requires VALUES"))?;
@@ -294,10 +340,7 @@ impl Executor {
             .get_schema(txn, db_id, &t)
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
-        let trigger_defs = self
-            .store()
-            .list_triggers_for_table(txn, db_id, &t)
-            .await?;
+        let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
         if schema.pk_indices.is_empty() {
             return Err(anyhow!("No PK"));
         }
@@ -344,10 +387,30 @@ impl Executor {
                 .get_schema(txn, db_id, &using_resolved.full)
                 .await?
                 .ok_or_else(|| anyhow!("USING table not found"))?;
-            let using_rows =
-                self.scan_and_fill(txn, db_id, &using_resolved.full, &using_schema).await?;
+            let using_rows = self
+                .scan_and_fill(txn, db_id, &using_resolved.full, &using_schema)
+                .await?;
             Some((using_schema, using_rows, using_alias))
         };
+
+        let validation_schema = using_data.as_ref().map(|(using_schema, _, using_alias)| {
+            build_type_infer_schema_for_two_table_join(
+                &table_alias,
+                &schema,
+                using_alias,
+                using_schema,
+            )
+        });
+        if let Some(sel) = resolved_selection.as_ref() {
+            match validation_schema.as_ref() {
+                Some(schema) => {
+                    validate_bool_expr_in_boolean_context(sel, schema, BOOLEAN_CONTEXT_ERR_MSG)?
+                }
+                None => {
+                    validate_bool_expr_in_boolean_context(sel, &schema, BOOLEAN_CONTEXT_ERR_MSG)?
+                }
+            }
+        }
 
         for r in rows {
             let should_delete = if let Some(ref e) = resolved_selection {
@@ -370,37 +433,35 @@ impl Executor {
                             combined_row: &combined_row,
                             combined_schema: &combined_schema,
                         };
-                        if matches!(
-                            self.eval_expr_join_maybe_sequence(
+                        let value = self
+                            .eval_expr_join_maybe_sequence(
                                 txn,
                                 db_id,
                                 sequence_values,
                                 search_path,
                                 e,
-                                &ctx
+                                &ctx,
                             )
-                            .await?,
-                            Value::Boolean(true)
-                        ) {
+                            .await?;
+                        if predicate_value_to_bool(e, value)? {
                             matched = true;
                             break;
                         }
                     }
                     matched
                 } else {
-                    matches!(
-                        self.eval_expr_maybe_sequence(
+                    let value = self
+                        .eval_expr_maybe_sequence(
                             txn,
                             db_id,
                             sequence_values,
                             search_path,
                             e,
                             Some(&r),
-                            Some(&schema)
+                            Some(&schema),
                         )
-                        .await?,
-                        Value::Boolean(true)
-                    )
+                        .await?;
+                    predicate_value_to_bool(e, value)?
                 }
             } else {
                 if let Some((_, ref using_rows, _)) = using_data {
@@ -469,17 +530,15 @@ impl Executor {
     ) -> Result<ExecuteResult> {
         let ctes_ctx: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let resolved_target = match &table.relation {
-            sqlparser::ast::TableFactor::Table { name, .. } => {
-                names::resolve_existing_table_name(
-                    self.store().as_ref(),
-                    txn,
-                    db_id,
-                    name,
-                    search_path,
-                )
-                    .await?
-                    .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?
-            }
+            sqlparser::ast::TableFactor::Table { name, .. } => names::resolve_existing_table_name(
+                self.store().as_ref(),
+                txn,
+                db_id,
+                name,
+                search_path,
+            )
+            .await?
+            .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?,
             _ => return Err(anyhow!("Unsupported")),
         };
         let t = resolved_target.full.clone();
@@ -496,10 +555,7 @@ impl Executor {
             .await?
             .ok_or_else(|| anyhow!("Table not found"))?;
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
-        let trigger_defs = self
-            .store()
-            .list_triggers_for_table(txn, db_id, &t)
-            .await?;
+        let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
         if schema.pk_indices.is_empty() {
             return Err(anyhow!("No PK"));
         }
@@ -548,6 +604,28 @@ impl Executor {
             (None, None, None)
         };
 
+        let validation_schema = match (&from_schema, &from_alias) {
+            (Some(from_schema), Some(from_alias)) => {
+                Some(build_type_infer_schema_for_two_table_join(
+                    &table_alias,
+                    &schema,
+                    from_alias,
+                    from_schema,
+                ))
+            }
+            _ => None,
+        };
+        if let Some(sel) = resolved_selection.as_ref() {
+            match validation_schema.as_ref() {
+                Some(schema) => {
+                    validate_bool_expr_in_boolean_context(sel, schema, BOOLEAN_CONTEXT_ERR_MSG)?
+                }
+                None => {
+                    validate_bool_expr_in_boolean_context(sel, &schema, BOOLEAN_CONTEXT_ERR_MSG)?
+                }
+            }
+        }
+
         let rows = self.scan_and_fill(txn, db_id, &t, &schema).await?;
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
@@ -573,18 +651,17 @@ impl Executor {
                             combined_row: &combined_row,
                             combined_schema: &combined_schema,
                         };
-                        if matches!(
-                            self.eval_expr_join_maybe_sequence(
+                        let value = self
+                            .eval_expr_join_maybe_sequence(
                                 txn,
                                 db_id,
                                 sequence_values,
                                 search_path,
                                 sel,
-                                &ctx
+                                &ctx,
                             )
-                            .await?,
-                            Value::Boolean(true)
-                        ) {
+                            .await?;
+                        if predicate_value_to_bool(sel, value)? {
                             matches.push(from_row);
                         }
                     } else {
@@ -594,19 +671,18 @@ impl Executor {
                 matches
             } else {
                 if let Some(ref e) = resolved_selection {
-                    if !matches!(
-                        self.eval_expr_maybe_sequence(
+                    let value = self
+                        .eval_expr_maybe_sequence(
                             txn,
                             db_id,
                             sequence_values,
                             search_path,
                             e,
                             Some(r),
-                            Some(&schema)
+                            Some(&schema),
                         )
-                        .await?,
-                        Value::Boolean(true)
-                    ) {
+                        .await?;
+                    if !predicate_value_to_bool(e, value)? {
                         continue;
                     }
                 }
@@ -692,18 +768,17 @@ impl Executor {
                 None => continue,
             };
 
-            let updated_row =
-                dml::execute_update_row(
-                    &self.store(),
-                    txn,
-                    db_id,
-                    &t,
-                    &schema,
-                    r,
-                    new_row,
-                    &enum_cache,
-                )
-                    .await?;
+            let updated_row = dml::execute_update_row(
+                &self.store(),
+                txn,
+                db_id,
+                &t,
+                &schema,
+                r,
+                new_row,
+                &enum_cache,
+            )
+            .await?;
 
             trigger_worker::enqueue_after_triggers(
                 txn,

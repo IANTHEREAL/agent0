@@ -18,6 +18,19 @@ fn is_explicit_null(expr: &Expr) -> bool {
     }
 }
 
+fn is_string_literal_expr(expr: &Expr) -> bool {
+    use sqlparser::ast::Value as SqlValue;
+    match expr {
+        Expr::Nested(inner) => is_string_literal_expr(inner),
+        Expr::Value(
+            SqlValue::SingleQuotedString(_)
+            | SqlValue::DoubleQuotedString(_)
+            | SqlValue::EscapedStringLiteral(_),
+        ) => true,
+        _ => false,
+    }
+}
+
 fn infer_expr_type_for_validation<C: EvalContext>(ctx: &C, expr: &Expr) -> DataType {
     if let Some(data_type) = ctx.column_type(expr) {
         return data_type.clone();
@@ -71,7 +84,7 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg:
         }
 
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => match ctx.column_type(expr) {
-            Some(DataType::Boolean) | Some(DataType::Text) => Ok(()),
+            Some(DataType::Boolean) => Ok(()),
             _ => Err(anyhow!(err_msg)),
         },
 
@@ -155,9 +168,15 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg:
                 }
             }
             for result in results {
+                if is_string_literal_expr(result) {
+                    return Err(anyhow!(err_msg));
+                }
                 ensure_boolean_or_null_operand(ctx, result, err_msg)?;
             }
             if let Some(else_expr) = else_result {
+                if is_string_literal_expr(else_expr) {
+                    return Err(anyhow!(err_msg));
+                }
                 ensure_boolean_or_null_operand(ctx, else_expr, err_msg)?;
             }
             Ok(())
@@ -188,12 +207,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => {
                 let left_val = eval_expr_impl(ctx, left)?;
-                let left_val = match left_val {
-                    Value::Text(s) => parse_bool_pg(&s)
-                        .map(Value::Boolean)
-                        .unwrap_or(Value::Text(s)),
-                    other => other,
-                };
+                let left_val = super::coerce_text_literal_to_bool(left, left_val)?;
                 match &left_val {
                     Value::Boolean(false) => {
                         ensure_boolean_or_null_operand(ctx, right, "AND requires boolean operands")?;
@@ -201,6 +215,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                     }
                     Value::Boolean(true) | Value::Null => {
                         let right_val = eval_expr_impl(ctx, right)?;
+                        let right_val = super::coerce_text_literal_to_bool(right, right_val)?;
                         eval_binary_op(left_val, op, right_val)
                     }
                     _ => Err(anyhow!("AND requires boolean operands")),
@@ -208,12 +223,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             }
             BinaryOperator::Or => {
                 let left_val = eval_expr_impl(ctx, left)?;
-                let left_val = match left_val {
-                    Value::Text(s) => parse_bool_pg(&s)
-                        .map(Value::Boolean)
-                        .unwrap_or(Value::Text(s)),
-                    other => other,
-                };
+                let left_val = super::coerce_text_literal_to_bool(left, left_val)?;
                 match &left_val {
                     Value::Boolean(true) => {
                         ensure_boolean_or_null_operand(ctx, right, "OR requires boolean operands")?;
@@ -221,6 +231,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                     }
                     Value::Boolean(false) | Value::Null => {
                         let right_val = eval_expr_impl(ctx, right)?;
+                        let right_val = super::coerce_text_literal_to_bool(right, right_val)?;
                         eval_binary_op(left_val, op, right_val)
                     }
                     _ => Err(anyhow!("OR requires boolean operands")),
@@ -267,14 +278,14 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                     }
                     other => Err(anyhow!("Cannot negate {:?}", other)),
                 },
-                sqlparser::ast::UnaryOperator::Not => match val {
-                    Value::Boolean(b) => Ok(Value::Boolean(!b)),
-                    Value::Null => Ok(Value::Null),
-                    Value::Text(s) => parse_bool_pg(&s)
-                        .map(|b| Value::Boolean(!b))
-                        .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
-                    _ => Err(anyhow!("NOT requires boolean, got {:?}", val)),
-                },
+                sqlparser::ast::UnaryOperator::Not => {
+                    let val = super::coerce_text_literal_to_bool(expr, val)?;
+                    match val {
+                        Value::Boolean(b) => Ok(Value::Boolean(!b)),
+                        Value::Null => Ok(Value::Null),
+                        other => Err(anyhow!("NOT requires boolean, got {:?}", other)),
+                    }
+                }
                 _ => Err(anyhow!("Unsupported unary operator: {:?}", op)),
             }
         }
@@ -287,38 +298,42 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             let val = eval_expr_impl(ctx, expr)?;
             Ok(Value::Boolean(!matches!(val, Value::Null)))
         }
-        Expr::IsTrue(expr) => match eval_expr_impl(ctx, expr)? {
-            Value::Boolean(b) => Ok(Value::Boolean(b)),
-            Value::Null => Ok(Value::Boolean(false)),
-            Value::Text(s) => parse_bool_pg(&s)
-                .map(Value::Boolean)
-                .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
-            other => Err(anyhow!("IS TRUE requires boolean, got {:?}", other)),
-        },
-        Expr::IsNotTrue(expr) => match eval_expr_impl(ctx, expr)? {
-            Value::Boolean(true) => Ok(Value::Boolean(false)),
-            Value::Boolean(false) | Value::Null => Ok(Value::Boolean(true)),
-            Value::Text(s) => parse_bool_pg(&s)
-                .map(|b| Value::Boolean(!b))
-                .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
-            other => Err(anyhow!("IS NOT TRUE requires boolean, got {:?}", other)),
-        },
-        Expr::IsFalse(expr) => match eval_expr_impl(ctx, expr)? {
-            Value::Boolean(b) => Ok(Value::Boolean(!b)),
-            Value::Null => Ok(Value::Boolean(false)),
-            Value::Text(s) => parse_bool_pg(&s)
-                .map(|b| Value::Boolean(!b))
-                .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
-            other => Err(anyhow!("IS FALSE requires boolean, got {:?}", other)),
-        },
-        Expr::IsNotFalse(expr) => match eval_expr_impl(ctx, expr)? {
-            Value::Boolean(false) => Ok(Value::Boolean(false)),
-            Value::Boolean(true) | Value::Null => Ok(Value::Boolean(true)),
-            Value::Text(s) => parse_bool_pg(&s)
-                .map(Value::Boolean)
-                .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
-            other => Err(anyhow!("IS NOT FALSE requires boolean, got {:?}", other)),
-        },
+        Expr::IsTrue(expr) => {
+            let val = eval_expr_impl(ctx, expr)?;
+            let val = super::coerce_text_literal_to_bool(expr, val)?;
+            match val {
+                Value::Boolean(b) => Ok(Value::Boolean(b)),
+                Value::Null => Ok(Value::Boolean(false)),
+                other => Err(anyhow!("IS TRUE requires boolean, got {:?}", other)),
+            }
+        }
+        Expr::IsNotTrue(expr) => {
+            let val = eval_expr_impl(ctx, expr)?;
+            let val = super::coerce_text_literal_to_bool(expr, val)?;
+            match val {
+                Value::Boolean(true) => Ok(Value::Boolean(false)),
+                Value::Boolean(false) | Value::Null => Ok(Value::Boolean(true)),
+                other => Err(anyhow!("IS NOT TRUE requires boolean, got {:?}", other)),
+            }
+        }
+        Expr::IsFalse(expr) => {
+            let val = eval_expr_impl(ctx, expr)?;
+            let val = super::coerce_text_literal_to_bool(expr, val)?;
+            match val {
+                Value::Boolean(b) => Ok(Value::Boolean(!b)),
+                Value::Null => Ok(Value::Boolean(false)),
+                other => Err(anyhow!("IS FALSE requires boolean, got {:?}", other)),
+            }
+        }
+        Expr::IsNotFalse(expr) => {
+            let val = eval_expr_impl(ctx, expr)?;
+            let val = super::coerce_text_literal_to_bool(expr, val)?;
+            match val {
+                Value::Boolean(false) => Ok(Value::Boolean(false)),
+                Value::Boolean(true) | Value::Null => Ok(Value::Boolean(true)),
+                other => Err(anyhow!("IS NOT FALSE requires boolean, got {:?}", other)),
+            }
+        }
         Expr::IsUnknown(expr) => {
             let val = eval_expr_impl(ctx, expr)?;
             Ok(Value::Boolean(matches!(val, Value::Null)))
@@ -459,12 +474,10 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             } else {
                 for (i, cond) in conditions.iter().enumerate() {
                     let cond_val = eval_expr_impl(ctx, cond)?;
+                    let cond_val = super::coerce_text_literal_to_bool(cond, cond_val)?;
                     let cond_true = match cond_val {
                         Value::Boolean(b) => b,
                         Value::Null => false,
-                        Value::Text(s) => parse_bool_pg(&s).ok_or_else(|| {
-                            anyhow!("invalid input syntax for type boolean: \"{}\"", s)
-                        })?,
                         other => {
                             return Err(anyhow!(
                                 "CASE WHEN requires boolean condition, got {:?}",
@@ -1006,5 +1019,40 @@ fn eval_overlay_with_context<C: EvalContext>(
             replace_len,
         ))),
         _ => Ok(Value::Null),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::eval_expr;
+    use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue};
+
+    #[test]
+    fn test_and_short_circuit_errors_on_case_text_branches() {
+        let make_case = || Expr::Case {
+            operand: None,
+            conditions: vec![Expr::Value(SqlValue::Boolean(true))],
+            results: vec![Expr::Value(SqlValue::SingleQuotedString("true".to_string()))],
+            else_result: Some(Box::new(Expr::Value(SqlValue::SingleQuotedString(
+                "false".to_string(),
+            )))),
+        };
+
+        let false_and = Expr::BinaryOp {
+            left: Box::new(Expr::Value(SqlValue::Boolean(false))),
+            op: BinaryOperator::And,
+            right: Box::new(make_case()),
+        };
+        let true_and = Expr::BinaryOp {
+            left: Box::new(Expr::Value(SqlValue::Boolean(true))),
+            op: BinaryOperator::And,
+            right: Box::new(make_case()),
+        };
+
+        let false_err = eval_expr(&false_and, None, None).unwrap_err().to_string();
+        assert_eq!(false_err, "AND requires boolean operands");
+
+        let true_err = eval_expr(&true_and, None, None).unwrap_err().to_string();
+        assert_eq!(true_err, "AND requires boolean operands");
     }
 }

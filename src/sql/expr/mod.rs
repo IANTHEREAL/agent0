@@ -1,6 +1,7 @@
 //! Expression evaluation logic
 
 mod context;
+mod boolean;
 mod evaluator;
 pub mod functions;
 mod numeric;
@@ -11,6 +12,7 @@ pub use context::{JoinEvalContext, SingleTableContext};
 pub use context::EvalContext;
 #[allow(unused_imports)]
 pub use evaluator::eval_expr_impl as eval_expr_unified;
+pub(crate) use boolean::{coerce_text_literal_to_bool, validate_bool_expr_in_boolean_context};
 
 pub(crate) fn parse_bool_pg(s: &str) -> Option<bool> {
     operators::parse_bool_pg(s)

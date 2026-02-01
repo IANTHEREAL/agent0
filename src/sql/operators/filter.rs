@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use sqlparser::ast::Expr;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::{eval_expr, parse_bool_pg};
+use crate::sql::expr::{coerce_text_literal_to_bool, eval_expr, validate_bool_expr_in_boolean_context};
 use crate::types::{Row, TableSchema, Value};
 
 #[derive(Debug)]
@@ -24,11 +24,10 @@ impl FilterOperator {
 
     fn evaluate_predicate(&self, row: &Row) -> Result<bool> {
         let result = eval_expr(&self.predicate, Some(row), Some(self.child.schema()))?;
+        let result = coerce_text_literal_to_bool(&self.predicate, result)?;
         match result {
             Value::Boolean(b) => Ok(b),
             Value::Null => Ok(false),
-            Value::Text(s) => parse_bool_pg(&s)
-                .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
             _ => Err(anyhow!("Filter predicate must evaluate to boolean")),
         }
     }
@@ -41,6 +40,11 @@ impl PhysicalOperator for FilterOperator {
     }
 
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        validate_bool_expr_in_boolean_context(
+            &self.predicate,
+            self.child.schema(),
+            "Filter predicate must evaluate to boolean",
+        )?;
         self.child.open(ctx).await?;
         self.opened = true;
         Ok(())

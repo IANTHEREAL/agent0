@@ -204,6 +204,17 @@ SELECT * FROM users WHERE email IS NOT NULL;
 SELECT * FROM users WHERE id IN (1, 2, 3);
 ```
 
+**Boolean typing**: Boolean contexts (e.g., `WHERE`, `HAVING`, `FILTER (WHERE ...)`, `CASE WHEN`, `AND`/`OR`/`NOT`) require boolean expressions. pg-tikv does **not** implicitly coerce `TEXT` column values to boolean. String literals are accepted when they parse as PostgreSQL boolean tokens (e.g., `'true'`, `'false'`, `'t'`, `'f'`, `'1'`, `'0'`).
+
+```sql
+-- Rejected (x is TEXT):
+SELECT * FROM t WHERE x;
+
+-- Accepted:
+SELECT * FROM t WHERE x::BOOLEAN;   -- explicit cast (may error on invalid values)
+SELECT * FROM t WHERE x = 'true';   -- regular text comparison
+```
+
 ### ORDER BY, LIMIT, OFFSET
 
 ```sql

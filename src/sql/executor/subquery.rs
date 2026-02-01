@@ -1,6 +1,7 @@
 //! Subquery resolution for the SQL executor
 
 use super::core::Executor;
+use super::super::expr::{coerce_text_literal_to_bool, eval_binary_op_public};
 use super::super::helpers::{
     query_has_outer_reference, substitute_outer_values_in_query, value_to_sql_expr,
 };
@@ -502,15 +503,10 @@ impl Executor {
                         )
                         .await?;
                     match op {
-                        BinaryOperator::And => {
-                            let left_bool = matches!(left_val, Value::Boolean(true));
-                            let right_bool = matches!(right_val, Value::Boolean(true));
-                            Ok(Value::Boolean(left_bool && right_bool))
-                        }
-                        BinaryOperator::Or => {
-                            let left_bool = matches!(left_val, Value::Boolean(true));
-                            let right_bool = matches!(right_val, Value::Boolean(true));
-                            Ok(Value::Boolean(left_bool || right_bool))
+                        BinaryOperator::And | BinaryOperator::Or => {
+                            let left_val = coerce_text_literal_to_bool(left, left_val)?;
+                            let right_val = coerce_text_literal_to_bool(right, right_val)?;
+                            eval_binary_op_public(left_val, op, right_val)
                         }
                         _ => {
                             self.eval_expr_maybe_sequence(
@@ -542,8 +538,12 @@ impl Executor {
                             outer_row,
                         )
                         .await?;
-                    let inner_bool = matches!(inner_val, Value::Boolean(true));
-                    Ok(Value::Boolean(!inner_bool))
+                    let inner_val = coerce_text_literal_to_bool(inner, inner_val)?;
+                    match inner_val {
+                        Value::Boolean(b) => Ok(Value::Boolean(!b)),
+                        Value::Null => Ok(Value::Null),
+                        other => Err(anyhow!("NOT requires boolean, got {:?}", other)),
+                    }
                 }
                 Expr::Nested(inner) => {
                     self.eval_selection_with_correlated_exists(
