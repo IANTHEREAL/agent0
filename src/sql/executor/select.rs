@@ -958,7 +958,68 @@ impl Executor {
                             }
                             rows
                         }
-                        ScanType::IndexRangeScan { .. } | ScanType::FullTableScan => {
+                        ScanType::IndexRangeScan {
+                            index_id,
+                            ref index_name,
+                            ref prefix_values,
+                            ..
+                        } => {
+                            let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
+                                vec![DataType::Uuid]
+                            } else {
+                                schema
+                                    .pk_indices
+                                    .iter()
+                                    .map(|&idx| schema.columns[idx].data_type.clone())
+                                    .collect()
+                            };
+
+                            let index = schema.indexes.iter().find(|i| i.id == index_id);
+                            let Some(idx) = index else {
+                                return Err(anyhow!("Index not found"));
+                            };
+
+                            let index_column_types: Vec<_> = idx
+                                .columns
+                                .iter()
+                                .map(|col| {
+                                    schema
+                                        .columns
+                                        .iter()
+                                        .find(|c| c.name.eq_ignore_ascii_case(col))
+                                        .map(|c| c.data_type.clone())
+                                        .ok_or_else(|| anyhow!("Index column '{}' not found", col))
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+
+                            debug!(
+                                "Using Index Range Scan on {} (cost: {:.2})",
+                                index_name, access_path.cost
+                            );
+
+                            let pks = self
+                                .store()
+                                .scan_index_prefix(
+                                    txn,
+                                    db_id,
+                                    schema.table_id,
+                                    idx.id,
+                                    prefix_values,
+                                    idx.unique,
+                                    &index_column_types,
+                                    &pk_types,
+                                )
+                                .await?;
+                            let mut rows = self
+                                .store()
+                                .batch_get_rows(txn, db_id, schema.table_id, pks, &schema)
+                                .await?;
+                            for r in &mut rows {
+                                fill_row_defaults(r, &schema)?;
+                            }
+                            rows
+                        }
+                        ScanType::FullTableScan => {
                             debug!("Using Full Table Scan (cost: {:.2})", access_path.cost);
                             self.scan_and_fill(txn, db_id, &t, &schema).await?
                         }
