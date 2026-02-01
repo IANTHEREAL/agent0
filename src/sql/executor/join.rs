@@ -430,6 +430,7 @@ fn project_rows_by_join_wildcard_plan(
     combined_schemas: &[(String, TableSchema)],
     plan_cols: &[JoinWildcardColumn],
     rows_to_project: Vec<Row>,
+    merged_column_offsets: Option<&HashMap<String, Vec<usize>>>,
 ) -> (Vec<String>, Vec<DataType>, Vec<Row>) {
     let mut source_offsets: Vec<usize> = Vec::with_capacity(combined_schemas.len());
     let mut offset = 0usize;
@@ -449,12 +450,36 @@ fn project_rows_by_join_wildcard_plan(
     let cols: Vec<String> = plan_cols.iter().map(|c| c.name.clone()).collect();
     let column_types: Vec<DataType> = plan_cols.iter().map(|c| c.data_type.clone()).collect();
 
+    // Map an absolute column index (in the combined row) to the set of indices that must be
+    // COALESCE'd for that merged join key.
+    //
+    // Key detail: use indices (not column names) so we don't accidentally coalesce unrelated
+    // FROM items that happen to share the same column name.
+    let mut coalesce_by_idx: HashMap<usize, Vec<usize>> = HashMap::new();
+    if let Some(merged) = merged_column_offsets {
+        for offsets in merged.values() {
+            for &idx in offsets {
+                coalesce_by_idx.insert(idx, offsets.clone());
+            }
+        }
+    }
+
     let result_rows = rows_to_project
         .into_iter()
         .map(|row| {
             let vals: Vec<Value> = col_indices
                 .iter()
-                .map(|&idx| row.values.get(idx).cloned().unwrap_or(Value::Null))
+                .map(|&idx| {
+                    if let Some(offsets) = coalesce_by_idx.get(&idx) {
+                        offsets
+                            .iter()
+                            .filter_map(|&off| row.values.get(off).cloned())
+                            .find(|v| !matches!(v, Value::Null))
+                            .unwrap_or(Value::Null)
+                    } else {
+                        row.values.get(idx).cloned().unwrap_or(Value::Null)
+                    }
+                })
                 .collect();
             Row::new(vals)
         })
@@ -4207,6 +4232,7 @@ impl Executor {
                     &combined_schemas,
                     &plan.columns,
                     rows_to_project,
+                    merged_column_offsets_ref,
                 );
             } else if has_natural_join && !natural_join_common_cols.is_empty() {
                 (cols, column_types, result_rows) = project_wildcard_natural_join(
@@ -5390,7 +5416,7 @@ mod tests {
         ])];
 
         let (cols, _types, projected) =
-            project_rows_by_join_wildcard_plan(&combined_schemas, &plan.columns, rows);
+            project_rows_by_join_wildcard_plan(&combined_schemas, &plan.columns, rows, None);
 
         assert_eq!(cols, vec!["foo", "id", "name", "a1", "b1", "c1"]);
         assert_eq!(

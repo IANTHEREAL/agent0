@@ -1,0 +1,26 @@
+id|x|y
+NULL|lx_null|NULL
+NULL|NULL|ry_null
+1|lx1|ry1
+2|NULL|ry2
+(4 rows)
+id|x|y
+NULL|NULL|ry_null
+1|lx1|ry1
+2|NULL|ry2
+(3 rows)
+id|x|y
+NULL|lx_null|NULL
+NULL|NULL|ry_null
+1|lx1|ry1
+2|NULL|ry2
+(4 rows)
+id|x|y
+NULL|NULL|ry_null
+1|lx1|ry1
+2|NULL|ry2
+(3 rows)
+id|x|y|id
+NULL|lx_null|NULL|999
+NULL|NULL|ry_null|999
+(2 rows)
