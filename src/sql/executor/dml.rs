@@ -635,40 +635,44 @@ impl Executor {
             let matching_from_rows: Vec<&Row> = if let (Some(ref fs), Some(ref fr), Some(ref fa)) =
                 (&from_schema, &from_rows, &from_alias)
             {
-                let (combined_schema, _, column_offsets) =
-                    dml::build_update_join_context(&schema, &table_alias, fs, fa, r, &fr[0]);
+                if fr.is_empty() {
+                    Vec::new()
+                } else {
+                    let (combined_schema, _, column_offsets) =
+                        dml::build_update_join_context(&schema, &table_alias, fs, fa, r, &fr[0]);
 
-                let mut matches = Vec::new();
-                for from_row in fr {
-                    if let Some(ref sel) = resolved_selection {
-                        let mut combined_values = r.values.clone();
-                        combined_values.extend(from_row.values.clone());
-                        let combined_row = Row::new(combined_values);
-                        let ctx = JoinContext {
-                            tables: HashMap::new(),
-                            column_offsets: column_offsets.clone(),
-                            merged_column_offsets: None,
-                            combined_row: &combined_row,
-                            combined_schema: &combined_schema,
-                        };
-                        let value = self
-                            .eval_expr_join_maybe_sequence(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                sel,
-                                &ctx,
-                            )
-                            .await?;
-                        if predicate_value_to_bool(sel, value)? {
+                    let mut matches = Vec::new();
+                    for from_row in fr {
+                        if let Some(ref sel) = resolved_selection {
+                            let mut combined_values = r.values.clone();
+                            combined_values.extend(from_row.values.clone());
+                            let combined_row = Row::new(combined_values);
+                            let ctx = JoinContext {
+                                tables: HashMap::new(),
+                                column_offsets: column_offsets.clone(),
+                                merged_column_offsets: None,
+                                combined_row: &combined_row,
+                                combined_schema: &combined_schema,
+                            };
+                            let value = self
+                                .eval_expr_join_maybe_sequence(
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    sel,
+                                    &ctx,
+                                )
+                                .await?;
+                            if predicate_value_to_bool(sel, value)? {
+                                matches.push(from_row);
+                            }
+                        } else {
                             matches.push(from_row);
                         }
-                    } else {
-                        matches.push(from_row);
                     }
+                    matches
                 }
-                matches
             } else {
                 if let Some(ref e) = resolved_selection {
                     let value = self
