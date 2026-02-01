@@ -1,0 +1,34 @@
+a
+1
+2
+(2 rows)
+l_a|r_a
+1|1
+NULL|2
+(2 rows)
+a
+1
+2
+3
+(3 rows)
+l_a|r_a
+1|1
+NULL|2
+3|NULL
+(3 rows)
+a
+1
+2
+3
+(3 rows)
+a|rn
+1|1
+2|2
+3|3
+(3 rows)
+a|l|r
+NULL|40|NULL
+1|10|100
+2|NULL|200
+3|30|NULL
+(4 rows)
