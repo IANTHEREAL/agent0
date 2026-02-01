@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tikv_client::{
-    BoundRange, CheckLevel, Config, Transaction, TransactionClient, TransactionOptions,
+    BoundRange, CheckLevel, Config, Key, Transaction, TransactionClient, TransactionOptions,
 };
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -19,6 +19,15 @@ const SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Maximum scan limit for TiKV operations.
 const SCAN_LIMIT: u32 = u32::MAX;
+const BATCH_GET_CHUNK_SIZE: usize = 256;
+
+fn scan_limit_to_u32(limit: Option<usize>) -> u32 {
+    match limit {
+        Some(0) => 0,
+        Some(n) => u32::try_from(n).unwrap_or(u32::MAX),
+        None => SCAN_LIMIT,
+    }
+}
 
 fn column_comment_table_prefix_v2(db_id: u64, table_full_name: &str) -> Vec<u8> {
     let mut prefix = encode_comment_prefix_v2(db_id);
@@ -1477,6 +1486,7 @@ impl TikvStore {
         txn: &mut Transaction,
         db_id: u64,
         table_name: &str,
+        limit: Option<usize>,
     ) -> Result<Vec<Row>> {
         let schema = self
             .get_schema(txn, db_id, table_name)
@@ -1484,7 +1494,7 @@ impl TikvStore {
             .ok_or_else(|| anyhow!("Table not found"))?;
         let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
         let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
-        let pairs: Vec<_> = txn.scan(range, SCAN_LIMIT).await?.collect();
+        let pairs = txn.scan(range, scan_limit_to_u32(limit)).await?;
         let mut rows = Vec::new();
         for pair in pairs {
             let row = deserialize_row(pair.value())?;
@@ -2845,15 +2855,25 @@ impl TikvStore {
         pks: Vec<Vec<Value>>,
         _schema: &TableSchema,
     ) -> Result<Vec<Row>> {
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(pks.len());
+        let mut data_keys: Vec<Vec<u8>> = Vec::with_capacity(BATCH_GET_CHUNK_SIZE);
+
         for pk in &pks {
             let row_key = encode_pk_values(pk);
-            let data_key = self.key(&encode_data_key_v2(db_id, table_id, &row_key));
-            if let Some(val) = txn.get(data_key).await? {
-                let row = deserialize_row(&val)?;
-                rows.push(row);
+            data_keys.push(self.key(&encode_data_key_v2(db_id, table_id, &row_key)));
+
+            if data_keys.len() >= BATCH_GET_CHUNK_SIZE {
+                self.batch_get_rows_by_data_keys(txn, &data_keys, &mut rows)
+                    .await?;
+                data_keys.clear();
             }
         }
+
+        if !data_keys.is_empty() {
+            self.batch_get_rows_by_data_keys(txn, &data_keys, &mut rows)
+                .await?;
+        }
+
         Ok(rows)
     }
 
@@ -2867,14 +2887,49 @@ impl TikvStore {
         table_id: u64,
         pk_keys: Vec<Vec<u8>>,
     ) -> Result<Vec<Row>> {
-        let mut rows = Vec::new();
+        let mut rows = Vec::with_capacity(pk_keys.len());
+        let mut data_keys: Vec<Vec<u8>> = Vec::with_capacity(BATCH_GET_CHUNK_SIZE);
+
         for pk_key in &pk_keys {
-            let data_key = self.key(&encode_data_key_v2(db_id, table_id, pk_key));
-            if let Some(val) = txn.get(data_key).await? {
-                rows.push(deserialize_row(&val)?);
+            data_keys.push(self.key(&encode_data_key_v2(db_id, table_id, pk_key)));
+
+            if data_keys.len() >= BATCH_GET_CHUNK_SIZE {
+                self.batch_get_rows_by_data_keys(txn, &data_keys, &mut rows)
+                    .await?;
+                data_keys.clear();
             }
         }
+
+        if !data_keys.is_empty() {
+            self.batch_get_rows_by_data_keys(txn, &data_keys, &mut rows)
+                .await?;
+        }
+
         Ok(rows)
+    }
+
+    async fn batch_get_rows_by_data_keys(
+        &self,
+        txn: &mut Transaction,
+        data_keys: &[Vec<u8>],
+        out: &mut Vec<Row>,
+    ) -> Result<()> {
+        let pairs = txn.batch_get(data_keys.iter().cloned()).await?;
+        let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(data_keys.len());
+
+        for pair in pairs {
+            let tikv_client::KvPair(key, value) = pair;
+            by_key.insert(key, value);
+        }
+
+        for key in data_keys {
+            let key_ref: &Key = key.into();
+            if let Some(val) = by_key.get(key_ref) {
+                out.push(deserialize_row(val)?);
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn create_view(

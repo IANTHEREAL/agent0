@@ -841,7 +841,44 @@ impl Executor {
             let estimated_rows = 1000;
 
             match &resolved_selection {
-                None => self.scan_and_fill(txn, db_id, &t, &schema).await?,
+                None => {
+                    let scan_upper_bound = {
+                        let limit = super::operators::extract_limit(query);
+                        let offset = super::operators::extract_offset(query);
+                        match limit {
+                            Some(0) => Some(0),
+                            Some(n) => Some(offset.saturating_add(n)),
+                            None => None,
+                        }
+                    };
+
+                    let has_for_update = query
+                        .locks
+                        .iter()
+                        .any(|l| matches!(l.lock_type, LockType::Update));
+
+                    let can_pushdown_scan_limit = scan_upper_bound.is_some()
+                        && !has_for_update
+                        && select.distinct.is_none()
+                        && query.order_by.is_empty()
+                        && matches!(
+                            &select.group_by,
+                            GroupByExpr::Expressions(exprs) if exprs.is_empty()
+                        )
+                        && select.having.is_none()
+                        && select.from.len() == 1
+                        && select.from[0].joins.is_empty()
+                        && extract_window_functions(&select.projection).is_empty();
+
+                    let scan_upper_bound = if can_pushdown_scan_limit {
+                        scan_upper_bound
+                    } else {
+                        None
+                    };
+
+                    self.scan_and_fill_with_limit(txn, db_id, &t, &schema, scan_upper_bound)
+                        .await?
+                }
                 Some(sel) => {
                     let access_path =
                         planner::choose_best_access_path_for_filter(&schema, Some(sel), estimated_rows);

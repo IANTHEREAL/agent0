@@ -8,6 +8,7 @@ use crate::types::{Row, TableSchema, Value};
 #[derive(Debug)]
 pub struct TableScanOperator {
     schema: TableSchema,
+    scan_limit: Option<usize>,
     buffer: Vec<Row>,
     position: usize,
     opened: bool,
@@ -18,6 +19,18 @@ impl TableScanOperator {
     pub fn new(schema: TableSchema) -> Self {
         Self {
             schema,
+            scan_limit: None,
+            buffer: Vec::new(),
+            position: 0,
+            opened: false,
+            preloaded: false,
+        }
+    }
+
+    pub fn new_with_scan_limit(schema: TableSchema, scan_limit: Option<usize>) -> Self {
+        Self {
+            schema,
+            scan_limit,
             buffer: Vec::new(),
             position: 0,
             opened: false,
@@ -29,6 +42,7 @@ impl TableScanOperator {
     pub fn new_with_rows(schema: TableSchema, rows: Vec<Row>) -> Self {
         Self {
             schema,
+            scan_limit: None,
             buffer: rows,
             position: 0,
             opened: false,
@@ -57,7 +71,10 @@ impl PhysicalOperator for TableScanOperator {
 
         if !self.preloaded {
             self.buffer.clear();
-            let rows = ctx.store.scan(ctx.txn, ctx.db_id, &self.schema.name).await?;
+            let rows = ctx
+                .store
+                .scan(ctx.txn, ctx.db_id, &self.schema.name, self.scan_limit)
+                .await?;
             self.buffer = rows
                 .into_iter()
                 .map(|r| fill_row_defaults_scan(r, &self.schema))

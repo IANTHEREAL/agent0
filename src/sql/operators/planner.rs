@@ -89,8 +89,20 @@ impl PhysicalPlanner {
     ) -> Result<BoxedOperator> {
         let access_path = choose_best_access_path_for_filter(&schema, filter, estimated_rows);
 
+        let scan_upper_bound = if filter.is_none() && order_by.is_empty() {
+            match limit {
+                Some(0) => Some(0),
+                Some(n) => Some(offset.saturating_add(n)),
+                None => None,
+            }
+        } else {
+            None
+        };
+
         let mut root: BoxedOperator = match access_path.scan_type {
-            ScanType::FullTableScan => Box::new(TableScanOperator::new(schema.clone())),
+            ScanType::FullTableScan => {
+                Box::new(TableScanOperator::new_with_scan_limit(schema.clone(), scan_upper_bound))
+            }
             ScanType::IndexScan {
                 index_id,
                 index_name,
@@ -113,7 +125,9 @@ impl PhysicalPlanner {
                 index_name,
                 prefix_values,
             )),
-            ScanType::GinIndexScan { .. } => Box::new(TableScanOperator::new(schema.clone())),
+            ScanType::GinIndexScan { .. } => {
+                Box::new(TableScanOperator::new_with_scan_limit(schema.clone(), scan_upper_bound))
+            }
         };
 
         if let Some(filter_expr) = filter {

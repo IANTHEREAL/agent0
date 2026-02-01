@@ -790,7 +790,7 @@ pub async fn handle_foreign_key_on_delete(
     for t in &table_names {
         if let Some(s) = store.get_schema(txn, db_id, t).await? {
             if !s.foreign_keys.is_empty() {
-                let rows = store.scan(txn, db_id, t).await?;
+                let rows = store.scan(txn, db_id, t, None).await?;
                 table_rows.insert(t.clone(), rows);
                 table_schemas.insert(t.clone(), s);
             }
@@ -988,7 +988,7 @@ pub async fn handle_foreign_key_on_update(
                 continue;
             }
 
-            let all_rows = store.scan(txn, db_id, other_table).await?;
+            let all_rows = store.scan(txn, db_id, other_table, None).await?;
             let mut rows_to_update: Vec<(Row, Row)> = Vec::new();
 
             for other_row in &all_rows {
