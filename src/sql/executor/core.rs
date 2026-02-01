@@ -942,21 +942,97 @@ impl Executor {
                     && (is_observability_system_query(stmt) || is_observability_tableless_query(stmt));
                 if is_observability_user {
                     match stmt {
-                        Statement::StartTransaction { .. }
-                        | Statement::Commit { .. }
-                        | Statement::Savepoint { .. }
-                        | Statement::ReleaseSavepoint { .. }
-                        | Statement::Rollback { .. }
-                        | Statement::SetVariable { .. }
-                        | Statement::ShowVariable { .. }
+                        // For observability user, allow common utility statements and return
+                        // semantically correct protocol responses (never `EmptyQueryResponse` for
+                        // non-empty SQL).
+                        Statement::StartTransaction { .. } => {
+                            session.begin().await?;
+                            results.push(ExecuteResult::TransactionStart { tag: "BEGIN" });
+                            continue;
+                        }
+                        Statement::Commit { .. } => {
+                            let tag = if session.is_transaction_failed() {
+                                "ROLLBACK"
+                            } else {
+                                "COMMIT"
+                            };
+                            session.commit().await?;
+                            results.push(ExecuteResult::TransactionEnd { tag });
+                            continue;
+                        }
+                        Statement::Savepoint { name } => {
+                            session.create_savepoint(normalize_ident(name))?;
+                            results.push(ExecuteResult::CommandComplete { tag: "SAVEPOINT" });
+                            continue;
+                        }
+                        Statement::ReleaseSavepoint { name } => {
+                            let sp = normalize_ident(name);
+                            session.release_savepoint(&sp)?;
+                            results.push(ExecuteResult::CommandComplete { tag: "RELEASE" });
+                            continue;
+                        }
+                        Statement::Rollback {
+                            savepoint: Some(name),
+                            ..
+                        } => {
+                            let sp = normalize_ident(name);
+                            session.rollback_to_savepoint(&sp).await?;
+                            results.push(ExecuteResult::CommandComplete { tag: "ROLLBACK" });
+                            continue;
+                        }
+                        Statement::Rollback {
+                            savepoint: None, ..
+                        } => {
+                            session.rollback().await?;
+                            results.push(ExecuteResult::TransactionEnd { tag: "ROLLBACK" });
+                            continue;
+                        }
+                        Statement::SetVariable { .. }
                         | Statement::SetTimeZone { .. }
                         | Statement::SetNames { .. }
                         | Statement::SetTransaction { .. } => {
-                            results.push(ExecuteResult::Empty);
+                            results.push(ExecuteResult::CommandComplete { tag: "SET" });
+                            continue;
+                        }
+                        Statement::ShowVariable { variable } => {
+                            let var_name = variable
+                                .iter()
+                                .map(normalize_ident)
+                                .collect::<Vec<_>>()
+                                .join(".")
+                                .to_lowercase();
+                            let value = match session.show_setting_value(&var_name) {
+                                Some(value) => value,
+                                None => {
+                                    let err = anyhow!(
+                                        "unrecognized configuration parameter \"{}\"",
+                                        var_name
+                                    );
+                                    if session.is_in_transaction() {
+                                        session.mark_transaction_failed();
+                                    }
+                                    return Err(err);
+                                }
+                            };
+                            let timezone = Arc::from(
+                                session
+                                    .show_setting_value("timezone")
+                                    .unwrap_or_else(|| "UTC".to_string()),
+                            );
+
+                            results.push(ExecuteResult::Select {
+                                columns: vec![var_name],
+                                column_types: Some(vec![DataType::Text]),
+                                rows: vec![Row::new(vec![Value::Text(value)])],
+                                timezone,
+                            });
                             continue;
                         }
                         Statement::Query(_) => {
                             if !is_observability_query {
+                                if session.is_in_transaction() {
+                                    session.mark_transaction_failed();
+                                }
                                 return Err(anyhow!(
                                     "permission denied for role '{}'",
                                     OBSERVABILITY_USER
@@ -964,6 +1040,9 @@ impl Executor {
                             }
                         }
                         _ => {
+                            if session.is_in_transaction() {
+                                session.mark_transaction_failed();
+                            }
                             return Err(anyhow!(
                                 "permission denied for role '{}'",
                                 OBSERVABILITY_USER
