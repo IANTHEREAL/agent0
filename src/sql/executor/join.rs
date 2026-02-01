@@ -19,13 +19,12 @@ use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     BinaryOperator, Distinct, Expr, FunctionArg, FunctionArgExpr, GroupByExpr, Ident,
-    JoinConstraint, JoinOperator, Query, SelectItem, Statement, TableFactor,
+    JoinConstraint, JoinOperator, Query, SelectItem, Statement, TableFactor, Value as SqlValue,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use tikv_client::Transaction;
-
 tokio::task_local! {
     static VIEW_EXPANSION_STACK: RefCell<Vec<String>>;
 }
@@ -77,6 +76,111 @@ impl Drop for ViewExpansionGuard {
             }
         });
     }
+}
+
+fn expand_projection_exprs_for_join_positional_order_by(
+    resolved_projection: &[SelectItem],
+    combined_schemas: &[(String, TableSchema)],
+    has_natural_join: bool,
+    natural_join_common_cols: &[String],
+) -> Result<Vec<Expr>> {
+    let mut exprs = Vec::new();
+
+    for item in resolved_projection {
+        match item {
+            SelectItem::Wildcard(_) => {
+                if has_natural_join && !natural_join_common_cols.is_empty() {
+                    for common_col in natural_join_common_cols {
+                        exprs.push(Expr::Identifier(Ident::new(common_col.clone())));
+                    }
+
+                    for (alias, schema) in combined_schemas {
+                        for col in &schema.columns {
+                            if natural_join_common_cols.contains(&col.name) {
+                                continue;
+                            }
+                            exprs.push(Expr::CompoundIdentifier(vec![
+                                Ident::new(alias.clone()),
+                                Ident::new(col.name.clone()),
+                            ]));
+                        }
+                    }
+                } else {
+                    for (alias, schema) in combined_schemas {
+                        for col in &schema.columns {
+                            exprs.push(Expr::CompoundIdentifier(vec![
+                                Ident::new(alias.clone()),
+                                Ident::new(col.name.clone()),
+                            ]));
+                        }
+                    }
+                }
+            }
+            SelectItem::QualifiedWildcard(prefix, _) => {
+                let table_alias = prefix.0.last().map(|i| i.value.clone()).unwrap_or_default();
+                let (_, schema) = combined_schemas
+                    .iter()
+                    .find(|(a, _)| a.eq_ignore_ascii_case(&table_alias))
+                    .ok_or_else(|| anyhow!("Unknown table alias '{}' in projection", table_alias))?;
+
+                for col in &schema.columns {
+                    exprs.push(Expr::CompoundIdentifier(vec![
+                        Ident::new(table_alias.clone()),
+                        Ident::new(col.name.clone()),
+                    ]));
+                }
+            }
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                exprs.push(expr.clone());
+            }
+        }
+    }
+
+    Ok(exprs)
+}
+
+fn resolve_order_by_exprs_for_join_non_agg(
+    order_by: &[sqlparser::ast::OrderByExpr],
+    resolved_projection: &[SelectItem],
+    combined_schemas: &[(String, TableSchema)],
+    has_natural_join: bool,
+    natural_join_common_cols: &[String],
+) -> Result<Vec<Expr>> {
+    let output_exprs = expand_projection_exprs_for_join_positional_order_by(
+        resolved_projection,
+        combined_schemas,
+        has_natural_join,
+        natural_join_common_cols,
+    )?;
+
+    order_by
+        .iter()
+        .map(|order_expr| {
+            if let Expr::Identifier(ref ident) = order_expr.expr {
+                for item in resolved_projection {
+                    if let SelectItem::ExprWithAlias { expr, alias } = item {
+                        if alias.value.eq_ignore_ascii_case(&ident.value) {
+                            return Ok(expr.clone());
+                        }
+                    }
+                }
+            }
+
+            if let Expr::Value(SqlValue::Number(n, _)) = &order_expr.expr {
+                if let Ok(pos) = n.parse::<usize>() {
+                    if pos == 0 || pos > output_exprs.len() {
+                        return Err(anyhow!(
+                            "ORDER BY position {} is not in select list",
+                            pos
+                        ));
+                    }
+                    return Ok(output_exprs[pos - 1].clone());
+                }
+            }
+
+            Ok(order_expr.expr.clone())
+        })
+        .collect()
 }
 
 fn extract_virtual_table_filter(where_clause: &Option<Expr>) -> VirtualTableFilter {
@@ -3652,22 +3756,13 @@ impl Executor {
         };
 
         let (filtered_rows, window_results) = if !query.order_by.is_empty() {
-            let resolved_order_exprs: Vec<Expr> = query
-                .order_by
-                .iter()
-                .map(|order_expr| {
-                    if let Expr::Identifier(ref ident) = order_expr.expr {
-                        for item in &resolved_projection {
-                            if let SelectItem::ExprWithAlias { expr, alias } = item {
-                                if alias.value.eq_ignore_ascii_case(&ident.value) {
-                                    return expr.clone();
-                                }
-                            }
-                        }
-                    }
-                    order_expr.expr.clone()
-                })
-                .collect();
+            let resolved_order_exprs = resolve_order_by_exprs_for_join_non_agg(
+                &query.order_by,
+                &resolved_projection,
+                &combined_schemas,
+                has_natural_join,
+                &natural_join_common_cols,
+            )?;
 
             let order_by_uses_sequences = resolved_order_exprs
                 .iter()
@@ -4728,6 +4823,43 @@ fn interval_to_days(iv: &crate::types::IntervalValue) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse_query(sql: &str) -> Query {
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+        match statements.into_iter().next().unwrap() {
+            Statement::Query(q) => *q,
+            _ => panic!("Expected query"),
+        }
+    }
+
+    fn make_schema(name: &str, cols: &[&str]) -> TableSchema {
+        TableSchema {
+            name: name.to_string(),
+            table_id: 0,
+            columns: cols
+                .iter()
+                .map(|c| ColumnDef {
+                    name: (*c).to_string(),
+                    data_type: DataType::Int32,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                })
+                .collect(),
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        }
+    }
 
     #[test]
     fn natural_join_wildcard_projection_keeps_common_cols_first_and_in_order() {
@@ -5246,5 +5378,34 @@ mod tests {
         })
         .await
         .unwrap();
+
+    #[test]
+    fn resolves_order_by_positional_for_join_wildcard() {
+        let query = parse_query("SELECT * FROM t1 a JOIN t2 b ON a.id = b.id ORDER BY 3");
+        let sqlparser::ast::SetExpr::Select(select) = &*query.body else {
+            panic!("Expected SELECT");
+        };
+
+        let combined_schemas = vec![
+            ("a".to_string(), make_schema("t1", &["id", "x"])),
+            ("b".to_string(), make_schema("t2", &["id", "y"])),
+        ];
+
+        let resolved = resolve_order_by_exprs_for_join_non_agg(
+            &query.order_by,
+            &select.projection,
+            &combined_schemas,
+            false,
+            &[],
+        )
+        .unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            matches!(&resolved[0], Expr::CompoundIdentifier(parts) if parts.len() == 2 && parts[0].value == "b" && parts[1].value == "id"),
+            "unexpected resolved expr: {:?}",
+            resolved[0]
+        );
+    }
     }
 }

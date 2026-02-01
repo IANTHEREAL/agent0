@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, GroupByExpr, OrderByExpr, Query, SelectItem,
-    SetExpr, UnaryOperator,
+    SetExpr, UnaryOperator, Value as SqlValue,
 };
 use tikv_client::Transaction;
 
@@ -1387,20 +1387,89 @@ impl Executor {
             rewrite_join_expr_with_aliases(f, left_alias, right_alias, &left_schema, &right_schema)
         });
 
+        let mut projection_exprs_for_order_by: Vec<Expr> = Vec::new();
+        let mut alias_exprs_for_order_by: HashMap<String, Expr> = HashMap::new();
+        for item in projection {
+            match item {
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                    projection_exprs_for_order_by.extend(combined_schema.columns.iter().map(|col| {
+                        Expr::Identifier(Ident::new(col.name.clone()))
+                    }));
+                }
+                SelectItem::UnnamedExpr(expr) => {
+                    projection_exprs_for_order_by.push(rewrite_join_expr_with_aliases(
+                        expr,
+                        left_alias,
+                        right_alias,
+                        &left_schema,
+                        &right_schema,
+                    ));
+                }
+                SelectItem::ExprWithAlias { expr, alias } => {
+                    let rewritten = rewrite_join_expr_with_aliases(
+                        expr,
+                        left_alias,
+                        right_alias,
+                        &left_schema,
+                        &right_schema,
+                    );
+                    alias_exprs_for_order_by.insert(alias.value.to_lowercase(), rewritten.clone());
+                    projection_exprs_for_order_by.push(rewritten);
+                }
+            }
+        }
+
         let rewritten_order_by: Vec<OrderByExpr> = order_by
             .iter()
-            .map(|o| OrderByExpr {
-                expr: rewrite_join_expr_with_aliases(
-                    &o.expr,
-                    left_alias,
-                    right_alias,
-                    &left_schema,
-                    &right_schema,
-                ),
-                asc: o.asc,
-                nulls_first: o.nulls_first,
+            .map(|o| {
+                let expr = if let Expr::Identifier(ident) = &o.expr {
+                    alias_exprs_for_order_by
+                        .get(&ident.value.to_lowercase())
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            rewrite_join_expr_with_aliases(
+                                &o.expr,
+                                left_alias,
+                                right_alias,
+                                &left_schema,
+                                &right_schema,
+                            )
+                        })
+                } else if let Expr::Value(SqlValue::Number(n, _)) = &o.expr {
+                    if let Ok(pos) = n.parse::<usize>() {
+                        if pos == 0 || pos > projection_exprs_for_order_by.len() {
+                            return Err(anyhow!(
+                                "ORDER BY position {} is not in select list",
+                                pos
+                            ));
+                        }
+                        projection_exprs_for_order_by[pos - 1].clone()
+                    } else {
+                        rewrite_join_expr_with_aliases(
+                            &o.expr,
+                            left_alias,
+                            right_alias,
+                            &left_schema,
+                            &right_schema,
+                        )
+                    }
+                } else {
+                    rewrite_join_expr_with_aliases(
+                        &o.expr,
+                        left_alias,
+                        right_alias,
+                        &left_schema,
+                        &right_schema,
+                    )
+                };
+
+                Ok(OrderByExpr {
+                    expr,
+                    asc: o.asc,
+                    nulls_first: o.nulls_first,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let left_op: BoxedOperator = Box::new(TableScanOperator::new(left_schema.clone()));
         let right_op: BoxedOperator = Box::new(TableScanOperator::new(right_schema.clone()));
@@ -1574,6 +1643,78 @@ impl Executor {
             }
         }
 
+        let mut alias_exprs_for_order_by: HashMap<String, Expr> = HashMap::new();
+        for item in projection {
+            if let SelectItem::ExprWithAlias { expr, alias } = item {
+                alias_exprs_for_order_by.insert(alias.value.to_lowercase(), expr.clone());
+            }
+        }
+
+        let rewrite_order_by_for_pre_projection_sort =
+            |order_by: &[OrderByExpr]| -> Result<Vec<OrderByExpr>> {
+                order_by
+                    .iter()
+                    .map(|o| {
+                        let expr = if let Expr::Identifier(ident) = &o.expr {
+                            alias_exprs_for_order_by
+                                .get(&ident.value.to_lowercase())
+                                .cloned()
+                                .unwrap_or_else(|| o.expr.clone())
+                        } else if let Expr::Value(SqlValue::Number(n, _)) = &o.expr {
+                            if let Ok(pos) = n.parse::<usize>() {
+                                if pos == 0 || pos > projection_exprs.len() {
+                                    return Err(anyhow!(
+                                        "ORDER BY position {} is not in select list",
+                                        pos
+                                    ));
+                                }
+                                projection_exprs[pos - 1].clone()
+                            } else {
+                                o.expr.clone()
+                            }
+                        } else {
+                            o.expr.clone()
+                        };
+
+                        Ok(OrderByExpr {
+                            expr,
+                            asc: o.asc,
+                            nulls_first: o.nulls_first,
+                        })
+                    })
+                    .collect()
+            };
+
+        let rewrite_order_by_for_post_projection_sort =
+            |order_by: &[OrderByExpr]| -> Result<Vec<OrderByExpr>> {
+                order_by
+                    .iter()
+                    .map(|o| {
+                        let expr = if let Expr::Value(SqlValue::Number(n, _)) = &o.expr {
+                            if let Ok(pos) = n.parse::<usize>() {
+                                if pos == 0 || pos > columns.len() {
+                                    return Err(anyhow!(
+                                        "ORDER BY position {} is not in select list",
+                                        pos
+                                    ));
+                                }
+                                Expr::Identifier(Ident::new(columns[pos - 1].clone()))
+                            } else {
+                                o.expr.clone()
+                            }
+                        } else {
+                            o.expr.clone()
+                        };
+
+                        Ok(OrderByExpr {
+                            expr,
+                            asc: o.asc,
+                            nulls_first: o.nulls_first,
+                        })
+                    })
+                    .collect()
+            };
+
         let estimated_rows = 1000;
 
         if distinct && !is_wildcard_only {
@@ -1596,7 +1737,9 @@ impl Executor {
             let distinct_operator = Box::new(DistinctOperator::new(project_operator));
 
             let mut operator: BoxedOperator = if !order_by.is_empty() {
-                let sort_operator = Box::new(SortOperator::new(distinct_operator, order_by.to_vec()));
+                let rewritten_order_by = rewrite_order_by_for_post_projection_sort(order_by)?;
+                let sort_operator =
+                    Box::new(SortOperator::new(distinct_operator, rewritten_order_by));
                 if limit.is_some() || offset > 0 {
                     Box::new(LimitOperator::new(sort_operator, limit, offset))
                 } else {
@@ -1629,7 +1772,7 @@ impl Executor {
         let base_operator = planner.plan_simple_select(
             schema.clone(),
             filter,
-            order_by.to_vec(),
+            rewrite_order_by_for_pre_projection_sort(order_by)?,
             limit,
             offset,
             estimated_rows,

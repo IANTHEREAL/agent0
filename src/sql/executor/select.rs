@@ -22,7 +22,6 @@ use sqlparser::ast::{
 use std::collections::{HashMap, HashSet};
 use tikv_client::Transaction;
 use tracing::debug;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GenerateSeriesOffsetLimitPushdownPlan {
     offset: usize,
@@ -254,6 +253,63 @@ fn ensure_no_locking_clauses_for_join(query: &Query) -> Result<()> {
         return Ok(());
     }
     Err(anyhow!(JOIN_LOCKING_CLAUSE_UNSUPPORTED))
+}
+
+fn expand_projection_exprs_for_positional_order_by(
+    resolved_projection: &[SelectItem],
+    schema: &TableSchema,
+) -> Vec<Expr> {
+    let mut exprs = Vec::new();
+    for item in resolved_projection {
+        match item {
+            SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {
+                exprs.extend(schema.columns.iter().map(|col| {
+                    Expr::Identifier(sqlparser::ast::Ident::new(col.name.clone()))
+                }));
+            }
+            SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                exprs.push(expr.clone());
+            }
+        }
+    }
+    exprs
+}
+
+fn resolve_order_by_exprs_for_non_agg(
+    order_by: &[sqlparser::ast::OrderByExpr],
+    resolved_projection: &[SelectItem],
+    schema: &TableSchema,
+) -> Result<Vec<Expr>> {
+    let output_exprs = expand_projection_exprs_for_positional_order_by(resolved_projection, schema);
+
+    order_by
+        .iter()
+        .map(|order_expr| {
+            if let Expr::Identifier(ref ident) = order_expr.expr {
+                for item in resolved_projection {
+                    if let SelectItem::ExprWithAlias { expr, alias } = item {
+                        if alias.value.eq_ignore_ascii_case(&ident.value) {
+                            return Ok(expr.clone());
+                        }
+                    }
+                }
+            }
+
+            if let Expr::Value(SqlValue::Number(n, _)) = &order_expr.expr {
+                if let Ok(pos) = n.parse::<usize>() {
+                    if pos == 0 || pos > output_exprs.len() {
+                        return Err(anyhow!(
+                            "ORDER BY position {} is not in select list",
+                            pos
+                        ));
+                    }
+                    return Ok(output_exprs[pos - 1].clone());
+                }
+            }
+
+            Ok(order_expr.expr.clone())
+        })
+        .collect()
 }
 
 impl Executor {
@@ -1115,6 +1171,9 @@ impl Executor {
             None
         };
 
+        let output_exprs_for_order_by =
+            expand_projection_exprs_for_positional_order_by(&resolved_projection, &schema);
+
         let order_by_references_correlated_subquery = query.order_by.iter().any(|order_expr| {
             if let Expr::Identifier(ref ident) = order_expr.expr {
                 for item in &resolved_projection {
@@ -1126,7 +1185,20 @@ impl Executor {
                         }
                     }
                 }
+                return false;
             }
+
+            if let Expr::Value(SqlValue::Number(n, _)) = &order_expr.expr {
+                if let Ok(pos) = n.parse::<usize>() {
+                    if pos > 0 {
+                        if let Some(expr) = output_exprs_for_order_by.get(pos - 1) {
+                            return matches!(expr, Expr::Subquery(_));
+                        }
+                    }
+                }
+                return false;
+            }
+
             false
         });
 
@@ -1937,21 +2009,8 @@ impl Executor {
         resolved_projection: &[SelectItem],
         schema: &TableSchema,
     ) -> Result<(Vec<Row>, Option<Vec<Vec<Value>>>)> {
-        let resolved_order_exprs: Vec<Expr> = order_by
-            .iter()
-            .map(|order_expr| {
-                if let Expr::Identifier(ref ident) = order_expr.expr {
-                    for item in resolved_projection {
-                        if let SelectItem::ExprWithAlias { expr, alias } = item {
-                            if alias.value.eq_ignore_ascii_case(&ident.value) {
-                                return expr.clone();
-                            }
-                        }
-                    }
-                }
-                order_expr.expr.clone()
-            })
-            .collect();
+        let resolved_order_exprs =
+            resolve_order_by_exprs_for_non_agg(order_by, resolved_projection, schema)?;
 
         let order_by_uses_sequences = resolved_order_exprs
             .iter()
@@ -2730,6 +2789,32 @@ mod tests {
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 
+    fn make_schema(col_names: &[&str]) -> TableSchema {
+        TableSchema {
+            name: "t".to_string(),
+            table_id: 0,
+            columns: col_names
+                .iter()
+                .map(|name| crate::types::ColumnDef {
+                    name: (*name).to_string(),
+                    data_type: DataType::Int32,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                })
+                .collect(),
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        }
+    }
+
     fn ident(name: &str) -> Expr {
         Expr::Identifier(sqlparser::ast::Ident::new(name))
     }
@@ -2741,6 +2826,57 @@ mod tests {
             sqlparser::ast::Statement::Query(q) => q,
             other => panic!("expected query, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resolves_order_by_positional_for_select_projection() {
+        let query = parse_query("SELECT a, b FROM t ORDER BY 2");
+        let SetExpr::Select(select) = &*query.body else {
+            panic!("Expected SELECT");
+        };
+
+        let schema = make_schema(&["a", "b"]);
+        let resolved = resolve_order_by_exprs_for_non_agg(&query.order_by, &select.projection, &schema)
+            .unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            matches!(&resolved[0], Expr::Identifier(id) if id.value == "b"),
+            "unexpected resolved expr: {:?}",
+            resolved[0]
+        );
+    }
+
+    #[test]
+    fn resolves_order_by_positional_for_select_wildcard() {
+        let query = parse_query("SELECT * FROM t ORDER BY 2");
+        let SetExpr::Select(select) = &*query.body else {
+            panic!("Expected SELECT");
+        };
+
+        let schema = make_schema(&["a", "b", "c"]);
+        let resolved = resolve_order_by_exprs_for_non_agg(&query.order_by, &select.projection, &schema)
+            .unwrap();
+
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            matches!(&resolved[0], Expr::Identifier(id) if id.value == "b"),
+            "unexpected resolved expr: {:?}",
+            resolved[0]
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_order_by_position() {
+        let query = parse_query("SELECT a FROM t ORDER BY 2");
+        let SetExpr::Select(select) = &*query.body else {
+            panic!("Expected SELECT");
+        };
+
+        let schema = make_schema(&["a"]);
+        let err =
+            resolve_order_by_exprs_for_non_agg(&query.order_by, &select.projection, &schema).unwrap_err();
+        assert!(err.to_string().contains("ORDER BY position 2"));
     }
 
     #[test]
