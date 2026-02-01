@@ -790,7 +790,10 @@ impl Executor {
             .await?;
             let func_full_name = match func_resolved {
                 Some(resolved) => resolved.full,
-                None => names::resolve_ddl_object_name(&function, search_path)?.full,
+                None => {
+                    let resolved = names::resolve_ddl_object_name(&function, search_path)?;
+                    return Err(anyhow!("Function '{}' does not exist", resolved.full));
+                }
             };
 
             let def = TriggerDef {
