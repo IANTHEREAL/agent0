@@ -2004,11 +2004,7 @@ mod tests {
 }
 
 pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
-    let unescaped = val
-        .replace("\\t", "\t")
-        .replace("\\n", "\n")
-        .replace("\\r", "\r")
-        .replace("\\\\", "\\");
+    let unescaped = unescape_copy_text(val);
 
     match data_type {
         DataType::Boolean => match unescaped.to_lowercase().as_str() {
@@ -2116,6 +2112,77 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
             }
         }
     }
+}
+
+fn unescape_copy_text(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b != b'\\' {
+            out.push(b);
+            i += 1;
+            continue;
+        }
+
+        i += 1;
+        if i >= bytes.len() {
+            out.push(b'\\');
+            break;
+        }
+
+        match bytes[i] {
+            b'b' => {
+                out.push(0x08);
+                i += 1;
+            }
+            b'f' => {
+                out.push(0x0c);
+                i += 1;
+            }
+            b'n' => {
+                out.push(b'\n');
+                i += 1;
+            }
+            b'r' => {
+                out.push(b'\r');
+                i += 1;
+            }
+            b't' => {
+                out.push(b'\t');
+                i += 1;
+            }
+            b'v' => {
+                out.push(0x0b);
+                i += 1;
+            }
+            b'\\' => {
+                out.push(b'\\');
+                i += 1;
+            }
+            b'0'..=b'7' => {
+                let mut oct: u16 = (bytes[i] - b'0') as u16;
+                i += 1;
+                for _ in 0..2 {
+                    if i < bytes.len() && bytes[i].is_ascii_digit() && bytes[i] < b'8' {
+                        oct = (oct * 8).saturating_add((bytes[i] - b'0') as u16);
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                }
+                out.push((oct & 0xff) as u8);
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+
+    String::from_utf8(out).unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
 }
 
 pub fn parse_time_string(s: &str) -> Option<i64> {

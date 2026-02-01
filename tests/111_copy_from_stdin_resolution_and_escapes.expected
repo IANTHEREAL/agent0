@@ -1,0 +1,18 @@
+count
+6
+(1 row)
+count
+0
+(1 row)
+id|len|a1|a2
+1|2|92|116
+2|2|92|110
+3|2|92|114
+4|1|9|0
+5|1|10|0
+6|1|13|0
+(6 rows)
+count
+1
+(1 row)
+ERROR:  column "badcol" of relation "t_copy_resolve" does not exist

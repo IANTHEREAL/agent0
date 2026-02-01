@@ -1,14 +1,15 @@
 //! SQL executor
 
 use super::super::ddl;
+use super::super::dml;
 use super::super::alter_owner;
 use super::super::alter_sequence_owned_by;
 use super::super::comment_on;
 use super::triggers::strip_leading_sql_comments;
 use super::super::explain;
 use super::super::helpers::{
-    eval_default_expr, fill_row_defaults, get_expr_name, get_skip_reason, get_unsupported_reason,
-    infer_expr_type, normalize_ident, parse_value_for_copy,
+    fill_row_defaults, get_expr_name, get_skip_reason, get_unsupported_reason, infer_expr_type,
+    normalize_ident, parse_value_for_copy,
 };
 use super::super::names;
 use super::super::query;
@@ -3117,59 +3118,58 @@ impl Executor {
 
         let result = async {
             let db_id = session.current_database_id();
-            let txn = session.get_mut_txn().expect("Transaction must be active");
+            let (txn, sequence_values, search_path) = session
+                .get_mut_txn_sequence_values_and_search_path()
+                .ok_or_else(|| anyhow!("Transaction must be active"))?;
+
             let schema = self
                 .store
                 .get_schema(txn, db_id, table_name)
                 .await?
                 .ok_or_else(|| anyhow!("Table '{}' not found", table_name))?;
 
+            let enum_cache = dml::build_enum_label_cache(&self.store, txn, db_id, &schema).await?;
+
             let mut row_values = vec![Value::Null; schema.columns.len()];
+            let mut indices: Vec<usize> = Vec::with_capacity(col_values.len());
 
             for (col_name, value) in col_values {
                 if let Some(idx) = schema.column_index(&col_name) {
                     row_values[idx] = value;
+                    indices.push(idx);
                 }
             }
 
-            for (i, col) in schema.columns.iter().enumerate() {
-                if matches!(row_values[i], Value::Null) {
-                    if col.is_serial {
-                        let next_id = self
-                            .store
-                            .next_sequence_value(txn, db_id, schema.table_id)
-                            .await?;
-                        row_values[i] = match col.data_type {
-                            DataType::Int64 => Value::Int64(next_id as i64),
-                            _ => Value::Int32(next_id),
-                        };
-                    } else if let Some(ref default_expr) = col.default_expr {
-                        row_values[i] = eval_default_expr(default_expr)?;
-                    }
-                }
-            }
+            indices.sort_unstable();
+            indices.dedup();
 
-            let mut row = Row { values: row_values };
-            fill_row_defaults(&mut row, &schema)?;
+            dml::fill_missing_columns(
+                &self.store,
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                &schema,
+                &mut row_values,
+                &indices,
+            )
+            .await?;
+            dml::coerce_row_values(&schema, &mut row_values)?;
+            let row = Row { values: row_values };
+            dml::validate_check_constraints(&schema, &row)?;
 
-            let pk_values = self
-                .store
-                .insert(txn, db_id, &schema.name, row.clone())
-                .await?;
-            for index in &schema.indexes {
-                let idx_values = schema.get_index_values(index, &row);
-                self.store
-                    .create_index_entry(
-                        txn,
-                        db_id,
-                        schema.table_id,
-                        index.id,
-                        &idx_values,
-                        &pk_values,
-                        index.unique,
-                    )
-                    .await?;
-            }
+            let on_conflict = None;
+            let _ = dml::execute_insert_row(
+                &self.store,
+                txn,
+                db_id,
+                table_name,
+                &schema,
+                row,
+                &on_conflict,
+                &enum_cache,
+            )
+            .await?;
 
             Ok::<(), anyhow::Error>(())
         }

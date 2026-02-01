@@ -123,6 +123,28 @@ async fn rollback_autocommit_or_mark_failed(session: &mut Session, started_txn: 
     }
 }
 
+fn copy_from_stdin_line_too_long_error() -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        "54000".to_string(),
+        format!(
+            "COPY FROM STDIN row exceeded max size ({} bytes)",
+            MAX_COPY_FROM_STDIN_LINE_BYTES
+        ),
+    )))
+}
+
+fn copy_row_column_mismatch_error(actual: usize, expected: usize) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_string(),
+        "22P04".to_string(),
+        format!(
+            "COPY row has {} columns but {} columns expected",
+            actual, expected
+        ),
+    )))
+}
+
 fn is_empty_simple_query(query: &str) -> bool {
     let trimmed = query.trim();
     trimmed.is_empty() || trimmed == ";"
@@ -500,7 +522,68 @@ impl ServerParameterProvider for PgServerParameterProvider {
 pub struct CopyContext {
     pub table_name: String,
     pub columns: Vec<String>,
-    pub data_buffer: Vec<Vec<u8>>,
+    pub column_types: Vec<Option<DataType>>,
+    pub line_buffer: Vec<u8>,
+    pub row_count: usize,
+    pub started_txn: bool,
+    pub reached_end_marker: bool,
+}
+
+/// A safety cap to prevent unbounded buffering if the client sends a single row without newlines.
+/// This is a per-row cap (not a cap on the total COPY stream).
+const MAX_COPY_FROM_STDIN_LINE_BYTES: usize = 32 * 1024 * 1024;
+
+impl CopyContext {
+    fn push_copy_data(&mut self, data: &[u8]) -> PgWireResult<Vec<Vec<u8>>> {
+        let mut lines: Vec<Vec<u8>> = Vec::new();
+        let mut start = 0usize;
+
+        for (idx, byte) in data.iter().enumerate() {
+            if *byte != b'\n' {
+                continue;
+            }
+
+            let mut line: Vec<u8> = Vec::new();
+            if !self.line_buffer.is_empty() {
+                line.extend_from_slice(&self.line_buffer);
+                self.line_buffer.clear();
+            }
+            line.extend_from_slice(&data[start..idx]);
+            if line.last() == Some(&b'\r') {
+                line.pop();
+            }
+
+            if line.len() > MAX_COPY_FROM_STDIN_LINE_BYTES {
+                return Err(copy_from_stdin_line_too_long_error());
+            }
+
+            lines.push(line);
+            start = idx.saturating_add(1);
+        }
+
+        if start < data.len() {
+            let remaining = &data[start..];
+            let new_len = self.line_buffer.len().saturating_add(remaining.len());
+            if new_len > MAX_COPY_FROM_STDIN_LINE_BYTES {
+                return Err(copy_from_stdin_line_too_long_error());
+            }
+            self.line_buffer.extend_from_slice(remaining);
+        }
+
+        Ok(lines)
+    }
+
+    fn drain_final_line(&mut self) -> Option<Vec<u8>> {
+        if self.line_buffer.is_empty() {
+            return None;
+        }
+        let mut line = Vec::new();
+        std::mem::swap(&mut line, &mut self.line_buffer);
+        if line.last() == Some(&b'\r') {
+            line.pop();
+        }
+        Some(line)
+    }
 }
 
 /// Parse username in format "tenant.user" or "tenant:user" into (keyspace, actual_user).
@@ -667,6 +750,65 @@ fn resolve_table_for_insert(table_name: &str, search_path: &[String]) -> String 
         let schema = search_path.first().map(|s| s.as_str()).unwrap_or("public");
         format!("{}.{}", schema, strip_quotes(table_name))
     }
+}
+
+fn normalize_copy_ident(token: &str) -> String {
+    let token = token.trim();
+    if token.starts_with('"') && token.ends_with('"') && token.len() >= 2 {
+        token[1..token.len() - 1].replace("\"\"", "\"")
+    } else {
+        token.to_lowercase()
+    }
+}
+
+fn resolve_copy_columns(
+    schema: &TableSchema,
+    columns: &[String],
+    relation_name: &str,
+) -> PgWireResult<(Vec<String>, Vec<Option<DataType>>)> {
+    if columns.is_empty() {
+        let resolved: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+        let types: Vec<Option<DataType>> = schema
+            .columns
+            .iter()
+            .map(|c| Some(c.data_type.clone()))
+            .collect();
+        return Ok((resolved, types));
+    }
+
+    let mut resolved_columns: Vec<String> = Vec::with_capacity(columns.len());
+    let mut column_types: Vec<Option<DataType>> = Vec::with_capacity(columns.len());
+    let mut seen: HashSet<String> = HashSet::with_capacity(columns.len());
+
+    for col in columns {
+        let normalized = normalize_copy_ident(col);
+        let Some(def) = schema.columns.iter().find(|c| c.name == normalized) else {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "42703".to_string(),
+                format!(
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    normalized, relation_name
+                ),
+            ))));
+        };
+
+        if !seen.insert(def.name.clone()) {
+            return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_string(),
+                "42701".to_string(),
+                format!(
+                    "column \"{}\" specified more than once",
+                    def.name
+                ),
+            ))));
+        }
+
+        resolved_columns.push(def.name.clone());
+        column_types.push(Some(def.data_type.clone()));
+    }
+
+    Ok((resolved_columns, column_types))
 }
 
 fn count_placeholders_in_expr(expr: &Expr) -> usize {
@@ -2420,12 +2562,18 @@ impl DynamicPgHandler {
             return None;
         }
 
-        // Regex: COPY [public.]table_name (col1, col2, ...) FROM stdin
-        let re = regex::Regex::new(r"(?i)COPY\s+(?:public\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin")
-            .ok()?;
+        // Regex: COPY [schema.]table_name (col1, col2, ...) FROM stdin
+        let re =
+            regex::Regex::new(r"(?i)COPY\s+(?:(\w+)\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin")
+                .ok()?;
         if let Some(caps) = re.captures(query) {
-            let table_name = caps.get(1)?.as_str().to_string();
-            let columns_str = caps.get(2)?.as_str();
+            let schema = caps.get(1).map(|m| m.as_str().to_string());
+            let table = caps.get(2)?.as_str().to_string();
+            let table_name = match schema {
+                Some(s) => format!("{}.{}", s, table),
+                None => table,
+            };
+            let columns_str = caps.get(3)?.as_str();
             let columns: Vec<String> = columns_str
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -2433,10 +2581,15 @@ impl DynamicPgHandler {
             return Some((table_name, columns));
         }
 
-        // Regex: COPY [public.]table_name FROM stdin (no column list)
-        let re2 = regex::Regex::new(r"(?i)COPY\s+(?:public\.)?(\w+)\s+FROM\s+stdin").ok()?;
+        // Regex: COPY [schema.]table_name FROM stdin (no column list)
+        let re2 = regex::Regex::new(r"(?i)COPY\s+(?:(\w+)\.)?(\w+)\s+FROM\s+stdin").ok()?;
         if let Some(caps) = re2.captures(query) {
-            let table_name = caps.get(1)?.as_str().to_string();
+            let schema = caps.get(1).map(|m| m.as_str().to_string());
+            let table = caps.get(2)?.as_str().to_string();
+            let table_name = match schema {
+                Some(s) => format!("{}.{}", s, table),
+                None => table,
+            };
             return Some((table_name, vec![]));
         }
 
@@ -2843,7 +2996,7 @@ impl SimpleQueryHandler for DynamicPgHandler {
                 table_name, columns
             );
 
-            let col_count = {
+            let (resolved_table, resolved_columns, column_types, col_count, started_txn) = {
                 let mut session_guard = self.session.lock().await;
                 let session = session_guard.as_mut().ok_or_else(|| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -2857,37 +3010,141 @@ impl SimpleQueryHandler for DynamicPgHandler {
                     return Err(in_failed_sql_transaction_pgwire_error());
                 }
 
-                if columns.is_empty() {
-                    let db_id = session.current_database_id();
-                    let started_txn = !session.is_in_transaction();
-                    if started_txn {
-                        session.begin().await.ok();
-                    }
-                    let count = if let Some(txn) = session.get_mut_txn() {
-                        if let Ok(Some(schema)) =
-                            executor.store().get_schema(txn, db_id, &table_name).await
-                        {
-                            schema.columns.len()
+                let started_txn = !session.is_in_transaction();
+                if started_txn {
+                    session.begin().await.map_err(|e| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "XX000".to_string(),
+                            e.to_string(),
+                        )))
+                    })?;
+                }
+
+                let db_id = session.current_database_id();
+                let search_path: Vec<String> = session.search_path().to_vec();
+                let (resolved_table, schema) = {
+                    let txn = session.get_mut_txn().ok_or_else(|| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "XX000".to_string(),
+                            "No transaction".to_string(),
+                        )))
+                    })?;
+
+                    let strip_quotes = |s: &str| -> String { s.trim_matches('"').to_string() };
+                    let (schema_opt, table_ident) = if table_name.contains('.') {
+                        let parts: Vec<&str> = table_name.splitn(2, '.').collect();
+                        if parts.len() == 2 {
+                            (
+                                Some(strip_quotes(parts[0]).to_lowercase()),
+                                strip_quotes(parts[1]).to_lowercase(),
+                            )
                         } else {
-                            1
+                            (None, strip_quotes(&table_name).to_lowercase())
                         }
                     } else {
-                        1
+                        (None, strip_quotes(&table_name).to_lowercase())
                     };
-                    if started_txn {
-                        session.rollback().await.ok();
+
+                    if let Some(schema_ident) = schema_opt {
+                        let resolved_table = format!("{}.{}", schema_ident, table_ident);
+                        match executor
+                            .store()
+                            .get_schema(txn, db_id, &resolved_table)
+                            .await
+                        {
+                            Ok(Some(schema)) => (resolved_table, schema),
+                            Ok(None) => {
+                                rollback_autocommit_or_mark_failed(session, started_txn).await;
+                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "42P01".to_string(),
+                                    format!("relation \"{}\" does not exist", table_name),
+                                ))));
+                            }
+                            Err(e) => {
+                                rollback_autocommit_or_mark_failed(session, started_txn).await;
+                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "XX000".to_string(),
+                                    e.to_string(),
+                                ))));
+                            }
+                        }
+                    } else {
+                        let schemas: Vec<&str> = if search_path.is_empty() {
+                            vec!["public"]
+                        } else {
+                            search_path.iter().map(|s| s.as_str()).collect()
+                        };
+
+                        let mut found: Option<(String, TableSchema)> = None;
+                        for schema_ident in schemas {
+                            let resolved_table = format!("{}.{}", schema_ident, table_ident);
+                            match executor
+                                .store()
+                                .get_schema(txn, db_id, &resolved_table)
+                                .await
+                            {
+                                Ok(Some(schema)) => {
+                                    found = Some((resolved_table, schema));
+                                    break;
+                                }
+                                Ok(None) => continue,
+                                Err(e) => {
+                                    rollback_autocommit_or_mark_failed(session, started_txn).await;
+                                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                        "ERROR".to_string(),
+                                        "XX000".to_string(),
+                                        e.to_string(),
+                                    ))));
+                                }
+                            }
+                        }
+
+                        match found {
+                            Some(found) => found,
+                            None => {
+                                rollback_autocommit_or_mark_failed(session, started_txn).await;
+                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "42P01".to_string(),
+                                    format!("relation \"{}\" does not exist", table_name),
+                                ))));
+                            }
+                        }
                     }
-                    count
-                } else {
-                    columns.len()
-                }
+                };
+
+                let (resolved_columns, column_types) =
+                    match resolve_copy_columns(&schema, &columns, &table_name) {
+                        Ok(resolved) => resolved,
+                        Err(e) => {
+                            rollback_autocommit_or_mark_failed(session, started_txn).await;
+                            return Err(e);
+                        }
+                    };
+
+                let col_count = resolved_columns.len();
+                (
+                    resolved_table,
+                    resolved_columns,
+                    column_types,
+                    col_count,
+                    started_txn,
+                )
             };
 
             let mut ctx = self.copy_context.lock().await;
             *ctx = Some(CopyContext {
-                table_name,
-                columns,
-                data_buffer: Vec::new(),
+                table_name: resolved_table,
+                columns: resolved_columns,
+                column_types,
+                line_buffer: Vec::new(),
+                row_count: 0,
+                started_txn,
+                reached_end_marker: false,
             });
 
             let column_formats: Vec<i16> = vec![0; col_count];
@@ -2950,27 +3207,95 @@ impl CopyHandler for DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let mut ctx_guard = self.copy_context.lock().await;
-        if let Some(ref mut ctx) = *ctx_guard {
-            ctx.data_buffer.push(copy_data.data.to_vec());
-        }
-        Ok(())
-    }
-
-    async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
-    where
-        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
-        C::Error: Debug,
-        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
-    {
         let executor = self.get_executor()?;
 
-        let ctx_opt = {
+        let (parse_res, table_name, started_txn) = {
             let mut ctx_guard = self.copy_context.lock().await;
-            ctx_guard.take()
+            let Some(ctx) = ctx_guard.as_mut() else {
+                return Ok(());
+            };
+
+            let table_name = ctx.table_name.clone();
+            let started_txn = ctx.started_txn;
+
+            let parse_res = (|| -> PgWireResult<Vec<Vec<(String, Value)>>> {
+                if ctx.reached_end_marker {
+                    return Ok(Vec::new());
+                }
+
+                let lines = ctx.push_copy_data(copy_data.data.as_ref())?;
+                if lines.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let mut rows_to_insert: Vec<Vec<(String, Value)>> = Vec::with_capacity(lines.len());
+                for line_bytes in lines {
+                    if ctx.reached_end_marker {
+                        break;
+                    }
+                    if line_bytes.as_slice() == b"\\." {
+                        ctx.reached_end_marker = true;
+                        ctx.line_buffer.clear();
+                        break;
+                    }
+
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    let values: Vec<&str> = line.split('\t').collect();
+
+                    if values.len() != ctx.columns.len() {
+                        return Err(copy_row_column_mismatch_error(
+                            values.len(),
+                            ctx.columns.len(),
+                        ));
+                    }
+
+                    let mut col_values: Vec<(String, Value)> =
+                        Vec::with_capacity(ctx.columns.len());
+                    for ((col_name, col_type), val) in ctx
+                        .columns
+                        .iter()
+                        .zip(ctx.column_types.iter())
+                        .zip(values.iter())
+                    {
+                        let value = if *val == "\\N" {
+                            Value::Null
+                        } else if let Some(dt) = col_type.as_ref() {
+                            executor.parse_value_for_copy(val, dt)
+                        } else {
+                            Value::Text(val.to_string())
+                        };
+                        col_values.push((col_name.clone(), value));
+                    }
+                    rows_to_insert.push(col_values);
+                }
+
+                Ok(rows_to_insert)
+            })();
+
+            (parse_res, table_name, started_txn)
         };
 
-        let row_count = if let Some(ctx) = ctx_opt {
+        let rows_to_insert = match parse_res {
+            Ok(rows) => rows,
+            Err(e) => {
+                let mut ctx_guard = self.copy_context.lock().await;
+                *ctx_guard = None;
+                drop(ctx_guard);
+
+                let mut session_guard = self.session.lock().await;
+                if let Some(session) = session_guard.as_mut() {
+                    rollback_autocommit_or_mark_failed(session, started_txn).await;
+                }
+                return Err(e);
+            }
+        };
+
+        let inserted_count = rows_to_insert.len();
+        if inserted_count == 0 {
+            return Ok(());
+        }
+
+        let insert_res: PgWireResult<()> = async {
             let mut session_guard = self.session.lock().await;
             let session = session_guard.as_mut().ok_or_else(|| {
                 PgWireError::UserError(Box::new(ErrorInfo::new(
@@ -2984,112 +3309,124 @@ impl CopyHandler for DynamicPgHandler {
                 return Err(in_failed_sql_transaction_pgwire_error());
             }
 
-            let started_txn = !session.is_in_transaction();
-            if started_txn {
-                session.begin().await.map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "XX000".to_string(),
-                        e.to_string(),
-                    )))
-                })?;
-            }
-
-            let count_res: PgWireResult<usize> = async {
-                let db_id = session.current_database_id();
-                let schema = {
-                    let txn = session.get_mut_txn().ok_or_else(|| {
+            for col_values in rows_to_insert {
+                executor
+                    .execute_copy_insert(session, &table_name, col_values)
+                    .await
+                    .map_err(|e| {
+                        error!("COPY insert error: {}", e);
                         PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".to_string(),
                             "XX000".to_string(),
-                            "No transaction".to_string(),
+                            e.to_string(),
                         )))
                     })?;
-                    executor
-                        .store()
-                        .get_schema(txn, db_id, &ctx.table_name)
-                        .await
-                        .map_err(|e| {
-                            PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_string(),
-                                "XX000".to_string(),
-                                e.to_string(),
-                            )))
-                        })?
-                        .ok_or_else(|| {
-                            PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_string(),
-                                "42P01".to_string(),
-                                format!("relation \"{}\" does not exist", ctx.table_name),
-                            )))
-                        })?
-                };
-
-                let columns: Vec<String> = if ctx.columns.is_empty() {
-                    schema.columns.iter().map(|c| c.name.clone()).collect()
-                } else {
-                    ctx.columns.clone()
-                };
-
-                let mut all_data = Vec::new();
-                for chunk in &ctx.data_buffer {
-                    all_data.extend_from_slice(chunk);
-                }
-
-                let data_str = String::from_utf8_lossy(&all_data);
-                let lines: Vec<&str> = data_str.lines().filter(|l| !l.is_empty()).collect();
-
-                let mut count = 0usize;
-
-                for line in lines {
-                    let values: Vec<&str> = line.split('\t').collect();
-
-                    if values.len() != columns.len() {
-                        continue;
-                    }
-
-                    let mut col_values: Vec<(String, Value)> = Vec::new();
-                    for (col_name, val) in columns.iter().zip(values.iter()) {
-                        let value = if *val == "\\N" {
-                            Value::Null
-                        } else {
-                            let col_schema = schema.columns.iter().find(|c| c.name == *col_name);
-                            if let Some(cs) = col_schema {
-                                executor.parse_value_for_copy(val, &cs.data_type)
-                            } else {
-                                Value::Text(val.to_string())
-                            }
-                        };
-                        col_values.push((col_name.clone(), value));
-                    }
-
-                    executor
-                        .execute_copy_insert(session, &ctx.table_name, col_values)
-                        .await
-                        .map_err(|e| {
-                            error!("COPY insert error: {}", e);
-                            PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_string(),
-                                "XX000".to_string(),
-                                e.to_string(),
-                            )))
-                        })?;
-                    count += 1;
-                }
-
-                Ok(count)
             }
-            .await;
 
-            let count = match count_res {
-                Ok(count) => count,
-                Err(e) => {
-                    rollback_autocommit_or_mark_failed(session, started_txn).await;
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = insert_res {
+            let mut session_guard = self.session.lock().await;
+            if let Some(session) = session_guard.as_mut() {
+                rollback_autocommit_or_mark_failed(session, started_txn).await;
+            }
+            drop(session_guard);
+
+            let mut ctx_guard = self.copy_context.lock().await;
+            *ctx_guard = None;
+            return Err(e);
+        }
+
+        let mut ctx_guard = self.copy_context.lock().await;
+        if let Some(ctx) = ctx_guard.as_mut() {
+            ctx.row_count = ctx.row_count.saturating_add(inserted_count);
+        }
+
+        Ok(())
+    }
+
+    async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let ctx_opt = {
+            let mut ctx_guard = self.copy_context.lock().await;
+            ctx_guard.take()
+        };
+
+        let row_count = if let Some(mut ctx) = ctx_opt {
+            let executor = self.get_executor()?;
+
+            let mut session_guard = self.session.lock().await;
+            let session = session_guard.as_mut().ok_or_else(|| {
+                PgWireError::UserError(Box::new(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "XX000".to_string(),
+                    "Session not initialized".to_string(),
+                )))
+            })?;
+
+            if session.is_transaction_failed() {
+                return Err(in_failed_sql_transaction_pgwire_error());
+            }
+
+            if let Some(final_line_bytes) = ctx.drain_final_line() {
+                if final_line_bytes.as_slice() == b"\\." {
+                    ctx.reached_end_marker = true;
+                } else if !ctx.reached_end_marker {
+                let line = String::from_utf8_lossy(&final_line_bytes);
+                let values: Vec<&str> = line.split('\t').collect();
+
+                if values.len() != ctx.columns.len() {
+                    rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
+                    return Err(copy_row_column_mismatch_error(
+                        values.len(),
+                        ctx.columns.len(),
+                    ));
+                }
+
+                let mut col_values: Vec<(String, Value)> = Vec::with_capacity(ctx.columns.len());
+                for ((col_name, col_type), val) in ctx
+                    .columns
+                    .iter()
+                    .zip(ctx.column_types.iter())
+                    .zip(values.iter())
+                {
+                    let value = if *val == "\\N" {
+                        Value::Null
+                    } else if let Some(dt) = col_type.as_ref() {
+                        executor.parse_value_for_copy(val, dt)
+                    } else {
+                        Value::Text(val.to_string())
+                    };
+                    col_values.push((col_name.clone(), value));
+                }
+
+                if let Err(e) = executor
+                    .execute_copy_insert(session, &ctx.table_name, col_values)
+                    .await
+                    .map_err(|e| {
+                        error!("COPY insert error: {}", e);
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "XX000".to_string(),
+                            e.to_string(),
+                        )))
+                    })
+                {
+                    rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
                     return Err(e);
                 }
-            };
 
-            if started_txn {
+                ctx.row_count = ctx.row_count.saturating_add(1);
+                }
+            }
+
+            if ctx.started_txn {
                 session.commit().await.map_err(|e| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_string(),
@@ -3099,7 +3436,7 @@ impl CopyHandler for DynamicPgHandler {
                 })?;
             }
 
-            count
+            ctx.row_count
         } else {
             0
         };
@@ -3119,8 +3456,17 @@ impl CopyHandler for DynamicPgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let mut ctx_guard = self.copy_context.lock().await;
-        *ctx_guard = None;
+        let ctx_opt = {
+            let mut ctx_guard = self.copy_context.lock().await;
+            ctx_guard.take()
+        };
+
+        if let Some(ctx) = ctx_opt {
+            let mut session_guard = self.session.lock().await;
+            if let Some(session) = session_guard.as_mut() {
+                rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
+            }
+        }
 
         warn!("COPY failed: {}", fail.message);
 
@@ -3922,11 +4268,17 @@ impl PgHandler {
             return None;
         }
 
-        let re = regex::Regex::new(r"(?i)COPY\s+(?:public\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin")
-            .ok()?;
+        let re =
+            regex::Regex::new(r"(?i)COPY\s+(?:(\w+)\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin")
+                .ok()?;
         if let Some(caps) = re.captures(query) {
-            let table_name = caps.get(1)?.as_str().to_string();
-            let columns_str = caps.get(2)?.as_str();
+            let schema = caps.get(1).map(|m| m.as_str().to_string());
+            let table = caps.get(2)?.as_str().to_string();
+            let table_name = match schema {
+                Some(s) => format!("{}.{}", s, table),
+                None => table,
+            };
+            let columns_str = caps.get(3)?.as_str();
             let columns: Vec<String> = columns_str
                 .split(',')
                 .map(|s| s.trim().to_string())
@@ -3934,9 +4286,14 @@ impl PgHandler {
             return Some((table_name, columns));
         }
 
-        let re2 = regex::Regex::new(r"(?i)COPY\s+(?:public\.)?(\w+)\s+FROM\s+stdin").ok()?;
+        let re2 = regex::Regex::new(r"(?i)COPY\s+(?:(\w+)\.)?(\w+)\s+FROM\s+stdin").ok()?;
         if let Some(caps) = re2.captures(query) {
-            let table_name = caps.get(1)?.as_str().to_string();
+            let schema = caps.get(1).map(|m| m.as_str().to_string());
+            let table = caps.get(2)?.as_str().to_string();
+            let table_name = match schema {
+                Some(s) => format!("{}.{}", s, table),
+                None => table,
+            };
             return Some((table_name, vec![]));
         }
 
@@ -3997,46 +4354,150 @@ impl SimpleQueryHandler for PgHandler {
                 table_name, columns
             );
 
-            let col_count = {
+            let (resolved_table, resolved_columns, column_types, col_count, started_txn) = {
                 let mut session = self.session.lock().await;
                 if session.is_transaction_failed() {
                     return Err(in_failed_sql_transaction_pgwire_error());
                 }
 
-                if columns.is_empty() {
-                    let db_id = session.current_database_id();
-                    let started_txn = !session.is_in_transaction();
-                    if started_txn {
-                        session.begin().await.ok();
-                    }
-                    let count = if let Some(txn) = session.get_mut_txn() {
-                        if let Ok(Some(schema)) = self
-                            .executor
-                            .store()
-                            .get_schema(txn, db_id, &table_name)
-                            .await
-                        {
-                            schema.columns.len()
+                let started_txn = !session.is_in_transaction();
+                if started_txn {
+                    session.begin().await.map_err(|e| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "XX000".to_string(),
+                            e.to_string(),
+                        )))
+                    })?;
+                }
+
+                let db_id = session.current_database_id();
+                let search_path: Vec<String> = session.search_path().to_vec();
+                let (resolved_table, schema) = {
+                    let txn = session.get_mut_txn().ok_or_else(|| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "XX000".to_string(),
+                            "No transaction".to_string(),
+                        )))
+                    })?;
+
+                    let strip_quotes = |s: &str| -> String { s.trim_matches('"').to_string() };
+                    let (schema_opt, table_ident) = if table_name.contains('.') {
+                        let parts: Vec<&str> = table_name.splitn(2, '.').collect();
+                        if parts.len() == 2 {
+                            (
+                                Some(strip_quotes(parts[0]).to_lowercase()),
+                                strip_quotes(parts[1]).to_lowercase(),
+                            )
                         } else {
-                            1
+                            (None, strip_quotes(&table_name).to_lowercase())
                         }
                     } else {
-                        1
+                        (None, strip_quotes(&table_name).to_lowercase())
                     };
-                    if started_txn {
-                        session.rollback().await.ok();
+
+                    if let Some(schema_ident) = schema_opt {
+                        let resolved_table = format!("{}.{}", schema_ident, table_ident);
+                        match self
+                            .executor
+                            .store()
+                            .get_schema(txn, db_id, &resolved_table)
+                            .await
+                        {
+                            Ok(Some(schema)) => (resolved_table, schema),
+                            Ok(None) => {
+                                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "42P01".to_string(),
+                                    format!("relation \"{}\" does not exist", table_name),
+                                ))));
+                            }
+                            Err(e) => {
+                                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "XX000".to_string(),
+                                    e.to_string(),
+                                ))));
+                            }
+                        }
+                    } else {
+                        let schemas: Vec<&str> = if search_path.is_empty() {
+                            vec!["public"]
+                        } else {
+                            search_path.iter().map(|s| s.as_str()).collect()
+                        };
+
+                        let mut found: Option<(String, TableSchema)> = None;
+                        for schema_ident in schemas {
+                            let resolved_table = format!("{}.{}", schema_ident, table_ident);
+                            match self
+                                .executor
+                                .store()
+                                .get_schema(txn, db_id, &resolved_table)
+                                .await
+                            {
+                                Ok(Some(schema)) => {
+                                    found = Some((resolved_table, schema));
+                                    break;
+                                }
+                                Ok(None) => continue,
+                                Err(e) => {
+                                    rollback_autocommit_or_mark_failed(&mut session, started_txn)
+                                        .await;
+                                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                        "ERROR".to_string(),
+                                        "XX000".to_string(),
+                                        e.to_string(),
+                                    ))));
+                                }
+                            }
+                        }
+
+                        match found {
+                            Some(found) => found,
+                            None => {
+                                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "42P01".to_string(),
+                                    format!("relation \"{}\" does not exist", table_name),
+                                ))));
+                            }
+                        }
                     }
-                    count
-                } else {
-                    columns.len()
-                }
+                };
+
+                let (resolved_columns, column_types) =
+                    match resolve_copy_columns(&schema, &columns, &table_name) {
+                        Ok(resolved) => resolved,
+                        Err(e) => {
+                            rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                            return Err(e);
+                        }
+                    };
+
+                let col_count = resolved_columns.len();
+                (
+                    resolved_table,
+                    resolved_columns,
+                    column_types,
+                    col_count,
+                    started_txn,
+                )
             };
 
             let mut ctx = self.copy_context.lock().await;
             *ctx = Some(CopyContext {
-                table_name,
-                columns,
-                data_buffer: Vec::new(),
+                table_name: resolved_table,
+                columns: resolved_columns,
+                column_types,
+                line_buffer: Vec::new(),
+                row_count: 0,
+                started_txn,
+                reached_end_marker: false,
             });
 
             let column_formats: Vec<i16> = vec![0; col_count];
@@ -4092,10 +4553,130 @@ impl CopyHandler for PgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let mut ctx_guard = self.copy_context.lock().await;
-        if let Some(ref mut ctx) = *ctx_guard {
-            ctx.data_buffer.push(copy_data.data.to_vec());
+        let (parse_res, table_name, started_txn) = {
+            let mut ctx_guard = self.copy_context.lock().await;
+            let Some(ctx) = ctx_guard.as_mut() else {
+                return Ok(());
+            };
+
+            let table_name = ctx.table_name.clone();
+            let started_txn = ctx.started_txn;
+
+            let parse_res = (|| -> PgWireResult<Vec<Vec<(String, Value)>>> {
+                if ctx.reached_end_marker {
+                    return Ok(Vec::new());
+                }
+
+                let lines = ctx.push_copy_data(copy_data.data.as_ref())?;
+                if lines.is_empty() {
+                    return Ok(Vec::new());
+                }
+
+                let mut rows_to_insert: Vec<Vec<(String, Value)>> = Vec::with_capacity(lines.len());
+                for line_bytes in lines {
+                    if ctx.reached_end_marker {
+                        break;
+                    }
+                    if line_bytes.as_slice() == b"\\." {
+                        ctx.reached_end_marker = true;
+                        ctx.line_buffer.clear();
+                        break;
+                    }
+
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    let values: Vec<&str> = line.split('\t').collect();
+
+                    if values.len() != ctx.columns.len() {
+                        return Err(copy_row_column_mismatch_error(
+                            values.len(),
+                            ctx.columns.len(),
+                        ));
+                    }
+
+                    let mut col_values: Vec<(String, Value)> =
+                        Vec::with_capacity(ctx.columns.len());
+                    for ((col_name, col_type), val) in ctx
+                        .columns
+                        .iter()
+                        .zip(ctx.column_types.iter())
+                        .zip(values.iter())
+                    {
+                        let value = if *val == "\\N" {
+                            Value::Null
+                        } else if let Some(dt) = col_type.as_ref() {
+                            self.executor.parse_value_for_copy(val, dt)
+                        } else {
+                            Value::Text(val.to_string())
+                        };
+                        col_values.push((col_name.clone(), value));
+                    }
+                    rows_to_insert.push(col_values);
+                }
+
+                Ok(rows_to_insert)
+            })();
+
+            (parse_res, table_name, started_txn)
+        };
+
+        let rows_to_insert = match parse_res {
+            Ok(rows) => rows,
+            Err(e) => {
+                let mut ctx_guard = self.copy_context.lock().await;
+                *ctx_guard = None;
+                drop(ctx_guard);
+
+                let mut session = self.session.lock().await;
+                rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                return Err(e);
+            }
+        };
+
+        let inserted_count = rows_to_insert.len();
+        if inserted_count == 0 {
+            return Ok(());
         }
+
+        let insert_res: PgWireResult<()> = async {
+            let mut session = self.session.lock().await;
+
+            if session.is_transaction_failed() {
+                return Err(in_failed_sql_transaction_pgwire_error());
+            }
+
+            for col_values in rows_to_insert {
+                self.executor
+                    .execute_copy_insert(&mut session, &table_name, col_values)
+                    .await
+                    .map_err(|e| {
+                        error!("COPY insert error: {}", e);
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "XX000".to_string(),
+                            e.to_string(),
+                        )))
+                    })?;
+            }
+
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = insert_res {
+            let mut session = self.session.lock().await;
+            rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+            drop(session);
+
+            let mut ctx_guard = self.copy_context.lock().await;
+            *ctx_guard = None;
+            return Err(e);
+        }
+
+        let mut ctx_guard = self.copy_context.lock().await;
+        if let Some(ctx) = ctx_guard.as_mut() {
+            ctx.row_count = ctx.row_count.saturating_add(inserted_count);
+        }
+
         Ok(())
     }
 
@@ -4110,119 +4691,67 @@ impl CopyHandler for PgHandler {
             ctx_guard.take()
         };
 
-        let row_count = if let Some(ctx) = ctx_opt {
+        let row_count = if let Some(mut ctx) = ctx_opt {
             let mut session = self.session.lock().await;
 
             if session.is_transaction_failed() {
                 return Err(in_failed_sql_transaction_pgwire_error());
             }
 
-            let started_txn = !session.is_in_transaction();
-            if started_txn {
-                session.begin().await.map_err(|e| {
-                    PgWireError::UserError(Box::new(ErrorInfo::new(
-                        "ERROR".to_string(),
-                        "XX000".to_string(),
-                        e.to_string(),
-                    )))
-                })?;
-            }
+            if let Some(final_line_bytes) = ctx.drain_final_line() {
+                if final_line_bytes.as_slice() == b"\\." {
+                    ctx.reached_end_marker = true;
+                } else if !ctx.reached_end_marker {
+                let line = String::from_utf8_lossy(&final_line_bytes);
+                let values: Vec<&str> = line.split('\t').collect();
 
-            let count_res: PgWireResult<usize> = async {
-                let db_id = session.current_database_id();
-                let schema = {
-                    let txn = session.get_mut_txn().ok_or_else(|| {
+                if values.len() != ctx.columns.len() {
+                    rollback_autocommit_or_mark_failed(&mut session, ctx.started_txn).await;
+                    return Err(copy_row_column_mismatch_error(
+                        values.len(),
+                        ctx.columns.len(),
+                    ));
+                }
+
+                let mut col_values: Vec<(String, Value)> = Vec::with_capacity(ctx.columns.len());
+                for ((col_name, col_type), val) in ctx
+                    .columns
+                    .iter()
+                    .zip(ctx.column_types.iter())
+                    .zip(values.iter())
+                {
+                    let value = if *val == "\\N" {
+                        Value::Null
+                    } else if let Some(dt) = col_type.as_ref() {
+                        self.executor.parse_value_for_copy(val, dt)
+                    } else {
+                        Value::Text(val.to_string())
+                    };
+                    col_values.push((col_name.clone(), value));
+                }
+
+                if let Err(e) = self
+                    .executor
+                    .execute_copy_insert(&mut session, &ctx.table_name, col_values)
+                    .await
+                    .map_err(|e| {
+                        error!("COPY insert error: {}", e);
                         PgWireError::UserError(Box::new(ErrorInfo::new(
                             "ERROR".to_string(),
                             "XX000".to_string(),
-                            "No transaction".to_string(),
+                            e.to_string(),
                         )))
-                    })?;
-                    self.executor
-                        .store()
-                        .get_schema(txn, db_id, &ctx.table_name)
-                        .await
-                        .map_err(|e| {
-                            PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_string(),
-                                "XX000".to_string(),
-                                e.to_string(),
-                            )))
-                        })?
-                        .ok_or_else(|| {
-                            PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_string(),
-                                "42P01".to_string(),
-                                format!("relation \"{}\" does not exist", ctx.table_name),
-                            )))
-                        })?
-                };
-
-                let columns: Vec<String> = if ctx.columns.is_empty() {
-                    schema.columns.iter().map(|c| c.name.clone()).collect()
-                } else {
-                    ctx.columns.clone()
-                };
-
-                let mut all_data = Vec::new();
-                for chunk in &ctx.data_buffer {
-                    all_data.extend_from_slice(chunk);
-                }
-
-                let data_str = String::from_utf8_lossy(&all_data);
-                let lines: Vec<&str> = data_str.lines().filter(|l| !l.is_empty()).collect();
-
-                let mut count = 0usize;
-
-                for line in lines {
-                    let values: Vec<&str> = line.split('\t').collect();
-
-                    if values.len() != columns.len() {
-                        continue;
-                    }
-
-                    let mut col_values: Vec<(String, Value)> = Vec::new();
-                    for (col_name, val) in columns.iter().zip(values.iter()) {
-                        let value = if *val == "\\N" {
-                            Value::Null
-                        } else {
-                            let col_schema = schema.columns.iter().find(|c| c.name == *col_name);
-                            if let Some(cs) = col_schema {
-                                self.executor.parse_value_for_copy(val, &cs.data_type)
-                            } else {
-                                Value::Text(val.to_string())
-                            }
-                        };
-                        col_values.push((col_name.clone(), value));
-                    }
-
-                    self.executor
-                        .execute_copy_insert(&mut session, &ctx.table_name, col_values)
-                        .await
-                        .map_err(|e| {
-                            error!("COPY insert error: {}", e);
-                            PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_string(),
-                                "XX000".to_string(),
-                                e.to_string(),
-                            )))
-                        })?;
-                    count += 1;
-                }
-
-                Ok(count)
-            }
-            .await;
-
-            let count = match count_res {
-                Ok(count) => count,
-                Err(e) => {
-                    rollback_autocommit_or_mark_failed(&mut session, started_txn).await;
+                    })
+                {
+                    rollback_autocommit_or_mark_failed(&mut session, ctx.started_txn).await;
                     return Err(e);
                 }
-            };
 
-            if started_txn {
+                ctx.row_count = ctx.row_count.saturating_add(1);
+                }
+            }
+
+            if ctx.started_txn {
                 session.commit().await.map_err(|e| {
                     PgWireError::UserError(Box::new(ErrorInfo::new(
                         "ERROR".to_string(),
@@ -4232,7 +4761,7 @@ impl CopyHandler for PgHandler {
                 })?;
             }
 
-            count
+            ctx.row_count
         } else {
             0
         };
@@ -4252,8 +4781,15 @@ impl CopyHandler for PgHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let mut ctx_guard = self.copy_context.lock().await;
-        *ctx_guard = None;
+        let ctx_opt = {
+            let mut ctx_guard = self.copy_context.lock().await;
+            ctx_guard.take()
+        };
+
+        if let Some(ctx) = ctx_opt {
+            let mut session = self.session.lock().await;
+            rollback_autocommit_or_mark_failed(&mut session, ctx.started_txn).await;
+        }
 
         warn!("COPY failed: {}", fail.message);
 
@@ -5900,7 +6436,7 @@ mod tests {
         assert_eq!(
             result,
             Some((
-                "users".to_string(),
+                "public.users".to_string(),
                 vec!["id".to_string(), "name".to_string()]
             ))
         );
@@ -6083,7 +6619,10 @@ mod tests {
         assert_eq!(count_sql_parameters("SELECT 1 -- $10\n;"), 0);
         assert_eq!(count_sql_parameters("SELECT a$1 FROM t WHERE id = $1;"), 1);
         assert_eq!(count_sql_parameters("SELECT 1 /* $10 */ , $2;"), 2);
-        assert_eq!(count_sql_parameters("SELECT /* outer /* $10 */ inner */ $1;"), 1);
+        assert_eq!(
+            count_sql_parameters("SELECT /* outer /* $10 */ inner */ $1;"),
+            1
+        );
     }
 
     #[test]

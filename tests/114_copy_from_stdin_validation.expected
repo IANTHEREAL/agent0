@@ -1,0 +1,19 @@
+count
+0
+(1 row)
+count
+0
+(1 row)
+count
+0
+(1 row)
+count
+0
+(1 row)
+ERROR:  invalid input syntax for type integer: "abc"
+ERROR:  null value in column "b" of relation "t_copy_validate_notnull" violates not-null constraint
+DETAIL:  Failing row contains (1, NULL).
+ERROR:  new row for relation "t_copy_validate_check" violates check constraint "chk_positive"
+DETAIL:  Failing row contains (-1).
+ERROR:  insert or update on table "public.t_copy_validate_fk_child" violates foreign key constraint "fk_parent"
+DETAIL:  Key (pid)=(999) is not present in table "public.t_copy_validate_fk_parent".

@@ -1,0 +1,4 @@
+count
+0
+(1 row)
+ERROR:  COPY row has 1 columns but 2 columns expected
