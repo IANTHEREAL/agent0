@@ -817,8 +817,26 @@ fn compute_sum_join(
     wf_idx: usize,
     results: &mut [Vec<Value>],
 ) -> Result<()> {
-    if wf.order_by.is_empty() {
-        // Compute total for entire partition
+    let frame_full_partition = matches!(
+        wf.window_frame.as_ref(),
+        Some(WindowFrame {
+            start_bound: WindowFrameBound::Preceding(None),
+            end_bound: Some(WindowFrameBound::Following(None)),
+            ..
+        })
+    );
+    let frame_running_from_start = matches!(
+        wf.window_frame.as_ref(),
+        Some(WindowFrame {
+            start_bound: WindowFrameBound::Preceding(None),
+            end_bound: None | Some(WindowFrameBound::CurrentRow),
+            ..
+        })
+    );
+    let full_partition = (wf.window_frame.is_none() && wf.order_by.is_empty()) || frame_full_partition;
+    let running = (wf.window_frame.is_none() && !wf.order_by.is_empty()) || frame_running_from_start;
+
+    if full_partition {
         let mut total = 0.0f64;
         for &row_idx in row_indices {
             if let Some(ref arg) = wf.arg_expr {
@@ -842,8 +860,10 @@ fn compute_sum_join(
         for &row_idx in row_indices {
             results[row_idx][wf_idx] = Value::Float64(total);
         }
-    } else {
-        // Compute running sum
+        return Ok(());
+    }
+
+    if running {
         let mut running_sum = 0.0f64;
         for &row_idx in row_indices {
             if let Some(ref arg) = wf.arg_expr {
@@ -865,6 +885,37 @@ fn compute_sum_join(
             }
             results[row_idx][wf_idx] = Value::Float64(running_sum);
         }
+        return Ok(());
+    }
+
+    let partition_size = row_indices.len();
+
+    for (pos, &row_idx) in row_indices.iter().enumerate() {
+        let (start, end) = get_frame_bounds(wf, pos, partition_size);
+        let mut sum = 0.0f64;
+        for i in start..end {
+            if i < partition_size {
+                let frame_row_idx = row_indices[i];
+                if let Some(ref arg) = wf.arg_expr {
+                    let ctx = JoinContext {
+                        tables: HashMap::new(),
+                        column_offsets,
+                        merged_column_offsets,
+                        combined_row: &rows[frame_row_idx],
+                        combined_schema,
+                    };
+                    let val = eval_expr_join(arg, &ctx)?;
+                    match val {
+                        Value::Int32(n) => sum += n as f64,
+                        Value::Int64(n) => sum += n as f64,
+                        Value::Float64(n) => sum += n,
+                        Value::Numeric(d) => sum += d.to_f64().unwrap_or(0.0),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        results[row_idx][wf_idx] = Value::Float64(sum);
     }
     Ok(())
 }
@@ -879,7 +930,26 @@ fn compute_avg_join(
     wf_idx: usize,
     results: &mut [Vec<Value>],
 ) -> Result<()> {
-    if wf.order_by.is_empty() {
+    let frame_full_partition = matches!(
+        wf.window_frame.as_ref(),
+        Some(WindowFrame {
+            start_bound: WindowFrameBound::Preceding(None),
+            end_bound: Some(WindowFrameBound::Following(None)),
+            ..
+        })
+    );
+    let frame_running_from_start = matches!(
+        wf.window_frame.as_ref(),
+        Some(WindowFrame {
+            start_bound: WindowFrameBound::Preceding(None),
+            end_bound: None | Some(WindowFrameBound::CurrentRow),
+            ..
+        })
+    );
+    let full_partition = (wf.window_frame.is_none() && wf.order_by.is_empty()) || frame_full_partition;
+    let running = (wf.window_frame.is_none() && !wf.order_by.is_empty()) || frame_running_from_start;
+
+    if full_partition {
         let mut total_sum = 0.0f64;
         let mut total_count = 0i64;
         for &row_idx in row_indices {
@@ -924,7 +994,10 @@ fn compute_avg_join(
         for &row_idx in row_indices {
             results[row_idx][wf_idx] = avg_val.clone();
         }
-    } else {
+        return Ok(());
+    }
+
+    if running {
         let mut running_sum = 0.0f64;
         let mut running_count = 0i64;
         for &row_idx in row_indices {
@@ -966,6 +1039,57 @@ fn compute_avg_join(
                 Value::Null
             };
         }
+        return Ok(());
+    }
+
+    let partition_size = row_indices.len();
+
+    for (pos, &row_idx) in row_indices.iter().enumerate() {
+        let (start, end) = get_frame_bounds(wf, pos, partition_size);
+        let mut frame_sum = 0.0f64;
+        let mut frame_count = 0i64;
+        for i in start..end {
+            if i < partition_size {
+                let frame_row_idx = row_indices[i];
+                if let Some(ref arg) = wf.arg_expr {
+                    let ctx = JoinContext {
+                        tables: HashMap::new(),
+                        column_offsets,
+                        merged_column_offsets,
+                        combined_row: &rows[frame_row_idx],
+                        combined_schema,
+                    };
+                    let val = eval_expr_join(arg, &ctx)?;
+                    match val {
+                        Value::Int32(n) => {
+                            frame_sum += n as f64;
+                            frame_count += 1;
+                        }
+                        Value::Int64(n) => {
+                            frame_sum += n as f64;
+                            frame_count += 1;
+                        }
+                        Value::Float64(n) => {
+                            frame_sum += n;
+                            frame_count += 1;
+                        }
+                        Value::Numeric(d) => {
+                            frame_sum += d.to_f64().unwrap_or(0.0);
+                            frame_count += 1;
+                        }
+                        Value::Null => {}
+                        _ => {
+                            frame_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        results[row_idx][wf_idx] = if frame_count > 0 {
+            Value::Float64(frame_sum / frame_count as f64)
+        } else {
+            Value::Null
+        };
     }
     Ok(())
 }
@@ -980,39 +1104,121 @@ fn compute_min_join(
     wf_idx: usize,
     results: &mut [Vec<Value>],
 ) -> Result<()> {
-    let mut min_val: Option<Value> = None;
-    for &row_idx in row_indices {
-        if let Some(ref arg) = wf.arg_expr {
-            let ctx = JoinContext {
-                tables: HashMap::new(),
-                column_offsets,
-                merged_column_offsets,
-                combined_row: &rows[row_idx],
-                combined_schema,
-            };
-            let val = eval_expr_join(arg, &ctx)?;
-            if !matches!(val, Value::Null) {
-                min_val = Some(match &min_val {
-                    None => val.clone(),
-                    Some(m) => {
-                        if compare_values(&val, m).unwrap_or(0) < 0 {
-                            val.clone()
-                        } else {
-                            m.clone()
+    let frame_full_partition = matches!(
+        wf.window_frame.as_ref(),
+        Some(WindowFrame {
+            start_bound: WindowFrameBound::Preceding(None),
+            end_bound: Some(WindowFrameBound::Following(None)),
+            ..
+        })
+    );
+    let frame_running_from_start = matches!(
+        wf.window_frame.as_ref(),
+        Some(WindowFrame {
+            start_bound: WindowFrameBound::Preceding(None),
+            end_bound: None | Some(WindowFrameBound::CurrentRow),
+            ..
+        })
+    );
+    let full_partition = (wf.window_frame.is_none() && wf.order_by.is_empty()) || frame_full_partition;
+    let running = (wf.window_frame.is_none() && !wf.order_by.is_empty()) || frame_running_from_start;
+
+    if full_partition {
+        let mut min_val: Option<Value> = None;
+        for &row_idx in row_indices {
+            if let Some(ref arg) = wf.arg_expr {
+                let ctx = JoinContext {
+                    tables: HashMap::new(),
+                    column_offsets,
+                    merged_column_offsets,
+                    combined_row: &rows[row_idx],
+                    combined_schema,
+                };
+                let val = eval_expr_join(arg, &ctx)?;
+                if !matches!(val, Value::Null) {
+                    min_val = Some(match &min_val {
+                        None => val.clone(),
+                        Some(m) => {
+                            if compare_values(&val, m).unwrap_or(0) < 0 {
+                                val.clone()
+                            } else {
+                                m.clone()
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
         }
-        if !wf.order_by.is_empty() {
-            results[row_idx][wf_idx] = min_val.clone().unwrap_or(Value::Null);
-        }
-    }
-    if wf.order_by.is_empty() {
         let final_min = min_val.unwrap_or(Value::Null);
         for &row_idx in row_indices {
             results[row_idx][wf_idx] = final_min.clone();
         }
+        return Ok(());
+    }
+
+    if running {
+        let mut min_val: Option<Value> = None;
+        for &row_idx in row_indices {
+            if let Some(ref arg) = wf.arg_expr {
+                let ctx = JoinContext {
+                    tables: HashMap::new(),
+                    column_offsets,
+                    merged_column_offsets,
+                    combined_row: &rows[row_idx],
+                    combined_schema,
+                };
+                let val = eval_expr_join(arg, &ctx)?;
+                if !matches!(val, Value::Null) {
+                    min_val = Some(match &min_val {
+                        None => val.clone(),
+                        Some(m) => {
+                            if compare_values(&val, m).unwrap_or(0) < 0 {
+                                val.clone()
+                            } else {
+                                m.clone()
+                            }
+                        }
+                    });
+                }
+            }
+            results[row_idx][wf_idx] = min_val.clone().unwrap_or(Value::Null);
+        }
+        return Ok(());
+    }
+
+    let partition_size = row_indices.len();
+
+    for (pos, &row_idx) in row_indices.iter().enumerate() {
+        let (start, end) = get_frame_bounds(wf, pos, partition_size);
+        let mut min_val: Option<Value> = None;
+        for i in start..end {
+            if i < partition_size {
+                let frame_row_idx = row_indices[i];
+                if let Some(ref arg) = wf.arg_expr {
+                    let ctx = JoinContext {
+                        tables: HashMap::new(),
+                        column_offsets,
+                        merged_column_offsets,
+                        combined_row: &rows[frame_row_idx],
+                        combined_schema,
+                    };
+                    let val = eval_expr_join(arg, &ctx)?;
+                    if !matches!(val, Value::Null) {
+                        min_val = Some(match &min_val {
+                            None => val.clone(),
+                            Some(m) => {
+                                if compare_values(&val, m).unwrap_or(0) < 0 {
+                                    val.clone()
+                                } else {
+                                    m.clone()
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        results[row_idx][wf_idx] = min_val.unwrap_or(Value::Null);
     }
     Ok(())
 }
@@ -1027,39 +1233,121 @@ fn compute_max_join(
     wf_idx: usize,
     results: &mut [Vec<Value>],
 ) -> Result<()> {
-    let mut max_val: Option<Value> = None;
-    for &row_idx in row_indices {
-        if let Some(ref arg) = wf.arg_expr {
-            let ctx = JoinContext {
-                tables: HashMap::new(),
-                column_offsets,
-                merged_column_offsets,
-                combined_row: &rows[row_idx],
-                combined_schema,
-            };
-            let val = eval_expr_join(arg, &ctx)?;
-            if !matches!(val, Value::Null) {
-                max_val = Some(match &max_val {
-                    None => val.clone(),
-                    Some(m) => {
-                        if compare_values(&val, m).unwrap_or(0) > 0 {
-                            val.clone()
-                        } else {
-                            m.clone()
+    let frame_full_partition = matches!(
+        wf.window_frame.as_ref(),
+        Some(WindowFrame {
+            start_bound: WindowFrameBound::Preceding(None),
+            end_bound: Some(WindowFrameBound::Following(None)),
+            ..
+        })
+    );
+    let frame_running_from_start = matches!(
+        wf.window_frame.as_ref(),
+        Some(WindowFrame {
+            start_bound: WindowFrameBound::Preceding(None),
+            end_bound: None | Some(WindowFrameBound::CurrentRow),
+            ..
+        })
+    );
+    let full_partition = (wf.window_frame.is_none() && wf.order_by.is_empty()) || frame_full_partition;
+    let running = (wf.window_frame.is_none() && !wf.order_by.is_empty()) || frame_running_from_start;
+
+    if full_partition {
+        let mut max_val: Option<Value> = None;
+        for &row_idx in row_indices {
+            if let Some(ref arg) = wf.arg_expr {
+                let ctx = JoinContext {
+                    tables: HashMap::new(),
+                    column_offsets,
+                    merged_column_offsets,
+                    combined_row: &rows[row_idx],
+                    combined_schema,
+                };
+                let val = eval_expr_join(arg, &ctx)?;
+                if !matches!(val, Value::Null) {
+                    max_val = Some(match &max_val {
+                        None => val.clone(),
+                        Some(m) => {
+                            if compare_values(&val, m).unwrap_or(0) > 0 {
+                                val.clone()
+                            } else {
+                                m.clone()
+                            }
                         }
-                    }
-                });
+                    });
+                }
             }
         }
-        if !wf.order_by.is_empty() {
-            results[row_idx][wf_idx] = max_val.clone().unwrap_or(Value::Null);
-        }
-    }
-    if wf.order_by.is_empty() {
         let final_max = max_val.unwrap_or(Value::Null);
         for &row_idx in row_indices {
             results[row_idx][wf_idx] = final_max.clone();
         }
+        return Ok(());
+    }
+
+    if running {
+        let mut max_val: Option<Value> = None;
+        for &row_idx in row_indices {
+            if let Some(ref arg) = wf.arg_expr {
+                let ctx = JoinContext {
+                    tables: HashMap::new(),
+                    column_offsets,
+                    merged_column_offsets,
+                    combined_row: &rows[row_idx],
+                    combined_schema,
+                };
+                let val = eval_expr_join(arg, &ctx)?;
+                if !matches!(val, Value::Null) {
+                    max_val = Some(match &max_val {
+                        None => val.clone(),
+                        Some(m) => {
+                            if compare_values(&val, m).unwrap_or(0) > 0 {
+                                val.clone()
+                            } else {
+                                m.clone()
+                            }
+                        }
+                    });
+                }
+            }
+            results[row_idx][wf_idx] = max_val.clone().unwrap_or(Value::Null);
+        }
+        return Ok(());
+    }
+
+    let partition_size = row_indices.len();
+
+    for (pos, &row_idx) in row_indices.iter().enumerate() {
+        let (start, end) = get_frame_bounds(wf, pos, partition_size);
+        let mut max_val: Option<Value> = None;
+        for i in start..end {
+            if i < partition_size {
+                let frame_row_idx = row_indices[i];
+                if let Some(ref arg) = wf.arg_expr {
+                    let ctx = JoinContext {
+                        tables: HashMap::new(),
+                        column_offsets,
+                        merged_column_offsets,
+                        combined_row: &rows[frame_row_idx],
+                        combined_schema,
+                    };
+                    let val = eval_expr_join(arg, &ctx)?;
+                    if !matches!(val, Value::Null) {
+                        max_val = Some(match &max_val {
+                            None => val.clone(),
+                            Some(m) => {
+                                if compare_values(&val, m).unwrap_or(0) > 0 {
+                                    val.clone()
+                                } else {
+                                    m.clone()
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        results[row_idx][wf_idx] = max_val.unwrap_or(Value::Null);
     }
     Ok(())
 }
@@ -1162,6 +1450,7 @@ fn compute_lead_join(
 mod tests {
     use super::*;
     use crate::types::{ColumnDef, DataType};
+    use sqlparser::ast::WindowFrameUnits;
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -1337,5 +1626,63 @@ mod tests {
         assert_eq!(results[1][1], Value::Int64(3));
         assert_eq!(results[2][1], Value::Int64(1));
         assert_eq!(results[3][1], Value::Int64(2));
+    }
+
+    #[test]
+    fn window_join_aggregates_respect_explicit_frame() {
+        let schema = test_schema();
+        let window_frame = Some(WindowFrame {
+            units: WindowFrameUnits::Rows,
+            start_bound: WindowFrameBound::Preceding(None),
+            end_bound: Some(WindowFrameBound::Following(None)),
+        });
+
+        let window_func = |func_name: &str, proj_idx: usize| WindowFuncInfo {
+            proj_idx,
+            func_name: func_name.to_string(),
+            arg_expr: Some(Expr::Identifier(sqlparser::ast::Ident::new("grp"))),
+            partition_by: vec![],
+            order_by: vec![OrderByExpr {
+                expr: Expr::Identifier(sqlparser::ast::Ident::new("id")),
+                asc: Some(true),
+                nulls_first: None,
+            }],
+            offset_expr: None,
+            default_value_expr: None,
+            window_frame: window_frame.clone(),
+        };
+
+        let window_funcs = vec![
+            window_func("sum", 0),
+            window_func("avg", 1),
+            window_func("min", 2),
+            window_func("max", 3),
+        ];
+
+        let mut column_offsets = HashMap::new();
+        column_offsets.insert("id".to_string(), 0);
+        column_offsets.insert("grp".to_string(), 1);
+
+        let rows = vec![
+            Row::new(vec![Value::Int32(1), Value::Float64(20.0)]),
+            Row::new(vec![Value::Int32(2), Value::Float64(10.0)]),
+            Row::new(vec![Value::Int32(3), Value::Float64(30.0)]),
+        ];
+
+        let results = compute_window_functions_join(
+            &rows,
+            &column_offsets,
+            None,
+            &schema,
+            &window_funcs,
+        )
+        .unwrap();
+
+        for row in &results {
+            assert_eq!(row[0], Value::Float64(60.0));
+            assert_eq!(row[1], Value::Float64(20.0));
+            assert_eq!(row[2], Value::Float64(10.0));
+            assert_eq!(row[3], Value::Float64(30.0));
+        }
     }
 }
