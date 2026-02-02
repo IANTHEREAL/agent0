@@ -584,7 +584,7 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
         SqlDataType::Date => Ok(DataType::Date),
         SqlDataType::Time(_, _) => Ok(DataType::Time),
         SqlDataType::Uuid => Ok(DataType::Uuid),
-        SqlDataType::JSON => Ok(DataType::Jsonb),
+        SqlDataType::JSON => Ok(DataType::Json),
         SqlDataType::Custom(name, modifiers) => {
             if let Some(ident) = name.0.last() {
                 let type_name = ident.value.to_uppercase();

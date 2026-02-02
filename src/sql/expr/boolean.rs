@@ -125,10 +125,42 @@ pub(crate) fn validate_bool_expr_in_boolean_context(
 
         Expr::AnyOp { .. } | Expr::AllOp { .. } => Ok(()),
 
-        Expr::JsonAccess { operator, .. } => {
+        Expr::JsonAccess { operator, right, .. } => {
             use sqlparser::ast::JsonOperator;
             match operator {
                 JsonOperator::AtArrow | JsonOperator::ArrowAt => Ok(()),
+                // sqlparser-rs precedence quirk: expressions like `col ->> 'k' = 'v'` can be
+                // parsed as `JsonAccess(col, ->>, BinaryOp('k', =, 'v'))`. Our evaluator
+                // handles this form, so treat it as boolean in WHERE/FILTER contexts.
+                JsonOperator::Arrow
+                | JsonOperator::LongArrow
+                | JsonOperator::HashArrow
+                | JsonOperator::HashLongArrow => match right.as_ref() {
+                    Expr::InList { .. } => Ok(()),
+                    Expr::BinaryOp { op, .. } => match op {
+                        BinaryOperator::And
+                        | BinaryOperator::Or
+                        | BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Gt
+                        | BinaryOperator::Lt
+                        | BinaryOperator::GtEq
+                        | BinaryOperator::LtEq
+                        | BinaryOperator::PGRegexMatch
+                        | BinaryOperator::PGRegexIMatch
+                        | BinaryOperator::PGRegexNotMatch
+                        | BinaryOperator::PGRegexNotIMatch
+                        | BinaryOperator::PGOverlap => Ok(()),
+                        BinaryOperator::Custom(op) if op == "?" => Ok(()),
+                        BinaryOperator::PGCustomBinaryOperator(op)
+                            if op.len() == 1 && op[0] == "?" =>
+                        {
+                            Ok(())
+                        }
+                        _ => Err(anyhow!(err_msg)),
+                    },
+                    _ => Err(anyhow!(err_msg)),
+                },
                 _ => Err(anyhow!(err_msg)),
             }
         }

@@ -125,6 +125,45 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg:
             _ => Err(anyhow!(err_msg)),
         },
 
+        Expr::JsonAccess { operator, right, .. } => {
+            use sqlparser::ast::JsonOperator;
+            match operator {
+                JsonOperator::AtArrow | JsonOperator::ArrowAt => Ok(()),
+                // See `validate_bool_expr_in_boolean_context` for rationale: sqlparser can
+                // attach comparison/IN expressions under the RHS of a JSON access.
+                JsonOperator::Arrow
+                | JsonOperator::LongArrow
+                | JsonOperator::HashArrow
+                | JsonOperator::HashLongArrow => match right.as_ref() {
+                    Expr::InList { .. } => Ok(()),
+                    Expr::BinaryOp { op, .. } => match op {
+                        BinaryOperator::And
+                        | BinaryOperator::Or
+                        | BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Gt
+                        | BinaryOperator::Lt
+                        | BinaryOperator::GtEq
+                        | BinaryOperator::LtEq
+                        | BinaryOperator::PGRegexMatch
+                        | BinaryOperator::PGRegexIMatch
+                        | BinaryOperator::PGRegexNotMatch
+                        | BinaryOperator::PGRegexNotIMatch
+                        | BinaryOperator::PGOverlap => Ok(()),
+                        BinaryOperator::Custom(op) if op == "?" => Ok(()),
+                        BinaryOperator::PGCustomBinaryOperator(op)
+                            if op.len() == 1 && op[0] == "?" =>
+                        {
+                            Ok(())
+                        }
+                        _ => Err(anyhow!(err_msg)),
+                    },
+                    _ => Err(anyhow!(err_msg)),
+                },
+                _ => Err(anyhow!(err_msg)),
+            }
+        }
+
         Expr::Like { expr, pattern, .. } => {
             ensure_text_or_explicit_null_operand(ctx, expr, "LIKE requires text operands")?;
             ensure_text_or_explicit_null_operand(ctx, pattern, "LIKE requires text operands")?;

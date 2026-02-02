@@ -5715,54 +5715,61 @@ fn encode_value(
         }
         Value::Json(s) => encoder.encode_field(s),
         Value::Jsonb(s) => {
-            use serde::Serialize;
-
-            struct PgJsonbFormatter;
-
-            impl serde_json::ser::Formatter for PgJsonbFormatter {
-                fn begin_array_value<W: ?Sized + std::io::Write>(
-                    &mut self,
-                    writer: &mut W,
-                    first: bool,
-                ) -> std::io::Result<()> {
-                    if first {
-                        Ok(())
-                    } else {
-                        writer.write_all(b", ")
+            fn write_jsonb_pg(out: &mut String, val: &serde_json::Value) {
+                match val {
+                    serde_json::Value::Null => out.push_str("null"),
+                    serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+                    serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+                    serde_json::Value::String(s) => {
+                        // Delegate escaping to serde_json.
+                        if let Ok(escaped) = serde_json::to_string(s) {
+                            out.push_str(&escaped);
+                        } else {
+                            out.push_str("\"\"");
+                        }
                     }
-                }
-
-                fn begin_object_key<W: ?Sized + std::io::Write>(
-                    &mut self,
-                    writer: &mut W,
-                    first: bool,
-                ) -> std::io::Result<()> {
-                    if first {
-                        Ok(())
-                    } else {
-                        writer.write_all(b", ")
+                    serde_json::Value::Array(arr) => {
+                        out.push('[');
+                        for (idx, item) in arr.iter().enumerate() {
+                            if idx > 0 {
+                                out.push_str(", ");
+                            }
+                            write_jsonb_pg(out, item);
+                        }
+                        out.push(']');
                     }
-                }
+                    serde_json::Value::Object(obj) => {
+                        use std::cmp::Ordering;
+                        let mut items: Vec<(&String, &serde_json::Value)> = obj.iter().collect();
+                        // PostgreSQL jsonb key ordering: length first, then binary (byte) order.
+                        items.sort_by(|(k1, _), (k2, _)| match k1.len().cmp(&k2.len()) {
+                            Ordering::Equal => k1.cmp(k2),
+                            other => other,
+                        });
 
-                fn begin_object_value<W: ?Sized + std::io::Write>(
-                    &mut self,
-                    writer: &mut W,
-                ) -> std::io::Result<()> {
-                    writer.write_all(b": ")
+                        out.push('{');
+                        for (idx, (k, v)) in items.into_iter().enumerate() {
+                            if idx > 0 {
+                                out.push_str(", ");
+                            }
+                            if let Ok(key) = serde_json::to_string(k) {
+                                out.push_str(&key);
+                            } else {
+                                out.push_str("\"\"");
+                            }
+                            out.push_str(": ");
+                            write_jsonb_pg(out, v);
+                        }
+                        out.push('}');
+                    }
                 }
             }
 
             match serde_json::from_str::<serde_json::Value>(s) {
                 Ok(val) => {
-                    let mut buf = Vec::new();
-                    let mut ser =
-                        serde_json::Serializer::with_formatter(&mut buf, PgJsonbFormatter);
-                    if val.serialize(&mut ser).is_ok() {
-                        if let Ok(formatted) = String::from_utf8(buf) {
-                            return encoder.encode_field(&formatted);
-                        }
-                    }
-                    encoder.encode_field(s)
+                    let mut formatted = String::new();
+                    write_jsonb_pg(&mut formatted, &val);
+                    encoder.encode_field(&formatted)
                 }
                 Err(_) => encoder.encode_field(s),
             }
