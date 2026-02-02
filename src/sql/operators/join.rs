@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use sqlparser::ast::{Expr, JoinOperator};
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::eval_expr;
+use crate::sql::expr::{eval_expr, parse_bool_pg};
 use crate::types::{ColumnDef, Row, TableSchema, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -133,6 +133,8 @@ impl NestedLoopJoinOperator {
             match result {
                 Value::Boolean(b) => Ok(b),
                 Value::Null => Ok(false),
+                Value::Text(s) => parse_bool_pg(&s)
+                    .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
                 _ => Err(anyhow!("Join condition must evaluate to boolean")),
             }
         } else {

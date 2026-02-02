@@ -1,0 +1,9 @@
+l_id|r_id
+1|10
+1|20
+2|10
+2|20
+(4 rows)
+l_id|r_id
+(0 rows)
+ERROR:  invalid input syntax for type boolean: "notabool"
