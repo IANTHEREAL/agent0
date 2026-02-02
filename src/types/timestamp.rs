@@ -63,17 +63,17 @@ pub(crate) enum TimeZoneSpec {
 }
 
 impl TimeZoneSpec {
-    pub(crate) fn parse(setting: &str) -> Self {
+    pub(crate) fn try_parse(setting: &str) -> Result<Self> {
         let setting = setting.trim();
         if setting.is_empty() {
-            return Self::Named(chrono_tz::UTC);
+            return Ok(Self::Named(chrono_tz::UTC));
         }
         if setting.eq_ignore_ascii_case("UTC") || setting.eq_ignore_ascii_case("GMT") {
-            return Self::Named(chrono_tz::UTC);
+            return Ok(Self::Named(chrono_tz::UTC));
         }
 
         if let Some(offset) = parse_fixed_offset(setting) {
-            return Self::Fixed(offset);
+            return Ok(Self::Fixed(offset));
         }
 
         let normalized;
@@ -86,7 +86,11 @@ impl TimeZoneSpec {
 
         zone.parse::<chrono_tz::Tz>()
             .map(Self::Named)
-            .unwrap_or(Self::Named(chrono_tz::UTC))
+            .map_err(|_| anyhow::anyhow!("time zone \"{}\" not recognized", setting))
+    }
+
+    pub(crate) fn parse(setting: &str) -> Self {
+        Self::try_parse(setting).unwrap_or(Self::Named(chrono_tz::UTC))
     }
 
     pub(crate) fn format_timestamptz(self, dt_utc: DateTime<Utc>, micros: u32) -> String {
@@ -249,5 +253,14 @@ mod tests {
             tz.format_timestamptz(dt, 0),
             "2024-01-15 18:00:00+08".to_string()
         );
+    }
+
+    #[test]
+    fn timezone_spec_try_parse_rejects_unknown_zones() {
+        assert!(TimeZoneSpec::try_parse("localtime").is_err());
+        assert!(matches!(
+            TimeZoneSpec::parse("localtime"),
+            TimeZoneSpec::Named(chrono_tz::UTC)
+        ));
     }
 }

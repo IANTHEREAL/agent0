@@ -128,7 +128,10 @@ impl SessionSettings {
             "idle_in_transaction_session_timeout" => {
                 self.idle_in_transaction_session_timeout_ms = Self::parse_timeout_millis(&value)?
             }
-            "timezone" => self.timezone = Some(value),
+            "timezone" => {
+                crate::types::timestamp::TimeZoneSpec::try_parse(&value)?;
+                self.timezone = Some(value);
+            }
             "application_name" => self.application_name = Some(value),
             "client_encoding" => self.client_encoding = Some(value),
             "standard_conforming_strings" => self.standard_conforming_strings = Some(value),
@@ -541,6 +544,14 @@ mod tests {
         assert!(settings
             .set_known_setting("timezone", "Asia/Shanghai".to_string())
             .unwrap());
+        assert_eq!(
+            settings.show_value("timezone").as_deref(),
+            Some("Asia/Shanghai")
+        );
+
+        assert!(settings
+            .set_known_setting("timezone", "localtime".to_string())
+            .is_err());
         assert_eq!(
             settings.show_value("timezone").as_deref(),
             Some("Asia/Shanghai")
