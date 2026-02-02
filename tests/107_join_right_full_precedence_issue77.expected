@@ -1,0 +1,12 @@
+a_id|b_id|c_id
+1|NULL|2
+2|NULL|2
+(2 rows)
+a_id|b_id|c_id
+(0 rows)
+a_id|b_id|c_id
+1|1|NULL
+1|NULL|2
+2|1|NULL
+2|NULL|2
+(4 rows)
