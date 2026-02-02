@@ -2144,7 +2144,7 @@ impl Executor {
                                 let matches = if let Some(cond) = &join_condition {
                                     let ctx = JoinContext {
                                         tables: HashMap::new(),
-                                        column_offsets: column_offsets.clone(),
+                                        column_offsets: &column_offsets,
                                         merged_column_offsets: None,
                                         combined_row: &combined_row,
                                         combined_schema: &temp_combined_schema,
@@ -2735,7 +2735,7 @@ impl Executor {
                         let matches = if let Some(ref cond) = resolved_condition {
                             let ctx = JoinContext {
                                 tables: HashMap::new(),
-                                column_offsets: column_offsets.clone(),
+                                column_offsets: &column_offsets,
                                 merged_column_offsets: None,
                                 combined_row: &combined_row,
                                 combined_schema: &temp_combined_schema,
@@ -3010,7 +3010,7 @@ impl Executor {
 
                         let ctx = JoinContext {
                             tables: HashMap::new(),
-                            column_offsets: final_column_offsets.clone(),
+                            column_offsets: final_column_offsets,
                             merged_column_offsets: None,
                             combined_row: &combined_row,
                             combined_schema: final_schema,
@@ -3607,7 +3607,7 @@ impl Executor {
                         let matches = if let Some(ref cond) = resolved_condition {
                             let ctx = JoinContext {
                                 tables: HashMap::new(),
-                                column_offsets: column_offsets.clone(),
+                                column_offsets: &column_offsets,
                                 merged_column_offsets: None,
                                 combined_row: &combined_row,
                                 combined_schema: &temp_combined_schema,
@@ -3785,7 +3785,7 @@ impl Executor {
             for row in combined_rows {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
-                    column_offsets: final_column_offsets.clone(),
+                    column_offsets: &final_column_offsets,
                     merged_column_offsets: merged_column_offsets_ref,
                     combined_row: &row,
                     combined_schema: &final_schema,
@@ -3896,7 +3896,7 @@ impl Executor {
             for row in filtered_rows {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
-                    column_offsets: final_column_offsets.clone(),
+                    column_offsets: &final_column_offsets,
                     merged_column_offsets: merged_column_offsets_ref,
                     combined_row: &row,
                     combined_schema: &final_schema,
@@ -4074,7 +4074,7 @@ impl Executor {
                 let representative = &group_rows[&key_bytes];
                 let ctx = JoinContext {
                     tables: HashMap::new(),
-                    column_offsets: final_column_offsets.clone(),
+                    column_offsets: &final_column_offsets,
                     merged_column_offsets: merged_column_offsets_ref,
                     combined_row: representative,
                     combined_schema: &final_schema,
@@ -4323,7 +4323,7 @@ impl Executor {
                 for (orig_idx, row) in filtered_rows.into_iter().enumerate() {
                     let ctx = JoinContext {
                         tables: HashMap::new(),
-                        column_offsets: final_column_offsets.clone(),
+                        column_offsets: &final_column_offsets,
                         merged_column_offsets: merged_column_offsets_ref,
                         combined_row: &row,
                         combined_schema: &final_schema,
@@ -4424,14 +4424,14 @@ impl Executor {
                         let expr = &resolved_order_exprs[idx];
                         let ctx_a = JoinContext {
                             tables: HashMap::new(),
-                            column_offsets: final_column_offsets.clone(),
+                            column_offsets: &final_column_offsets,
                             merged_column_offsets: merged_column_offsets_ref,
                             combined_row: a,
                             combined_schema: &final_schema,
                         };
                         let ctx_b = JoinContext {
                             tables: HashMap::new(),
-                            column_offsets: final_column_offsets.clone(),
+                            column_offsets: &final_column_offsets,
                             merged_column_offsets: merged_column_offsets_ref,
                             combined_row: b,
                             combined_schema: &final_schema,
@@ -4650,7 +4650,7 @@ impl Executor {
             for (row_idx, row) in rows_to_project.iter().enumerate() {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
-                    column_offsets: final_column_offsets.clone(),
+                    column_offsets: &final_column_offsets,
                     merged_column_offsets: merged_column_offsets_ref,
                     combined_row: row,
                     combined_schema: &final_schema,
@@ -4761,7 +4761,7 @@ impl Executor {
             for (row_idx, row) in rows_to_project.iter().enumerate() {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
-                    column_offsets: final_column_offsets.clone(),
+                    column_offsets: &final_column_offsets,
                     merged_column_offsets: merged_column_offsets_ref,
                     combined_row: row,
                     combined_schema: &final_schema,

@@ -600,7 +600,7 @@ pub(crate) fn compute_window_functions_join(
         for (row_idx, row) in rows.iter().enumerate() {
             let ctx = JoinContext {
                 tables: HashMap::new(),
-                column_offsets: column_offsets.clone(),
+                column_offsets,
                 merged_column_offsets,
                 combined_row: row,
                 combined_schema,
@@ -620,14 +620,14 @@ pub(crate) fn compute_window_functions_join(
                     for order_expr in &wf.order_by {
                         let ctx_a = JoinContext {
                             tables: HashMap::new(),
-                            column_offsets: column_offsets.clone(),
+                            column_offsets,
                             merged_column_offsets,
                             combined_row: &rows[a],
                             combined_schema,
                         };
                         let ctx_b = JoinContext {
                             tables: HashMap::new(),
-                            column_offsets: column_offsets.clone(),
+                            column_offsets,
                             merged_column_offsets,
                             combined_row: &rows[b],
                             combined_schema,
@@ -752,7 +752,7 @@ fn compute_rank_join(
     for (pos, &row_idx) in row_indices.iter().enumerate() {
         let ctx = JoinContext {
             tables: HashMap::new(),
-            column_offsets: column_offsets.clone(),
+            column_offsets,
             merged_column_offsets,
             combined_row: &rows[row_idx],
             combined_schema,
@@ -787,7 +787,7 @@ fn compute_dense_rank_join(
     for &row_idx in row_indices {
         let ctx = JoinContext {
             tables: HashMap::new(),
-            column_offsets: column_offsets.clone(),
+            column_offsets,
             merged_column_offsets,
             combined_row: &rows[row_idx],
             combined_schema,
@@ -824,7 +824,7 @@ fn compute_sum_join(
             if let Some(ref arg) = wf.arg_expr {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
-                    column_offsets: column_offsets.clone(),
+                    column_offsets,
                     merged_column_offsets,
                     combined_row: &rows[row_idx],
                     combined_schema,
@@ -849,7 +849,7 @@ fn compute_sum_join(
             if let Some(ref arg) = wf.arg_expr {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
-                    column_offsets: column_offsets.clone(),
+                    column_offsets,
                     merged_column_offsets,
                     combined_row: &rows[row_idx],
                     combined_schema,
@@ -886,7 +886,7 @@ fn compute_avg_join(
             if let Some(ref arg) = wf.arg_expr {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
-                    column_offsets: column_offsets.clone(),
+                    column_offsets,
                     merged_column_offsets,
                     combined_row: &rows[row_idx],
                     combined_schema,
@@ -931,7 +931,7 @@ fn compute_avg_join(
             if let Some(ref arg) = wf.arg_expr {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
-                    column_offsets: column_offsets.clone(),
+                    column_offsets,
                     merged_column_offsets,
                     combined_row: &rows[row_idx],
                     combined_schema,
@@ -985,7 +985,7 @@ fn compute_min_join(
         if let Some(ref arg) = wf.arg_expr {
             let ctx = JoinContext {
                 tables: HashMap::new(),
-                column_offsets: column_offsets.clone(),
+                column_offsets,
                 merged_column_offsets,
                 combined_row: &rows[row_idx],
                 combined_schema,
@@ -1032,7 +1032,7 @@ fn compute_max_join(
         if let Some(ref arg) = wf.arg_expr {
             let ctx = JoinContext {
                 tables: HashMap::new(),
-                column_offsets: column_offsets.clone(),
+                column_offsets,
                 merged_column_offsets,
                 combined_row: &rows[row_idx],
                 combined_schema,
@@ -1094,7 +1094,7 @@ fn compute_lag_join(
             if let Some(ref arg) = wf.arg_expr {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
-                    column_offsets: column_offsets.clone(),
+                    column_offsets,
                     merged_column_offsets,
                     combined_row: &rows[lag_row_idx],
                     combined_schema,
@@ -1141,7 +1141,7 @@ fn compute_lead_join(
             if let Some(ref arg) = wf.arg_expr {
                 let ctx = JoinContext {
                     tables: HashMap::new(),
-                    column_offsets: column_offsets.clone(),
+                    column_offsets,
                     merged_column_offsets,
                     combined_row: &rows[lead_row_idx],
                     combined_schema,

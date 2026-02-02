@@ -1655,7 +1655,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
 
                         let mut relid: Option<i64> = None;
                         let mut def: Option<&Value> = None;
-                        for (col_key, &offset) in &join_ctx.column_offsets {
+                        for (col_key, &offset) in join_ctx.column_offsets {
                             if relid.is_none()
                                 && (col_key.ends_with(".indexrelid") || col_key == "indexrelid")
                             {

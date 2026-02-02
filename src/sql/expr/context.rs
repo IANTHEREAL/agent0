@@ -139,7 +139,7 @@ impl<'a> JoinEvalContext<'a> {
 
     pub fn from_join_context(ctx: &'a super::JoinContext<'a>) -> Self {
         Self {
-            column_offsets: &ctx.column_offsets,
+            column_offsets: ctx.column_offsets,
             merged_column_offsets: ctx.merged_column_offsets,
             combined_row: ctx.combined_row,
             combined_schema: ctx.combined_schema,

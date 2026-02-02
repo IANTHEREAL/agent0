@@ -91,7 +91,7 @@ where
 pub struct JoinContext<'a> {
     #[allow(dead_code)]
     pub tables: HashMap<String, (&'a TableSchema, &'a Row)>,
-    pub column_offsets: HashMap<String, usize>,
+    pub column_offsets: &'a HashMap<String, usize>,
     /// Offsets for merged output columns produced by `USING`/`NATURAL` joins.
     ///
     /// For outer joins, the merged join key should behave like `COALESCE(left, right)` so that
@@ -217,7 +217,7 @@ pub fn eval_with_context(expr: &Expr, ctx: &SingleTableContext) -> Result<Value>
 pub fn eval_with_join_context(expr: &Expr, ctx: &JoinEvalContext) -> Result<Value> {
     let join_ctx = JoinContext {
         tables: HashMap::new(),
-        column_offsets: ctx.column_offsets.clone(),
+        column_offsets: ctx.column_offsets,
         merged_column_offsets: ctx.merged_column_offsets,
         combined_row: ctx.combined_row,
         combined_schema: ctx.combined_schema,
@@ -2163,7 +2163,7 @@ mod tests {
 
         let ctx = JoinContext {
             tables: HashMap::new(),
-            column_offsets,
+            column_offsets: &column_offsets,
             merged_column_offsets: None,
             combined_row: &combined_row,
             combined_schema: &combined_schema,

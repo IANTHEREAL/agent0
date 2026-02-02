@@ -112,8 +112,8 @@ pub fn distinct_on_rows_join_with_indices(
     for (idx, row) in rows.into_iter().enumerate() {
         let ctx = JoinContext {
             tables: std::collections::HashMap::new(),
-            column_offsets: column_offsets.clone(),
             merged_column_offsets,
+            column_offsets,
             combined_row: &row,
             combined_schema,
         };

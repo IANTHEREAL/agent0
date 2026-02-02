@@ -2157,7 +2157,7 @@ impl Executor {
         Box::pin(async move {
             let substituted_query = super::super::helpers::substitute_join_context_values_in_query(
                 subquery,
-                &join_ctx.column_offsets,
+                join_ctx.column_offsets,
                 join_ctx.combined_row,
             );
             let result = self
