@@ -3970,6 +3970,7 @@ impl Executor {
             }
 
             let final_rows = if has_order_by {
+                let mut compare_error: Option<anyhow::Error> = None;
                 final_rows_with_order_keys.sort_by(|(a_idx, _, a_keys), (b_idx, _, b_keys)| {
                     for (i, order_expr) in query.order_by.iter().enumerate() {
                         let val_a = a_keys.get(i).cloned().unwrap_or(Value::Null);
@@ -3996,7 +3997,15 @@ impl Executor {
                             _ => {}
                         }
 
-                        let cmp = super::super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                        let cmp = match super::super::expr::compare_values(&val_a, &val_b) {
+                            Ok(cmp) => cmp,
+                            Err(err) => {
+                                if compare_error.is_none() {
+                                    compare_error = Some(err);
+                                }
+                                return std::cmp::Ordering::Equal;
+                            }
+                        };
                         if cmp != 0 {
                             return if asc {
                                 if cmp > 0 {
@@ -4013,6 +4022,9 @@ impl Executor {
                     }
                     a_idx.cmp(b_idx)
                 });
+                if let Some(err) = compare_error {
+                    return Err(err);
+                }
                 final_rows_with_order_keys
                     .into_iter()
                     .map(|(_, r, _)| r)
@@ -4105,13 +4117,44 @@ impl Executor {
                     rows_with_keys.push((orig_idx, row, keys));
                 }
 
-                rows_with_keys.sort_by(|(_, _, a_keys), (_, _, b_keys)| {
+                let mut compare_error: Option<anyhow::Error> = None;
+                rows_with_keys.sort_by(|(idx_a, _, a_keys), (idx_b, _, b_keys)| {
                     for (idx, order_expr) in query.order_by.iter().enumerate() {
                         let val_a = a_keys.get(idx).cloned().unwrap_or(Value::Null);
                         let val_b = b_keys.get(idx).cloned().unwrap_or(Value::Null);
-                        let cmp = super::super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+
+                        let asc = order_expr.asc.unwrap_or(true);
+                        let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+
+                        match (&val_a, &val_b) {
+                            (Value::Null, Value::Null) => continue,
+                            (Value::Null, _) => {
+                                return if nulls_first {
+                                    std::cmp::Ordering::Less
+                                } else {
+                                    std::cmp::Ordering::Greater
+                                }
+                            }
+                            (_, Value::Null) => {
+                                return if nulls_first {
+                                    std::cmp::Ordering::Greater
+                                } else {
+                                    std::cmp::Ordering::Less
+                                }
+                            }
+                            _ => {}
+                        }
+
+                        let cmp = match super::super::expr::compare_values(&val_a, &val_b) {
+                            Ok(cmp) => cmp,
+                            Err(err) => {
+                                if compare_error.is_none() {
+                                    compare_error = Some(err);
+                                }
+                                return std::cmp::Ordering::Equal;
+                            }
+                        };
                         if cmp != 0 {
-                            let asc = order_expr.asc.unwrap_or(true);
                             return if asc {
                                 if cmp > 0 {
                                     std::cmp::Ordering::Greater
@@ -4125,8 +4168,11 @@ impl Executor {
                             };
                         }
                     }
-                    std::cmp::Ordering::Equal
+                    idx_a.cmp(idx_b)
                 });
+                if let Some(err) = compare_error {
+                    return Err(err);
+                }
 
                 let reordered_wr = window_results.map(|wr| {
                     rows_with_keys
@@ -4140,7 +4186,8 @@ impl Executor {
             } else {
                 let mut indexed: Vec<(usize, Row)> =
                     filtered_rows.into_iter().enumerate().collect();
-                indexed.sort_by(|(_, a), (_, b)| {
+                let mut compare_error: Option<anyhow::Error> = None;
+                indexed.sort_by(|(idx_a, a), (idx_b, b)| {
                     for (idx, order_expr) in query.order_by.iter().enumerate() {
                         let expr = &resolved_order_exprs[idx];
                         let ctx_a = JoinContext {
@@ -4159,9 +4206,39 @@ impl Executor {
                         };
                         let val_a = eval_expr_join(expr, &ctx_a).unwrap_or(Value::Null);
                         let val_b = eval_expr_join(expr, &ctx_b).unwrap_or(Value::Null);
-                        let cmp = super::super::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+
+                        let asc = order_expr.asc.unwrap_or(true);
+                        let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+
+                        match (&val_a, &val_b) {
+                            (Value::Null, Value::Null) => continue,
+                            (Value::Null, _) => {
+                                return if nulls_first {
+                                    std::cmp::Ordering::Less
+                                } else {
+                                    std::cmp::Ordering::Greater
+                                }
+                            }
+                            (_, Value::Null) => {
+                                return if nulls_first {
+                                    std::cmp::Ordering::Greater
+                                } else {
+                                    std::cmp::Ordering::Less
+                                }
+                            }
+                            _ => {}
+                        }
+
+                        let cmp = match super::super::expr::compare_values(&val_a, &val_b) {
+                            Ok(cmp) => cmp,
+                            Err(err) => {
+                                if compare_error.is_none() {
+                                    compare_error = Some(err);
+                                }
+                                return std::cmp::Ordering::Equal;
+                            }
+                        };
                         if cmp != 0 {
-                            let asc = order_expr.asc.unwrap_or(true);
                             return if asc {
                                 if cmp > 0 {
                                     std::cmp::Ordering::Greater
@@ -4175,8 +4252,11 @@ impl Executor {
                             };
                         }
                     }
-                    std::cmp::Ordering::Equal
+                    idx_a.cmp(idx_b)
                 });
+                if let Some(err) = compare_error {
+                    return Err(err);
+                }
                 let reordered_wr = window_results.map(|wr| {
                     indexed
                         .iter()
