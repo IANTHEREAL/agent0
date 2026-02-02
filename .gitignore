@@ -1,2 +1,3 @@
 bin/*
 .agent0
+.env
