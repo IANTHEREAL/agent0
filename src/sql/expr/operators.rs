@@ -287,23 +287,22 @@ fn add_interval_to_timestamp(ts_millis: i64, iv: &crate::types::IntervalValue) -
     let mut result = dt;
 
     if iv.months != 0 {
-        let mut year = result.year();
-        let mut month = result.month() as i32 + iv.months;
+        // NOTE: normalize months in O(1) and avoid i32 overflow.
+        // `year * 12 + (month-1)` gives an absolute month index. We add the interval months in i64
+        // then convert back using euclidean division so negative values work as expected.
+        let abs_month0 = i64::from(result.year()) * 12 + (i64::from(result.month()) - 1);
+        let abs_month = abs_month0 + i64::from(iv.months);
+        let year_i64 = abs_month.div_euclid(12);
+        let month_u32 = (abs_month.rem_euclid(12) + 1) as u32;
 
-        while month > 12 {
-            month -= 12;
-            year += 1;
-        }
-        while month < 1 {
-            month += 12;
-            year -= 1;
-        }
+        let year = i32::try_from(year_i64)
+            .map_err(|_| anyhow!("Date out of range after adding months"))?;
 
-        let day = result.day().min(days_in_month(year, month as u32));
+        let day = result.day().min(days_in_month(year, month_u32));
 
         result = result
             .with_year(year)
-            .and_then(|d| d.with_month(month as u32))
+            .and_then(|d| d.with_month(month_u32))
             .and_then(|d| d.with_day(day))
             .ok_or_else(|| anyhow!("Date out of range after adding months"))?;
     }
@@ -865,5 +864,18 @@ mod tests {
 
         let err = add_interval_to_timestamp(ts_millis, &iv).unwrap_err();
         assert!(err.to_string().contains("Interval out of range"));
+    }
+
+    #[test]
+    fn test_add_interval_to_timestamp_month_overflow_does_not_panic() {
+        let ts_millis = 0;
+
+        let iv = crate::types::IntervalValue::from_months(i32::MAX);
+        let err = add_interval_to_timestamp(ts_millis, &iv).unwrap_err();
+        assert!(err.to_string().contains("Date out of range"));
+
+        let iv = crate::types::IntervalValue::from_months(i32::MIN);
+        let err = add_interval_to_timestamp(ts_millis, &iv).unwrap_err();
+        assert!(err.to_string().contains("Date out of range"));
     }
 }

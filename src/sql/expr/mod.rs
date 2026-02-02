@@ -251,9 +251,19 @@ fn interval_from_number(num: i64, interval: &sqlparser::ast::Interval) -> Result
 
 fn interval_from_field(num: i64, field: &sqlparser::ast::DateTimeField) -> Result<Value> {
     use crate::types::IntervalValue;
+    fn months_iv(months: i64) -> Result<IntervalValue> {
+        let months = i32::try_from(months).map_err(|_| anyhow!("Interval out of range"))?;
+        Ok(IntervalValue::from_months(months))
+    }
+
     let iv = match field {
-        sqlparser::ast::DateTimeField::Year => IntervalValue::from_months((num * 12) as i32),
-        sqlparser::ast::DateTimeField::Month => IntervalValue::from_months(num as i32),
+        sqlparser::ast::DateTimeField::Year => {
+            let months = num
+                .checked_mul(12)
+                .ok_or_else(|| anyhow!("Interval out of range"))?;
+            months_iv(months)?
+        }
+        sqlparser::ast::DateTimeField::Month => months_iv(num)?,
         sqlparser::ast::DateTimeField::Week => {
             IntervalValue::from_millis(num * 7 * 24 * 60 * 60 * 1000)
         }
@@ -3170,6 +3180,15 @@ mod tests {
 
         let result = eval_expr(&parse_expr("INTERVAL '1' MONTH"), None, None).unwrap();
         assert_eq!(result, Value::Interval(IntervalValue::from_months(1)));
+    }
+
+    #[test]
+    fn test_interval_expression_month_out_of_range_errors() {
+        let err = eval_expr(&parse_expr("INTERVAL '2147483648' MONTH"), None, None).unwrap_err();
+        assert!(err.to_string().contains("Interval out of range"));
+
+        let err = eval_expr(&parse_expr("INTERVAL '214748365' YEAR"), None, None).unwrap_err();
+        assert!(err.to_string().contains("Interval out of range"));
     }
 
     #[test]
