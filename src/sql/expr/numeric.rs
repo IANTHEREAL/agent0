@@ -2,6 +2,8 @@ use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 
+use crate::sql::pg_numeric::pg_numeric_div;
+
 #[derive(Debug, Clone)]
 pub enum NumericValue {
     Int32(i32),
@@ -158,7 +160,9 @@ pub fn numeric_div(left: NumericValue, right: NumericValue) -> Result<NumericVal
         (NumericValue::Int32(a), NumericValue::Int32(b)) => Ok(NumericValue::Int32(a / b)),
         (NumericValue::Int64(a), NumericValue::Int64(b)) => Ok(NumericValue::Int64(a / b)),
         (NumericValue::Float64(a), NumericValue::Float64(b)) => Ok(NumericValue::Float64(a / b)),
-        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => Ok(NumericValue::Decimal(a / b)),
+        (NumericValue::Decimal(a), NumericValue::Decimal(b)) => {
+            Ok(NumericValue::Decimal(pg_numeric_div(a, b)))
+        }
         _ => Err(anyhow!("type promotion failed")),
     }
 }
@@ -273,5 +277,27 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert_eq!(err, "Modulo by zero");
+    }
+
+    #[test]
+    fn test_div_decimal_pg_scale_rounding() {
+        let result = numeric_div(NumericValue::Decimal(Decimal::from(800)), NumericValue::Int32(3))
+            .unwrap();
+
+        match result {
+            NumericValue::Decimal(d) => assert_eq!(d.to_string(), "266.6666666666666667"),
+            _ => panic!("expected Decimal"),
+        }
+    }
+
+    #[test]
+    fn test_div_decimal_pg_scale_firstdigit_adjust() {
+        let result = numeric_div(NumericValue::Decimal(Decimal::ONE), NumericValue::Int32(3))
+            .unwrap();
+
+        match result {
+            NumericValue::Decimal(d) => assert_eq!(d.to_string(), "0.33333333333333333333"),
+            _ => panic!("expected Decimal"),
+        }
     }
 }

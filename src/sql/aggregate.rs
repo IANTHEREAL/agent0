@@ -1,10 +1,12 @@
 //! Aggregation logic
 
-use crate::sql::expr::compare_values;
-use crate::types::Value;
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+
+use crate::sql::expr::compare_values;
+use crate::sql::pg_numeric::pg_numeric_div;
+use crate::types::Value;
 
 #[derive(Debug)]
 pub enum Aggregator {
@@ -149,7 +151,8 @@ impl Aggregator {
                 if *count == 0 {
                     Value::Null
                 } else {
-                    Value::Numeric(*sum / Decimal::from(*count))
+                    let denom = Decimal::from(*count);
+                    Value::Numeric(pg_numeric_div(*sum, denom))
                 }
             }
             Aggregator::StringAgg { values, delimiter } => {
@@ -352,7 +355,7 @@ mod tests {
         assert_eq!(
             result,
             Value::Numeric(Decimal::from_str_exact(
-                "266.66666666666666666666666667"
+                "266.6666666666666667"
             )
             .unwrap())
         );

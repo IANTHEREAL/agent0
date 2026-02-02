@@ -21,6 +21,7 @@ mod names;
 mod parser;
 mod planner;
 mod plpgsql;
+mod pg_numeric;
 mod query;
 mod rbac;
 mod result;
