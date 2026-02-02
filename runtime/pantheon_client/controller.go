@@ -29,6 +29,10 @@ type ControllerConfig struct {
 	ProjectName string
 	Agent       string
 
+	// Rebootstrap forces running the bootstrap episode even if the controller
+	// state is already initialized.
+	Rebootstrap bool
+
 	// ParentBranchID is only used when the state file has no anchor_branch_id yet.
 	ParentBranchID string
 
@@ -89,7 +93,10 @@ func runControllerWithClient(ctx context.Context, cfg ControllerConfig, client a
 	if err != nil {
 		return err
 	}
-	bootstrapNeeded := !state.Initialized
+	if cfg.Rebootstrap && strings.TrimSpace(state.ActiveBranch) != "" {
+		return fmt.Errorf("cannot rebootstrap with an active episode branch in progress (active_episode_branch_id=%s)", strings.TrimSpace(state.ActiveBranch))
+	}
+	bootstrapNeeded := cfg.Rebootstrap || !state.Initialized
 
 	applyControllerOverrides(&state, cfg)
 	normalizeControllerDefaults(&state)

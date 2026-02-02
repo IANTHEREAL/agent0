@@ -26,6 +26,7 @@ func main() {
 		agentsMDURL     string
 		skillsURL       string
 		minibookAccount string
+		rebootstrap     bool
 	)
 
 	flag.StringVar(&mcpBaseURL, "mcp-base-url", envOr("MCP_BASE_URL", ""), "Pantheon MCP base URL (e.g. http://host:8000/mcp/sse)")
@@ -38,6 +39,7 @@ func main() {
 	flag.StringVar(&agentsMDURL, "agents-md-url", envOr("AGENTS_MD_URL", ""), "Optional: hint URL to initialize AGENTS.md inside the workspace")
 	flag.StringVar(&skillsURL, "skills-url", envOr("SKILLS_URL", ""), "Optional: hint URL to initialize skills inside the workspace")
 	flag.StringVar(&minibookAccount, "minibook-account", envOr("MINIBOOK_ACCOUNT", ""), "Minibook account to inject into AGENTS.md during bootstrap")
+	flag.BoolVar(&rebootstrap, "rebootstrap", false, "Force running the bootstrap episode even if already initialized (to refresh AGENTS.md/skills)")
 
 	flag.Parse()
 
@@ -45,16 +47,17 @@ func main() {
 	defer stop()
 
 	cfg := pantheon.ControllerConfig{
-		MCPBaseURL:     mcpBaseURL,
-		ProjectName:    projectName,
-		ParentBranchID: parentBranchID,
-		Agent:          mcpAgent,
-		Task:           task,
-		AgentsMDURL:    agentsMDURL,
-		SkillsURL:      skillsURL,
+		MCPBaseURL:      mcpBaseURL,
+		ProjectName:     projectName,
+		ParentBranchID:  parentBranchID,
+		Agent:           mcpAgent,
+		Rebootstrap:     rebootstrap,
+		Task:            task,
+		AgentsMDURL:     agentsMDURL,
+		SkillsURL:       skillsURL,
 		MinibookAccount: minibookAccount,
-		StatePath:      defaultStatePath,
-		MaxEpisodes:    maxEpisodes,
+		StatePath:       defaultStatePath,
+		MaxEpisodes:     maxEpisodes,
 	}
 
 	if err := pantheon.RunController(ctx, cfg); err != nil {

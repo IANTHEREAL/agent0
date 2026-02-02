@@ -217,3 +217,95 @@ func TestControllerResumesActiveBranch(t *testing.T) {
 		t.Fatalf("expected active cleared, got %q", st.ActiveBranch)
 	}
 }
+
+func TestControllerRebootstrapRunsBootstrapAgain(t *testing.T) {
+	tmp := t.TempDir()
+	statePath := filepath.Join(tmp, "state.json")
+
+	initial := ControllerState{
+		MCPBaseURL:   "http://localhost:8000/mcp/sse",
+		ProjectName:  "proj",
+		Agent:        "codex",
+		Task:         "do it",
+		Initialized:  true,
+		AnchorBranch: "parent-0",
+	}
+	if err := saveControllerState(statePath, initial); err != nil {
+		t.Fatalf("save initial state: %v", err)
+	}
+
+	client := &stubControllerClient{
+		branches: []string{"branch-1", "branch-2"},
+		getBranch: func(branchID string) (map[string]any, error) {
+			return map[string]any{"id": branchID, "status": "succeed"}, nil
+		},
+		branchOutput: func(branchID string, fullOutput bool) (map[string]any, error) {
+			return map[string]any{"output": "ok"}, nil
+		},
+	}
+
+	cfg := ControllerConfig{
+		StatePath:   statePath,
+		Rebootstrap: true,
+		MaxEpisodes: 1,
+	}
+
+	err := runControllerWithClient(context.Background(), cfg, client, func(time.Duration) {})
+	if err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if client.parallelExploreCalls != 2 {
+		t.Fatalf("expected 2 parallel_explore calls (rebootstrap + episode), got %d", client.parallelExploreCalls)
+	}
+
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatalf("read state file: %v", err)
+	}
+	var st ControllerState
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatalf("parse state file: %v", err)
+	}
+	if st.BootstrapBranch != "branch-1" {
+		t.Fatalf("expected bootstrap_branch_id=branch-1, got %q", st.BootstrapBranch)
+	}
+	if st.AnchorBranch != "branch-2" {
+		t.Fatalf("expected anchor branch-2, got %q", st.AnchorBranch)
+	}
+	if !st.Initialized {
+		t.Fatalf("expected initialized=true after rebootstrap")
+	}
+}
+
+func TestControllerRebootstrapErrorsWithActiveBranch(t *testing.T) {
+	tmp := t.TempDir()
+	statePath := filepath.Join(tmp, "state.json")
+
+	initial := ControllerState{
+		MCPBaseURL:   "http://localhost:8000/mcp/sse",
+		ProjectName:  "proj",
+		Agent:        "codex",
+		Task:         "do it",
+		Initialized:  true,
+		AnchorBranch: "parent-0",
+		ActiveBranch: "branch-77",
+	}
+	if err := saveControllerState(statePath, initial); err != nil {
+		t.Fatalf("save initial state: %v", err)
+	}
+
+	client := &stubControllerClient{}
+
+	cfg := ControllerConfig{
+		StatePath:   statePath,
+		Rebootstrap: true,
+	}
+
+	err := runControllerWithClient(context.Background(), cfg, client, func(time.Duration) {})
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if client.parallelExploreCalls != 0 {
+		t.Fatalf("expected 0 parallel_explore calls, got %d", client.parallelExploreCalls)
+	}
+}
