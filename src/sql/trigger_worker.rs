@@ -188,6 +188,40 @@ impl TriggerWorker {
         }
     }
 
+    async fn bootstrap_active_keyspaces(&self, pool: &TikvClientPool) {
+        let pd_endpoints = pool.pd_endpoints();
+        if pd_endpoints.is_empty() {
+            return;
+        }
+
+        let mut marked_any = false;
+        match list_keyspaces_from_pd(pd_endpoints).await {
+            Ok(keyspaces) => {
+                let mut discovered = 0usize;
+                for keyspace in keyspaces {
+                    self.mark_active(&keyspace);
+                    discovered += 1;
+                }
+                if discovered > 0 {
+                    marked_any = true;
+                    info!("trigger worker bootstrap: discovered {} keyspaces", discovered);
+                }
+            }
+            Err(e) => {
+                warn!("trigger worker bootstrap failed to list keyspaces: {}", e);
+            }
+        }
+
+        if !marked_any {
+            let fallback = env::var("PG_KEYSPACE")
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "default".to_string());
+            self.mark_active(&normalize_pd_keyspace_name(&fallback));
+        }
+    }
+
     pub(crate) fn config(&self) -> &TriggerWorkerConfig {
         &self.config
     }
@@ -239,6 +273,10 @@ impl TriggerWorker {
     }
 
     pub(crate) async fn run(&self, pool: Arc<TikvClientPool>) {
+        // After restart/failover, `active_keyspaces` starts empty. Bootstrap by discovering
+        // keyspaces from PD so any pre-existing `_sys_tq_` backlog can be recovered.
+        self.bootstrap_active_keyspaces(pool.as_ref()).await;
+
         let poll_interval = Duration::from_millis(self.config.poll_interval_ms);
 
         let gc_pool = pool.clone();
@@ -275,6 +313,7 @@ impl TriggerWorker {
             .claim_events(&mut txn, quota.max_events_per_batch)
             .await?;
         if events.is_empty() {
+            let _ = txn.rollback().await;
             // Nothing pending; stop polling this keyspace until new enqueue.
             self.remove_active(keyspace);
             return Ok(());
@@ -295,6 +334,76 @@ impl TriggerWorker {
 
         Ok(())
     }
+}
+
+fn normalize_pd_keyspace_name(name: &str) -> String {
+    if name == "DEFAULT" {
+        "default".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+fn parse_pd_keyspace_names(payload: &serde_json::Value) -> Vec<String> {
+    let keyspaces = payload
+        .get("keyspaces")
+        .and_then(|v| v.as_array())
+        .or_else(|| payload.as_array());
+
+    let Some(keyspaces) = keyspaces else {
+        return Vec::new();
+    };
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in keyspaces {
+        let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let normalized = normalize_pd_keyspace_name(name);
+        if normalized.is_empty() {
+            continue;
+        }
+        if seen.insert(normalized.clone()) {
+            out.push(normalized);
+        }
+    }
+    out
+}
+
+async fn list_keyspaces_from_pd(pd_endpoints: &[String]) -> Result<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+
+    let mut last_err = None;
+    for endpoint in pd_endpoints {
+        let url = format!("http://{}/pd/api/v2/keyspaces", endpoint);
+        let resp = match client.get(&url).send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                last_err = Some(anyhow::anyhow!("PD request to {} failed: {}", endpoint, e));
+                continue;
+            }
+        };
+        if !resp.status().is_success() {
+            last_err = Some(anyhow::anyhow!(
+                "PD {} returned {} for {}",
+                endpoint,
+                resp.status(),
+                url
+            ));
+            continue;
+        }
+
+        let payload: serde_json::Value = resp.json().await?;
+        return Ok(parse_pd_keyspace_names(&payload));
+    }
+
+    if let Some(err) = last_err {
+        return Err(err);
+    }
+    Ok(Vec::new())
 }
 
 static TRIGGER_WORKER: OnceLock<TriggerWorker> = OnceLock::new();
@@ -1342,8 +1451,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::{
-        case_insensitive_replace, parse_new_assignment, plpgsql_outer_block_range,
-        substitute_row_references, value_to_sql_literal,
+        case_insensitive_replace, parse_new_assignment, parse_pd_keyspace_names,
+        plpgsql_outer_block_range, substitute_row_references, value_to_sql_literal,
     };
 
     #[test]
@@ -1552,5 +1661,37 @@ mod tests {
         assert!(block.contains("END;"));
         assert!(block.contains("SELECT 2;"));
         assert!(!block.contains("-- end"));
+    }
+
+    #[test]
+    fn parse_pd_keyspace_names_extracts_keyspaces() {
+        let payload = serde_json::json!({
+            "keyspaces": [
+                {"name": "DEFAULT"},
+                {"name": "tenant_a"},
+                {"name": "tenant_a"},
+                {"name": 123},
+                {}
+            ]
+        });
+
+        let mut keyspaces = parse_pd_keyspace_names(&payload);
+        keyspaces.sort();
+        assert_eq!(
+            keyspaces,
+            vec!["default".to_string(), "tenant_a".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_pd_keyspace_names_accepts_array_payload() {
+        let payload = serde_json::json!([{"name": "DEFAULT"}, {"name": "tenant_b"}]);
+
+        let mut keyspaces = parse_pd_keyspace_names(&payload);
+        keyspaces.sort();
+        assert_eq!(
+            keyspaces,
+            vec!["default".to_string(), "tenant_b".to_string()]
+        );
     }
 }

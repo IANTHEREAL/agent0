@@ -18,6 +18,10 @@ impl TikvClientPool {
         }
     }
 
+    pub fn pd_endpoints(&self) -> &[String] {
+        &self.pd_endpoints
+    }
+
     pub async fn get_client(&self, keyspace: Option<String>) -> Result<Arc<TikvStore>> {
         let key = keyspace.clone().unwrap_or_else(|| "default".to_string());
 
