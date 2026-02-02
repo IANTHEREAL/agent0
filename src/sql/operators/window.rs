@@ -10,6 +10,7 @@ use sqlparser::ast::{Expr, OrderByExpr, WindowFrame, WindowFrameBound};
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::expr::{compare_order_by_values, eval_expr};
+use crate::sql::value_key::serialize_values_for_key;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
 /// Information about a single window function in the projection.
@@ -47,6 +48,31 @@ pub struct WindowOperator {
     result_rows: Vec<Row>,
     position: usize,
     opened: bool,
+}
+
+fn order_by_values_are_peers(
+    prev_values: &[Value],
+    current_values: &[Value],
+    order_by: &[OrderByExpr],
+) -> bool {
+    debug_assert_eq!(prev_values.len(), order_by.len());
+    debug_assert_eq!(current_values.len(), order_by.len());
+
+    for (order_expr, (prev_value, current_value)) in order_by
+        .iter()
+        .zip(prev_values.iter().zip(current_values.iter()))
+    {
+        let asc = order_expr.asc.unwrap_or(true);
+        let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+        if !matches!(
+            compare_order_by_values(prev_value, current_value, asc, nulls_first),
+            std::cmp::Ordering::Equal
+        ) {
+            return false;
+        }
+    }
+
+    true
 }
 
 impl WindowOperator {
@@ -119,7 +145,7 @@ impl WindowOperator {
                 for expr in &wf.partition_by {
                     key.push(eval_expr(expr, Some(row), Some(schema))?);
                 }
-                let key_bytes = bincode::serialize(&key).unwrap_or_default();
+                let key_bytes = serialize_values_for_key(&key).unwrap_or_default();
                 partitions.entry(key_bytes).or_default().push(row_idx);
             }
 
@@ -190,7 +216,7 @@ impl WindowOperator {
                 .map(|o| eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema)).unwrap_or(Value::Null))
                 .collect();
             if let Some(prev) = &prev_values {
-                if prev != &current_values {
+                if !order_by_values_are_peers(prev, &current_values, &wf.order_by) {
                     current_rank = (pos + 1) as i64;
                 }
             }
@@ -217,7 +243,7 @@ impl WindowOperator {
                 .map(|o| eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema)).unwrap_or(Value::Null))
                 .collect();
             if let Some(prev) = &prev_values {
-                if prev != &current_values {
+                if !order_by_values_are_peers(prev, &current_values, &wf.order_by) {
                     current_rank += 1;
                 }
             }
@@ -777,5 +803,217 @@ mod tests {
         let info = op.explain_info().unwrap();
         assert!(info.contains("row_number"));
         assert!(info.contains("sum"));
+    }
+
+    fn test_schema_with_float_partition() -> TableSchema {
+        TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "grp".to_string(),
+                    data_type: DataType::Float64,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![0],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        }
+    }
+
+    fn test_schema_with_numeric_partition() -> TableSchema {
+        TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![
+                ColumnDef {
+                    name: "id".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "grp".to_string(),
+                    data_type: DataType::Numeric {
+                        precision: None,
+                        scale: Some(2),
+                    },
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![0],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_window_operator_partition_by_canonicalizes_float_keys() {
+        let schema = test_schema_with_float_partition();
+        let child = Box::new(TableScanOperator::new(schema.clone()));
+
+        let window_funcs = vec![WindowFunctionExpr {
+            func_name: "row_number".to_string(),
+            arg_expr: None,
+            partition_by: vec![Expr::Identifier(sqlparser::ast::Ident::new("grp"))],
+            order_by: vec![],
+            offset_expr: None,
+            default_value_expr: None,
+            window_frame: None,
+            output_name: "row_num".to_string(),
+            output_type: DataType::Int64,
+        }];
+
+        let op = WindowOperator::new(child, window_funcs);
+
+        let rows = vec![
+            Row::new(vec![Value::Int32(1), Value::Float64(-0.0)]),
+            Row::new(vec![Value::Int32(2), Value::Float64(0.0)]),
+        ];
+        let results = op.compute_window_functions(&rows, &schema).unwrap();
+        assert_eq!(results[0][0], Value::Int64(1));
+        assert_eq!(results[1][0], Value::Int64(2));
+
+        let nan1 = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan2 = f64::from_bits(0x7ff8_0000_0000_0002);
+        assert!(nan1.is_nan() && nan2.is_nan());
+        let rows = vec![
+            Row::new(vec![Value::Int32(1), Value::Float64(nan1)]),
+            Row::new(vec![Value::Int32(2), Value::Float64(nan2)]),
+        ];
+        let results = op.compute_window_functions(&rows, &schema).unwrap();
+        assert_eq!(results[0][0], Value::Int64(1));
+        assert_eq!(results[1][0], Value::Int64(2));
+    }
+
+    #[test]
+    fn test_window_operator_partition_by_canonicalizes_numeric_keys() {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        let schema = test_schema_with_numeric_partition();
+        let child = Box::new(TableScanOperator::new(schema.clone()));
+
+        let window_funcs = vec![WindowFunctionExpr {
+            func_name: "row_number".to_string(),
+            arg_expr: None,
+            partition_by: vec![Expr::Identifier(sqlparser::ast::Ident::new("grp"))],
+            order_by: vec![],
+            offset_expr: None,
+            default_value_expr: None,
+            window_frame: None,
+            output_name: "row_num".to_string(),
+            output_type: DataType::Int64,
+        }];
+
+        let op = WindowOperator::new(child, window_funcs);
+
+        let rows = vec![
+            Row::new(vec![
+                Value::Int32(1),
+                Value::Numeric(Decimal::from_str("1.0").unwrap()),
+            ]),
+            Row::new(vec![
+                Value::Int32(2),
+                Value::Numeric(Decimal::from_str("1.00").unwrap()),
+            ]),
+        ];
+        let results = op.compute_window_functions(&rows, &schema).unwrap();
+        assert_eq!(results[0][0], Value::Int64(1));
+        assert_eq!(results[1][0], Value::Int64(2));
+    }
+
+    #[test]
+    fn test_window_operator_rank_dense_rank_treat_nan_order_keys_as_peers() {
+        let schema = test_schema_with_float_partition();
+        let child = Box::new(TableScanOperator::new(schema.clone()));
+
+        let window_funcs = vec![
+            WindowFunctionExpr {
+                func_name: "rank".to_string(),
+                arg_expr: None,
+                partition_by: vec![],
+                order_by: vec![OrderByExpr {
+                    expr: Expr::Identifier(sqlparser::ast::Ident::new("grp")),
+                    asc: Some(true),
+                    nulls_first: None,
+                }],
+                offset_expr: None,
+                default_value_expr: None,
+                window_frame: None,
+                output_name: "rank_val".to_string(),
+                output_type: DataType::Int64,
+            },
+            WindowFunctionExpr {
+                func_name: "dense_rank".to_string(),
+                arg_expr: None,
+                partition_by: vec![],
+                order_by: vec![OrderByExpr {
+                    expr: Expr::Identifier(sqlparser::ast::Ident::new("grp")),
+                    asc: Some(true),
+                    nulls_first: None,
+                }],
+                offset_expr: None,
+                default_value_expr: None,
+                window_frame: None,
+                output_name: "dense_rank_val".to_string(),
+                output_type: DataType::Int64,
+            },
+        ];
+
+        let op = WindowOperator::new(child, window_funcs);
+
+        let nan1 = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan2 = f64::from_bits(0x7ff8_0000_0000_0002);
+        assert!(nan1.is_nan() && nan2.is_nan());
+
+        let rows = vec![
+            Row::new(vec![Value::Int32(1), Value::Float64(nan1)]),
+            Row::new(vec![Value::Int32(2), Value::Float64(nan2)]),
+            Row::new(vec![Value::Int32(3), Value::Float64(1.0)]),
+            Row::new(vec![Value::Int32(4), Value::Float64(2.0)]),
+        ];
+
+        let results = op.compute_window_functions(&rows, &schema).unwrap();
+
+        // ORDER BY grp ASC sorts NaNs last; both NaNs are peers.
+        assert_eq!(results[0][0], Value::Int64(3));
+        assert_eq!(results[1][0], Value::Int64(3));
+        assert_eq!(results[2][0], Value::Int64(1));
+        assert_eq!(results[3][0], Value::Int64(2));
+
+        assert_eq!(results[0][1], Value::Int64(3));
+        assert_eq!(results[1][1], Value::Int64(3));
+        assert_eq!(results[2][1], Value::Int64(1));
+        assert_eq!(results[3][1], Value::Int64(2));
     }
 }

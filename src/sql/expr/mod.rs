@@ -2590,6 +2590,26 @@ mod tests {
     }
 
     #[test]
+    fn test_compare_values_nan_semantics() {
+        let nan1 = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan2 = f64::from_bits(0x7ff8_0000_0000_0002);
+        assert!(nan1.is_nan() && nan2.is_nan());
+
+        assert_eq!(
+            compare_values(&Value::Float64(nan1), &Value::Float64(nan2)).unwrap(),
+            0
+        );
+        assert_eq!(
+            compare_values(&Value::Float64(nan1), &Value::Float64(1.0)).unwrap(),
+            1
+        );
+        assert_eq!(
+            compare_values(&Value::Float64(1.0), &Value::Float64(nan1)).unwrap(),
+            -1
+        );
+    }
+
+    #[test]
     fn test_compare_order_by_values_nulls() {
         use std::cmp::Ordering;
 

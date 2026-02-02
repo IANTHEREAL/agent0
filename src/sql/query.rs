@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use sqlparser::ast::SetQuantifier;
 
+use super::value_key::serialize_values_for_key;
 use crate::types::Row;
 
 pub fn apply_union(left_rows: Vec<Row>, right_rows: Vec<Row>, is_all: bool) -> Vec<Row> {
@@ -11,17 +12,17 @@ pub fn apply_union(left_rows: Vec<Row>, right_rows: Vec<Row>, is_all: bool) -> V
     } else {
         let existing: HashSet<Vec<u8>> = result
             .iter()
-            .map(|r| bincode::serialize(&r.values).unwrap_or_default())
+            .map(|r| serialize_values_for_key(&r.values).unwrap_or_default())
             .collect();
         for row in right_rows {
-            let key = bincode::serialize(&row.values).unwrap_or_default();
+            let key = serialize_values_for_key(&row.values).unwrap_or_default();
             if !existing.contains(&key) {
                 result.push(row);
             }
         }
         let mut seen = HashSet::new();
         result.retain(|r| {
-            let key = bincode::serialize(&r.values).unwrap_or_default();
+            let key = serialize_values_for_key(&r.values).unwrap_or_default();
             seen.insert(key)
         });
     }
@@ -31,19 +32,19 @@ pub fn apply_union(left_rows: Vec<Row>, right_rows: Vec<Row>, is_all: bool) -> V
 pub fn apply_intersect(left_rows: Vec<Row>, right_rows: Vec<Row>, is_all: bool) -> Vec<Row> {
     let right_set: HashSet<Vec<u8>> = right_rows
         .iter()
-        .map(|r| bincode::serialize(&r.values).unwrap_or_default())
+        .map(|r| serialize_values_for_key(&r.values).unwrap_or_default())
         .collect();
     let mut result: Vec<Row> = left_rows
         .into_iter()
         .filter(|r| {
-            let key = bincode::serialize(&r.values).unwrap_or_default();
+            let key = serialize_values_for_key(&r.values).unwrap_or_default();
             right_set.contains(&key)
         })
         .collect();
     if !is_all {
         let mut seen = HashSet::new();
         result.retain(|r| {
-            let key = bincode::serialize(&r.values).unwrap_or_default();
+            let key = serialize_values_for_key(&r.values).unwrap_or_default();
             seen.insert(key)
         });
     }
@@ -53,19 +54,19 @@ pub fn apply_intersect(left_rows: Vec<Row>, right_rows: Vec<Row>, is_all: bool) 
 pub fn apply_except(left_rows: Vec<Row>, right_rows: Vec<Row>, is_all: bool) -> Vec<Row> {
     let right_set: HashSet<Vec<u8>> = right_rows
         .iter()
-        .map(|r| bincode::serialize(&r.values).unwrap_or_default())
+        .map(|r| serialize_values_for_key(&r.values).unwrap_or_default())
         .collect();
     let mut result: Vec<Row> = left_rows
         .into_iter()
         .filter(|r| {
-            let key = bincode::serialize(&r.values).unwrap_or_default();
+            let key = serialize_values_for_key(&r.values).unwrap_or_default();
             !right_set.contains(&key)
         })
         .collect();
     if !is_all {
         let mut seen = HashSet::new();
         result.retain(|r| {
-            let key = bincode::serialize(&r.values).unwrap_or_default();
+            let key = serialize_values_for_key(&r.values).unwrap_or_default();
             seen.insert(key)
         });
     }
@@ -168,4 +169,28 @@ pub fn apply_limit(rows: Vec<Row>, limit: usize) -> Vec<Row> {
 #[allow(dead_code)]
 pub fn reorder_by_indices<T: Clone>(data: &[T], indices: &[usize]) -> Vec<T> {
     indices.iter().map(|&idx| data[idx].clone()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Value;
+
+    #[test]
+    fn set_operation_distinct_keys_canonicalize_floats() {
+        let left = vec![Row::new(vec![Value::Float64(-0.0)])];
+        let right = vec![Row::new(vec![Value::Float64(0.0)])];
+        assert_eq!(apply_union(left.clone(), right.clone(), false).len(), 1);
+        assert_eq!(apply_intersect(left.clone(), right.clone(), false).len(), 1);
+        assert_eq!(apply_except(left, right, false).len(), 0);
+
+        let nan1 = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan2 = f64::from_bits(0x7ff8_0000_0000_0002);
+        assert!(nan1.is_nan() && nan2.is_nan());
+        let left = vec![Row::new(vec![Value::Float64(nan1)])];
+        let right = vec![Row::new(vec![Value::Float64(nan2)])];
+        assert_eq!(apply_union(left.clone(), right.clone(), false).len(), 1);
+        assert_eq!(apply_intersect(left.clone(), right.clone(), false).len(), 1);
+        assert_eq!(apply_except(left, right, false).len(), 0);
+    }
 }

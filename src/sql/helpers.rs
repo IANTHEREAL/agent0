@@ -30,6 +30,7 @@ use std::str::FromStr;
 
 use super::expr::{coerce_text_literal_to_bool, eval_expr, eval_expr_join, JoinContext};
 use super::Aggregator;
+use super::value_key::serialize_values_for_key;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
 /// Deduplicate rows based on their serialized values
@@ -37,7 +38,7 @@ pub fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut result = Vec::new();
     for row in rows {
-        let key = bincode::serialize(&row.values).unwrap_or_default();
+        let key = serialize_values_for_key(&row.values).unwrap_or_default();
         if seen.insert(key) {
             result.push(row);
         }
@@ -68,7 +69,7 @@ pub fn distinct_on_rows_with_indices(
             .iter()
             .map(|expr| eval_expr(expr, Some(&row), row_context))
             .collect::<Result<Vec<_>>>()?;
-        let key = bincode::serialize(&key_values)?;
+        let key = serialize_values_for_key(&key_values)?;
         if seen.insert(key) {
             indices.push(idx);
             result.push(row);
@@ -120,7 +121,7 @@ pub fn distinct_on_rows_join_with_indices(
             .iter()
             .map(|expr| eval_expr_join(expr, &ctx))
             .collect::<Result<Vec<_>>>()?;
-        let key = bincode::serialize(&key_values)?;
+        let key = serialize_values_for_key(&key_values)?;
         if seen.insert(key) {
             indices.push(idx);
             result.push(row);
@@ -1242,6 +1243,9 @@ mod tests {
 
     #[test]
     fn test_dedup_rows() {
+        let nan1 = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan2 = f64::from_bits(0x7ff8_0000_0000_0002);
+
         let rows = vec![
             Row {
                 values: vec![Value::Int32(1), Value::Text("a".to_string())],
@@ -1252,9 +1256,21 @@ mod tests {
             Row {
                 values: vec![Value::Int32(2), Value::Text("b".to_string())],
             },
+            Row {
+                values: vec![Value::Float64(nan1)],
+            },
+            Row {
+                values: vec![Value::Float64(nan2)],
+            },
+            Row {
+                values: vec![Value::Float64(-0.0)],
+            },
+            Row {
+                values: vec![Value::Float64(0.0)],
+            },
         ];
         let result = dedup_rows(rows);
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.len(), 4);
     }
 
     fn parse_first_projection_function(sql: &str) -> sqlparser::ast::Function {

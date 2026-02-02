@@ -12,6 +12,7 @@ use super::super::operators::{
 };
 use super::super::sequences;
 use super::super::wildcard::{build_join_wildcard_plan, JoinWildcardColumn};
+use super::super::value_key::{serialize_value_for_key, serialize_values_for_key};
 use super::super::window::{compute_window_functions_join, extract_window_functions};
 use super::super::{
     expr::{
@@ -3915,7 +3916,7 @@ impl Executor {
                         .await?,
                     );
                 }
-                let key_bytes = bincode::serialize(&key).unwrap();
+                let key_bytes = serialize_values_for_key(&key).unwrap();
 
                 if !groups.contains_key(&key_bytes) {
                     let mut aggs = Vec::new();
@@ -4023,7 +4024,7 @@ impl Executor {
 
                     let is_distinct = matches!(agg_expr, AggExpr::Function(f) if f.distinct);
                     if is_distinct {
-                        let val_bytes = bincode::serialize(&val).unwrap_or_default();
+                        let val_bytes = serialize_value_for_key(&val).unwrap_or_default();
                         let distinct_sets = seen_distinct.get_mut(&key_bytes).unwrap();
                         if !distinct_sets[agg_idx].insert(val_bytes) {
                             continue;
@@ -4037,7 +4038,7 @@ impl Executor {
                 // PostgreSQL semantics: aggregate query without GROUP BY returns exactly one row,
                 // even when the input is empty (e.g., `SELECT COUNT(*) FROM empty` -> 0).
                 let key: Vec<Value> = Vec::new();
-                let key_bytes = bincode::serialize(&key).unwrap();
+                let key_bytes = serialize_values_for_key(&key).unwrap();
 
                 let mut aggs = Vec::new();
                 for (_, agg_expr) in &agg_funcs {

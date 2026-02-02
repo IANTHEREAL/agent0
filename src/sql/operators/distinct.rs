@@ -6,6 +6,7 @@ use sqlparser::ast::Expr;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::expr::eval_expr;
+use crate::sql::value_key::serialize_values_for_key;
 use crate::types::{Row, TableSchema};
 
 #[derive(Debug)]
@@ -25,7 +26,7 @@ impl DistinctOperator {
     }
 
     fn row_to_key(row: &Row) -> Vec<u8> {
-        bincode::serialize(&row.values).unwrap_or_default()
+        serialize_values_for_key(&row.values).unwrap_or_default()
     }
 }
 
@@ -104,7 +105,7 @@ impl DistinctOnOperator {
         for expr in &self.on_exprs {
             key_values.push(eval_expr(expr, Some(row), Some(schema))?);
         }
-        Ok(bincode::serialize(&key_values).unwrap_or_default())
+        Ok(serialize_values_for_key(&key_values).unwrap_or_default())
     }
 }
 
@@ -166,7 +167,7 @@ impl PhysicalOperator for DistinctOnOperator {
 mod tests {
     use super::*;
     use crate::sql::operators::scan::TableScanOperator;
-    use crate::types::{ColumnDef, DataType};
+    use crate::types::{ColumnDef, DataType, Value};
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -223,5 +224,21 @@ mod tests {
 
         assert_eq!(op.name(), "DistinctOn");
         assert!(op.explain_info().unwrap().contains("name"));
+    }
+
+    #[test]
+    fn test_row_to_key_canonicalizes_numeric_scales() {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        let d1 = Decimal::from_str("1.0").unwrap();
+        let d2 = Decimal::from_str("1.00").unwrap();
+
+        let row1 = Row::new(vec![Value::Numeric(d1)]);
+        let row2 = Row::new(vec![Value::Numeric(d2)]);
+        assert_eq!(
+            DistinctOperator::row_to_key(&row1),
+            DistinctOperator::row_to_key(&row2)
+        );
     }
 }

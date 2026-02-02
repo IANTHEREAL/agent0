@@ -6,6 +6,7 @@ use sqlparser::ast::Expr;
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::expr::eval_expr;
+use crate::sql::value_key::{serialize_value_for_key, serialize_values_for_key};
 use crate::sql::Aggregator;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
@@ -119,7 +120,7 @@ impl PhysicalOperator for HashAggregateOperator {
                 group_key_values.push(val);
             }
 
-            let key_bytes = bincode::serialize(&group_key_values)
+            let key_bytes = serialize_values_for_key(&group_key_values)
                 .map_err(|e| anyhow!("Failed to serialize group key: {}", e))?;
 
             if !groups.contains_key(&key_bytes) {
@@ -153,7 +154,7 @@ impl PhysicalOperator for HashAggregateOperator {
                 };
 
                 if agg_expr.distinct {
-                    let val_bytes = bincode::serialize(&val)
+                    let val_bytes = serialize_value_for_key(&val)
                         .map_err(|e| anyhow!("Failed to serialize DISTINCT value: {}", e))?;
                     if !state.seen_distinct[i].insert(val_bytes) {
                         continue;

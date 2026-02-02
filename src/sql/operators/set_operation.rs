@@ -4,6 +4,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::sql::value_key::serialize_values_for_key;
 use crate::types::{Row, TableSchema};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,7 +40,7 @@ impl SetOperationOperator {
     }
 
     fn row_to_key(row: &Row) -> Vec<u8> {
-        bincode::serialize(&row.values).unwrap_or_default()
+        serialize_values_for_key(&row.values).unwrap_or_default()
     }
 }
 
@@ -242,5 +243,45 @@ mod tests {
         let op = SetOperationOperator::new(left, right, SetOperationType::Except);
 
         assert_eq!(op.name(), "Except");
+    }
+
+    #[test]
+    fn test_row_to_key_canonicalizes_negative_zero() {
+        let row_neg = Row::new(vec![Value::Float64(-0.0)]);
+        let row_pos = Row::new(vec![Value::Float64(0.0)]);
+        assert_eq!(
+            SetOperationOperator::row_to_key(&row_neg),
+            SetOperationOperator::row_to_key(&row_pos)
+        );
+    }
+
+    #[test]
+    fn test_row_to_key_canonicalizes_nan_payloads() {
+        let nan1 = f64::from_bits(0x7ff8_0000_0000_0001);
+        let nan2 = f64::from_bits(0x7ff8_0000_0000_0002);
+        assert!(nan1.is_nan() && nan2.is_nan());
+
+        let row1 = Row::new(vec![Value::Float64(nan1)]);
+        let row2 = Row::new(vec![Value::Float64(nan2)]);
+        assert_eq!(
+            SetOperationOperator::row_to_key(&row1),
+            SetOperationOperator::row_to_key(&row2)
+        );
+    }
+
+    #[test]
+    fn test_row_to_key_canonicalizes_numeric_scales() {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        let d1 = Decimal::from_str("1.0").unwrap();
+        let d2 = Decimal::from_str("1.00").unwrap();
+
+        let row1 = Row::new(vec![Value::Numeric(d1)]);
+        let row2 = Row::new(vec![Value::Numeric(d2)]);
+        assert_eq!(
+            SetOperationOperator::row_to_key(&row1),
+            SetOperationOperator::row_to_key(&row2)
+        );
     }
 }
