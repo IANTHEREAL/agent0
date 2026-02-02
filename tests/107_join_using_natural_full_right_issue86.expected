@@ -1,26 +1,25 @@
 id|b_id|c_id
-NULL|NULL|NULL
-NULL|NULL|NULL
 1|1|1
 2|NULL|2
+NULL|NULL|NULL
+NULL|NULL|NULL
 (4 rows)
 id|b_id|c_id
-NULL|NULL|NULL
 1|1|1
 2|NULL|2
+NULL|NULL|NULL
 (3 rows)
 id|b_id|c_id
-NULL|NULL|NULL
-NULL|NULL|NULL
 1|1|1
 2|NULL|2
+NULL|NULL|NULL
+NULL|NULL|NULL
 (4 rows)
 id|b_id|c_id
-NULL|NULL|NULL
 1|1|1
 2|NULL|2
+NULL|NULL|NULL
 (3 rows)
-id|b_id|c_id|extra_id
-NULL|NULL|NULL|999
-NULL|NULL|NULL|999
-(2 rows)
+ERROR:  column reference "id" is ambiguous
+LINE 1: SELECT id, issue86_b.id AS b_id, issue86_c.id AS c_id, issue...
+               ^
