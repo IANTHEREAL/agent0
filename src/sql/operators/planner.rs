@@ -19,16 +19,110 @@
 //! ```
 
 use anyhow::Result;
-use sqlparser::ast::{Expr, OrderByExpr};
+use sqlparser::ast::{BinaryOperator, Expr, OrderByExpr};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{
     BoxedOperator, FilterOperator, IndexScanOperator, LimitOperator, ProjectOperator, SortOperator,
     TableScanOperator,
 };
+use crate::sql::expr::eval_expr;
+use crate::sql::helpers::coerce_value_for_column;
 use crate::sql::planner::{choose_best_access_path_for_filter, ScanType};
 use crate::storage::TikvStore;
-use crate::types::{DataType, TableSchema};
+use crate::types::{DataType, TableSchema, Value};
+
+fn extract_column_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
+        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.to_lowercase()),
+        Expr::Nested(inner) => extract_column_name(inner),
+        _ => None,
+    }
+}
+
+fn collect_eq_predicates(expr: &Expr, out: &mut HashMap<String, Value>) -> Option<()> {
+    match expr {
+        Expr::Nested(inner) => collect_eq_predicates(inner, out),
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                collect_eq_predicates(left, out)?;
+                collect_eq_predicates(right, out)?;
+                Some(())
+            }
+            BinaryOperator::Eq => {
+                let (col, val) = if let Some(col) = extract_column_name(left) {
+                    (col, eval_expr(right, None, None).ok()?)
+                } else if let Some(col) = extract_column_name(right) {
+                    (col, eval_expr(left, None, None).ok()?)
+                } else {
+                    return None;
+                };
+
+                if let Some(existing) = out.get(&col) {
+                    if existing != &val {
+                        return None;
+                    }
+                    return Some(());
+                }
+
+                out.insert(col, val);
+                Some(())
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn filter_is_exact_index_lookup(
+    filter: &Expr,
+    schema: &TableSchema,
+    index_id: u64,
+    lookup_values: &[Value],
+) -> bool {
+    let Some(index) = schema.indexes.iter().find(|i| i.id == index_id) else {
+        return false;
+    };
+
+    if lookup_values.is_empty() || lookup_values.len() > index.columns.len() {
+        return false;
+    }
+
+    let mut predicates: HashMap<String, Value> = HashMap::new();
+    if collect_eq_predicates(filter, &mut predicates).is_none() {
+        return false;
+    }
+
+    if predicates.len() != lookup_values.len() {
+        return false;
+    }
+
+    for (i, col) in index.columns.iter().take(lookup_values.len()).enumerate() {
+        let key = col.to_lowercase();
+        let Some(pred_value) = predicates.get(&key) else {
+            return false;
+        };
+
+        let coerced = if let Some(col_def) = schema
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(col))
+        {
+            coerce_value_for_column(pred_value.clone(), col_def)
+                .unwrap_or_else(|_| pred_value.clone())
+        } else {
+            pred_value.clone()
+        };
+
+        if coerced != lookup_values[i] {
+            return false;
+        }
+    }
+
+    true
+}
 
 /// Physical query planner that builds operator trees.
 ///
@@ -89,45 +183,68 @@ impl PhysicalPlanner {
     ) -> Result<BoxedOperator> {
         let access_path = choose_best_access_path_for_filter(&schema, filter, estimated_rows);
 
-        let scan_upper_bound = if filter.is_none() && order_by.is_empty() {
-            match limit {
-                Some(0) => Some(0),
-                Some(n) => Some(offset.saturating_add(n)),
-                None => None,
-            }
-        } else {
-            None
+        let scan_upper_bound = match limit {
+            Some(0) => Some(0),
+            Some(n) => Some(offset.saturating_add(n)),
+            None => None,
         };
 
         let mut root: BoxedOperator = match access_path.scan_type {
             ScanType::FullTableScan => {
-                Box::new(TableScanOperator::new_with_scan_limit(schema.clone(), scan_upper_bound))
+                let scan_limit = if filter.is_none() && order_by.is_empty() {
+                    scan_upper_bound
+                } else {
+                    None
+                };
+                Box::new(TableScanOperator::new_with_scan_limit(schema.clone(), scan_limit))
             }
             ScanType::IndexScan {
                 index_id,
                 index_name,
                 values,
                 ..
-            } => Box::new(IndexScanOperator::new(
-                schema.clone(),
-                index_id,
-                index_name,
-                values,
-            )),
+            } => {
+                let scan_limit = if order_by.is_empty()
+                    && scan_upper_bound.is_some()
+                    && filter.is_some_and(|f| filter_is_exact_index_lookup(f, &schema, index_id, &values))
+                {
+                    scan_upper_bound
+                } else {
+                    None
+                };
+                Box::new(IndexScanOperator::new_with_scan_limit(
+                    schema.clone(),
+                    index_id,
+                    index_name,
+                    values,
+                    scan_limit,
+                ))
+            }
             ScanType::IndexRangeScan {
                 index_id,
                 index_name,
                 prefix_values,
                 ..
-            } => Box::new(IndexScanOperator::new(
-                schema.clone(),
-                index_id,
-                index_name,
-                prefix_values,
-            )),
-            ScanType::GinIndexScan { .. } => {
-                Box::new(TableScanOperator::new_with_scan_limit(schema.clone(), scan_upper_bound))
+            } => {
+                let scan_limit = if order_by.is_empty()
+                    && scan_upper_bound.is_some()
+                    && filter.is_some_and(|f| {
+                        filter_is_exact_index_lookup(f, &schema, index_id, &prefix_values)
+                    })
+                {
+                    scan_upper_bound
+                } else {
+                    None
+                };
+                Box::new(IndexScanOperator::new_with_scan_limit(
+                    schema.clone(),
+                    index_id,
+                    index_name,
+                    prefix_values,
+                    scan_limit,
+                ))
             }
+            ScanType::GinIndexScan { .. } => Box::new(TableScanOperator::new(schema.clone())),
         };
 
         if let Some(filter_expr) = filter {

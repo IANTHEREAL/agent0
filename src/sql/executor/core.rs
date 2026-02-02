@@ -21,7 +21,7 @@ use super::super::{parse_sql, ExecuteResult, ExecuteResults, InFailedSqlTransact
 use crate::auth::AuthManager;
 use crate::observability::TenantObservability;
 use crate::session_context;
-use crate::storage::TikvStore;
+use crate::storage::{with_kv_read_stats, KvReadStatsSnapshot, TikvStore};
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
@@ -3085,19 +3085,26 @@ impl Executor {
         analyze: bool,
         _verbose: bool,
     ) -> Result<ExecuteResult> {
-        let (actual_rows, execution_time_ms) = if analyze {
+        let (actual_rows, execution_time_ms, kv_stats) = if analyze {
             match statement {
                 Statement::Query(query) => {
                     let start = Instant::now();
-                    let result = self
-                        .execute_query(txn, db_id, sequence_values, search_path, query)
-                        .await?;
+                    let (result, kv_stats) = with_kv_read_stats(async {
+                        self.execute_query(txn, db_id, sequence_values, search_path, query)
+                            .await
+                    })
+                    .await;
+                    let result = result?;
                     let elapsed = start.elapsed();
                     let actual_rows = match result {
                         ExecuteResult::Select { rows, .. } => rows.len(),
                         _ => 0,
                     };
-                    (Some(actual_rows), Some(elapsed.as_secs_f64() * 1000.0))
+                    (
+                        Some(actual_rows),
+                        Some(elapsed.as_secs_f64() * 1000.0),
+                        Some(kv_stats),
+                    )
                 }
                 _ => {
                     return Err(anyhow!(
@@ -3106,7 +3113,7 @@ impl Executor {
                 }
             }
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let tables = self.store.list_tables(txn, db_id).await?;
@@ -3155,6 +3162,19 @@ impl Executor {
                 execution_time_ms
             )
             .unwrap();
+        }
+        if let Some(KvReadStatsSnapshot {
+            table_scan_pairs,
+            index_scan_pairs,
+            batch_get_keys,
+            gin_scan_keys,
+        }) = kv_stats
+        {
+            use std::fmt::Write;
+            writeln!(&mut plan_text, "KV Table Scan Pairs: {}", table_scan_pairs).unwrap();
+            writeln!(&mut plan_text, "KV Index Scan Pairs: {}", index_scan_pairs).unwrap();
+            writeln!(&mut plan_text, "KV Batch Get Keys: {}", batch_get_keys).unwrap();
+            writeln!(&mut plan_text, "KV GIN Scan Keys: {}", gin_scan_keys).unwrap();
         }
 
         let lines: Vec<Row> = plan_text

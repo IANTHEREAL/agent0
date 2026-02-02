@@ -123,6 +123,7 @@ pub struct IndexScanOperator {
     index_id: u64,
     index_name: String,
     lookup_values: Vec<Value>,
+    scan_limit: Option<usize>,
     buffer: Vec<Row>,
     position: usize,
     opened: bool,
@@ -140,6 +141,26 @@ impl IndexScanOperator {
             index_id,
             index_name,
             lookup_values,
+            scan_limit: None,
+            buffer: Vec::new(),
+            position: 0,
+            opened: false,
+        }
+    }
+
+    pub fn new_with_scan_limit(
+        schema: TableSchema,
+        index_id: u64,
+        index_name: String,
+        lookup_values: Vec<Value>,
+        scan_limit: Option<usize>,
+    ) -> Self {
+        Self {
+            schema,
+            index_id,
+            index_name,
+            lookup_values,
+            scan_limit,
             buffer: Vec::new(),
             position: 0,
             opened: false,
@@ -199,6 +220,7 @@ impl PhysicalOperator for IndexScanOperator {
                     index.unique,
                     &index_column_types,
                     &pk_types,
+                    self.scan_limit,
                 )
                 .await?
         } else {
@@ -211,6 +233,7 @@ impl PhysicalOperator for IndexScanOperator {
                     &self.lookup_values,
                     index.unique,
                     &pk_types,
+                    self.scan_limit,
                 )
                 .await?
         };

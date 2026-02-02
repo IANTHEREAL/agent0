@@ -358,6 +358,7 @@ pub async fn execute_insert_row(
                                         &idx_values,
                                         true,
                                         &pk_types,
+                                        None,
                                     )
                                     .await?;
                                 if pks.is_empty() {
@@ -489,6 +490,7 @@ pub async fn execute_insert_row(
                                         &idx_values,
                                         true,
                                         &pk_types,
+                                        None,
                                     )
                                     .await?;
                                 if pks.is_empty() {

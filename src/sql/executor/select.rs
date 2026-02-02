@@ -1039,6 +1039,7 @@ impl Executor {
                                     values,
                                     idx.unique,
                                     &pk_types,
+                                    None,
                                 )
                                 .await?;
                             let mut rows = self
@@ -1100,6 +1101,7 @@ impl Executor {
                                     idx.unique,
                                     &index_column_types,
                                     &pk_types,
+                                    None,
                                 )
                                 .await?;
                             let mut rows = self

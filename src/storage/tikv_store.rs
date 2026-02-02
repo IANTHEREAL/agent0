@@ -1,4 +1,5 @@
 use super::encoding::*;
+use super::kv_stats;
 use crate::txn::{txn_delete, txn_put};
 use crate::types::{
     DataType, DatabaseDef, FunctionDef, Row, SequenceBacking, SequenceDef, SequenceState,
@@ -1549,10 +1550,13 @@ impl TikvStore {
         let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
         let pairs = txn.scan(range, scan_limit_to_u32(limit)).await?;
         let mut rows = Vec::new();
+        let mut scanned_pairs = 0usize;
         for pair in pairs {
+            scanned_pairs += 1;
             let row = deserialize_row(pair.value())?;
             rows.push(row);
         }
+        kv_stats::record_table_scan_pairs(scanned_pairs);
         debug!("Scanned {} rows from '{}'", rows.len(), table_name);
         Ok(rows)
     }
@@ -2840,9 +2844,14 @@ impl TikvStore {
         values: &[Value],
         unique: bool,
         pk_types: &[DataType],
+        limit: Option<usize>,
     ) -> Result<Vec<Vec<Value>>> {
         if pk_types.is_empty() {
             return Err(anyhow!("PK types required for index scan"));
+        }
+
+        if matches!(limit, Some(0)) {
+            return Ok(Vec::new());
         }
 
         if unique {
@@ -2865,10 +2874,12 @@ impl TikvStore {
             let end_key = self.key(&end_raw);
 
             let range: BoundRange = (start_key.clone()..end_key).into();
-            let pairs = txn.scan(range, SCAN_LIMIT).await?;
+            let pairs = txn.scan(range, scan_limit_to_u32(limit)).await?;
 
             let mut pks = Vec::new();
+            let mut scanned_pairs = 0usize;
             for pair in pairs {
+                scanned_pairs += 1;
                 let full_key: &[u8] = pair.key().as_ref().into();
                 if full_key.len() <= start_key.len() {
                     continue;
@@ -2877,6 +2888,7 @@ impl TikvStore {
                 let pk = decode_pk_from_index_suffix(pk_bytes, pk_types)?;
                 pks.push(pk);
             }
+            kv_stats::record_index_scan_pairs(scanned_pairs);
             Ok(pks)
         }
     }
@@ -2896,9 +2908,14 @@ impl TikvStore {
         unique: bool,
         index_column_types: &[DataType],
         pk_types: &[DataType],
+        limit: Option<usize>,
     ) -> Result<Vec<Vec<Value>>> {
         if pk_types.is_empty() {
             return Err(anyhow!("PK types required for index scan"));
+        }
+
+        if matches!(limit, Some(0)) {
+            return Ok(Vec::new());
         }
 
         let prefix = encode_index_key_v2(db_id, table_id, index_id, prefix_values, None);
@@ -2909,20 +2926,25 @@ impl TikvStore {
         let end_key = self.key(&end_raw);
 
         let range: BoundRange = (start_key..end_key).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        let pairs = txn.scan(range, scan_limit_to_u32(limit)).await?;
 
         let mut pks = Vec::new();
         if unique {
+            let mut scanned_pairs = 0usize;
             for pair in pairs {
+                scanned_pairs += 1;
                 let pk_bytes: &[u8] = pair.value().as_ref();
                 let pk = decode_pk_from_index_suffix(pk_bytes, pk_types)?;
                 pks.push(pk);
             }
+            kv_stats::record_index_scan_pairs(scanned_pairs);
             return Ok(pks);
         }
 
         let fixed_prefix_len = encode_index_key_v2(db_id, table_id, index_id, &[], None).len();
+        let mut scanned_pairs = 0usize;
         for pair in pairs {
+            scanned_pairs += 1;
             let full_key: &[u8] = pair.key().as_ref().into();
             if full_key.len() <= fixed_prefix_len {
                 continue;
@@ -2944,6 +2966,7 @@ impl TikvStore {
             pks.push(pk);
         }
 
+        kv_stats::record_index_scan_pairs(scanned_pairs);
         Ok(pks)
     }
 
@@ -3045,6 +3068,7 @@ impl TikvStore {
 
             let range: BoundRange = (start_key.clone()..end_key).into();
             let keys: Vec<_> = txn.scan_keys(range, probe_scan_limit).await?.collect();
+            kv_stats::record_gin_scan_keys(keys.len());
             let estimated_postings = keys.len();
 
             let cached_pk_keys = if estimated_postings < probe_scan_limit as usize {
@@ -3107,18 +3131,23 @@ impl TikvStore {
             if i == 0 {
                 let range: BoundRange = (start_key..end_key).into();
                 let keys = txn.scan_keys(range, SCAN_LIMIT).await?;
+                let mut scanned_keys = 0usize;
                 for key in keys {
+                    scanned_keys += 1;
                     let full_key: &[u8] = key.as_ref().into();
                     let Some(pk_bytes) = pk_suffix(full_key, prefix_len) else {
                         continue;
                     };
                     candidates.insert(pk_bytes.to_vec());
                 }
+                kv_stats::record_gin_scan_keys(scanned_keys);
             } else {
                 let mut next: HashSet<Vec<u8>> = HashSet::with_capacity(candidates.len());
                 let range: BoundRange = (start_key..end_key).into();
                 let keys = txn.scan_keys(range, SCAN_LIMIT).await?;
+                let mut scanned_keys = 0usize;
                 for key in keys {
+                    scanned_keys += 1;
                     let full_key: &[u8] = key.as_ref().into();
                     let Some(pk_bytes) = pk_suffix(full_key, prefix_len) else {
                         continue;
@@ -3127,6 +3156,7 @@ impl TikvStore {
                         next.insert(pk_bytes.to_vec());
                     }
                 }
+                kv_stats::record_gin_scan_keys(scanned_keys);
                 candidates = next;
             }
         }
@@ -3204,6 +3234,7 @@ impl TikvStore {
         data_keys: &[Vec<u8>],
         out: &mut Vec<Row>,
     ) -> Result<()> {
+        kv_stats::record_batch_get_keys(data_keys.len());
         let pairs = txn.batch_get(data_keys.iter().cloned()).await?;
         let mut by_key: HashMap<Key, tikv_client::Value> = HashMap::with_capacity(data_keys.len());
 

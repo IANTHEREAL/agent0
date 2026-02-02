@@ -1,0 +1,5 @@
+Index Scan using idx_limit_pushdown_a on limit_pushdown_t
+Actual Rows: 5
+KV Index Scan Pairs: 5
+KV Batch Get Keys: 5
+
