@@ -309,7 +309,9 @@ fn add_interval_to_timestamp(ts_millis: i64, iv: &crate::types::IntervalValue) -
     }
 
     if iv.millis != 0 {
-        result = result + Duration::milliseconds(iv.millis);
+        let delta = Duration::try_milliseconds(iv.millis)
+            .ok_or_else(|| anyhow!("Interval out of range"))?;
+        result = result + delta;
     }
 
     Ok(result.timestamp_millis())
@@ -854,5 +856,14 @@ mod tests {
         assert_eq!(parse_bool_pg("0"), Some(false));
 
         assert_eq!(parse_bool_pg("maybe"), None);
+    }
+
+    #[test]
+    fn test_add_interval_to_timestamp_millis_min_does_not_panic() {
+        let ts_millis = 0;
+        let iv = crate::types::IntervalValue::new(0, i64::MIN);
+
+        let err = add_interval_to_timestamp(ts_millis, &iv).unwrap_err();
+        assert!(err.to_string().contains("Interval out of range"));
     }
 }
