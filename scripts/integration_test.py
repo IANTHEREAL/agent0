@@ -377,23 +377,14 @@ def run_sql(
 ) -> Tuple[str, int]:
     output = ""
     for attempt in range(retries + 1):
-        if mode == PsqlOutputMode.ALIGNED:
-            result = subprocess.run(
-                psql_args_for_mode(mode, database=database) + ["-c", sql],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env=psql_env(client_min_messages=client_min_messages),
-            )
-            output = result.stdout or ""
-        else:
-            result = subprocess.run(
-                psql_args_for_mode(mode, database=database) + ["-c", sql],
-                capture_output=True,
-                text=True,
-                env=psql_env(client_min_messages=client_min_messages),
-            )
-            output = (result.stdout or "") + (result.stderr or "")
+        result = subprocess.run(
+            psql_args_for_mode(mode, database=database) + ["-c", sql],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=psql_env(client_min_messages=client_min_messages),
+        )
+        output = result.stdout or ""
 
         if "Failed to connect to TiKV" not in output and "connection refused" not in output.lower():
             return output, result.returncode
@@ -412,22 +403,14 @@ def run_sql_file(
     client_min_messages: str = "warning",
     database: Optional[str] = None,
 ) -> Tuple[str, int]:
-    if mode == PsqlOutputMode.ALIGNED:
-        result = subprocess.run(
-            psql_args_for_mode(mode, database=database) + ["-f", str(sql_file)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env=psql_env(client_min_messages=client_min_messages),
-        )
-        return result.stdout or "", result.returncode
     result = subprocess.run(
         psql_args_for_mode(mode, database=database) + ["-f", str(sql_file)],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         env=psql_env(client_min_messages=client_min_messages),
     )
-    return (result.stdout or "") + (result.stderr or ""), result.returncode
+    return result.stdout or "", result.returncode
 
 
 def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
