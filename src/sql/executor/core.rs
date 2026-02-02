@@ -27,7 +27,7 @@ use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use sqlparser::ast::{
     Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, SetOperator, SetQuantifier,
-    Statement, TableFactor, Visit, Visitor,
+    ReferentialAction, Statement, TableFactor, Visit, Visitor,
 };
 
 use std::collections::HashMap;
@@ -2061,8 +2061,12 @@ impl Executor {
             Statement::DropFunction {
                 if_exists,
                 func_desc,
+                option,
                 ..
             } => {
+                let cascade = option
+                    .as_ref()
+                    .is_some_and(|action| matches!(action, ReferentialAction::Cascade));
                 let mut last_name = None;
                 for desc in func_desc {
                     let func_name = &desc.name;
@@ -2079,7 +2083,10 @@ impl Executor {
                         None => names::resolve_ddl_object_name(func_name, search_path)?.full,
                     };
                     last_name = Some(func_full_name.clone());
-                    let dropped = self.store.drop_function(txn, db_id, &func_full_name).await?;
+                    let dropped = self
+                        .store
+                        .drop_function(txn, db_id, &func_full_name, cascade)
+                        .await?;
                     if !dropped && !if_exists {
                         return Err(anyhow!("Function '{}' does not exist", func_full_name));
                     }

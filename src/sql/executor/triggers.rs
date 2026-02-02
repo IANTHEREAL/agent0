@@ -474,7 +474,7 @@ fn parse_create_function_sql(sql: &str) -> Result<(ObjectName, FunctionDef, bool
     Ok((name, def, or_replace))
 }
 
-fn parse_drop_function_sql(sql: &str) -> Result<(bool, Vec<ObjectName>)> {
+fn parse_drop_function_sql(sql: &str) -> Result<(bool, bool, Vec<ObjectName>)> {
     let sql = strip_leading_sql_comments(sql).trim();
     let sql = sql.trim_end_matches(';').trim_end();
 
@@ -493,7 +493,9 @@ fn parse_drop_function_sql(sql: &str) -> Result<(bool, Vec<ObjectName>)> {
 
     let rest = rest.split_whitespace().collect::<Vec<_>>().join(" ");
     let rest_upper = rest.to_ascii_uppercase();
+    let mut cascade = false;
     let rest = if let Some(pos) = rest_upper.rfind(" CASCADE") {
+        cascade = true;
         rest[..pos].trim_end()
     } else if let Some(pos) = rest_upper.rfind(" RESTRICT") {
         rest[..pos].trim_end()
@@ -515,7 +517,7 @@ fn parse_drop_function_sql(sql: &str) -> Result<(bool, Vec<ObjectName>)> {
         names.push(object_name_from_token(name_token)?);
     }
 
-    Ok((if_exists, names))
+    Ok((if_exists, cascade, names))
 }
 
 fn parse_create_trigger_sql(
@@ -700,7 +702,7 @@ impl Executor {
         session: &mut Session,
         sql: &str,
     ) -> Result<ExecuteResult> {
-        let (if_exists, names) = parse_drop_function_sql(sql)?;
+        let (if_exists, cascade, names) = parse_drop_function_sql(sql)?;
 
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {
@@ -728,7 +730,10 @@ impl Executor {
                     None => names::resolve_ddl_object_name(&name, search_path)?.full,
                 };
                 last_name = Some(func_full_name.clone());
-                let dropped = self.store().drop_function(txn, db_id, &func_full_name).await?;
+                let dropped = self
+                    .store()
+                    .drop_function(txn, db_id, &func_full_name, cascade)
+                    .await?;
                 if !dropped && !if_exists {
                     return Err(anyhow!("Function '{}' does not exist", func_full_name));
                 }

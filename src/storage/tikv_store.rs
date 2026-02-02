@@ -2035,9 +2035,32 @@ impl TikvStore {
         txn: &mut Transaction,
         db_id: u64,
         full_name: &str,
+        cascade: bool,
     ) -> Result<bool> {
         let key = self.key(&encode_function_key_v2(db_id, full_name));
         if txn.get(key.clone()).await?.is_some() {
+            let dependent_triggers: Vec<TriggerDef> = self
+                .list_triggers(txn, db_id)
+                .await?
+                .into_iter()
+                .filter(|t| t.function == full_name)
+                .collect();
+
+            if !dependent_triggers.is_empty() && !cascade {
+                return Err(anyhow!(
+                    "cannot drop function '{}': other objects depend on it",
+                    full_name
+                ));
+            }
+
+            if cascade {
+                for trigger in dependent_triggers {
+                    let _ = self
+                        .drop_trigger(txn, db_id, &trigger.table, &trigger.name)
+                        .await?;
+                }
+            }
+
             txn_delete(txn, key).await?;
             let comment_key = self.key(&encode_comment_function_key_v2(db_id, full_name));
             txn_delete(txn, comment_key).await?;

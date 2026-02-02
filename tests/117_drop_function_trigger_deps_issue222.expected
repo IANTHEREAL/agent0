@@ -1,0 +1,13 @@
+ERROR:  cannot drop function 'ft_drop_fn_deps.ft_drop_fn_deps_set_updated_at': other objects depend on it
+?column?
+TRIGGER_STILL=1
+(1 row)
+?column?
+FUNC_STILL=1
+(1 row)
+?column?
+TRIGGER_LEFT=0
+(1 row)
+?column?
+FUNC_LEFT=0
+(1 row)
