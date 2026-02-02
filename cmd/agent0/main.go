@@ -45,16 +45,16 @@ func main() {
 	defer stop()
 
 	cfg := pantheon.ControllerConfig{
-		MCPBaseURL:     mcpBaseURL,
-		ProjectName:    projectName,
-		ParentBranchID: parentBranchID,
-		Agent:          mcpAgent,
-		Task:           task,
-		AgentsMDURL:    agentsMDURL,
-		SkillsURL:      skillsURL,
+		MCPBaseURL:      mcpBaseURL,
+		ProjectName:     projectName,
+		ParentBranchID:  parentBranchID,
+		Agent:           mcpAgent,
+		Task:            task,
+		AgentsMDURL:     agentsMDURL,
+		SkillsURL:       skillsURL,
 		MinibookAccount: minibookAccount,
-		StatePath:      defaultStatePath,
-		MaxEpisodes:    maxEpisodes,
+		StatePath:       defaultStatePath,
+		MaxEpisodes:     maxEpisodes,
 	}
 
 	if err := pantheon.RunController(ctx, cfg); err != nil {

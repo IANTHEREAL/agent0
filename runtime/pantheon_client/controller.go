@@ -17,9 +17,6 @@ const (
 	defaultPollTimeoutSeconds     = 24 * 60 * 60
 	defaultPollIntervalSeconds    = 60
 	defaultMaxPollIntervalSeconds = 300
-
-	bootstrapMCPServerName = "test"
-	bootstrapMCPServerURL  = "http://35.89.132.179:8000/mcp/sse"
 )
 
 type ControllerConfig struct {

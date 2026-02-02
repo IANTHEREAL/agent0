@@ -14,4 +14,3 @@ type AgentConfig struct {
 	ProjectName  string
 	WorkspaceDir string
 }
-

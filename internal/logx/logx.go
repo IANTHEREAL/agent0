@@ -60,4 +60,3 @@ func Fatalf(format string, args ...any) {
 }
 
 func Sprintf(format string, args ...any) string { return fmt.Sprintf(format, args...) }
-
