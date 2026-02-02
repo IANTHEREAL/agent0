@@ -5,36 +5,6 @@ use crate::types::Value;
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use rust_decimal::RoundingStrategy;
-
-const PG_NUMERIC_MIN_SIG_DIGITS: i32 = 16;
-const PG_NUMERIC_DEC_DIGITS: i32 = 4;
-const PG_NUMERIC_MIN_DISPLAY_SCALE: i32 = 0;
-const PG_NUMERIC_MAX_DISPLAY_SCALE: i32 = 28; // rust_decimal max scale
-
-fn pg_numeric_weight(d: &Decimal) -> i32 {
-    if d.is_zero() {
-        return 0;
-    }
-    let abs = d.abs();
-    let int_part = abs.trunc();
-    let digits_before_decimal = int_part
-        .to_string()
-        .trim_start_matches('-')
-        .len()
-        .max(1) as i32;
-    (digits_before_decimal - 1) / PG_NUMERIC_DEC_DIGITS
-}
-
-fn pg_select_div_scale(numer: &Decimal, denom: &Decimal) -> u32 {
-    let qweight = pg_numeric_weight(numer) - pg_numeric_weight(denom);
-    let mut scale = PG_NUMERIC_MIN_SIG_DIGITS - qweight * PG_NUMERIC_DEC_DIGITS;
-    let input_scale = numer.scale().max(denom.scale()) as i32;
-    scale = scale.max(input_scale);
-    scale = scale.max(PG_NUMERIC_MIN_DISPLAY_SCALE);
-    scale = scale.min(PG_NUMERIC_MAX_DISPLAY_SCALE);
-    scale.max(0) as u32
-}
 
 #[derive(Debug)]
 pub enum Aggregator {
@@ -179,15 +149,7 @@ impl Aggregator {
                 if *count == 0 {
                     Value::Null
                 } else {
-                    let denom = Decimal::from(*count);
-                    let scale = pg_select_div_scale(sum, &denom);
-                    let mut result = *sum / denom;
-                    if result.scale() > scale {
-                        result = result
-                            .round_dp_with_strategy(scale, RoundingStrategy::MidpointAwayFromZero);
-                    }
-                    result.rescale(scale);
-                    Value::Numeric(result)
+                    Value::Numeric(*sum / Decimal::from(*count))
                 }
             }
             Aggregator::StringAgg { values, delimiter } => {
@@ -378,6 +340,22 @@ mod tests {
         agg.update(&Value::Float64(2.5)).unwrap();
         let result = agg.result();
         assert_eq!(result, Value::Numeric(Decimal::from(2)));
+    }
+
+    #[test]
+    fn test_avg_int_repeating_precision() {
+        let mut agg = Aggregator::new("AVG").unwrap();
+        agg.update(&Value::Int32(300)).unwrap();
+        agg.update(&Value::Int32(200)).unwrap();
+        agg.update(&Value::Int32(300)).unwrap();
+        let result = agg.result();
+        assert_eq!(
+            result,
+            Value::Numeric(Decimal::from_str_exact(
+                "266.66666666666666666666666667"
+            )
+            .unwrap())
+        );
     }
 
     #[test]
