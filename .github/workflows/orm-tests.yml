@@ -35,15 +35,39 @@ jobs:
           cache-dependency-path: orm-tests/package-lock.json
 
       - name: Install tiup
+        shell: bash
         run: |
+          set -euo pipefail
+
           # Isolate TiUP state to avoid flaky/corrupted manifests on runners.
           export TIUP_HOME="$RUNNER_TEMP/tiup"
           echo "TIUP_HOME=$TIUP_HOME" >> "$GITHUB_ENV"
 
-          rm -rf "$TIUP_HOME"
-          mkdir -p "$TIUP_HOME"
-          curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
-          echo "$TIUP_HOME/bin" >> $GITHUB_PATH
+          export PATH="$TIUP_HOME/bin:$PATH"
+          echo "$TIUP_HOME/bin" >> "$GITHUB_PATH"
+
+          install_and_verify() {
+            rm -rf "$TIUP_HOME"
+            mkdir -p "$TIUP_HOME"
+            curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+
+            tiup --version
+            tiup mirror show
+            tiup list >/dev/null
+            tiup install playground
+          }
+
+          for attempt in 1 2 3; do
+            echo "Setting up TiUP (attempt $attempt)..."
+            if install_and_verify; then
+              break
+            fi
+            echo "TiUP setup failed; retrying..."
+            sleep $((attempt * 5))
+          done
+
+          # Ensure the repository is initialized and trusted.
+          tiup list >/dev/null
 
       - name: Build pg-tikv
         run: cargo build --release
@@ -52,12 +76,18 @@ jobs:
         run: cargo test
 
       - name: Start TiKV cluster
+        shell: bash
         run: |
+          set -euo pipefail
+
           cat > /tmp/tikv.toml <<'EOF'
           [storage]
           api-version = 2
           enable-ttl = true
           EOF
+
+          PLAYGROUND_LOG=/tmp/tiup-playground.log
+          rm -f "$PLAYGROUND_LOG"
 
           tiup playground \
             --mode tikv-slim \
@@ -66,10 +96,17 @@ jobs:
             --pd.port 2379 \
             --kv.host 127.0.0.1 \
             --kv.config /tmp/tikv.toml \
-            --kv 1 &
+            --kv 1 >"$PLAYGROUND_LOG" 2>&1 &
+          PLAYGROUND_PID=$!
 
           # Wait for TiKV to be ready (PD is healthy and a store is registered)
           for i in $(seq 1 120); do
+            if ! kill -0 "$PLAYGROUND_PID" 2>/dev/null; then
+              echo "tiup playground exited early:"
+              cat "$PLAYGROUND_LOG" || true
+              exit 1
+            fi
+
             if curl -sf http://127.0.0.1:2379/pd/api/v1/health > /dev/null 2>&1; then
               if curl -sf http://127.0.0.1:2379/pd/api/v1/stores | grep -Eq '"count"[[:space:]]*:[[:space:]]*[1-9]'; then
                 echo "TiKV ready after $i seconds"
@@ -79,8 +116,8 @@ jobs:
             sleep 1
           done
 
-          curl -sf http://127.0.0.1:2379/pd/api/v1/health || exit 1
-          curl -sf http://127.0.0.1:2379/pd/api/v1/stores | grep -Eq '"count"[[:space:]]*:[[:space:]]*[1-9]' || exit 1
+          curl -sf http://127.0.0.1:2379/pd/api/v1/health || (cat "$PLAYGROUND_LOG" && exit 1)
+          curl -sf http://127.0.0.1:2379/pd/api/v1/stores | grep -Eq '"count"[[:space:]]*:[[:space:]]*[1-9]' || (cat "$PLAYGROUND_LOG" && exit 1)
 
       - name: Start pg-tikv
         run: |
