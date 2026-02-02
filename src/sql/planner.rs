@@ -314,7 +314,7 @@ pub fn choose_best_access_path(
         if !is_planner_usable_index(index) {
             continue;
         }
-        if index.predicate.is_some() && !predicate_implies_index_predicate(predicates, index) {
+        if index.predicate.is_some() {
             continue;
         }
         if let Some((scan_type, cost)) =
@@ -327,41 +327,6 @@ pub fn choose_best_access_path(
     }
 
     best_path
-}
-
-fn predicate_implies_index_predicate(predicates: &[PredicateInfo], index: &IndexDef) -> bool {
-    let Some(index_pred) = &index.predicate else {
-        return true;
-    };
-
-    let pred_upper = index_pred.to_uppercase();
-
-    for pred in predicates {
-        let col_upper = pred.column.to_uppercase();
-        let value_str = match &pred.value {
-            Value::Int32(n) => n.to_string(),
-            Value::Int64(n) => n.to_string(),
-            Value::Float64(f) => f.to_string(),
-            Value::Text(s) => format!("'{}'", s),
-            Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-            _ => continue,
-        };
-
-        let check_pattern = match pred.op {
-            PredicateOp::Eq => format!("{} = {}", col_upper, value_str),
-            PredicateOp::Gt => format!("{} > {}", col_upper, value_str),
-            PredicateOp::Ge => format!("{} >= {}", col_upper, value_str),
-            PredicateOp::Lt => format!("{} < {}", col_upper, value_str),
-            PredicateOp::Le => format!("{} <= {}", col_upper, value_str),
-            _ => continue,
-        };
-
-        if pred_upper.contains(&check_pattern) {
-            return true;
-        }
-    }
-
-    false
 }
 
 fn is_planner_usable_index(index: &IndexDef) -> bool {
@@ -812,6 +777,37 @@ mod tests {
         }];
         let path = choose_best_access_path(&schema, &predicates, 1000);
         assert!(matches!(path.scan_type, ScanType::IndexScan { .. }));
+    }
+
+    #[test]
+    fn test_skip_partial_index_scan() {
+        let schema = TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![IndexDef {
+                id: 1,
+                name: "idx_a_partial".to_string(),
+                columns: vec!["a".to_string()],
+                unique: false,
+                method: None,
+                predicate: Some("a = 10".to_string()),
+                expressions: Vec::new(),
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+        let predicates = vec![PredicateInfo {
+            column: "a".to_string(),
+            op: PredicateOp::Eq,
+            value: Value::Int32(1),
+        }];
+        let path = choose_best_access_path(&schema, &predicates, 1000);
+        assert!(matches!(path.scan_type, ScanType::FullTableScan));
     }
 
     #[test]
