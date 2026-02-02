@@ -417,6 +417,60 @@ impl Executor {
             return Ok(result);
         }
 
+        if let SetExpr::Values(values) = &*query.body {
+            let store = self.store();
+            let mut column_count: Option<usize> = None;
+            let mut rows = Vec::with_capacity(values.rows.len());
+            for expr_row in &values.rows {
+                let expr_len = expr_row.len();
+                if let Some(expected) = column_count {
+                    if expr_len != expected {
+                        return Err(anyhow!("VALUES lists must all be the same length"));
+                    }
+                } else {
+                    column_count = Some(expr_len);
+                }
+
+                let mut row_values = Vec::with_capacity(expr_len);
+                for expr in expr_row {
+                    let resolved = self
+                        .resolve_subqueries(txn, db_id, sequence_values, search_path, expr, ctes)
+                        .await?;
+                    let value = sequences::eval_expr_with_sequences(
+                        &store,
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        &resolved,
+                        None,
+                        None,
+                    )
+                    .await?;
+                    row_values.push(value);
+                }
+                rows.push(Row::new(row_values));
+            }
+
+            let column_count = column_count.unwrap_or(0);
+            let columns: Vec<String> = (1..=column_count)
+                .map(|idx| format!("column{}", idx))
+                .collect();
+            let mut rows = rows;
+
+            if !query.order_by.is_empty() {
+                rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns);
+            }
+            rows = apply_offset_limit_fetch(rows, query);
+
+            return Ok(ExecuteResult::Select {
+                column_types: None,
+                columns,
+                rows,
+                timezone: crate::session_context::current_timezone(),
+            });
+        }
+
         let select = match &*query.body {
             SetExpr::Select(s) => s,
             _ => return Err(anyhow!("Only SELECT supported")),
