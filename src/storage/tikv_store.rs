@@ -16,6 +16,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 const SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
+const AUTOCOMMIT_MAX_RETRIES: usize = 10;
 
 /// Maximum scan limit for TiKV operations.
 const SCAN_LIMIT: u32 = u32::MAX;
@@ -211,6 +212,45 @@ impl TikvStore {
             .begin_with_options(options)
             .await
             .map_err(|e| anyhow!(e))
+    }
+
+    /// Perform a single-key read/modify/write in its own auto-committed transaction.
+    ///
+    /// This is used to emulate PostgreSQL non-transactional semantics (e.g. sequences),
+    /// where updates must survive caller transaction rollbacks and SAVEPOINT rollbacks.
+    async fn autocommit_update_key<R>(
+        &self,
+        key: Vec<u8>,
+        mut compute: impl FnMut(Option<Vec<u8>>) -> Result<(Option<Vec<u8>>, R)>,
+    ) -> Result<R> {
+        for attempt in 0..AUTOCOMMIT_MAX_RETRIES {
+            let mut txn = self.begin_optimistic().await?;
+            let current = txn.get(key.clone()).await?;
+            let (new_value, result) = compute(current)?;
+
+            match new_value {
+                Some(val) => txn.put(key.clone(), val).await.map_err(|e| anyhow!(e))?,
+                None => txn.delete(key.clone()).await.map_err(|e| anyhow!(e))?,
+            }
+
+            match txn.commit().await {
+                Ok(_) => return Ok(result),
+                Err(e) => {
+                    let _ = txn.rollback().await;
+                    debug!(
+                        "autocommit update failed (attempt {} of {}): {}",
+                        attempt + 1,
+                        AUTOCOMMIT_MAX_RETRIES,
+                        e
+                    );
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "autocommit update failed after {} attempts",
+            AUTOCOMMIT_MAX_RETRIES
+        ))
     }
 
     /// Check or initialize the on-disk storage format version for this keyspace.
@@ -1121,9 +1161,21 @@ impl TikvStore {
     }
 
     /// Get the next table ID (auto-increment)
-    pub async fn next_table_id(&self, txn: &mut Transaction, db_id: u64) -> Result<u64> {
-        self.increment_sys_key(txn, encode_next_table_id_key_v2(db_id))
-            .await
+    pub async fn next_table_id(&self, _txn: &mut Transaction, db_id: u64) -> Result<u64> {
+        let key = self.key(&encode_next_table_id_key_v2(db_id));
+        self.autocommit_update_key(key, |current| {
+            let next_val = match current {
+                Some(data) => {
+                    let id = u64::from_be_bytes(
+                        data.try_into().map_err(|_| anyhow!("Invalid ID format"))?,
+                    );
+                    id.checked_add(1).ok_or_else(|| anyhow!("Table ID overflow"))?
+                }
+                None => 1,
+            };
+            Ok((Some(next_val.to_be_bytes().to_vec()), next_val))
+        })
+        .await
     }
 
     pub async fn next_type_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
@@ -1146,24 +1198,25 @@ impl TikvStore {
         Ok(next_val)
     }
 
-    pub async fn next_sequence_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
+    pub async fn next_sequence_oid(&self, _txn: &mut Transaction, db_id: u64) -> Result<u32> {
         const FIRST_SEQUENCE_OID: u32 = 1;
 
         let key = self.key(&encode_next_sequence_oid_key_v2(db_id));
-        let current = txn.get(key.clone()).await?;
-        let next_val = match current {
-            Some(data) => {
-                let oid = u32::from_be_bytes(
-                    data.try_into()
-                        .map_err(|_| anyhow!("Invalid sequence OID format"))?,
-                );
-                oid.checked_add(1)
-                    .ok_or_else(|| anyhow!("Sequence OID overflow"))?
-            }
-            None => FIRST_SEQUENCE_OID,
-        };
-        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
-        Ok(next_val)
+        self.autocommit_update_key(key, |current| {
+            let next_val = match current {
+                Some(data) => {
+                    let oid = u32::from_be_bytes(
+                        data.try_into()
+                            .map_err(|_| anyhow!("Invalid sequence OID format"))?,
+                    );
+                    oid.checked_add(1)
+                        .ok_or_else(|| anyhow!("Sequence OID overflow"))?
+                }
+                None => FIRST_SEQUENCE_OID,
+            };
+            Ok((Some(next_val.to_be_bytes().to_vec()), next_val))
+        })
+        .await
     }
 
     pub async fn next_function_oid(&self, txn: &mut Transaction, db_id: u64) -> Result<u32> {
@@ -1228,40 +1281,40 @@ impl TikvStore {
 
     pub async fn next_sequence_value(
         &self,
-        txn: &mut Transaction,
+        _txn: &mut Transaction,
         db_id: u64,
         table_id: u64,
     ) -> Result<i32> {
-        let raw_key = encode_table_sequence_value_key_v2(db_id, table_id);
-        let val = self.increment_sys_key(txn, raw_key).await?;
+        let key = self.key(&encode_table_sequence_value_key_v2(db_id, table_id));
+        let val = self
+            .autocommit_update_key(key, |current| {
+                let current_val = match current {
+                    Some(data) => u64::from_be_bytes(
+                        data.try_into().map_err(|_| anyhow!("Invalid ID format"))?,
+                    ),
+                    None => 0,
+                };
+                let next_val = current_val
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("Sequence overflow"))?;
+                Ok((Some(next_val.to_be_bytes().to_vec()), next_val))
+            })
+            .await?;
         Ok(val as i32)
     }
 
     pub async fn set_sequence_value(
         &self,
-        txn: &mut Transaction,
+        _txn: &mut Transaction,
         db_id: u64,
         table_id: u64,
         value: u64,
     ) -> Result<()> {
         let key = self.key(&encode_table_sequence_value_key_v2(db_id, table_id));
-        txn_put(txn, key, value.to_be_bytes().to_vec()).await?;
-        Ok(())
-    }
-
-    async fn increment_sys_key(&self, txn: &mut Transaction, raw_key: Vec<u8>) -> Result<u64> {
-        let key = self.key(&raw_key);
-        let current = txn.get(key.clone()).await?;
-        let next_val = match current {
-            Some(data) => {
-                let id =
-                    u64::from_be_bytes(data.try_into().map_err(|_| anyhow!("Invalid ID format"))?);
-                id + 1
-            }
-            None => 1,
-        };
-        txn_put(txn, key, next_val.to_be_bytes().to_vec()).await?;
-        Ok(next_val)
+        self.autocommit_update_key(key, |_current| {
+            Ok((Some(value.to_be_bytes().to_vec()), ()))
+        })
+        .await
     }
 
     pub async fn create_table(
@@ -1691,6 +1744,21 @@ impl TikvStore {
             Some(data) => {
                 let mut def: SequenceDef = bincode::deserialize(&data)
                     .context("Failed to deserialize sequence definition")?;
+                if def.oid == 0 {
+                    if let Some(backfilled) =
+                        self.autocommit_backfill_sequence_oid(db_id, full_name).await?
+                    {
+                        let mut def = backfilled;
+                        if def.start_value == 0 {
+                            def.start_value = def.min_value;
+                        }
+                        if def.cache_size == 0 {
+                            def.cache_size = 1;
+                        }
+                        return Ok(Some(def));
+                    }
+                }
+
                 let mut needs_update = false;
                 if def.oid == 0 {
                     def.oid = self.next_sequence_oid(txn, db_id).await?;
@@ -1715,6 +1783,76 @@ impl TikvStore {
         }
     }
 
+    /// Ensure a legacy sequence definition has a stable non-zero OID.
+    ///
+    /// This backfill is performed in its own auto-committed transaction so it survives caller
+    /// transaction rollbacks and SAVEPOINT rollbacks. This is required because standalone sequence
+    /// state is stored separately under a key derived from the OID.
+    async fn autocommit_backfill_sequence_oid(
+        &self,
+        db_id: u64,
+        full_name: &str,
+    ) -> Result<Option<SequenceDef>> {
+        const FIRST_SEQUENCE_OID: u32 = 1;
+
+        let def_key = self.key(&encode_sequence_def_key_v2(db_id, full_name));
+        let oid_key = self.key(&encode_next_sequence_oid_key_v2(db_id));
+
+        for attempt in 0..AUTOCOMMIT_MAX_RETRIES {
+            let mut txn = self.begin_optimistic().await?;
+            let Some(data) = txn.get(def_key.clone()).await? else {
+                let _ = txn.rollback().await;
+                return Ok(None);
+            };
+
+            let mut def: SequenceDef = bincode::deserialize(&data)
+                .context("Failed to deserialize sequence definition")?;
+
+            if def.oid != 0 {
+                let _ = txn.rollback().await;
+                return Ok(Some(def));
+            }
+
+            let current = txn.get(oid_key.clone()).await?;
+            let next_val = match current {
+                Some(data) => {
+                    let oid = u32::from_be_bytes(
+                        data.try_into()
+                            .map_err(|_| anyhow!("Invalid sequence OID format"))?,
+                    );
+                    oid.checked_add(1)
+                        .ok_or_else(|| anyhow!("Sequence OID overflow"))?
+                }
+                None => FIRST_SEQUENCE_OID,
+            };
+            txn.put(oid_key.clone(), next_val.to_be_bytes().to_vec())
+                .await
+                .map_err(|e| anyhow!(e))?;
+
+            def.oid = next_val;
+            let data = bincode::serialize(&def).context("Failed to serialize sequence definition")?;
+            txn.put(def_key.clone(), data).await.map_err(|e| anyhow!(e))?;
+
+            match txn.commit().await {
+                Ok(_) => return Ok(Some(def)),
+                Err(e) => {
+                    let _ = txn.rollback().await;
+                    debug!(
+                        "autocommit sequence OID backfill failed (attempt {} of {}): {}",
+                        attempt + 1,
+                        AUTOCOMMIT_MAX_RETRIES,
+                        e
+                    );
+                }
+            }
+        }
+
+        Err(anyhow!(
+            "autocommit sequence OID backfill failed after {} attempts",
+            AUTOCOMMIT_MAX_RETRIES
+        ))
+    }
+
     pub async fn list_sequences(
         &self,
         txn: &mut Transaction,
@@ -1730,6 +1868,23 @@ impl TikvStore {
         for pair in pairs {
             let mut def: SequenceDef =
                 bincode::deserialize(pair.value()).context("Failed to deserialize sequence")?;
+            if def.oid == 0 {
+                if let Some(backfilled) =
+                    self.autocommit_backfill_sequence_oid(db_id, &def.full_name())
+                        .await?
+                {
+                    let mut def = backfilled;
+                    if def.start_value == 0 {
+                        def.start_value = def.min_value;
+                    }
+                    if def.cache_size == 0 {
+                        def.cache_size = 1;
+                    }
+                    sequences.push(def);
+                    continue;
+                }
+            }
+
             let mut needs_update = false;
             if def.oid == 0 {
                 def.oid = self.next_sequence_oid(txn, db_id).await?;
@@ -1759,12 +1914,24 @@ impl TikvStore {
         full_name: &str,
     ) -> Result<bool> {
         let key = self.key(&encode_sequence_def_key_v2(db_id, full_name));
-        if txn.get(key.clone()).await?.is_some() {
-            txn_delete(txn, key).await?;
-            Ok(true)
-        } else {
-            Ok(false)
+        let Some(data) = txn.get(key.clone()).await? else {
+            return Ok(false);
+        };
+
+        let def: SequenceDef =
+            bincode::deserialize(&data).context("Failed to deserialize sequence definition")?;
+        txn_delete(txn, key).await?;
+
+        // Standalone sequences persist state under `sys_seq_{oid}`. Drop that state along with the
+        // definition so that a later recreate (with a new OID) doesn't accumulate orphan keys.
+        if matches!(def.backing, SequenceBacking::Standalone(_)) && def.oid != 0 {
+            let state_key = self.key(&encode_sequence_value_key_v2(db_id, def.oid));
+            if txn.get(state_key.clone()).await?.is_some() {
+                txn_delete(txn, state_key).await?;
+            }
         }
+
+        Ok(true)
     }
 
     pub async fn create_function(
@@ -2004,30 +2171,45 @@ impl TikvStore {
         db_id: u64,
         full_name: &str,
     ) -> Result<i64> {
-        let mut def = self
+        let def = self
             .get_sequence(txn, db_id, full_name)
             .await?
             .ok_or_else(|| anyhow!("Sequence '{}' does not exist", full_name))?;
 
-        match &mut def.backing {
+        match &def.backing {
             SequenceBacking::TableId(table_id) => {
                 Ok(self.next_sequence_value(txn, db_id, *table_id).await? as i64)
             }
-            SequenceBacking::Standalone(state) => {
-                let next = nextval_standalone(
-                    full_name,
-                    def.increment,
-                    def.min_value,
-                    def.max_value,
-                    def.is_cycled,
-                    state,
-                )?;
+            SequenceBacking::Standalone(embedded_state) => {
+                let state_key = self.key(&encode_sequence_value_key_v2(db_id, def.oid));
+                let embedded_state = embedded_state.clone();
+                let full_name = full_name.to_string();
+                let increment = def.increment;
+                let min_value = def.min_value;
+                let max_value = def.max_value;
+                let is_cycled = def.is_cycled;
 
-                let key = self.key(&encode_sequence_def_key_v2(db_id, full_name));
-                let data =
-                    bincode::serialize(&def).context("Failed to serialize sequence definition")?;
-                txn_put(txn, key, data).await?;
-                Ok(next)
+                self.autocommit_update_key(state_key, |current| {
+                    let mut state: SequenceState = match current {
+                        Some(data) => bincode::deserialize(&data)
+                            .context("Failed to deserialize sequence state")?,
+                        None => embedded_state.clone(),
+                    };
+
+                    let next = nextval_standalone(
+                        &full_name,
+                        increment,
+                        min_value,
+                        max_value,
+                        is_cycled,
+                        &mut state,
+                    )?;
+
+                    let data =
+                        bincode::serialize(&state).context("Failed to serialize sequence state")?;
+                    Ok((Some(data), next))
+                })
+                .await
             }
         }
     }
@@ -2040,12 +2222,12 @@ impl TikvStore {
         value: i64,
         is_called: bool,
     ) -> Result<i64> {
-        let mut def = self
+        let def = self
             .get_sequence(txn, db_id, full_name)
             .await?
             .ok_or_else(|| anyhow!("Sequence '{}' does not exist", full_name))?;
 
-        match &mut def.backing {
+        match &def.backing {
             SequenceBacking::TableId(table_id) => {
                 if value < 1 {
                     return Err(anyhow!(
@@ -2075,21 +2257,36 @@ impl TikvStore {
                 self.set_sequence_value(txn, db_id, *table_id, stored).await?;
                 Ok(value)
             }
-            SequenceBacking::Standalone(state) => {
-                setval_standalone(
-                    full_name,
-                    def.min_value,
-                    def.max_value,
-                    state,
-                    value,
-                    is_called,
-                )?;
+            SequenceBacking::Standalone(embedded_state) => {
+                let state_key = self.key(&encode_sequence_value_key_v2(db_id, def.oid));
+                let embedded_state = embedded_state.clone();
+                let full_name = full_name.to_string();
+                let min_value = def.min_value;
+                let max_value = def.max_value;
+                let value_copy = value;
+                let is_called_copy = is_called;
 
-                let key = self.key(&encode_sequence_def_key_v2(db_id, full_name));
-                let data =
-                    bincode::serialize(&def).context("Failed to serialize sequence definition")?;
-                txn_put(txn, key, data).await?;
-                Ok(value)
+                self.autocommit_update_key(state_key, |current| {
+                    let mut state: SequenceState = match current {
+                        Some(data) => bincode::deserialize(&data)
+                            .context("Failed to deserialize sequence state")?,
+                        None => embedded_state.clone(),
+                    };
+
+                    setval_standalone(
+                        &full_name,
+                        min_value,
+                        max_value,
+                        &mut state,
+                        value_copy,
+                        is_called_copy,
+                    )?;
+
+                    let data =
+                        bincode::serialize(&state).context("Failed to serialize sequence state")?;
+                    Ok((Some(data), value_copy))
+                })
+                .await
             }
         }
     }

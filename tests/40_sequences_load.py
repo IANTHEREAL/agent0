@@ -79,8 +79,10 @@ def main() -> int:
         cfg,
         """
         DROP TABLE IF EXISTS seq_serial_t;
+        DROP TABLE IF EXISTS seq_serial_rollback_t;
         DROP SEQUENCE IF EXISTS s1;
         DROP SEQUENCE IF EXISTS s2;
+        DROP SEQUENCE IF EXISTS s_txn;
         """,
     )
 
@@ -140,8 +142,61 @@ def main() -> int:
     )
     assert_lines(out, ["S", "2", "3", "4", "100", "101", "200", "200", "0"])
 
+    # Transaction and savepoint behavior: nextval/setval effects must survive ROLLBACK and
+    # ROLLBACK TO SAVEPOINT (PostgreSQL semantics).
+    out = must_stdout(
+        cfg,
+        """
+        DROP SEQUENCE IF EXISTS s_txn;
+        CREATE SEQUENCE s_txn START WITH 1 INCREMENT BY 1;
+        SELECT nextval('s_txn');
+        BEGIN;
+        SELECT nextval('s_txn');
+        ROLLBACK;
+        SELECT nextval('s_txn');
+        BEGIN;
+        SAVEPOINT a;
+        SELECT nextval('s_txn');
+        ROLLBACK TO a;
+        SELECT nextval('s_txn');
+        ROLLBACK;
+        SELECT nextval('s_txn');
+        SELECT setval('s_txn', 100);
+        BEGIN;
+        SELECT setval('s_txn', 200);
+        ROLLBACK;
+        SELECT nextval('s_txn');
+        """,
+    )
+    assert_lines(out, ["1", "2", "3", "4", "5", "6", "100", "200", "201"])
+
+    # SERIAL bridge: INSERT-generated values must advance even if the transaction is rolled back.
+    out = must_stdout(
+        cfg,
+        """
+        DROP TABLE IF EXISTS seq_serial_rollback_t;
+        CREATE TABLE seq_serial_rollback_t (id SERIAL PRIMARY KEY, v INT);
+        INSERT INTO seq_serial_rollback_t(v) VALUES (1);
+        BEGIN;
+        INSERT INTO seq_serial_rollback_t(v) VALUES (2);
+        ROLLBACK;
+        INSERT INTO seq_serial_rollback_t(v) VALUES (3);
+        SELECT max(id) FROM seq_serial_rollback_t;
+        BEGIN;
+        SAVEPOINT a;
+        INSERT INTO seq_serial_rollback_t(v) VALUES (4);
+        ROLLBACK TO a;
+        INSERT INTO seq_serial_rollback_t(v) VALUES (5);
+        ROLLBACK;
+        INSERT INTO seq_serial_rollback_t(v) VALUES (6);
+        SELECT max(id) FROM seq_serial_rollback_t;
+        DROP TABLE seq_serial_rollback_t;
+        """,
+    )
+    assert_lines(out, ["3", "6"])
+
     # Cleanup.
-    must_stdout(cfg, "DROP SEQUENCE IF EXISTS s1; DROP SEQUENCE IF EXISTS s2;")
+    must_stdout(cfg, "DROP SEQUENCE IF EXISTS s1; DROP SEQUENCE IF EXISTS s2; DROP SEQUENCE IF EXISTS s_txn;")
     return 0
 
 
@@ -151,4 +206,3 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"[40_sequences_load.py] FAILED: {e}", file=sys.stderr)
         raise
-
