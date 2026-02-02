@@ -26,22 +26,29 @@ fn rewrite_join_expr_with_aliases(
     right_alias: &str,
     left_schema: &TableSchema,
     right_schema: &TableSchema,
-) -> Expr {
+) -> Result<Expr> {
     match expr {
         Expr::Identifier(ident) => {
             let col_name = &ident.value;
-            if left_schema.column_index(col_name).is_some() {
-                Expr::CompoundIdentifier(vec![
+            let in_left = left_schema.column_index(col_name).is_some();
+            let in_right = right_schema.column_index(col_name).is_some();
+
+            if in_left && in_right {
+                return Err(anyhow!("column reference \"{}\" is ambiguous", col_name));
+            }
+
+            if in_left {
+                Ok(Expr::CompoundIdentifier(vec![
                     Ident::new(left_alias),
                     Ident::new(col_name.clone()),
-                ])
-            } else if right_schema.column_index(col_name).is_some() {
-                Expr::CompoundIdentifier(vec![
+                ]))
+            } else if in_right {
+                Ok(Expr::CompoundIdentifier(vec![
                     Ident::new(right_alias),
                     Ident::new(col_name.clone()),
-                ])
+                ]))
             } else {
-                expr.clone()
+                Ok(expr.clone())
             }
         }
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
@@ -54,27 +61,27 @@ fn rewrite_join_expr_with_aliases(
             let right_table_lower = right_schema.name.to_lowercase();
 
             if table_ref == left_lower || table_ref == left_table_lower {
-                Expr::CompoundIdentifier(vec![
+                Ok(Expr::CompoundIdentifier(vec![
                     Ident::new(left_alias),
                     Ident::new(col_name.clone()),
-                ])
+                ]))
             } else if table_ref == right_lower || table_ref == right_table_lower {
-                Expr::CompoundIdentifier(vec![
+                Ok(Expr::CompoundIdentifier(vec![
                     Ident::new(right_alias),
                     Ident::new(col_name.clone()),
-                ])
+                ]))
             } else {
-                expr.clone()
+                Ok(expr.clone())
             }
         }
-        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+        Expr::BinaryOp { left, op, right } => Ok(Expr::BinaryOp {
             left: Box::new(rewrite_join_expr_with_aliases(
                 left,
                 left_alias,
                 right_alias,
                 left_schema,
                 right_schema,
-            )),
+            )?),
             op: op.clone(),
             right: Box::new(rewrite_join_expr_with_aliases(
                 right,
@@ -82,9 +89,9 @@ fn rewrite_join_expr_with_aliases(
                 right_alias,
                 left_schema,
                 right_schema,
-            )),
-        },
-        Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+            )?),
+        }),
+        Expr::UnaryOp { op, expr: inner } => Ok(Expr::UnaryOp {
             op: op.clone(),
             expr: Box::new(rewrite_join_expr_with_aliases(
                 inner,
@@ -92,41 +99,41 @@ fn rewrite_join_expr_with_aliases(
                 right_alias,
                 left_schema,
                 right_schema,
-            )),
-        },
-        Expr::Nested(inner) => Expr::Nested(Box::new(rewrite_join_expr_with_aliases(
+            )?),
+        }),
+        Expr::Nested(inner) => Ok(Expr::Nested(Box::new(rewrite_join_expr_with_aliases(
             inner,
             left_alias,
             right_alias,
             left_schema,
             right_schema,
-        ))),
-        Expr::IsNull(inner) => Expr::IsNull(Box::new(rewrite_join_expr_with_aliases(
+        )?))),
+        Expr::IsNull(inner) => Ok(Expr::IsNull(Box::new(rewrite_join_expr_with_aliases(
             inner,
             left_alias,
             right_alias,
             left_schema,
             right_schema,
-        ))),
-        Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(rewrite_join_expr_with_aliases(
+        )?))),
+        Expr::IsNotNull(inner) => Ok(Expr::IsNotNull(Box::new(rewrite_join_expr_with_aliases(
             inner,
             left_alias,
             right_alias,
             left_schema,
             right_schema,
-        ))),
+        )?))),
         Expr::InList {
             expr: inner,
             list,
             negated,
-        } => Expr::InList {
+        } => Ok(Expr::InList {
             expr: Box::new(rewrite_join_expr_with_aliases(
                 inner,
                 left_alias,
                 right_alias,
                 left_schema,
                 right_schema,
-            )),
+            )?),
             list: list
                 .iter()
                 .map(|e| {
@@ -138,22 +145,22 @@ fn rewrite_join_expr_with_aliases(
                         right_schema,
                     )
                 })
-                .collect(),
+                .collect::<Result<Vec<_>>>()?,
             negated: *negated,
-        },
+        }),
         Expr::Between {
             expr: inner,
             negated,
             low,
             high,
-        } => Expr::Between {
+        } => Ok(Expr::Between {
             expr: Box::new(rewrite_join_expr_with_aliases(
                 inner,
                 left_alias,
                 right_alias,
                 left_schema,
                 right_schema,
-            )),
+            )?),
             negated: *negated,
             low: Box::new(rewrite_join_expr_with_aliases(
                 low,
@@ -161,31 +168,33 @@ fn rewrite_join_expr_with_aliases(
                 right_alias,
                 left_schema,
                 right_schema,
-            )),
+            )?),
             high: Box::new(rewrite_join_expr_with_aliases(
                 high,
                 left_alias,
                 right_alias,
                 left_schema,
                 right_schema,
-            )),
-        },
+            )?),
+        }),
         Expr::Case {
             operand,
             conditions,
             results,
             else_result,
-        } => Expr::Case {
-            operand: operand.as_ref().map(|o| {
-                Box::new(rewrite_join_expr_with_aliases(
+        } => {
+            let operand = match operand.as_ref() {
+                Some(o) => Some(Box::new(rewrite_join_expr_with_aliases(
                     o,
                     left_alias,
                     right_alias,
                     left_schema,
                     right_schema,
-                ))
-            }),
-            conditions: conditions
+                )?)),
+                None => None,
+            };
+
+            let conditions = conditions
                 .iter()
                 .map(|c| {
                     rewrite_join_expr_with_aliases(
@@ -196,8 +205,9 @@ fn rewrite_join_expr_with_aliases(
                         right_schema,
                     )
                 })
-                .collect(),
-            results: results
+                .collect::<Result<Vec<_>>>()?;
+
+            let results = results
                 .iter()
                 .map(|r| {
                     rewrite_join_expr_with_aliases(
@@ -208,17 +218,26 @@ fn rewrite_join_expr_with_aliases(
                         right_schema,
                     )
                 })
-                .collect(),
-            else_result: else_result.as_ref().map(|e| {
-                Box::new(rewrite_join_expr_with_aliases(
+                .collect::<Result<Vec<_>>>()?;
+
+            let else_result = match else_result.as_ref() {
+                Some(e) => Some(Box::new(rewrite_join_expr_with_aliases(
                     e,
                     left_alias,
                     right_alias,
                     left_schema,
                     right_schema,
-                ))
-            }),
-        },
+                )?)),
+                None => None,
+            };
+
+            Ok(Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            })
+        }
         Expr::Function(f) => {
             let rewritten_args = f
                 .args
@@ -226,18 +245,20 @@ fn rewrite_join_expr_with_aliases(
                 .into_iter()
                 .map(|arg| match arg {
                     FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(rewrite_join_expr_with_aliases(
+                        Ok(FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                            rewrite_join_expr_with_aliases(
                             &e,
                             left_alias,
                             right_alias,
                             left_schema,
                             right_schema,
+                        )?,
                         )))
                     }
-                    other => other,
+                    other => Ok(other),
                 })
-                .collect();
-            Expr::Function(Function {
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Expr::Function(Function {
                 name: f.name.clone(),
                 args: rewritten_args,
                 filter: f.filter.clone(),
@@ -246,20 +267,20 @@ fn rewrite_join_expr_with_aliases(
                 distinct: f.distinct,
                 special: f.special,
                 order_by: f.order_by.clone(),
-            })
+            }))
         }
-        Expr::Cast { expr: inner, data_type, format } => Expr::Cast {
+        Expr::Cast { expr: inner, data_type, format } => Ok(Expr::Cast {
             expr: Box::new(rewrite_join_expr_with_aliases(
                 inner,
                 left_alias,
                 right_alias,
                 left_schema,
                 right_schema,
-            )),
+            )?),
             data_type: data_type.clone(),
             format: format.clone(),
-        },
-        _ => expr.clone(),
+        }),
+        _ => Ok(expr.clone()),
     }
 }
 
@@ -1381,28 +1402,39 @@ impl Executor {
             owner: String::new(),
         };
 
-        let rewritten_condition = join_condition.map(|cond| {
-            rewrite_join_expr_with_aliases(
+        let rewritten_condition = match join_condition {
+            Some(cond) => Some(rewrite_join_expr_with_aliases(
                 &cond,
                 left_alias,
                 right_alias,
                 &left_schema,
                 &right_schema,
-            )
-        });
+            )?),
+            None => None,
+        };
 
-        let rewritten_filter = filter.map(|f| {
-            rewrite_join_expr_with_aliases(f, left_alias, right_alias, &left_schema, &right_schema)
-        });
+        let rewritten_filter = match filter {
+            Some(f) => Some(rewrite_join_expr_with_aliases(
+                f,
+                left_alias,
+                right_alias,
+                &left_schema,
+                &right_schema,
+            )?),
+            None => None,
+        };
 
         let mut projection_exprs_for_order_by: Vec<Expr> = Vec::new();
         let mut alias_exprs_for_order_by: HashMap<String, Expr> = HashMap::new();
         for item in projection {
             match item {
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
-                    projection_exprs_for_order_by.extend(combined_schema.columns.iter().map(|col| {
-                        Expr::Identifier(Ident::new(col.name.clone()))
-                    }));
+                    projection_exprs_for_order_by.extend(
+                        combined_schema
+                            .columns
+                            .iter()
+                            .map(|col| Expr::Identifier(Ident::new(col.name.clone()))),
+                    );
                 }
                 SelectItem::UnnamedExpr(expr) => {
                     projection_exprs_for_order_by.push(rewrite_join_expr_with_aliases(
@@ -1411,7 +1443,7 @@ impl Executor {
                         right_alias,
                         &left_schema,
                         &right_schema,
-                    ));
+                    )?);
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     let rewritten = rewrite_join_expr_with_aliases(
@@ -1420,47 +1452,18 @@ impl Executor {
                         right_alias,
                         &left_schema,
                         &right_schema,
-                    );
+                    )?;
                     alias_exprs_for_order_by.insert(alias.value.to_lowercase(), rewritten.clone());
                     projection_exprs_for_order_by.push(rewritten);
                 }
             }
         }
 
-        let rewritten_order_by: Vec<OrderByExpr> = order_by
-            .iter()
-            .map(|o| {
-                let expr = if let Expr::Identifier(ident) = &o.expr {
-                    alias_exprs_for_order_by
-                        .get(&ident.value.to_lowercase())
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            rewrite_join_expr_with_aliases(
-                                &o.expr,
-                                left_alias,
-                                right_alias,
-                                &left_schema,
-                                &right_schema,
-                            )
-                        })
-                } else if let Expr::Value(SqlValue::Number(n, _)) = &o.expr {
-                    if let Ok(pos) = n.parse::<usize>() {
-                        if pos == 0 || pos > projection_exprs_for_order_by.len() {
-                            return Err(anyhow!(
-                                "ORDER BY position {} is not in select list",
-                                pos
-                            ));
-                        }
-                        projection_exprs_for_order_by[pos - 1].clone()
-                    } else {
-                        rewrite_join_expr_with_aliases(
-                            &o.expr,
-                            left_alias,
-                            right_alias,
-                            &left_schema,
-                            &right_schema,
-                        )
-                    }
+        let mut rewritten_order_by: Vec<OrderByExpr> = Vec::with_capacity(order_by.len());
+        for o in order_by {
+            let expr = if let Expr::Identifier(ident) = &o.expr {
+                if let Some(expr) = alias_exprs_for_order_by.get(&ident.value.to_lowercase()) {
+                    expr.clone()
                 } else {
                     rewrite_join_expr_with_aliases(
                         &o.expr,
@@ -1468,16 +1471,39 @@ impl Executor {
                         right_alias,
                         &left_schema,
                         &right_schema,
-                    )
-                };
+                    )?
+                }
+            } else if let Expr::Value(SqlValue::Number(n, _)) = &o.expr {
+                if let Ok(pos) = n.parse::<usize>() {
+                    if pos == 0 || pos > projection_exprs_for_order_by.len() {
+                        return Err(anyhow!("ORDER BY position {} is not in select list", pos));
+                    }
+                    projection_exprs_for_order_by[pos - 1].clone()
+                } else {
+                    rewrite_join_expr_with_aliases(
+                        &o.expr,
+                        left_alias,
+                        right_alias,
+                        &left_schema,
+                        &right_schema,
+                    )?
+                }
+            } else {
+                rewrite_join_expr_with_aliases(
+                    &o.expr,
+                    left_alias,
+                    right_alias,
+                    &left_schema,
+                    &right_schema,
+                )?
+            };
 
-                Ok(OrderByExpr {
-                    expr,
-                    asc: o.asc,
-                    nulls_first: o.nulls_first,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+            rewritten_order_by.push(OrderByExpr {
+                expr,
+                asc: o.asc,
+                nulls_first: o.nulls_first,
+            });
+        }
 
         let left_op: BoxedOperator = Box::new(TableScanOperator::new(left_schema.clone()));
         let right_op: BoxedOperator = Box::new(TableScanOperator::new(right_schema.clone()));
@@ -1533,31 +1559,33 @@ impl Executor {
                 .collect();
             (cols, types, rows)
         } else {
-            let rewritten_projection: Vec<SelectItem> = projection
-                .iter()
-                .map(|item| match item {
-                    SelectItem::UnnamedExpr(expr) => SelectItem::UnnamedExpr(
-                        rewrite_join_expr_with_aliases(
+            let mut rewritten_projection: Vec<SelectItem> = Vec::with_capacity(projection.len());
+            for item in projection {
+                match item {
+                    SelectItem::UnnamedExpr(expr) => rewritten_projection.push(
+                        SelectItem::UnnamedExpr(rewrite_join_expr_with_aliases(
                             expr,
                             left_alias,
                             right_alias,
                             &left_schema,
                             &right_schema,
-                        ),
+                        )?),
                     ),
-                    SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias {
-                        expr: rewrite_join_expr_with_aliases(
-                            expr,
-                            left_alias,
-                            right_alias,
-                            &left_schema,
-                            &right_schema,
-                        ),
-                        alias: alias.clone(),
-                    },
-                    other => other.clone(),
-                })
-                .collect();
+                    SelectItem::ExprWithAlias { expr, alias } => {
+                        rewritten_projection.push(SelectItem::ExprWithAlias {
+                            expr: rewrite_join_expr_with_aliases(
+                                expr,
+                                left_alias,
+                                right_alias,
+                                &left_schema,
+                                &right_schema,
+                            )?,
+                            alias: alias.clone(),
+                        });
+                    }
+                    other => rewritten_projection.push(other.clone()),
+                }
+            }
 
             let cols: Vec<String> = rewritten_projection
                 .iter()

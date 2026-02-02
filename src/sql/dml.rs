@@ -1730,15 +1730,31 @@ pub fn build_update_join_context<'a>(
     };
 
     let mut column_offsets: HashMap<String, usize> = HashMap::new();
+    let mut ambiguous_unqualified: HashSet<String> = HashSet::new();
     for (i, col) in main_schema.columns.iter().enumerate() {
         column_offsets.insert(format!("{}.{}", main_alias, col.name), i);
         column_offsets.insert(col.name.clone(), i);
     }
     let offset = main_schema.columns.len();
     for (i, col) in from_schema.columns.iter().enumerate() {
-        column_offsets.insert(format!("{}.{}", from_alias, col.name), offset + i);
-        if !column_offsets.contains_key(&col.name) {
-            column_offsets.insert(col.name.clone(), offset + i);
+        let col_offset = offset + i;
+        column_offsets.insert(format!("{}.{}", from_alias, col.name), col_offset);
+        if col.name.contains('.') {
+            column_offsets.insert(col.name.clone(), col_offset);
+            continue;
+        }
+        if ambiguous_unqualified.contains(&col.name) {
+            continue;
+        }
+        match column_offsets.get(&col.name) {
+            Some(&prev) if prev != col_offset => {
+                column_offsets.remove(&col.name);
+                ambiguous_unqualified.insert(col.name.clone());
+            }
+            Some(_) => {}
+            None => {
+                column_offsets.insert(col.name.clone(), col_offset);
+            }
         }
     }
 

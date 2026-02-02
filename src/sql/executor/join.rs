@@ -562,6 +562,187 @@ fn resolve_join_expr_offset(expr: &Expr, column_offsets: &HashMap<String, usize>
     }
 }
 
+fn insert_unqualified_join_offset(
+    column_offsets: &mut HashMap<String, usize>,
+    ambiguous_unqualified: &mut HashSet<String>,
+    col_name: &str,
+    offset: usize,
+) {
+    if col_name.contains('.') {
+        if !column_offsets.contains_key(col_name) {
+            column_offsets.insert(col_name.to_string(), offset);
+        }
+        return;
+    }
+    if ambiguous_unqualified.contains(col_name) {
+        return;
+    }
+
+    match column_offsets.get(col_name) {
+        Some(&prev) if prev != offset => {
+            column_offsets.remove(col_name);
+            ambiguous_unqualified.insert(col_name.to_string());
+        }
+        Some(_) => {}
+        None => {
+            column_offsets.insert(col_name.to_string(), offset);
+        }
+    }
+}
+
+fn unqualified_column_is_ambiguous(name: &str, column_offsets: &HashMap<String, usize>) -> bool {
+    let mut first_offset: Option<usize> = None;
+    for (key, &offset) in column_offsets {
+        if let Some((_, suffix)) = key.rsplit_once('.') {
+            if suffix == name {
+                match first_offset {
+                    None => first_offset = Some(offset),
+                    Some(prev) if prev != offset => return true,
+                    Some(_) => {}
+                }
+            }
+        }
+    }
+    false
+}
+
+fn validate_no_ambiguous_unqualified_columns(
+    expr: &Expr,
+    column_offsets: &HashMap<String, usize>,
+) -> Result<()> {
+    match expr {
+        Expr::Identifier(ident) => {
+            if ident.value.eq_ignore_ascii_case("DEFAULT") {
+                return Ok(());
+            }
+            if column_offsets.contains_key(&ident.value) {
+                return Ok(());
+            }
+            if unqualified_column_is_ambiguous(&ident.value, column_offsets) {
+                return Err(anyhow!(
+                    "column reference \"{}\" is ambiguous",
+                    ident.value
+                ));
+            }
+            Ok(())
+        }
+        Expr::CompoundIdentifier(_) => Ok(()),
+        Expr::BinaryOp { left, right, .. } => {
+            validate_no_ambiguous_unqualified_columns(left, column_offsets)?;
+            validate_no_ambiguous_unqualified_columns(right, column_offsets)
+        }
+        Expr::UnaryOp { expr: inner, .. }
+        | Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::IsNotTrue(inner)
+        | Expr::IsNotFalse(inner) => validate_no_ambiguous_unqualified_columns(inner, column_offsets),
+        Expr::Cast { expr: inner, .. } => validate_no_ambiguous_unqualified_columns(inner, column_offsets),
+        Expr::Between {
+            expr: inner,
+            low,
+            high,
+            ..
+        } => {
+            validate_no_ambiguous_unqualified_columns(inner, column_offsets)?;
+            validate_no_ambiguous_unqualified_columns(low, column_offsets)?;
+            validate_no_ambiguous_unqualified_columns(high, column_offsets)
+        }
+        Expr::InList { expr: inner, list, .. } => {
+            validate_no_ambiguous_unqualified_columns(inner, column_offsets)?;
+            for e in list {
+                validate_no_ambiguous_unqualified_columns(e, column_offsets)?;
+            }
+            Ok(())
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                validate_no_ambiguous_unqualified_columns(op, column_offsets)?;
+            }
+            for e in conditions {
+                validate_no_ambiguous_unqualified_columns(e, column_offsets)?;
+            }
+            for e in results {
+                validate_no_ambiguous_unqualified_columns(e, column_offsets)?;
+            }
+            if let Some(e) = else_result {
+                validate_no_ambiguous_unqualified_columns(e, column_offsets)?;
+            }
+            Ok(())
+        }
+        Expr::Function(func) => {
+            for arg in &func.args {
+                if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
+                    validate_no_ambiguous_unqualified_columns(e, column_offsets)?;
+                }
+            }
+            if let Some(filter) = func.filter.as_deref() {
+                validate_no_ambiguous_unqualified_columns(filter, column_offsets)?;
+            }
+            Ok(())
+        }
+        Expr::InSubquery { .. }
+        | Expr::Exists { .. }
+        | Expr::Subquery(_)
+        | Expr::AnyOp { .. }
+        | Expr::AllOp { .. } => Ok(()),
+        _ => Ok(()),
+    }
+}
+
+fn build_join_output_schema_and_offsets(
+    combined_schemas: &[(String, TableSchema)],
+    merged_unqualified_columns: &HashSet<String>,
+) -> (TableSchema, HashMap<String, usize>) {
+    let mut column_offsets: HashMap<String, usize> = HashMap::new();
+    let mut ambiguous_unqualified: HashSet<String> = HashSet::new();
+    let mut columns: Vec<ColumnDef> = Vec::new();
+    let mut offset = 0;
+
+    for (alias, schema) in combined_schemas {
+        for col in &schema.columns {
+            column_offsets.insert(format!("{}.{}", alias, col.name), offset);
+            if merged_unqualified_columns.contains(&col.name) {
+                column_offsets.entry(col.name.clone()).or_insert(offset);
+            } else {
+                insert_unqualified_join_offset(
+                    &mut column_offsets,
+                    &mut ambiguous_unqualified,
+                    &col.name,
+                    offset,
+                );
+            }
+            if col.name.contains('.') {
+                column_offsets.insert(col.name.clone(), offset);
+            }
+            columns.push(col.clone());
+            offset += 1;
+        }
+    }
+
+    let schema = TableSchema {
+        name: "joined".to_string(),
+        table_id: 0,
+        columns,
+        version: 1,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+    };
+
+    (schema, column_offsets)
+}
+
 fn extract_equi_join_key_indices_for_hash_join(
     expr: &Expr,
     column_offsets: &HashMap<String, usize>,
@@ -1903,23 +2084,34 @@ impl Executor {
                         );
 
                         let mut column_offsets: HashMap<String, usize> = HashMap::new();
+                        let mut ambiguous_unqualified: HashSet<String> = HashSet::new();
                         let mut offset = 0;
                         for (tbl_alias, cols) in &all_table_aliases {
                             for col in cols {
                                 column_offsets
                                     .insert(format!("{}.{}", tbl_alias, col.name), offset);
-                                if !column_offsets.contains_key(&col.name) {
-                                    column_offsets.insert(col.name.clone(), offset);
-                                }
+                                insert_unqualified_join_offset(
+                                    &mut column_offsets,
+                                    &mut ambiguous_unqualified,
+                                    &col.name,
+                                    offset,
+                                );
                                 offset += 1;
                             }
                         }
                         for col in &join_schema.columns {
                             column_offsets.insert(format!("{}.{}", join_alias, col.name), offset);
-                            if !column_offsets.contains_key(&col.name) {
-                                column_offsets.insert(col.name.clone(), offset);
-                            }
+                            insert_unqualified_join_offset(
+                                &mut column_offsets,
+                                &mut ambiguous_unqualified,
+                                &col.name,
+                                offset,
+                            );
                             offset += 1;
+                        }
+
+                        if let Some(cond) = &join_condition {
+                            validate_no_ambiguous_unqualified_columns(cond, &column_offsets)?;
                         }
 
                         let mut temp_columns = combined_schema.columns.clone();
@@ -2086,6 +2278,7 @@ impl Executor {
         let mut has_natural_join = false;
         let mut natural_join_common_cols: Vec<String> = Vec::new();
         let mut natural_join_column_sources: HashMap<String, (String, String)> = HashMap::new();
+        let mut merged_unqualified_columns: HashSet<String> = HashSet::new();
 
         let mut extra_from_items: Vec<(Vec<(String, TableSchema)>, Vec<Row>)> = Vec::new();
 
@@ -2279,6 +2472,7 @@ impl Executor {
                             .collect();
                         has_natural_join = true;
                         natural_join_common_cols = common_cols.clone();
+                        merged_unqualified_columns.extend(common_cols.iter().cloned());
                         natural_join_column_sources.clear();
                         for col in &common_cols {
                             let left_alias_for_col = item_schemas
@@ -2334,6 +2528,7 @@ impl Executor {
                             cols.iter().map(|c| normalize_ident(c)).collect();
                         has_natural_join = true;
                         natural_join_common_cols = using_cols.clone();
+                        merged_unqualified_columns.extend(using_cols.iter().cloned());
                         natural_join_column_sources.clear();
                         if using_cols.is_empty() {
                             (None, true)
@@ -2413,25 +2608,36 @@ impl Executor {
                 let left_col_count: usize = item_schemas.iter().map(|(_, s)| s.columns.len()).sum();
 
                 let mut column_offsets: HashMap<String, usize> = HashMap::new();
+                let mut ambiguous_unqualified: HashSet<String> = HashSet::new();
                 let mut offset = 0;
                 for (alias, schema) in &item_schemas {
                     for col in &schema.columns {
                         column_offsets.insert(format!("{}.{}", alias, col.name), offset);
-                        if !column_offsets.contains_key(&col.name) {
-                            column_offsets.insert(col.name.clone(), offset);
-                        }
+                        insert_unqualified_join_offset(
+                            &mut column_offsets,
+                            &mut ambiguous_unqualified,
+                            &col.name,
+                            offset,
+                        );
                         offset += 1;
                     }
                 }
                 for col in &join_schema.columns {
                     column_offsets.insert(format!("{}.{}", join_alias, col.name), offset);
-                    if !column_offsets.contains_key(&col.name) {
-                        column_offsets.insert(col.name.clone(), offset);
-                    }
+                    insert_unqualified_join_offset(
+                        &mut column_offsets,
+                        &mut ambiguous_unqualified,
+                        &col.name,
+                        offset,
+                    );
                     if col.name.contains('.') {
                         column_offsets.insert(col.name.clone(), offset);
                     }
                     offset += 1;
+                }
+
+                if let Some(cond) = &join_condition {
+                    validate_no_ambiguous_unqualified_columns(cond, &column_offsets)?;
                 }
 
                 let mut combined_col_defs: Vec<ColumnDef> = Vec::new();
@@ -2736,25 +2942,36 @@ impl Executor {
                         }
 
                         let mut column_offsets: HashMap<String, usize> = HashMap::new();
+                        let mut ambiguous_unqualified: HashSet<String> = HashSet::new();
                         let mut offset = 0;
                         for (alias, schema) in &combined_schemas {
                             for col in &schema.columns {
                                 column_offsets.insert(format!("{}.{}", alias, col.name), offset);
-                                if !column_offsets.contains_key(&col.name) {
-                                    column_offsets.insert(col.name.clone(), offset);
-                                }
+                                insert_unqualified_join_offset(
+                                    &mut column_offsets,
+                                    &mut ambiguous_unqualified,
+                                    &col.name,
+                                    offset,
+                                );
                                 offset += 1;
                             }
                         }
                         for col in &this_schema.columns {
                             column_offsets.insert(format!("{}.{}", join_alias, col.name), offset);
-                            if !column_offsets.contains_key(&col.name) {
-                                column_offsets.insert(col.name.clone(), offset);
-                            }
+                            insert_unqualified_join_offset(
+                                &mut column_offsets,
+                                &mut ambiguous_unqualified,
+                                &col.name,
+                                offset,
+                            );
                             if col.name.contains('.') {
                                 column_offsets.insert(col.name.clone(), offset);
                             }
                             offset += 1;
+                        }
+
+                        if let Some(cond) = &join_condition {
+                            validate_no_ambiguous_unqualified_columns(cond, &column_offsets)?;
                         }
                         join_column_offsets = Some(column_offsets);
 
@@ -2953,6 +3170,7 @@ impl Executor {
                         .collect();
                     has_natural_join = true;
                     natural_join_common_cols = common_cols.clone();
+                    merged_unqualified_columns.extend(common_cols.iter().cloned());
                     natural_join_column_sources.clear();
                     for col in &common_cols {
                         let left_alias_for_col = combined_schemas
@@ -3005,6 +3223,7 @@ impl Executor {
                     let using_cols: Vec<String> = cols.iter().map(|c| normalize_ident(c)).collect();
                     has_natural_join = true;
                     natural_join_common_cols = using_cols.clone();
+                    merged_unqualified_columns.extend(using_cols.iter().cloned());
                     natural_join_column_sources.clear();
                     if using_cols.is_empty() {
                         (None, true)
@@ -3083,26 +3302,37 @@ impl Executor {
             let left_col_count: usize = combined_schemas.iter().map(|(_, s)| s.columns.len()).sum();
 
             let mut column_offsets: HashMap<String, usize> = HashMap::new();
+            let mut ambiguous_unqualified: HashSet<String> = HashSet::new();
             let mut offset = 0;
             for (alias, schema) in &combined_schemas {
                 for col in &schema.columns {
                     column_offsets.insert(format!("{}.{}", alias, col.name), offset);
-                    if !column_offsets.contains_key(&col.name) {
-                        column_offsets.insert(col.name.clone(), offset);
-                    }
+                    insert_unqualified_join_offset(
+                        &mut column_offsets,
+                        &mut ambiguous_unqualified,
+                        &col.name,
+                        offset,
+                    );
                     offset += 1;
                 }
             }
             let _join_start_offset = offset;
             for col in &join_schema.columns {
                 column_offsets.insert(format!("{}.{}", join_alias, col.name), offset);
-                if !column_offsets.contains_key(&col.name) {
-                    column_offsets.insert(col.name.clone(), offset);
-                }
+                insert_unqualified_join_offset(
+                    &mut column_offsets,
+                    &mut ambiguous_unqualified,
+                    &col.name,
+                    offset,
+                );
                 if col.name.contains('.') {
                     column_offsets.insert(col.name.clone(), offset);
                 }
                 offset += 1;
+            }
+
+            if let Some(cond) = &join_condition {
+                validate_no_ambiguous_unqualified_columns(cond, &column_offsets)?;
             }
 
             let mut combined_col_defs: Vec<ColumnDef> = Vec::new();
@@ -3445,35 +3675,8 @@ impl Executor {
             combined_schemas.extend(extra_schemas);
             combined_rows = new_combined_rows;
         }
-
-        let mut final_column_offsets: HashMap<String, usize> = HashMap::new();
-        let mut final_columns: Vec<ColumnDef> = Vec::new();
-        let mut offset = 0;
-        for (alias, schema) in &combined_schemas {
-            for col in &schema.columns {
-                final_column_offsets.insert(format!("{}.{}", alias, col.name), offset);
-                if !final_column_offsets.contains_key(&col.name) {
-                    final_column_offsets.insert(col.name.clone(), offset);
-                }
-                if col.name.contains('.') {
-                    final_column_offsets.insert(col.name.clone(), offset);
-                }
-                final_columns.push(col.clone());
-                offset += 1;
-            }
-        }
-        let final_schema = TableSchema {
-            name: "joined".to_string(),
-            table_id: 0,
-            columns: final_columns,
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-        };
+        let (final_schema, final_column_offsets) =
+            build_join_output_schema_and_offsets(&combined_schemas, &merged_unqualified_columns);
         let type_infer_schema = build_type_infer_schema_for_join(&combined_schemas);
 
         // For `USING`/`NATURAL` joins, common columns are merged in the output. For outer joins,
@@ -3529,6 +3732,34 @@ impl Executor {
             None
         };
         let merged_column_offsets_ref = merged_column_offsets.as_ref();
+
+        if let Some(sel) = &select.selection {
+            validate_no_ambiguous_unqualified_columns(sel, &final_column_offsets)?;
+        }
+        for item in &select.projection {
+            match item {
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    validate_no_ambiguous_unqualified_columns(expr, &final_column_offsets)?;
+                }
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {}
+            }
+        }
+        match &select.group_by {
+            GroupByExpr::Expressions(exprs) => {
+                for expr in exprs {
+                    validate_no_ambiguous_unqualified_columns(expr, &final_column_offsets)?;
+                }
+            }
+            GroupByExpr::All => {}
+        }
+        if let Some(having) = &select.having {
+            validate_no_ambiguous_unqualified_columns(having, &final_column_offsets)?;
+        }
+        if let Some(Distinct::On(on_exprs)) = &select.distinct {
+            for expr in on_exprs {
+                validate_no_ambiguous_unqualified_columns(expr, &final_column_offsets)?;
+            }
+        }
 
         // Resolve subqueries (EXISTS, IN (SELECT ...), scalar subqueries) in WHERE clause
         let resolved_selection = if let Some(sel) = &select.selection {
@@ -6635,6 +6866,7 @@ mod tests {
         })
         .await
         .unwrap();
+    }
 
     #[test]
     fn resolves_order_by_positional_for_join_wildcard() {
@@ -6664,5 +6896,76 @@ mod tests {
             resolved[0]
         );
     }
+
+    #[test]
+    fn join_column_offsets_remove_ambiguous_unqualified_names() {
+        let mut column_offsets: HashMap<String, usize> = HashMap::new();
+        let mut ambiguous_unqualified: HashSet<String> = HashSet::new();
+
+        insert_unqualified_join_offset(&mut column_offsets, &mut ambiguous_unqualified, "id", 0);
+        assert_eq!(column_offsets.get("id"), Some(&0));
+
+        insert_unqualified_join_offset(&mut column_offsets, &mut ambiguous_unqualified, "id", 1);
+        assert!(column_offsets.get("id").is_none());
+        assert!(ambiguous_unqualified.contains("id"));
+    }
+
+    #[test]
+    fn validate_join_expr_ambiguous_unqualified_identifier_errors() {
+        let mut column_offsets: HashMap<String, usize> = HashMap::new();
+        column_offsets.insert("a.id".to_string(), 0);
+        column_offsets.insert("b.id".to_string(), 1);
+
+        let expr = Expr::Identifier(Ident::new("id"));
+        let err = validate_no_ambiguous_unqualified_columns(&expr, &column_offsets)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("column reference \"id\" is ambiguous"));
+    }
+
+    #[test]
+    fn using_join_merged_columns_are_unqualified_unambiguous() {
+        use crate::sql::expr::EvalContext;
+
+        fn int_col(name: &str) -> ColumnDef {
+            ColumnDef {
+                name: name.to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }
+        }
+
+        let schema = TableSchema {
+            name: "t".to_string(),
+            columns: vec![int_col("id")],
+            ..Default::default()
+        };
+
+        let combined_schemas = vec![
+            ("a".to_string(), schema.clone()),
+            ("b".to_string(), schema),
+        ];
+
+        let mut merged: HashSet<String> = HashSet::new();
+        merged.insert("id".to_string());
+
+        let (joined_schema, column_offsets) =
+            build_join_output_schema_and_offsets(&combined_schemas, &merged);
+
+        let expr = Expr::Identifier(Ident::new("id"));
+        validate_no_ambiguous_unqualified_columns(&expr, &column_offsets).unwrap();
+
+        let row = Row::new(vec![Value::Int32(1), Value::Int32(1)]);
+        let ctx = crate::sql::expr::JoinEvalContext::new(
+            &column_offsets,
+            None,
+            &row,
+            &joined_schema,
+        );
+        assert_eq!(ctx.resolve_column("id").unwrap(), Value::Int32(1));
     }
 }

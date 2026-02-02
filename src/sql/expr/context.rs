@@ -182,10 +182,27 @@ impl EvalContext for JoinEvalContext<'_> {
         }
 
         if let Some(&offset) = self.column_offsets.get(name) {
-            Ok(self.combined_row.values[offset].clone())
-        } else {
-            Err(anyhow!("Column '{}' not found or ambiguous", name))
+            return Ok(self.combined_row.values[offset].clone());
         }
+
+        // If an unqualified identifier doesn't exist in the short-name map,
+        // it may be ambiguous (multiple joined inputs expose the same column name).
+        let mut first_offset: Option<usize> = None;
+        for (key, &offset) in self.column_offsets {
+            if let Some((_, suffix)) = key.rsplit_once('.') {
+                if suffix == name {
+                    match first_offset {
+                        None => first_offset = Some(offset),
+                        Some(prev) if prev != offset => {
+                            return Err(anyhow!("column reference \"{}\" is ambiguous", name));
+                        }
+                        Some(_) => {}
+                    }
+                }
+            }
+        }
+
+        Err(anyhow!("Column '{}' not found or ambiguous", name))
     }
 
     fn resolve_compound_identifier(&self, parts: &[sqlparser::ast::Ident]) -> Result<Value> {
@@ -284,5 +301,46 @@ impl EvalContext for JoinEvalContext<'_> {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+    use std::collections::HashMap;
+
+    fn int_col(name: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type: DataType::Int32,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        }
+    }
+
+    fn schema(cols: Vec<ColumnDef>) -> TableSchema {
+        TableSchema {
+            name: "t".to_string(),
+            columns: cols,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_resolve_column_unqualified_ambiguous_errors() {
+        let mut column_offsets: HashMap<String, usize> = HashMap::new();
+        column_offsets.insert("a.id".to_string(), 0);
+        column_offsets.insert("b.id".to_string(), 1);
+
+        let combined_row = Row::new(vec![Value::Int32(1), Value::Int32(2)]);
+        let combined_schema = schema(vec![int_col("id"), int_col("id")]);
+
+        let ctx = JoinEvalContext::new(&column_offsets, None, &combined_row, &combined_schema);
+        let err = ctx.resolve_column("id").unwrap_err().to_string();
+        assert!(err.contains("column reference \"id\" is ambiguous"));
     }
 }
