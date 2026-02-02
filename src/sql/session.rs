@@ -455,21 +455,31 @@ impl Session {
 
     /// Commit a transaction block (COMMIT)
     pub async fn commit(&mut self) -> Result<()> {
-        // Move txn out of state to take ownership
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset()?;
-                txn.commit().await.map(|_| ()).map_err(|e| anyhow!(e))?;
-                self.observability.record_commit();
-                Ok(())
+                match txn.commit().await {
+                    Ok(_) => {
+                        self.observability.record_commit();
+                        Ok(())
+                    }
+                    Err(e) => {
+                        self.state = TransactionState::Failed(txn);
+                        Err(anyhow!(e))
+                    }
+                }
             }
             TransactionState::Failed(mut txn) => {
                 self.savepoints.reset()?;
-                txn.rollback().await.map_err(|e| anyhow!(e))
+                match txn.rollback().await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        self.state = TransactionState::Failed(txn);
+                        Err(anyhow!(e))
+                    }
+                }
             }
-            TransactionState::Idle => {
-                Ok(()) // No-op
-            }
+            TransactionState::Idle => Ok(()), // No-op
         }
     }
 
@@ -478,15 +488,25 @@ impl Session {
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset()?;
-                txn.rollback().await.map_err(|e| anyhow!(e))
+                match txn.rollback().await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        self.state = TransactionState::Failed(txn);
+                        Err(anyhow!(e))
+                    }
+                }
             }
             TransactionState::Failed(mut txn) => {
                 self.savepoints.reset()?;
-                txn.rollback().await.map_err(|e| anyhow!(e))
+                match txn.rollback().await {
+                    Ok(_) => Ok(()),
+                    Err(e) => {
+                        self.state = TransactionState::Failed(txn);
+                        Err(anyhow!(e))
+                    }
+                }
             }
-            TransactionState::Idle => {
-                Ok(()) // No-op
-            }
+            TransactionState::Idle => Ok(()), // No-op
         }
     }
 }
