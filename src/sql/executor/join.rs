@@ -5705,7 +5705,7 @@ fn interval_to_millis(iv: &crate::types::IntervalValue) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::TimeZone;
+    use chrono::{Offset, TimeZone, Timelike};
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
     use std::sync::Arc;
@@ -6571,6 +6571,65 @@ mod tests {
                 Value::Timestamp(t24)
             ]
         );
+    }
+
+    #[test]
+    fn generate_series_date_sub_day_step_across_dst_start_does_not_error() {
+        let start_days = crate::types::date::parse_date_days("2024-03-10").unwrap();
+        let stop_days = crate::types::date::parse_date_days("2024-03-11").unwrap();
+        let step = Value::Interval(crate::types::IntervalValue::from_millis(60 * 60 * 1000));
+
+        let (values, ty) = with_session_timezone("America/Los_Angeles", || {
+            generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
+                .unwrap()
+        });
+
+        assert_eq!(ty, DataType::TimestampTz);
+        assert_eq!(values.len(), 24);
+
+        let tz = chrono_tz::America::Los_Angeles;
+        let mut hours = Vec::with_capacity(values.len());
+        for v in &values {
+            let Value::Timestamp(ms) = v else {
+                panic!("expected timestamptz values");
+            };
+            hours.push(tz.timestamp_millis_opt(*ms).single().unwrap().hour());
+        }
+        assert_eq!(hours.iter().filter(|&&h| h == 2).count(), 0);
+        assert!(hours.iter().any(|&h| h == 3));
+    }
+
+    #[test]
+    fn generate_series_date_sub_day_step_across_dst_end_does_not_error() {
+        let start_days = crate::types::date::parse_date_days("2024-11-03").unwrap();
+        let stop_days = crate::types::date::parse_date_days("2024-11-04").unwrap();
+        let step = Value::Interval(crate::types::IntervalValue::from_millis(60 * 60 * 1000));
+
+        let (values, ty) = with_session_timezone("America/Los_Angeles", || {
+            generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
+                .unwrap()
+        });
+
+        assert_eq!(ty, DataType::TimestampTz);
+        assert_eq!(values.len(), 26);
+
+        let tz = chrono_tz::America::Los_Angeles;
+        let mut offsets = std::collections::BTreeSet::new();
+        let mut hour_1_count = 0;
+        for v in &values {
+            let Value::Timestamp(ms) = v else {
+                panic!("expected timestamptz values");
+            };
+            let dt = tz.timestamp_millis_opt(*ms).single().unwrap();
+            if dt.hour() == 1 {
+                hour_1_count += 1;
+                offsets.insert(dt.offset().fix().local_minus_utc());
+            }
+        }
+        assert_eq!(hour_1_count, 2);
+        assert_eq!(offsets.len(), 2);
+        assert!(offsets.contains(&(-7 * 3600)));
+        assert!(offsets.contains(&(-8 * 3600)));
     }
 
     #[test]
