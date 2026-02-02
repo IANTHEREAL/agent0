@@ -3514,19 +3514,25 @@ impl CopyHandler for DynamicPgHandler {
                 return Err(in_failed_sql_transaction_pgwire_error());
             }
 
-            for col_values in rows_to_insert {
-                executor
-                    .execute_copy_insert(session, &table_name, col_values)
-                    .await
-                    .map_err(|e| {
-                        error!("COPY insert error: {}", e);
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "XX000".to_string(),
-                            e.to_string(),
-                        )))
-                    })?;
-            }
+            let savepoints = session.savepoints();
+            crate::txn::with_savepoints(savepoints, async {
+                for col_values in rows_to_insert {
+                    executor
+                        .execute_copy_insert(session, &table_name, col_values)
+                        .await
+                        .map_err(|e| {
+                            error!("COPY insert error: {}", e);
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "XX000".to_string(),
+                                e.to_string(),
+                            )))
+                        })?;
+                }
+
+                Ok::<(), PgWireError>(())
+            })
+            .await?;
 
             Ok(())
         }
@@ -3617,18 +3623,23 @@ impl CopyHandler for DynamicPgHandler {
                     col_values.push((col_name.clone(), value));
                 }
 
-                if let Err(e) = executor
-                    .execute_copy_insert(session, &ctx.table_name, col_values)
-                    .await
-                    .map_err(|e| {
-                        error!("COPY insert error: {}", e);
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "XX000".to_string(),
-                            e.to_string(),
-                        )))
-                    })
-                {
+                let savepoints = session.savepoints();
+                let insert_res = crate::txn::with_savepoints(savepoints, async {
+                    executor
+                        .execute_copy_insert(session, &ctx.table_name, col_values)
+                        .await
+                        .map_err(|e| {
+                            error!("COPY insert error: {}", e);
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "XX000".to_string(),
+                                e.to_string(),
+                            )))
+                        })
+                })
+                .await;
+
+                if let Err(e) = insert_res {
                     rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
                     return Err(e);
                 }
@@ -4862,19 +4873,25 @@ impl CopyHandler for PgHandler {
                 return Err(in_failed_sql_transaction_pgwire_error());
             }
 
-            for col_values in rows_to_insert {
-                self.executor
-                    .execute_copy_insert(&mut session, &table_name, col_values)
-                    .await
-                    .map_err(|e| {
-                        error!("COPY insert error: {}", e);
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "XX000".to_string(),
-                            e.to_string(),
-                        )))
-                    })?;
-            }
+            let savepoints = session.savepoints();
+            crate::txn::with_savepoints(savepoints, async {
+                for col_values in rows_to_insert {
+                    self.executor
+                        .execute_copy_insert(&mut session, &table_name, col_values)
+                        .await
+                        .map_err(|e| {
+                            error!("COPY insert error: {}", e);
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "XX000".to_string(),
+                                e.to_string(),
+                            )))
+                        })?;
+                }
+
+                Ok::<(), PgWireError>(())
+            })
+            .await?;
 
             Ok(())
         }
@@ -4954,19 +4971,23 @@ impl CopyHandler for PgHandler {
                     col_values.push((col_name.clone(), value));
                 }
 
-                if let Err(e) = self
-                    .executor
-                    .execute_copy_insert(&mut session, &ctx.table_name, col_values)
-                    .await
-                    .map_err(|e| {
-                        error!("COPY insert error: {}", e);
-                        PgWireError::UserError(Box::new(ErrorInfo::new(
-                            "ERROR".to_string(),
-                            "XX000".to_string(),
-                            e.to_string(),
-                        )))
-                    })
-                {
+                let savepoints = session.savepoints();
+                let insert_res = crate::txn::with_savepoints(savepoints, async {
+                    self.executor
+                        .execute_copy_insert(&mut session, &ctx.table_name, col_values)
+                        .await
+                        .map_err(|e| {
+                            error!("COPY insert error: {}", e);
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "XX000".to_string(),
+                                e.to_string(),
+                            )))
+                        })
+                })
+                .await;
+
+                if let Err(e) = insert_res {
                     rollback_autocommit_or_mark_failed(&mut session, ctx.started_txn).await;
                     return Err(e);
                 }
