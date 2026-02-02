@@ -2019,114 +2019,153 @@ mod tests {
     }
 }
 
-pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Value {
+pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
     let unescaped = unescape_copy_text(val);
+    let trimmed = unescaped.trim();
 
     match data_type {
-        DataType::Boolean => match unescaped.to_lowercase().as_str() {
-            "t" | "true" | "1" | "yes" | "on" => Value::Boolean(true),
-            "f" | "false" | "0" | "no" | "off" => Value::Boolean(false),
-            _ => Value::Text(unescaped),
+        DataType::Boolean => match trimmed.to_lowercase().as_str() {
+            "t" | "true" | "1" | "yes" | "on" => Ok(Value::Boolean(true)),
+            "f" | "false" | "0" | "no" | "off" => Ok(Value::Boolean(false)),
+            _ => Err(anyhow!(
+                "invalid input syntax for type boolean: \"{}\"",
+                unescaped
+            )),
         },
-        DataType::Int32 => unescaped
+        DataType::Int32 => trimmed
             .parse::<i32>()
             .map(Value::Int32)
-            .unwrap_or(Value::Text(unescaped)),
-        DataType::Int64 => unescaped
+            .map_err(|_| anyhow!("invalid input syntax for type integer: \"{}\"", unescaped)),
+        DataType::Int64 => trimmed
             .parse::<i64>()
             .map(Value::Int64)
-            .unwrap_or(Value::Text(unescaped)),
-        DataType::Float64 => unescaped
+            .map_err(|_| anyhow!("invalid input syntax for type bigint: \"{}\"", unescaped)),
+        DataType::Float64 => trimmed
             .parse::<f64>()
             .map(Value::Float64)
-            .unwrap_or(Value::Text(unescaped)),
-        DataType::Timestamp | DataType::TimestampTz => {
-            if let Ok(ts) =
-                chrono::NaiveDateTime::parse_from_str(&unescaped, "%Y-%m-%d %H:%M:%S%.f")
-            {
-                Value::Timestamp(ts.and_utc().timestamp_millis())
-            } else if let Ok(ts) =
-                chrono::NaiveDateTime::parse_from_str(&unescaped, "%Y-%m-%d %H:%M:%S")
-            {
-                Value::Timestamp(ts.and_utc().timestamp_millis())
-            } else if let Ok(d) = chrono::NaiveDate::parse_from_str(&unescaped, "%Y-%m-%d") {
-                Value::Timestamp(d.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis())
-            } else {
-                Value::Text(unescaped)
-            }
-        }
-        DataType::Date => crate::types::date::parse_date_days(&unescaped)
+            .map_err(|_| anyhow!("invalid input syntax for type double precision: \"{}\"", unescaped)),
+        DataType::Timestamp => super::expr::parse_timestamp_string(trimmed).map_err(|_| {
+            anyhow!(
+                "invalid input syntax for type timestamp: \"{}\"",
+                unescaped
+            )
+        }),
+        DataType::TimestampTz => super::expr::parse_timestamp_string(trimmed).map_err(|_| {
+            anyhow!(
+                "invalid input syntax for type timestamp with time zone: \"{}\"",
+                unescaped
+            )
+        }),
+        DataType::Date => crate::types::date::parse_date_days(trimmed)
             .map(Value::Date)
-            .unwrap_or(Value::Text(unescaped)),
-        DataType::Uuid => {
-            if let Ok(u) = uuid::Uuid::parse_str(&unescaped) {
-                Value::Uuid(*u.as_bytes())
-            } else {
-                Value::Text(unescaped)
-            }
-        }
+            .map_err(|_| anyhow!("invalid input syntax for type date: \"{}\"", unescaped)),
+        DataType::Uuid => uuid::Uuid::parse_str(trimmed)
+            .map(|u| Value::Uuid(*u.as_bytes()))
+            .map_err(|_| anyhow!("invalid input syntax for type uuid: \"{}\"", unescaped)),
         DataType::Bytes => {
             if unescaped.starts_with("\\x") {
-                hex::decode(&unescaped[2..])
+                Ok(hex::decode(&unescaped[2..])
                     .map(Value::Bytes)
-                    .unwrap_or(Value::Bytes(unescaped.into_bytes()))
+                    .unwrap_or(Value::Bytes(unescaped.into_bytes())))
             } else {
-                Value::Bytes(unescaped.into_bytes())
+                Ok(Value::Bytes(unescaped.into_bytes()))
             }
         }
         DataType::Time => {
-            if let Some(micros) = parse_time_string(&unescaped) {
-                Value::Time(micros)
-            } else {
-                Value::Text(unescaped)
-            }
+            parse_time_string(trimmed)
+                .map(Value::Time)
+                .ok_or_else(|| anyhow!("invalid input syntax for type time: \"{}\"", unescaped))
         }
-        DataType::Text | DataType::Interval | DataType::UserDefined(_) => Value::Text(unescaped),
+        DataType::Interval => super::expr::parse_interval_string(trimmed).map_err(|_| {
+            anyhow!(
+                "invalid input syntax for type interval: \"{}\"",
+                unescaped
+            )
+        }),
+        DataType::Text | DataType::UserDefined(_) => Ok(Value::Text(unescaped)),
         DataType::Array(_) => {
-            if let Ok(arr) = parse_pg_array(&unescaped) {
-                Value::Array(arr)
-            } else {
-                Value::Text(unescaped)
-            }
+            parse_pg_array(trimmed)
+                .map(Value::Array)
+                .map_err(|_| anyhow!("invalid input syntax for type array: \"{}\"", unescaped))
         }
         DataType::Json => {
-            if serde_json::from_str::<serde_json::Value>(&unescaped).is_ok() {
-                Value::Json(unescaped)
-            } else {
-                Value::Text(unescaped)
-            }
+            serde_json::from_str::<serde_json::Value>(&unescaped)
+                .map_err(|e| anyhow!("invalid input syntax for type json: {}", e))?;
+            Ok(Value::Json(unescaped))
         }
         DataType::Jsonb => {
-            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&unescaped) {
-                Value::Jsonb(parsed.to_string())
-            } else {
-                Value::Text(unescaped)
-            }
+            let parsed: serde_json::Value = serde_json::from_str(&unescaped)
+                .map_err(|e| anyhow!("invalid input syntax for type jsonb: {}", e))?;
+            Ok(Value::Jsonb(parsed.to_string()))
         }
         DataType::Vector(_) => {
             if unescaped.starts_with('[') && unescaped.ends_with(']') {
                 let inner = &unescaped[1..unescaped.len() - 1];
                 let elements: Result<Vec<f64>, _> =
                     inner.split(',').map(|s| s.trim().parse::<f64>()).collect();
-                if let Ok(vec) = elements {
-                    Value::Vector(vec)
-                } else {
-                    Value::Text(unescaped)
-                }
+                elements
+                    .map(Value::Vector)
+                    .map_err(|_| anyhow!("invalid input syntax for type vector: \"{}\"", unescaped))
             } else {
-                Value::Text(unescaped)
+                Err(anyhow!(
+                    "invalid input syntax for type vector: \"{}\"",
+                    unescaped
+                ))
             }
         }
         DataType::Numeric { scale, .. } => {
-            if let Ok(mut d) = Decimal::from_str(&unescaped) {
-                if let Some(s) = scale {
-                    d.rescale(*s);
-                }
-                Value::Numeric(d)
-            } else {
-                Value::Text(unescaped)
+            let mut d = Decimal::from_str(trimmed)
+                .map_err(|_| anyhow!("invalid input syntax for type numeric: \"{}\"", unescaped))?;
+            if let Some(s) = scale {
+                d.rescale(*s);
             }
+            Ok(Value::Numeric(d))
         }
+    }
+}
+
+#[cfg(test)]
+mod copy_parse_tests {
+    use super::parse_value_for_copy;
+    use crate::types::{DataType, IntervalValue, Value};
+
+    #[test]
+    fn parse_value_for_copy_trims_common_scalars() {
+        assert_eq!(
+            parse_value_for_copy(" 1 ", &DataType::Int32).unwrap(),
+            Value::Int32(1)
+        );
+        assert_eq!(
+            parse_value_for_copy(" true\t", &DataType::Boolean).unwrap(),
+            Value::Boolean(true)
+        );
+    }
+
+    #[test]
+    fn parse_value_for_copy_rejects_invalid_timestamp_instead_of_falling_back_to_text() {
+        let err = parse_value_for_copy("abc", &DataType::Timestamp).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("invalid input syntax for type timestamp"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_value_for_copy_rejects_invalid_time_instead_of_falling_back_to_text() {
+        let err = parse_value_for_copy("25:00:00", &DataType::Time).unwrap_err();
+        assert!(
+            err.to_string().contains("invalid input syntax for type time"),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_value_for_copy_parses_interval() {
+        assert_eq!(
+            parse_value_for_copy("1 day", &DataType::Interval).unwrap(),
+            Value::Interval(IntervalValue::from_millis(24 * 60 * 60 * 1000))
+        );
     }
 }
 

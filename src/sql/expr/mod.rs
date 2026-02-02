@@ -1236,7 +1236,7 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
     }
 }
 
-fn parse_interval_string(s: &str) -> Result<Value> {
+pub(super) fn parse_interval_string(s: &str) -> Result<Value> {
     use crate::types::IntervalValue;
     let s = s.trim().to_lowercase();
     let mut total_months: i32 = 0;

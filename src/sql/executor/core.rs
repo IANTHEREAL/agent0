@@ -3191,7 +3191,7 @@ impl Executor {
         Ok(filled_rows)
     }
 
-    pub fn parse_value_for_copy(&self, val: &str, data_type: &DataType) -> Value {
+    pub fn parse_value_for_copy(&self, val: &str, data_type: &DataType) -> Result<Value> {
         parse_value_for_copy(val, data_type)
     }
 

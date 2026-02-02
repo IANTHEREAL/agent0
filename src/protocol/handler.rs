@@ -3260,7 +3260,13 @@ impl CopyHandler for DynamicPgHandler {
                         let value = if *val == "\\N" {
                             Value::Null
                         } else if let Some(dt) = col_type.as_ref() {
-                            executor.parse_value_for_copy(val, dt)
+                            executor.parse_value_for_copy(val, dt).map_err(|e| {
+                                PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "22P02".to_string(),
+                                    e.to_string(),
+                                )))
+                            })?
                         } else {
                             Value::Text(val.to_string())
                         };
@@ -3399,7 +3405,13 @@ impl CopyHandler for DynamicPgHandler {
                     let value = if *val == "\\N" {
                         Value::Null
                     } else if let Some(dt) = col_type.as_ref() {
-                        executor.parse_value_for_copy(val, dt)
+                        executor.parse_value_for_copy(val, dt).map_err(|e| {
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "22P02".to_string(),
+                                e.to_string(),
+                            )))
+                        })?
                     } else {
                         Value::Text(val.to_string())
                     };
@@ -4604,7 +4616,13 @@ impl CopyHandler for PgHandler {
                         let value = if *val == "\\N" {
                             Value::Null
                         } else if let Some(dt) = col_type.as_ref() {
-                            self.executor.parse_value_for_copy(val, dt)
+                            self.executor.parse_value_for_copy(val, dt).map_err(|e| {
+                                PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "22P02".to_string(),
+                                    e.to_string(),
+                                )))
+                            })?
                         } else {
                             Value::Text(val.to_string())
                         };
@@ -4723,7 +4741,13 @@ impl CopyHandler for PgHandler {
                     let value = if *val == "\\N" {
                         Value::Null
                     } else if let Some(dt) = col_type.as_ref() {
-                        self.executor.parse_value_for_copy(val, dt)
+                        self.executor.parse_value_for_copy(val, dt).map_err(|e| {
+                            PgWireError::UserError(Box::new(ErrorInfo::new(
+                                "ERROR".to_string(),
+                                "22P02".to_string(),
+                                e.to_string(),
+                            )))
+                        })?
                     } else {
                         Value::Text(val.to_string())
                     };
