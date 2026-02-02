@@ -1,6 +1,6 @@
 -- GENERATE_SERIES Tests
 
-SET TIME ZONE 'America/Los_Angeles';
+SET TIME ZONE 'UTC';
 
 SELECT * FROM generate_series(1, 5) AS n ORDER BY n;
 

@@ -1,6 +1,6 @@
 -- PRD-D01: AT TIME ZONE timezone conversion (Dify compatibility)
 
-SET TIME ZONE 'America/Los_Angeles';
+SET TIME ZONE 'UTC';
 
 -- timestamp -> timestamptz (interpret timestamp in the given zone)
 SELECT TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'UTC' AS ts_utc;
