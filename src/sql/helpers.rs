@@ -177,6 +177,38 @@ pub fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Value> {
         (Value::Timestamp(ts), DataType::Date) => {
             crate::types::date::timestamp_millis_to_date_days(*ts).map(Value::Date)
         }
+        (Value::Text(s), DataType::Timestamp | DataType::TimestampTz) => {
+            let trimmed = s.trim();
+            let parsed = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S"))
+                .map(|ts| ts.and_utc().timestamp_millis())
+                .or_else(|_| {
+                    chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").map(|d| {
+                        d.and_hms_opt(0, 0, 0)
+                            .unwrap()
+                            .and_utc()
+                            .timestamp_millis()
+                    })
+                });
+            match parsed {
+                Ok(ms) => Ok(Value::Timestamp(ms)),
+                Err(_) => {
+                    let ty = match col.data_type {
+                        DataType::TimestampTz => "timestamp with time zone",
+                        _ => "timestamp",
+                    };
+                    Err(anyhow!("invalid input syntax for type {}: \"{}\"", ty, s))
+                }
+            }
+        }
+        (Value::Text(s), DataType::Time) => {
+            let trimmed = s.trim();
+            if let Some(micros) = parse_time_string(trimmed) {
+                Ok(Value::Time(micros))
+            } else {
+                Err(anyhow!("invalid input syntax for type time: \"{}\"", s))
+            }
+        }
         (Value::Text(s), DataType::Int32) => s
             .trim()
             .parse::<i32>()
@@ -233,6 +265,80 @@ pub fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Value> {
         }
         (Value::Jsonb(s), DataType::Json) => Ok(Value::Json(s.clone())),
         (Value::Jsonb(s), DataType::Jsonb) => Ok(Value::Jsonb(s.clone())),
+        (Value::Text(s), DataType::Array(elem_type)) => {
+            let arr = parse_pg_array(s)
+                .map_err(|_| anyhow!("invalid input syntax for type array: \"{}\"", s))?;
+            let elem_col = ColumnDef {
+                name: String::new(),
+                data_type: (**elem_type).clone(),
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            };
+            let mut out = Vec::with_capacity(arr.len());
+            for v in arr {
+                if v == Value::Null {
+                    out.push(Value::Null);
+                } else {
+                    out.push(coerce_value_for_column(v, &elem_col)?);
+                }
+            }
+            Ok(Value::Array(out))
+        }
+        (Value::Array(elems), DataType::Array(elem_type)) => {
+            let elem_col = ColumnDef {
+                name: String::new(),
+                data_type: (**elem_type).clone(),
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            };
+            let mut out = Vec::with_capacity(elems.len());
+            for v in elems {
+                if v == &Value::Null {
+                    out.push(Value::Null);
+                } else {
+                    out.push(coerce_value_for_column(v.clone(), &elem_col)?);
+                }
+            }
+            Ok(Value::Array(out))
+        }
+        (Value::Text(s), DataType::Vector(dim)) => {
+            let trimmed = s.trim();
+            if !trimmed.starts_with('[') || !trimmed.ends_with(']') {
+                return Err(anyhow!("invalid input syntax for type vector: \"{}\"", s));
+            }
+            let inner = &trimmed[1..trimmed.len() - 1];
+            let elements: Result<Vec<f64>, _> = if inner.trim().is_empty() {
+                Ok(Vec::new())
+            } else {
+                inner.split(',').map(|e| e.trim().parse::<f64>()).collect()
+            };
+            let vec = elements
+                .map_err(|_| anyhow!("invalid input syntax for type vector: \"{}\"", s))?;
+            if vec.len() != *dim as usize {
+                return Err(anyhow!(
+                    "vector has wrong dimensions: expected {}, got {}",
+                    dim,
+                    vec.len()
+                ));
+            }
+            Ok(Value::Vector(vec))
+        }
+        (Value::Vector(vec), DataType::Vector(dim)) => {
+            if vec.len() != *dim as usize {
+                return Err(anyhow!(
+                    "vector has wrong dimensions: expected {}, got {}",
+                    dim,
+                    vec.len()
+                ));
+            }
+            Ok(Value::Vector(vec.clone()))
+        }
         (Value::Text(s), DataType::Numeric { scale, .. }) => {
             let mut d = Decimal::from_str(s.trim())
                 .map_err(|_| anyhow!("invalid input syntax for type numeric: \"{}\"", s))?;
@@ -1271,6 +1377,59 @@ mod tests {
         ];
         let result = dedup_rows(rows);
         assert_eq!(result.len(), 4);
+    }
+
+    fn test_col(name: &str, data_type: DataType) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        }
+    }
+
+    #[test]
+    fn test_coerce_timestamp_time_array_vector_from_text() {
+        let ts_col = test_col("ts", DataType::Timestamp);
+        let got = coerce_value_for_column(Value::Text("2026-01-01 00:00:00".into()), &ts_col)
+            .unwrap();
+        assert!(matches!(got, Value::Timestamp(_)));
+
+        let ts_bad = coerce_value_for_column(Value::Text("not-a-ts".into()), &ts_col)
+            .unwrap_err()
+            .to_string();
+        assert!(ts_bad.contains("invalid input syntax for type timestamp"));
+
+        let time_col = test_col("t", DataType::Time);
+        let got = coerce_value_for_column(Value::Text("01:02:03.004005".into()), &time_col)
+            .unwrap();
+        assert_eq!(got, Value::Time(3_723_004_005));
+
+        let time_bad = coerce_value_for_column(Value::Text("99:99".into()), &time_col)
+            .unwrap_err()
+            .to_string();
+        assert!(time_bad.contains("invalid input syntax for type time"));
+
+        let arr_col = test_col("a", DataType::Array(Box::new(DataType::Int32)));
+        let got = coerce_value_for_column(Value::Text("{1,2}".into()), &arr_col).unwrap();
+        assert_eq!(got, Value::Array(vec![Value::Int32(1), Value::Int32(2)]));
+
+        let arr_bad = coerce_value_for_column(Value::Text("not-an-array".into()), &arr_col)
+            .unwrap_err()
+            .to_string();
+        assert!(arr_bad.contains("invalid input syntax for type array"));
+
+        let vec_col = test_col("v", DataType::Vector(3));
+        let got = coerce_value_for_column(Value::Text("[1, 2, 3]".into()), &vec_col).unwrap();
+        assert_eq!(got, Value::Vector(vec![1.0, 2.0, 3.0]));
+
+        let vec_bad = coerce_value_for_column(Value::Text("not-a-vector".into()), &vec_col)
+            .unwrap_err()
+            .to_string();
+        assert!(vec_bad.contains("invalid input syntax for type vector"));
     }
 
     fn parse_first_projection_function(sql: &str) -> sqlparser::ast::Function {

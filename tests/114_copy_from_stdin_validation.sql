@@ -40,3 +40,39 @@ COPY t_copy_validate_fk_child (id, pid) FROM STDIN;
 \.
 
 SELECT COUNT(*) FROM t_copy_validate_fk_child;
+
+DROP TABLE IF EXISTS t_copy_validate_timestamp;
+CREATE TABLE t_copy_validate_timestamp (a TIMESTAMP NOT NULL);
+
+COPY t_copy_validate_timestamp (a) FROM STDIN;
+not-a-ts
+\.
+
+SELECT COUNT(*) FROM t_copy_validate_timestamp;
+
+DROP TABLE IF EXISTS t_copy_validate_time;
+CREATE TABLE t_copy_validate_time (a TIME NOT NULL);
+
+COPY t_copy_validate_time (a) FROM STDIN;
+99:99
+\.
+
+SELECT COUNT(*) FROM t_copy_validate_time;
+
+DROP TABLE IF EXISTS t_copy_validate_array;
+CREATE TABLE t_copy_validate_array (a INT[] NOT NULL);
+
+COPY t_copy_validate_array (a) FROM STDIN;
+not-an-array
+\.
+
+SELECT COUNT(*) FROM t_copy_validate_array;
+
+DROP TABLE IF EXISTS t_copy_validate_vector;
+CREATE TABLE t_copy_validate_vector (a vector(3) NOT NULL);
+
+COPY t_copy_validate_vector (a) FROM STDIN;
+not-a-vector
+\.
+
+SELECT COUNT(*) FROM t_copy_validate_vector;
