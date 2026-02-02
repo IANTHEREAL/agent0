@@ -1244,8 +1244,6 @@ pub async fn execute_update_row(
         validate_foreign_keys(store, txn, db_id, schema, &new_row).await?;
     }
 
-    handle_foreign_key_on_update(store, txn, db_id, table_name, schema, old_row, &new_row).await?;
-
     if pk_changed {
         let existing = store
             .batch_get_rows(txn, db_id, schema.table_id, vec![new_pks.clone()], schema)
@@ -1318,6 +1316,8 @@ pub async fn execute_update_row(
                 .await?;
         }
     }
+
+    handle_foreign_key_on_update(store, txn, db_id, table_name, schema, old_row, &new_row).await?;
     Ok(new_row)
 }
 
