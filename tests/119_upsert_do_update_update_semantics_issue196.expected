@@ -1,0 +1,15 @@
+# unordered
+ERROR:  insert or update on table "public.t_issue196_fk_child" violates foreign key constraint "t_issue196_fk_child_parent_id_fkey"
+DETAIL:  Key (parent_id)=(2) is not present in table "public.t_issue196_fk_parent".
+id|parent_id
+1|1
+(1 row)
+id|pid
+1|2
+(1 row)
+id|u
+2|10
+(1 row)
+id|u
+2|10
+(1 row)

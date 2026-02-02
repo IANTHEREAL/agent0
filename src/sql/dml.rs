@@ -434,21 +434,24 @@ pub async fn execute_insert_row(
                                         store
                                             .delete_by_pk(txn, db_id, table_name, &pk_values)
                                             .await?;
-                                        store
-                                            .delete_by_pk(txn, db_id, table_name, existing_pk)
-                                            .await?;
 
-                                        update_row_indexes(
-                                            store,
-                                            txn,
-                                            db_id,
-                                            schema,
-                                            existing_pk,
-                                            existing_row,
-                                            &updated_row,
-                                        )
-                                        .await?;
                                         if schema.pk_indices.is_empty() {
+                                            if !schema.foreign_keys.is_empty() {
+                                                validate_foreign_keys(
+                                                    store, txn, db_id, schema, &updated_row,
+                                                )
+                                                .await?;
+                                            }
+                                            update_row_indexes(
+                                                store,
+                                                txn,
+                                                db_id,
+                                                schema,
+                                                existing_pk,
+                                                existing_row,
+                                                &updated_row,
+                                            )
+                                            .await?;
                                             store
                                                 .upsert_by_pk(
                                                     txn,
@@ -458,11 +461,20 @@ pub async fn execute_insert_row(
                                                     updated_row.clone(),
                                                 )
                                                 .await?;
-                                        } else {
-                                            store
-                                                .upsert(txn, db_id, table_name, updated_row.clone())
-                                                .await?;
+                                            return Ok(Some(updated_row));
                                         }
+
+                                        let updated_row = execute_update_row(
+                                            store,
+                                            txn,
+                                            db_id,
+                                            table_name,
+                                            schema,
+                                            existing_row,
+                                            updated_row,
+                                            enum_cache,
+                                        )
+                                        .await?;
                                         return Ok(Some(updated_row));
                                     }
                                 }
@@ -528,21 +540,21 @@ pub async fn execute_insert_row(
                                 store
                                     .delete_by_pk(txn, db_id, table_name, &pk_values)
                                     .await?;
-                                store
-                                    .delete_by_pk(txn, db_id, table_name, existing_pk)
-                                    .await?;
 
-                                update_row_indexes(
-                                    store,
-                                    txn,
-                                    db_id,
-                                    schema,
-                                    existing_pk,
-                                    existing_row,
-                                    &updated_row,
-                                )
-                                    .await?;
                                 if schema.pk_indices.is_empty() {
+                                    if !schema.foreign_keys.is_empty() {
+                                        validate_foreign_keys(store, txn, db_id, schema, &updated_row).await?;
+                                    }
+                                    update_row_indexes(
+                                        store,
+                                        txn,
+                                        db_id,
+                                        schema,
+                                        existing_pk,
+                                        existing_row,
+                                        &updated_row,
+                                    )
+                                        .await?;
                                     store
                                         .upsert_by_pk(
                                             txn,
@@ -552,11 +564,20 @@ pub async fn execute_insert_row(
                                             updated_row.clone(),
                                         )
                                         .await?;
-                                } else {
-                                    store
-                                        .upsert(txn, db_id, table_name, updated_row.clone())
-                                        .await?;
+                                    return Ok(Some(updated_row));
                                 }
+
+                                let updated_row = execute_update_row(
+                                    store,
+                                    txn,
+                                    db_id,
+                                    table_name,
+                                    schema,
+                                    existing_row,
+                                    updated_row,
+                                    enum_cache,
+                                )
+                                .await?;
                                 return Ok(Some(updated_row));
                             }
                             None => {
@@ -649,19 +670,17 @@ pub async fn execute_insert_row(
                         }
                         let updated_row = Row::new(updated_vals);
                         validate_enum_values(schema, &updated_row, enum_cache)?;
-                        update_row_indexes(
+                        let updated_row = execute_update_row(
                             store,
                             txn,
                             db_id,
+                            table_name,
                             schema,
-                            &pk_values,
                             existing_row,
-                            &updated_row,
+                            updated_row,
+                            enum_cache,
                         )
-                            .await?;
-                        store
-                            .upsert(txn, db_id, table_name, updated_row.clone())
-                            .await?;
+                        .await?;
                         Ok(Some(updated_row))
                     }
                 },
@@ -695,19 +714,17 @@ pub async fn execute_insert_row(
                     }
                     let updated_row = Row::new(updated_vals);
                     validate_enum_values(schema, &updated_row, enum_cache)?;
-                    update_row_indexes(
+                    let updated_row = execute_update_row(
                         store,
                         txn,
                         db_id,
+                        table_name,
                         schema,
-                        &pk_values,
                         existing_row,
-                        &updated_row,
+                        updated_row,
+                        enum_cache,
                     )
-                        .await?;
-                    store
-                        .upsert(txn, db_id, table_name, updated_row.clone())
-                        .await?;
+                    .await?;
                     Ok(Some(updated_row))
                 }
                 None => Err(e),
