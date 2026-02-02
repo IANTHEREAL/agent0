@@ -2165,16 +2165,83 @@ impl TikvStore {
         }
     }
 
+    async fn maybe_migrate_implicit_sequence_to_standalone(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        def: &mut SequenceDef,
+    ) -> Result<()> {
+        let SequenceBacking::TableId(table_id) = def.backing.clone() else {
+            return Ok(());
+        };
+
+        // Only implicit sequences created from SERIAL/IDENTITY are expected to use TableId backing.
+        // Migrate these to standalone state so each sequence advances independently.
+        if def.owned_by.is_none() {
+            return Ok(());
+        }
+
+        // Mirror the current per-table allocator value, if any, so we don't re-issue values
+        // that may have been consumed under the old shared-counter behavior.
+        let key = self.key(&encode_table_sequence_value_key_v2(db_id, table_id));
+        let current = {
+            let mut read_txn = self.begin_optimistic().await?;
+            let current = read_txn.get(key).await?;
+            let _ = read_txn.rollback().await;
+            current
+        };
+        let current_u64 = match current {
+            Some(data) => u64::from_be_bytes(
+                data.try_into()
+                    .map_err(|_| anyhow!("Invalid sequence value format"))?,
+            ),
+            None => 0,
+        };
+
+        if let Some((owned_table, owned_col)) = def.owned_by.as_ref() {
+            if let Some(schema) = self.get_schema(txn, db_id, owned_table).await? {
+                if let Some(col) = schema.columns.iter().find(|c| c.name == *owned_col) {
+                    def.max_value = match col.data_type {
+                        DataType::Int64 => i64::MAX,
+                        _ => i32::MAX as i64,
+                    };
+                }
+            }
+        }
+
+        let last_value = if current_u64 == 0 {
+            def.start_value
+        } else {
+            current_u64.try_into().map_err(|_| {
+                anyhow!(
+                    "Sequence value {} is too large for i64 (table_id={})",
+                    current_u64,
+                    table_id
+                )
+            })?
+        };
+        let is_called = current_u64 != 0;
+
+        def.backing = SequenceBacking::Standalone(SequenceState {
+            last_value,
+            is_called,
+        });
+        Ok(())
+    }
+
     pub async fn nextval_sequence(
         &self,
         txn: &mut Transaction,
         db_id: u64,
         full_name: &str,
     ) -> Result<i64> {
-        let def = self
+        let mut def = self
             .get_sequence(txn, db_id, full_name)
             .await?
             .ok_or_else(|| anyhow!("Sequence '{}' does not exist", full_name))?;
+
+        self.maybe_migrate_implicit_sequence_to_standalone(txn, db_id, &mut def)
+            .await?;
 
         match &def.backing {
             SequenceBacking::TableId(table_id) => {
@@ -2222,10 +2289,13 @@ impl TikvStore {
         value: i64,
         is_called: bool,
     ) -> Result<i64> {
-        let def = self
+        let mut def = self
             .get_sequence(txn, db_id, full_name)
             .await?
             .ok_or_else(|| anyhow!("Sequence '{}' does not exist", full_name))?;
+
+        self.maybe_migrate_implicit_sequence_to_standalone(txn, db_id, &mut def)
+            .await?;
 
         match &def.backing {
             SequenceBacking::TableId(table_id) => {

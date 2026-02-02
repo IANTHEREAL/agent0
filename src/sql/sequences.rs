@@ -1,5 +1,5 @@
 use crate::storage::TikvStore;
-use crate::types::{IndexDef, SequenceBacking, SequenceDef, SequenceState, Value};
+use crate::types::{DataType, IndexDef, SequenceBacking, SequenceDef, SequenceState, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, MinMaxValue, ObjectName, SequenceOptions,
@@ -188,7 +188,7 @@ pub(crate) fn implicit_sequence_name(table_name: &str, column_name: &str) -> Str
 pub(crate) fn build_implicit_sequence_def(
     table_full_name: &str,
     column_name: &str,
-    table_id: u64,
+    data_type: &DataType,
 ) -> SequenceDef {
     let (schema, table_name) = match table_full_name.split_once('.') {
         Some((schema, table)) if !schema.is_empty() && !table.is_empty() => {
@@ -196,6 +196,12 @@ pub(crate) fn build_implicit_sequence_def(
         }
         _ => ("public".to_string(), table_full_name.to_string()),
     };
+
+    let max_value = match data_type {
+        DataType::Int64 => i64::MAX,
+        _ => i32::MAX as i64,
+    };
+
     SequenceDef {
         oid: 0,
         schema,
@@ -203,13 +209,42 @@ pub(crate) fn build_implicit_sequence_def(
         start_value: 1,
         increment: 1,
         min_value: 1,
-        max_value: i64::MAX,
+        max_value,
         cache_size: 1,
         is_cycled: false,
         owned_by: Some((table_full_name.to_string(), column_name.to_string())),
         owner: "postgres".to_string(),
-        backing: SequenceBacking::TableId(table_id),
+        backing: SequenceBacking::Standalone(SequenceState {
+            last_value: 1,
+            is_called: false,
+        }),
     }
+}
+
+pub(crate) fn find_owned_sequence_full_name(
+    sequences: &[SequenceDef],
+    table_full_name: &str,
+    column_name: &str,
+) -> Result<Option<String>> {
+    let mut matches = sequences.iter().filter(|seq| {
+        seq.owned_by.as_ref().map_or(false, |(owned_table, owned_col)| {
+            owned_table == table_full_name && owned_col == column_name
+        })
+    });
+
+    let Some(first) = matches.next() else {
+        return Ok(None);
+    };
+
+    if matches.next().is_some() {
+        return Err(anyhow!(
+            "Multiple sequences are owned by {}.{}",
+            table_full_name,
+            column_name
+        ));
+    }
+
+    Ok(Some(first.full_name()))
 }
 
 fn eval_i64(expr: &Expr) -> Result<i64> {
@@ -383,6 +418,65 @@ pub(crate) async fn execute_create_sequence(
     Ok(ExecuteResult::CommandComplete {
         tag: "CREATE SEQUENCE",
     })
+}
+
+#[cfg(test)]
+mod owned_sequence_lookup_tests {
+    use super::*;
+
+    fn make_sequence(full_name: &str, owned_by: Option<(&str, &str)>) -> SequenceDef {
+        let (schema, name) = full_name
+            .split_once('.')
+            .unwrap_or(("public", full_name));
+        SequenceDef {
+            oid: 0,
+            schema: schema.to_string(),
+            name: name.to_string(),
+            start_value: 1,
+            increment: 1,
+            min_value: 1,
+            max_value: i64::MAX,
+            cache_size: 1,
+            is_cycled: false,
+            owned_by: owned_by.map(|(table, col)| (table.to_string(), col.to_string())),
+            owner: "postgres".to_string(),
+            backing: SequenceBacking::Standalone(SequenceState {
+                last_value: 1,
+                is_called: false,
+            }),
+        }
+    }
+
+    #[test]
+    fn finds_owned_sequence_after_table_rename() {
+        let sequences = vec![make_sequence("public.t_a_seq", Some(("public.t2", "a")))];
+        let found = find_owned_sequence_full_name(&sequences, "public.t2", "a").unwrap();
+        assert_eq!(found.as_deref(), Some("public.t_a_seq"));
+    }
+
+    #[test]
+    fn finds_owned_sequence_after_column_rename() {
+        let sequences = vec![make_sequence("public.t_a_seq", Some(("public.t2", "b")))];
+        let found = find_owned_sequence_full_name(&sequences, "public.t2", "b").unwrap();
+        assert_eq!(found.as_deref(), Some("public.t_a_seq"));
+    }
+
+    #[test]
+    fn returns_none_when_no_owned_sequence_matches() {
+        let sequences = vec![make_sequence("public.t_a_seq", Some(("public.t", "a")))];
+        let found = find_owned_sequence_full_name(&sequences, "public.t2", "a").unwrap();
+        assert!(found.is_none());
+    }
+
+    #[test]
+    fn errors_when_multiple_owned_sequences_match() {
+        let sequences = vec![
+            make_sequence("public.s1", Some(("public.t", "a"))),
+            make_sequence("public.s2", Some(("public.t", "a"))),
+        ];
+        let err = find_owned_sequence_full_name(&sequences, "public.t", "a").unwrap_err();
+        assert!(err.to_string().contains("Multiple sequences"));
+    }
 }
 
 pub(crate) async fn execute_drop_sequence(

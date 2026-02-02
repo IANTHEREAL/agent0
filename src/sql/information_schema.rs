@@ -1402,6 +1402,7 @@ async fn get_columns_rows(
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
+    let sequence_defs = store.list_sequences(txn, db_id).await?;
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
@@ -1437,11 +1438,18 @@ async fn get_columns_rows(
                 };
 
                 let column_default = if col.is_serial {
-                    let seq_full_name = format!(
-                        "{}.{}",
-                        table_schema,
-                        sequences::implicit_sequence_name(&table_name, &col.name)
-                    );
+                    let seq_full_name = match sequences::find_owned_sequence_full_name(
+                        &sequence_defs,
+                        full_table_name,
+                        &col.name,
+                    )? {
+                        Some(full_name) => full_name,
+                        None => format!(
+                            "{}.{}",
+                            table_schema,
+                            sequences::implicit_sequence_name(&table_name, &col.name)
+                        ),
+                    };
                     text_val(&format!("nextval('{}'::regclass)", seq_full_name))
                 } else {
                     col.default_expr
@@ -2143,6 +2151,7 @@ async fn get_pg_attrdef_rows(
     user_tables: &[String],
 ) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
+    let sequence_defs = store.list_sequences(txn, db_id).await?;
 
     for full_table_name in user_tables {
         let (table_schema, table_name) = split_schema_and_name(full_table_name);
@@ -2153,11 +2162,18 @@ async fn get_pg_attrdef_rows(
 
         for (i, col) in schema.columns.iter().enumerate() {
             let expr = if col.is_serial {
-                let seq_full_name = format!(
-                    "{}.{}",
-                    table_schema,
-                    sequences::implicit_sequence_name(&table_name, &col.name)
-                );
+                let seq_full_name = match sequences::find_owned_sequence_full_name(
+                    &sequence_defs,
+                    full_table_name,
+                    &col.name,
+                )? {
+                    Some(full_name) => full_name,
+                    None => format!(
+                        "{}.{}",
+                        table_schema,
+                        sequences::implicit_sequence_name(&table_name, &col.name)
+                    ),
+                };
                 Some(format!("nextval('{}'::regclass)", seq_full_name))
             } else {
                 col.default_expr.clone()

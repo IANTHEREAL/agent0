@@ -1435,34 +1435,76 @@ pub async fn fill_missing_columns(
     row_vals: &mut Vec<Value>,
     indices: &[usize],
 ) -> Result<()> {
+    let (table_schema, table_name) = schema
+        .name
+        .rsplit_once('.')
+        .unwrap_or(("public", schema.name.as_str()));
+    let sequence_defs = if schema
+        .columns
+        .iter()
+        .enumerate()
+        .any(|(i, col)| col.is_serial && !indices.contains(&i))
+    {
+        Some(store.list_sequences(txn, db_id).await?)
+    } else {
+        None
+    };
+
     for (i, c) in schema.columns.iter().enumerate() {
-            if !indices.contains(&i) {
-                if c.is_serial {
-                let seq_val = store.next_sequence_value(txn, db_id, schema.table_id).await?;
-                row_vals[i] = match c.data_type {
-                    DataType::Int64 => Value::Int64(seq_val as i64),
-                    _ => Value::Int32(seq_val),
-                };
-            } else if let Some(def) = &c.default_expr {
-                row_vals[i] =
-                    eval_default_expr_maybe_sequence(
-                        store,
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        def,
+        if indices.contains(&i) {
+            continue;
+        }
+
+        if c.is_serial {
+            let seq_full_name = match sequence_defs.as_ref() {
+                Some(defs) => match sequences::find_owned_sequence_full_name(defs, &schema.name, &c.name)?
+                {
+                    Some(full_name) => full_name,
+                    None => format!(
+                        "{}.{}",
+                        table_schema,
+                        sequences::implicit_sequence_name(table_name, &c.name)
+                    ),
+                },
+                None => format!(
+                    "{}.{}",
+                    table_schema,
+                    sequences::implicit_sequence_name(table_name, &c.name)
+                ),
+            };
+
+            let seq_val = store.nextval_sequence(txn, db_id, &seq_full_name).await?;
+            sequence_values.insert(seq_full_name, seq_val);
+
+            row_vals[i] = match c.data_type {
+                DataType::Int64 => Value::Int64(seq_val),
+                _ => Value::Int32(seq_val.try_into().map_err(|_| {
+                    anyhow!(
+                        "serial sequence value {} overflows INT4 for column \"{}\"",
+                        seq_val,
+                        c.name
                     )
-                        .await?;
-            } else if !c.nullable {
-                let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-                return Err(anyhow!(
-                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint\nDETAIL:  Failing row contains ({}).",
-                    c.name,
-                    short_table,
-                    row_vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ")
-                ));
-            }
+                })?),
+            };
+        } else if let Some(def) = &c.default_expr {
+            row_vals[i] =
+                eval_default_expr_maybe_sequence(
+                    store,
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    def,
+                )
+                    .await?;
+        } else if !c.nullable {
+            let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+            return Err(anyhow!(
+                "null value in column \"{}\" of relation \"{}\" violates not-null constraint\nDETAIL:  Failing row contains ({}).",
+                c.name,
+                short_table,
+                row_vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ")
+            ));
         }
     }
     Ok(())

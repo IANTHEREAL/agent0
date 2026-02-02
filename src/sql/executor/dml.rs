@@ -155,51 +155,62 @@ impl Executor {
             .ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
         let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
-        let source = source
-            .as_ref()
-            .ok_or_else(|| anyhow!("INSERT requires VALUES"))?;
 
         let mut affected = 0;
         let mut ret_rows = Vec::new();
         let ret_cols = dml::build_returning_columns(returning, &schema)?;
 
-        let source_rows: Vec<Vec<Expr>> = match &*source.body {
-            SetExpr::Values(Values { rows, .. }) => rows.clone(),
-            SetExpr::Select(_) => {
-                let select_result = self
-                    .execute_query(txn, db_id, sequence_values, search_path, source)
-                    .await?;
-                match select_result {
-                    super::super::ExecuteResult::Select {
-                        rows,
-                        columns: select_cols,
-                        ..
-                    } => {
-                        let insert_columns: Vec<String> = if select_cols.is_empty() {
-                            schema.columns.iter().map(|c| c.name.clone()).collect()
-                        } else {
-                            select_cols.iter().map(|c| c.to_lowercase()).collect()
-                        };
-
-                        rows.into_iter()
-                            .map(|row| {
-                                row.values
-                                    .into_iter()
-                                    .enumerate()
-                                    .map(|(i, val)| {
-                                        value_to_expr(
-                                            val,
-                                            insert_columns.get(i).map(|s| s.as_str()),
-                                        )
-                                    })
-                                    .collect::<Result<Vec<Expr>>>()
-                            })
-                            .collect::<Result<Vec<Vec<Expr>>>>()?
-                    }
-                    _ => return Err(anyhow!("INSERT...SELECT source must return rows")),
-                }
+        let source_rows: Vec<Vec<Expr>> = match source.as_ref() {
+            None => {
+                // sqlparser represents INSERT ... DEFAULT VALUES with source=None.
+                let count = if columns.is_empty() {
+                    schema.columns.len()
+                } else {
+                    columns.len()
+                };
+                let defaults = (0..count)
+                    .map(|_| Expr::Identifier(Ident::new("DEFAULT")))
+                    .collect();
+                vec![defaults]
             }
-            _ => return Err(anyhow!("INSERT source must be VALUES or SELECT")),
+            Some(source) => match &*source.body {
+                SetExpr::Values(Values { rows, .. }) => rows.clone(),
+                SetExpr::Select(_) => {
+                    let select_result = self
+                        .execute_query(txn, db_id, sequence_values, search_path, source)
+                        .await?;
+                    match select_result {
+                        super::super::ExecuteResult::Select {
+                            rows,
+                            columns: select_cols,
+                            ..
+                        } => {
+                            let insert_columns: Vec<String> = if select_cols.is_empty() {
+                                schema.columns.iter().map(|c| c.name.clone()).collect()
+                            } else {
+                                select_cols.iter().map(|c| c.to_lowercase()).collect()
+                            };
+
+                            rows.into_iter()
+                                .map(|row| {
+                                    row.values
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(i, val)| {
+                                            value_to_expr(
+                                                val,
+                                                insert_columns.get(i).map(|s| s.as_str()),
+                                            )
+                                        })
+                                        .collect::<Result<Vec<Expr>>>()
+                                })
+                                .collect::<Result<Vec<Vec<Expr>>>>()?
+                        }
+                        _ => return Err(anyhow!("INSERT...SELECT source must return rows")),
+                    }
+                }
+                _ => return Err(anyhow!("INSERT source must be VALUES or SELECT")),
+            },
         };
 
         for exprs in &source_rows {

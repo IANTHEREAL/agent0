@@ -3212,7 +3212,6 @@ impl Executor {
             let (txn, sequence_values, search_path) = session
                 .get_mut_txn_sequence_values_and_search_path()
                 .ok_or_else(|| anyhow!("Transaction must be active"))?;
-
             let schema = self
                 .store
                 .get_schema(txn, db_id, table_name)
@@ -3230,7 +3229,6 @@ impl Executor {
                     indices.push(idx);
                 }
             }
-
             indices.sort_unstable();
             indices.dedup();
 

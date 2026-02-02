@@ -143,12 +143,48 @@ async fn create_implicit_sequences_for_schema(
                     sequences::build_implicit_sequence_def(
                         &schema.name,
                         &col.name,
-                        schema.table_id,
+                        &col.data_type,
                     ),
                 )
                 .await?;
         }
     }
+    Ok(())
+}
+
+async fn advance_implicit_sequences_for_seeded_rows(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    row_count: usize,
+) -> Result<()> {
+    if row_count == 0 {
+        return Ok(());
+    }
+
+    let last_value = i64::try_from(row_count)
+        .map_err(|_| anyhow!("row count {} overflows sequence value", row_count))?;
+    let (table_schema, table_name) = schema
+        .name
+        .rsplit_once('.')
+        .unwrap_or(("public", schema.name.as_str()));
+
+    for col in &schema.columns {
+        if !col.is_serial {
+            continue;
+        }
+
+        let seq_full_name = format!(
+            "{}.{}",
+            table_schema,
+            sequences::implicit_sequence_name(table_name, &col.name)
+        );
+        store
+            .setval_sequence(txn, db_id, &seq_full_name, last_value, true)
+            .await?;
+    }
+
     Ok(())
 }
 
@@ -882,11 +918,7 @@ pub async fn create_table_from_query_result(
             .await?;
     }
 
-    if row_count > 0 {
-        store
-            .set_sequence_value(txn, db_id, schema.table_id, row_count as u64)
-            .await?;
-    }
+    advance_implicit_sequences_for_seeded_rows(store, txn, db_id, &schema, row_count).await?;
 
     Ok(ExecuteResult::CreateTable {
         table_name: table_name.to_string(),
@@ -962,11 +994,7 @@ pub async fn create_table_from_select_into(
             .await?;
     }
 
-    if row_count > 0 {
-        store
-            .set_sequence_value(txn, db_id, schema.table_id, row_count as u64)
-            .await?;
-    }
+    advance_implicit_sequences_for_seeded_rows(store, txn, db_id, &schema, row_count).await?;
 
     Ok(ExecuteResult::Insert {
         affected_rows: row_count as u64,
@@ -1289,11 +1317,7 @@ pub async fn execute_create_materialized_view(
     for row in rows {
         store.insert(txn, db_id, &view_name, row).await?;
     }
-    if row_count > 0 {
-        store
-            .set_sequence_value(txn, db_id, schema.table_id, row_count as u64)
-            .await?;
-    }
+    advance_implicit_sequences_for_seeded_rows(store, txn, db_id, &schema, row_count).await?;
 
     Ok(ExecuteResult::CreateMaterializedView { view_name })
 }
@@ -1366,11 +1390,7 @@ pub async fn execute_refresh_materialized_view(
     for row in rows {
         dml::execute_insert_row(store, txn, db_id, name, &schema, row, &None, &enum_cache).await?;
     }
-    if row_count > 0 {
-        store
-            .set_sequence_value(txn, db_id, schema.table_id, row_count as u64)
-            .await?;
-    }
+    advance_implicit_sequences_for_seeded_rows(store, txn, db_id, &schema, row_count).await?;
 
     Ok(ExecuteResult::RefreshMaterializedView {
         view_name: name.to_string(),
@@ -1629,7 +1649,11 @@ pub async fn execute_alter_table(
                                 .expect("column just pushed")
                                 .name
                                 .as_str(),
-                            schema.table_id,
+                            &schema
+                                .columns
+                                .last()
+                                .expect("column just pushed")
+                                .data_type,
                         ),
                     )
                     .await?;

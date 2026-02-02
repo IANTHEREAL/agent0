@@ -1,0 +1,6 @@
+n_after_table_rename
+1
+(1 row)
+n_after_column_rename|min_b|max_b
+2|1|2
+(1 row)

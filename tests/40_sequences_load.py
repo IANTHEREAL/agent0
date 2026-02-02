@@ -142,6 +142,37 @@ def main() -> int:
     )
     assert_lines(out, ["S", "2", "3", "4", "100", "101", "200", "200", "0"])
 
+    # Implicit sequences: per-sequence (not per-table) counters + currval should work after INSERT.
+    out = must_stdout(
+        cfg,
+        """
+        DROP TABLE IF EXISTS seq_multi_serial;
+        CREATE TABLE seq_multi_serial(a SERIAL, b SERIAL);
+        INSERT INTO seq_multi_serial DEFAULT VALUES;
+        INSERT INTO seq_multi_serial DEFAULT VALUES;
+        SELECT a, b FROM seq_multi_serial ORDER BY a;
+        SELECT currval('seq_multi_serial_a_seq');
+        SELECT currval('seq_multi_serial_b_seq');
+        DROP TABLE seq_multi_serial;
+        """,
+    )
+    assert_lines(out, ["1|1", "2|2", "2", "2"])
+
+    # BIGSERIAL should not truncate/wrap at INT4 boundaries.
+    out = must_stdout(
+        cfg,
+        """
+        DROP TABLE IF EXISTS seq_big_serial_t;
+        CREATE TABLE seq_big_serial_t(id BIGSERIAL);
+        SELECT setval('seq_big_serial_t_id_seq', 2147483647, true);
+        INSERT INTO seq_big_serial_t DEFAULT VALUES;
+        SELECT id FROM seq_big_serial_t;
+        SELECT currval('seq_big_serial_t_id_seq');
+        DROP TABLE seq_big_serial_t;
+        """,
+    )
+    assert_lines(out, ["2147483647", "2147483648", "2147483648"])
+
     # Transaction and savepoint behavior: nextval/setval effects must survive ROLLBACK and
     # ROLLBACK TO SAVEPOINT (PostgreSQL semantics).
     out = must_stdout(
