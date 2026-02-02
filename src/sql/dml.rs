@@ -323,6 +323,7 @@ pub async fn execute_insert_row(
     let insert_result = store.insert(txn, db_id, table_name, row.clone()).await;
     match insert_result {
         Ok(pk_values) => {
+            let mut created_index_entries: Vec<(u64, Vec<Value>, bool)> = Vec::new();
             for index in &schema.indexes {
                 if !index_helpers::is_index_materializable(index) {
                     continue;
@@ -368,6 +369,15 @@ pub async fn execute_insert_row(
 
                                 match &oc.action {
                                     OnConflictAction::DoNothing => {
+                                        rollback_inserted_index_entries(
+                                            store,
+                                            txn,
+                                            db_id,
+                                            schema,
+                                            &pk_values,
+                                            &created_index_entries,
+                                        )
+                                        .await?;
                                         store
                                             .delete_by_pk(txn, db_id, table_name, &pk_values)
                                             .await?;
@@ -412,6 +422,15 @@ pub async fn execute_insert_row(
                                         let updated_row = Row::new(updated_vals);
                                         validate_enum_values(schema, &updated_row, enum_cache)?;
 
+                                        rollback_inserted_index_entries(
+                                            store,
+                                            txn,
+                                            db_id,
+                                            schema,
+                                            &pk_values,
+                                            &created_index_entries,
+                                        )
+                                        .await?;
                                         store
                                             .delete_by_pk(txn, db_id, table_name, &pk_values)
                                             .await?;
@@ -497,6 +516,15 @@ pub async fn execute_insert_row(
                                 let updated_row = Row::new(updated_vals);
                                 validate_enum_values(schema, &updated_row, enum_cache)?;
 
+                                rollback_inserted_index_entries(
+                                    store,
+                                    txn,
+                                    db_id,
+                                    schema,
+                                    &pk_values,
+                                    &created_index_entries,
+                                )
+                                .await?;
                                 store
                                     .delete_by_pk(txn, db_id, table_name, &pk_values)
                                     .await?;
@@ -558,6 +586,7 @@ pub async fn execute_insert_row(
                     }
                     return Err(e);
                 }
+                created_index_entries.push((index.id, idx_values, index.unique));
             }
             // Materialize supported GIN indexes only after B-Tree indexes succeed, so
             // ON CONFLICT paths don't need additional cleanup.
@@ -774,6 +803,84 @@ async fn update_row_indexes(
     Ok(())
 }
 
+async fn rollback_inserted_index_entries(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema: &TableSchema,
+    pk_values: &[Value],
+    created_index_entries: &[(u64, Vec<Value>, bool)],
+) -> Result<()> {
+    for (index_id, idx_values, unique) in created_index_entries.iter().rev() {
+        store
+            .delete_index_entry(
+                txn,
+                db_id,
+                schema.table_id,
+                *index_id,
+                idx_values,
+                pk_values,
+                *unique,
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+async fn delete_row_storage_entries(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    table_name: &str,
+    schema: &TableSchema,
+    row: &Row,
+) -> Result<()> {
+    let pk_values = schema.get_pk_values(row);
+    store
+        .delete_by_pk(txn, db_id, table_name, &pk_values)
+        .await?;
+
+    for index in &schema.indexes {
+        let gin_hashes = extract_gin_token_hashes_from_row(schema, index, row)?;
+        if !gin_hashes.is_empty() {
+            store
+                .delete_gin_index_entries(
+                    txn,
+                    db_id,
+                    schema.table_id,
+                    index.id,
+                    &gin_hashes,
+                    &pk_values,
+                )
+                .await?;
+            continue;
+        }
+
+        if !index_helpers::is_index_materializable(index) {
+            continue;
+        }
+
+        if !index_helpers::eval_index_predicate(index, schema, row)? {
+            continue;
+        }
+
+        let idx_values = index_helpers::get_index_values_with_expressions(index, schema, row)?;
+        store
+            .delete_index_entry(
+                txn,
+                db_id,
+                schema.table_id,
+                index.id,
+                &idx_values,
+                &pk_values,
+                index.unique,
+            )
+            .await?;
+    }
+
+    Ok(())
+}
+
 pub async fn handle_foreign_key_on_delete(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -931,7 +1038,8 @@ async fn cascade_delete_recursive(
                     .or_default()
                     .push(del_pk.clone());
 
-                store.delete_by_pk(txn, db_id, other_table, &del_pk).await?;
+                delete_row_storage_entries(store, txn, db_id, other_table, other_schema, &del_row)
+                    .await?;
             }
 
             let enum_cache = build_enum_label_cache(store, txn, db_id, other_schema).await?;
@@ -1094,32 +1202,7 @@ pub async fn execute_delete_row(
 ) -> Result<()> {
     handle_foreign_key_on_delete(store, txn, db_id, table_name, schema, row).await?;
 
-    let pks = schema.get_pk_values(row);
-    store.delete_by_pk(txn, db_id, table_name, &pks).await?;
-    for index in &schema.indexes {
-        let gin_hashes = extract_gin_token_hashes_from_row(schema, index, row)?;
-        if !gin_hashes.is_empty() {
-            store
-                .delete_gin_index_entries(txn, db_id, schema.table_id, index.id, &gin_hashes, &pks)
-                .await?;
-            continue;
-        }
-
-        if !index_helpers::is_index_materializable(index) {
-            continue;
-        }
-
-        let matches = index_helpers::eval_index_predicate(index, schema, row)?;
-        if !matches {
-            continue;
-        }
-
-        let idx_values = index_helpers::get_index_values_with_expressions(index, schema, row)?;
-        store
-            .delete_index_entry(txn, db_id, schema.table_id, index.id, &idx_values, &pks, index.unique)
-            .await?;
-    }
-    Ok(())
+    delete_row_storage_entries(store, txn, db_id, table_name, schema, row).await
 }
 
 pub async fn execute_update_row(
