@@ -42,3 +42,16 @@ This change adds a reproducible, low-friction development environment for the `a
 - **Pinned versions** reduce “works on my machine” drift and make CI easier to reproduce later.
 - **Makefile + setup script** provides both a one-command entrypoint (`./setup_dev.sh`) and composable targets for day-to-day work.
 
+## Verification
+
+Commands run locally:
+
+- `./setup_dev.sh`
+- `make fmt`
+- `make lint`
+- `make test`
+- `make build`
+
+Notes:
+
+- `make vuln` uses `govulncheck` and will report vulnerabilities in the **standard library** if your local Go toolchain is behind security patch releases. Upgrade Go (same major/minor) to reduce false alarms.
