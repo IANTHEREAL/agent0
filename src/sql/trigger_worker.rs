@@ -1390,75 +1390,192 @@ fn substitute_row_references(
     new_values: &[crate::types::Value],
     old_row: Option<&Row>,
 ) -> String {
-    let mut result = expr.to_string();
+    let bytes = expr.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
 
-    for (idx, col) in schema.columns.iter().enumerate() {
-        let patterns = [
-            format!("NEW.{}", col.name.to_uppercase()),
-            format!("new.{}", col.name.to_lowercase()),
-            format!("NEW.{}", col.name),
-            format!("new.{}", col.name),
-        ];
-        let value_str = new_values
-            .get(idx)
-            .map(value_to_sql_literal)
-            .unwrap_or_else(|| "NULL".to_string());
-
-        for pattern in &patterns {
-            if result.to_uppercase().contains(&pattern.to_uppercase()) {
-                result = case_insensitive_replace(&result, pattern, &value_str);
+    while i < bytes.len() {
+        // Line comment.
+        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+            let start = i;
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
             }
+            out.extend_from_slice(&bytes[start..i]);
+            continue;
         }
-    }
 
-    if let Some(old) = old_row {
-        for (idx, col) in schema.columns.iter().enumerate() {
-            let patterns = [
-                format!("OLD.{}", col.name.to_uppercase()),
-                format!("old.{}", col.name.to_lowercase()),
-                format!("OLD.{}", col.name),
-                format!("old.{}", col.name),
-            ];
-            let value_str = old
-                .values
-                .get(idx)
-                .map(value_to_sql_literal)
-                .unwrap_or_else(|| "NULL".to_string());
+        // Block comment (supports nesting).
+        if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+            let start = i;
+            i += 2;
+            let mut depth = 1usize;
+            while i < bytes.len() && depth > 0 {
+                if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                    depth = depth.saturating_sub(1);
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            out.extend_from_slice(&bytes[start..i]);
+            continue;
+        }
 
-            for pattern in &patterns {
-                if result.to_uppercase().contains(&pattern.to_uppercase()) {
-                    result = case_insensitive_replace(&result, pattern, &value_str);
+        // Single-quoted string literal.
+        if bytes[i] == b'\'' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'\'' {
+                    // Escaped quote: ''.
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.extend_from_slice(&bytes[start..i]);
+            continue;
+        }
+
+        // Double-quoted identifier.
+        if bytes[i] == b'"' {
+            let start = i;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b'"' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            out.extend_from_slice(&bytes[start..i]);
+            continue;
+        }
+
+        // Dollar-quoted strings ($tag$...$tag$ or $$...$$).
+        if bytes[i] == b'$' {
+            // Skip parameter placeholders like $1.
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j > i + 1 {
+                out.extend_from_slice(&bytes[i..j]);
+                i = j;
+                continue;
+            }
+
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'$' {
+                if bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' {
+                    j += 1;
+                    continue;
+                }
+                break;
+            }
+            if j < bytes.len() && bytes[j] == b'$' {
+                let start = i;
+                let delim = &bytes[i..=j];
+                let delim_len = delim.len();
+                i = j + 1;
+                while i + delim_len <= bytes.len() {
+                    if &bytes[i..i + delim_len] == delim {
+                        i += delim_len;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.extend_from_slice(&bytes[start..i]);
+                continue;
+            }
+
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+
+        // Identifier token.
+        if is_ident_start(bytes[i]) {
+            let start = i;
+            i += 1;
+            while i < bytes.len() && is_ident_continue(bytes[i]) {
+                i += 1;
+            }
+
+            let ident = &bytes[start..i];
+            let is_new = ident.eq_ignore_ascii_case(b"NEW");
+            let is_old = ident.eq_ignore_ascii_case(b"OLD");
+            if (is_new || is_old) && i < bytes.len() && bytes[i] == b'.' {
+                let col_start = i + 1;
+                if col_start < bytes.len() && is_ident_start(bytes[col_start]) {
+                    let mut col_end = col_start + 1;
+                    while col_end < bytes.len() && is_ident_continue(bytes[col_end]) {
+                        col_end += 1;
+                    }
+
+                    if let Ok(col_name) = std::str::from_utf8(&bytes[col_start..col_end]) {
+                        if let Some(idx) = schema
+                            .columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                        {
+                            if is_new {
+                                let value = new_values
+                                    .get(idx)
+                                    .map(value_to_sql_literal)
+                                    .unwrap_or_else(|| "NULL".to_string());
+                                out.extend_from_slice(value.as_bytes());
+                                i = col_end;
+                                continue;
+                            }
+
+                            if let Some(old) = old_row {
+                                let value = old
+                                    .values
+                                    .get(idx)
+                                    .map(value_to_sql_literal)
+                                    .unwrap_or_else(|| "NULL".to_string());
+                                out.extend_from_slice(value.as_bytes());
+                                i = col_end;
+                                continue;
+                            }
+                        }
+                    }
                 }
             }
+
+            out.extend_from_slice(ident);
+            continue;
         }
+
+        out.push(bytes[i]);
+        i += 1;
     }
 
-    result
+    String::from_utf8(out).unwrap_or_else(|_| expr.to_string())
 }
 
-fn case_insensitive_replace(s: &str, pattern: &str, replacement: &str) -> String {
-    if pattern.is_empty() {
-        return s.to_string();
-    }
+fn is_ident_start(b: u8) -> bool {
+    b.is_ascii_alphabetic() || b == b'_'
+}
 
-    // Replace only when `pattern` is not immediately followed by an identifier
-    // continuation (avoid prefix matches like `NEW.id` inside `NEW.id2`).
-    let re_pattern = format!("{}($|[^\\p{{XID_Continue}}$])", regex::escape(pattern));
-    let Ok(re) = regex::RegexBuilder::new(&re_pattern)
-        .case_insensitive(true)
-        .build()
-    else {
-        return s.to_string();
-    };
-
-    re.replace_all(s, |caps: &regex::Captures| {
-        let delim = caps.get(1).map_or("", |m| m.as_str());
-        let mut out = String::with_capacity(replacement.len() + delim.len());
-        out.push_str(replacement);
-        out.push_str(delim);
-        out
-    })
-    .into_owned()
+fn is_ident_continue(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$'
 }
 
 fn value_to_sql_literal(value: &crate::types::Value) -> String {
@@ -1521,8 +1638,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        case_insensitive_replace, parse_new_assignment, parse_pd_keyspace_names,
-        plpgsql_outer_block_range, substitute_row_references, value_to_sql_literal,
+        parse_new_assignment, parse_pd_keyspace_names, plpgsql_outer_block_range,
+        substitute_row_references, value_to_sql_literal,
     };
 
     #[test]
@@ -1549,13 +1666,6 @@ mod tests {
     fn value_to_sql_literal_bytes_uses_single_backslash_x_prefix() {
         let value = Value::Bytes(vec![0xde, 0xad, 0xbe, 0xef]);
         assert_eq!(value_to_sql_literal(&value), "'\\xdeadbeef'");
-    }
-
-    #[test]
-    fn case_insensitive_replace_unicode_offsets() {
-        let s = "ıNEW.col";
-        let result = case_insensitive_replace(s, "new.COL", "X");
-        assert_eq!(result, "ıX");
     }
 
     #[test]
@@ -1605,13 +1715,6 @@ mod tests {
             delay,
             Duration::from_millis(super::DEFAULT_KEYSPACE_ERROR_BACKOFF_MAX_MS)
         );
-    }
-
-    #[test]
-    fn case_insensitive_replace_does_not_expand_replacement() {
-        let s = "NEW.col";
-        let result = case_insensitive_replace(s, "new.COL", "$1");
-        assert_eq!(result, "$1");
     }
 
     #[test]
@@ -1747,6 +1850,49 @@ mod tests {
             Some(&old_row),
         );
         assert_eq!(result, "NULL IS NULL");
+    }
+
+    #[test]
+    fn substitute_row_references_does_not_collide_a_aa() {
+        let schema = TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![
+                ColumnDef {
+                    name: "a".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "aa".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+
+        let new_values = vec![Value::Int32(1), Value::Int32(9)];
+        let expr = "'NEW.aa' || NEW.aa::TEXT /* NEW.aa */ -- NEW.aa";
+        let result = substitute_row_references(expr, &schema, &new_values, None);
+        assert_eq!(
+            result,
+            "'NEW.aa' || 9::TEXT /* NEW.aa */ -- NEW.aa"
+        );
     }
 
     #[test]

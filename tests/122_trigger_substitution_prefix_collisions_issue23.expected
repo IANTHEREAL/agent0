@@ -1,0 +1,9 @@
+a|aa
+11|10
+(1 row)
+pg_sleep
+
+(1 row)
+msg|aa
+NEW.aa|20
+(1 row)
