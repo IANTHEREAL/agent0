@@ -690,13 +690,21 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                 Value::Array(arr) => arr,
                 _ => return Err(anyhow!("ANY requires an array operand")),
             };
+            let mut saw_null = false;
             for elem in arr {
                 let cmp = eval_binary_op(left_val.clone(), compare_op, elem)?;
-                if matches!(cmp, Value::Boolean(true)) {
-                    return Ok(Value::Boolean(true));
-                }
+                match cmp {
+                    Value::Boolean(true) => return Ok(Value::Boolean(true)),
+                    Value::Boolean(false) => {}
+                    Value::Null => saw_null = true,
+                    other => return Err(anyhow!("ANY comparison must yield boolean, got {other:?}")),
+                };
             }
-            Ok(Value::Boolean(false))
+            if saw_null {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Boolean(false))
+            }
         }
         Expr::AllOp {
             left,
@@ -712,13 +720,21 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             if arr.is_empty() {
                 return Ok(Value::Boolean(true));
             }
+            let mut saw_null = false;
             for elem in arr {
                 let cmp = eval_binary_op(left_val.clone(), compare_op, elem)?;
-                if !matches!(cmp, Value::Boolean(true)) {
-                    return Ok(Value::Boolean(false));
-                }
+                match cmp {
+                    Value::Boolean(false) => return Ok(Value::Boolean(false)),
+                    Value::Boolean(true) => {}
+                    Value::Null => saw_null = true,
+                    other => return Err(anyhow!("ALL comparison must yield boolean, got {other:?}")),
+                };
             }
-            Ok(Value::Boolean(true))
+            if saw_null {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Boolean(true))
+            }
         }
         _ => Err(anyhow!("Unsupported expression: {:?}", expr)),
     }
