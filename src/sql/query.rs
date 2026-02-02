@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use sqlparser::ast::SetQuantifier;
 
@@ -30,6 +30,28 @@ pub fn apply_union(left_rows: Vec<Row>, right_rows: Vec<Row>, is_all: bool) -> V
 }
 
 pub fn apply_intersect(left_rows: Vec<Row>, right_rows: Vec<Row>, is_all: bool) -> Vec<Row> {
+    if is_all {
+        let mut right_counts: HashMap<Vec<u8>, usize> = HashMap::new();
+        for row in right_rows {
+            let key = serialize_values_for_key(&row.values).unwrap_or_default();
+            *right_counts.entry(key).or_insert(0) += 1;
+        }
+
+        let mut result = Vec::new();
+        for row in left_rows {
+            let key = serialize_values_for_key(&row.values).unwrap_or_default();
+            let Some(count) = right_counts.get_mut(&key) else {
+                continue;
+            };
+            if *count == 0 {
+                continue;
+            }
+            *count -= 1;
+            result.push(row);
+        }
+        return result;
+    }
+
     let right_set: HashSet<Vec<u8>> = right_rows
         .iter()
         .map(|r| serialize_values_for_key(&r.values).unwrap_or_default())
@@ -41,17 +63,37 @@ pub fn apply_intersect(left_rows: Vec<Row>, right_rows: Vec<Row>, is_all: bool) 
             right_set.contains(&key)
         })
         .collect();
-    if !is_all {
-        let mut seen = HashSet::new();
-        result.retain(|r| {
-            let key = serialize_values_for_key(&r.values).unwrap_or_default();
-            seen.insert(key)
-        });
-    }
+
+    let mut seen = HashSet::new();
+    result.retain(|r| {
+        let key = serialize_values_for_key(&r.values).unwrap_or_default();
+        seen.insert(key)
+    });
     result
 }
 
 pub fn apply_except(left_rows: Vec<Row>, right_rows: Vec<Row>, is_all: bool) -> Vec<Row> {
+    if is_all {
+        let mut right_counts: HashMap<Vec<u8>, usize> = HashMap::new();
+        for row in right_rows {
+            let key = serialize_values_for_key(&row.values).unwrap_or_default();
+            *right_counts.entry(key).or_insert(0) += 1;
+        }
+
+        let mut result = Vec::new();
+        for row in left_rows {
+            let key = serialize_values_for_key(&row.values).unwrap_or_default();
+            if let Some(count) = right_counts.get_mut(&key) {
+                if *count > 0 {
+                    *count -= 1;
+                    continue;
+                }
+            }
+            result.push(row);
+        }
+        return result;
+    }
+
     let right_set: HashSet<Vec<u8>> = right_rows
         .iter()
         .map(|r| serialize_values_for_key(&r.values).unwrap_or_default())
@@ -63,13 +105,12 @@ pub fn apply_except(left_rows: Vec<Row>, right_rows: Vec<Row>, is_all: bool) -> 
             !right_set.contains(&key)
         })
         .collect();
-    if !is_all {
-        let mut seen = HashSet::new();
-        result.retain(|r| {
-            let key = serialize_values_for_key(&r.values).unwrap_or_default();
-            seen.insert(key)
-        });
-    }
+
+    let mut seen = HashSet::new();
+    result.retain(|r| {
+        let key = serialize_values_for_key(&r.values).unwrap_or_default();
+        seen.insert(key)
+    });
     result
 }
 
