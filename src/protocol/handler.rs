@@ -2090,6 +2090,57 @@ async fn infer_result_fields_from_query_ast(
     }
 }
 
+fn strip_leading_whitespace_and_comments(query: &str) -> Option<&str> {
+    let bytes = query.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+
+        // Line comment: -- ... \n
+        if i + 1 < bytes.len() && bytes[i] == b'-' && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < bytes.len() {
+                let is_newline = bytes[i] == b'\n';
+                i += 1;
+                if is_newline {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // Block comment (supports nesting): /* ... */
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            let mut depth = 1usize;
+            while i < bytes.len() && depth > 0 {
+                if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+                    depth += 1;
+                    i += 2;
+                    continue;
+                }
+                if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+                    depth -= 1;
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+            }
+            if depth > 0 {
+                return None;
+            }
+            continue;
+        }
+
+        break;
+    }
+
+    Some(&query[i..])
+}
+
 pub struct DynamicPgHandler {
     client_pool: Option<Arc<TikvClientPool>>,
     pd_endpoints: Vec<String>,
@@ -2554,8 +2605,10 @@ impl DynamicPgHandler {
     }
 
     fn parse_copy_command(query: &str) -> Option<(String, Vec<String>)> {
+        let query = strip_leading_whitespace_and_comments(query)?;
         let query_upper = query.to_uppercase();
-        if !query_upper.contains("COPY")
+        // COPY FROM STDIN must start at statement start (after leading whitespace/comments).
+        if !query_upper.starts_with("COPY")
             || !query_upper.contains("FROM")
             || !query_upper.contains("STDIN")
         {
@@ -2564,7 +2617,7 @@ impl DynamicPgHandler {
 
         // Regex: COPY [schema.]table_name (col1, col2, ...) FROM stdin
         let re =
-            regex::Regex::new(r"(?i)COPY\s+(?:(\w+)\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin")
+            regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin")
                 .ok()?;
         if let Some(caps) = re.captures(query) {
             let schema = caps.get(1).map(|m| m.as_str().to_string());
@@ -2582,7 +2635,7 @@ impl DynamicPgHandler {
         }
 
         // Regex: COPY [schema.]table_name FROM stdin (no column list)
-        let re2 = regex::Regex::new(r"(?i)COPY\s+(?:(\w+)\.)?(\w+)\s+FROM\s+stdin").ok()?;
+        let re2 = regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s+FROM\s+stdin").ok()?;
         if let Some(caps) = re2.captures(query) {
             let schema = caps.get(1).map(|m| m.as_str().to_string());
             let table = caps.get(2)?.as_str().to_string();
@@ -2597,8 +2650,10 @@ impl DynamicPgHandler {
     }
 
     fn parse_copy_to_command(query: &str) -> Option<(String, Vec<String>)> {
+        let query = strip_leading_whitespace_and_comments(query)?;
         let query_upper = query.to_uppercase();
-        if !query_upper.contains("COPY") || !query_upper.contains("TO") {
+        // COPY TO STDOUT must start at statement start (after leading whitespace/comments).
+        if !query_upper.starts_with("COPY") || !query_upper.contains("TO") {
             return None;
         }
         if !query_upper.contains("STDOUT") {
@@ -2607,7 +2662,7 @@ impl DynamicPgHandler {
 
         // COPY [schema.]table (col1, col2) TO STDOUT
         let re =
-            regex::Regex::new(r"(?i)COPY\s+(?:(\w+)\.)?(\w+)\s*\(([^)]+)\)\s+TO\s+STDOUT").ok()?;
+            regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*\(([^)]+)\)\s+TO\s+STDOUT").ok()?;
         if let Some(caps) = re.captures(query) {
             let schema = caps.get(1).map(|m| m.as_str().to_string());
             let table = caps.get(2)?.as_str().to_string();
@@ -2625,7 +2680,7 @@ impl DynamicPgHandler {
         }
 
         // COPY [schema.]table TO STDOUT (no columns)
-        let re2 = regex::Regex::new(r"(?i)COPY\s+(?:(\w+)\.)?(\w+)\s+TO\s+STDOUT").ok()?;
+        let re2 = regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s+TO\s+STDOUT").ok()?;
         if let Some(caps) = re2.captures(query) {
             let schema = caps.get(1).map(|m| m.as_str().to_string());
             let table = caps.get(2)?.as_str().to_string();
@@ -4272,8 +4327,9 @@ impl PgHandler {
 
     #[allow(dead_code)]
     fn parse_copy_command(query: &str) -> Option<(String, Vec<String>)> {
+        let query = strip_leading_whitespace_and_comments(query)?;
         let query_upper = query.to_uppercase();
-        if !query_upper.contains("COPY")
+        if !query_upper.starts_with("COPY")
             || !query_upper.contains("FROM")
             || !query_upper.contains("STDIN")
         {
@@ -4281,7 +4337,7 @@ impl PgHandler {
         }
 
         let re =
-            regex::Regex::new(r"(?i)COPY\s+(?:(\w+)\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin")
+            regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin")
                 .ok()?;
         if let Some(caps) = re.captures(query) {
             let schema = caps.get(1).map(|m| m.as_str().to_string());
@@ -4298,7 +4354,7 @@ impl PgHandler {
             return Some((table_name, columns));
         }
 
-        let re2 = regex::Regex::new(r"(?i)COPY\s+(?:(\w+)\.)?(\w+)\s+FROM\s+stdin").ok()?;
+        let re2 = regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s+FROM\s+stdin").ok()?;
         if let Some(caps) = re2.captures(query) {
             let schema = caps.get(1).map(|m| m.as_str().to_string());
             let table = caps.get(2)?.as_str().to_string();
@@ -6486,6 +6542,26 @@ mod tests {
         );
         assert_eq!(
             DynamicPgHandler::parse_copy_command("INSERT INTO users VALUES (1)"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_copy_command_copy_keyword_inside_string_literal() {
+        assert_eq!(
+            DynamicPgHandler::parse_copy_command("SELECT 'COPY users FROM stdin' AS s;"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_copy_command_copy_keyword_inside_comment() {
+        assert_eq!(
+            DynamicPgHandler::parse_copy_command("/* COPY users FROM stdin */ SELECT 1;"),
+            None
+        );
+        assert_eq!(
+            DynamicPgHandler::parse_copy_command("-- COPY users FROM stdin\nSELECT 1;"),
             None
         );
     }
