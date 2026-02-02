@@ -30,6 +30,8 @@ const DEFAULT_MAX_EVENTS_PER_BATCH: usize = 10;
 const DEFAULT_MAX_RETRIES: u8 = 3;
 
 const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
+const DEFAULT_KEYSPACE_ERROR_BACKOFF_INITIAL_MS: u64 = 1_000;
+const DEFAULT_KEYSPACE_ERROR_BACKOFF_MAX_MS: u64 = 60_000;
 const DEFAULT_GC_INTERVAL_SEC: u64 = 60;
 const DEFAULT_DONE_RETENTION_SEC: u64 = 3600;
 const DEFAULT_DLQ_RETENTION_DAYS: u64 = 7;
@@ -171,9 +173,17 @@ pub(crate) struct TriggerWorker {
     worker_id: String,
     active_keyspaces: Mutex<HashSet<String>>,
     quotas: Mutex<HashMap<String, Arc<KeyspaceQuota>>>,
+    keyspace_backoff: Mutex<HashMap<String, KeyspaceBackoff>>,
     config: TriggerWorkerConfig,
     shutdown: AtomicBool,
     default_search_path: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct KeyspaceBackoff {
+    next_retry_at: Instant,
+    delay_ms: u64,
+    failures: u32,
 }
 
 impl TriggerWorker {
@@ -182,6 +192,7 @@ impl TriggerWorker {
             worker_id: format!("worker-{}", std::process::id()),
             active_keyspaces: Mutex::new(HashSet::new()),
             quotas: Mutex::new(HashMap::new()),
+            keyspace_backoff: Mutex::new(HashMap::new()),
             config: TriggerWorkerConfig::from_env(),
             shutdown: AtomicBool::new(false),
             default_search_path: vec!["public".to_string()],
@@ -267,6 +278,49 @@ impl TriggerWorker {
         quota
     }
 
+    fn should_process_keyspace(&self, keyspace: &str, now: Instant) -> bool {
+        let guard = self
+            .keyspace_backoff
+            .lock()
+            .expect("trigger worker keyspace_backoff lock");
+        let Some(backoff) = guard.get(keyspace) else {
+            return true;
+        };
+        now >= backoff.next_retry_at
+    }
+
+    fn clear_keyspace_backoff(&self, keyspace: &str) {
+        let mut guard = self
+            .keyspace_backoff
+            .lock()
+            .expect("trigger worker keyspace_backoff lock");
+        guard.remove(keyspace);
+    }
+
+    fn record_keyspace_failure(&self, keyspace: &str, now: Instant) -> (Duration, u32) {
+        let mut guard = self
+            .keyspace_backoff
+            .lock()
+            .expect("trigger worker keyspace_backoff lock");
+        let entry = guard.entry(keyspace.to_string()).or_insert(KeyspaceBackoff {
+            next_retry_at: now,
+            delay_ms: 0,
+            failures: 0,
+        });
+
+        entry.failures = entry.failures.saturating_add(1);
+        entry.delay_ms = match entry.delay_ms {
+            0 => DEFAULT_KEYSPACE_ERROR_BACKOFF_INITIAL_MS,
+            ms => ms
+                .saturating_mul(2)
+                .min(DEFAULT_KEYSPACE_ERROR_BACKOFF_MAX_MS),
+        };
+        let delay = Duration::from_millis(entry.delay_ms);
+        entry.next_retry_at = now + delay;
+
+        (delay, entry.failures)
+    }
+
     #[allow(dead_code)]
     pub(crate) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
@@ -294,8 +348,23 @@ impl TriggerWorker {
             }
 
             for keyspace in keyspaces {
-                if let Err(e) = self.process_keyspace(&pool, &keyspace).await {
-                    warn!("trigger worker error for {}: {}", keyspace, e);
+                let now = Instant::now();
+                if !self.should_process_keyspace(&keyspace, now) {
+                    continue;
+                }
+
+                match self.process_keyspace(&pool, &keyspace).await {
+                    Ok(()) => {
+                        self.clear_keyspace_backoff(&keyspace);
+                    }
+                    Err(e) => {
+                        let (delay, failures) =
+                            self.record_keyspace_failure(&keyspace, Instant::now());
+                        warn!(
+                            "trigger worker error for {} (attempt {}, backoff {:?}): {}",
+                            keyspace, failures, delay, e
+                        );
+                    }
                 }
             }
         }
@@ -1449,6 +1518,7 @@ fn value_to_sql_literal(value: &crate::types::Value) -> String {
 mod tests {
     use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     use super::{
         case_insensitive_replace, parse_new_assignment, parse_pd_keyspace_names,
@@ -1486,6 +1556,55 @@ mod tests {
         let s = "ıNEW.col";
         let result = case_insensitive_replace(s, "new.COL", "X");
         assert_eq!(result, "ıX");
+    }
+
+    #[test]
+    fn keyspace_backoff_is_applied_and_cleared() {
+        let worker = super::TriggerWorker::new();
+        let keyspace = "ks1";
+        let t0 = Instant::now();
+
+        assert!(worker.should_process_keyspace(keyspace, t0));
+
+        let (delay1, failures1) = worker.record_keyspace_failure(keyspace, t0);
+        assert_eq!(failures1, 1);
+        assert_eq!(
+            delay1,
+            Duration::from_millis(super::DEFAULT_KEYSPACE_ERROR_BACKOFF_INITIAL_MS)
+        );
+        assert!(!worker.should_process_keyspace(keyspace, t0));
+        assert!(worker.should_process_keyspace(keyspace, t0 + delay1));
+
+        let (delay2, failures2) = worker.record_keyspace_failure(keyspace, t0 + delay1);
+        assert_eq!(failures2, 2);
+        assert_eq!(
+            delay2,
+            Duration::from_millis(
+                (super::DEFAULT_KEYSPACE_ERROR_BACKOFF_INITIAL_MS.saturating_mul(2))
+                    .min(super::DEFAULT_KEYSPACE_ERROR_BACKOFF_MAX_MS)
+            )
+        );
+
+        worker.clear_keyspace_backoff(keyspace);
+        assert!(worker.should_process_keyspace(keyspace, t0));
+    }
+
+    #[test]
+    fn keyspace_backoff_is_capped() {
+        let worker = super::TriggerWorker::new();
+        let keyspace = "ks2";
+        let mut now = Instant::now();
+
+        let mut delay = Duration::from_millis(0);
+        for _ in 0..32 {
+            (delay, _) = worker.record_keyspace_failure(keyspace, now);
+            now += delay;
+        }
+
+        assert_eq!(
+            delay,
+            Duration::from_millis(super::DEFAULT_KEYSPACE_ERROR_BACKOFF_MAX_MS)
+        );
     }
 
     #[test]
