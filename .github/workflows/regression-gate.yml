@@ -61,7 +61,27 @@ jobs:
           fi
 
           if ! command -v tiup >/dev/null 2>&1; then
-            curl --proto '=https' --tlsv1.2 -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+            arch="$(uname -m)"
+            case "$arch" in
+              x86_64|amd64) arch=amd64 ;;
+              aarch64|arm64) arch=arm64 ;;
+              *) echo "Unsupported architecture: $arch" >&2; exit 1 ;;
+            esac
+
+            tiup_version="${TIUP_VERSION:-v1.16.4}"
+            url="https://github.com/pingcap/tiup/releases/download/${tiup_version}/tiup-${tiup_version}-linux-${arch}.tar.gz"
+
+            mkdir -p "$TIUP_HOME"
+            if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 10 --max-time 300 -o /tmp/tiup.tar.gz "$url" \
+              && tar -zxf /tmp/tiup.tar.gz -C "$TIUP_HOME"; then
+              rm -f /tmp/tiup.tar.gz
+            else
+              rm -f /tmp/tiup.tar.gz
+              rm -rf "$TIUP_HOME"
+              mkdir -p "$TIUP_HOME"
+              curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-all-errors --connect-timeout 10 --max-time 300 \
+                https://tiup-mirrors.pingcap.com/install.sh | sh
+            fi
           fi
 
           for attempt in 1 2 3; do
