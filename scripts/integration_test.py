@@ -393,6 +393,8 @@ def normalize_output(
                     line = f"psql:{canon_file}:{line_no}:{rest}"
             elif strip_psql_prefix:
                 line = line[len("psql:") :].lstrip()
+        if re.match(r"^LINE\s+\d+:", line, re.IGNORECASE) or re.match(r"^\s*\^", line):
+            continue
         line = _normalize_test_sql_paths(line)
         line = normalize_timestamp(line)
         line = normalize_decimal(line)
