@@ -1,10 +1,10 @@
 use super::context::EvalContext;
+use super::operators::{parse_bool_pg, try_coerce_text_to_numeric};
 use super::{
     cast_value, compare_values, eval_binary_op, eval_json_access, eval_value, interval_from_number,
     like_match, parse_interval_from_expr, parse_interval_string, parse_timestamp_string,
     parse_timezone_offset_seconds, similar_to_match,
 };
-use super::operators::{parse_bool_pg, try_coerce_text_to_numeric};
 use crate::types::{DataType, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{BinaryOperator, Expr};
@@ -63,7 +63,11 @@ fn ensure_array_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg: &'static 
     }
 }
 
-fn ensure_boolean_or_null_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg: &'static str) -> Result<()> {
+fn ensure_boolean_or_null_operand<C: EvalContext>(
+    ctx: &C,
+    expr: &Expr,
+    err_msg: &'static str,
+) -> Result<()> {
     use sqlparser::ast::UnaryOperator;
     use sqlparser::ast::Value as SqlValue;
 
@@ -85,7 +89,15 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg:
 
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => match ctx.column_type(expr) {
             Some(DataType::Boolean) => Ok(()),
-            _ => Err(anyhow!(err_msg)),
+            Some(_) => Err(anyhow!(err_msg)),
+            None => {
+                let empty_schema = TableSchema::default();
+                let schema = ctx.schema().unwrap_or(&empty_schema);
+                match crate::sql::types::infer_expr_type(expr, schema) {
+                    DataType::Boolean => Ok(()),
+                    _ => Err(anyhow!(err_msg)),
+                }
+            }
         },
 
         Expr::UnaryOp {
@@ -179,6 +191,8 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg:
         Expr::SimilarTo { .. }
         | Expr::Between { .. }
         | Expr::InList { .. }
+        | Expr::AnyOp { .. }
+        | Expr::AllOp { .. }
         | Expr::IsNull(_)
         | Expr::IsNotNull(_)
         | Expr::IsTrue(_)
@@ -203,7 +217,11 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg:
             // short-circuit OR/AND cannot mask deterministic type errors inside WHEN.
             if operand.is_none() {
                 for condition in conditions {
-                    ensure_boolean_or_null_operand(ctx, condition, "CASE WHEN requires boolean operands")?;
+                    ensure_boolean_or_null_operand(
+                        ctx,
+                        condition,
+                        "CASE WHEN requires boolean operands",
+                    )?;
                 }
             }
             for result in results {
@@ -249,7 +267,11 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                 let left_val = super::coerce_text_literal_to_bool(left, left_val)?;
                 match &left_val {
                     Value::Boolean(false) => {
-                        ensure_boolean_or_null_operand(ctx, right, "AND requires boolean operands")?;
+                        ensure_boolean_or_null_operand(
+                            ctx,
+                            right,
+                            "AND requires boolean operands",
+                        )?;
                         Ok(Value::Boolean(false))
                     }
                     Value::Boolean(true) | Value::Null => {
@@ -308,10 +330,9 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                                 .map(Value::Int64)
                                 .ok_or_else(|| anyhow!("bigint out of range")),
                             Value::Float64(f) => Ok(Value::Float64(-f)),
-                            Value::Text(_) => Err(anyhow!(
-                                "invalid input syntax for type numeric: \"{}\"",
-                                s
-                            )),
+                            Value::Text(_) => {
+                                Err(anyhow!("invalid input syntax for type numeric: \"{}\"", s))
+                            }
                             other => Err(anyhow!("Cannot negate {:?}", other)),
                         }
                     }
@@ -736,7 +757,9 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                     Value::Boolean(true) => return Ok(Value::Boolean(true)),
                     Value::Boolean(false) => {}
                     Value::Null => saw_null = true,
-                    other => return Err(anyhow!("ANY comparison must yield boolean, got {other:?}")),
+                    other => {
+                        return Err(anyhow!("ANY comparison must yield boolean, got {other:?}"))
+                    }
                 };
             }
             if saw_null {
@@ -766,7 +789,9 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                     Value::Boolean(false) => return Ok(Value::Boolean(false)),
                     Value::Boolean(true) => {}
                     Value::Null => saw_null = true,
-                    other => return Err(anyhow!("ALL comparison must yield boolean, got {other:?}")),
+                    other => {
+                        return Err(anyhow!("ALL comparison must yield boolean, got {other:?}"))
+                    }
                 };
             }
             if saw_null {
@@ -1087,7 +1112,9 @@ mod tests {
         let make_case = || Expr::Case {
             operand: None,
             conditions: vec![Expr::Value(SqlValue::Boolean(true))],
-            results: vec![Expr::Value(SqlValue::SingleQuotedString("true".to_string()))],
+            results: vec![Expr::Value(SqlValue::SingleQuotedString(
+                "true".to_string(),
+            ))],
             else_result: Some(Box::new(Expr::Value(SqlValue::SingleQuotedString(
                 "false".to_string(),
             )))),

@@ -1068,4 +1068,30 @@ fn register_builtin_functions(r: &mut FunctionRegistry) {
         "GROUPING",
         FunctionSignature::fixed(DataType::Int32).with_args(1, None),
     );
+
+    // pg_catalog visibility functions (return boolean)
+    r.register(
+        "PG_TABLE_IS_VISIBLE",
+        FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(1)),
+    );
+    r.register(
+        "PG_FUNCTION_IS_VISIBLE",
+        FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(1)),
+    );
+    r.register(
+        "PG_TYPE_IS_VISIBLE",
+        FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(1)),
+    );
+    r.register(
+        "PG_OPERATOR_IS_VISIBLE",
+        FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(1)),
+    );
+    r.register(
+        "HAS_SCHEMA_PRIVILEGE",
+        FunctionSignature::fixed(DataType::Boolean).with_args(2, Some(3)),
+    );
+    r.register(
+        "HAS_TABLE_PRIVILEGE",
+        FunctionSignature::fixed(DataType::Boolean).with_args(2, Some(3)),
+    );
 }

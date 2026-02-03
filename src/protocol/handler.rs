@@ -4285,6 +4285,30 @@ fn substitute_parameters(query: &str, portal: &Portal<String>) -> PgWireResult<S
                         .map_err(|e| invalid_param(e.to_string()))?;
                     quote_sql_string_literal(s)
                 }
+                // Type::UNKNOWN (OID 705) - pgx/GORM sends binary unknown when type is not inferred.
+                // Treat as text - decode UTF-8 and quote. If not valid UTF-8, try as integer.
+                t if *t == Type::UNKNOWN => {
+                    if let Ok(s) = std::str::from_utf8(param_bytes.as_ref()) {
+                        // Try to parse as integer first (common case for LIMIT $1)
+                        if let Ok(v) = s.trim().parse::<i64>() {
+                            v.to_string()
+                        } else {
+                            quote_sql_string_literal(s)
+                        }
+                    } else if param_bytes.len() == 8 {
+                        // Try as big-endian i64 (binary integer)
+                        let arr: [u8; 8] = param_bytes.as_ref().try_into().unwrap();
+                        i64::from_be_bytes(arr).to_string()
+                    } else if param_bytes.len() == 4 {
+                        // Try as big-endian i32 (binary integer)
+                        let arr: [u8; 4] = param_bytes.as_ref().try_into().unwrap();
+                        i32::from_be_bytes(arr).to_string()
+                    } else {
+                        // Fallback: hex encode as bytea
+                        let hex = hex::encode(param_bytes.as_ref());
+                        format!("'\\x{}'::bytea", hex)
+                    }
+                }
                 _ => {
                     return Err(invalid_param(format!(
                         "unsupported binary parameter type {}",
