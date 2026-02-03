@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+MANIFEST_PATH="${MANIFEST_PATH:-$SCRIPT_DIR/regression_gate.list}"
+
 CLUSTER_NAME="${CLUSTER_NAME:-regression-$(date +%s)}"
 
 PG_HOST="${PG_HOST:-127.0.0.1}"
@@ -22,24 +24,28 @@ RUN_UNIT=1
 START_ENV=1
 VERBOSE=0
 STOP_ON_ERROR=0
+SKIP_ORM=0
 
 usage() {
   cat <<'EOF'
 Usage:
   scripts/regression_gate.sh [options]
 
-Runs the release regression gate (critical integration regressions + unit tests).
+Runs the fast regression gate (SQL regressions + optional ORM subset + unit tests).
 
 By default it will:
   1) Start a fresh TiKV cluster (via scripts/tikv_admin.py)
   2) Build pg-tikv (release)
   3) Start pg-tikv
-  4) Run the regression SQL test set
-  5) Stop & clean the cluster
+  4) Run the regression SQL pack (SSOT: scripts/regression_gate.list)
+  5) (Optional) Run the regression ORM pack (SSOT: scripts/regression_gate.list)
+  6) Stop & clean the cluster
 
 Options:
   --dsn <dsn>         Use an existing running pg-tikv instance (skip cluster/server start)
   --no-env            Skip starting TiKV/pg-tikv (alias of providing --dsn)
+  --manifest <path>   Override regression manifest path (default: scripts/regression_gate.list)
+  --skip-orm          Skip ORM regression pack
   --skip-unit         Skip `cargo test`
   -v, --verbose       Pass `--verbose` to integration_test.py
   -x, --stop-on-error Pass `--stop-on-error` to integration_test.py
@@ -48,7 +54,46 @@ Options:
 Environment:
   PG_HOST/PG_PORT/PG_USER/PG_PASSWORD control the default DSN when --dsn is not provided.
   CLUSTER_NAME controls the TiKV cluster name when auto-starting.
+  MANIFEST_PATH overrides the manifest path (same as --manifest).
 EOF
+}
+
+trim_manifest_line() {
+  local s="$1"
+  s="${s%%#*}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s\n' "$s"
+}
+
+parse_manifest() {
+  local manifest="$1"
+  local section=""
+
+  SQL_TESTS=()
+  ORM_TESTS=()
+
+  while IFS= read -r raw_line || [[ -n "$raw_line" ]]; do
+    local line
+    line="$(trim_manifest_line "$raw_line")"
+    [[ -z "$line" ]] && continue
+
+    if [[ "$line" =~ ^\[([a-z]+)\]$ ]]; then
+      section="${BASH_REMATCH[1]}"
+      continue
+    fi
+
+    case "$section" in
+      sql) SQL_TESTS+=("$line") ;;
+      orm) ORM_TESTS+=("$line") ;;
+      *) echo "ERROR: invalid manifest entry (outside [sql]/[orm]): $line" >&2; return 2 ;;
+    esac
+  done <"$manifest"
+
+  if [[ "${#SQL_TESTS[@]}" -eq 0 ]]; then
+    echo "ERROR: manifest has no [sql] entries: $manifest" >&2
+    return 2
+  fi
 }
 
 while [[ $# -gt 0 ]]; do
@@ -60,6 +105,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-env)
       START_ENV=0
+      shift
+      ;;
+    --manifest)
+      MANIFEST_PATH="${2:-}"
+      shift 2
+      ;;
+    --skip-orm)
+      SKIP_ORM=1
       shift
       ;;
     --skip-unit)
@@ -86,19 +139,28 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-REGRESSION_TESTS=(
-  tests/01_ddl_basic.sql
-  tests/24_json_comprehensive.sql
-  tests/74_filter_clause.sql
-  tests/86_async_triggers.sql
-  tests/107_join_using_natural_full_right_issue86.sql
-  tests/108_chained_natural_using_join_wildcard.sql
-  tests/116_join_using_outer_unqualified_refs_issue86.sql
-  tests/117_drop_function_trigger_deps_issue222.sql
-  tests/119_upsert_do_update_update_semantics_issue196.sql
-  tests/125_pr285_compat_regressions.sql
-  tests/126_timestamptz_offset_input_issue270.sql
-)
+SQL_TESTS=()
+ORM_TESTS=()
+if [[ -f "$MANIFEST_PATH" ]]; then
+  parse_manifest "$MANIFEST_PATH"
+else
+  echo "WARN: manifest not found at '$MANIFEST_PATH'; falling back to built-in SQL list." >&2
+  SQL_TESTS=(
+    tests/01_ddl_basic.sql
+    tests/24_json_comprehensive.sql
+    tests/74_filter_clause.sql
+    tests/86_async_triggers.sql
+    tests/107_join_using_natural_full_right_issue86.sql
+    tests/108_chained_natural_using_join_wildcard.sql
+    tests/116_join_using_outer_unqualified_refs_issue86.sql
+    tests/117_drop_function_trigger_deps_issue222.sql
+    tests/119_upsert_do_update_update_semantics_issue196.sql
+    tests/125_pr285_compat_regressions.sql
+    tests/126_timestamptz_offset_input_issue270.sql
+  )
+fi
+
+REGRESSION_TESTS=("${SQL_TESTS[@]}")
 
 for test_file in "${REGRESSION_TESTS[@]}"; do
   if [[ ! -f "$ROOT_DIR/$test_file" ]]; then
@@ -160,6 +222,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+REPORT_TS="$(date +%Y%m%d-%H%M%S)"
+REPORT_DIR="$ROOT_DIR/test-reports/regression-gate-$REPORT_TS"
+mkdir -p "$REPORT_DIR"
+UNIT_LOG="$REPORT_DIR/unit.log"
+SQL_LOG="$REPORT_DIR/sql.log"
+ORM_LOG="$REPORT_DIR/orm.log"
+
 if [[ "$START_ENV" -eq 1 ]]; then
   if ! is_port_free "$PG_HOST" "$PG_PORT"; then
     if [[ "$PG_PORT_IS_EXPLICIT" -eq 1 ]]; then
@@ -178,19 +247,26 @@ fi
 
 echo "=== pg-tikv Regression Gate ==="
 echo "PG_DSN: $PG_DSN"
+echo "Manifest: $MANIFEST_PATH"
+echo "Report dir: $REPORT_DIR"
 echo ""
 
+TOTAL_STEPS=4
+if [[ "$SKIP_ORM" -eq 0 && "${#ORM_TESTS[@]}" -gt 0 ]]; then
+  TOTAL_STEPS=5
+fi
+
 if [[ "$RUN_UNIT" -eq 1 ]]; then
-  echo "[1/4] Running unit tests..."
-  (cd "$ROOT_DIR" && cargo test)
+  echo "[1/$TOTAL_STEPS] Running unit tests..."
+  (cd "$ROOT_DIR" && cargo test) 2>&1 | tee "$UNIT_LOG"
   echo ""
 else
-  echo "[1/4] Skipping unit tests (--skip-unit)"
+  echo "[1/$TOTAL_STEPS] Skipping unit tests (--skip-unit)"
   echo ""
 fi
 
 if [[ "$START_ENV" -eq 1 ]]; then
-  echo "[2/4] Starting TiKV cluster '$CLUSTER_NAME'..."
+  echo "[2/$TOTAL_STEPS] Starting TiKV cluster '$CLUSTER_NAME'..."
   TIKV_OUTPUT="$(python3 "$ROOT_DIR/scripts/tikv_admin.py" start --name "$CLUSTER_NAME" 2>&1)"
   echo "$TIKV_OUTPUT"
 
@@ -205,7 +281,7 @@ if [[ "$START_ENV" -eq 1 ]]; then
   sleep 5
 
   echo ""
-  echo "[3/4] Building pg-tikv..."
+  echo "[3/$TOTAL_STEPS] Building pg-tikv..."
   (cd "$ROOT_DIR" && cargo build --release --quiet)
   echo ""
 
@@ -240,11 +316,11 @@ if [[ "$START_ENV" -eq 1 ]]; then
   echo "pg-tikv ready (PID: $PGTIKV_PID)"
   echo ""
 else
-  echo "[2/4] Skipping TiKV/pg-tikv startup (--no-env/--dsn)"
+  echo "[2/$TOTAL_STEPS] Skipping TiKV/pg-tikv startup (--no-env/--dsn)"
   echo ""
 fi
 
-echo "[4/4] Running regression SQL cases (${#REGRESSION_TESTS[@]} files)..."
+echo "[4/$TOTAL_STEPS] Running regression SQL cases (${#REGRESSION_TESTS[@]} files)..."
 args=(--dsn "$PG_DSN")
 if [[ "$VERBOSE" -eq 1 ]]; then
   args+=(--verbose)
@@ -253,7 +329,54 @@ if [[ "$STOP_ON_ERROR" -eq 1 ]]; then
   args+=(--stop-on-error)
 fi
 
-(cd "$ROOT_DIR" && python3 scripts/integration_test.py "${args[@]}" "${REGRESSION_TESTS[@]}")
+SQL_EXIT=0
+set +e
+(cd "$ROOT_DIR" && python3 scripts/integration_test.py "${args[@]}" "${REGRESSION_TESTS[@]}") 2>&1 | tee "$SQL_LOG"
+SQL_EXIT=${PIPESTATUS[0]}
+set -e
 
 echo ""
+if [[ "$SQL_EXIT" -ne 0 ]]; then
+  echo "❌ Regression gate failed (SQL exit=$SQL_EXIT). See: $SQL_LOG"
+  exit 1
+fi
+
+if [[ "$SKIP_ORM" -eq 1 || "${#ORM_TESTS[@]}" -eq 0 ]]; then
+  echo "✅ Regression gate passed (SQL-only)"
+  exit 0
+fi
+
+if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
+  echo "ERROR: node/npm are required for the ORM regression pack (or pass --skip-orm)." >&2
+  exit 2
+fi
+
+echo "[5/$TOTAL_STEPS] Running ORM regression pack (${#ORM_TESTS[@]} item(s))..."
+ORM_FILTERS=()
+for item in "${ORM_TESTS[@]}"; do
+  if [[ "$item" == orm-tests/* ]]; then
+    ORM_FILTERS+=("${item#orm-tests/}")
+  else
+    ORM_FILTERS+=("$item")
+  fi
+done
+
+ORM_EXIT=0
+set +e
+(
+  cd "$ROOT_DIR/orm-tests"
+  if [[ ! -d node_modules ]]; then
+    npm ci
+  fi
+  PG_DSN="$PG_DSN" npm test -- "${ORM_FILTERS[@]}"
+) 2>&1 | tee "$ORM_LOG"
+ORM_EXIT=${PIPESTATUS[0]}
+set -e
+
+echo ""
+if [[ "$ORM_EXIT" -ne 0 ]]; then
+  echo "❌ Regression gate failed (ORM exit=$ORM_EXIT). See: $ORM_LOG"
+  exit 1
+fi
+
 echo "✅ Regression gate passed"

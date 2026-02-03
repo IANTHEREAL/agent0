@@ -86,4 +86,5 @@ jobs:
           name: regression-gate-reports
           path: |
             test-reports/regression-gate-*/
-
+            orm-tests/test-results.json
+            /tmp/pgtikv-regression.log

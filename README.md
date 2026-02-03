@@ -368,11 +368,19 @@ See [orm-tests/README.md](orm-tests/README.md) for details.
 ## Tests
 
 ```bash
+# Fast, deterministic regression gate (recommended; <5min typical)
+# - Starts TiKV + pg-tikv by default
+# - Uses `scripts/regression_gate.list` as the single source of truth
+bash scripts/regression_gate.sh
+
+# Reuse an existing running pg-tikv instance
+bash scripts/regression_gate.sh --dsn "$PG_DSN"
+
+# Full automated test suite (slower; broader coverage)
+./run_tests.sh
+
 # Unit tests (184 tests)
 cargo test
-
-# Regression gate (critical release regressions; starts TiKV + pg-tikv)
-bash scripts/regression_gate.sh
 
 # Integration tests (requires running server)
 python3 scripts/integration_test.py

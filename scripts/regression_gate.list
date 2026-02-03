@@ -1,0 +1,25 @@
+# Regression Gate manifest (SSOT)
+#
+# This file is the single source of truth for what `scripts/regression_gate.sh` runs.
+# Keep it small, deterministic, and fast (<5min typical).
+#
+# Format:
+#   - Section headers: [sql] / [orm]
+#   - One path per line (relative to repo root)
+#   - Blank lines and `#` comments are ignored
+#
+# Notes:
+#   - SQL entries are passed to `scripts/integration_test.py`
+#   - ORM entries are passed as Vitest filters to `npm test` in `orm-tests/`
+
+[sql]
+tests/96_dify_schema.sql
+tests/97_comment_on.sql
+tests/125_pr285_compat_regressions.sql
+tests/126_timestamptz_offset_input_issue270.sql
+
+[orm]
+orm-tests/pg-client/
+orm-tests/typeorm/connection.test.ts
+orm-tests/typeorm/transaction.test.ts
+orm-tests/typeorm/schema.test.ts
