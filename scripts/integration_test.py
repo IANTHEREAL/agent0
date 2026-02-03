@@ -350,6 +350,28 @@ def normalize_psql_aligned_line(line: str) -> str:
     return stripped
 
 
+_PSQL_FILE_LINE_PREFIX = re.compile(r"^psql:(?P<file>.+?):(?P<line>\d+):(?P<rest>.*)$")
+_ABS_TEST_SQL_PATH = re.compile(
+    r"(?P<path>(?:[A-Za-z]:)?(?:[/\\][^\s:\"']+)*[/\\](?:tests|tests_pending)[/\\][^\s:\"']+\.sql)"
+)
+
+
+def _canonicalize_test_sql_path(path: str) -> str:
+    path = path.replace("\\", "/")
+    for marker in ("/tests/", "/tests_pending/"):
+        if marker in path:
+            base = marker.strip("/")
+            return f"{base}/{path.split(marker, 1)[1]}"
+    return path
+
+
+def _normalize_test_sql_paths(line: str) -> str:
+    def repl(match: re.Match) -> str:
+        return _canonicalize_test_sql_path(match.group("path"))
+
+    return _ABS_TEST_SQL_PATH.sub(repl, line)
+
+
 def normalize_output(
     text: str,
     *,
@@ -360,17 +382,18 @@ def normalize_output(
     for raw in text.splitlines():
         line = raw.rstrip()
         if line.startswith("psql:"):
-            if not strip_psql_prefix:
-                continue
-            # Convert `psql:file:line: ERROR: ...` into `ERROR: ...` to match expected
-            # files that omit the file/line prefix.
-            for needle in ("ERROR:", "FATAL:", "WARNING:", "NOTICE:"):
-                idx = line.find(needle)
-                if idx >= 0:
-                    line = line[idx:]
-                    break
-            else:
-                continue
+            match = _PSQL_FILE_LINE_PREFIX.match(line)
+            if match:
+                if strip_psql_prefix:
+                    line = match.group("rest").lstrip()
+                else:
+                    canon_file = _canonicalize_test_sql_path(match.group("file"))
+                    line_no = match.group("line")
+                    rest = match.group("rest")
+                    line = f"psql:{canon_file}:{line_no}:{rest}"
+            elif strip_psql_prefix:
+                line = line[len("psql:") :].lstrip()
+        line = _normalize_test_sql_paths(line)
         line = normalize_timestamp(line)
         line = normalize_decimal(line)
         line = normalize_json_whitespace(line)
@@ -386,7 +409,8 @@ def normalize_output(
 def check_connection() -> bool:
     result = subprocess.run(
         psql_args_for_mode(PsqlOutputMode.UNALIGNED) + ["-c", "SELECT 1"],
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         text=True,
         env=psql_env(client_min_messages="warning"),
         timeout=10,
@@ -514,8 +538,6 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
 
     if expected_file.exists():
         expected = expected_text
-        output_lines = output.splitlines()
-        output_has_psql = any(line.startswith("psql:") for line in output_lines)
 
         unordered = False
         for line in expected_lines:
@@ -529,13 +551,8 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
             expected_lines = [line for line in expected_lines if line.strip().lower() != "# unordered"]
             expected = "\n".join(expected_lines)
 
-        if expected_has_psql and not output_has_psql:
-            log_test(sql_file.name, TestResult.FAILED, "expected psql error output missing")
-            return TestResult.FAILED
-
-        strip_psql_prefix = (not expected_has_psql) and expected_has_bare_diagnostics
-        normalized_output = normalize_output(output, strip_psql_prefix=strip_psql_prefix, mode=mode)
-        normalized_expected = normalize_output(expected, strip_psql_prefix=strip_psql_prefix, mode=mode)
+        normalized_output = normalize_output(output, strip_psql_prefix=True, mode=mode)
+        normalized_expected = normalize_output(expected, strip_psql_prefix=True, mode=mode)
 
         if unordered:
             normalized_output = [line for line in normalized_output if line.strip()]
