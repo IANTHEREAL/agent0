@@ -899,7 +899,8 @@ impl Executor {
                             if let Some(ref a) = arg {
                                 match infer_expr_type(a, schema) {
                                     DataType::Int32 | DataType::Int64 => DataType::Int64,
-                                    DataType::Float64 | DataType::Numeric { .. } => {
+                                    DataType::Float64 => DataType::Float64,
+                                    DataType::Numeric { .. } => {
                                         DataType::Numeric {
                                             precision: None,
                                             scale: None,
@@ -914,10 +915,22 @@ impl Executor {
                                 DataType::Int64
                             }
                         }
-                        "AVG" => DataType::Numeric {
-                            precision: None,
-                            scale: None,
-                        },
+                        "AVG" => {
+                            if let Some(ref a) = arg {
+                                match infer_expr_type(a, schema) {
+                                    DataType::Float64 => DataType::Float64,
+                                    _ => DataType::Numeric {
+                                        precision: None,
+                                        scale: None,
+                                    },
+                                }
+                            } else {
+                                DataType::Numeric {
+                                    precision: None,
+                                    scale: None,
+                                }
+                            }
+                        }
                         "MIN" | "MAX" => {
                             if let Some(ref a) = arg {
                                 infer_expr_type(a, schema)
@@ -2095,6 +2108,8 @@ enum ProjectionSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ColumnDef;
+    use pgwire::api::Type;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 
@@ -2111,6 +2126,37 @@ mod tests {
         match &*query.body {
             SetExpr::Select(s) => s,
             _ => panic!("Expected select"),
+        }
+    }
+
+    fn schema_with_column(name: &str, data_type: DataType) -> TableSchema {
+        TableSchema {
+            name: "t".to_string(),
+            table_id: 0,
+            columns: vec![ColumnDef {
+                name: name.to_string(),
+                data_type,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        }
+    }
+
+    fn pg_oid_for_datatype(dt: &DataType) -> u32 {
+        match dt {
+            DataType::Float64 => Type::FLOAT8.oid(),
+            DataType::Numeric { .. } => Type::NUMERIC.oid(),
+            _ => Type::TEXT.oid(),
         }
     }
 
@@ -2219,6 +2265,21 @@ mod tests {
         let query = parse_query("SELECT SUM(amount), AVG(amount) FROM orders");
         let select = get_select(&query);
         assert!(Executor::is_aggregate_operator_query(&query, select));
+    }
+
+    #[test]
+    fn test_extract_aggregate_info_sum_avg_float8_types() {
+        let query = parse_query("SELECT SUM(x) AS s, AVG(x) AS a FROM t");
+        let select = get_select(&query);
+        let schema = schema_with_column("x", DataType::Float64);
+
+        let (_, names, types) = Executor::extract_aggregate_info(&select.projection, &schema);
+        assert_eq!(names, vec!["s".to_string(), "a".to_string()]);
+        assert_eq!(types, vec![DataType::Float64, DataType::Float64]);
+        assert_eq!(
+            types.iter().map(pg_oid_for_datatype).collect::<Vec<_>>(),
+            vec![701, 701]
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub enum Aggregator {
     Min(Value),
     Avg {
         sum: Decimal,
+        sum_float: Option<f64>,
         count: i64,
     },
     StringAgg {
@@ -38,6 +39,7 @@ impl Aggregator {
             "MIN" => Ok(Aggregator::Min(Value::Null)),
             "AVG" => Ok(Aggregator::Avg {
                 sum: Decimal::ZERO,
+                sum_float: None,
                 count: 0,
             }),
             "STRING_AGG" => Ok(Aggregator::StringAgg {
@@ -102,16 +104,50 @@ impl Aggregator {
                     }
                 }
             }
-            Aggregator::Avg { sum, count } => {
+            Aggregator::Avg {
+                sum,
+                sum_float,
+                count,
+            } => {
                 if !matches!(val, Value::Null) {
-                    let v = match val {
-                        Value::Int32(i) => Decimal::from(*i),
-                        Value::Int64(i) => Decimal::from(*i),
-                        Value::Float64(f) => Decimal::try_from(*f).unwrap_or(Decimal::ZERO),
-                        Value::Numeric(d) => *d,
+                    match val {
+                        Value::Int32(i) => {
+                            if let Some(sf) = sum_float.as_mut() {
+                                *sf += *i as f64;
+                            } else {
+                                *sum += Decimal::from(*i);
+                            }
+                        }
+                        Value::Int64(i) => {
+                            if let Some(sf) = sum_float.as_mut() {
+                                *sf += *i as f64;
+                            } else {
+                                *sum += Decimal::from(*i);
+                            }
+                        }
+                        Value::Float64(f) => {
+                            if sum_float.is_none() {
+                                let df = sum.to_f64().ok_or_else(|| {
+                                    anyhow!("numeric value out of range for double precision")
+                                })?;
+                                *sum_float = Some(df);
+                            }
+                            if let Some(sf) = sum_float.as_mut() {
+                                *sf += *f;
+                            }
+                        }
+                        Value::Numeric(d) => {
+                            if let Some(sf) = sum_float.as_mut() {
+                                let df = d.to_f64().ok_or_else(|| {
+                                    anyhow!("numeric value out of range for double precision")
+                                })?;
+                                *sf += df;
+                            } else {
+                                *sum += *d;
+                            }
+                        }
                         _ => return Err(anyhow!("AVG requires numeric type")),
-                    };
-                    *sum += v;
+                    }
                     *count += 1;
                 }
             }
@@ -147,9 +183,15 @@ impl Aggregator {
             Aggregator::Sum(v) => v.clone(),
             Aggregator::Max(v) => v.clone(),
             Aggregator::Min(v) => v.clone(),
-            Aggregator::Avg { sum, count } => {
+            Aggregator::Avg {
+                sum,
+                sum_float,
+                count,
+            } => {
                 if *count == 0 {
                     Value::Null
+                } else if let Some(sf) = sum_float {
+                    Value::Float64(*sf / *count as f64)
                 } else {
                     let denom = Decimal::from(*count);
                     Value::Numeric(pg_numeric_div(*sum, denom))
@@ -342,7 +384,7 @@ mod tests {
         agg.update(&Value::Float64(1.5)).unwrap();
         agg.update(&Value::Float64(2.5)).unwrap();
         let result = agg.result();
-        assert_eq!(result, Value::Numeric(Decimal::from(2)));
+        assert_eq!(result, Value::Float64(2.0));
     }
 
     #[test]
