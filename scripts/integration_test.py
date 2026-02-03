@@ -430,6 +430,30 @@ def move_error_block_to_end(lines: List[str]) -> List[str]:
     return head + tail
 
 
+_PSQL_DIAGNOSTIC_LINE = re.compile(
+    r"^(?:ERROR|FATAL|PANIC|WARNING|NOTICE|DETAIL|HINT|CONTEXT):|^LINE\s+\d+:|^\s*\^",
+    re.IGNORECASE,
+)
+
+
+def stable_partition_psql_diagnostics(lines: List[str]) -> List[str]:
+    """Move psql diagnostics (ERROR/NOTICE/etc) to the end, preserving relative order.
+
+    stdout/stderr buffering and capture strategies can reorder psql diagnostics relative to
+    query results. Canonicalize by stable-partitioning diagnostic lines to the end for both
+    expected and actual outputs before diffing.
+    """
+
+    non_diagnostics: List[str] = []
+    diagnostics: List[str] = []
+    for line in lines:
+        if _PSQL_DIAGNOSTIC_LINE.match(line):
+            diagnostics.append(line)
+        else:
+            non_diagnostics.append(line)
+    return non_diagnostics + diagnostics
+
+
 def check_connection() -> bool:
     result = subprocess.run(
         psql_args_for_mode(PsqlOutputMode.UNALIGNED) + ["-c", "SELECT 1"],
@@ -577,6 +601,8 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
 
         normalized_output = normalize_output(output, strip_psql_prefix=True, mode=mode)
         normalized_expected = normalize_output(expected, strip_psql_prefix=True, mode=mode)
+        normalized_output = stable_partition_psql_diagnostics(normalized_output)
+        normalized_expected = stable_partition_psql_diagnostics(normalized_expected)
 
         if unordered:
             normalized_output = [line for line in normalized_output if line.strip()]
