@@ -1326,7 +1326,8 @@ impl TikvStore {
     ) -> Result<()> {
         let schema_key = self.key(&encode_schema_key_v2(db_id, &schema.name));
         if txn.get(schema_key.clone()).await?.is_some() {
-            return Err(anyhow!("Table '{}' already exists", schema.name));
+            let short_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+            return Err(anyhow!("relation \"{}\" already exists", short_name));
         }
         let schema_data = serialize_schema(&schema)?;
         txn_put(txn, schema_key, schema_data).await?;
