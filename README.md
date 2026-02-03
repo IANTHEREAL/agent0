@@ -387,6 +387,12 @@ python3 scripts/integration_test.py
 
 # ORM tests (requires running server)
 cd orm-tests && npm test
+
+# Go/GORM smoke test (requires running server + Go)
+export PG_DSN="postgres://admin:admin@127.0.0.1:5433/postgres?sslmode=disable"
+(cd e2e/gorm_smoke && go test ./... -count=1)
+# Or via the runner:
+bash scripts/e2e_tests.sh gorm_smoke
 ```
 
 | Test Suite | Coverage |
