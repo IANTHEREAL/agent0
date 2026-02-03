@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+CLUSTER_NAME="${CLUSTER_NAME:-regression-$(date +%s)}"
+
+PG_HOST="${PG_HOST:-127.0.0.1}"
+PG_PORT_IS_EXPLICIT=0
+if [[ -n "${PG_PORT+x}" ]]; then
+  PG_PORT_IS_EXPLICIT=1
+fi
+PG_PORT="${PG_PORT:-15433}"
+PG_USER="${PG_USER:-admin}"
+PG_PASSWORD="${PG_PASSWORD:-admin}"
+
+PGTIKV_PID=""
+CLUSTER_STARTED=0
+
+RUN_UNIT=1
+START_ENV=1
+VERBOSE=0
+STOP_ON_ERROR=0
+
+usage() {
+  cat <<'EOF'
+Usage:
+  scripts/regression_gate.sh [options]
+
+Runs the release regression gate (critical integration regressions + unit tests).
+
+By default it will:
+  1) Start a fresh TiKV cluster (via scripts/tikv_admin.py)
+  2) Build pg-tikv (release)
+  3) Start pg-tikv
+  4) Run the regression SQL test set
+  5) Stop & clean the cluster
+
+Options:
+  --dsn <dsn>         Use an existing running pg-tikv instance (skip cluster/server start)
+  --no-env            Skip starting TiKV/pg-tikv (alias of providing --dsn)
+  --skip-unit         Skip `cargo test`
+  -v, --verbose       Pass `--verbose` to integration_test.py
+  -x, --stop-on-error Pass `--stop-on-error` to integration_test.py
+  -h, --help          Show help
+
+Environment:
+  PG_HOST/PG_PORT/PG_USER/PG_PASSWORD control the default DSN when --dsn is not provided.
+  CLUSTER_NAME controls the TiKV cluster name when auto-starting.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dsn)
+      PG_DSN="${2:-}"
+      START_ENV=0
+      shift 2
+      ;;
+    --no-env)
+      START_ENV=0
+      shift
+      ;;
+    --skip-unit)
+      RUN_UNIT=0
+      shift
+      ;;
+    -v|--verbose)
+      VERBOSE=1
+      shift
+      ;;
+    -x|--stop-on-error)
+      STOP_ON_ERROR=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+REGRESSION_TESTS=(
+  tests/01_ddl_basic.sql
+  tests/24_json_comprehensive.sql
+  tests/74_filter_clause.sql
+  tests/86_async_triggers.sql
+  tests/107_join_using_natural_full_right_issue86.sql
+  tests/108_chained_natural_using_join_wildcard.sql
+  tests/116_join_using_outer_unqualified_refs_issue86.sql
+  tests/117_drop_function_trigger_deps_issue222.sql
+  tests/119_upsert_do_update_update_semantics_issue196.sql
+  tests/125_pr285_compat_regressions.sql
+  tests/126_timestamptz_offset_input_issue270.sql
+)
+
+for test_file in "${REGRESSION_TESTS[@]}"; do
+  if [[ ! -f "$ROOT_DIR/$test_file" ]]; then
+    echo "ERROR: missing regression test file: $test_file" >&2
+    echo "Tip: make sure the regression guards are backported to your branch before release." >&2
+    exit 2
+  fi
+done
+
+is_port_free() {
+  python3 - "$1" "$2" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    sock.bind((host, port))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+sys.exit(0)
+PY
+}
+
+pick_free_port() {
+  python3 - "$PG_HOST" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.bind((host, 0))
+print(sock.getsockname()[1])
+sock.close()
+PY
+}
+
+cleanup() {
+  echo ""
+  echo "=== Regression gate cleanup ==="
+
+  if [[ -n "$PGTIKV_PID" ]] && kill -0 "$PGTIKV_PID" 2>/dev/null; then
+    echo "Stopping pg-tikv (PID: $PGTIKV_PID)..."
+    kill "$PGTIKV_PID" 2>/dev/null || true
+    wait "$PGTIKV_PID" 2>/dev/null || true
+  fi
+
+  if [[ "$CLUSTER_STARTED" -eq 1 ]]; then
+    echo "Stopping TiKV cluster '$CLUSTER_NAME'..."
+    python3 "$ROOT_DIR/scripts/tikv_admin.py" stop --name "$CLUSTER_NAME" 2>/dev/null || true
+    python3 "$ROOT_DIR/scripts/tikv_admin.py" clean --name "$CLUSTER_NAME" 2>/dev/null || true
+  fi
+
+  echo "Cleanup complete"
+}
+trap cleanup EXIT
+
+if [[ "$START_ENV" -eq 1 ]]; then
+  if ! is_port_free "$PG_HOST" "$PG_PORT"; then
+    if [[ "$PG_PORT_IS_EXPLICIT" -eq 1 ]]; then
+      echo "ERROR: PG_PORT ${PG_PORT} is already in use on ${PG_HOST}. Please pick another port." >&2
+      exit 1
+    fi
+    NEW_PORT="$(pick_free_port)"
+    echo "WARN: PG_PORT ${PG_PORT} is already in use on ${PG_HOST}; using free port ${NEW_PORT}"
+    PG_PORT="$NEW_PORT"
+  fi
+fi
+
+if [[ -z "${PG_DSN:-}" ]]; then
+  PG_DSN="postgres://${PG_USER}:${PG_PASSWORD}@${PG_HOST}:${PG_PORT}/postgres"
+fi
+
+echo "=== pg-tikv Regression Gate ==="
+echo "PG_DSN: $PG_DSN"
+echo ""
+
+if [[ "$RUN_UNIT" -eq 1 ]]; then
+  echo "[1/4] Running unit tests..."
+  (cd "$ROOT_DIR" && cargo test)
+  echo ""
+else
+  echo "[1/4] Skipping unit tests (--skip-unit)"
+  echo ""
+fi
+
+if [[ "$START_ENV" -eq 1 ]]; then
+  echo "[2/4] Starting TiKV cluster '$CLUSTER_NAME'..."
+  TIKV_OUTPUT="$(python3 "$ROOT_DIR/scripts/tikv_admin.py" start --name "$CLUSTER_NAME" 2>&1)"
+  echo "$TIKV_OUTPUT"
+
+  PD_ENDPOINTS="$(echo "$TIKV_OUTPUT" | grep -oE 'PD_ENDPOINTS=[^[:space:]]+' | tail -n 1 | cut -d= -f2 || true)"
+  if [[ -z "$PD_ENDPOINTS" ]]; then
+    echo "ERROR: Failed to parse PD_ENDPOINTS from tikv_admin.py output" >&2
+    exit 1
+  fi
+
+  CLUSTER_STARTED=1
+  echo "Waiting for TiKV to be fully ready..."
+  sleep 5
+
+  echo ""
+  echo "[3/4] Building pg-tikv..."
+  (cd "$ROOT_DIR" && cargo build --release --quiet)
+  echo ""
+
+  echo "Starting pg-tikv on ${PG_HOST}:${PG_PORT} (PD_ENDPOINTS=${PD_ENDPOINTS})..."
+  pushd "$ROOT_DIR" >/dev/null
+  PD_ENDPOINTS="$PD_ENDPOINTS" PG_PORT="$PG_PORT" ./target/release/pg-tikv > /tmp/pgtikv-regression.log 2>&1 &
+  PGTIKV_PID=$!
+  popd >/dev/null
+
+  # Wait for readiness
+  if command -v pg_isready >/dev/null 2>&1; then
+    for i in $(seq 1 30); do
+      if pg_isready -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -q 2>/dev/null; then
+        break
+      fi
+      if ! kill -0 "$PGTIKV_PID" 2>/dev/null; then
+        echo "ERROR: pg-tikv exited during startup" >&2
+        sed -n '1,200p' /tmp/pgtikv-regression.log || true
+        exit 1
+      fi
+      sleep 1
+    done
+  fi
+
+  # Final check via psql
+  if ! PGPASSWORD="$PG_PASSWORD" psql -h "$PG_HOST" -p "$PG_PORT" -U "$PG_USER" -d postgres -c "SELECT 1" >/dev/null 2>&1; then
+    echo "ERROR: pg-tikv not ready" >&2
+    sed -n '1,200p' /tmp/pgtikv-regression.log || true
+    exit 1
+  fi
+
+  echo "pg-tikv ready (PID: $PGTIKV_PID)"
+  echo ""
+else
+  echo "[2/4] Skipping TiKV/pg-tikv startup (--no-env/--dsn)"
+  echo ""
+fi
+
+echo "[4/4] Running regression SQL cases (${#REGRESSION_TESTS[@]} files)..."
+args=(--dsn "$PG_DSN")
+if [[ "$VERBOSE" -eq 1 ]]; then
+  args+=(--verbose)
+fi
+if [[ "$STOP_ON_ERROR" -eq 1 ]]; then
+  args+=(--stop-on-error)
+fi
+
+(cd "$ROOT_DIR" && python3 scripts/integration_test.py "${args[@]}" "${REGRESSION_TESTS[@]}")
+
+echo ""
+echo "✅ Regression gate passed"

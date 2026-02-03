@@ -371,6 +371,9 @@ See [orm-tests/README.md](orm-tests/README.md) for details.
 # Unit tests (184 tests)
 cargo test
 
+# Regression gate (critical release regressions; starts TiKV + pg-tikv)
+bash scripts/regression_gate.sh
+
 # Integration tests (requires running server)
 python3 scripts/integration_test.py
 

@@ -1,0 +1,103 @@
+name: Regression Gate
+
+on:
+  push:
+    branches: [main, master, "release/**"]
+    tags: ["v*"]
+  pull_request:
+    branches: [main, master, "release/**"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  PG_PORT: 5433
+  PG_USER: admin
+  PG_PASSWORD: admin
+  # Isolate TiUP state from the runner's home directory.
+  TIUP_HOME: ${{ runner.temp }}/tiup
+
+jobs:
+  regression-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Compute TiUP cache key
+        id: tiup-cache
+        shell: bash
+        run: echo "day=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache TiUP downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.TIUP_HOME }}/bin
+            ${{ env.TIUP_HOME }}/storage
+          key: tiup-${{ runner.os }}-${{ steps.tiup-cache.outputs.day }}
+          restore-keys: |
+            tiup-${{ runner.os }}-
+
+      - name: Install tiup
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Isolate TiUP state to avoid flaky/corrupted manifests on runners.
+          export TIUP_HOME="$TIUP_HOME"
+          echo "TIUP_HOME=$TIUP_HOME" >> "$GITHUB_ENV"
+
+          export PATH="$TIUP_HOME/bin:$PATH"
+          echo "$TIUP_HOME/bin" >> "$GITHUB_PATH"
+
+          install_and_verify() {
+            mkdir -p "$TIUP_HOME/bin" "$TIUP_HOME/storage"
+
+            # Keep cached downloads between runs; wipe the rest to avoid flaky state.
+            find "$TIUP_HOME" -mindepth 1 -maxdepth 1 ! -name storage ! -name bin -exec rm -rf {} +
+
+            if ! tiup --version >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 \
+                --retry 3 --retry-all-errors --connect-timeout 15 --max-time 300 \
+                -sSf https://tiup-mirrors.pingcap.com/install.sh | sh
+            fi
+
+            tiup --version
+            tiup mirror show
+            tiup list >/dev/null
+            # Pre-fetch components used by `tiup playground --mode tikv-slim`.
+            tiup install playground pd tikv
+          }
+
+          for attempt in 1 2 3; do
+            echo "Setting up TiUP (attempt $attempt)..."
+            if install_and_verify; then
+              break
+            fi
+            echo "TiUP setup failed; retrying..."
+            sleep $((attempt * 5))
+          done
+
+          # Ensure the repository is initialized and trusted.
+          tiup list >/dev/null
+
+      - name: Run regression gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash scripts/regression_gate.sh
+
+      - name: Upload pg-tikv logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-gate-logs
+          path: |
+            /tmp/pgtikv-regression.log
