@@ -429,7 +429,6 @@ def move_error_block_to_end(lines: List[str]) -> List[str]:
             head.append(line)
     return head + tail
 
-
 _PSQL_DIAGNOSTIC_LINE = re.compile(
     r"^(?:ERROR|FATAL|PANIC|WARNING|NOTICE|DETAIL|HINT|CONTEXT):|^LINE\s+\d+:|^\s*\^",
     re.IGNORECASE,
