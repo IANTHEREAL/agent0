@@ -330,7 +330,32 @@ def normalize_pg_array_literal(text: str) -> str:
     return text.replace(stripped, normalized, 1)
 
 
-def normalize_output(text: str, *, strip_psql_prefix: bool) -> List[str]:
+def normalize_psql_aligned_line(line: str) -> str:
+    stripped = line.strip()
+    if not stripped:
+        return ""
+
+    # Psql table separator lines depend on column widths (which can vary when we
+    # normalize numeric literals). Canonicalize by collapsing '-' runs while
+    # keeping '+' column separators.
+    if all(ch in "-+" for ch in stripped) and "-" in stripped:
+        return re.sub(r"-+", "-", stripped)
+
+    # Canonicalize aligned tables (`col | col`) by trimming cell padding so
+    # column width differences don't affect comparisons.
+    if "|" in stripped:
+        parts = [part.strip() for part in stripped.split("|")]
+        return "|".join(parts)
+
+    return stripped
+
+
+def normalize_output(
+    text: str,
+    *,
+    strip_psql_prefix: bool,
+    mode: PsqlOutputMode,
+) -> List[str]:
     lines = []
     for raw in text.splitlines():
         line = raw.rstrip()
@@ -350,6 +375,8 @@ def normalize_output(text: str, *, strip_psql_prefix: bool) -> List[str]:
         line = normalize_decimal(line)
         line = normalize_json_whitespace(line)
         line = normalize_pg_array_literal(line)
+        if mode == PsqlOutputMode.ALIGNED:
+            line = normalize_psql_aligned_line(line)
         if line.strip() == "testdb":
             line = line.replace("testdb", "postgres")
         lines.append(line)
@@ -507,8 +534,8 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
             return TestResult.FAILED
 
         strip_psql_prefix = (not expected_has_psql) and expected_has_bare_diagnostics
-        normalized_output = normalize_output(output, strip_psql_prefix=strip_psql_prefix)
-        normalized_expected = normalize_output(expected, strip_psql_prefix=strip_psql_prefix)
+        normalized_output = normalize_output(output, strip_psql_prefix=strip_psql_prefix, mode=mode)
+        normalized_expected = normalize_output(expected, strip_psql_prefix=strip_psql_prefix, mode=mode)
 
         if unordered:
             normalized_output = [line for line in normalized_output if line.strip()]
