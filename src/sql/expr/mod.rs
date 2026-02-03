@@ -1282,8 +1282,62 @@ pub(super) fn parse_interval_string(s: &str) -> Result<Value> {
 }
 
 pub(super) fn parse_timestamp_string(s: &str) -> Result<Value> {
-    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s.trim()) {
+    let trimmed = s.trim();
+
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
         return Ok(Value::Timestamp(dt.timestamp_millis()));
+    }
+
+    // PostgreSQL accepts TIMESTAMPTZ inputs like:
+    // - `YYYY-MM-DD HH:MM:SS[.ffffff]+HH:MM`
+    // - `YYYY-MM-DD HH:MM:SS[.ffffff] +HH:MM`
+    // and similar forms with `T` separators. Many ORMs/JDBC/JS stacks emit these.
+    {
+        use chrono::DateTime;
+
+        // `chrono` supports `%:z` for `+HH:MM` and `%z` for `+HHMM`.
+        // Try the common Postgres-style layouts that are not RFC3339 (missing `T`).
+        let tz_formats = [
+            "%Y-%m-%d %H:%M:%S%.f%:z",
+            "%Y-%m-%d %H:%M:%S%:z",
+            "%Y-%m-%d %H:%M:%S%.f %:z",
+            "%Y-%m-%d %H:%M:%S %:z",
+            "%Y-%m-%dT%H:%M:%S%.f%:z",
+            "%Y-%m-%dT%H:%M:%S%:z",
+            "%Y-%m-%dT%H:%M:%S%.f %:z",
+            "%Y-%m-%dT%H:%M:%S %:z",
+            "%Y-%m-%d %H:%M:%S%.f%z",
+            "%Y-%m-%d %H:%M:%S%z",
+            "%Y-%m-%d %H:%M:%S%.f %z",
+            "%Y-%m-%d %H:%M:%S %z",
+            "%Y-%m-%dT%H:%M:%S%.f%z",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S%.f %z",
+            "%Y-%m-%dT%H:%M:%S %z",
+        ];
+
+        for fmt in &tz_formats {
+            if let Ok(dt) = DateTime::parse_from_str(trimmed, fmt) {
+                return Ok(Value::Timestamp(dt.timestamp_millis()));
+            }
+        }
+
+        // Also accept `+HH` / `-HH` offsets by normalizing them to `+HH:00`.
+        if trimmed.len() >= 3 {
+            let bytes = trimmed.as_bytes();
+            let len = bytes.len();
+            let sign = bytes[len - 3];
+            let d1 = bytes[len - 2];
+            let d2 = bytes[len - 1];
+            if matches!(sign, b'+' | b'-') && d1.is_ascii_digit() && d2.is_ascii_digit() {
+                let normalized = format!("{trimmed}:00");
+                for fmt in &tz_formats {
+                    if let Ok(dt) = DateTime::parse_from_str(&normalized, fmt) {
+                        return Ok(Value::Timestamp(dt.timestamp_millis()));
+                    }
+                }
+            }
+        }
     }
 
     use chrono::{NaiveDateTime, TimeZone, Utc};
@@ -3217,6 +3271,41 @@ mod tests {
 
         let result = parse_timestamp_string("2024-01-15T10:30:00").unwrap();
         assert!(matches!(result, Value::Timestamp(_)));
+    }
+
+    #[test]
+    fn test_timestamp_cast_accepts_postgres_timestamptz_offsets() {
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-02-02T23:39:52.850+00:00")
+            .unwrap()
+            .timestamp_millis();
+
+        assert_eq!(
+            parse_timestamp_string("2026-02-02 23:39:52.850 +00:00").unwrap(),
+            Value::Timestamp(expected)
+        );
+        assert_eq!(
+            parse_timestamp_string("2026-02-02 23:39:52.850+00:00").unwrap(),
+            Value::Timestamp(expected)
+        );
+        assert_eq!(
+            parse_timestamp_string("2026-02-02 23:39:52.850000+00:00").unwrap(),
+            Value::Timestamp(expected)
+        );
+
+        let expected_plus2 =
+            chrono::DateTime::parse_from_rfc3339("2026-02-02T21:39:52.850+00:00")
+                .unwrap()
+                .timestamp_millis();
+        assert_eq!(
+            parse_timestamp_string("2026-02-02 23:39:52.850 +02:00").unwrap(),
+            Value::Timestamp(expected_plus2)
+        );
+
+        // `+HH` offsets are also accepted by PostgreSQL (interpreted as `+HH:00`).
+        assert_eq!(
+            parse_timestamp_string("2026-02-02 23:39:52.850 +02").unwrap(),
+            Value::Timestamp(expected_plus2)
+        );
     }
 
     #[test]

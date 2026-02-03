@@ -178,28 +178,13 @@ pub fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Value> {
             crate::types::date::timestamp_millis_to_date_days(*ts).map(Value::Date)
         }
         (Value::Text(s), DataType::Timestamp | DataType::TimestampTz) => {
-            let trimmed = s.trim();
-            let parsed = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f")
-                .or_else(|_| chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S"))
-                .map(|ts| ts.and_utc().timestamp_millis())
-                .or_else(|_| {
-                    chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d").map(|d| {
-                        d.and_hms_opt(0, 0, 0)
-                            .unwrap()
-                            .and_utc()
-                            .timestamp_millis()
-                    })
-                });
-            match parsed {
-                Ok(ms) => Ok(Value::Timestamp(ms)),
-                Err(_) => {
-                    let ty = match col.data_type {
-                        DataType::TimestampTz => "timestamp with time zone",
-                        _ => "timestamp",
-                    };
-                    Err(anyhow!("invalid input syntax for type {}: \"{}\"", ty, s))
-                }
-            }
+            super::expr::parse_timestamp_string(s).map_err(|_| {
+                let ty = match col.data_type {
+                    DataType::TimestampTz => "timestamp with time zone",
+                    _ => "timestamp",
+                };
+                anyhow!("invalid input syntax for type {}: \"{}\"", ty, s)
+            })
         }
         (Value::Text(s), DataType::Time) => {
             let trimmed = s.trim();
@@ -1396,6 +1381,14 @@ mod tests {
         let ts_col = test_col("ts", DataType::Timestamp);
         let got = coerce_value_for_column(Value::Text("2026-01-01 00:00:00".into()), &ts_col)
             .unwrap();
+        assert!(matches!(got, Value::Timestamp(_)));
+
+        let tstz_col = test_col("tsz", DataType::TimestampTz);
+        let got = coerce_value_for_column(
+            Value::Text("2026-02-02 23:39:52.850 +00:00".into()),
+            &tstz_col,
+        )
+        .unwrap();
         assert!(matches!(got, Value::Timestamp(_)));
 
         let ts_bad = coerce_value_for_column(Value::Text("not-a-ts".into()), &ts_col)
