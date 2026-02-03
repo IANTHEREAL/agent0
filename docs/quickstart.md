@@ -25,15 +25,7 @@ brew install libpq
 
 ## Starting TiKV
 
-### Option 1: Simple Development Setup
-
-```bash
-tiup playground --mode tikv-slim
-```
-
-This starts a single-node TiKV cluster. Note the PD endpoint from the output (e.g., `127.0.0.1:2379`).
-
-### Option 2: With Keyspace Support (Multi-Tenancy)
+pg-tikv uses TiKV keyspaces for isolation. Your TiKV cluster must run with API v2 enabled (`storage.api-version = 2`).
 
 Create a config file `/tmp/tikv.toml`:
 
@@ -49,13 +41,21 @@ Start with config:
 tiup playground --mode tikv-slim --kv.config /tmp/tikv.toml
 ```
 
-Create keyspaces for tenants:
+Note the PD endpoint from the output (often `127.0.0.1:2379`). If it differs, set `PD_ENDPOINTS` when starting pg-tikv.
+
+### Create Additional Keyspaces (Multi-Tenancy)
+
+The default keyspace is provided by TiKV/PD; you only need to create extra tenant keyspaces (e.g. `tenant_a`, `tenant_b`).
 
 ```bash
-# Find PD port from tiup output
-tiup ctl:v8.5.4 pd -u http://127.0.0.1:2379 keyspace create default
-tiup ctl:v8.5.4 pd -u http://127.0.0.1:2379 keyspace create tenant_a
-tiup ctl:v8.5.4 pd -u http://127.0.0.1:2379 keyspace create tenant_b
+# Replace 127.0.0.1:2379 if your PD endpoint differs.
+curl -sS -X POST http://127.0.0.1:2379/pd/api/v2/keyspaces \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"tenant_a"}'
+
+curl -sS -X POST http://127.0.0.1:2379/pd/api/v2/keyspaces \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"tenant_b"}'
 ```
 
 ## Building pg-tikv
@@ -79,7 +79,7 @@ cargo build --release
 ```bash
 PD_ENDPOINTS=127.0.0.1:2379 \
 PG_PORT=5433 \
-PG_PASSWORD=fallback_password \
+PG_KEYSPACE=default \
 ./target/release/pg-tikv
 ```
 
