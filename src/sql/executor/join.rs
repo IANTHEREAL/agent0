@@ -701,6 +701,7 @@ fn validate_no_ambiguous_unqualified_columns(
 fn build_join_output_schema_and_offsets(
     combined_schemas: &[(String, TableSchema)],
     merged_unqualified_columns: &HashSet<String>,
+    merged_column_offsets: Option<&HashMap<String, Vec<usize>>>,
 ) -> (TableSchema, HashMap<String, usize>) {
     let mut column_offsets: HashMap<String, usize> = HashMap::new();
     let mut ambiguous_unqualified: HashSet<String> = HashSet::new();
@@ -711,7 +712,27 @@ fn build_join_output_schema_and_offsets(
         for col in &schema.columns {
             column_offsets.insert(format!("{}.{}", alias, col.name), offset);
             if merged_unqualified_columns.contains(&col.name) {
-                column_offsets.entry(col.name.clone()).or_insert(offset);
+                let merged_offsets = merged_column_offsets.and_then(|merged| merged.get(&col.name));
+                if let Some(offsets) = merged_offsets {
+                    let canonical = offsets.first().copied().unwrap_or(offset);
+                    if offsets.contains(&offset) {
+                        insert_unqualified_join_offset(
+                            &mut column_offsets,
+                            &mut ambiguous_unqualified,
+                            &col.name,
+                            canonical,
+                        );
+                    } else {
+                        insert_unqualified_join_offset(
+                            &mut column_offsets,
+                            &mut ambiguous_unqualified,
+                            &col.name,
+                            offset,
+                        );
+                    }
+                } else {
+                    column_offsets.entry(col.name.clone()).or_insert(offset);
+                }
             } else {
                 insert_unqualified_join_offset(
                     &mut column_offsets,
@@ -3676,10 +3697,6 @@ impl Executor {
             combined_schemas.extend(extra_schemas);
             combined_rows = new_combined_rows;
         }
-        let (final_schema, final_column_offsets) =
-            build_join_output_schema_and_offsets(&combined_schemas, &merged_unqualified_columns);
-        let type_infer_schema = build_type_infer_schema_for_join(&combined_schemas);
-
         // For `USING`/`NATURAL` joins, common columns are merged in the output. For outer joins,
         // the merged join key should behave like `COALESCE(left, right)` so that right-only rows
         // in `RIGHT/FULL` joins expose the right-side key instead of NULL.
@@ -3733,6 +3750,13 @@ impl Executor {
             None
         };
         let merged_column_offsets_ref = merged_column_offsets.as_ref();
+
+        let (final_schema, final_column_offsets) = build_join_output_schema_and_offsets(
+            &combined_schemas,
+            &merged_unqualified_columns,
+            merged_column_offsets_ref,
+        );
+        let type_infer_schema = build_type_infer_schema_for_join(&combined_schemas);
 
         if let Some(sel) = &select.selection {
             validate_no_ambiguous_unqualified_columns(sel, &final_column_offsets)?;
@@ -3888,6 +3912,28 @@ impl Executor {
         let is_agg = !group_keys_exprs.is_empty() || !agg_funcs.is_empty();
 
         if is_agg {
+            let col_names: Vec<String> =
+                select.projection.iter().map(get_select_item_name).collect();
+            if !query.order_by.is_empty() {
+                for order_expr in &query.order_by {
+                    match &order_expr.expr {
+                        Expr::Value(SqlValue::Number(_, _)) => continue,
+                        Expr::Identifier(ident)
+                            if col_names
+                                .iter()
+                                .any(|n| n.eq_ignore_ascii_case(&ident.value)) =>
+                        {
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    validate_no_ambiguous_unqualified_columns(
+                        &order_expr.expr,
+                        &final_column_offsets,
+                    )?;
+                }
+            }
+
             let mut groups: HashMap<Vec<u8>, Vec<Aggregator>> = HashMap::new();
             let mut group_rows: HashMap<Vec<u8>, Row> = HashMap::new();
             // Track seen values for DISTINCT aggregates: group_key -> (agg_idx -> seen_values)
@@ -4066,8 +4112,6 @@ impl Executor {
 
             let mut final_rows = Vec::new();
             let mut final_rows_with_order_keys: Vec<(usize, Row, Vec<Value>)> = Vec::new();
-            let col_names: Vec<String> =
-                select.projection.iter().map(get_select_item_name).collect();
 
             let has_order_by = !query.order_by.is_empty();
             for (key_bytes, aggs) in groups {
@@ -4311,6 +4355,25 @@ impl Executor {
                 has_natural_join,
                 &natural_join_common_cols,
             )?;
+            let order_by_aliases: HashSet<String> = resolved_projection
+                .iter()
+                .filter_map(|item| match item {
+                    SelectItem::ExprWithAlias { alias, .. } => Some(alias.value.to_lowercase()),
+                    _ => None,
+                })
+                .collect();
+            for order_expr in &query.order_by {
+                match &order_expr.expr {
+                    Expr::Value(SqlValue::Number(_, _)) => continue,
+                    Expr::Identifier(ident)
+                        if order_by_aliases.contains(&ident.value.to_lowercase()) =>
+                    {
+                        continue;
+                    }
+                    _ => {}
+                }
+                validate_no_ambiguous_unqualified_columns(&order_expr.expr, &final_column_offsets)?;
+            }
 
             let order_by_uses_sequences = resolved_order_exprs
                 .iter()
@@ -7014,7 +7077,7 @@ mod tests {
         merged.insert("id".to_string());
 
         let (joined_schema, column_offsets) =
-            build_join_output_schema_and_offsets(&combined_schemas, &merged);
+            build_join_output_schema_and_offsets(&combined_schemas, &merged, None);
 
         let expr = Expr::Identifier(Ident::new("id"));
         validate_no_ambiguous_unqualified_columns(&expr, &column_offsets).unwrap();

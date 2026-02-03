@@ -37,6 +37,9 @@ FROM issue86_b FULL JOIN issue86_c USING (id), issue86_extra
 WHERE issue86_b.id IS NULL AND issue86_c.id IS NULL
 ORDER BY extra_id;
 
+-- ORDER BY: ambiguous unqualified join key must error (not resolve via merged-key COALESCE).
+SELECT 1 FROM issue86_b FULL JOIN issue86_c USING (id), issue86_extra ORDER BY id;
+
 DROP TABLE issue86_b;
 DROP TABLE issue86_c;
 DROP TABLE issue86_extra;

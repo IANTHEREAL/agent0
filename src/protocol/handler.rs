@@ -107,6 +107,49 @@ fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
     }
 }
 
+fn find_unqualified_identifier_position(query: &str, ident: &str) -> Option<usize> {
+    if ident.is_empty() {
+        return None;
+    }
+    let query_lower = query.to_ascii_lowercase();
+    let ident_lower = ident.to_ascii_lowercase();
+    let haystack = query_lower.as_bytes();
+    let needle = ident_lower.as_bytes();
+
+    if needle.len() > haystack.len() {
+        return None;
+    }
+
+    for i in 0..=haystack.len().saturating_sub(needle.len()) {
+        if &haystack[i..i + needle.len()] != needle {
+            continue;
+        }
+
+        let prev = i.checked_sub(1).map(|idx| haystack[idx]);
+        if prev.is_some_and(|b| b == b'.' || is_ident_char(b)) {
+            continue;
+        }
+
+        let next = haystack.get(i + needle.len()).copied();
+        if next.is_some_and(is_ident_char) {
+            continue;
+        }
+
+        return Some(i + 1);
+    }
+
+    None
+}
+
+fn ambiguous_column_error_with_position(query: &str, message: &str) -> Option<(String, usize)> {
+    let trimmed = message.trim();
+    let prefix = "column reference \"";
+    let suffix = "\" is ambiguous";
+    let col_name = trimmed.strip_prefix(prefix)?.strip_suffix(suffix)?;
+    let pos = find_unqualified_identifier_position(query, col_name)?;
+    Some((col_name.to_string(), pos))
+}
+
 fn in_failed_sql_transaction_pgwire_error() -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".to_string(),
@@ -3388,11 +3431,18 @@ impl SimpleQueryHandler for DynamicPgHandler {
             }
             Err(e) => {
                 error!("Query execution error: {}", e);
-                Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                let mut error_info = ErrorInfo::new(
                     "ERROR".to_string(),
                     sqlstate_for_executor_error(&e).to_string(),
                     e.to_string(),
-                ))))
+                );
+                if let Some((_col, pos)) =
+                    ambiguous_column_error_with_position(query, &error_info.message)
+                {
+                    error_info.code = "42702".to_string();
+                    error_info.position = Some(pos.to_string());
+                }
+                Err(PgWireError::UserError(Box::new(error_info)))
             }
         }
     }
