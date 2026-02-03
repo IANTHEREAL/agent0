@@ -101,6 +101,27 @@ pub(crate) fn pg_numeric_div(numer: Decimal, denom: Decimal) -> Decimal {
     if result.scale() > scale {
         result = result.round_dp_with_strategy(scale, RoundingStrategy::MidpointAwayFromZero);
     }
+    if result.scale() < scale {
+        result.rescale(scale);
+    }
     result
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_pg_numeric_div_pads_scale_for_exact_result() {
+        let result = pg_numeric_div(Decimal::from(675), Decimal::from(4));
+        assert_eq!(result.scale(), 16);
+        assert_eq!(result.to_string(), "168.7500000000000000");
+    }
+
+    #[test]
+    fn test_pg_numeric_div_rounds_to_pg_scale_for_repeating_result() {
+        let result = pg_numeric_div(Decimal::from(1000), Decimal::from(7));
+        assert_eq!(result.scale(), 16);
+        assert_eq!(result.to_string(), "142.8571428571428571");
+    }
+}
