@@ -79,4 +79,5 @@ If you hit metadata incompatibilities between builds, the safest rollback is to:
 - **ORM coverage**: `run_tests.sh` runs a subset of `orm-tests/` (pg client, TypeORM, Sequelize, Knex, Drizzle).
   - **Prisma is not run by `run_tests.sh`**, and `orm-tests/prisma` is not shipped in this repository at the moment. Prisma compatibility is not guaranteed in v0.1.0.
   - `kysely/` is also not currently included in the default `run_tests.sh` ORM subset.
+  - **TypeORM gate skip**: `UNNEST(...)` is not supported yet. The v0.1.0 gate currently skips `TypeORM SQL Features [pg-tikv] ARRAY operations should support UNNEST`.
 - **Passwords are sent in cleartext unless TLS is enabled** (use `PG_TLS_CERT` + `PG_TLS_KEY` in production).
