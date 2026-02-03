@@ -2299,7 +2299,9 @@ impl Executor {
         let mut combined_rows: Vec<Row> = base_rows;
         let mut has_natural_join = false;
         let mut natural_join_common_cols: Vec<String> = Vec::new();
-        let mut natural_join_column_sources: HashMap<String, (String, String)> = HashMap::new();
+        // Track which table aliases participate in each merged join key column across the entire
+        // JOIN tree so that chained NATURAL/USING joins do not lose earlier merge groups.
+        let mut natural_join_column_sources: HashMap<String, Vec<String>> = HashMap::new();
         let mut merged_unqualified_columns: HashSet<String> = HashSet::new();
 
         let mut extra_from_items: Vec<(Vec<(String, TableSchema)>, Vec<Row>)> = Vec::new();
@@ -2487,15 +2489,25 @@ impl Executor {
                     | JoinOperator::LeftOuter(JoinConstraint::Natural)
                     | JoinOperator::RightOuter(JoinConstraint::Natural)
                     | JoinOperator::FullOuter(JoinConstraint::Natural) => {
+                        // `left_columns` can contain duplicates because the executor keeps all
+                        // underlying table columns. NATURAL join keys must be unique and ordered
+                        // like Postgres (left-to-right, first occurrence wins).
+                        let right_set: HashSet<&str> =
+                            right_columns.iter().map(|c| c.as_str()).collect();
+                        let mut seen: HashSet<String> = HashSet::new();
                         let common_cols: Vec<String> = left_columns
                             .iter()
-                            .filter(|c| right_columns.contains(c))
-                            .cloned()
+                            .filter_map(|c| {
+                                if right_set.contains(c.as_str()) && seen.insert(c.clone()) {
+                                    Some(c.clone())
+                                } else {
+                                    None
+                                }
+                            })
                             .collect();
                         has_natural_join = true;
                         natural_join_common_cols = common_cols.clone();
                         merged_unqualified_columns.extend(common_cols.iter().cloned());
-                        natural_join_column_sources.clear();
                         for col in &common_cols {
                             let left_alias_for_col = item_schemas
                                 .iter()
@@ -2504,8 +2516,18 @@ impl Executor {
                                 })
                                 .map(|(a, _)| a.clone())
                                 .unwrap_or_else(|| extra_alias.clone());
-                            natural_join_column_sources
-                                .insert(col.clone(), (left_alias_for_col, join_alias.clone()));
+                            let aliases = natural_join_column_sources
+                                .entry(col.clone())
+                                .or_insert_with(|| vec![left_alias_for_col.clone()]);
+                            if !aliases
+                                .iter()
+                                .any(|a| a.eq_ignore_ascii_case(&left_alias_for_col))
+                            {
+                                aliases.push(left_alias_for_col);
+                            }
+                            if !aliases.iter().any(|a| a.eq_ignore_ascii_case(&join_alias)) {
+                                aliases.push(join_alias.clone());
+                            }
                         }
                         if common_cols.is_empty() {
                             (None, true)
@@ -2546,12 +2568,15 @@ impl Executor {
                     | JoinOperator::LeftOuter(JoinConstraint::Using(cols))
                     | JoinOperator::RightOuter(JoinConstraint::Using(cols))
                     | JoinOperator::FullOuter(JoinConstraint::Using(cols)) => {
-                        let using_cols: Vec<String> =
-                            cols.iter().map(|c| normalize_ident(c)).collect();
+                        let mut seen: HashSet<String> = HashSet::new();
+                        let using_cols: Vec<String> = cols
+                            .iter()
+                            .map(|c| normalize_ident(c))
+                            .filter(|c| seen.insert(c.clone()))
+                            .collect();
                         has_natural_join = true;
                         natural_join_common_cols = using_cols.clone();
                         merged_unqualified_columns.extend(using_cols.iter().cloned());
-                        natural_join_column_sources.clear();
                         if using_cols.is_empty() {
                             (None, true)
                         } else {
@@ -2565,8 +2590,15 @@ impl Executor {
                                 .map(|(a, _)| a.clone())
                                 .unwrap_or_else(|| extra_alias.clone());
                             for col in &using_cols {
-                                natural_join_column_sources
-                                    .insert(col.clone(), (left_alias.clone(), join_alias.clone()));
+                                let aliases = natural_join_column_sources
+                                    .entry(col.clone())
+                                    .or_insert_with(|| vec![left_alias.clone()]);
+                                if !aliases.iter().any(|a| a.eq_ignore_ascii_case(&left_alias)) {
+                                    aliases.push(left_alias.clone());
+                                }
+                                if !aliases.iter().any(|a| a.eq_ignore_ascii_case(&join_alias)) {
+                                    aliases.push(join_alias.clone());
+                                }
                             }
                             let cond = using_cols
                                 .iter()
@@ -3185,23 +3217,43 @@ impl Executor {
                 | JoinOperator::LeftOuter(JoinConstraint::Natural)
                 | JoinOperator::RightOuter(JoinConstraint::Natural)
                 | JoinOperator::FullOuter(JoinConstraint::Natural) => {
+                    // `left_columns` can contain duplicates because the executor keeps all
+                    // underlying table columns. NATURAL join keys must be unique and ordered
+                    // like Postgres (left-to-right, first occurrence wins).
+                    let right_set: HashSet<&str> =
+                        right_columns.iter().map(|c| c.as_str()).collect();
+                    let mut seen: HashSet<String> = HashSet::new();
                     let common_cols: Vec<String> = left_columns
                         .iter()
-                        .filter(|c| right_columns.contains(c))
-                        .cloned()
+                        .filter_map(|c| {
+                            if right_set.contains(c.as_str()) && seen.insert(c.clone()) {
+                                Some(c.clone())
+                            } else {
+                                None
+                            }
+                        })
                         .collect();
                     has_natural_join = true;
                     natural_join_common_cols = common_cols.clone();
                     merged_unqualified_columns.extend(common_cols.iter().cloned());
-                    natural_join_column_sources.clear();
                     for col in &common_cols {
                         let left_alias_for_col = combined_schemas
                             .iter()
                             .find(|(_, s)| s.columns.iter().any(|c| c.name.eq_ignore_ascii_case(col)))
                             .map(|(a, _)| a.clone())
                             .unwrap_or_else(|| base_alias.clone());
-                        natural_join_column_sources
-                            .insert(col.clone(), (left_alias_for_col, join_alias.clone()));
+                        let aliases = natural_join_column_sources
+                            .entry(col.clone())
+                            .or_insert_with(|| vec![left_alias_for_col.clone()]);
+                        if !aliases
+                            .iter()
+                            .any(|a| a.eq_ignore_ascii_case(&left_alias_for_col))
+                        {
+                            aliases.push(left_alias_for_col);
+                        }
+                        if !aliases.iter().any(|a| a.eq_ignore_ascii_case(&join_alias)) {
+                            aliases.push(join_alias.clone());
+                        }
                     }
                     if common_cols.is_empty() {
                         (None, true)
@@ -3242,11 +3294,15 @@ impl Executor {
                 | JoinOperator::LeftOuter(JoinConstraint::Using(cols))
                 | JoinOperator::RightOuter(JoinConstraint::Using(cols))
                 | JoinOperator::FullOuter(JoinConstraint::Using(cols)) => {
-                    let using_cols: Vec<String> = cols.iter().map(|c| normalize_ident(c)).collect();
+                    let mut seen: HashSet<String> = HashSet::new();
+                    let using_cols: Vec<String> = cols
+                        .iter()
+                        .map(|c| normalize_ident(c))
+                        .filter(|c| seen.insert(c.clone()))
+                        .collect();
                     has_natural_join = true;
                     natural_join_common_cols = using_cols.clone();
                     merged_unqualified_columns.extend(using_cols.iter().cloned());
-                    natural_join_column_sources.clear();
                     if using_cols.is_empty() {
                         (None, true)
                     } else {
@@ -3260,8 +3316,15 @@ impl Executor {
                             .map(|(a, _)| a.clone())
                             .unwrap_or_else(|| base_alias.clone());
                         for col in &using_cols {
-                            natural_join_column_sources
-                                .insert(col.clone(), (left_alias.clone(), join_alias.clone()));
+                            let aliases = natural_join_column_sources
+                                .entry(col.clone())
+                                .or_insert_with(|| vec![left_alias.clone()]);
+                            if !aliases.iter().any(|a| a.eq_ignore_ascii_case(&left_alias)) {
+                                aliases.push(left_alias.clone());
+                            }
+                            if !aliases.iter().any(|a| a.eq_ignore_ascii_case(&join_alias)) {
+                                aliases.push(join_alias.clone());
+                            }
                         }
                         let cond = using_cols
                             .iter()
@@ -3703,7 +3766,7 @@ impl Executor {
         //
         // Keep qualified column access intact by computing merged values only for unqualified
         // identifier resolution.
-        let merged_column_offsets = if has_natural_join && !natural_join_common_cols.is_empty() {
+        let merged_column_offsets = if has_natural_join && !natural_join_column_sources.is_empty() {
             let mut merged: HashMap<String, Vec<usize>> = HashMap::new();
 
             let find_offset = |table_alias: &str, col_name: &str| -> Option<usize> {
@@ -3724,18 +3787,12 @@ impl Executor {
                 None
             };
 
-            for common_col in &natural_join_common_cols {
-                let Some((left_alias, right_alias)) = natural_join_column_sources.get(common_col)
-                else {
-                    continue;
-                };
-
-                let mut offsets = Vec::with_capacity(2);
-                if let Some(offset) = find_offset(left_alias, common_col) {
-                    offsets.push(offset);
-                }
-                if let Some(offset) = find_offset(right_alias, common_col) {
-                    offsets.push(offset);
+            for (common_col, aliases) in &natural_join_column_sources {
+                let mut offsets: Vec<usize> = Vec::with_capacity(aliases.len());
+                for alias in aliases {
+                    if let Some(offset) = find_offset(alias, common_col) {
+                        offsets.push(offset);
+                    }
                 }
 
                 offsets.sort_unstable();
