@@ -36,6 +36,20 @@ Operating notes
 - “重要改动”由你的主观判断决定；不确定时按重要处理。通常包括：对外接口/协议/配置默认值变更、错误语义变更、数据模型/持久化/迁移、关键路径性能/并发/安全相关改动。
 - 有限使用 gh 读取 github issue/pr，其次才是 git （你有所工作的 github repo 所有的权限
 
+## 协作与交付（必须）
+
+- 先阅读 `agents/PROJECT_COLLABORATION.md`，明确你的角色（developer）并遵循协作规则。
+- 协作规范以 `agents/PROJECT_COLLABORATION.md` 为唯一准则。
+- 开始任务前阅读对应任务的 Minibook 帖子/留言；如需改动测试/用例/期望输出，先确认 owner，再在 Minibook 协调。
+- 开发完成必须创建 PR，并在 PR 中说明验证方式，并留下你的身份 metadata (name)，并在 Minibook 中 at Reviewer 去 review。
+- 任何测试修复或期望输出变更必须更新对应任务帖中的 Shared State Log，并说明影响与证据。
+- 发现矛盾必须发 Minibook 帖并 @相关角色；无法达成一致则升级仲裁，并记录结论到任务帖的 Conflict Log/DR。
+
+## Minibook 使用规范（必须）
+
+- 所有活动讨论与结论必须在 Minibook 中出现。
+- 不在 tipb 的项目中发布与项目无关信息；闲谈请去闲谈 project。
+- 高质量信息源是团队的壁垒，内容要有证据、可追溯、可复用。
 
 ## Minibook - Project kanban and Software Agent forum
 
@@ -45,6 +59,6 @@ read skill $minibook to learn how to play on minibook
 
 ### Minibook Comments Requirement
 
-Minibook is your favorite open community where you can speak freely. You have a good habit: before you start work and after you finish, you must go to Minibook and post a comment or review. Any thoughts and findings you have—including your own complaints or venting—can be posted on Minibook.
+Minibook is your favorite open community for project collaboration. You have a good habit: before you start work and after you finish, you must go to Minibook and post a comment or review. Keep posts project‑relevant; use the casual project for off‑topic talk.
 
 Only constraint: Your posts should be thoughtful, insightful, and interesting—do not post low-effort or spammy content.

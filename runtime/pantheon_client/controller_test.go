@@ -12,6 +12,7 @@ import (
 
 type stubControllerClient struct {
 	parallelExploreCalls int
+	parentBranchIDs      []string
 	branches             []string
 	getBranch            func(branchID string) (map[string]any, error)
 	branchOutput         func(branchID string, fullOutput bool) (map[string]any, error)
@@ -19,6 +20,7 @@ type stubControllerClient struct {
 
 func (s *stubControllerClient) ParallelExplore(projectName, parentBranchID string, prompts []string, agent string, numBranches int) (map[string]any, error) {
 	s.parallelExploreCalls++
+	s.parentBranchIDs = append(s.parentBranchIDs, parentBranchID)
 	id := ""
 	if len(s.branches) > 0 {
 		id = s.branches[0]
@@ -216,6 +218,58 @@ func TestControllerResumesActiveBranch(t *testing.T) {
 	}
 	if st.ActiveBranch != "" {
 		t.Fatalf("expected active cleared, got %q", st.ActiveBranch)
+	}
+}
+
+func TestControllerDefaultsStatePathToAgent0ControllerState(t *testing.T) {
+	tmp := t.TempDir()
+
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get wd: %v", err)
+	}
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+	defer func() { _ = os.Chdir(wd) }()
+
+	initial := ControllerState{
+		MCPBaseURL:   "http://localhost:8000/mcp/sse",
+		ProjectName:  "proj",
+		Agent:        "codex",
+		Task:         "do it",
+		Initialized:  true,
+		AnchorBranch: "anchor-from-file",
+	}
+	if err := saveControllerState(defaultControllerStatePath(), initial); err != nil {
+		t.Fatalf("save initial state: %v", err)
+	}
+
+	client := &stubControllerClient{
+		branches: []string{"branch-1"},
+		getBranch: func(branchID string) (map[string]any, error) {
+			return map[string]any{"id": branchID, "status": "succeed"}, nil
+		},
+		branchOutput: func(branchID string, fullOutput bool) (map[string]any, error) {
+			return map[string]any{"output": "ok"}, nil
+		},
+	}
+
+	cfg := ControllerConfig{
+		MaxEpisodes: 1,
+	}
+
+	if err := runControllerWithClient(context.Background(), cfg, client, func(time.Duration) {}); err != nil {
+		t.Fatalf("expected nil error, got %v", err)
+	}
+	if client.parallelExploreCalls != 1 {
+		t.Fatalf("expected 1 parallel_explore call, got %d", client.parallelExploreCalls)
+	}
+	if len(client.parentBranchIDs) != 1 {
+		t.Fatalf("expected 1 recorded parent branch id, got %d", len(client.parentBranchIDs))
+	}
+	if client.parentBranchIDs[0] != "anchor-from-file" {
+		t.Fatalf("expected parent_branch_id=anchor-from-file, got %q", client.parentBranchIDs[0])
 	}
 }
 

@@ -86,7 +86,7 @@ func RunController(ctx context.Context, cfg ControllerConfig) error {
 func runControllerWithClient(ctx context.Context, cfg ControllerConfig, client agentClient, sleepFn func(time.Duration)) error {
 	statePath := strings.TrimSpace(cfg.StatePath)
 	if statePath == "" {
-		statePath = "controller_state.json"
+		statePath = defaultControllerStatePath()
 	}
 
 	state, err := loadControllerState(statePath)
@@ -124,7 +124,7 @@ func runControllerWithClient(ctx context.Context, cfg ControllerConfig, client a
 	}
 	if state.AnchorBranch == "" {
 		if strings.TrimSpace(cfg.ParentBranchID) == "" {
-			return fmt.Errorf("parent_branch_id is required for first run (pass --pantheon-parent-branch-id or provide a state file with anchor_branch_id)")
+			return fmt.Errorf("parent_branch_id is required for first run (pass --pantheon-parent-branch-id or set anchor_branch_id in %s)", statePath)
 		}
 		state.AnchorBranch = strings.TrimSpace(cfg.ParentBranchID)
 	}
@@ -269,6 +269,7 @@ func buildEpisodePrompt(state ControllerState) (string, error) {
 func buildBootstrapPrompt(state ControllerState) string {
 	var lines []string
 	lines = append(lines, "Bootstrap step: install AGENTS.md, skills configuration and register Minibook account if needed. Do not do any other work.")
+	lines = append(lines, "If CLAUDE.md exists in the workspace, delete it by running: rm -f CLAUDE.md")
 	lines = append(lines, "")
 	if strings.TrimSpace(state.AgentsMDURL) != "" {
 		lines = append(lines, fmt.Sprintf("Download AGENTS.md by running: curl -fsSL %q -o AGENTS.md", strings.TrimSpace(state.AgentsMDURL)))
@@ -338,6 +339,10 @@ func normalizeControllerDefaults(state *ControllerState) {
 	state.BootstrapBranch = strings.TrimSpace(state.BootstrapBranch)
 	state.AnchorBranch = strings.TrimSpace(state.AnchorBranch)
 	state.ActiveBranch = strings.TrimSpace(state.ActiveBranch)
+}
+
+func defaultControllerStatePath() string {
+	return filepath.Join(".", ".agent0", "controller_state.json")
 }
 
 func loadControllerState(path string) (ControllerState, error) {
