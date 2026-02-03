@@ -29,5 +29,6 @@ Optional initialization hints:
 
 - `--agents-md-url <url>`
 - `--skills-url <url>`
+- `--project-collaboration-md-url <url>`
 - `--minibook-account <account>`
 - `--rebootstrap`
