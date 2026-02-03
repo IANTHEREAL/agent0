@@ -50,6 +50,7 @@ cat > "$REPORT_FILE" << EOF
 
 **Generated**: $(date '+%Y-%m-%d %H:%M:%S')
 **Host**: $(hostname)
+**Git**: $(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 **Rust**: $(rustc --version 2>/dev/null || echo "unknown")
 **Node**: $(node --version 2>/dev/null || echo "unknown")
 
@@ -169,9 +170,13 @@ if [ ! -d "node_modules" ]; then
     echo "Installing dependencies..."
     npm install --silent
 fi
-if [ ! -d "node_modules/.prisma" ]; then
-    echo "Generating Prisma client..."
-    npx prisma generate --silent
+if [ -f "schema.prisma" ] || [ -f "prisma/schema.prisma" ]; then
+    if [ ! -d "node_modules/.prisma" ]; then
+        echo "Generating Prisma client..."
+        npx prisma generate --no-hints
+    fi
+else
+    echo "Prisma schema not found; skipping prisma generate"
 fi
 
 ORM_START=$(date +%s)
