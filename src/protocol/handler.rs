@@ -16,7 +16,7 @@ use pgwire::api::results::{
     CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
     FieldInfo, QueryResponse, Response, Tag,
 };
-use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
+use pgwire::api::stmt::StoredStatement;
 use pgwire::api::store::PortalStore;
 use pgwire::api::{
     ClientInfo, ClientPortalStore, NoopErrorHandler, PgWireConnectionState, PgWireServerHandlers,
@@ -5893,6 +5893,7 @@ mod tests {
     use bytes::Buf;
     use bytes::Bytes;
     use pgwire::api::portal::Format;
+    use pgwire::api::stmt::NoopQueryParser;
     use pgwire::api::stmt::QueryParser;
     use pgwire::api::DefaultClient;
     use pgwire::messages::response::CommandComplete;

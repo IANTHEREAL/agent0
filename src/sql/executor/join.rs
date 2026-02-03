@@ -4583,7 +4583,6 @@ impl Executor {
 
         let mut cols = Vec::new();
         let mut result_rows = Vec::new();
-        let mut column_types: Vec<DataType> = Vec::new();
 
         let has_wildcard = select
             .projection
@@ -4600,17 +4599,17 @@ impl Executor {
 	                build_join_wildcard_plan(select, &schema_refs)
 	            } else {
 	                None
-	            };
+            };
 
             if let Some(plan) = plan.filter(|p| p.any_merge) {
-                (cols, column_types, result_rows) = project_rows_by_join_wildcard_plan(
+                (cols, _, result_rows) = project_rows_by_join_wildcard_plan(
                     &combined_schemas,
                     &plan.columns,
                     rows_to_project,
                     merged_column_offsets_ref,
                 );
             } else if has_natural_join && !natural_join_common_cols.is_empty() {
-                (cols, column_types, result_rows) = project_wildcard_natural_join(
+                (cols, _, result_rows) = project_wildcard_natural_join(
                     &combined_schemas,
                     &natural_join_common_cols,
 	                    rows_to_project,
@@ -4620,7 +4619,6 @@ impl Executor {
 	                for (alias, schema) in &combined_schemas {
 	                    for col in &schema.columns {
 	                        cols.push(format!("{}.{}", alias, col.name));
-                        column_types.push(col.data_type.clone());
                     }
                 }
                 result_rows = rows_to_project;
@@ -4687,26 +4685,6 @@ impl Executor {
 
             for (name, _) in &expanded_items {
                 cols.push(name.clone());
-            }
-
-            for item in resolved_projection.iter() {
-                match item {
-                    SelectItem::QualifiedWildcard(prefix, _) => {
-                        let table_alias =
-                            prefix.0.last().map(|i| i.value.clone()).unwrap_or_default();
-                        if let Some((_, schema)) = combined_schemas
-                            .iter()
-                            .find(|(a, _)| a.eq_ignore_ascii_case(&table_alias))
-                        {
-                            column_types
-                                .extend(schema.columns.iter().map(|col| col.data_type.clone()));
-                        }
-                    }
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        column_types.push(infer_expr_type(expr, &type_infer_schema));
-                    }
-                    _ => column_types.push(DataType::Text),
-                }
             }
 
             let has_window_funcs = !window_funcs.is_empty();
@@ -4809,16 +4787,6 @@ impl Executor {
                     _ => cols.push("col".to_string()),
                 }
             }
-
-            column_types = resolved_projection
-                .iter()
-                .map(|item| match item {
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        infer_expr_type(expr, &type_infer_schema)
-                    }
-                    _ => DataType::Text,
-                })
-                .collect();
 
             let has_window_funcs = !window_funcs.is_empty();
             for (row_idx, row) in rows_to_project.iter().enumerate() {
@@ -4994,6 +4962,7 @@ fn infer_join_result_column_types(
         .collect()
 }
 
+#[cfg(test)]
 fn generate_series_values(
     start: &Value,
     stop: &Value,
