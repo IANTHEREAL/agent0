@@ -4,11 +4,11 @@ use std::fmt::Write;
 
 use sqlparser::ast::{Expr, Query, Select, SetExpr, Statement, TableFactor, TableWithJoins};
 
+use super::operators::HashJoinConfig;
 use super::planner::{
     analyze_predicates, choose_best_access_path_for_filter, choose_join_algorithm,
     JoinAlgorithmChoice, PredicateInfo, ScanType,
 };
-use super::operators::HashJoinConfig;
 use crate::types::TableSchema;
 
 const DEFAULT_ROW_WIDTH: usize = 40;
@@ -181,13 +181,8 @@ fn generate_select_plan(
     // "Hash Join" when applicable.
     if select.from.len() == 1 && select.from[0].joins.len() == 1 {
         let join = &select.from[0].joins[0];
-        let right_plan = generate_table_factor_plan(
-            &join.relation,
-            &[],
-            None,
-            schema_lookup,
-            row_count_lookup,
-        );
+        let right_plan =
+            generate_table_factor_plan(&join.relation, &[], None, schema_lookup, row_count_lookup);
 
         let join_type = match &join.join_operator {
             sqlparser::ast::JoinOperator::LeftOuter(_) => "Left",
@@ -579,6 +574,7 @@ fn format_value(value: &crate::types::Value) -> String {
             format!("'{}'", s)
         }
         crate::types::Value::Numeric(d) => d.to_string(),
+        crate::types::Value::Tsvector(s) | crate::types::Value::Tsquery(s) => format!("'{}'", s),
     }
 }
 

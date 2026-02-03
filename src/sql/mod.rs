@@ -6,6 +6,7 @@ mod alter_owner;
 
 pub mod operators;
 mod alter_sequence_owned_by;
+pub(crate) mod fts;
 mod comment_on;
 mod ddl;
 mod dml;

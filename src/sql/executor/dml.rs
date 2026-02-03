@@ -122,6 +122,7 @@ fn value_to_expr(val: Value, _col_name: Option<&str>) -> Result<Expr> {
                 .collect::<Vec<_>>()
                 .join(",")
         ))),
+        Value::Tsvector(s) | Value::Tsquery(s) => Expr::Value(SqlValue::SingleQuotedString(s)),
     })
 }
 

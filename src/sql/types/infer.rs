@@ -351,6 +351,8 @@ pub fn sql_datatype_to_internal(dt: &SqlDataType) -> DataType {
                 "TIMESTAMPTZ" => DataType::TimestampTz,
                 "JSONB" => DataType::Jsonb,
                 "JSON" => DataType::Json,
+                "TSVECTOR" => DataType::Tsvector,
+                "TSQUERY" => DataType::Tsquery,
                 _ if name_str.to_uppercase().starts_with("VECTOR") => DataType::Vector(0),
                 _ => DataType::UserDefined(name_str),
             }

@@ -119,16 +119,20 @@ pub(crate) fn validate_bool_expr_in_boolean_context(
             // PostgreSQL JSONB existence operator: `jsonb ? text`
             BinaryOperator::Custom(op) if op == "?" => Ok(()),
             BinaryOperator::PGCustomBinaryOperator(op) if op.len() == 1 && op[0] == "?" => Ok(()),
+            // PostgreSQL FTS match operator: `tsvector @@ tsquery`
+            BinaryOperator::PGCustomBinaryOperator(op) if op.len() == 1 && op[0] == "@@" => Ok(()),
 
             _ => Err(anyhow!(err_msg)),
         },
 
         Expr::AnyOp { .. } | Expr::AllOp { .. } => Ok(()),
 
-        Expr::JsonAccess { operator, right, .. } => {
+        Expr::JsonAccess {
+            operator, right, ..
+        } => {
             use sqlparser::ast::JsonOperator;
             match operator {
-                JsonOperator::AtArrow | JsonOperator::ArrowAt => Ok(()),
+                JsonOperator::AtArrow | JsonOperator::ArrowAt | JsonOperator::AtAt => Ok(()),
                 // sqlparser-rs precedence quirk: expressions like `col ->> 'k' = 'v'` can be
                 // parsed as `JsonAccess(col, ->>, BinaryOp('k', =, 'v'))`. Our evaluator
                 // handles this form, so treat it as boolean in WHERE/FILTER contexts.

@@ -130,17 +130,19 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(
             | BinaryOperator::PGRegexNotMatch
             | BinaryOperator::PGRegexNotIMatch => Ok(()),
 
-            // PostgreSQL JSONB existence operator: `jsonb ? text`
             BinaryOperator::Custom(op) if op == "?" => Ok(()),
             BinaryOperator::PGCustomBinaryOperator(op) if op.len() == 1 && op[0] == "?" => Ok(()),
+            BinaryOperator::PGCustomBinaryOperator(op) if op.len() == 1 && op[0] == "@@" => Ok(()),
 
             _ => Err(anyhow!(err_msg)),
         },
 
-        Expr::JsonAccess { operator, right, .. } => {
+        Expr::JsonAccess {
+            operator, right, ..
+        } => {
             use sqlparser::ast::JsonOperator;
             match operator {
-                JsonOperator::AtArrow | JsonOperator::ArrowAt => Ok(()),
+                JsonOperator::AtArrow | JsonOperator::ArrowAt | JsonOperator::AtAt => Ok(()),
                 // See `validate_bool_expr_in_boolean_context` for rationale: sqlparser can
                 // attach comparison/IN expressions under the RHS of a JSON access.
                 JsonOperator::Arrow

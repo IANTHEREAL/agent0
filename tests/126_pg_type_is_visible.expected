@@ -1,0 +1,12 @@
+pg_type_is_visible
+t
+(1 row)
+pg_type_is_visible
+t
+(1 row)
+pg_type_is_visible
+t
+(1 row)
+is_visible
+t
+(1 row)

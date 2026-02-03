@@ -12,7 +12,7 @@ use sqlparser::ast::{BinaryOperator, Expr, JsonOperator};
 use super::expr::eval_expr;
 use super::helpers::normalize_ident;
 use super::operators::HashJoinConfig;
-use crate::types::{IndexDef, TableSchema, Value};
+use crate::types::{DataType, IndexDef, TableSchema, Value};
 
 /// Result of join algorithm selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -417,7 +417,18 @@ fn choose_gin_access_path(
     filter_expr: &Expr,
     estimated_table_rows: usize,
 ) -> Option<AccessPath> {
-    let (column, pattern) = extract_jsonb_contains_predicate(filter_expr)?;
+    let (column, pattern) = extract_gin_contains_predicate(filter_expr)?;
+
+    let col_idx = schema.column_index(&column)?;
+    let col_type = &schema.columns.get(col_idx)?.data_type;
+
+    let is_gin_compatible = matches!(
+        col_type,
+        DataType::Json | DataType::Jsonb | DataType::Array(_) | DataType::Tsvector
+    );
+    if !is_gin_compatible {
+        return None;
+    }
 
     let index = schema.indexes.iter().find(|idx| {
         idx.method
@@ -430,7 +441,6 @@ fn choose_gin_access_path(
             && idx.columns[0].eq_ignore_ascii_case(&column)
     })?;
 
-    // Without stats, assume `@>` is reasonably selective in typical workloads (Dify metadata).
     let selectivity = 0.01_f64;
     let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
     let cost = 0.5 + (estimated_rows as f64 * 0.2);
@@ -447,18 +457,32 @@ fn choose_gin_access_path(
     })
 }
 
-fn extract_jsonb_contains_predicate(expr: &Expr) -> Option<(String, Value)> {
+fn extract_gin_contains_predicate(expr: &Expr) -> Option<(String, Value)> {
     match expr {
-        Expr::Nested(inner) => extract_jsonb_contains_predicate(inner),
+        Expr::Nested(inner) => extract_gin_contains_predicate(inner),
         Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::And) => {
-            extract_jsonb_contains_predicate(left)
-                .or_else(|| extract_jsonb_contains_predicate(right))
+            extract_gin_contains_predicate(left).or_else(|| extract_gin_contains_predicate(right))
+        }
+        Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::PGCustomBinaryOperator(ops) if ops.len() == 1 && ops[0] == "@@") =>
+        {
+            let column = extract_column_name(left)?;
+            let pattern = eval_expr(right, None, None).ok()?;
+            Some((column, pattern))
         }
         Expr::JsonAccess {
             left,
             operator,
             right,
         } if matches!(operator, JsonOperator::AtArrow) => {
+            let column = extract_column_name(left)?;
+            let pattern = eval_expr(right, None, None).ok()?;
+            Some((column, pattern))
+        }
+        Expr::JsonAccess {
+            left,
+            operator,
+            right,
+        } if matches!(operator, JsonOperator::AtAt) => {
             let column = extract_column_name(left)?;
             let pattern = eval_expr(right, None, None).ok()?;
             Some((column, pattern))
@@ -812,10 +836,19 @@ mod tests {
 
     #[test]
     fn test_choose_gin_index_scan_for_jsonb_contains() {
+        use crate::types::ColumnDef;
         let schema = TableSchema {
             name: "test".to_string(),
             table_id: 1,
-            columns: vec![],
+            columns: vec![ColumnDef {
+                name: "metadata".to_string(),
+                data_type: DataType::Jsonb,
+                nullable: true,
+                default_expr: None,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+            }],
             version: 1,
             pk_constraint_name: None,
             pk_indices: vec![],

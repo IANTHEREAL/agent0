@@ -1628,6 +1628,9 @@ fn value_to_sql_literal(value: &crate::types::Value) -> String {
             let secs = total_secs % 60;
             format!("'{:02}:{:02}:{:02}'", hours, mins, secs)
         }
+        crate::types::Value::Tsvector(s) | crate::types::Value::Tsquery(s) => {
+            format!("'{}'", s.replace('\'', "''"))
+        }
     }
 }
 

@@ -76,6 +76,8 @@ pub enum DataType {
         scale: Option<u32>,
     },
     TimestampTz,
+    Tsvector,
+    Tsquery,
 }
 
 impl DataType {
@@ -99,6 +101,8 @@ impl DataType {
             DataType::Date => 4,
             DataType::Numeric { .. } => 16,
             DataType::TimestampTz => 8,
+            DataType::Tsvector => 64,
+            DataType::Tsquery => 32,
         }
     }
 }
@@ -132,6 +136,8 @@ impl fmt::Display for DataType {
             } => write!(f, "NUMERIC({})", p),
             DataType::Numeric { .. } => write!(f, "NUMERIC"),
             DataType::TimestampTz => write!(f, "TIMESTAMPTZ"),
+            DataType::Tsvector => write!(f, "TSVECTOR"),
+            DataType::Tsquery => write!(f, "TSQUERY"),
         }
     }
 }
@@ -247,6 +253,8 @@ pub enum Value {
     Time(i64),
     Date(i32),
     Numeric(#[serde(with = "decimal_serde")] Decimal),
+    Tsvector(String),
+    Tsquery(String),
 }
 
 impl Value {
@@ -277,6 +285,8 @@ impl Value {
                 precision: None,
                 scale: Some(d.scale()),
             }),
+            Value::Tsvector(_) => Some(DataType::Tsvector),
+            Value::Tsquery(_) => Some(DataType::Tsquery),
         }
     }
 
@@ -370,6 +380,8 @@ impl fmt::Display for Value {
                 Err(_) => write!(f, "{days}"),
             },
             Value::Numeric(d) => write!(f, "{}", d),
+            Value::Tsvector(s) => write!(f, "{}", s),
+            Value::Tsquery(s) => write!(f, "{}", s),
         }
     }
 }

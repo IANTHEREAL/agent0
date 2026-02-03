@@ -105,6 +105,7 @@ fn hash_single_value_for_join<H: Hasher>(hasher: &mut H, value: &Value) {
                 Value::Json(s) | Value::Jsonb(s) => s.hash(hasher),
                 Value::Time(t) => t.hash(hasher),
                 Value::Date(d) => d.hash(hasher),
+                Value::Tsvector(s) | Value::Tsquery(s) => s.hash(hasher),
                 Value::Int32(_)
                 | Value::Int64(_)
                 | Value::Numeric(_)

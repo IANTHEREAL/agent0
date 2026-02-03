@@ -24,6 +24,20 @@
 ### Prisma - DONE
 - [x] Extended Query parameter binding works
 
+### FTS Performance Optimization - DONE ✅
+- [x] HashSet 替代 Vec::contains (O(n*m) → O(n+m))
+- [x] GIN 索引支持 `@@` 操作符
+- [x] TSVECTOR/TSQUERY 类型正确映射到 GIN
+- [x] Python TODO app 验证通过
+- [x] ORM 回归测试通过 (537 pass, 4 pre-existing failures)
+- [ ] 二进制格式存储 (P1 - deferred, text format works correctly)
+
+---
+
+## IN PROGRESS 🔄
+
+(No active items)
+
 ---
 
 ## HIGH ROI - Fix These First

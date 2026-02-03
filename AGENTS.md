@@ -455,3 +455,40 @@ cd orm-tests && npm test -- --grep "TypeORM"
 - The `EvalContext` trait needs methods for: `resolve_column(name)`, `resolve_compound_identifier(parts)`, `schema()`, `is_timestamptz(expr)`, and `column_type(expr)` to fully abstract single-table vs JOIN evaluation.
 - For `JoinEvalContext`, column resolution requires case-insensitive fallback searches and special handling for ORM-style aliases (e.g., Sequelize's `table->association` patterns).
 - Full code deduplication requires converting helper functions (`eval_function`, `eval_substring`, `eval_extract`, etc.) to be context-aware - this is a substantial undertaking best done incrementally.
+
+## Lessons Learned (SQLAlchemy Compatibility)
+
+- For ORM compatibility functions like `pg_type_is_visible(oid)`, a stub returning `true` is often sufficient since ORMs use these for introspection, not critical logic.
+- pgwire re-exports `postgres_types::Type` which includes all PostgreSQL array types (`Type::INT4_ARRAY`, `Type::TEXT_ARRAY`, etc.) - no need to define custom OIDs.
+- When `datatype_to_pgtype()` returns `Type::TEXT` for arrays, Python drivers (psycopg2/asyncpg) receive strings instead of lists. The fix is mapping `DataType::Array(inner)` to the corresponding `Type::*_ARRAY` based on the element type.
+- For trigger validation, pre-check the trigger body for unsupported functions (like FTS functions `to_tsvector`, `plainto_tsquery`) before execution. This gives clearer error messages than runtime failures.
+- The `UNSUPPORTED_FTS_FUNCTIONS` list in `triggers.rs` should be case-insensitive and check both the function body text and parsed AST for comprehensive coverage.
+
+## Lessons Learned (GIN Index for ARRAY)
+
+- Extending GIN indexes to support ARRAY columns requires changes in 4 places: `gin.rs` (token extraction), `ddl.rs` + `dml.rs` (index maintenance), `planner.rs` (query optimization), and `executor/select.rs` (scan execution).
+- The `supported_gin_index_column()` function signature changed from `Option<usize>` to `Option<(usize, bool)>` where the bool indicates whether it's an ARRAY column (vs JSON/JSONB).
+- ARRAY GIN tokens use a different prefix ('A') than JSON tokens to avoid hash collisions between array elements and JSON key-values.
+- The planner's `choose_gin_access_path()` must verify the column type matches the GIN-compatible types before selecting the index scan path.
+- PostgreSQL overloads `@>` for both JSONB containment and ARRAY containment; the same `JsonOperator::AtArrow` AST node is used for both, distinguished by operand types at runtime.
+
+## Lessons Learned (Full-Text Search MVP)
+
+- sqlparser-rs parses the `@@` operator as `Expr::JsonAccess` with `JsonOperator::AtAt`, not as a `BinaryOperator`. Handle it in `eval_json_access()` before the JSON/array paths.
+- For FTS boolean validation, add `JsonOperator::AtAt` to the match arms in both `boolean.rs` and `evaluator.rs` to allow `@@` in WHERE clauses.
+- MVP FTS implementation uses simple space-based tokenization with lowercasing; no stemming or language-specific processing. Store tsvector as `'word':posA 'word2':pos2A` format.
+- `ts_match()` in `src/sql/fts.rs` handles both `Value::Tsvector`/`Value::Tsquery` and `Value::Text` for flexibility with different evaluation paths.
+- For tsquery matching, support both `&` (AND) and `|` (OR) operators; default to AND semantics when no operator present.
+- `ts_rank()` returns a simple ratio: (matched_terms / total_query_terms). Production systems need TF-IDF or more sophisticated ranking.
+- Function registration goes in `src/sql/expr/functions/fts.rs`, delegating to core logic in `src/sql/fts.rs` to keep function wrappers thin.
+
+## Lessons Learned (FTS Performance Optimization)
+
+- The `@@` operator is parsed as `BinaryOperator::PGCustomBinaryOperator(["@@"])`, NOT as `JsonOperator::AtAt` (though some code paths also emit `AtAt`). Handle both in planner/executor.
+- TSVECTOR/TSQUERY types must be added to THREE separate type conversion functions: `convert_data_type()` in helpers.rs, `resolve_column_data_type()` in ddl.rs, and `sql_datatype_to_internal()` in types/infer.rs. Missing any one causes column type to default to TEXT, breaking GIN index selection.
+- GIN token prefix 'T' for tsvector tokens distinguishes them from JSON ('J') and ARRAY ('A') tokens to avoid hash collisions.
+- For O(n+m) FTS matching, return `HashSet<String>` from `extract_tsvector_words()` instead of `Vec<String>`. This eliminates `Vec::contains()` O(n) lookups per query term.
+- The `GinColumnType` enum (`Json`, `Array`, `Tsvector`) provides clean dispatch in DML/DDL for index maintenance. Prefer explicit enum variants over boolean flags.
+- Column type MUST be `DataType::Tsvector` (not `DataType::Text`) for the planner's `choose_gin_access_path()` to select GIN index scan. If columns show as TEXT in schema, GIN index won't be used.
+- For planner GIN predicate extraction, handle both `Expr::BinaryOp` with `PGCustomBinaryOperator(["@@"])` and `Expr::JsonAccess` with `JsonOperator::AtAt` to catch all parser output variations.
+- Binary format storage for tsvector (Sprint 5.3) is a P1 optimization - text format works correctly and can be optimized later based on profiling.

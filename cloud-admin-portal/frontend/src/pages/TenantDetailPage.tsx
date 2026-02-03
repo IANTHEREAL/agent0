@@ -122,19 +122,19 @@ export function TenantDetailPage() {
     }
   }
 
-  const copyConnectionString = async (endpoint?: { host: string; port: number }) => {
-    const host = endpoint?.host || tenant?.endpoints?.[0]?.host || '127.0.0.1'
-    const port = endpoint?.port || tenant?.endpoints?.[0]?.port || 5433
-    const connStr = `psql -h ${host} -p ${port} -U t${tenantId}.admin -d postgres`
-    
+  const copyConnectionString = async (text: string, type: string) => {
     try {
-      await navigator.clipboard.writeText(connStr)
+      await navigator.clipboard.writeText(text)
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
+      toast({
+        title: "Copied",
+        description: `${type} connection string copied to clipboard`,
+      })
     } catch {
       // Fallback for non-secure contexts or when clipboard API fails
       const textArea = document.createElement('textarea')
-      textArea.value = connStr
+      textArea.value = text
       textArea.style.position = 'fixed'
       textArea.style.left = '-9999px'
       document.body.appendChild(textArea)
@@ -143,6 +143,10 @@ export function TenantDetailPage() {
         document.execCommand('copy')
         setCopied(true)
         setTimeout(() => setCopied(false), 2000)
+        toast({
+          title: "Copied",
+          description: `${type} connection string copied to clipboard`,
+        })
       } catch {
         toast({
           title: "Copy failed",
@@ -246,22 +250,49 @@ export function TenantDetailPage() {
                         <span className="font-mono font-medium bg-background/50 px-1.5 py-0.5 rounded">{endpoint.port}</span>
                       </div>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <code className="flex-1 bg-background/60 border border-border/30 px-3 py-2 rounded-md text-xs font-mono text-muted-foreground">
-                        psql -h {endpoint.host} -p {endpoint.port} -U t{tenantId}.admin -d postgres
-                      </code>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        className="h-8 w-8 p-0 hover:bg-primary/10"
-                        onClick={() => copyConnectionString(endpoint)}
-                      >
-                        {copied ? (
-                          <Check className="w-4 h-4 text-green-500" />
-                        ) : (
-                          <Copy className="w-4 h-4 text-muted-foreground" />
-                        )}
-                      </Button>
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] text-muted-foreground uppercase tracking-wide font-medium min-w-[36px]">psql</span>
+                        <code className="flex-1 bg-background/60 border border-border/30 px-3 py-2 rounded-md text-xs font-mono text-muted-foreground">
+                          psql -h {endpoint.host} -p {endpoint.port} -U t{tenantId}.admin -d postgres
+                        </code>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-8 w-8 p-0 hover:bg-primary/10"
+                          onClick={() => copyConnectionString(
+                            `psql -h ${endpoint.host} -p ${endpoint.port} -U t${tenantId}.admin -d postgres`,
+                            "psql"
+                          )}
+                        >
+                          {copied ? (
+                            <Check className="w-4 h-4 text-green-500" />
+                          ) : (
+                            <Copy className="w-4 h-4 text-muted-foreground" />
+                          )}
+                        </Button>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] text-muted-foreground uppercase tracking-wide font-medium min-w-[36px]">DSN</span>
+                        <code className="flex-1 bg-background/60 border border-border/30 px-3 py-2 rounded-md text-xs font-mono text-muted-foreground">
+                          postgresql://t{tenantId}.admin@{endpoint.host}:{endpoint.port}/postgres
+                        </code>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          className="h-8 w-8 p-0 hover:bg-primary/10"
+                          onClick={() => copyConnectionString(
+                            `postgresql://t${tenantId}.admin@${endpoint.host}:${endpoint.port}/postgres`,
+                            "DSN"
+                          )}
+                        >
+                          {copied ? (
+                            <Check className="w-4 h-4 text-green-500" />
+                          ) : (
+                            <Copy className="w-4 h-4 text-muted-foreground" />
+                          )}
+                        </Button>
+                      </div>
                     </div>
                   </div>
                 </div>

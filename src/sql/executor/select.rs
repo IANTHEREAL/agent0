@@ -950,57 +950,67 @@ impl Executor {
                                 return Err(anyhow!("GIN index not found"));
                             };
 
-                            let pattern_text = match pattern {
-                                Value::Json(s) | Value::Jsonb(s) | Value::Text(s) => Some(s.as_str()),
-                                Value::Null => None,
+                            let token_hashes = match &pattern {
+                                Value::Array(arr) => {
+                                    gin::extract_array_gin_tokens(arr)
+                                }
+                                Value::Tsquery(s) => {
+                                    gin::extract_tsquery_gin_tokens(s)
+                                }
+                                Value::Tsvector(s) => {
+                                    gin::extract_tsvector_gin_tokens(s)
+                                }
+                                Value::Json(s) | Value::Jsonb(s) => {
+                                    let pattern_json: serde_json::Value =
+                                        serde_json::from_str(s)
+                                            .map_err(|e| anyhow!("Invalid JSONB pattern for @>: {}", e))?;
+                                    gin::extract_gin_tokens(&pattern_json).into_scan_hashes()
+                                }
+                                Value::Text(s) => {
+                                    if let Ok(pattern_json) = serde_json::from_str::<serde_json::Value>(s) {
+                                        gin::extract_gin_tokens(&pattern_json).into_scan_hashes()
+                                    } else {
+                                        gin::extract_tsquery_gin_tokens(s)
+                                    }
+                                }
+                                Value::Null => Vec::new(),
                                 other => {
                                     return Err(anyhow!(
-                                        "GIN pattern must be json/jsonb, got {}",
+                                        "GIN pattern must be array, json/jsonb, or tsquery, got {}",
                                         other.data_type().unwrap_or(DataType::Text)
                                     ));
                                 }
                             };
 
-                            if let Some(pattern_text) = pattern_text {
-                                let pattern_json: serde_json::Value =
-                                    serde_json::from_str(pattern_text)
-                                        .map_err(|e| anyhow!("Invalid JSONB pattern for @>: {}", e))?;
-                                let token_hashes =
-                                    gin::extract_gin_tokens(&pattern_json).into_scan_hashes();
-                                if token_hashes.is_empty() {
-                                    // Patterns like '{}' yield no tokens; fall back to a full scan.
-                                    debug!(
-                                        "GIN predicate yields no tokens; falling back to full scan (index: {})",
-                                        index_name
-                                    );
-                                    self.scan_and_fill(txn, db_id, &t, &schema).await?
-                                } else {
-                                    debug!(
-                                        "Using GIN Index Scan on {} (cost: {:.2})",
-                                        index_name, access_path.cost
-                                    );
-                                    let pk_keys = self
-                                        .store()
-                                        .scan_gin_index_intersection(
-                                            txn,
-                                            db_id,
-                                            schema.table_id,
-                                            idx.id,
-                                            &token_hashes,
-                                        )
-                                        .await?;
-                                    let mut rows = self
-                                        .store()
-                                        .batch_get_rows_by_pk_keys(txn, db_id, schema.table_id, pk_keys)
-                                        .await?;
-                                    for r in &mut rows {
-                                        fill_row_defaults(r, &schema)?;
-                                    }
-                                    rows
-                                }
+                            if token_hashes.is_empty() {
+                                debug!(
+                                    "GIN predicate yields no tokens; falling back to full scan (index: {})",
+                                    index_name
+                                );
+                                self.scan_and_fill(txn, db_id, &t, &schema).await?
                             } else {
-                                // `col @> NULL` yields NULL, which is treated as false in WHERE.
-                                Vec::new()
+                                debug!(
+                                    "Using GIN Index Scan on {} (cost: {:.2})",
+                                    index_name, access_path.cost
+                                );
+                                let pk_keys = self
+                                    .store()
+                                    .scan_gin_index_intersection(
+                                        txn,
+                                        db_id,
+                                        schema.table_id,
+                                        idx.id,
+                                        &token_hashes,
+                                    )
+                                    .await?;
+                                let mut rows = self
+                                    .store()
+                                    .batch_get_rows_by_pk_keys(txn, db_id, schema.table_id, pk_keys)
+                                    .await?;
+                                for r in &mut rows {
+                                    fill_row_defaults(r, &schema)?;
+                                }
+                                rows
                             }
                         }
                         ScanType::IndexScan {

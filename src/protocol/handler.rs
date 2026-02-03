@@ -5350,10 +5350,29 @@ fn datatype_to_pgtype(dt: Option<&DataType>) -> Type {
         Some(DataType::Jsonb) => Type::JSONB,
         Some(DataType::Time) => Type::TIME,
         Some(DataType::Numeric { .. }) => Type::NUMERIC,
+        Some(DataType::Array(inner)) => match inner.as_ref() {
+            DataType::Boolean => Type::BOOL_ARRAY,
+            DataType::Int32 => Type::INT4_ARRAY,
+            DataType::Int64 => Type::INT8_ARRAY,
+            DataType::Float64 => Type::FLOAT8_ARRAY,
+            DataType::Text => Type::TEXT_ARRAY,
+            DataType::Timestamp => Type::TIMESTAMP_ARRAY,
+            DataType::TimestampTz => Type::TIMESTAMPTZ_ARRAY,
+            DataType::Date => Type::DATE_ARRAY,
+            DataType::Interval => Type::INTERVAL_ARRAY,
+            DataType::Uuid => Type::UUID_ARRAY,
+            DataType::Bytes => Type::BYTEA_ARRAY,
+            DataType::Json => Type::JSON_ARRAY,
+            DataType::Jsonb => Type::JSONB_ARRAY,
+            DataType::Time => Type::TIME_ARRAY,
+            DataType::Numeric { .. } => Type::NUMERIC_ARRAY,
+            _ => Type::TEXT_ARRAY,
+        },
         Some(DataType::Vector(_))
-        | Some(DataType::Array(_))
         | Some(DataType::Text)
         | Some(DataType::UserDefined(_))
+        | Some(DataType::Tsvector)
+        | Some(DataType::Tsquery)
         | None => Type::TEXT,
     }
 }
@@ -5743,49 +5762,23 @@ fn encode_value(
             encoder.encode_field(&uuid.to_string())
         }
         Value::Array(elems) => {
-            fn needs_array_quotes(s: &str) -> bool {
-                s.is_empty()
-                    || s.eq_ignore_ascii_case("NULL")
-                    || s.chars()
-                        .any(|c| c.is_whitespace() || matches!(c, '{' | '}' | ',' | '"' | '\\'))
-            }
-
-            fn escape_array_element(s: &str) -> String {
-                let mut out = String::with_capacity(s.len());
-                for ch in s.chars() {
-                    match ch {
-                        '\\' => out.push_str("\\\\"),
-                        '"' => out.push_str("\\\""),
-                        other => out.push(other),
+            fn value_to_string(v: &Value) -> String {
+                match v {
+                    Value::Null => "NULL".to_string(),
+                    Value::Text(t) => t.clone(),
+                    Value::Boolean(b) => if *b { "t" } else { "f" }.to_string(),
+                    Value::Int32(i) => i.to_string(),
+                    Value::Int64(i) => i.to_string(),
+                    Value::Float64(f) => f.to_string(),
+                    Value::Array(nested) => {
+                        let parts: Vec<String> = nested.iter().map(value_to_string).collect();
+                        format!("{{{}}}", parts.join(","))
                     }
+                    other => other.to_string(),
                 }
-                out
             }
-
-            fn encode_array(elems: &[Value]) -> String {
-                let mut parts = Vec::with_capacity(elems.len());
-                for elem in elems {
-                    let part = match elem {
-                        Value::Null => "NULL".to_string(),
-                        Value::Array(nested) => encode_array(nested),
-                        other => {
-                            let s = match other {
-                                Value::Text(t) => t.clone(),
-                                v => v.to_string(),
-                            };
-                            if needs_array_quotes(&s) {
-                                format!("\"{}\"", escape_array_element(&s))
-                            } else {
-                                s
-                            }
-                        }
-                    };
-                    parts.push(part);
-                }
-                format!("{{{}}}", parts.join(","))
-            }
-
-            encoder.encode_field(&encode_array(elems))
+            let string_elems: Vec<String> = elems.iter().map(value_to_string).collect();
+            encoder.encode_field(&string_elems)
         }
         Value::Json(s) => encoder.encode_field(s),
         Value::Jsonb(s) => {
@@ -5884,6 +5877,7 @@ fn encode_value(
             encoder.encode_field(&s)
         }
         Value::Numeric(d) => encoder.encode_field(&d.to_string()),
+        Value::Tsvector(s) | Value::Tsquery(s) => encoder.encode_field(s),
     }
 }
 

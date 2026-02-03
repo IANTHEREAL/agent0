@@ -29,8 +29,8 @@ use rust_decimal::Decimal;
 use std::str::FromStr;
 
 use super::expr::{coerce_text_literal_to_bool, eval_expr, eval_expr_join, JoinContext};
-use super::Aggregator;
 use super::value_key::serialize_values_for_key;
+use super::Aggregator;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
 /// Deduplicate rows based on their serialized values
@@ -86,16 +86,14 @@ pub fn distinct_on_rows_join(
     combined_schema: &TableSchema,
     merged_column_offsets: Option<&std::collections::HashMap<String, Vec<usize>>>,
 ) -> Result<Vec<Row>> {
-    Ok(
-        distinct_on_rows_join_with_indices(
-            rows,
-            on_exprs,
-            column_offsets,
-            combined_schema,
-            merged_column_offsets,
-        )?
-        .0,
-    )
+    Ok(distinct_on_rows_join_with_indices(
+        rows,
+        on_exprs,
+        column_offsets,
+        combined_schema,
+        merged_column_offsets,
+    )?
+    .0)
 }
 
 pub fn distinct_on_rows_join_with_indices(
@@ -303,8 +301,8 @@ pub fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Value> {
             } else {
                 inner.split(',').map(|e| e.trim().parse::<f64>()).collect()
             };
-            let vec = elements
-                .map_err(|_| anyhow!("invalid input syntax for type vector: \"{}\"", s))?;
+            let vec =
+                elements.map_err(|_| anyhow!("invalid input syntax for type vector: \"{}\"", s))?;
             if vec.len() != *dim as usize {
                 return Err(anyhow!(
                     "vector has wrong dimensions: expected {}, got {}",
@@ -435,6 +433,9 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
             )))
         }
         Value::Numeric(d) => Expr::Value(SqlValue::Number(d.to_string(), false)),
+        Value::Tsvector(s) | Value::Tsquery(s) => {
+            Expr::Value(SqlValue::SingleQuotedString(s.clone()))
+        }
     }
 }
 
@@ -590,6 +591,8 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
                         };
                         Ok(DataType::Vector(dim))
                     }
+                    "TSVECTOR" => Ok(DataType::Tsvector),
+                    "TSQUERY" => Ok(DataType::Tsquery),
                     _ => Ok(DataType::Text),
                 }
             } else {
@@ -1163,6 +1166,8 @@ pub fn infer_data_type(value: &Value) -> DataType {
             precision: None,
             scale: None,
         },
+        Value::Tsvector(_) => DataType::Tsvector,
+        Value::Tsquery(_) => DataType::Tsquery,
     }
 }
 
@@ -1379,8 +1384,8 @@ mod tests {
     #[test]
     fn test_coerce_timestamp_time_array_vector_from_text() {
         let ts_col = test_col("ts", DataType::Timestamp);
-        let got = coerce_value_for_column(Value::Text("2026-01-01 00:00:00".into()), &ts_col)
-            .unwrap();
+        let got =
+            coerce_value_for_column(Value::Text("2026-01-01 00:00:00".into()), &ts_col).unwrap();
         assert!(matches!(got, Value::Timestamp(_)));
 
         let tstz_col = test_col("tsz", DataType::TimestampTz);
@@ -1397,8 +1402,8 @@ mod tests {
         assert!(ts_bad.contains("invalid input syntax for type timestamp"));
 
         let time_col = test_col("t", DataType::Time);
-        let got = coerce_value_for_column(Value::Text("01:02:03.004005".into()), &time_col)
-            .unwrap();
+        let got =
+            coerce_value_for_column(Value::Text("01:02:03.004005".into()), &time_col).unwrap();
         assert_eq!(got, Value::Time(3_723_004_005));
 
         let time_bad = coerce_value_for_column(Value::Text("99:99".into()), &time_col)
@@ -1467,7 +1472,8 @@ mod tests {
         assert!(!args_match(&count_x, &count_distinct_x));
 
         let count_star = parse_first_projection_function("SELECT COUNT(*)");
-        let count_star_filter = parse_first_projection_function("SELECT COUNT(*) FILTER (WHERE x > 0)");
+        let count_star_filter =
+            parse_first_projection_function("SELECT COUNT(*) FILTER (WHERE x > 0)");
         assert!(!args_match(&count_star, &count_star_filter));
 
         let count_star_filter_same =
@@ -1501,7 +1507,8 @@ mod tests {
     #[test]
     fn test_eval_having_expr_matches_filtered_aggregate_call() {
         let count_star = parse_first_projection_function("SELECT COUNT(*)");
-        let count_star_filter = parse_first_projection_function("SELECT COUNT(*) FILTER (WHERE x > 0)");
+        let count_star_filter =
+            parse_first_projection_function("SELECT COUNT(*) FILTER (WHERE x > 0)");
 
         let agg_funcs = vec![
             (0, AggExpr::Function(count_star)),
@@ -1519,8 +1526,14 @@ mod tests {
         let row = Row::new(vec![]);
         let schema = TableSchema::default();
         let expr = sqlparser::ast::Expr::Function(count_star_filter);
-        let result = eval_having_expr(&expr, &row, &schema, &agg_funcs, &[count_all, count_filtered])
-            .unwrap();
+        let result = eval_having_expr(
+            &expr,
+            &row,
+            &schema,
+            &agg_funcs,
+            &[count_all, count_filtered],
+        )
+        .unwrap();
         assert_eq!(result, Value::Int64(1));
     }
 
@@ -1909,7 +1922,10 @@ mod tests {
             vec![],
         );
 
-        let rows = vec![Row::new(vec![Value::Int32(1)]), Row::new(vec![Value::Int32(2)])];
+        let rows = vec![
+            Row::new(vec![Value::Int32(1)]),
+            Row::new(vec![Value::Int32(2)]),
+        ];
         let on_exprs = vec![sqlparser::ast::Expr::Identifier(
             sqlparser::ast::Ident::new("missing_col"),
         )];
@@ -1970,7 +1986,10 @@ mod tests {
         let mut offsets = HashMap::new();
         offsets.insert("a".to_string(), 0);
 
-        let rows = vec![Row::new(vec![Value::Int32(1)]), Row::new(vec![Value::Int32(2)])];
+        let rows = vec![
+            Row::new(vec![Value::Int32(1)]),
+            Row::new(vec![Value::Int32(2)]),
+        ];
         let on_exprs = vec![sqlparser::ast::Expr::Identifier(
             sqlparser::ast::Ident::new("missing_col"),
         )];
@@ -2019,8 +2038,7 @@ mod tests {
         assert_eq!(result[0].values[0], Value::Int32(11));
         assert_eq!(result[1].values[0], Value::Int32(12));
 
-        let statements =
-            Parser::parse_sql(&dialect, "SELECT 1 FETCH FIRST '2' ROWS ONLY").unwrap();
+        let statements = Parser::parse_sql(&dialect, "SELECT 1 FETCH FIRST '2' ROWS ONLY").unwrap();
         let query = match &statements[0] {
             sqlparser::ast::Statement::Query(q) => q.as_ref(),
             _ => panic!("expected query"),
@@ -2192,16 +2210,14 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
             .parse::<i64>()
             .map(Value::Int64)
             .map_err(|_| anyhow!("invalid input syntax for type bigint: \"{}\"", unescaped)),
-        DataType::Float64 => trimmed
-            .parse::<f64>()
-            .map(Value::Float64)
-            .map_err(|_| anyhow!("invalid input syntax for type double precision: \"{}\"", unescaped)),
-        DataType::Timestamp => super::expr::parse_timestamp_string(trimmed).map_err(|_| {
+        DataType::Float64 => trimmed.parse::<f64>().map(Value::Float64).map_err(|_| {
             anyhow!(
-                "invalid input syntax for type timestamp: \"{}\"",
+                "invalid input syntax for type double precision: \"{}\"",
                 unescaped
             )
         }),
+        DataType::Timestamp => super::expr::parse_timestamp_string(trimmed)
+            .map_err(|_| anyhow!("invalid input syntax for type timestamp: \"{}\"", unescaped)),
         DataType::TimestampTz => super::expr::parse_timestamp_string(trimmed).map_err(|_| {
             anyhow!(
                 "invalid input syntax for type timestamp with time zone: \"{}\"",
@@ -2223,23 +2239,15 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
                 Ok(Value::Bytes(unescaped.into_bytes()))
             }
         }
-        DataType::Time => {
-            parse_time_string(trimmed)
-                .map(Value::Time)
-                .ok_or_else(|| anyhow!("invalid input syntax for type time: \"{}\"", unescaped))
-        }
-        DataType::Interval => super::expr::parse_interval_string(trimmed).map_err(|_| {
-            anyhow!(
-                "invalid input syntax for type interval: \"{}\"",
-                unescaped
-            )
-        }),
+        DataType::Time => parse_time_string(trimmed)
+            .map(Value::Time)
+            .ok_or_else(|| anyhow!("invalid input syntax for type time: \"{}\"", unescaped)),
+        DataType::Interval => super::expr::parse_interval_string(trimmed)
+            .map_err(|_| anyhow!("invalid input syntax for type interval: \"{}\"", unescaped)),
         DataType::Text | DataType::UserDefined(_) => Ok(Value::Text(unescaped)),
-        DataType::Array(_) => {
-            parse_pg_array(trimmed)
-                .map(Value::Array)
-                .map_err(|_| anyhow!("invalid input syntax for type array: \"{}\"", unescaped))
-        }
+        DataType::Array(_) => parse_pg_array(trimmed)
+            .map(Value::Array)
+            .map_err(|_| anyhow!("invalid input syntax for type array: \"{}\"", unescaped)),
         DataType::Json => {
             serde_json::from_str::<serde_json::Value>(&unescaped)
                 .map_err(|e| anyhow!("invalid input syntax for type json: {}", e))?;
@@ -2273,6 +2281,8 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
             }
             Ok(Value::Numeric(d))
         }
+        DataType::Tsvector => Ok(Value::Tsvector(unescaped)),
+        DataType::Tsquery => Ok(Value::Tsquery(unescaped)),
     }
 }
 
@@ -2307,7 +2317,8 @@ mod copy_parse_tests {
     fn parse_value_for_copy_rejects_invalid_time_instead_of_falling_back_to_text() {
         let err = parse_value_for_copy("25:00:00", &DataType::Time).unwrap_err();
         assert!(
-            err.to_string().contains("invalid input syntax for type time"),
+            err.to_string()
+                .contains("invalid input syntax for type time"),
             "unexpected error: {err:?}"
         );
     }

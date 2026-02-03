@@ -1,0 +1,16 @@
+id|title
+1|PostgreSQL Tutorial
+(1 row)
+id|title
+4|Database Indexing
+(1 row)
+id|title|rank
+1|PostgreSQL Tutorial|1
+4|Database Indexing|1
+(2 rows)
+id|title
+(0 rows)
+QUERY PLAN
+Index Scan using idx_fts_search on fts_articles  (cost=0.15..0.25 rows=10 width=132)
+  Index Cond: search_vector @@ plainto_tsquery('postgresql')
+(2 rows)

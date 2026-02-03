@@ -237,7 +237,10 @@ mod tests {
 
     #[test]
     fn formats_timestamptz_in_named_zone() {
-        let dt = Utc.with_ymd_and_hms(2024, 1, 15, 10, 0, 0).single().unwrap();
+        let dt = Utc
+            .with_ymd_and_hms(2024, 1, 15, 10, 0, 0)
+            .single()
+            .unwrap();
         let tz = TimeZoneSpec::parse("America/Los_Angeles");
         assert_eq!(
             tz.format_timestamptz(dt, 0),
@@ -247,7 +250,10 @@ mod tests {
 
     #[test]
     fn formats_timestamptz_in_fixed_offset() {
-        let dt = Utc.with_ymd_and_hms(2024, 1, 15, 10, 0, 0).single().unwrap();
+        let dt = Utc
+            .with_ymd_and_hms(2024, 1, 15, 10, 0, 0)
+            .single()
+            .unwrap();
         let tz = TimeZoneSpec::parse("+08:00");
         assert_eq!(
             tz.format_timestamptz(dt, 0),
