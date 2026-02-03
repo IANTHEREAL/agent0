@@ -2051,9 +2051,16 @@ impl TikvStore {
                 .collect();
 
             if !dependent_triggers.is_empty() && !cascade {
+                let func_name = full_name.rsplit('.').next().unwrap_or(full_name);
+                let func_sig = format!("{}()", func_name);
+                let trigger = &dependent_triggers[0];
+                let table_name = trigger.table.rsplit('.').next().unwrap_or(&trigger.table);
                 return Err(anyhow!(
-                    "cannot drop function '{}': other objects depend on it",
-                    full_name
+                    "cannot drop function {} because other objects depend on it\nDETAIL:  trigger {} on table {} depends on function {}\nHINT:  Use DROP ... CASCADE to drop the dependent objects too.",
+                    func_sig,
+                    trigger.name,
+                    table_name,
+                    func_sig
                 ));
             }
 

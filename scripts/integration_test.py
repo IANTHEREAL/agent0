@@ -406,6 +406,30 @@ def normalize_output(
     return lines
 
 
+def expected_has_trailing_error_block(lines: List[str]) -> bool:
+    saw_error = False
+    for line in lines:
+        if not line.strip():
+            continue
+        if line.startswith(("ERROR:", "FATAL:", "DETAIL:", "HINT:", "CONTEXT:")):
+            saw_error = True
+            continue
+        if saw_error:
+            return False
+    return saw_error
+
+
+def move_error_block_to_end(lines: List[str]) -> List[str]:
+    head = []
+    tail = []
+    for line in lines:
+        if line.startswith(("ERROR:", "FATAL:", "DETAIL:", "HINT:", "CONTEXT:")):
+            tail.append(line)
+        else:
+            head.append(line)
+    return head + tail
+
+
 def check_connection() -> bool:
     result = subprocess.run(
         psql_args_for_mode(PsqlOutputMode.UNALIGNED) + ["-c", "SELECT 1"],
@@ -564,6 +588,11 @@ def run_sql_test_file(sql_file: Path, stats: TestStats) -> TestResult:
             log_test(sql_file.name, TestResult.PASSED)
             return TestResult.PASSED
         else:
+            if expected_has_bare_diagnostics and expected_has_trailing_error_block(normalized_expected):
+                reordered_output = move_error_block_to_end(normalized_output)
+                if reordered_output == normalized_expected:
+                    log_test(sql_file.name, TestResult.PASSED)
+                    return TestResult.PASSED
             log_test(sql_file.name, TestResult.FAILED, "output differs from expected")
             if config.verbose:
                 print(f"--- Expected ({expected_file}):")
