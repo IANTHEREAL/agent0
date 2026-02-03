@@ -63,7 +63,7 @@ curl -sS -X POST http://127.0.0.1:2379/pd/api/v2/keyspaces \
 ```bash
 git clone https://github.com/c4pt0r/tipg.git
 cd tipg
-cargo build --release
+cargo build --release --locked
 ```
 
 ## Running pg-tikv
@@ -83,12 +83,19 @@ PG_KEYSPACE=default \
 ./target/release/pg-tikv
 ```
 
+## Security Note
+
+By default, pg-tikv binds to `0.0.0.0:${PG_PORT}` and bootstraps a superuser `admin` with password `admin` per keyspace. Do not expose this to the public internet. For production-like usage, change the default password and enable TLS (see `docs/authentication.md` and `docs/release-notes-v0.1.0.md`).
+
 ## Connecting
 
 ### Basic Connection
 
 ```bash
-psql -h 127.0.0.1 -p 5433 -U admin
+pg_isready -h 127.0.0.1 -p 5433
+psql -h 127.0.0.1 -p 5433 -U admin -d postgres -c "SELECT 1;"
+# Or open an interactive shell:
+psql -h 127.0.0.1 -p 5433 -U admin -d postgres
 # Password: admin (default)
 ```
 
@@ -96,11 +103,11 @@ psql -h 127.0.0.1 -p 5433 -U admin
 
 ```bash
 # Connect to tenant_a keyspace
-psql -h 127.0.0.1 -p 5433 -U tenant_a.admin
+psql -h 127.0.0.1 -p 5433 -U tenant_a.admin -d postgres
 # Password: admin
 
 # Connect to tenant_b keyspace
-psql -h 127.0.0.1 -p 5433 -U tenant_b.admin
+psql -h 127.0.0.1 -p 5433 -U tenant_b.admin -d postgres
 # Password: admin
 ```
 
