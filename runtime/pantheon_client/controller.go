@@ -93,10 +93,6 @@ func runControllerWithClient(ctx context.Context, cfg ControllerConfig, client a
 	if err != nil {
 		return err
 	}
-	if cfg.Rebootstrap && strings.TrimSpace(state.ActiveBranch) != "" {
-		return fmt.Errorf("cannot rebootstrap with an active episode branch in progress (active_episode_branch_id=%s)", strings.TrimSpace(state.ActiveBranch))
-	}
-	bootstrapNeeded := cfg.Rebootstrap || !state.Initialized
 
 	applyControllerOverrides(&state, cfg)
 	normalizeControllerDefaults(&state)
@@ -104,6 +100,24 @@ func runControllerWithClient(ctx context.Context, cfg ControllerConfig, client a
 	if client == nil {
 		client = NewMCPClient(state.MCPBaseURL)
 	}
+
+	if cfg.Rebootstrap && strings.TrimSpace(state.ActiveBranch) != "" {
+		activeBranch := strings.TrimSpace(state.ActiveBranch)
+		running, status, err := isBranchRunning(client, activeBranch)
+		if err != nil {
+			return fmt.Errorf("check active episode branch %s before rebootstrap: %w", activeBranch, err)
+		}
+		if running {
+			msg := fmt.Sprintf("cannot rebootstrap with an active episode branch still running (active_episode_branch_id=%s)", activeBranch)
+			if status != "" {
+				msg = fmt.Sprintf("%s (status=%s)", msg, status)
+			}
+			return fmt.Errorf("%s", msg)
+		}
+		logx.Infof("Clearing stopped active_episode_branch_id=%s before rebootstrap (status=%s).", activeBranch, status)
+		state.ActiveBranch = ""
+	}
+	bootstrapNeeded := cfg.Rebootstrap || !state.Initialized
 
 	if state.ProjectName == "" {
 		return fmt.Errorf("project_name is required (set in state file or pass --pantheon-project-name)")
@@ -376,4 +390,50 @@ func isTerminalFailed(err error) bool {
 		return true
 	}
 	return false
+}
+
+func isBranchRunning(client agentClient, branchID string) (bool, string, error) {
+	resp, err := client.GetBranch(branchID)
+	if err != nil {
+		return false, "", err
+	}
+	if errMsg, ok := resp["error"]; ok && errMsg != nil {
+		msg := strings.ToLower(fmt.Sprintf("%v", errMsg))
+		if strings.Contains(msg, "404") || strings.Contains(msg, "not found") {
+			return false, "not_found", nil
+		}
+		return false, "", fmt.Errorf("GetBranch returned error: %v", errMsg)
+	}
+
+	status := stringsLower(resp["status"])
+	latestSnapID := stringsLower(resp["latest_snap_id"])
+	parentID := stringsLower(resp["parent_id"])
+	hasNewSnapshot := true
+	if parentID != "" {
+		parentResp, err := client.GetBranch(parentID)
+		if err != nil {
+			hasNewSnapshot = false
+		} else if errMsg, ok := parentResp["error"]; ok && errMsg != nil {
+			hasNewSnapshot = false
+		} else {
+			parentLatestSnapID := stringsLower(parentResp["latest_snap_id"])
+			if parentLatestSnapID != "" && parentLatestSnapID == latestSnapID {
+				hasNewSnapshot = false
+			}
+		}
+	}
+
+	if hasNewSnapshot && isTerminalBranchStatus(status) {
+		return false, status, nil
+	}
+	return true, status, nil
+}
+
+func isTerminalBranchStatus(status string) bool {
+	switch stringsTrimLower(status) {
+	case "succeed", "ready_for_manifest", "finished", "failed", "manifesting":
+		return true
+	default:
+		return false
+	}
 }
