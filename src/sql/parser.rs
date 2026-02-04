@@ -36,14 +36,7 @@ fn preprocess_explain(sql: &str) -> Option<String> {
 fn is_sequence_option_keyword(token_upper: &str) -> bool {
     matches!(
         token_upper,
-        "INCREMENT"
-            | "MINVALUE"
-            | "MAXVALUE"
-            | "START"
-            | "CACHE"
-            | "CYCLE"
-            | "OWNED"
-            | "NO"
+        "INCREMENT" | "MINVALUE" | "MAXVALUE" | "START" | "CACHE" | "CYCLE" | "OWNED" | "NO"
     )
 }
 
@@ -619,11 +612,9 @@ fn preprocess_sql(sql: &str) -> String {
     // Rewrite ALL/ANY subquery patterns
     result = rewrite_all_any_subqueries(&result);
 
-    // Rewrite PostgreSQL jsonb existence operators that sqlparser doesn't support:
-    // - `lhs ? rhs`  => JSONB_EXISTS(lhs, rhs)
-    // - `lhs ?| rhs` => JSONB_EXISTS_ANY(lhs, rhs)
-    // - `lhs ?& rhs` => JSONB_EXISTS_ALL(lhs, rhs)
     result = rewrite_jsonb_exists_ops(&result);
+
+    result = rewrite_vector_distance_ops(&result);
 
     result
 }
@@ -829,6 +820,22 @@ fn tokenize_sql_for_rewrite(sql: &str) -> Vec<Token> {
             continue;
         }
 
+        // pgvector distance operators: <->  <#>  <=>
+        if bytes[i] == b'<' && i + 2 < bytes.len() {
+            let next = bytes[i + 1];
+            let after = bytes[i + 2];
+            if (next == b'-' || next == b'#' || next == b'=') && after == b'>' {
+                i += 3;
+                tokens.push(Token {
+                    kind: TokenKind::Operator,
+                    start,
+                    end: i,
+                    text: sql[start..i].to_string(),
+                });
+                continue;
+            }
+        }
+
         // Fallback: single char
         i += 1;
         tokens.push(Token {
@@ -844,12 +851,12 @@ fn tokenize_sql_for_rewrite(sql: &str) -> Vec<Token> {
 fn is_rewrite_boundary_keyword(token_upper: &str) -> bool {
     matches!(
         token_upper,
-        "AS"
-            | "SELECT"
+        "AS" | "SELECT"
             | "FROM"
             | "WHERE"
             | "GROUP"
             | "ORDER"
+            | "BY"
             | "HAVING"
             | "LIMIT"
             | "OFFSET"
@@ -862,6 +869,9 @@ fn is_rewrite_boundary_keyword(token_upper: &str) -> bool {
             | "THEN"
             | "ELSE"
             | "END"
+            | "ASC"
+            | "DESC"
+            | "NULLS"
     )
 }
 
@@ -1036,6 +1046,72 @@ fn rewrite_jsonb_exists_ops(sql: &str) -> String {
 
 fn is_ident_char(b: u8) -> bool {
     matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_')
+}
+
+fn rewrite_vector_distance_ops(sql: &str) -> String {
+    let tokens = tokenize_sql_for_rewrite(sql);
+    if tokens.is_empty() {
+        return sql.to_string();
+    }
+
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    for (op_idx, tok) in tokens.iter().enumerate() {
+        if tok.kind != TokenKind::Operator {
+            continue;
+        }
+        let func = match tok.text.as_str() {
+            "<->" => "l2_distance",
+            "<#>" => "inner_product",
+            "<=>" => "cosine_distance",
+            _ => continue,
+        };
+
+        let left_start_idx = find_left_expr_start(&tokens, op_idx);
+        let left_start_idx = skip_ws_comments_forward(&tokens, left_start_idx, op_idx);
+
+        if left_start_idx >= op_idx {
+            continue;
+        }
+
+        let mut right_start_idx = op_idx + 1;
+        right_start_idx = skip_ws_comments_forward(&tokens, right_start_idx, tokens.len());
+
+        if right_start_idx >= tokens.len() {
+            continue;
+        }
+
+        let mut right_end_idx = find_right_expr_end(&tokens, op_idx);
+        right_end_idx = skip_ws_comments_backward(&tokens, right_end_idx, right_start_idx);
+
+        if right_end_idx < right_start_idx {
+            continue;
+        }
+
+        let replace_start = tokens[left_start_idx].start;
+        let replace_end = tokens[right_end_idx].end;
+
+        let left_expr = sql[replace_start..tok.start].trim();
+        let right_expr = sql[tokens[right_start_idx].start..replace_end].trim();
+
+        if left_expr.is_empty() || right_expr.is_empty() {
+            continue;
+        }
+
+        let replacement = format!("({}({}, {}))", func, left_expr, right_expr);
+        replacements.push((replace_start, replace_end, replacement));
+    }
+
+    if replacements.is_empty() {
+        return sql.to_string();
+    }
+
+    replacements.sort_by_key(|(s, _, _)| *s);
+    let mut out = sql.to_string();
+    for (start, end, repl) in replacements.into_iter().rev() {
+        out.replace_range(start..end, &repl);
+    }
+    out
 }
 
 fn find_keyword_outside_strings(query: &str, keyword: &str) -> Option<usize> {
@@ -1424,5 +1500,36 @@ mod tests {
             result,
             Some("CREATE SEQUENCE s1 INCREMENT BY 1 START WITH 1;\nSELECT 1;".to_string())
         );
+    }
+
+    #[test]
+    fn test_rewrite_vector_distance_l2() {
+        let result = rewrite_vector_distance_ops("SELECT v <-> '[1,0,0]' FROM vec_test");
+        assert!(result.contains("l2_distance(v, '[1,0,0]')"));
+    }
+
+    #[test]
+    fn test_rewrite_vector_distance_in_order_by() {
+        let result = rewrite_vector_distance_ops("SELECT * FROM t ORDER BY v <#> '[1,0,0]' ASC");
+        assert!(result.contains("inner_product(v, '[1,0,0]')"));
+    }
+
+    #[test]
+    fn test_rewrite_vector_distance_cosine() {
+        let result = rewrite_vector_distance_ops("SELECT v <=> '[0,1,0]' FROM vec_test");
+        assert!(result.contains("cosine_distance(v, '[0,1,0]')"));
+    }
+
+    #[test]
+    fn test_rewrite_vector_distance_no_false_positive_in_strings() {
+        let result = rewrite_vector_distance_ops("SELECT '<->' FROM t");
+        assert_eq!(result, "SELECT '<->' FROM t");
+    }
+
+    #[test]
+    fn test_rewrite_vector_distance_parses() {
+        let sql = "SELECT v <-> '[1,0,0]'::vector(3) FROM vec_test";
+        let stmts = parse_sql(sql).unwrap();
+        assert_eq!(stmts.len(), 1);
     }
 }

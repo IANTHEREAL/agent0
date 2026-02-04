@@ -702,7 +702,7 @@ fn substitute_variables(ctx: &PlpgsqlContext, s: &str) -> String {
     result
 }
 
-fn replace_identifier(s: &str, name: &str, replacement: &str) -> String {
+pub(crate) fn replace_identifier(s: &str, name: &str, replacement: &str) -> String {
     if name.is_empty() {
         return s.to_string();
     }
