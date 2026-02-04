@@ -1,0 +1,31 @@
+table_schema|table_name
+(0 rows)
+table_schema|table_name
+t146_csn_schema|a
+t146_csn_schema|A
+(2 rows)
+x
+1
+(1 row)
+x
+2
+(1 row)
+x|y|Y
+1|10|20
+(1 row)
+Y
+20
+(1 row)
+x|Y
+1|20
+(1 row)
+x|Y
+1|20
+(1 row)
+indexname
+t146_csn_i
+T146_CSN_I
+(2 rows)
+len|len2
+3|3
+(1 row)
