@@ -56,7 +56,7 @@ ORDER BY id;
 SELECT id, title, ts_rank(to_tsvector(body), plainto_tsquery('database')) as rank
 FROM fts_docs
 WHERE to_tsvector(body) @@ plainto_tsquery('database')
-ORDER BY rank DESC;
+ORDER BY rank DESC, id;
 
 -- Search that returns no results
 SELECT id, title FROM fts_docs 
