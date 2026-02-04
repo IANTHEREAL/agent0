@@ -1,0 +1,5 @@
+table_schema|table_name|grantee|privilege_type|is_grantable
+(0 rows)
+table_schema|table_name|grantee|privilege_type|is_grantable
+adpgo_schema|t_after|adpgo_grantee|SELECT|YES
+(1 row)

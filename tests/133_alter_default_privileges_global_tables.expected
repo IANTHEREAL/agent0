@@ -1,0 +1,6 @@
+table_schema|table_name|grantee|privilege_type
+(0 rows)
+table_schema|table_name|grantee|privilege_type
+adpg_schema1|t_after|adpg_grantee|SELECT
+adpg_schema2|t_after|adpg_grantee|SELECT
+(2 rows)
