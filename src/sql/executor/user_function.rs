@@ -183,6 +183,7 @@ fn substitute_params(func_def: &FunctionDef, args: &[Value]) -> String {
             Value::Null => "NULL".to_string(),
             Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
             Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+            Value::Vector(_) => format!("'{}'", value),
             v => v.to_string(),
         };
         sql = plpgsql::replace_identifier(&sql, name, &value_str);
