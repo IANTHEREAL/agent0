@@ -942,6 +942,7 @@ impl Executor {
                         ScanType::GinIndexScan {
                             index_id,
                             ref index_name,
+                            ref column,
                             ref pattern,
                             ..
                         } => {
@@ -950,7 +951,14 @@ impl Executor {
                                 return Err(anyhow!("GIN index not found"));
                             };
 
+                            let gin_col_type = schema
+                                .columns
+                                .iter()
+                                .find(|c| c.name.eq_ignore_ascii_case(column))
+                                .map(|c| &c.data_type);
+
                             let token_hashes = match &pattern {
+                                Value::Null => Vec::new(),
                                 Value::Array(arr) => {
                                     gin::extract_array_gin_tokens(arr)
                                 }
@@ -967,13 +975,23 @@ impl Executor {
                                     gin::extract_gin_tokens(&pattern_json).into_scan_hashes()
                                 }
                                 Value::Text(s) => {
-                                    if let Ok(pattern_json) = serde_json::from_str::<serde_json::Value>(s) {
-                                        gin::extract_gin_tokens(&pattern_json).into_scan_hashes()
-                                    } else {
-                                        gin::extract_tsquery_gin_tokens(s)
+                                    match gin_col_type {
+                                        Some(DataType::Tsvector) => {
+                                            gin::extract_tsquery_gin_tokens(s)
+                                        }
+                                        Some(DataType::Array(_)) => {
+                                            let parsed: Vec<Value> = serde_json::from_str(s)
+                                                .unwrap_or_default();
+                                            gin::extract_array_gin_tokens(&parsed)
+                                        }
+                                        _ => {
+                                            let pattern_json: serde_json::Value =
+                                                serde_json::from_str(s)
+                                                    .map_err(|e| anyhow!("Invalid JSONB pattern for @>: {}", e))?;
+                                            gin::extract_gin_tokens(&pattern_json).into_scan_hashes()
+                                        }
                                     }
                                 }
-                                Value::Null => Vec::new(),
                                 other => {
                                     return Err(anyhow!(
                                         "GIN pattern must be array, json/jsonb, or tsquery, got {}",

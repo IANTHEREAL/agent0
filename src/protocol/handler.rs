@@ -5368,11 +5368,11 @@ fn datatype_to_pgtype(dt: Option<&DataType>) -> Type {
             DataType::Numeric { .. } => Type::NUMERIC_ARRAY,
             _ => Type::TEXT_ARRAY,
         },
+        Some(DataType::Tsvector) => Type::TS_VECTOR,
+        Some(DataType::Tsquery) => Type::TSQUERY,
         Some(DataType::Vector(_))
         | Some(DataType::Text)
         | Some(DataType::UserDefined(_))
-        | Some(DataType::Tsvector)
-        | Some(DataType::Tsquery)
         | None => Type::TEXT,
     }
 }
@@ -5762,23 +5762,32 @@ fn encode_value(
             encoder.encode_field(&uuid.to_string())
         }
         Value::Array(elems) => {
-            fn value_to_string(v: &Value) -> String {
+            fn value_to_option_string(v: &Value) -> Option<String> {
                 match v {
-                    Value::Null => "NULL".to_string(),
-                    Value::Text(t) => t.clone(),
-                    Value::Boolean(b) => if *b { "t" } else { "f" }.to_string(),
-                    Value::Int32(i) => i.to_string(),
-                    Value::Int64(i) => i.to_string(),
-                    Value::Float64(f) => f.to_string(),
+                    Value::Null => None,
+                    Value::Text(t) => Some(t.clone()),
+                    Value::Boolean(b) => Some(if *b { "t" } else { "f" }.to_string()),
+                    Value::Int32(i) => Some(i.to_string()),
+                    Value::Int64(i) => Some(i.to_string()),
+                    Value::Float64(f) => Some(f.to_string()),
                     Value::Array(nested) => {
-                        let parts: Vec<String> = nested.iter().map(value_to_string).collect();
-                        format!("{{{}}}", parts.join(","))
+                        // Nested arrays: build PostgreSQL text literal {el1,el2,...}
+                        // with NULL preserved for null elements.
+                        let parts: Vec<String> = nested
+                            .iter()
+                            .map(|v| match value_to_option_string(v) {
+                                Some(s) => s,
+                                None => "NULL".to_string(),
+                            })
+                            .collect();
+                        Some(format!("{{{}}}", parts.join(",")))
                     }
-                    other => other.to_string(),
+                    other => Some(other.to_string()),
                 }
             }
-            let string_elems: Vec<String> = elems.iter().map(value_to_string).collect();
-            encoder.encode_field(&string_elems)
+            let option_elems: Vec<Option<String>> =
+                elems.iter().map(value_to_option_string).collect();
+            encoder.encode_field(&option_elems)
         }
         Value::Json(s) => encoder.encode_field(s),
         Value::Jsonb(s) => {

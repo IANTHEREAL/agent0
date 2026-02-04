@@ -261,7 +261,8 @@ fn hash_array_element(val: &Value) -> u64 {
         Value::Array(nested) => {
             h = fnv1a_u64(h, b"arr");
             for elem in nested {
-                h = hash_array_element(elem);
+                let child_hash = hash_array_element(elem);
+                h = fnv1a_u64(h, &child_hash.to_be_bytes());
             }
             h
         }
