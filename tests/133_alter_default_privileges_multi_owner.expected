@@ -1,0 +1,5 @@
+table_schema|table_name|grantee|privilege_type
+adp133_schema|t_by_owner1|adp133_grantee|SELECT
+(1 row)
+table_schema|table_name|grantee|privilege_type
+(0 rows)
