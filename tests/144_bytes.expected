@@ -1,0 +1,10 @@
+decoded
+\x5c78
+(1 row)
+eq_count
+1
+(1 row)
+len|first_hex|second_hex
+1|61|NULL
+2|62|63
+(2 rows)

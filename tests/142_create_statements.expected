@@ -1,0 +1,16 @@
+indexname|has_cols
+t_pgtests_create_statements_c_a_b_idx|t
+(1 row)
+attname|attnotnull
+a|t
+b|f
+(2 rows)
+relname|description
+t_pgtests_create_statements_c|table
+(1 row)
+attname|description
+a|column
+(1 row)
+result
+create_statements tests completed successfully
+(1 row)

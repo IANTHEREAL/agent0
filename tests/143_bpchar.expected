@@ -1,0 +1,9 @@
+bpchar_cast
+foo
+(1 row)
+c
+ba
+c
+foo
+foobarbaz
+(4 rows)
