@@ -15,5 +15,6 @@ mod select;
 mod subquery;
 pub(crate) mod triggers;
 mod udt;
+mod user_function;
 
 pub use core::*;

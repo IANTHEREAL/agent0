@@ -1905,6 +1905,21 @@ impl Executor {
                         {
                             return Ok((als, schema, rows));
                         }
+
+                        if let Some((schema, rows)) = self
+                            .try_execute_user_table_function(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                name,
+                                func_args,
+                                alias.as_ref(),
+                            )
+                            .await?
+                        {
+                            return Ok((als, schema, rows));
+                        }
                     }
 
                     let is_scalar_function = matches!(

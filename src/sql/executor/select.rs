@@ -595,6 +595,23 @@ impl Executor {
                                 .map(|a| a.name.value.clone())
                                 .unwrap_or_else(|| obj_name.clone());
                             (schema.name.clone(), alias_str, schema, rows, true, true)
+                        } else if let Some((schema, rows)) = self
+                            .try_execute_user_table_function(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                name,
+                                func_args,
+                                alias.as_ref(),
+                            )
+                            .await?
+                        {
+                            let alias_str = alias
+                                .as_ref()
+                                .map(|a| a.name.value.clone())
+                                .unwrap_or_else(|| obj_name.clone());
+                            (schema.name.clone(), alias_str, schema, rows, true, true)
                         } else {
                             let lookup_name = match schema_opt {
                                 Some(schema) => format!("{}.{}", schema, obj_name),
