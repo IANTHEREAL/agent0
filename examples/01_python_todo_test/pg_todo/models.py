@@ -4,10 +4,11 @@ SQLAlchemy models demonstrating PostgreSQL features
 from datetime import datetime
 from sqlalchemy import (
     Column, String, Text, DateTime, Boolean, Integer,
-    Index, Enum as SQLEnum, CheckConstraint
+    Index, Enum as SQLEnum, CheckConstraint, ForeignKey
 )
 from sqlalchemy.dialects.postgresql import UUID, JSONB, ARRAY, TSVECTOR
 from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 import uuid
 import enum
@@ -23,6 +24,81 @@ class Priority(enum.Enum):
     URGENT = "urgent"
 
 
+class User(Base):
+    """
+    User model for multi-user support
+    Demonstrates foreign key relationships with TodoItem
+    """
+    __tablename__ = 'users'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    username = Column(String(50), unique=True, nullable=False)
+    email = Column(String(100), unique=True, nullable=False)
+    full_name = Column(String(200))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # Relationships
+    todos = relationship('TodoItem', back_populates='owner', cascade='all, delete-orphan')
+    projects = relationship('Project', back_populates='owner', cascade='all, delete-orphan')
+
+    __table_args__ = (
+        Index('idx_username', 'username'),
+        Index('idx_email', 'email'),
+    )
+
+    def __repr__(self):
+        return f"<User(id={self.id}, username='{self.username}')>"
+
+
+class Project(Base):
+    """
+    Project model to group TODO items
+    Demonstrates one-to-many relationships
+    """
+    __tablename__ = 'projects'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(200), nullable=False)
+    description = Column(Text)
+    owner_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='CASCADE'), nullable=False)
+    start_date = Column(DateTime(timezone=True))
+    end_date = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
+
+    # Relationships
+    owner = relationship('User', back_populates='projects')
+    todos = relationship('TodoItem', back_populates='project')
+
+    __table_args__ = (
+        Index('idx_project_owner', 'owner_id'),
+        Index('idx_project_active', 'is_active'),
+    )
+
+    def __repr__(self):
+        return f"<Project(id={self.id}, name='{self.name}')>"
+
+
+class Category(Base):
+    """
+    Category model for classifying TODO items
+    Demonstrates many-to-many relationships via association table
+    """
+    __tablename__ = 'categories'
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(String(100), unique=True, nullable=False)
+    description = Column(Text)
+    color = Column(String(7))  # Hex color code
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    # Relationships
+    todos = relationship('TodoItem', back_populates='category')
+
+    def __repr__(self):
+        return f"<Category(id={self.id}, name='{self.name}')>"
+
+
 class TodoItem(Base):
     """
     TODO item model demonstrating PostgreSQL features:
@@ -33,6 +109,7 @@ class TodoItem(Base):
     - Enum types
     - Automatic timestamps
     - Composite indexes
+    - Foreign key relationships (for JOIN demonstrations)
     """
     __tablename__ = 'todo_items'
 
@@ -48,6 +125,12 @@ class TodoItem(Base):
 
     # Boolean field
     is_completed = Column(Boolean, default=False, nullable=False)
+
+    # Foreign keys for relationships (demonstrates JOINs)
+    owner_id = Column(UUID(as_uuid=True), ForeignKey('users.id', ondelete='SET NULL'))
+    project_id = Column(UUID(as_uuid=True), ForeignKey('projects.id', ondelete='SET NULL'))
+    category_id = Column(UUID(as_uuid=True), ForeignKey('categories.id', ondelete='SET NULL'))
+    parent_todo_id = Column(UUID(as_uuid=True), ForeignKey('todo_items.id', ondelete='SET NULL'))  # Self-referential
 
     # ARRAY type for tags (PostgreSQL feature)
     tags = Column(ARRAY(String), default=list)
@@ -68,12 +151,26 @@ class TodoItem(Base):
     # Completion date
     completed_at = Column(DateTime(timezone=True))
 
-    # Constraint: if completed, must have completion time
+    # Relationships
+    owner = relationship('User', back_populates='todos')
+    project = relationship('Project', back_populates='todos')
+    category = relationship('Category', back_populates='todos')
+    parent_todo = relationship('TodoItem', remote_side=[id], backref='subtasks')
+
+    # Constraints and indexes
     __table_args__ = (
         # Composite indexes
         Index('idx_priority_completed', 'priority', 'is_completed'),
         Index('idx_created_at', 'created_at'),
         Index('idx_due_date', 'due_date'),
+        # Foreign key indexes (improves JOIN performance)
+        Index('idx_owner_id', 'owner_id'),
+        Index('idx_project_id', 'project_id'),
+        Index('idx_category_id', 'category_id'),
+        Index('idx_parent_todo_id', 'parent_todo_id'),
+        # Composite index for common JOIN query patterns
+        Index('idx_owner_project', 'owner_id', 'project_id'),
+        Index('idx_project_completed', 'project_id', 'is_completed'),
         # GIN indexes for JSONB and ARRAY (PostgreSQL feature)
         Index('idx_tags_gin', 'tags', postgresql_using='gin'),
         Index('idx_extra_data_gin', 'extra_data', postgresql_using='gin'),
