@@ -67,24 +67,36 @@ fn eval_array_subquery_with_context<C: EvalContext, Q: AsRef<Query>>(
     ctx: &C,
     query: &Q,
 ) -> Result<Value> {
-    let query = query.as_ref();
+    let mut query = query.as_ref();
 
-    if query.with.is_some()
-        || !query.order_by.is_empty()
-        || query.limit.is_some()
-        || query.offset.is_some()
-        || query.fetch.is_some()
-    {
-        return Err(anyhow!("Unsupported ARRAY(subquery) shape: {:?}", query));
-    }
+    // SQLAlchemy wraps scalar subqueries in parens, leading to `ARRAY((SELECT ...))`, which parses
+    // as nested `SetExpr::Query` nodes. We only unwrap the nested queries when each wrapper is
+    // "shape-less" (no WITH/ORDER/LIMIT/OFFSET/FETCH), then apply our existing Dify-focused
+    // constraints on the innermost SELECT.
+    let select = loop {
+        if query.with.is_some()
+            || !query.order_by.is_empty()
+            || query.limit.is_some()
+            || query.offset.is_some()
+            || query.fetch.is_some()
+        {
+            return Err(anyhow!("Unsupported ARRAY(subquery) shape: {:?}", query));
+        }
 
-    let SetExpr::Select(select) = &*query.body else {
-        return Err(anyhow!(
-            "Unsupported ARRAY(subquery) body: {:?}",
-            query.body
-        ));
+        match &*query.body {
+            SetExpr::Query(nested) => {
+                query = nested.as_ref();
+                continue;
+            }
+            SetExpr::Select(select) => break select.as_ref(),
+            _ => {
+                return Err(anyhow!(
+                    "Unsupported ARRAY(subquery) body: {:?}",
+                    query.body
+                ))
+            }
+        }
     };
-    let select = select.as_ref();
 
     let group_by_is_empty = matches!(
         &select.group_by,

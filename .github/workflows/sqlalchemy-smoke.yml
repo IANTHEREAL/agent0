@@ -15,12 +15,7 @@ env:
 
 jobs:
   sqlalchemy-smoke:
-    # Tier-2 job: non-blocking signal while the suite matures.
-    #
-    # Promotion path (make required):
-    #   1) Remove `continue-on-error: true` below.
-    #   2) Add the check `SQLAlchemy Smoke (Tier 2) / sqlalchemy-smoke` to branch protection required checks.
-    continue-on-error: true
+    # Tier-2 job: required signal for SQLAlchemy + Dify-lite compatibility.
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -174,6 +169,12 @@ jobs:
       - name: Run SQLAlchemy smoke suite
         shell: bash
         run: bash scripts/e2e_tests.sh sqlalchemy_smoke
+        env:
+          PG_DSN: postgres://${{ env.PG_USER }}:${{ env.PG_PASSWORD }}@127.0.0.1:${{ env.PG_PORT }}/postgres
+
+      - name: Run Dify SQLAlchemy compat suite
+        shell: bash
+        run: bash scripts/e2e_tests.sh dify_sqlalchemy_compat
         env:
           PG_DSN: postgres://${{ env.PG_USER }}:${{ env.PG_PASSWORD }}@127.0.0.1:${{ env.PG_PORT }}/postgres
 

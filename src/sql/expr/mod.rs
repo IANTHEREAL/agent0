@@ -3631,6 +3631,22 @@ mod tests {
     }
 
     #[test]
+    fn test_array_subquery_flattens_set_returning_projection_nested_query() {
+        assert_eq!(
+            eval_expr(
+                &parse_expr(r#"ARRAY((SELECT jsonb_array_elements_text('["a","b"]')))"#),
+                None,
+                None
+            )
+            .unwrap(),
+            Value::Array(vec![
+                Value::Text("a".to_string()),
+                Value::Text("b".to_string()),
+            ])
+        );
+    }
+
+    #[test]
     fn test_array_indexing() {
         assert_eq!(
             eval_expr(&parse_expr("(ARRAY[10, 20, 30])[2]"), None, None).unwrap(),

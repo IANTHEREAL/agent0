@@ -20,7 +20,7 @@ use super::core::Executor;
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    Distinct, Expr, FunctionArg, FunctionArgExpr, GroupByExpr, JoinConstraint, LockType,
+    Distinct, Expr, FunctionArg, FunctionArgExpr, GroupByExpr, JoinConstraint, LockType, NonBlock,
     ObjectName, Query, SelectItem, SetExpr, TableFactor, Value as SqlValue,
 };
 use std::collections::{HashMap, HashSet};
@@ -312,6 +312,50 @@ fn resolve_order_by_exprs_for_non_agg(
             }
 
             Ok(order_expr.expr.clone())
+        })
+        .collect()
+}
+
+fn resolve_group_by_exprs(
+    group_by: &[Expr],
+    resolved_projection: &[SelectItem],
+    schema: &TableSchema,
+) -> Result<Vec<Expr>> {
+    let output_exprs = expand_projection_exprs_for_positional_order_by(resolved_projection, schema);
+
+    group_by
+        .iter()
+        .map(|expr| {
+            // Match PostgreSQL-ish behavior: if the name resolves to an input column, prefer it.
+            // Otherwise, allow referencing select-list aliases (e.g. `SELECT ... AS day GROUP BY day`).
+            if let Expr::Identifier(ref ident) = expr {
+                let exists_in_schema = schema
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&ident.value));
+
+                if !exists_in_schema {
+                    for item in resolved_projection {
+                        if let SelectItem::ExprWithAlias { expr, alias } = item {
+                            if alias.value.eq_ignore_ascii_case(&ident.value) {
+                                return Ok(expr.clone());
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Positional GROUP BY (e.g. `GROUP BY 1`).
+            if let Expr::Value(SqlValue::Number(n, _)) = expr {
+                if let Ok(pos) = n.parse::<usize>() {
+                    if pos == 0 || pos > output_exprs.len() {
+                        return Err(anyhow!("GROUP BY position {} is not in select list", pos));
+                    }
+                    return Ok(output_exprs[pos - 1].clone());
+                }
+            }
+
+            Ok(expr.clone())
         })
         .collect()
 }
@@ -761,6 +805,7 @@ impl Executor {
             && !is_virtual
             && !rows_loaded
             && !has_correlated_exists
+            && query.locks.is_empty()
             && !(has_for_update && schema.pk_indices.is_empty())
             && select_into_target.is_none()
             && Self::is_simple_operator_query(query, select)
@@ -812,6 +857,7 @@ impl Executor {
             && !is_virtual
             && !rows_loaded
             && !has_correlated_exists
+            && query.locks.is_empty()
             && !(has_for_update && schema.pk_indices.is_empty())
             && select_into_target.is_none()
             && Self::is_aggregate_operator_query(query, select)
@@ -864,6 +910,7 @@ impl Executor {
             && !is_virtual
             && !rows_loaded
             && !has_correlated_exists
+            && query.locks.is_empty()
             && !(has_for_update && schema.pk_indices.is_empty())
             && select_into_target.is_none()
             && Self::is_window_operator_query(query, select)
@@ -1296,22 +1343,18 @@ impl Executor {
             (all_rows, Vec::new())
         };
 
-        if has_for_update && !filtered_rows.is_empty() {
-            if pkless_for_update {
-                txn.lock_keys(lock_keys)
-                    .await
-                    .map_err(|e| anyhow!(e))?;
-            } else {
-                self.store()
-                    .lock_rows(txn, db_id, &t, &filtered_rows)
-                    .await?;
-            }
+        if has_for_update && pkless_for_update && !filtered_rows.is_empty() {
+            txn.lock_keys(lock_keys).await.map_err(|e| anyhow!(e))?;
         }
 
         let group_keys_exprs = match &select.group_by {
             GroupByExpr::Expressions(exprs) => exprs,
             GroupByExpr::All => return Err(anyhow!("GROUP BY ALL not supported")),
         };
+
+        let resolved_group_keys_exprs =
+            resolve_group_by_exprs(group_keys_exprs, &resolved_projection, &schema)?;
+        let group_keys_exprs = resolved_group_keys_exprs.as_slice();
 
         let grouping_sets = extract_grouping_sets(group_keys_exprs);
         let has_grouping_sets = grouping_sets.is_some();
@@ -1472,7 +1515,7 @@ impl Executor {
             .any(|p| matches!(p, SelectItem::Wildcard(_)));
         let pure_wildcard = wildcard && select.projection.len() == 1;
 
-        let (rows_for_projection, window_results) = match &select.distinct {
+        let (mut rows_for_projection, mut window_results) = match &select.distinct {
             Some(Distinct::On(on_exprs)) => {
                 let (rows, indices) =
                     distinct_on_rows_with_indices(filtered_rows, on_exprs, Some(&schema))?;
@@ -1482,6 +1525,64 @@ impl Executor {
             }
             _ => (filtered_rows, window_results),
         };
+
+        if has_for_update && !pkless_for_update && !rows_for_projection.is_empty() {
+            let for_update_nonblock = query
+                .locks
+                .iter()
+                .find(|l| matches!(l.lock_type, LockType::Update))
+                .and_then(|l| l.nonblock);
+
+            let query_base_for_offset_limit_fetch =
+                query_with_evaluated_offset_limit_fetch.as_ref().unwrap_or(query);
+            let query_for_offset_limit_fetch = if generate_series_offset_limit_pushed_down {
+                let mut q = query_base_for_offset_limit_fetch.clone();
+                q.offset = None;
+                q.limit = None;
+                q.fetch = None;
+                q
+            } else {
+                query_base_for_offset_limit_fetch.clone()
+            };
+
+            let offset = extract_offset(&query_for_offset_limit_fetch);
+            let max_lock = match extract_limit(&query_for_offset_limit_fetch) {
+                Some(0) => Some(0),
+                Some(n) => Some(offset.saturating_add(n)),
+                None => None,
+            };
+
+            match for_update_nonblock {
+                Some(NonBlock::SkipLocked) => {
+                    let locked_indices = self
+                        .store()
+                        .lock_rows_skip_locked(
+                            txn,
+                            db_id,
+                            &t,
+                            &rows_for_projection,
+                            max_lock,
+                        )
+                        .await?;
+                    rows_for_projection = locked_indices
+                        .iter()
+                        .map(|&idx| rows_for_projection[idx].clone())
+                        .collect();
+                    window_results = window_results.map(|wr| {
+                        super::super::query::reorder_by_indices(&wr, &locked_indices)
+                    });
+                }
+                _ => {
+                    let lock_count = max_lock.unwrap_or(rows_for_projection.len());
+                    let lock_count = lock_count.min(rows_for_projection.len());
+                    if lock_count > 0 {
+                        self.store()
+                            .lock_rows(txn, db_id, &t, &rows_for_projection[..lock_count])
+                            .await?;
+                    }
+                }
+            }
+        }
 
         let (cols, result_rows) = if pure_wildcard && !has_window_funcs {
             let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();

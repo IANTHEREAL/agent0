@@ -625,6 +625,67 @@ impl TikvStore {
         txn.lock_keys(keys).await.map_err(|e| anyhow!(e))
     }
 
+    pub async fn lock_rows_skip_locked(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+        rows: &[Row],
+        max_locks: Option<usize>,
+    ) -> Result<Vec<usize>> {
+        fn is_key_locked_error(err: &tikv_client::Error) -> bool {
+            match err {
+                tikv_client::Error::PessimisticLockError { inner, .. } => is_key_locked_error(inner.as_ref()),
+                tikv_client::Error::ExtractedErrors(errors)
+                | tikv_client::Error::MultipleKeyErrors(errors) => errors.iter().any(is_key_locked_error),
+                tikv_client::Error::KeyError(key_error) => {
+                    key_error.locked.is_some() || key_error.conflict.is_some()
+                }
+                _ => false,
+            }
+        }
+
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let schema = self
+            .get_schema(txn, db_id, table_name)
+            .await?
+            .ok_or_else(|| anyhow!("Table not found"))?;
+        if schema.pk_indices.is_empty() {
+            return Err(anyhow!(
+                "cannot lock rows: table '{}' has no primary key",
+                table_name
+            ));
+        }
+
+        let max_locks = max_locks.unwrap_or(usize::MAX);
+        let mut locked_indices = Vec::new();
+
+        for (idx, row) in rows.iter().enumerate() {
+            if locked_indices.len() >= max_locks {
+                break;
+            }
+
+            let pk_values = schema.get_pk_values(row);
+            let row_key = encode_pk_values(&pk_values);
+            let key = self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key));
+
+            match txn.lock_keys(vec![key]).await {
+                Ok(()) => locked_indices.push(idx),
+                Err(err) => {
+                    if is_key_locked_error(&err) {
+                        continue;
+                    }
+                    return Err(anyhow!(err));
+                }
+            }
+        }
+
+        Ok(locked_indices)
+    }
+
     /// Check if a table exists (using txn)
     pub async fn table_exists(
         &self,

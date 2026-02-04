@@ -616,6 +616,11 @@ fn preprocess_sql(sql: &str) -> String {
 
     result = rewrite_vector_distance_ops(&result);
 
+    // sqlparser-rs expects a quoted string after `AT TIME ZONE`, but PostgreSQL also allows
+    // prepared statement placeholders (`$n`). This rewrite is only used for parse-time validation
+    // (see `parse_sql()`), and the original SQL is preserved for execution/binding.
+    result = rewrite_at_time_zone_placeholders(&result);
+
     result
 }
 
@@ -1143,6 +1148,76 @@ fn rewrite_vector_distance_ops(sql: &str) -> String {
     out
 }
 
+fn rewrite_at_time_zone_placeholders(sql: &str) -> String {
+    let tokens = tokenize_sql_for_rewrite(sql);
+    if tokens.is_empty() {
+        return sql.to_string();
+    }
+
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < tokens.len() {
+        let tok = &tokens[idx];
+        if tok.kind != TokenKind::Word || !tok.text.eq_ignore_ascii_case("AT") {
+            idx += 1;
+            continue;
+        }
+
+        let mut j = idx + 1;
+        j = skip_ws_comments_forward(&tokens, j, tokens.len());
+        if j >= tokens.len()
+            || tokens[j].kind != TokenKind::Word
+            || !tokens[j].text.eq_ignore_ascii_case("TIME")
+        {
+            idx += 1;
+            continue;
+        }
+
+        j += 1;
+        j = skip_ws_comments_forward(&tokens, j, tokens.len());
+        if j >= tokens.len()
+            || tokens[j].kind != TokenKind::Word
+            || !tokens[j].text.eq_ignore_ascii_case("ZONE")
+        {
+            idx += 1;
+            continue;
+        }
+
+        j += 1;
+        j = skip_ws_comments_forward(&tokens, j, tokens.len());
+        if j + 1 >= tokens.len() {
+            idx += 1;
+            continue;
+        }
+
+        let is_placeholder = tokens[j].kind == TokenKind::Other
+            && tokens[j].text == "$"
+            && tokens[j + 1].kind == TokenKind::Word
+            && tokens[j + 1].text.chars().all(|c| c.is_ascii_digit());
+
+        if !is_placeholder {
+            idx += 1;
+            continue;
+        }
+
+        replacements.push((tok.start, tokens[j + 1].end, "AT TIME ZONE 'UTC'".to_string()));
+        idx = j + 2;
+    }
+
+    if replacements.is_empty() {
+        return sql.to_string();
+    }
+
+    // Apply replacements from right to left so offsets remain valid.
+    replacements.sort_by_key(|(s, _, _)| *s);
+    let mut out = sql.to_string();
+    for (start, end, repl) in replacements.into_iter().rev() {
+        out.replace_range(start..end, &repl);
+    }
+    out
+}
+
 fn find_keyword_outside_strings(query: &str, keyword: &str) -> Option<usize> {
     let bytes = query.as_bytes();
     let kw = keyword.as_bytes();
@@ -1347,6 +1422,13 @@ mod tests {
                 panic!("sqlparser-rs doesn't support double-digit placeholders");
             }
         }
+    }
+
+    #[test]
+    fn test_parse_at_time_zone_placeholder() {
+        let stmts =
+            parse_sql("SELECT TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE $1").unwrap();
+        assert_eq!(stmts.len(), 1);
     }
 
     #[test]

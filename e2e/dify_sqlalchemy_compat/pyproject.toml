@@ -1,0 +1,19 @@
+[project]
+name = "dify-sqlalchemy-compat"
+version = "0.1.0"
+description = "Dify SQLAlchemy compatibility E2E tests for pg-tikv"
+requires-python = ">=3.12"
+dependencies = [
+  # Mirror Dify's DB stack: Flask-SQLAlchemy + SQLAlchemy + psycopg2.
+  "flask~=3.1.2",
+  "flask-sqlalchemy~=3.1.1",
+  "psycopg2-binary~=2.9.6",
+  "pytest>=8.0.0",
+  "sqlalchemy~=2.0.29",
+]
+
+[project.scripts]
+dify-sqlalchemy-compat = "dify_sqlalchemy_compat.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

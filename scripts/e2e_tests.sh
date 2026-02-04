@@ -12,16 +12,19 @@ Suites:
   all              Run all e2e suites (default)
   gorm_smoke       Run Go/GORM smoke test (e2e/gorm_smoke)
   sqlalchemy_smoke Run Python SQLAlchemy smoke suite (e2e/sqlalchemy_smoke)
+  dify_sqlalchemy_compat Run Dify SQLAlchemy compat suite (e2e/dify_sqlalchemy_compat)
 
 Aliases:
   gorm             Alias for gorm_smoke
   sqlalchemy       Alias for sqlalchemy_smoke
+  dify             Alias for dify_sqlalchemy_compat
 
 Environment:
   PG_DSN           PostgreSQL DSN (e.g. postgres://admin:admin@127.0.0.1:5433/postgres?sslmode=disable)
 
 Examples:
   PG_DSN=postgres://admin:admin@127.0.0.1:5433/postgres bash scripts/e2e_tests.sh sqlalchemy_smoke
+  PG_DSN=postgres://admin:admin@127.0.0.1:5433/postgres bash scripts/e2e_tests.sh dify_sqlalchemy_compat
   PG_DSN=postgres://admin:admin@127.0.0.1:5433/postgres bash scripts/e2e_tests.sh all
 EOF
 }
@@ -66,6 +69,20 @@ run_sqlalchemy_smoke() {
   bash "$entrypoint"
 }
 
+run_dify_sqlalchemy_compat() {
+  require_cmd uv
+  require_python
+
+  local entrypoint="$ROOT_DIR/scripts/e2e_dify_sqlalchemy_compat.sh"
+  if [[ ! -f "$entrypoint" ]]; then
+    echo "ERROR: missing entrypoint: $entrypoint" >&2
+    exit 2
+  fi
+
+  echo "=== e2e: dify_sqlalchemy_compat ==="
+  bash "$entrypoint"
+}
+
 suite="${1:-all}"
 
 case "$suite" in
@@ -73,12 +90,17 @@ case "$suite" in
     run_gorm_smoke
     echo ""
     run_sqlalchemy_smoke
+    echo ""
+    run_dify_sqlalchemy_compat
     ;;
   gorm_smoke|gorm)
     run_gorm_smoke
     ;;
   sqlalchemy_smoke|sqlalchemy)
     run_sqlalchemy_smoke
+    ;;
+  dify_sqlalchemy_compat|dify)
+    run_dify_sqlalchemy_compat
     ;;
   -h|--help|help)
     usage
