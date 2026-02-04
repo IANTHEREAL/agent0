@@ -713,6 +713,20 @@ def run_external_tests(test_paths: List[Path]) -> TestStats:
 
     sql_files = filtered_files
 
+    # Most SQL tests are order-independent. Some workloads are intentionally paired:
+    # - `tests/96_dify_schema.sql` restores the upstream Dify schema into an isolated DB.
+    # - `tests/127_dify_lite_workload.sql` runs a deterministic Dify-lite workload and drops the DB.
+    #
+    # Keep the historical lexicographic ordering for all other tests to avoid surprising reordering.
+    dify_pair_order = {
+        "96_dify_schema.sql": 0,
+        "127_dify_lite_workload.sql": 1,
+    }
+    dify_files = [p for p in sql_files if p.name in dify_pair_order]
+    other_files = [p for p in sql_files if p.name not in dify_pair_order]
+    dify_files.sort(key=lambda p: dify_pair_order[p.name])
+    sql_files = other_files + dify_files
+
     log_info(f"Found {len(sql_files)} test file(s)")
     log_info("=========================================")
 

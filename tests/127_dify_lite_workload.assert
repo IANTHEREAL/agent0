@@ -1,0 +1,7 @@
+# Dify-lite deterministic assertions (label=value)
+dify_lite.member_join_count=1
+dify_lite.member_role=owner
+dify_lite.doc_day_shanghai=2026-01-03
+dify_lite.segment_keywords_match_100pct=t
+dify_lite.plugin_has_declaration_column=t
+dify_lite.plugin_declaration_nullable=YES

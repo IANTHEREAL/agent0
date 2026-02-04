@@ -7,7 +7,7 @@ use super::{
 };
 use crate::types::{DataType, TableSchema, Value};
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{BinaryOperator, Expr};
+use sqlparser::ast::{BinaryOperator, Expr, GroupByExpr, Query, SelectItem, SetExpr};
 
 fn is_explicit_null(expr: &Expr) -> bool {
     use sqlparser::ast::Value as SqlValue;
@@ -60,6 +60,69 @@ fn ensure_array_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg: &'static 
     match infer_expr_type_for_validation(ctx, expr) {
         DataType::Array(_) => Ok(()),
         _ => Err(anyhow!(err_msg)),
+    }
+}
+
+fn eval_array_subquery_with_context<C: EvalContext, Q: AsRef<Query>>(
+    ctx: &C,
+    query: &Q,
+) -> Result<Value> {
+    let query = query.as_ref();
+
+    if query.with.is_some()
+        || !query.order_by.is_empty()
+        || query.limit.is_some()
+        || query.offset.is_some()
+        || query.fetch.is_some()
+    {
+        return Err(anyhow!("Unsupported ARRAY(subquery) shape: {:?}", query));
+    }
+
+    let SetExpr::Select(select) = &*query.body else {
+        return Err(anyhow!(
+            "Unsupported ARRAY(subquery) body: {:?}",
+            query.body
+        ));
+    };
+    let select = select.as_ref();
+
+    let group_by_is_empty = matches!(
+        &select.group_by,
+        GroupByExpr::Expressions(exprs) if exprs.is_empty()
+    );
+
+    // KISS: support the Dify pattern (tableless correlated select with a single projection).
+    if !select.from.is_empty()
+        || select.selection.is_some()
+        || !group_by_is_empty
+        || select.having.is_some()
+        || select.distinct.is_some()
+        || select.projection.len() != 1
+    {
+        return Err(anyhow!("Unsupported ARRAY(subquery) shape: {:?}", query));
+    }
+
+    let proj_expr = match &select.projection[0] {
+        SelectItem::UnnamedExpr(expr) => expr,
+        SelectItem::ExprWithAlias { expr, .. } => expr,
+        other => {
+            return Err(anyhow!(
+                "Unsupported ARRAY(subquery) projection item: {:?}",
+                other
+            ))
+        }
+    };
+
+    // Our JSON set-returning functions (e.g. jsonb_array_elements_text) are modeled as `Value::Array`.
+    // Under `ARRAY(SELECT ...)`, preserve array-valued projections as a single element (e.g.
+    // `ARRAY(SELECT ARRAY[1,2])` => `{{1,2}}`), while still treating set-returning projections as a
+    // list (e.g. jsonb_array_elements_text => `{...}`).
+    match eval_expr_impl(ctx, proj_expr)? {
+        Value::Array(arr) => match infer_expr_type_for_validation(ctx, proj_expr) {
+            DataType::Array(_) => Ok(Value::Array(vec![Value::Array(arr)])),
+            _ => Ok(Value::Array(arr)),
+        },
+        other => Ok(Value::Array(vec![other])),
     }
 }
 
@@ -137,7 +200,9 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(
             _ => Err(anyhow!(err_msg)),
         },
 
-        Expr::JsonAccess { operator, right, .. } => {
+        Expr::JsonAccess {
+            operator, right, ..
+        } => {
             use sqlparser::ast::JsonOperator;
             match operator {
                 JsonOperator::AtArrow | JsonOperator::ArrowAt => Ok(()),
@@ -452,6 +517,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             let in_range = ge_low && le_high;
             Ok(Value::Boolean(if *negated { !in_range } else { in_range }))
         }
+        Expr::ArraySubquery(query) => eval_array_subquery_with_context(ctx, query),
         Expr::Function(func) => eval_function_with_context(ctx, func),
         Expr::Like {
             negated,

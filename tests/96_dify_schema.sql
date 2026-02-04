@@ -3,6 +3,11 @@
 -- Generated from: /tmp/dify_schema.sql
 -- Purpose: Ensure pg-tikv can restore a real-world pg_dump schema without errors.
 
+-- Isolation: restore into a dedicated database so the massive schema does not pollute other SQL/ORM tests.
+DROP DATABASE IF EXISTS dify_compat_96;
+CREATE DATABASE dify_compat_96 WITH OWNER = admin;
+\connect dify_compat_96
+
 --
 -- PostgreSQL database dump
 --
@@ -4757,9 +4762,4 @@ ALTER TABLE ONLY public.tool_published_apps
 SELECT extname FROM pg_catalog.pg_extension WHERE extname = 'uuid-ossp';
 SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_name IN ('accounts', 'documents') ORDER BY table_name;
 
--- Cleanup: keep the shared test database clean for subsequent suites (ORM tests).
-DROP TABLE IF EXISTS public.account_integrates, public.account_plugin_permissions, public.accounts, public.alembic_version, public.api_based_extensions, public.api_requests, public.api_tokens, public.app_annotation_hit_histories, public.app_annotation_settings, public.app_dataset_joins, public.app_mcp_servers, public.app_model_configs, public.app_triggers, public.apps, public.celery_taskmeta, public.celery_tasksetmeta, public.child_chunks, public.conversations, public.data_source_api_key_auth_bindings, public.data_source_oauth_bindings, public.dataset_auto_disable_logs, public.dataset_collection_bindings, public.dataset_keyword_tables, public.dataset_metadata_bindings, public.dataset_metadatas, public.dataset_permissions, public.dataset_process_rules, public.dataset_queries, public.dataset_retriever_resources, public.datasets, public.datasource_oauth_params, public.datasource_oauth_tenant_params, public.datasource_providers, public.dify_setups, public.document_pipeline_execution_logs, public.document_segments, public.documents, public.embeddings, public.end_users, public.external_knowledge_apis, public.external_knowledge_bindings, public.installed_apps, public.invitation_codes, public.load_balancing_model_configs, public.message_agent_thoughts, public.message_annotations, public.message_chains, public.message_feedbacks, public.message_files, public.messages, public.oauth_provider_apps, public.operation_logs, public.pinned_conversations, public.pipeline_built_in_templates, public.pipeline_customized_templates, public.pipeline_recommended_plugins, public.pipelines, public.provider_credentials, public.provider_model_credentials, public.provider_model_settings, public.provider_models, public.provider_orders, public.providers, public.rate_limit_logs, public.recommended_apps, public.saved_messages, public.segment_attachment_bindings, public.sites, public.tag_bindings, public.tags, public.tenant_account_joins, public.tenant_credit_pools, public.tenant_default_models, public.tenant_plugin_auto_upgrade_strategies, public.tenant_preferred_model_providers, public.tenants, public.tidb_auth_bindings, public.tool_api_providers, public.tool_builtin_providers, public.tool_conversation_variables, public.tool_files, public.tool_label_bindings, public.tool_mcp_providers, public.tool_model_invokes, public.tool_oauth_system_clients, public.tool_oauth_tenant_clients, public.tool_published_apps, public.tool_workflow_providers, public.trace_app_config, public.trigger_oauth_system_clients, public.trigger_oauth_tenant_clients, public.trigger_subscriptions, public.upload_files, public.whitelists, public.workflow_app_logs, public.workflow_conversation_variables, public.workflow_draft_variable_files, public.workflow_draft_variables, public.workflow_node_execution_offload, public.workflow_node_executions, public.workflow_pause_reasons, public.workflow_pauses, public.workflow_plugin_triggers, public.workflow_runs, public.workflow_schedule_plans, public.workflow_trigger_logs, public.workflow_webhook_triggers, public.workflows;
-DROP SEQUENCE IF EXISTS public.invitation_codes_id_seq, public.task_id_sequence, public.taskset_id_sequence;
-DROP FUNCTION IF EXISTS public.uuidv7, public.uuidv7_boundary;
-DROP EXTENSION IF EXISTS "uuid-ossp";
-
+-- Cleanup is performed by `tests/127_dify_lite_workload.sql` (drops the dedicated database).

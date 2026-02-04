@@ -395,6 +395,9 @@ export PG_DSN="postgres://admin:admin@127.0.0.1:5433/postgres?sslmode=disable"
 bash scripts/e2e_tests.sh gorm_smoke
 ```
 
+Notable integration workloads:
+- **Dify-lite compatibility gate**: `tests/96_dify_schema.sql` (schema restore smoke) + `tests/127_dify_lite_workload.sql` (minimal deterministic Dify query/DDL workload).
+
 | Test Suite | Coverage |
 |------------|----------|
 | DDL | CREATE, DROP, ALTER, TRUNCATE, Views, Schemas |
