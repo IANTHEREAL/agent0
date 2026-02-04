@@ -376,6 +376,9 @@ bash scripts/regression_gate.sh
 # Reuse an existing running pg-tikv instance
 bash scripts/regression_gate.sh --dsn "$PG_DSN"
 
+# Tier-2 E2E suites (app-like smoke tests; requires running pg-tikv)
+PG_DSN=postgres://admin:admin@127.0.0.1:5433/postgres bash scripts/e2e_tests.sh sqlalchemy_smoke
+
 # Full automated test suite (slower; broader coverage)
 ./run_tests.sh
 

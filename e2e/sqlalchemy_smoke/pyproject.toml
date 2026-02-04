@@ -1,0 +1,16 @@
+[project]
+name = "sqlalchemy-smoke"
+version = "0.1.0"
+description = "SQLAlchemy E2E smoke tests for pg-tikv"
+requires-python = ">=3.12"
+dependencies = [
+  "psycopg[binary]>=3.1.0",
+  "pytest>=8.0.0",
+  "sqlalchemy>=2.0.0",
+]
+
+[project.scripts]
+sqlalchemy-smoke = "sqlalchemy_smoke.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

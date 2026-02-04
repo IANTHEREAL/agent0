@@ -25,6 +25,7 @@ test-reports/
 # Python
 __pycache__/
 *.pyc
+.venv/
 
 # Session artifacts
 .sisyphus/

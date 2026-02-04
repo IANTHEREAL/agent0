@@ -1,0 +1,187 @@
+name: SQLAlchemy Smoke (Tier 2)
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  PG_PORT: 5433
+  PG_USER: admin
+  PG_PASSWORD: admin
+
+jobs:
+  sqlalchemy-smoke:
+    # Tier-2 job: non-blocking signal while the suite matures.
+    #
+    # Promotion path (make required):
+    #   1) Remove `continue-on-error: true` below.
+    #   2) Add the check `SQLAlchemy Smoke (Tier 2) / sqlalchemy-smoke` to branch protection required checks.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v2
+        with:
+          enable-cache: true
+
+      - name: Install PostgreSQL client
+        run: sudo apt-get update && sudo apt-get install -y postgresql-client
+
+      # TiKV + pg-tikv bring-up (mirrors the existing CI smoke/regression workflows).
+      - name: Install tiup
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Isolate TiUP state to avoid flaky/corrupted manifests on runners.
+          export TIUP_HOME="$RUNNER_TEMP/tiup"
+          echo "TIUP_HOME=$TIUP_HOME" >> "$GITHUB_ENV"
+
+          export PATH="$TIUP_HOME/bin:$PATH"
+          echo "$TIUP_HOME/bin" >> "$GITHUB_PATH"
+
+          install_and_verify() {
+            rm -rf "$TIUP_HOME"
+            mkdir -p "$TIUP_HOME"
+
+            local arch
+            arch="$(uname -m)"
+            case "$arch" in
+              x86_64|amd64) arch=amd64 ;;
+              aarch64|arm64) arch=arm64 ;;
+              *) echo "Unsupported architecture: $arch" >&2; return 1 ;;
+            esac
+
+            local tiup_version url
+            tiup_version="${TIUP_VERSION:-v1.16.4}"
+            url="https://github.com/pingcap/tiup/releases/download/${tiup_version}/tiup-${tiup_version}-linux-${arch}.tar.gz"
+
+            if curl -fsSL --retry 3 --retry-all-errors --connect-timeout 10 --max-time 300 -o /tmp/tiup.tar.gz "$url" \
+              && tar -zxf /tmp/tiup.tar.gz -C "$TIUP_HOME"; then
+              rm -f /tmp/tiup.tar.gz
+            else
+              rm -f /tmp/tiup.tar.gz
+              rm -rf "$TIUP_HOME"
+              mkdir -p "$TIUP_HOME"
+              curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-all-errors --connect-timeout 10 --max-time 300 \
+                https://tiup-mirrors.pingcap.com/install.sh | sh
+            fi
+
+            tiup --version
+            tiup mirror show
+            tiup list >/dev/null
+            tiup install playground
+          }
+
+          for attempt in 1 2 3; do
+            echo "Setting up TiUP (attempt $attempt)..."
+            if install_and_verify; then
+              break
+            fi
+            echo "TiUP setup failed; retrying..."
+            sleep $((attempt * 5))
+          done
+
+          # Ensure the repository is initialized and trusted.
+          tiup list >/dev/null
+
+      - name: Build pg-tikv
+        run: cargo build --release
+
+      - name: Start TiKV cluster
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cat > /tmp/tikv.toml <<'EOF'
+          [storage]
+          api-version = 2
+          enable-ttl = true
+          EOF
+
+          PLAYGROUND_LOG=/tmp/tiup-playground.log
+          rm -f "$PLAYGROUND_LOG"
+
+          tiup playground \
+            --mode tikv-slim \
+            --without-monitor \
+            --pd.host 127.0.0.1 \
+            --pd.port 2379 \
+            --kv.host 127.0.0.1 \
+            --kv.config /tmp/tikv.toml \
+            --kv 1 >"$PLAYGROUND_LOG" 2>&1 &
+          PLAYGROUND_PID=$!
+
+          # Wait for TiKV to be ready (PD is healthy and a store is registered)
+          for i in $(seq 1 120); do
+            if ! kill -0 "$PLAYGROUND_PID" 2>/dev/null; then
+              echo "tiup playground exited early:"
+              cat "$PLAYGROUND_LOG" || true
+              exit 1
+            fi
+
+            if curl -sf http://127.0.0.1:2379/pd/api/v1/health > /dev/null 2>&1; then
+              if curl -sf http://127.0.0.1:2379/pd/api/v1/stores | grep -Eq '\"count\"[[:space:]]*:[[:space:]]*[1-9]'; then
+                echo "TiKV ready after $i seconds"
+                break
+              fi
+            fi
+            sleep 1
+          done
+
+          curl -sf http://127.0.0.1:2379/pd/api/v1/health || (cat "$PLAYGROUND_LOG" && exit 1)
+          curl -sf http://127.0.0.1:2379/pd/api/v1/stores | grep -Eq '\"count\"[[:space:]]*:[[:space:]]*[1-9]' || (cat "$PLAYGROUND_LOG" && exit 1)
+
+      - name: Start pg-tikv
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PD_ENDPOINTS=127.0.0.1:2379 PG_PORT="$PG_PORT" ./target/release/pg-tikv > /tmp/pgtikv.log 2>&1 &
+          echo "PG_TIKV_PID=$!" >> "$GITHUB_ENV"
+
+          # Wait for pg-tikv to be ready
+          for i in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -q 2>/dev/null; then
+              echo "pg-tikv ready after $i seconds"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify pg-tikv is responding
+          PGPASSWORD="$PG_PASSWORD" psql -h 127.0.0.1 -p "$PG_PORT" -U "$PG_USER" -d postgres -c "SELECT 1" || (cat /tmp/pgtikv.log && exit 1)
+
+      - name: Run SQLAlchemy smoke suite
+        shell: bash
+        run: bash scripts/e2e_tests.sh sqlalchemy_smoke
+        env:
+          PG_DSN: postgres://${{ env.PG_USER }}:${{ env.PG_PASSWORD }}@127.0.0.1:${{ env.PG_PORT }}/postgres
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sqlalchemy-smoke-logs
+          path: |
+            /tmp/tiup-playground.log
+            /tmp/pgtikv.log
