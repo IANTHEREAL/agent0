@@ -1,0 +1,4 @@
+rolname|database|setconfig
+ars_role|<all>|statement_timeout=1000
+ars_role|postgres|statement_timeout=2000
+(2 rows)
