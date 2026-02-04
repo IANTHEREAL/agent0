@@ -87,11 +87,42 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
         },
 
         // Arithmetic
-        BinaryOperator::Plus => add_values(left, right),
-        BinaryOperator::Minus => sub_values(left, right),
-        BinaryOperator::Multiply => mul_values(left, right),
-        BinaryOperator::Divide => div_values(left, right),
-        BinaryOperator::Modulo => mod_values(left, right),
+        // PostgreSQL arithmetic operators are strict: NULL in => NULL out.
+        BinaryOperator::Plus => {
+            if left == Value::Null || right == Value::Null {
+                Ok(Value::Null)
+            } else {
+                add_values(left, right)
+            }
+        }
+        BinaryOperator::Minus => {
+            if left == Value::Null || right == Value::Null {
+                Ok(Value::Null)
+            } else {
+                sub_values(left, right)
+            }
+        }
+        BinaryOperator::Multiply => {
+            if left == Value::Null || right == Value::Null {
+                Ok(Value::Null)
+            } else {
+                mul_values(left, right)
+            }
+        }
+        BinaryOperator::Divide => {
+            if left == Value::Null || right == Value::Null {
+                Ok(Value::Null)
+            } else {
+                div_values(left, right)
+            }
+        }
+        BinaryOperator::Modulo => {
+            if left == Value::Null || right == Value::Null {
+                Ok(Value::Null)
+            } else {
+                mod_values(left, right)
+            }
+        }
 
         BinaryOperator::StringConcat => match (&left, &right) {
             (Value::Tsvector(_), _) | (_, Value::Tsvector(_)) => {

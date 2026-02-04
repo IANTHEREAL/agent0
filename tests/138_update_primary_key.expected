@@ -1,0 +1,40 @@
+id|v
+1|one
+2|two
+3|three
+(3 rows)
+id|v
+2|two
+3|three
+10|one
+(3 rows)
+id|v
+10|one
+12|two
+13|three
+(3 rows)
+id|v
+10|one->ten
+12|two
+13|three
+(3 rows)
+a|b|v
+1|1|r11
+1|2|r12
+2|1|r21
+(3 rows)
+a|b|v
+1|1|r11
+1|99|r12
+2|1|r21
+(3 rows)
+a|b|v
+1|1|r11
+1|99|r12
+10|10|r21
+(3 rows)
+a|b|v
+1|1|r11
+1|99|r12
+10|10|moved
+(3 rows)

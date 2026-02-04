@@ -1,0 +1,18 @@
+id|l_id|r_id|a|b
+2|2|2|a2|b2
+3|3|3|a3|b3
+(2 rows)
+id|l_id|r_id|a|b
+1|1|NULL|a1|NULL
+2|2|2|a2|b2
+3|3|3|a3|b3
+(3 rows)
+k1|k2|l_k1|l_k2|r_k1|r_k2|c|d
+1|1|1|1|1|1|c11|d11
+2|1|2|1|2|1|c21|d21
+(2 rows)
+k1|k2|l_k1|l_k2|r_k1|r_k2|c|d
+1|1|1|1|1|1|c11|d11
+1|2|1|2|NULL|NULL|c12|NULL
+2|1|2|1|2|1|c21|d21
+(3 rows)
