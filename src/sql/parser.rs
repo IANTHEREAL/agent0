@@ -872,6 +872,25 @@ fn is_rewrite_boundary_keyword(token_upper: &str) -> bool {
             | "ASC"
             | "DESC"
             | "NULLS"
+            | "ON"
+            | "JOIN"
+            | "INNER"
+            | "LEFT"
+            | "RIGHT"
+            | "FULL"
+            | "OUTER"
+            | "CROSS"
+            | "NATURAL"
+            | "RETURNING"
+            | "INTO"
+            | "SET"
+            | "CASE"
+            | "NOT"
+            | "IN"
+            | "BETWEEN"
+            | "LIKE"
+            | "ILIKE"
+            | "IS"
     )
 }
 
@@ -1553,6 +1572,33 @@ mod tests {
         assert!(
             result.contains("(l2_distance(a, b)) > 5"),
             "got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rewrite_vector_distance_join_on_boundary() {
+        let result = rewrite_vector_distance_ops("SELECT * FROM t1 JOIN t2 ON t1.v <-> t2.v < 1");
+        assert!(
+            result.contains("(l2_distance(t1.v, t2.v)) < 1"),
+            "JOIN/ON should be boundaries; got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rewrite_vector_distance_left_join_on() {
+        let result = rewrite_vector_distance_ops(
+            "SELECT * FROM t1 LEFT JOIN t2 ON t1.v <=> t2.v < 0.5 ORDER BY t1.v <-> t2.v",
+        );
+        assert!(
+            result.contains("(cosine_distance(t1.v, t2.v)) < 0.5"),
+            "LEFT JOIN ON should be boundaries; got: {}",
+            result
+        );
+        assert!(
+            result.contains("(l2_distance(t1.v, t2.v))"),
+            "ORDER BY rewrite should work; got: {}",
             result
         );
     }

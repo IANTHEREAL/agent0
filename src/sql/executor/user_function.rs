@@ -68,9 +68,22 @@ impl Executor {
                 return Ok(None);
             }
 
-            let call_args = eval_function_args(args)?;
+        let call_args = eval_function_args(args)?;
 
-            let result = execute_sql_table_function(
+        let expected_arity = func_def.arg_types.len();
+        let actual_arity = call_args.len();
+        if actual_arity != expected_arity {
+            return Err(anyhow!(
+                "function {}() requires {} argument{}, but {} {} provided",
+                full_name.rsplit('.').next().unwrap_or(&full_name),
+                expected_arity,
+                if expected_arity == 1 { "" } else { "s" },
+                actual_arity,
+                if actual_arity == 1 { "was" } else { "were" },
+            ));
+        }
+
+        let result = execute_sql_table_function(
                 self,
                 txn,
                 db_id,
@@ -179,16 +192,37 @@ fn substitute_params(func_def: &FunctionDef, args: &[Value]) -> String {
 
     let mut sql = func_def.body.clone();
     for (name, value) in &param_map {
-        let value_str = match value {
-            Value::Null => "NULL".to_string(),
-            Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
-            Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-            Value::Vector(_) => format!("'{}'", value),
-            v => v.to_string(),
-        };
+        let value_str = value_to_sql_literal(value);
         sql = plpgsql::replace_identifier(&sql, name, &value_str);
     }
     sql
+}
+
+fn value_to_sql_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+        Value::Int32(i) => i.to_string(),
+        Value::Int64(i) => i.to_string(),
+        Value::Float64(f) => f.to_string(),
+        Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+        Value::Vector(_) => format!("'{}'", value),
+        Value::Uuid(_) => format!("'{}'::uuid", value),
+        Value::Timestamp(ts) => format!("'{}'::timestamp", ts),
+        Value::Date(_) => format!("'{}'::date", value),
+        Value::Time(_) => format!("'{}'::time", value),
+        Value::Interval(iv) => format!("'{}'::interval", iv),
+        Value::Json(s) => format!("'{}'::json", s.replace('\'', "''")),
+        Value::Jsonb(s) => format!("'{}'::jsonb", s.replace('\'', "''")),
+        Value::Bytes(b) => format!("'\\x{}'::bytea", hex::encode(b)),
+        Value::Array(elems) => {
+            let inner: Vec<String> = elems.iter().map(value_to_sql_literal).collect();
+            format!("ARRAY[{}]", inner.join(", "))
+        }
+        Value::Numeric(d) => format!("{}::numeric", d),
+        Value::Tsvector(s) => format!("'{}'::tsvector", s.replace('\'', "''")),
+        Value::Tsquery(s) => format!("'{}'::tsquery", s.replace('\'', "''")),
+    }
 }
 
 fn looks_like_type(s: &str) -> bool {
