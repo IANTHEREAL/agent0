@@ -875,6 +875,10 @@ fn is_rewrite_boundary_keyword(token_upper: &str) -> bool {
     )
 }
 
+fn is_comparison_operator_char(tok: &Token) -> bool {
+    tok.kind == TokenKind::Other && matches!(tok.text.as_str(), "<" | ">" | "=" | "!")
+}
+
 fn find_left_expr_start(tokens: &[Token], op_idx: usize) -> usize {
     let mut depth_paren = 0i32;
     let mut depth_bracket = 0i32;
@@ -906,12 +910,15 @@ fn find_left_expr_start(tokens: &[Token], op_idx: usize) -> usize {
                 }
             }
             _ => {
-                if depth_paren == 0
-                    && depth_bracket == 0
-                    && tok.kind == TokenKind::Word
-                    && is_rewrite_boundary_keyword(&tok.text.to_uppercase())
-                {
-                    return idx + 1;
+                if depth_paren == 0 && depth_bracket == 0 {
+                    if is_comparison_operator_char(tok) {
+                        return idx + 1;
+                    }
+                    if tok.kind == TokenKind::Word
+                        && is_rewrite_boundary_keyword(&tok.text.to_uppercase())
+                    {
+                        return idx + 1;
+                    }
                 }
             }
         }
@@ -950,12 +957,15 @@ fn find_right_expr_end(tokens: &[Token], op_idx: usize) -> usize {
                 }
             }
             _ => {
-                if depth_paren == 0
-                    && depth_bracket == 0
-                    && tok.kind == TokenKind::Word
-                    && is_rewrite_boundary_keyword(&tok.text.to_uppercase())
-                {
-                    return idx.saturating_sub(1);
+                if depth_paren == 0 && depth_bracket == 0 {
+                    if is_comparison_operator_char(tok) {
+                        return idx.saturating_sub(1);
+                    }
+                    if tok.kind == TokenKind::Word
+                        && is_rewrite_boundary_keyword(&tok.text.to_uppercase())
+                    {
+                        return idx.saturating_sub(1);
+                    }
                 }
             }
         }
@@ -1518,6 +1528,33 @@ mod tests {
     fn test_rewrite_vector_distance_cosine() {
         let result = rewrite_vector_distance_ops("SELECT v <=> '[0,1,0]' FROM vec_test");
         assert!(result.contains("cosine_distance(v, '[0,1,0]')"));
+    }
+
+    #[test]
+    fn test_rewrite_vector_distance_with_comparison() {
+        let result = rewrite_vector_distance_ops(
+            "SELECT * FROM t WHERE a <#> b < -0.2 ORDER BY a <#> b ASC",
+        );
+        assert!(
+            result.contains("(inner_product(a, b)) < -0.2"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("(inner_product(a, b)) ASC"),
+            "got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_rewrite_vector_distance_comparison_boundary() {
+        let result = rewrite_vector_distance_ops("SELECT a <-> b > 5 FROM t");
+        assert!(
+            result.contains("(l2_distance(a, b)) > 5"),
+            "got: {}",
+            result
+        );
     }
 
     #[test]
