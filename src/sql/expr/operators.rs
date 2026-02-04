@@ -67,27 +67,23 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
         // Logical
         // SQL three-valued logic for boolean operators
         // https://www.postgresql.org/docs/current/functions-logical.html
-        BinaryOperator::And => {
-            match (left, right) {
-                (Value::Boolean(false), _) | (_, Value::Boolean(false)) => Ok(Value::Boolean(false)),
-                (Value::Boolean(true), Value::Boolean(true)) => Ok(Value::Boolean(true)),
-                (Value::Boolean(true), Value::Null) | (Value::Null, Value::Boolean(true)) => {
-                    Ok(Value::Null)
-                }
-                (Value::Null, Value::Null) => Ok(Value::Null),
-                _ => Err(anyhow!("AND requires boolean operands")),
+        BinaryOperator::And => match (left, right) {
+            (Value::Boolean(false), _) | (_, Value::Boolean(false)) => Ok(Value::Boolean(false)),
+            (Value::Boolean(true), Value::Boolean(true)) => Ok(Value::Boolean(true)),
+            (Value::Boolean(true), Value::Null) | (Value::Null, Value::Boolean(true)) => {
+                Ok(Value::Null)
             }
+            (Value::Null, Value::Null) => Ok(Value::Null),
+            _ => Err(anyhow!("AND requires boolean operands")),
         },
-        BinaryOperator::Or => {
-            match (left, right) {
-                (Value::Boolean(true), _) | (_, Value::Boolean(true)) => Ok(Value::Boolean(true)),
-                (Value::Boolean(false), Value::Boolean(false)) => Ok(Value::Boolean(false)),
-                (Value::Boolean(false), Value::Null) | (Value::Null, Value::Boolean(false)) => {
-                    Ok(Value::Null)
-                }
-                (Value::Null, Value::Null) => Ok(Value::Null),
-                _ => Err(anyhow!("OR requires boolean operands")),
+        BinaryOperator::Or => match (left, right) {
+            (Value::Boolean(true), _) | (_, Value::Boolean(true)) => Ok(Value::Boolean(true)),
+            (Value::Boolean(false), Value::Boolean(false)) => Ok(Value::Boolean(false)),
+            (Value::Boolean(false), Value::Null) | (Value::Null, Value::Boolean(false)) => {
+                Ok(Value::Null)
             }
+            (Value::Null, Value::Null) => Ok(Value::Null),
+            _ => Err(anyhow!("OR requires boolean operands")),
         },
 
         // Arithmetic
@@ -98,6 +94,9 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
         BinaryOperator::Modulo => mod_values(left, right),
 
         BinaryOperator::StringConcat => match (&left, &right) {
+            (Value::Tsvector(_), _) | (_, Value::Tsvector(_)) => {
+                super::super::fts::concat_tsvector(&left, &right)
+            }
             (Value::Jsonb(l), Value::Jsonb(r)) => {
                 let left_json: serde_json::Value =
                     serde_json::from_str(l).map_err(|e| anyhow!("Invalid JSONB: {}", e))?;
@@ -268,6 +267,9 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
             let json_val: serde_json::Value =
                 serde_json::from_str(&json_str).map_err(|e| anyhow!("Invalid JSON: {}", e))?;
             Ok(Value::Boolean(super::super::jsonb::exists(&json_val, &key)))
+        }
+        BinaryOperator::PGCustomBinaryOperator(op) if op.len() == 1 && op[0] == "@@" => {
+            super::super::fts::ts_match(&left, &right)
         }
 
         _ => Err(anyhow!("Unsupported binary operator: {:?}", op)),

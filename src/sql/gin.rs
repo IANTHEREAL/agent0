@@ -194,6 +194,127 @@ fn hash_json_number(mut h: u64, n: &JsonNumber) -> u64 {
     fnv1a_u64(h, &f.to_bits().to_be_bytes())
 }
 
+// ----------------------------
+// ARRAY GIN Token Extraction
+// ----------------------------
+
+use crate::types::Value;
+
+/// Extract hashed GIN tokens from an ARRAY value.
+///
+/// For ARRAY containment (`@>`), we hash each non-null element to a token.
+/// The containment check is order-independent, so we just hash element values.
+pub(crate) fn extract_array_gin_tokens(arr: &[Value]) -> Vec<u64> {
+    let mut tokens = Vec::with_capacity(arr.len());
+    for elem in arr {
+        if !matches!(elem, Value::Null) {
+            tokens.push(hash_array_element(elem));
+        }
+    }
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
+}
+
+fn hash_array_element(val: &Value) -> u64 {
+    let mut h = FNV1A_OFFSET_BASIS;
+    h = fnv1a_u64(h, b"A");
+    match val {
+        Value::Null => fnv1a_u64(h, b"n"),
+        Value::Boolean(b) => fnv1a_u64(h, if *b { b"t" } else { b"f" }),
+        Value::Int32(i) => {
+            h = fnv1a_u64(h, b"i4");
+            fnv1a_u64(h, &i.to_be_bytes())
+        }
+        Value::Int64(i) => {
+            h = fnv1a_u64(h, b"i8");
+            fnv1a_u64(h, &i.to_be_bytes())
+        }
+        Value::Float64(f) => {
+            h = fnv1a_u64(h, b"f8");
+            fnv1a_u64(h, &f.to_bits().to_be_bytes())
+        }
+        Value::Text(s) => {
+            h = fnv1a_u64(h, b"s");
+            fnv1a_u64(h, s.as_bytes())
+        }
+        Value::Uuid(bytes) => {
+            h = fnv1a_u64(h, b"u");
+            fnv1a_u64(h, bytes)
+        }
+        Value::Timestamp(ts) => {
+            h = fnv1a_u64(h, b"ts");
+            fnv1a_u64(h, &ts.to_be_bytes())
+        }
+        Value::Date(d) => {
+            h = fnv1a_u64(h, b"d");
+            fnv1a_u64(h, &d.to_be_bytes())
+        }
+        Value::Interval(iv) => {
+            h = fnv1a_u64(h, b"iv");
+            fnv1a_u64(h, iv.to_string().as_bytes())
+        }
+        Value::Bytes(b) => {
+            h = fnv1a_u64(h, b"b");
+            fnv1a_u64(h, b)
+        }
+        Value::Array(nested) => {
+            h = fnv1a_u64(h, b"arr");
+            for elem in nested {
+                let child_hash = hash_array_element(elem);
+                h = fnv1a_u64(h, &child_hash.to_be_bytes());
+            }
+            h
+        }
+        _ => fnv1a_u64(h, b"?"),
+    }
+}
+
+// ----------------------------
+// TSVECTOR GIN Token Extraction
+// ----------------------------
+
+/// Extract hashed GIN tokens from a tsvector string.
+///
+/// For FTS match (`@@`), we extract each lexeme (word) from the tsvector.
+/// Format: 'word':posWeight e.g., "'hello':1A 'world':2B"
+pub(crate) fn extract_tsvector_gin_tokens(tsvector: &str) -> Vec<u64> {
+    let mut tokens = Vec::new();
+    for part in tsvector.split_whitespace() {
+        if let Some(word) = part.split(':').next() {
+            let word = word.trim_matches('\'');
+            if !word.is_empty() {
+                tokens.push(hash_tsvector_lexeme(word));
+            }
+        }
+    }
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
+}
+
+/// Extract GIN tokens from a tsquery for index lookup.
+///
+/// Parses query terms from tsquery format: "'hello' & 'world'" => ["hello", "world"]
+pub(crate) fn extract_tsquery_gin_tokens(tsquery: &str) -> Vec<u64> {
+    let mut tokens = Vec::new();
+    for term in tsquery.split(|c: char| matches!(c, '&' | '|' | '!' | '(' | ')')) {
+        let word = term.trim().trim_matches('\'').to_lowercase();
+        if !word.is_empty() {
+            tokens.push(hash_tsvector_lexeme(&word));
+        }
+    }
+    tokens.sort_unstable();
+    tokens.dedup();
+    tokens
+}
+
+fn hash_tsvector_lexeme(word: &str) -> u64 {
+    let mut h = FNV1A_OFFSET_BASIS;
+    h = fnv1a_u64(h, b"T");
+    fnv1a_u64(h, word.to_lowercase().as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,5 +377,45 @@ mod tests {
             v
         };
         assert_eq!(&scan[..2], key_values_sorted.as_slice());
+    }
+
+    #[test]
+    fn array_tokens_basic() {
+        let arr = vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)];
+        let tokens = extract_array_gin_tokens(&arr);
+        assert_eq!(tokens.len(), 3);
+    }
+
+    #[test]
+    fn array_tokens_deduped() {
+        let arr = vec![Value::Int32(1), Value::Int32(1), Value::Int32(2)];
+        let tokens = extract_array_gin_tokens(&arr);
+        assert_eq!(tokens.len(), 2);
+    }
+
+    #[test]
+    fn array_tokens_null_ignored() {
+        let arr = vec![Value::Int32(1), Value::Null, Value::Int32(2)];
+        let tokens = extract_array_gin_tokens(&arr);
+        assert_eq!(tokens.len(), 2);
+    }
+
+    #[test]
+    fn array_containment_tokens_subset() {
+        let container = vec![
+            Value::Text("rust".to_string()),
+            Value::Text("tikv".to_string()),
+            Value::Text("postgres".to_string()),
+        ];
+        let contained = vec![
+            Value::Text("rust".to_string()),
+            Value::Text("tikv".to_string()),
+        ];
+        let container_tokens: std::collections::HashSet<u64> =
+            extract_array_gin_tokens(&container).into_iter().collect();
+        let contained_tokens = extract_array_gin_tokens(&contained);
+        for t in contained_tokens {
+            assert!(container_tokens.contains(&t));
+        }
     }
 }

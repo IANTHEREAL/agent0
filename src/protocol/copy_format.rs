@@ -133,6 +133,9 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
         Value::Numeric(d) => {
             buf.extend_from_slice(d.to_string().as_bytes());
         }
+        Value::Tsvector(s) | Value::Tsquery(s) => {
+            escape_text(s.as_bytes(), buf);
+        }
     }
 }
 

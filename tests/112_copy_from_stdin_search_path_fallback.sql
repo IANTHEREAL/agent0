@@ -1,6 +1,7 @@
+DROP TABLE IF EXISTS copy_schema2.t_copy_search_path;
 DROP TABLE IF EXISTS public.t_copy_search_path;
-DROP SCHEMA IF EXISTS copy_schema1 CASCADE;
-DROP SCHEMA IF EXISTS copy_schema2 CASCADE;
+DROP SCHEMA IF EXISTS copy_schema1;
+DROP SCHEMA IF EXISTS copy_schema2;
 CREATE SCHEMA copy_schema1;
 CREATE SCHEMA copy_schema2;
 

@@ -5,6 +5,7 @@ use std::sync::OnceLock;
 
 pub mod array;
 pub mod encoding;
+pub mod fts;
 pub mod json;
 pub mod math;
 pub mod misc;
@@ -23,6 +24,7 @@ fn init_registry() -> HashMap<&'static str, SqlFn> {
 
     array::register(&mut map);
     encoding::register(&mut map);
+    fts::register(&mut map);
     json::register(&mut map);
     math::register(&mut map);
     misc::register(&mut map);

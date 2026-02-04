@@ -22,6 +22,8 @@ pub fn type_precedence(dt: &DataType) -> i32 {
         DataType::Array(_) => 120,
         DataType::Vector(_) => 130,
         DataType::UserDefined(_) => 200,
+        DataType::Tsvector => 140,
+        DataType::Tsquery => 141,
     }
 }
 

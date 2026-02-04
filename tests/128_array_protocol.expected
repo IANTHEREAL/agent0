@@ -1,0 +1,22 @@
+int_array
+{1,2,3}
+(1 row)
+bigint_array
+{1,2,3}
+(1 row)
+text_array
+{a,b,c}
+(1 row)
+bool_array
+{t,f,t}
+(1 row)
+float_array
+{1.5,2.5,3.5}
+(1 row)
+concat_array
+{1,2,3,4}
+(1 row)
+id|tags
+1|{rust,tikv}
+2|{postgres,sql}
+(2 rows)

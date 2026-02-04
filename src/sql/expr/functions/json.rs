@@ -79,6 +79,7 @@ fn value_to_json(val: &Value) -> serde_json::Value {
             }
             serde_json::Value::String(s)
         }
+        Value::Tsvector(s) | Value::Tsquery(s) => serde_json::Value::String(s.clone()),
     }
 }
 

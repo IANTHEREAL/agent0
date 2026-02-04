@@ -1061,6 +1061,8 @@ fn data_type_to_pg_type(dt: &DataType) -> &'static str {
         DataType::Time => "time without time zone",
         DataType::UserDefined(_) => "character varying",
         DataType::Numeric { .. } => "numeric",
+        DataType::Tsvector => "tsvector",
+        DataType::Tsquery => "tsquery",
     }
 }
 
@@ -1089,6 +1091,8 @@ fn data_type_to_udt_name(dt: &DataType) -> &'static str {
         DataType::Time => "time",
         DataType::UserDefined(_) => "text",
         DataType::Numeric { .. } => "numeric",
+        DataType::Tsvector => "tsvector",
+        DataType::Tsquery => "tsquery",
     }
 }
 

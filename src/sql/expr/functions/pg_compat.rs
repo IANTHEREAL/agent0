@@ -13,6 +13,7 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("FORMAT_TYPE", format_type);
     map.insert("PG_IS_IN_RECOVERY", pg_is_in_recovery);
     map.insert("PG_TABLE_IS_VISIBLE", pg_table_is_visible);
+    map.insert("PG_TYPE_IS_VISIBLE", pg_type_is_visible);
     map.insert("CLOCK_TIMESTAMP", clock_timestamp);
     map.insert("STATEMENT_TIMESTAMP", clock_timestamp);
     map.insert("TRANSACTION_TIMESTAMP", clock_timestamp);
@@ -54,6 +55,8 @@ fn pg_typeof_name(val: &Value) -> String {
             format!("{}[]", elem_type)
         }
         Value::Vector(_) => "vector".to_string(),
+        Value::Tsvector(_) => "tsvector".to_string(),
+        Value::Tsquery(_) => "tsquery".to_string(),
     }
 }
 
@@ -140,6 +143,7 @@ pub fn pg_column_size(args: Vec<Value>) -> Result<Value> {
         Value::Json(s) | Value::Jsonb(s) => s.len() as i32 + 4,
         Value::Array(a) => a.len() as i32 * 8 + 4,
         Value::Vector(v) => v.len() as i32 * 4 + 4,
+        Value::Tsvector(s) | Value::Tsquery(s) => s.len() as i32 + 4,
     };
     Ok(Value::Int32(size))
 }
@@ -176,6 +180,16 @@ pub fn pg_is_in_recovery(_args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn pg_table_is_visible(_args: Vec<Value>) -> Result<Value> {
+    Ok(Value::Boolean(true))
+}
+
+/// Check if a type is visible in the current search_path.
+///
+/// In pg-tikv, all types within the keyspace are visible, so this always
+/// returns true (similar to pg_table_is_visible).
+///
+/// PostgreSQL signature: pg_type_is_visible(type_oid oid) → boolean
+pub fn pg_type_is_visible(_args: Vec<Value>) -> Result<Value> {
     Ok(Value::Boolean(true))
 }
 
@@ -309,6 +323,27 @@ mod tests {
         assert_eq!(
             format_type(vec![Value::Int32(25)]).unwrap(),
             Value::Text("text".into())
+        );
+    }
+
+    #[test]
+    fn test_pg_type_is_visible() {
+        assert_eq!(
+            pg_type_is_visible(vec![Value::Int32(12345)]).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(
+            pg_type_is_visible(vec![Value::Null]).unwrap(),
+            Value::Boolean(true)
+        );
+        assert_eq!(pg_type_is_visible(vec![]).unwrap(), Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_pg_table_is_visible() {
+        assert_eq!(
+            pg_table_is_visible(vec![Value::Int32(12345)]).unwrap(),
+            Value::Boolean(true)
         );
     }
 }

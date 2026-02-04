@@ -889,6 +889,10 @@ fn encode_value_memcomparable(value: &Value, buf: &mut Vec<u8>) {
                 buf.push(digits_len);
             }
         }
+        Value::Tsvector(s) | Value::Tsquery(s) => {
+            buf.push(NOT_NULL_TAG);
+            buf.extend(memcomparable::to_vec(s).unwrap());
+        }
     }
 }
 
@@ -968,6 +972,14 @@ pub fn decode_value_memcomparable(data: &[u8], data_type: &DataType) -> Result<(
         }
         DataType::Array(_) | DataType::Vector(_) => {
             anyhow::bail!("Array/Vector decoding not supported in index keys");
+        }
+        DataType::Tsvector => {
+            let v: String = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Tsvector(v), deserializer.position())
+        }
+        DataType::Tsquery => {
+            let v: String = serde::Deserialize::deserialize(&mut deserializer)?;
+            (Value::Tsquery(v), deserializer.position())
         }
         DataType::Numeric { .. } => {
             // Decode memcomparable Numeric:

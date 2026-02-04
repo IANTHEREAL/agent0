@@ -37,3 +37,25 @@ When `PGTIKV_TRIGGER_NODE_ID` is not set, a best-effort derived node id is used 
 - **Queue depth quota is best-effort**: `current_depth` is in-memory and resets on restart; it’s a fast backpressure guard, not a durable limit.
 - **Long-running triggers vs orphan timeout**: if a trigger execution exceeds `PGTIKV_TRIGGER_ORPHAN_TIMEOUT_SEC`, orphan recovery can re-queue and cause duplicates.
 - **Prometheus metrics** from the design doc are not wired (there is no metrics exporter pipeline in the current codebase); the sys table functions are implemented instead.
+
+---
+
+# Review: Array Encoding / GIN Pattern Handling / TSVECTOR OIDs
+
+Reviewer feedback (verbatim from reviewer model output) for a separate patch:
+
+- [P1] Preserve NULL elements when encoding arrays in pgwire responses — `src/protocol/handler.rs:5767-5776`
+  - In `encode_value()`, the `Value::Array` branch converts `Value::Null` into the string `"NULL"` and builds a `Vec<String>` for `DataRowEncoder`; pgwire’s array text encoding then quotes `NULL`-like strings, so queries like `SELECT ARRAY[1,NULL,2]` will be emitted as `{1,"NULL",2}` (NULL becomes a literal string), and nested arrays are stringified into `"{...}"` rather than `{{...}}`.
+  - This is a behavioral regression vs the previous explicit array-literal encoder; consider encoding as `Vec<Option<...>>` (so NULL stays NULL) or reverting to an explicit array formatter that preserves NULL/nesting semantics.
+
+- [P1] Don't fall back to tsquery tokens for invalid JSON GIN patterns — `src/sql/executor/select.rs:969-976`
+  - In GIN scan token derivation, `Value::Text` patterns are treated as JSON if they parse, otherwise as tsquery tokens (`extract_tsquery_gin_tokens`); since `planner::extract_gin_contains_predicate()` evaluates RHS constants without schema, JSONB `@>` patterns commonly arrive as `Value::Text`, so an invalid JSON literal like `metadata @> 'foo'` will no longer raise an error and can silently return 0 rows when the (miscomputed) token probe yields no candidates (predicate never evaluated).
+  - Token extraction should be driven by the indexed column type/operator (always error on invalid JSON for `@>`, parse arrays for array columns, treat text as tsquery only for `@@`), and `Value::Null` patterns should be short-circuited instead of falling back to a full scan.
+
+- [P2] Map TSVECTOR/TSQUERY to correct pgwire OIDs (not TEXT) — `src/protocol/handler.rs:5371-5376`
+  - `datatype_to_pgtype()` maps `DataType::Tsvector`/`DataType::Tsquery` to `Type::TEXT`, so RowDescriptions will advertise TEXT OIDs for TSVECTOR/TSQUERY columns and function results; this diverges from PostgreSQL and can break clients relying on OIDs/type introspection (and is inconsistent with the updated `information_schema` reporting).
+  - Use `postgres_types::Type::TS_VECTOR` and `Type::TSQUERY` (and array variants if needed) instead of `Type::TEXT`.
+
+- [P3] Fix nested-array hashing so GIN tokens include all elements — `src/sql/gin.rs:261-266`
+  - In `hash_array_element()`, the `Value::Array(nested)` case overwrites `h` with each `hash_array_element(elem)` result, so if nested arrays ever occur (e.g., via `ARRAY[ARRAY[...]]`), the token hash effectively collapses to the last nested element’s hash and loses the parent context, causing collisions and incorrect GIN behavior.
+  - If nested arrays are unsupported, reject them explicitly; otherwise fold each child hash into the parent hash instead of replacing it.

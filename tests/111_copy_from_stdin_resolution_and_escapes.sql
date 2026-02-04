@@ -1,5 +1,6 @@
+DROP TABLE IF EXISTS copy_schema.t_copy_resolve;
 DROP TABLE IF EXISTS public.t_copy_resolve;
-DROP SCHEMA IF EXISTS copy_schema CASCADE;
+DROP SCHEMA IF EXISTS copy_schema;
 CREATE SCHEMA copy_schema;
 
 CREATE TABLE copy_schema.t_copy_resolve (id INT, note TEXT);

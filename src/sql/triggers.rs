@@ -72,6 +72,32 @@ enum TriggerResult {
     Unchanged,
 }
 
+const UNSUPPORTED_FTS_FUNCTIONS: &[&str] = &[
+    "tsvector_update_trigger",
+    "websearch_to_tsquery",
+    "phraseto_tsquery",
+];
+
+fn validate_trigger_body(body: &str) -> Result<()> {
+    let body_lower = body.to_lowercase();
+    for func in UNSUPPORTED_FTS_FUNCTIONS {
+        if let Some(pos) = body_lower.find(func) {
+            let after_pos = pos + func.len();
+            if after_pos < body_lower.len() {
+                let next_char = body_lower.as_bytes()[after_pos] as char;
+                if next_char == '(' || next_char.is_whitespace() {
+                    return Err(anyhow::anyhow!(
+                        "Trigger uses unsupported function '{}'. \
+                         Use to_tsvector/plainto_tsquery/ts_rank instead.",
+                        func
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn execute_trigger_function(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -116,6 +142,8 @@ async fn execute_trigger_body(
     use super::expr::eval_expr;
     use super::sequences;
 
+    validate_trigger_body(body)?;
+
     let mut modified_values = new_row.values.clone();
     let mut was_modified = false;
 
@@ -127,9 +155,17 @@ async fn execute_trigger_body(
     let end_pos = body_upper.rfind("END").unwrap_or(body.len());
     let block_content = &body[begin_pos..end_pos];
 
-    for line in block_content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with("--") {
+    // Join lines to handle multi-line statements, split by semicolon
+    let normalized = block_content
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("--"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    for stmt in normalized.split(';') {
+        let line = stmt.trim();
+        if line.is_empty() {
             continue;
         }
 
@@ -471,6 +507,7 @@ fn value_to_sql_literal(value: &Value) -> String {
             format!("'{:02}:{:02}:{:02}'", hours, mins, secs)
         }
         Value::Numeric(d) => d.to_string(),
+        Value::Tsvector(s) | Value::Tsquery(s) => format!("'{}'", s.replace('\'', "''")),
     }
 }
 
@@ -663,5 +700,65 @@ mod tests {
             value_to_sql_literal(&Value::Text("it's".to_string())),
             "'it''s'"
         );
+    }
+
+    #[test]
+    fn test_validate_trigger_body_allows_normal_triggers() {
+        let body = r#"
+            BEGIN
+                NEW.updated_at := NOW();
+                RETURN NEW;
+            END;
+        "#;
+        assert!(validate_trigger_body(body).is_ok());
+    }
+
+    #[test]
+    fn test_validate_trigger_body_allows_to_tsvector() {
+        let body = r#"
+            BEGIN
+                NEW.search_vector := to_tsvector('english', NEW.title);
+                RETURN NEW;
+            END;
+        "#;
+        let result = validate_trigger_body(body);
+        assert!(result.is_ok(), "to_tsvector should be supported now");
+    }
+
+    #[test]
+    fn test_validate_trigger_body_allows_setweight() {
+        let body = r#"
+            BEGIN
+                NEW.search_vector := setweight(to_tsvector('english', NEW.title), 'A');
+                RETURN NEW;
+            END;
+        "#;
+        let result = validate_trigger_body(body);
+        assert!(result.is_ok(), "setweight should be supported now");
+    }
+
+    #[test]
+    fn test_validate_trigger_body_detects_unsupported_fts() {
+        let body = r#"
+            BEGIN
+                NEW.search_vector := tsvector_update_trigger();
+                RETURN NEW;
+            END;
+        "#;
+        let result = validate_trigger_body(body);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("tsvector_update_trigger"));
+    }
+
+    #[test]
+    fn test_validate_trigger_body_ignores_similar_names() {
+        let body = r#"
+            BEGIN
+                NEW.to_tsvector_count := 1;
+                RETURN NEW;
+            END;
+        "#;
+        assert!(validate_trigger_body(body).is_ok());
     }
 }

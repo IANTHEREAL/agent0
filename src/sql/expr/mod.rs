@@ -1722,6 +1722,11 @@ pub fn compare_order_by_values(
 }
 
 pub(super) fn eval_json_access(left: Value, operator: &JsonOperator, right: Value) -> Result<Value> {
+    // Handle @@ operator for full-text search (tsvector @@ tsquery)
+    if matches!(operator, JsonOperator::AtAt) {
+        return super::fts::ts_match(&left, &right);
+    }
+
     // `@>`/`<@` are overloaded by PostgreSQL for both SQL arrays and JSONB.
     if let Value::Array(left_arr) = &left {
         match operator {
@@ -2012,6 +2017,7 @@ fn value_to_json(val: &Value) -> serde_json::Value {
             }
             serde_json::Value::String(s)
         }
+        Value::Tsvector(s) | Value::Tsquery(s) => serde_json::Value::String(s.clone()),
     }
 }
 
