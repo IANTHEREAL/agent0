@@ -224,8 +224,10 @@ async fn validate_url(url: &Url) -> Result<()> {
         .port_or_known_default()
         .ok_or_else(|| anyhow!("http: url port is missing"))?;
 
+    let insecure = allow_insecure_http();
+
     let default_port = if is_https { 443 } else { 80 };
-    if port != default_port {
+    if port != default_port && !insecure {
         return Err(anyhow!(
             "http: only port {} is allowed for {} scheme",
             default_port,
@@ -237,6 +239,12 @@ async fn validate_url(url: &Url) -> Result<()> {
         .host_str()
         .ok_or_else(|| anyhow!("http: url host is missing"))?;
     let host_lower = host.to_ascii_lowercase();
+
+    // In insecure mode, allow localhost and private IPs for local development.
+    if insecure {
+        return Ok(());
+    }
+
     if host_lower == "localhost"
         || host_lower.ends_with(".localhost")
         || host_lower.ends_with(".local")

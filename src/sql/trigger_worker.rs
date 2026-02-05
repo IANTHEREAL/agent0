@@ -695,16 +695,22 @@ impl TriggerWorker {
 
         let mut sequence_values = HashMap::new();
         let start = Instant::now();
-        self.execute_trigger_body(
-            executor,
-            &mut txn,
-            db_id,
-            &mut sequence_values,
-            &schema,
-            &func.body,
-            event.old_row.as_ref(),
-            event.new_row.as_ref(),
-        )
+        // Wrap trigger body execution with extension context so that
+        // extensions (e.g. HTTP) are accessible from trigger functions.
+        // Trigger workers run as superuser since they are system-level.
+        crate::extensions::context::with_context(true, async {
+            self.execute_trigger_body(
+                executor,
+                &mut txn,
+                db_id,
+                &mut sequence_values,
+                &schema,
+                &func.body,
+                event.old_row.as_ref(),
+                event.new_row.as_ref(),
+            )
+            .await
+        })
         .await?;
 
         txn.commit().await?;
