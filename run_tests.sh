@@ -31,8 +31,7 @@ cleanup() {
         kill "$PGTIKV_PID" 2>/dev/null || true
         wait "$PGTIKV_PID" 2>/dev/null || true
     fi
-    echo "Stopping TiKV cluster '$CLUSTER_NAME'..."
-    uv run "$SCRIPT_DIR/scripts/tikv_admin.py" stop --name "$CLUSTER_NAME" 2>/dev/null || true
+    echo "Cleaning TiKV cluster '$CLUSTER_NAME'..."
     uv run "$SCRIPT_DIR/scripts/tikv_admin.py" clean --name "$CLUSTER_NAME" 2>/dev/null || true
     echo "Cleanup complete"
 }
