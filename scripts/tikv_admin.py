@@ -223,34 +223,10 @@ def check_cluster_process(info: ClusterInfo) -> str:
         return "stopped"
 
 
-def extract_ports_from_log(log_file: Path, timeout: int = 120) -> Optional[Dict[str, int]]:
-    """Extract PD and TiKV ports from tiup playground log."""
-    pd_pattern = re.compile(r"PD (?:Endpoints|client).*?[\d\.]+:(\d+)")
-    tikv_pattern = re.compile(r"TiKV.*?[\d\.]+:(\d+)")
-    
-    ports = {}
-    start_time = time.time()
-    
-    while time.time() - start_time < timeout:
-        if log_file.exists():
-            content = log_file.read_text()
-            
-            if "PD" not in ports:
-                match = pd_pattern.search(content)
-                if match:
-                    ports["pd"] = int(match.group(1))
-            
-            if "tikv" not in ports:
-                match = tikv_pattern.search(content)
-                if match:
-                    ports["tikv"] = int(match.group(1))
-            
-            if "pd" in ports:
-                return ports
-        
-        time.sleep(1)
-    
-    return ports if ports else None
+def wait_for_cluster_ready(host: str, pd_port: int, timeout: int = 120) -> bool:
+    """Wait for the cluster to be ready by checking the PD port."""
+    check_host = "127.0.0.1" if host == "0.0.0.0" else host
+    return wait_for_port(check_host, pd_port, timeout)
 
 
 def start_cluster(
@@ -293,8 +269,8 @@ enable-ttl = true
         "--mode", "tikv-slim",
         "--kv.config", str(tikv_config),
         "--tag", f"pg-tikv-{name}",
-        "--pd.host", host,
-        "--kv.host", host,
+        "--host", host,
+        "--without-monitor",
     ]
 
     if pd_port:
@@ -318,22 +294,16 @@ enable-ttl = true
             env=env,
         )
     
+    # Determine the actual PD port (default is 2379)
+    pd_port_actual = pd_port if pd_port else 2379
+    tikv_port_actual = 20160  # TiKV default port
+
     log_info(f"Cluster process started (PID: {proc.pid})")
-    log_info("Waiting for PD to be ready...")
-    
-    ports = extract_ports_from_log(log_file, timeout=120)
-    if not ports or "pd" not in ports:
-        log_error("Failed to start cluster - could not detect PD port")
+    log_info(f"Waiting for PD to be ready on port {pd_port_actual}...")
+
+    if not wait_for_cluster_ready(host, pd_port_actual, timeout=120):
+        log_error(f"Failed to start cluster - PD port {pd_port_actual} is not accessible")
         log_error(f"Check log file: {log_file}")
-        proc.terminate()
-        return None
-    
-    pd_port_actual = ports["pd"]
-    tikv_port_actual = ports.get("tikv", 20160)
-    
-    check_host = "127.0.0.1" if host == "0.0.0.0" else host
-    if not wait_for_port(check_host, pd_port_actual, 60):
-        log_error(f"PD port {pd_port_actual} is not accessible")
         proc.terminate()
         return None
     
