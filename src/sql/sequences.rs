@@ -148,6 +148,7 @@ fn is_known_builtin_function(name: &str) -> bool {
         // Misc
         | "PG_TYPEOF" | "VERSION" | "CURRENT_USER" | "CURRENT_ROLE" | "SESSION_USER"
         | "PG_BACKEND_PID" | "PG_CLIENT_ENCODING" | "PG_CATALOG" | "OBJ_DESCRIPTION" | "COL_DESCRIPTION"
+        | "PG_GET_SERIAL_SEQUENCE"
         | "GENERATE_SERIES" | "GENERATE_SUBSCRIPTS"
         // These are handled specially but are built-in
         | "CURRENT_SCHEMA" | "NEXTVAL" | "CURRVAL" | "SETVAL"
@@ -227,9 +228,11 @@ pub(crate) fn find_owned_sequence_full_name(
     column_name: &str,
 ) -> Result<Option<String>> {
     let mut matches = sequences.iter().filter(|seq| {
-        seq.owned_by.as_ref().map_or(false, |(owned_table, owned_col)| {
-            owned_table == table_full_name && owned_col == column_name
-        })
+        seq.owned_by
+            .as_ref()
+            .map_or(false, |(owned_table, owned_col)| {
+                owned_table == table_full_name && owned_col == column_name
+            })
     });
 
     let Some(first) = matches.next() else {
@@ -425,9 +428,7 @@ mod owned_sequence_lookup_tests {
     use super::*;
 
     fn make_sequence(full_name: &str, owned_by: Option<(&str, &str)>) -> SequenceDef {
-        let (schema, name) = full_name
-            .split_once('.')
-            .unwrap_or(("public", full_name));
+        let (schema, name) = full_name.split_once('.').unwrap_or(("public", full_name));
         SequenceDef {
             oid: 0,
             schema: schema.to_string(),
@@ -488,14 +489,9 @@ pub(crate) async fn execute_drop_sequence(
     if_exists: bool,
 ) -> Result<ExecuteResult> {
     for name in names {
-        let resolved = names::resolve_existing_sequence_name(
-            store.as_ref(),
-            txn,
-            db_id,
-            name,
-            search_path,
-        )
-        .await?;
+        let resolved =
+            names::resolve_existing_sequence_name(store.as_ref(), txn, db_id, name, search_path)
+                .await?;
         let Some(resolved) = resolved else {
             if !if_exists {
                 return Err(anyhow!("Sequence '{}' does not exist", name));
@@ -507,7 +503,9 @@ pub(crate) async fn execute_drop_sequence(
             return Err(anyhow!("Sequence '{}' does not exist", resolved.full));
         }
     }
-    Ok(ExecuteResult::CommandComplete { tag: "DROP SEQUENCE" })
+    Ok(ExecuteResult::CommandComplete {
+        tag: "DROP SEQUENCE",
+    })
 }
 
 fn function_name_upper(func: &Function) -> String {
@@ -639,7 +637,11 @@ async fn resolve_sequence_full_name_from_value(
     };
     for schema in candidates {
         let resolved = names::ResolvedName::new(schema.to_string(), seq_name.clone())?;
-        if store.get_sequence(txn, db_id, &resolved.full).await?.is_some() {
+        if store
+            .get_sequence(txn, db_id, &resolved.full)
+            .await?
+            .is_some()
+        {
             return Ok(resolved.full);
         }
     }

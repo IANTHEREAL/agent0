@@ -201,3 +201,126 @@ def test_sqlalchemy_inspector_reflection_smoke(schema, db):
         with db.engine.begin() as conn:
             conn.exec_driver_sql(f"DROP TABLE IF EXISTS {_qname(pg_schema, child_table)} CASCADE")
             conn.exec_driver_sql(f"DROP TABLE IF EXISTS {_qname(pg_schema, parent_table)} CASCADE")
+
+
+def test_alter_column_type_using_text_to_jsonb_updates_data_and_metadata(schema, db):
+    table = "migrations_alter_type_using_jsonb"
+    qualified_table = _qname(schema, table)
+
+    try:
+        with db.engine.begin() as conn:
+            conn.exec_driver_sql(
+                f"CREATE TABLE {qualified_table} (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+            )
+            conn.execute(
+                text(f"INSERT INTO {qualified_table} (id, payload) VALUES (:id, :payload)"),
+                {
+                    "id": 1,
+                    "payload": '{"a":"x","nested":{"b":"y"},"tags":["a","b"]}',
+                },
+            )
+
+            before = conn.execute(
+                text(
+                    """
+                    SELECT data_type, udt_name
+                    FROM information_schema.columns
+                    WHERE table_schema = :schema
+                      AND table_name = :table
+                      AND column_name = :column
+                    """
+                ),
+                {"schema": schema, "table": table, "column": "payload"},
+            ).one()
+
+            conn.exec_driver_sql(
+                f"ALTER TABLE {qualified_table} "
+                "ALTER COLUMN payload TYPE JSONB USING payload::jsonb"
+            )
+
+            after = conn.execute(
+                text(
+                    """
+                    SELECT data_type, udt_name
+                    FROM information_schema.columns
+                    WHERE table_schema = :schema
+                      AND table_name = :table
+                      AND column_name = :column
+                    """
+                ),
+                {"schema": schema, "table": table, "column": "payload"},
+            ).one()
+
+            # Verify the USING clause applied a real cast (jsonb operators should work).
+            stmt = text(
+                f"SELECT payload #>> '{{nested,b}}' FROM {qualified_table} WHERE id = 1"
+            )
+            assert conn.execute(stmt).scalar_one() == "y"
+
+            # Verify inserts after TYPE change are coerced to JSONB.
+            conn.execute(
+                text(f"INSERT INTO {qualified_table} (id, payload) VALUES (:id, :payload)"),
+                {"id": 2, "payload": '{"a":"z","nested":{"b":"w"}}'},
+            )
+            stmt = text(f"SELECT payload ->> 'a' FROM {qualified_table} WHERE id = 2")
+            assert conn.execute(stmt).scalar_one() == "z"
+    finally:
+        with db.engine.begin() as conn:
+            conn.exec_driver_sql(f"DROP TABLE IF EXISTS {qualified_table} CASCADE")
+
+    assert before.data_type != "jsonb"
+    assert after.data_type == "jsonb"
+    assert after.udt_name == "jsonb"
+
+
+def test_serial_sequence_pg_get_serial_sequence_nextval_and_default_insert(schema, db):
+    table = "migrations_serial_sequence"
+    qualified_table = _qname(schema, table)
+    expected_sequence = f"{schema}.{table}_id_seq"
+
+    try:
+        with db.engine.begin() as conn:
+            conn.exec_driver_sql(
+                f"CREATE TABLE {qualified_table} (id SERIAL PRIMARY KEY, name TEXT NOT NULL)"
+            )
+
+            seq_unquoted = conn.execute(
+                text("SELECT pg_get_serial_sequence(:table_name, :col_name)"),
+                {"table_name": f"{schema}.{table}", "col_name": "id"},
+            ).scalar()
+            seq_quoted = conn.execute(
+                text("SELECT pg_get_serial_sequence(:table_name, :col_name)"),
+                {"table_name": f'\"{schema}\".\"{table}\"', "col_name": "id"},
+            ).scalar()
+
+            assert seq_unquoted == expected_sequence
+            assert seq_quoted == expected_sequence
+
+            conn.execute(
+                text(f"INSERT INTO {qualified_table} (name) VALUES (:name)"),
+                {"name": "a"},
+            )
+            inserted_id = conn.execute(
+                text(f"SELECT id FROM {qualified_table} WHERE name = :name"),
+                {"name": "a"},
+            ).scalar_one()
+
+            explicit_next = conn.execute(
+                text(f"SELECT nextval('{expected_sequence}')")
+            ).scalar_one()
+
+            conn.execute(
+                text(f"INSERT INTO {qualified_table} (name) VALUES (:name)"),
+                {"name": "b"},
+            )
+            inserted_id_2 = conn.execute(
+                text(f"SELECT id FROM {qualified_table} WHERE name = :name"),
+                {"name": "b"},
+            ).scalar_one()
+    finally:
+        with db.engine.begin() as conn:
+            conn.exec_driver_sql(f"DROP TABLE IF EXISTS {qualified_table} CASCADE")
+
+    assert inserted_id == 1
+    assert explicit_next == 2
+    assert inserted_id_2 == 3

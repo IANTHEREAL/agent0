@@ -227,7 +227,103 @@ pub fn obj_description(_args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn pg_get_serial_sequence(_args: Vec<Value>) -> Result<Value> {
-    Ok(Value::Null)
+    fn parse_qname_token(token: &str) -> Option<(Option<String>, String)> {
+        fn push_part(parts: &mut Vec<String>, raw: &str, quoted: bool) -> Option<()> {
+            let trimmed = if quoted { raw } else { raw.trim() };
+            if trimmed.is_empty() {
+                return None;
+            }
+            if quoted {
+                parts.push(trimmed.to_string());
+            } else {
+                parts.push(trimmed.to_lowercase());
+            }
+            Some(())
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        let mut buf = String::new();
+        let mut in_quotes = false;
+        let mut part_quoted = false;
+
+        let mut chars = token.trim().chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => {
+                    if in_quotes {
+                        if chars.peek() == Some(&'"') {
+                            chars.next();
+                            buf.push('"');
+                        } else {
+                            in_quotes = false;
+                        }
+                    } else {
+                        in_quotes = true;
+                        part_quoted = true;
+                    }
+                }
+                '.' if !in_quotes => {
+                    push_part(&mut parts, &buf, part_quoted)?;
+                    buf.clear();
+                    part_quoted = false;
+                }
+                _ => buf.push(ch),
+            }
+        }
+
+        if in_quotes {
+            return None;
+        }
+        push_part(&mut parts, &buf, part_quoted)?;
+
+        if parts.len() >= 2 {
+            Some((
+                Some(parts[parts.len() - 2].clone()),
+                parts[parts.len() - 1].clone(),
+            ))
+        } else {
+            Some((None, parts[0].clone()))
+        }
+    }
+
+    fn quote_ident_str(ident: &str) -> String {
+        let needs_quote =
+            ident.is_empty() || !is_simple_unquoted_ident(ident) || is_sql_keyword(ident);
+        if needs_quote {
+            format!("\"{}\"", ident.replace('"', "\"\""))
+        } else {
+            ident.to_string()
+        }
+    }
+
+    let mut iter = _args.into_iter();
+    let table_name = match iter.next() {
+        Some(Value::Text(s)) => s,
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(v) => v.to_string(),
+    };
+    let col_name = match iter.next() {
+        Some(Value::Text(s)) => s,
+        Some(Value::Null) | None => return Ok(Value::Null),
+        Some(v) => v.to_string(),
+    };
+
+    let (schema_opt, table) = match parse_qname_token(&table_name) {
+        Some(parsed) => parsed,
+        None => return Ok(Value::Null),
+    };
+    let (_, column) = match parse_qname_token(&col_name) {
+        Some(parsed) => parsed,
+        None => return Ok(Value::Null),
+    };
+
+    let schema = schema_opt.unwrap_or_else(|| "public".to_string());
+    let seq_name = format!("{}_{}_seq", table, column);
+    Ok(Value::Text(format!(
+        "{}.{}",
+        quote_ident_str(&schema),
+        quote_ident_str(&seq_name)
+    )))
 }
 
 pub fn pg_get_expr(args: Vec<Value>) -> Result<Value> {
