@@ -1,0 +1,14 @@
+[project]
+name = "trigger-webhook"
+version = "0.1.0"
+description = "TiPG example: AFTER triggers + HTTP extension for webhook notifications"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "sqlalchemy>=2.0.25",
+    "psycopg2-binary>=2.9.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
