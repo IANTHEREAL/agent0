@@ -48,12 +48,13 @@ tiup playground --mode tikv-slim
 # 2. Start TiPG (in another terminal)
 PGTIKV_TRIGGER_ENABLED=true PGTIKV_HTTP_ALLOW_INSECURE=true cargo run
 
-# 3. Install dependencies
+# 3. Run the demo (installs dependencies automatically)
 cd examples/02_python_trigger_webhook
-pip install -r requirements.txt
+./run_demo.sh postgresql://admin:admin@127.0.0.1:5433/postgres
 
-# 4. Run the demo
-python run.py postgresql://admin:admin@127.0.0.1:5433/postgres
+# Or manually:
+uv sync
+uv run python run.py postgresql://admin:admin@127.0.0.1:5433/postgres
 ```
 
 ## Expected Output
@@ -163,8 +164,8 @@ CREATE TRIGGER trg_product_insert
 ```
 02_python_trigger_webhook/
 ├── README.md               ← This file
-├── pyproject.toml           ← Project metadata
-├── requirements.txt         ← pip dependencies
+├── pyproject.toml           ← Project metadata and dependencies
+├── run_demo.sh              ← Quick start script (uses uv)
 ├── .env.example             ← Environment variable template
 ├── run.py                   ← Entry point
 └── trigger_webhook/

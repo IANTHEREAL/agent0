@@ -2036,6 +2036,7 @@ impl TikvStore {
         }
         let data = serialize_function_def(&def)?;
         txn_put(txn, key, data).await?;
+        self.invalidate_function_cache(db_id, &full_name).await;
         Ok(())
     }
 
@@ -2062,6 +2063,7 @@ impl TikvStore {
 
         let data = serialize_function_def(&def)?;
         txn_put(txn, key, data).await?;
+        self.invalidate_function_cache(db_id, &full_name).await;
         Ok(())
     }
 
