@@ -26,19 +26,21 @@ type MCPClient struct {
 	sessionID  string
 	client     *http.Client
 	requestID  int64
+	bearerToken string
 }
 
-func NewMCPClient(baseURL string) *MCPClient {
+func NewMCPClient(baseURL string, bearerToken string) *MCPClient {
 	base := strings.TrimRight(baseURL, "/")
 	if base == "" {
 		base = "http://localhost:8000/mcp/sse"
 	}
 	return &MCPClient{
-		rpcURL:     base,
-		timeout:    30 * time.Second,
-		maxRetries: 3,
-		sessionID:  fmt.Sprintf("%d", time.Now().UnixNano()),
-		client:     &http.Client{},
+		rpcURL:      base,
+		timeout:     30 * time.Second,
+		maxRetries:  3,
+		sessionID:   fmt.Sprintf("%d", time.Now().UnixNano()),
+		client:      &http.Client{},
+		bearerToken: strings.TrimSpace(bearerToken),
 	}
 }
 
@@ -51,6 +53,9 @@ func (c *MCPClient) rpcPost(url string, body map[string]any, timeout time.Durati
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Mcp-Session-Id", c.sessionID)
+	if c.bearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.bearerToken)
+	}
 
 	effectiveTimeout := timeout
 	if effectiveTimeout <= 0 {
