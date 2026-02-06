@@ -156,6 +156,9 @@ impl Executor {
             .ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
         let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
+        let trigger_func_cache =
+            triggers::prefetch_trigger_functions(&self.store(), txn, db_id, &trigger_defs, "INSERT")
+                .await?;
 
         let mut affected = 0;
         let mut ret_rows = Vec::new();
@@ -241,13 +244,14 @@ impl Executor {
             let row = Row::new(row_vals);
             dml::validate_check_constraints(&schema, &row)?;
 
-            let row = match triggers::apply_before_triggers(
+            let row = match triggers::apply_before_triggers_with_cache(
                 &self.store(),
                 txn,
                 db_id,
                 sequence_values,
                 search_path,
                 &trigger_defs,
+                &trigger_func_cache,
                 &schema,
                 "INSERT",
                 row,
@@ -568,6 +572,9 @@ impl Executor {
             .ok_or_else(|| anyhow!("Table not found"))?;
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
         let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
+        let trigger_func_cache_update =
+            triggers::prefetch_trigger_functions(&self.store(), txn, db_id, &trigger_defs, "UPDATE")
+                .await?;
         if schema.pk_indices.is_empty() {
             return Err(anyhow!("No PK"));
         }
@@ -766,13 +773,14 @@ impl Executor {
             let new_row = Row::new(new_vals);
             dml::validate_check_constraints(&schema, &new_row)?;
 
-            let new_row = match triggers::apply_before_triggers(
+            let new_row = match triggers::apply_before_triggers_with_cache(
                 &self.store(),
                 txn,
                 db_id,
                 sequence_values,
                 search_path,
                 &trigger_defs,
+                &trigger_func_cache_update,
                 &schema,
                 "UPDATE",
                 new_row,

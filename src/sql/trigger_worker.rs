@@ -16,14 +16,18 @@ use crate::pool::TikvClientPool;
 use crate::storage::TikvStore;
 use crate::types::TableSchema;
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use dashmap::{DashMap, DashSet};
+use futures::stream::{self, StreamExt};
+use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tikv_client::BoundRange;
 use tikv_client::Transaction;
 use tracing::{info, warn};
+
+const MAX_CONCURRENT_KEYSPACES: usize = 4;
 
 const DEFAULT_MAX_QUEUE_DEPTH: usize = 10_000;
 const DEFAULT_MAX_EVENTS_PER_BATCH: usize = 10;
@@ -171,9 +175,9 @@ impl KeyspaceQuota {
 
 pub(crate) struct TriggerWorker {
     worker_id: String,
-    active_keyspaces: Mutex<HashSet<String>>,
-    quotas: Mutex<HashMap<String, Arc<KeyspaceQuota>>>,
-    keyspace_backoff: Mutex<HashMap<String, KeyspaceBackoff>>,
+    active_keyspaces: DashSet<String>,
+    quotas: DashMap<String, Arc<KeyspaceQuota>>,
+    keyspace_backoff: DashMap<String, KeyspaceBackoff>,
     config: TriggerWorkerConfig,
     shutdown: AtomicBool,
     default_search_path: Vec<String>,
@@ -190,9 +194,9 @@ impl TriggerWorker {
     fn new() -> Self {
         Self {
             worker_id: format!("worker-{}", std::process::id()),
-            active_keyspaces: Mutex::new(HashSet::new()),
-            quotas: Mutex::new(HashMap::new()),
-            keyspace_backoff: Mutex::new(HashMap::new()),
+            active_keyspaces: DashSet::new(),
+            quotas: DashMap::new(),
+            keyspace_backoff: DashMap::new(),
             config: TriggerWorkerConfig::from_env(),
             shutdown: AtomicBool::new(false),
             default_search_path: vec!["public".to_string()],
@@ -243,66 +247,38 @@ impl TriggerWorker {
     }
 
     pub(crate) fn mark_active(&self, keyspace: &str) {
-        let mut guard = self
-            .active_keyspaces
-            .lock()
-            .expect("trigger worker active_keyspaces lock");
-        if !guard.contains(keyspace) {
-            guard.insert(keyspace.to_string());
-        }
+        self.active_keyspaces.insert(keyspace.to_string());
     }
 
     pub(crate) fn take_active_keyspaces_snapshot(&self) -> Vec<String> {
-        let guard = self
-            .active_keyspaces
-            .lock()
-            .expect("trigger worker active_keyspaces lock");
-        guard.iter().cloned().collect()
+        self.active_keyspaces.iter().map(|r| r.clone()).collect()
     }
 
     pub(crate) fn remove_active(&self, keyspace: &str) {
-        let mut guard = self
-            .active_keyspaces
-            .lock()
-            .expect("trigger worker active_keyspaces lock");
-        guard.remove(keyspace);
+        self.active_keyspaces.remove(keyspace);
     }
 
     pub(crate) fn get_quota(&self, keyspace: &str) -> Arc<KeyspaceQuota> {
-        let mut guard = self.quotas.lock().expect("trigger worker quotas lock");
-        if let Some(existing) = guard.get(keyspace) {
+        if let Some(existing) = self.quotas.get(keyspace) {
             return existing.clone();
         }
         let quota = Arc::new(KeyspaceQuota::new(&self.config));
-        guard.insert(keyspace.to_string(), quota.clone());
-        quota
+        self.quotas.entry(keyspace.to_string()).or_insert(quota).clone()
     }
 
     fn should_process_keyspace(&self, keyspace: &str, now: Instant) -> bool {
-        let guard = self
-            .keyspace_backoff
-            .lock()
-            .expect("trigger worker keyspace_backoff lock");
-        let Some(backoff) = guard.get(keyspace) else {
-            return true;
-        };
-        now >= backoff.next_retry_at
+        match self.keyspace_backoff.get(keyspace) {
+            Some(backoff) => now >= backoff.next_retry_at,
+            None => true,
+        }
     }
 
     fn clear_keyspace_backoff(&self, keyspace: &str) {
-        let mut guard = self
-            .keyspace_backoff
-            .lock()
-            .expect("trigger worker keyspace_backoff lock");
-        guard.remove(keyspace);
+        self.keyspace_backoff.remove(keyspace);
     }
 
     fn record_keyspace_failure(&self, keyspace: &str, now: Instant) -> (Duration, u32) {
-        let mut guard = self
-            .keyspace_backoff
-            .lock()
-            .expect("trigger worker keyspace_backoff lock");
-        let entry = guard.entry(keyspace.to_string()).or_insert(KeyspaceBackoff {
+        let mut entry = self.keyspace_backoff.entry(keyspace.to_string()).or_insert(KeyspaceBackoff {
             next_retry_at: now,
             delay_ms: 0,
             failures: 0,
@@ -347,13 +323,30 @@ impl TriggerWorker {
                 continue;
             }
 
-            for keyspace in keyspaces {
-                let now = Instant::now();
-                if !self.should_process_keyspace(&keyspace, now) {
-                    continue;
-                }
+            let now = Instant::now();
+            let keyspaces_to_process: Vec<String> = keyspaces
+                .into_iter()
+                .filter(|ks| self.should_process_keyspace(ks, now))
+                .collect();
 
-                match self.process_keyspace(&pool, &keyspace).await {
+            if keyspaces_to_process.is_empty() {
+                continue;
+            }
+
+            let results: Vec<(String, Result<()>)> = stream::iter(keyspaces_to_process)
+                .map(|keyspace| {
+                    let pool = pool.clone();
+                    async move {
+                        let result = trigger_worker().process_keyspace(&pool, &keyspace).await;
+                        (keyspace, result)
+                    }
+                })
+                .buffer_unordered(MAX_CONCURRENT_KEYSPACES)
+                .collect()
+                .await;
+
+            for (keyspace, result) in results {
+                match result {
                     Ok(()) => {
                         self.clear_keyspace_backoff(&keyspace);
                     }
@@ -423,7 +416,7 @@ fn parse_pd_keyspace_names(payload: &serde_json::Value) -> Vec<String> {
         return Vec::new();
     };
 
-    let mut seen = HashSet::new();
+    let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
     for item in keyspaces {
         let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
@@ -792,17 +785,13 @@ impl TriggerWorker {
     }
 
     fn list_known_keyspaces(&self) -> Vec<String> {
+        use std::collections::HashSet;
         let mut out = HashSet::new();
-        {
-            let guard = self
-                .active_keyspaces
-                .lock()
-                .expect("trigger worker active_keyspaces lock");
-            out.extend(guard.iter().cloned());
+        for entry in self.active_keyspaces.iter() {
+            out.insert(entry.clone());
         }
-        {
-            let guard = self.quotas.lock().expect("trigger worker quotas lock");
-            out.extend(guard.keys().cloned());
+        for entry in self.quotas.iter() {
+            out.insert(entry.key().clone());
         }
         out.into_iter().collect()
     }

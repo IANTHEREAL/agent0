@@ -136,6 +136,8 @@ struct PerDatabaseSchemaCache {
     schemas: Option<(Instant, Vec<String>)>,
     schema_oids: Option<(Instant, HashMap<String, u32>)>,
     tables: Option<(Instant, Vec<String>)>,
+    triggers: HashMap<String, (Instant, Vec<TriggerDef>)>,
+    functions: HashMap<String, (Instant, Option<FunctionDef>)>,
 }
 
 impl SchemaCache {
@@ -152,6 +154,8 @@ impl PerDatabaseSchemaCache {
             schemas: None,
             schema_oids: None,
             tables: None,
+            triggers: HashMap::new(),
+            functions: HashMap::new(),
         }
     }
 }
@@ -756,6 +760,20 @@ impl TikvStore {
         let mut cache = self.cache.write().await;
         if let Some(entry) = cache.per_db.get_mut(&db_id) {
             entry.tables = None;
+        }
+    }
+
+    pub async fn invalidate_trigger_cache(&self, db_id: u64, table_full_name: &str) {
+        let mut cache = self.cache.write().await;
+        if let Some(entry) = cache.per_db.get_mut(&db_id) {
+            entry.triggers.remove(table_full_name);
+        }
+    }
+
+    pub async fn invalidate_function_cache(&self, db_id: u64, full_name: &str) {
+        let mut cache = self.cache.write().await;
+        if let Some(entry) = cache.per_db.get_mut(&db_id) {
+            entry.functions.remove(full_name);
         }
     }
 
@@ -1467,6 +1485,7 @@ impl TikvStore {
 
             info!("Dropped table '{}'", table_name);
             self.invalidate_table_cache(db_id).await;
+            self.invalidate_trigger_cache(db_id, table_name).await;
             Ok(true)
         } else {
             Ok(false)
@@ -2052,8 +2071,21 @@ impl TikvStore {
         db_id: u64,
         full_name: &str,
     ) -> Result<Option<FunctionDef>> {
+        // 1. Check cache
+        {
+            let cache = self.cache.read().await;
+            if let Some(db_cache) = cache.per_db.get(&db_id) {
+                if let Some((cached_at, func_opt)) = db_cache.functions.get(full_name) {
+                    if cached_at.elapsed() < SCHEMA_CACHE_TTL {
+                        return Ok(func_opt.clone());
+                    }
+                }
+            }
+        }
+
+        // 2. Cache miss - TiKV lookup
         let key = self.key(&encode_function_key_v2(db_id, full_name));
-        match txn.get(key).await? {
+        let result = match txn.get(key).await? {
             Some(data) => {
                 let mut def: FunctionDef = deserialize_function_def(&data)?;
                 if def.oid == 0 {
@@ -2061,10 +2093,23 @@ impl TikvStore {
                     let data = serialize_function_def(&def)?;
                     txn_put(txn, self.key(&encode_function_key_v2(db_id, full_name)), data).await?;
                 }
-                Ok(Some(def))
+                Some(def)
             }
-            None => Ok(None),
+            None => None,
+        };
+
+        // 3. Populate cache
+        {
+            let mut cache = self.cache.write().await;
+            cache
+                .per_db
+                .entry(db_id)
+                .or_insert_with(PerDatabaseSchemaCache::new)
+                .functions
+                .insert(full_name.to_string(), (Instant::now(), result.clone()));
         }
+
+        Ok(result)
     }
 
     pub async fn list_functions(
@@ -2127,16 +2172,22 @@ impl TikvStore {
             }
 
             if cascade {
-                for trigger in dependent_triggers {
+                let mut affected_tables = HashSet::new();
+                for trigger in &dependent_triggers {
+                    affected_tables.insert(trigger.table.as_str());
                     let _ = self
                         .drop_trigger(txn, db_id, &trigger.table, &trigger.name)
                         .await?;
+                }
+                for table in affected_tables {
+                    self.invalidate_trigger_cache(db_id, table).await;
                 }
             }
 
             txn_delete(txn, key).await?;
             let comment_key = self.key(&encode_comment_function_key_v2(db_id, full_name));
             txn_delete(txn, comment_key).await?;
+            self.invalidate_function_cache(db_id, full_name).await;
             Ok(true)
         } else {
             Ok(false)
@@ -2227,6 +2278,19 @@ impl TikvStore {
         db_id: u64,
         table_full_name: &str,
     ) -> Result<Vec<TriggerDef>> {
+        // 1. Check cache (read lock)
+        {
+            let cache = self.cache.read().await;
+            if let Some(db_cache) = cache.per_db.get(&db_id) {
+                if let Some((cached_at, triggers)) = db_cache.triggers.get(table_full_name) {
+                    if cached_at.elapsed() < SCHEMA_CACHE_TTL {
+                        return Ok(triggers.clone());
+                    }
+                }
+            }
+        }
+
+        // 2. Cache miss or expired — scan TiKV
         let prefix = encode_trigger_table_prefix_v2(db_id, table_full_name);
         let mut end = prefix.clone();
         end.push(0xFF);
@@ -2242,6 +2306,21 @@ impl TikvStore {
             }
             triggers.push(def);
         }
+
+        // 3. Populate cache (write lock)
+        {
+            let mut cache = self.cache.write().await;
+            cache
+                .per_db
+                .entry(db_id)
+                .or_insert_with(PerDatabaseSchemaCache::new)
+                .triggers
+                .insert(
+                    table_full_name.to_string(),
+                    (Instant::now(), triggers.clone()),
+                );
+        }
+
         Ok(triggers)
     }
 
