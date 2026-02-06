@@ -5,6 +5,7 @@ A PostgreSQL-compatible distributed SQL database built on TiKV.
 ## Table of Contents
 
 - [Quick Start](./quickstart.md)
+- [Testing Manual](./testing.md)
 - [SQL Reference](./sql-reference.md)
 - [Extensions](./extensions.md)
 - [Multi-Tenancy](./multi-tenancy.md)
