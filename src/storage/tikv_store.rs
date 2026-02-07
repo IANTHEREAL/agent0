@@ -1,12 +1,12 @@
 use super::encoding::*;
 use super::kv_stats;
+use crate::extensions::InstalledExtension;
 use crate::txn::{txn_delete, txn_put};
 use crate::types::{
     DataType, DatabaseDef, DefaultTablePrivilegeGrant, FunctionDef, Row, SequenceBacking,
     SequenceDef, SequenceState, TablePrivilegeGrant, TableSchema, TriggerDef, UserTypeDef, Value,
     ViewDef,
 };
-use crate::extensions::InstalledExtension;
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -114,9 +114,15 @@ fn setval_standalone(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CommentTarget {
-    Extension { name: String },
-    Function { full_name: String },
-    Table { full_name: String },
+    Extension {
+        name: String,
+    },
+    Function {
+        full_name: String,
+    },
+    Table {
+        full_name: String,
+    },
     Column {
         table_full_name: String,
         column_name: String,
@@ -317,7 +323,9 @@ impl TikvStore {
                     .get(self.key(&encode_next_table_id_key()))
                     .await?
                     .is_some()
-                    || self.prefix_has_any(&mut txn, encode_schema_prefix()).await?;
+                    || self
+                        .prefix_has_any(&mut txn, encode_schema_prefix())
+                        .await?;
 
                 if has_v1_tables {
                     txn.rollback().await.ok();
@@ -327,12 +335,7 @@ impl TikvStore {
                     ));
                 }
 
-                txn_put(
-                    &mut txn,
-                    key,
-                    STORAGE_FORMAT_VERSION.to_be_bytes().to_vec(),
-                )
-                .await?;
+                txn_put(&mut txn, key, STORAGE_FORMAT_VERSION.to_be_bytes().to_vec()).await?;
                 txn.commit().await?;
                 Ok(())
             }
@@ -661,9 +664,13 @@ impl TikvStore {
     ) -> Result<Vec<usize>> {
         fn is_key_locked_error(err: &tikv_client::Error) -> bool {
             match err {
-                tikv_client::Error::PessimisticLockError { inner, .. } => is_key_locked_error(inner.as_ref()),
+                tikv_client::Error::PessimisticLockError { inner, .. } => {
+                    is_key_locked_error(inner.as_ref())
+                }
                 tikv_client::Error::ExtractedErrors(errors)
-                | tikv_client::Error::MultipleKeyErrors(errors) => errors.iter().any(is_key_locked_error),
+                | tikv_client::Error::MultipleKeyErrors(errors) => {
+                    errors.iter().any(is_key_locked_error)
+                }
                 tikv_client::Error::KeyError(key_error) => {
                     key_error.locked.is_some() || key_error.conflict.is_some()
                 }
@@ -725,10 +732,18 @@ impl TikvStore {
     }
 
     fn is_builtin_schema(schema: &str) -> bool {
-        matches!(schema, "public" | "pg_catalog" | "information_schema" | "extensions")
+        matches!(
+            schema,
+            "public" | "pg_catalog" | "information_schema" | "extensions"
+        )
     }
 
-    pub async fn schema_exists(&self, txn: &mut Transaction, db_id: u64, schema: &str) -> Result<bool> {
+    pub async fn schema_exists(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        schema: &str,
+    ) -> Result<bool> {
         if Self::is_builtin_schema(schema) {
             return Ok(true);
         }
@@ -860,7 +875,8 @@ impl TikvStore {
 
         {
             let mut cache = self.cache.write().await;
-            cache.per_db
+            cache
+                .per_db
                 .entry(db_id)
                 .or_insert_with(PerDatabaseSchemaCache::new)
                 .schema_oids = Some((Instant::now(), oids.clone()));
@@ -1113,7 +1129,8 @@ impl TikvStore {
             }
         }
 
-        self.drop_schema_restrict(txn, db_id, schema, if_exists).await?;
+        self.drop_schema_restrict(txn, db_id, schema, if_exists)
+            .await?;
         Ok(true)
     }
 
@@ -1160,7 +1177,8 @@ impl TikvStore {
 
         {
             let mut cache = self.cache.write().await;
-            cache.per_db
+            cache
+                .per_db
                 .entry(db_id)
                 .or_insert_with(PerDatabaseSchemaCache::new)
                 .schemas = Some((Instant::now(), schemas.clone()));
@@ -1294,7 +1312,11 @@ impl TikvStore {
         column_name: &str,
         comment: Option<&str>,
     ) -> Result<()> {
-        let key = self.key(&encode_comment_column_key_v2(db_id, table_full_name, column_name));
+        let key = self.key(&encode_comment_column_key_v2(
+            db_id,
+            table_full_name,
+            column_name,
+        ));
         match comment {
             Some(text) => txn_put(txn, key, text.as_bytes().to_vec()).await,
             None => txn_delete(txn, key).await,
@@ -1366,7 +1388,10 @@ impl TikvStore {
                 .context("comment value is not valid UTF-8")?
                 .to_string();
 
-            records.push(CommentRecord { target, description });
+            records.push(CommentRecord {
+                target,
+                description,
+            });
         }
 
         Ok(records)
@@ -1401,7 +1426,8 @@ impl TikvStore {
                     let id = u64::from_be_bytes(
                         data.try_into().map_err(|_| anyhow!("Invalid ID format"))?,
                     );
-                    id.checked_add(1).ok_or_else(|| anyhow!("Table ID overflow"))?
+                    id.checked_add(1)
+                        .ok_or_else(|| anyhow!("Table ID overflow"))?
                 }
                 None => 1,
             };
@@ -1543,10 +1569,8 @@ impl TikvStore {
         value: u64,
     ) -> Result<()> {
         let key = self.key(&encode_table_sequence_value_key_v2(db_id, table_id));
-        self.autocommit_update_key(key, |_current| {
-            Ok((Some(value.to_be_bytes().to_vec()), ()))
-        })
-        .await
+        self.autocommit_update_key(key, |_current| Ok((Some(value.to_be_bytes().to_vec()), ())))
+            .await
     }
 
     pub async fn create_table(
@@ -1610,7 +1634,8 @@ impl TikvStore {
             Some(data) => bincode::deserialize(&data)?,
             None => Vec::new(),
         };
-        grants.retain(|g| !(g.grantee == grant.grantee && g.privilege_type == grant.privilege_type));
+        grants
+            .retain(|g| !(g.grantee == grant.grantee && g.privilege_type == grant.privilege_type));
         grants.push(grant);
         let data = bincode::serialize(&grants)?;
         txn_put(txn, key, data).await?;
@@ -1646,7 +1671,9 @@ impl TikvStore {
         owner: &str,
         schema: Option<&str>,
     ) -> Result<Vec<DefaultTablePrivilegeGrant>> {
-        let key = self.key(&encode_default_table_privileges_key_v2(db_id, owner, schema));
+        let key = self.key(&encode_default_table_privileges_key_v2(
+            db_id, owner, schema,
+        ));
         match txn.get(key).await? {
             Some(data) => Ok(bincode::deserialize(&data)?),
             None => Ok(Vec::new()),
@@ -1661,12 +1688,15 @@ impl TikvStore {
         schema: Option<&str>,
         grant: DefaultTablePrivilegeGrant,
     ) -> Result<()> {
-        let key = self.key(&encode_default_table_privileges_key_v2(db_id, owner, schema));
+        let key = self.key(&encode_default_table_privileges_key_v2(
+            db_id, owner, schema,
+        ));
         let mut grants: Vec<DefaultTablePrivilegeGrant> = match txn.get(key.clone()).await? {
             Some(data) => bincode::deserialize(&data)?,
             None => Vec::new(),
         };
-        grants.retain(|g| !(g.grantee == grant.grantee && g.privilege_type == grant.privilege_type));
+        grants
+            .retain(|g| !(g.grantee == grant.grantee && g.privilege_type == grant.privilege_type));
         grants.push(grant);
         txn_put(txn, key, bincode::serialize(&grants)?).await?;
         Ok(())
@@ -1681,7 +1711,9 @@ impl TikvStore {
         grantee: &str,
         privilege_type: &str,
     ) -> Result<()> {
-        let key = self.key(&encode_default_table_privileges_key_v2(db_id, owner, schema));
+        let key = self.key(&encode_default_table_privileges_key_v2(
+            db_id, owner, schema,
+        ));
         let Some(data) = txn.get(key.clone()).await? else {
             return Ok(());
         };
@@ -1742,11 +1774,10 @@ impl TikvStore {
             // `ALTER SEQUENCE ... OWNED BY NONE` preserves the sequence while leaving it
             // backed by the historical per-table `_sys_seq_ + table_id` key.
             let table_id = schema.table_id;
-            let has_table_id_sequence = self
-                .list_sequences(txn, db_id)
-                .await?
-                .iter()
-                .any(|def| matches!(&def.backing, SequenceBacking::TableId(id) if *id == table_id));
+            let has_table_id_sequence =
+                self.list_sequences(txn, db_id).await?.iter().any(
+                    |def| matches!(&def.backing, SequenceBacking::TableId(id) if *id == table_id),
+                );
             if !has_table_id_sequence {
                 let seq_key = self.key(&encode_table_sequence_value_key_v2(db_id, table_id));
                 txn_delete(txn, seq_key).await?;
@@ -2005,7 +2036,8 @@ impl TikvStore {
 
         {
             let mut cache = self.cache.write().await;
-            cache.per_db
+            cache
+                .per_db
                 .entry(db_id)
                 .or_insert_with(PerDatabaseSchemaCache::new)
                 .tables = Some((Instant::now(), tables.clone()));
@@ -2014,7 +2046,12 @@ impl TikvStore {
         Ok(tables)
     }
 
-    pub async fn create_type(&self, txn: &mut Transaction, db_id: u64, def: UserTypeDef) -> Result<()> {
+    pub async fn create_type(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        def: UserTypeDef,
+    ) -> Result<()> {
         let full_name = format!("{}.{}", def.schema, def.name);
         let key = self.key(&encode_type_key_v2(db_id, &full_name));
         if txn.get(key.clone()).await?.is_some() {
@@ -2116,8 +2153,9 @@ impl TikvStore {
                 let mut def: SequenceDef = bincode::deserialize(&data)
                     .context("Failed to deserialize sequence definition")?;
                 if def.oid == 0 {
-                    if let Some(backfilled) =
-                        self.autocommit_backfill_sequence_oid(db_id, full_name).await?
+                    if let Some(backfilled) = self
+                        .autocommit_backfill_sequence_oid(db_id, full_name)
+                        .await?
                     {
                         let mut def = backfilled;
                         if def.start_value == 0 {
@@ -2146,7 +2184,12 @@ impl TikvStore {
                 if needs_update {
                     let data = bincode::serialize(&def)
                         .context("Failed to serialize sequence definition")?;
-                    txn_put(txn, self.key(&encode_sequence_def_key_v2(db_id, full_name)), data).await?;
+                    txn_put(
+                        txn,
+                        self.key(&encode_sequence_def_key_v2(db_id, full_name)),
+                        data,
+                    )
+                    .await?;
                 }
                 Ok(Some(def))
             }
@@ -2176,8 +2219,8 @@ impl TikvStore {
                 return Ok(None);
             };
 
-            let mut def: SequenceDef = bincode::deserialize(&data)
-                .context("Failed to deserialize sequence definition")?;
+            let mut def: SequenceDef =
+                bincode::deserialize(&data).context("Failed to deserialize sequence definition")?;
 
             if def.oid != 0 {
                 let _ = txn.rollback().await;
@@ -2201,8 +2244,11 @@ impl TikvStore {
                 .map_err(|e| anyhow!(e))?;
 
             def.oid = next_val;
-            let data = bincode::serialize(&def).context("Failed to serialize sequence definition")?;
-            txn.put(def_key.clone(), data).await.map_err(|e| anyhow!(e))?;
+            let data =
+                bincode::serialize(&def).context("Failed to serialize sequence definition")?;
+            txn.put(def_key.clone(), data)
+                .await
+                .map_err(|e| anyhow!(e))?;
 
             match txn.commit().await {
                 Ok(_) => return Ok(Some(def)),
@@ -2240,9 +2286,9 @@ impl TikvStore {
             let mut def: SequenceDef =
                 bincode::deserialize(pair.value()).context("Failed to deserialize sequence")?;
             if def.oid == 0 {
-                if let Some(backfilled) =
-                    self.autocommit_backfill_sequence_oid(db_id, &def.full_name())
-                        .await?
+                if let Some(backfilled) = self
+                    .autocommit_backfill_sequence_oid(db_id, &def.full_name())
+                    .await?
                 {
                     let mut def = backfilled;
                     if def.start_value == 0 {
@@ -2271,7 +2317,12 @@ impl TikvStore {
             }
             if needs_update {
                 let data = bincode::serialize(&def).context("Failed to serialize sequence")?;
-                txn_put(txn, self.key(&encode_sequence_def_key_v2(db_id, &def.full_name())), data).await?;
+                txn_put(
+                    txn,
+                    self.key(&encode_sequence_def_key_v2(db_id, &def.full_name())),
+                    data,
+                )
+                .await?;
             }
             sequences.push(def);
         }
@@ -2379,7 +2430,12 @@ impl TikvStore {
                 if def.oid == 0 {
                     def.oid = self.next_function_oid(txn, db_id).await?;
                     let data = serialize_function_def(&def)?;
-                    txn_put(txn, self.key(&encode_function_key_v2(db_id, full_name)), data).await?;
+                    txn_put(
+                        txn,
+                        self.key(&encode_function_key_v2(db_id, full_name)),
+                        data,
+                    )
+                    .await?;
                 }
                 Some(def)
             }
@@ -2422,7 +2478,12 @@ impl TikvStore {
             if needs_update {
                 let data = serialize_function_def(&def)?;
                 let full_name = format!("{}.{}", def.schema, def.name);
-                txn_put(txn, self.key(&encode_function_key_v2(db_id, &full_name)), data).await?;
+                txn_put(
+                    txn,
+                    self.key(&encode_function_key_v2(db_id, &full_name)),
+                    data,
+                )
+                .await?;
             }
             funcs.push(def);
         }
@@ -2534,7 +2595,11 @@ impl TikvStore {
         }
     }
 
-    pub async fn list_triggers(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<TriggerDef>> {
+    pub async fn list_triggers(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+    ) -> Result<Vec<TriggerDef>> {
         let prefix = encode_trigger_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
@@ -2727,12 +2792,7 @@ impl TikvStore {
                     };
 
                     let next = nextval_standalone(
-                        &full_name,
-                        increment,
-                        min_value,
-                        max_value,
-                        is_cycled,
-                        &mut state,
+                        &full_name, increment, min_value, max_value, is_cycled, &mut state,
                     )?;
 
                     let data =
@@ -2787,7 +2847,8 @@ impl TikvStore {
                         )
                     })?
                 };
-                self.set_sequence_value(txn, db_id, *table_id, stored).await?;
+                self.set_sequence_value(txn, db_id, *table_id, stored)
+                    .await?;
                 Ok(value)
             }
             SequenceBacking::Standalone(embedded_state) => {
@@ -2950,14 +3011,8 @@ impl TikvStore {
 
         self.rename_column_comment(txn, db_id, table_full_name, old_column, new_column)
             .await?;
-        self.rewrite_sequences_owned_by_column(
-            txn,
-            db_id,
-            table_full_name,
-            old_column,
-            new_column,
-        )
-        .await?;
+        self.rewrite_sequences_owned_by_column(txn, db_id, table_full_name, old_column, new_column)
+            .await?;
         Ok(())
     }
 
@@ -3074,7 +3129,13 @@ impl TikvStore {
         let old_keys: HashSet<Vec<u8>> = triggers.iter().map(|(key, _)| key.clone()).collect();
         let (puts, deletes) = Self::plan_trigger_rename_ops(db_id, old_table, new_table, triggers)?;
 
-        Self::validate_trigger_rename_puts(old_table, new_table, &puts, &old_keys, &existing_triggers)?;
+        Self::validate_trigger_rename_puts(
+            old_table,
+            new_table,
+            &puts,
+            &old_keys,
+            &existing_triggers,
+        )?;
 
         for (key, data) in puts {
             txn_put(txn, key, data).await?;
@@ -3138,11 +3199,19 @@ impl TikvStore {
         old_column: &str,
         new_column: &str,
     ) -> Result<()> {
-        let old_key = self.key(&encode_comment_column_key_v2(db_id, table_full_name, old_column));
+        let old_key = self.key(&encode_comment_column_key_v2(
+            db_id,
+            table_full_name,
+            old_column,
+        ));
         let Some(value) = txn.get(old_key.clone()).await? else {
             return Ok(());
         };
-        let new_key = self.key(&encode_comment_column_key_v2(db_id, table_full_name, new_column));
+        let new_key = self.key(&encode_comment_column_key_v2(
+            db_id,
+            table_full_name,
+            new_column,
+        ));
         txn_put(txn, new_key, value).await?;
         txn_delete(txn, old_key).await?;
         Ok(())
@@ -3224,7 +3293,9 @@ impl TikvStore {
         unique: bool,
     ) -> Result<()> {
         if unique {
-            let idx_key = self.key(&encode_index_key_v2(db_id, table_id, index_id, values, None));
+            let idx_key = self.key(&encode_index_key_v2(
+                db_id, table_id, index_id, values, None,
+            ));
             if txn.get(idx_key.clone()).await?.is_some() {
                 return Err(anyhow!("Duplicate entry for unique index"));
             }
@@ -3255,7 +3326,9 @@ impl TikvStore {
         unique: bool,
     ) -> Result<()> {
         if unique {
-            let idx_key = self.key(&encode_index_key_v2(db_id, table_id, index_id, values, None));
+            let idx_key = self.key(&encode_index_key_v2(
+                db_id, table_id, index_id, values, None,
+            ));
             txn_delete(txn, idx_key).await?;
         } else {
             let idx_key = self.key(&encode_index_key_v2(
@@ -3291,7 +3364,9 @@ impl TikvStore {
         }
 
         if unique {
-            let idx_key = self.key(&encode_index_key_v2(db_id, table_id, index_id, values, None));
+            let idx_key = self.key(&encode_index_key_v2(
+                db_id, table_id, index_id, values, None,
+            ));
             if let Some(val) = txn.get(idx_key).await? {
                 let pk = decode_pk_from_index_suffix(&val, pk_types)?;
                 Ok(vec![pk])
@@ -3425,8 +3500,9 @@ impl TikvStore {
 
         let pk_key = encode_pk_values(pk_values);
         for &token_hash in token_hashes {
-            let key =
-                self.key(&encode_gin_index_key_v2(db_id, table_id, index_id, token_hash, &pk_key));
+            let key = self.key(&encode_gin_index_key_v2(
+                db_id, table_id, index_id, token_hash, &pk_key,
+            ));
             txn_put(txn, key, Vec::new()).await?;
         }
         Ok(())
@@ -3448,8 +3524,9 @@ impl TikvStore {
 
         let pk_key = encode_pk_values(pk_values);
         for &token_hash in token_hashes {
-            let key =
-                self.key(&encode_gin_index_key_v2(db_id, table_id, index_id, token_hash, &pk_key));
+            let key = self.key(&encode_gin_index_key_v2(
+                db_id, table_id, index_id, token_hash, &pk_key,
+            ));
             txn_delete(txn, key).await?;
         }
         Ok(())
@@ -3708,8 +3785,7 @@ impl TikvStore {
                 .await?
                 .ok_or_else(|| anyhow!("View '{}' does not exist", name))?;
             def.query = query.to_string();
-            let data =
-                bincode::serialize(&def).context("Failed to serialize view definition")?;
+            let data = bincode::serialize(&def).context("Failed to serialize view definition")?;
             txn_put(txn, key, data).await?;
             info!("Replaced view '{}'", name);
             return Ok(());
@@ -3766,12 +3842,7 @@ impl TikvStore {
         }
     }
 
-    pub async fn drop_view(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        name: &str,
-    ) -> Result<bool> {
+    pub async fn drop_view(&self, txn: &mut Transaction, db_id: u64, name: &str) -> Result<bool> {
         let key = self.key(&encode_view_key_v2(db_id, name));
         if txn.get(key.clone()).await?.is_some() {
             txn_delete(txn, key).await?;
@@ -4062,7 +4133,10 @@ mod trigger_rename_tests {
             db_id,
             old_table,
             new_table,
-            vec![(old_key_a.clone(), trigger_a), (old_key_nested.clone(), trigger_nested)],
+            vec![
+                (old_key_a.clone(), trigger_a),
+                (old_key_nested.clone(), trigger_nested),
+            ],
         )
         .unwrap();
 
@@ -4122,11 +4196,16 @@ mod trigger_rename_tests {
             db_id,
             old_table,
             new_table,
-            vec![(old_key_a.clone(), trigger_a), (old_key_nested.clone(), trigger_nested.clone())],
+            vec![
+                (old_key_a.clone(), trigger_a),
+                (old_key_nested.clone(), trigger_nested.clone()),
+            ],
         )
         .unwrap();
 
-        let old_keys: HashSet<Vec<u8>> = vec![old_key_a, old_key_nested.clone()].into_iter().collect();
+        let old_keys: HashSet<Vec<u8>> = vec![old_key_a, old_key_nested.clone()]
+            .into_iter()
+            .collect();
         let existing_triggers = HashMap::from([(old_key_nested, trigger_nested)]);
 
         TikvStore::validate_trigger_rename_puts(

@@ -76,11 +76,7 @@ impl VirtualTable for PgConstraint {
         let mut table_schemas: HashMap<String, TableSchema> = HashMap::new();
 
         for table_name in ctx.user_tables {
-            if let Some(schema) = ctx
-                .store
-                .get_schema(ctx.txn, ctx.db_id, table_name)
-                .await?
-            {
+            if let Some(schema) = ctx.store.get_schema(ctx.txn, ctx.db_id, table_name).await? {
                 let base_table_oid = catalog_oids::pg_class_table_oid(schema.table_id)?;
                 table_oids.insert(table_name.to_string(), base_table_oid);
                 table_schemas.insert(table_name.to_string(), schema);

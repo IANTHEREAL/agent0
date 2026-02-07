@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use anyhow::{anyhow, Result};
 use crate::sql::error::SqlError;
+use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     Distinct, Expr, Function, FunctionArg, FunctionArgExpr, GroupByExpr, OrderByExpr, Query,
     SelectItem, UnaryOperator, Value as SqlValue,
@@ -10,7 +10,6 @@ use sqlparser::ast::{
 use tikv_client::Transaction;
 
 use super::super::expr::{coerce_text_literal_to_bool, eval_expr};
-use super::super::projection::{get_expr_name, get_select_item_name, infer_expr_type};
 use super::super::operators::{
     execute_operator_tree, execute_operator_tree_with_ctes, AggregateExpr, BoxedOperator,
     DistinctOnOperator, DistinctOperator, FilterOperator, HashAggregateOperator, HashJoinConfig,
@@ -19,6 +18,7 @@ use super::super::operators::{
     WindowOperator,
 };
 use super::super::planner::{choose_join_algorithm, JoinAlgorithmChoice};
+use super::super::projection::{get_expr_name, get_select_item_name, infer_expr_type};
 use super::super::ExecuteResult;
 use super::core::Executor;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
@@ -45,11 +45,9 @@ pub(crate) fn rewrite_expr_for_multi_join(
                     }
                     found = Some(alias);
                 }
-                if schema
-                    .columns
-                    .iter()
-                    .any(|c| c.name.to_lowercase() == format!("{}.{}", alias.to_lowercase(), col_lower))
-                {
+                if schema.columns.iter().any(|c| {
+                    c.name.to_lowercase() == format!("{}.{}", alias.to_lowercase(), col_lower)
+                }) {
                     if found.is_some() {
                         return Err(SqlError::AmbiguousColumn(col_name.to_string()).into());
                     }
@@ -118,12 +116,20 @@ pub(crate) fn rewrite_expr_for_multi_join(
                 ..func.clone()
             }))
         }
-        Expr::Cast { expr: inner, data_type, format } => Ok(Expr::Cast {
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            format,
+        } => Ok(Expr::Cast {
             expr: Box::new(rewrite_expr_for_multi_join(inner, table_aliases)?),
             data_type: data_type.clone(),
             format: format.clone(),
         }),
-        Expr::InList { expr: inner, list, negated } => Ok(Expr::InList {
+        Expr::InList {
+            expr: inner,
+            list,
+            negated,
+        } => Ok(Expr::InList {
             expr: Box::new(rewrite_expr_for_multi_join(inner, table_aliases)?),
             list: list
                 .iter()
@@ -131,35 +137,85 @@ pub(crate) fn rewrite_expr_for_multi_join(
                 .collect::<Result<Vec<_>>>()?,
             negated: *negated,
         }),
-        Expr::Between { expr: inner, negated, low, high } => Ok(Expr::Between {
+        Expr::Between {
+            expr: inner,
+            negated,
+            low,
+            high,
+        } => Ok(Expr::Between {
             expr: Box::new(rewrite_expr_for_multi_join(inner, table_aliases)?),
             negated: *negated,
             low: Box::new(rewrite_expr_for_multi_join(low, table_aliases)?),
             high: Box::new(rewrite_expr_for_multi_join(high, table_aliases)?),
         }),
-        Expr::Case { operand, conditions, results, else_result } => Ok(Expr::Case {
-            operand: operand.as_ref().map(|o| rewrite_expr_for_multi_join(o, table_aliases)).transpose()?.map(Box::new),
-            conditions: conditions.iter().map(|c| rewrite_expr_for_multi_join(c, table_aliases)).collect::<Result<Vec<_>>>()?,
-            results: results.iter().map(|r| rewrite_expr_for_multi_join(r, table_aliases)).collect::<Result<Vec<_>>>()?,
-            else_result: else_result.as_ref().map(|e| rewrite_expr_for_multi_join(e, table_aliases)).transpose()?.map(Box::new),
+        Expr::Case {
+            operand,
+            conditions,
+            results,
+            else_result,
+        } => Ok(Expr::Case {
+            operand: operand
+                .as_ref()
+                .map(|o| rewrite_expr_for_multi_join(o, table_aliases))
+                .transpose()?
+                .map(Box::new),
+            conditions: conditions
+                .iter()
+                .map(|c| rewrite_expr_for_multi_join(c, table_aliases))
+                .collect::<Result<Vec<_>>>()?,
+            results: results
+                .iter()
+                .map(|r| rewrite_expr_for_multi_join(r, table_aliases))
+                .collect::<Result<Vec<_>>>()?,
+            else_result: else_result
+                .as_ref()
+                .map(|e| rewrite_expr_for_multi_join(e, table_aliases))
+                .transpose()?
+                .map(Box::new),
         }),
-        Expr::Like { negated, expr: inner, pattern, escape_char } => Ok(Expr::Like {
+        Expr::Like {
+            negated,
+            expr: inner,
+            pattern,
+            escape_char,
+        } => Ok(Expr::Like {
             negated: *negated,
             expr: Box::new(rewrite_expr_for_multi_join(inner, table_aliases)?),
             pattern: Box::new(rewrite_expr_for_multi_join(pattern, table_aliases)?),
             escape_char: *escape_char,
         }),
-        Expr::ILike { negated, expr: inner, pattern, escape_char } => Ok(Expr::ILike {
+        Expr::ILike {
+            negated,
+            expr: inner,
+            pattern,
+            escape_char,
+        } => Ok(Expr::ILike {
             negated: *negated,
             expr: Box::new(rewrite_expr_for_multi_join(inner, table_aliases)?),
             pattern: Box::new(rewrite_expr_for_multi_join(pattern, table_aliases)?),
             escape_char: *escape_char,
         }),
-        Expr::IsTrue(inner) => Ok(Expr::IsTrue(Box::new(rewrite_expr_for_multi_join(inner, table_aliases)?))),
-        Expr::IsFalse(inner) => Ok(Expr::IsFalse(Box::new(rewrite_expr_for_multi_join(inner, table_aliases)?))),
-        Expr::IsNotTrue(inner) => Ok(Expr::IsNotTrue(Box::new(rewrite_expr_for_multi_join(inner, table_aliases)?))),
-        Expr::IsNotFalse(inner) => Ok(Expr::IsNotFalse(Box::new(rewrite_expr_for_multi_join(inner, table_aliases)?))),
-        Expr::TryCast { expr: inner, data_type, format } => Ok(Expr::TryCast {
+        Expr::IsTrue(inner) => Ok(Expr::IsTrue(Box::new(rewrite_expr_for_multi_join(
+            inner,
+            table_aliases,
+        )?))),
+        Expr::IsFalse(inner) => Ok(Expr::IsFalse(Box::new(rewrite_expr_for_multi_join(
+            inner,
+            table_aliases,
+        )?))),
+        Expr::IsNotTrue(inner) => Ok(Expr::IsNotTrue(Box::new(rewrite_expr_for_multi_join(
+            inner,
+            table_aliases,
+        )?))),
+        Expr::IsNotFalse(inner) => Ok(Expr::IsNotFalse(Box::new(rewrite_expr_for_multi_join(
+            inner,
+            table_aliases,
+        )?))),
+        Expr::TryCast {
+            expr: inner,
+            data_type,
+            format,
+        } => Ok(Expr::TryCast {
             expr: Box::new(rewrite_expr_for_multi_join(inner, table_aliases)?),
             data_type: data_type.clone(),
             format: format.clone(),
@@ -394,17 +450,15 @@ fn rewrite_join_expr_with_aliases(
                 .clone()
                 .into_iter()
                 .map(|arg| match arg {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                        Ok(FunctionArg::Unnamed(FunctionArgExpr::Expr(
-                            rewrite_join_expr_with_aliases(
+                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(FunctionArg::Unnamed(
+                        FunctionArgExpr::Expr(rewrite_join_expr_with_aliases(
                             &e,
                             left_alias,
                             right_alias,
                             left_schema,
                             right_schema,
-                        )?,
-                        )))
-                    }
+                        )?),
+                    )),
                     other => Ok(other),
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -419,7 +473,11 @@ fn rewrite_join_expr_with_aliases(
                 order_by: f.order_by.clone(),
             }))
         }
-        Expr::Cast { expr: inner, data_type, format } => Ok(Expr::Cast {
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            format,
+        } => Ok(Expr::Cast {
             expr: Box::new(rewrite_join_expr_with_aliases(
                 inner,
                 left_alias,
@@ -463,7 +521,11 @@ pub(crate) fn eval_having_expr_for_operators(
                     Value::Float64(n) => Ok(Value::Float64(-n)),
                     _ => Err(anyhow!("Unary minus requires numeric operand")),
                 },
-                _ => Err(SqlError::Unsupported(format!("Unsupported unary operator in HAVING: {:?}", op)).into()),
+                _ => Err(SqlError::Unsupported(format!(
+                    "Unsupported unary operator in HAVING: {:?}",
+                    op
+                ))
+                .into()),
             }
         }
         Expr::Nested(inner) => {
@@ -633,7 +695,15 @@ pub fn extract_offset(query: &Query) -> usize {
 }
 
 static AGGREGATE_FUNC_NAMES: &[&str] = &[
-    "COUNT", "SUM", "AVG", "MIN", "MAX", "STRING_AGG", "ARRAY_AGG", "BOOL_AND", "BOOL_OR",
+    "COUNT",
+    "SUM",
+    "AVG",
+    "MIN",
+    "MAX",
+    "STRING_AGG",
+    "ARRAY_AGG",
+    "BOOL_AND",
+    "BOOL_OR",
     "EVERY",
 ];
 
@@ -648,15 +718,62 @@ pub(crate) fn is_aggregate_func(f: &Function) -> bool {
 }
 
 static EVAL_FUNCTION_MATCH_NAMES: &[&str] = &[
-    "NULLIF", "GREATEST", "LEAST", "GET_BIT", "SET_BIT", "INT8SEND", "INT4SEND", "UUID_SEND",
-    "SUBSTR", "FORMAT", "NOW", "CURRENT_TIMESTAMP", "CURRENT_DATE", "DATE_TRUNC", "DATE",
-    "TO_CHAR", "AGE", "GENERATE_SERIES", "NEXTVAL", "CURRVAL", "SETVAL", "SET_CONFIG",
-    "PG_BACKEND_PID", "VERSION", "CURRENT_DATABASE", "CURRENT_SCHEMA", "CURRENT_USER",
-    "SESSION_USER", "USER", "PG_GET_USERBYID", "PG_GET_INDEXDEF", "PG_GET_CONSTRAINTDEF",
-    "PG_GET_EXPR", "FORMAT_TYPE", "PG_CATALOG.SET_CONFIG", "L2_DISTANCE", "COSINE_DISTANCE",
-    "INNER_PRODUCT", "VECTOR_DIMS", "VECTOR_NORM", "SUBSTRING", "POSITION", "OVERLAY",
-    "COALESCE", "ROW_NUMBER", "RANK", "DENSE_RANK", "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE",
-    "NTH_VALUE", "NTILE", "CUME_DIST", "PERCENT_RANK", "CURRENT_SETTING",
+    "NULLIF",
+    "GREATEST",
+    "LEAST",
+    "GET_BIT",
+    "SET_BIT",
+    "INT8SEND",
+    "INT4SEND",
+    "UUID_SEND",
+    "SUBSTR",
+    "FORMAT",
+    "NOW",
+    "CURRENT_TIMESTAMP",
+    "CURRENT_DATE",
+    "DATE_TRUNC",
+    "DATE",
+    "TO_CHAR",
+    "AGE",
+    "GENERATE_SERIES",
+    "NEXTVAL",
+    "CURRVAL",
+    "SETVAL",
+    "SET_CONFIG",
+    "PG_BACKEND_PID",
+    "VERSION",
+    "CURRENT_DATABASE",
+    "CURRENT_SCHEMA",
+    "CURRENT_USER",
+    "SESSION_USER",
+    "USER",
+    "PG_GET_USERBYID",
+    "PG_GET_INDEXDEF",
+    "PG_GET_CONSTRAINTDEF",
+    "PG_GET_EXPR",
+    "FORMAT_TYPE",
+    "PG_CATALOG.SET_CONFIG",
+    "L2_DISTANCE",
+    "COSINE_DISTANCE",
+    "INNER_PRODUCT",
+    "VECTOR_DIMS",
+    "VECTOR_NORM",
+    "SUBSTRING",
+    "POSITION",
+    "OVERLAY",
+    "COALESCE",
+    "ROW_NUMBER",
+    "RANK",
+    "DENSE_RANK",
+    "LAG",
+    "LEAD",
+    "FIRST_VALUE",
+    "LAST_VALUE",
+    "NTH_VALUE",
+    "NTILE",
+    "CUME_DIST",
+    "PERCENT_RANK",
+    "CURRENT_SETTING",
 ];
 
 fn is_known_builtin_function(name: &str) -> bool {
@@ -673,12 +790,7 @@ fn is_known_builtin_function(name: &str) -> bool {
 fn expr_may_have_udf(expr: &Expr) -> bool {
     match expr {
         Expr::Function(f) => {
-            let name = f
-                .name
-                .0
-                .last()
-                .map(|n| n.value.clone())
-                .unwrap_or_default();
+            let name = f.name.0.last().map(|n| n.value.clone()).unwrap_or_default();
             if !is_known_builtin_function(&name) {
                 return true;
             }
@@ -759,8 +871,7 @@ fn collect_nested_aggregates_inner<'a>(expr: &'a Expr, out: &mut Vec<&'a Functio
         Expr::Nested(inner) => {
             collect_nested_aggregates_inner(inner, out);
         }
-        Expr::Cast { expr: inner, .. }
-        | Expr::TryCast { expr: inner, .. } => {
+        Expr::Cast { expr: inner, .. } | Expr::TryCast { expr: inner, .. } => {
             collect_nested_aggregates_inner(inner, out);
         }
         Expr::Case {
@@ -836,8 +947,18 @@ pub(crate) fn agg_func_signature(f: &Function) -> String {
             _ => format!("{:?}", a),
         })
         .collect();
-    let filter_suffix = f.filter.as_ref().map_or(String::new(), |flt| format!(" filter(where {})", flt));
-    format!("{}({}{}){}", name, distinct_prefix, args_str.join(", "), filter_suffix).to_lowercase()
+    let filter_suffix = f
+        .filter
+        .as_ref()
+        .map_or(String::new(), |flt| format!(" filter(where {})", flt));
+    format!(
+        "{}({}{}){}",
+        name,
+        distinct_prefix,
+        args_str.join(", "),
+        filter_suffix
+    )
+    .to_lowercase()
 }
 
 pub(crate) fn rewrite_agg_refs_to_columns(
@@ -873,26 +994,54 @@ pub(crate) fn rewrite_agg_refs_to_columns(
             }
         }
         Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
-            left: Box::new(rewrite_agg_refs_to_columns(left, agg_column_map, group_by_names)),
+            left: Box::new(rewrite_agg_refs_to_columns(
+                left,
+                agg_column_map,
+                group_by_names,
+            )),
             op: op.clone(),
-            right: Box::new(rewrite_agg_refs_to_columns(right, agg_column_map, group_by_names)),
+            right: Box::new(rewrite_agg_refs_to_columns(
+                right,
+                agg_column_map,
+                group_by_names,
+            )),
         },
         Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
             op: op.clone(),
-            expr: Box::new(rewrite_agg_refs_to_columns(inner, agg_column_map, group_by_names)),
+            expr: Box::new(rewrite_agg_refs_to_columns(
+                inner,
+                agg_column_map,
+                group_by_names,
+            )),
         },
         Expr::Nested(inner) => Expr::Nested(Box::new(rewrite_agg_refs_to_columns(
             inner,
             agg_column_map,
             group_by_names,
         ))),
-        Expr::Cast { expr: inner, data_type, format } => Expr::Cast {
-            expr: Box::new(rewrite_agg_refs_to_columns(inner, agg_column_map, group_by_names)),
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            format,
+        } => Expr::Cast {
+            expr: Box::new(rewrite_agg_refs_to_columns(
+                inner,
+                agg_column_map,
+                group_by_names,
+            )),
             data_type: data_type.clone(),
             format: format.clone(),
         },
-        Expr::TryCast { expr: inner, data_type, format } => Expr::TryCast {
-            expr: Box::new(rewrite_agg_refs_to_columns(inner, agg_column_map, group_by_names)),
+        Expr::TryCast {
+            expr: inner,
+            data_type,
+            format,
+        } => Expr::TryCast {
+            expr: Box::new(rewrite_agg_refs_to_columns(
+                inner,
+                agg_column_map,
+                group_by_names,
+            )),
             data_type: data_type.clone(),
             format: format.clone(),
         },
@@ -902,9 +1051,13 @@ pub(crate) fn rewrite_agg_refs_to_columns(
             results,
             else_result,
         } => Expr::Case {
-            operand: operand
-                .as_ref()
-                .map(|o| Box::new(rewrite_agg_refs_to_columns(o, agg_column_map, group_by_names))),
+            operand: operand.as_ref().map(|o| {
+                Box::new(rewrite_agg_refs_to_columns(
+                    o,
+                    agg_column_map,
+                    group_by_names,
+                ))
+            }),
             conditions: conditions
                 .iter()
                 .map(|c| rewrite_agg_refs_to_columns(c, agg_column_map, group_by_names))
@@ -913,25 +1066,27 @@ pub(crate) fn rewrite_agg_refs_to_columns(
                 .iter()
                 .map(|r| rewrite_agg_refs_to_columns(r, agg_column_map, group_by_names))
                 .collect(),
-            else_result: else_result
-                .as_ref()
-                .map(|e| Box::new(rewrite_agg_refs_to_columns(e, agg_column_map, group_by_names))),
+            else_result: else_result.as_ref().map(|e| {
+                Box::new(rewrite_agg_refs_to_columns(
+                    e,
+                    agg_column_map,
+                    group_by_names,
+                ))
+            }),
         },
         Expr::Function(f) => {
-            let new_args: Vec<FunctionArg> = f
-                .args
-                .iter()
-                .map(|a| match a {
-                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(rewrite_agg_refs_to_columns(
-                            e,
-                            agg_column_map,
-                            group_by_names,
-                        )))
-                    }
-                    other => other.clone(),
-                })
-                .collect();
+            let new_args: Vec<FunctionArg> =
+                f.args
+                    .iter()
+                    .map(|a| match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                rewrite_agg_refs_to_columns(e, agg_column_map, group_by_names),
+                            ))
+                        }
+                        other => other.clone(),
+                    })
+                    .collect();
             Expr::Function(Function {
                 name: f.name.clone(),
                 args: new_args,
@@ -1043,7 +1198,10 @@ impl Executor {
                     .iter()
                     .any(|c| c.name.eq_ignore_ascii_case(col_name))
                 {
-                    return Err(SqlError::ColumnNotFound { column: col_name.to_string() }.into());
+                    return Err(SqlError::ColumnNotFound {
+                        column: col_name.to_string(),
+                    }
+                    .into());
                 }
                 Ok(())
             }
@@ -1055,7 +1213,10 @@ impl Executor {
                         .iter()
                         .any(|c| c.name.eq_ignore_ascii_case(col_name))
                     {
-                        return Err(SqlError::ColumnNotFound { column: col_name.to_string() }.into());
+                        return Err(SqlError::ColumnNotFound {
+                            column: col_name.to_string(),
+                        }
+                        .into());
                     }
                 }
                 Ok(())
@@ -1097,7 +1258,10 @@ impl Executor {
                 for arg in &f.args {
                     match arg {
                         FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
-                        | FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. } => {
+                        | FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        } => {
                             Self::validate_projection_columns(e, schema)?;
                         }
                         _ => {}
@@ -1342,7 +1506,8 @@ impl Executor {
     ) -> Result<ExecuteResult> {
         let (mut group_by_exprs, mut group_by_names, mut group_by_types) =
             Self::extract_group_by_info(group_by, &schema);
-        let (mut agg_exprs, mut agg_names, mut agg_types) = Self::extract_aggregate_info(projection, &schema);
+        let (mut agg_exprs, mut agg_names, mut agg_types) =
+            Self::extract_aggregate_info(projection, &schema);
 
         Self::add_pg_get_indexdef_support_to_group_by(
             projection,
@@ -1358,10 +1523,21 @@ impl Executor {
                 .map(|a| {
                     let distinct_prefix = if a.distinct { "DISTINCT " } else { "" };
                     let arg_str = a.arg.as_ref().map_or("*".to_string(), |e| format!("{}", e));
-                    let filter_suffix = a.filter.as_ref().map_or(String::new(), |flt| format!(" filter(where {})", flt));
-                    let mut s = format!("{}({}{}){}", a.func_name, distinct_prefix, arg_str, filter_suffix).to_lowercase();
+                    let filter_suffix = a
+                        .filter
+                        .as_ref()
+                        .map_or(String::new(), |flt| format!(" filter(where {})", flt));
+                    let mut s = format!(
+                        "{}({}{}){}",
+                        a.func_name, distinct_prefix, arg_str, filter_suffix
+                    )
+                    .to_lowercase();
                     if let Some(ref delim) = a.delimiter {
-                        s = format!("{}({}{}, '{}'){}", a.func_name, distinct_prefix, arg_str, delim, filter_suffix).to_lowercase();
+                        s = format!(
+                            "{}({}{}, '{}'){}",
+                            a.func_name, distinct_prefix, arg_str, delim, filter_suffix
+                        )
+                        .to_lowercase();
                     }
                     s
                 })
@@ -1460,11 +1636,25 @@ impl Executor {
             let mut map = HashMap::new();
             for (i, agg) in agg_exprs.iter().enumerate() {
                 let distinct_prefix = if agg.distinct { "DISTINCT " } else { "" };
-                let arg_str = agg.arg.as_ref().map_or("*".to_string(), |e| format!("{}", e));
-                let filter_suffix = agg.filter.as_ref().map_or(String::new(), |flt| format!(" filter(where {})", flt));
-                let mut sig = format!("{}({}{}){}", agg.func_name, distinct_prefix, arg_str, filter_suffix).to_lowercase();
+                let arg_str = agg
+                    .arg
+                    .as_ref()
+                    .map_or("*".to_string(), |e| format!("{}", e));
+                let filter_suffix = agg
+                    .filter
+                    .as_ref()
+                    .map_or(String::new(), |flt| format!(" filter(where {})", flt));
+                let mut sig = format!(
+                    "{}({}{}){}",
+                    agg.func_name, distinct_prefix, arg_str, filter_suffix
+                )
+                .to_lowercase();
                 if let Some(ref delim) = agg.delimiter {
-                    sig = format!("{}({}{}, '{}'){}", agg.func_name, distinct_prefix, arg_str, delim, filter_suffix).to_lowercase();
+                    sig = format!(
+                        "{}({}{}, '{}'){}",
+                        agg.func_name, distinct_prefix, arg_str, delim, filter_suffix
+                    )
+                    .to_lowercase();
                 }
                 map.insert(sig, agg_names[i].clone());
             }
@@ -1561,8 +1751,6 @@ impl Executor {
             timezone: crate::session_context::current_timezone(),
         })
     }
-
-
 
     pub(crate) async fn execute_simple_join_with_operators(
         &self,
@@ -1829,23 +2017,13 @@ impl Executor {
                             if unqualified.starts_with("__tipg_subquery_") {
                                 continue;
                             }
-                            cols.push(
-                                c.name
-                                    .split('.')
-                                    .last()
-                                    .unwrap_or(&c.name)
-                                    .to_string(),
-                            );
+                            cols.push(c.name.split('.').last().unwrap_or(&c.name).to_string());
                             types.push(c.data_type.clone());
                             sources.push(ProjectionSource::ColumnIndex(idx));
                         }
                     }
                     SelectItem::QualifiedWildcard(obj, _) => {
-                        let qualifier = obj
-                            .0
-                            .last()
-                            .map(|i| i.value.clone())
-                            .unwrap_or_default();
+                        let qualifier = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                         let mut matched = false;
                         for (idx, c) in combined_schema.columns.iter().enumerate() {
                             let prefix = c.name.split('.').next().unwrap_or(&c.name);
@@ -1855,13 +2033,7 @@ impl Executor {
                                     continue;
                                 }
                                 matched = true;
-                                cols.push(
-                                    c.name
-                                        .split('.')
-                                        .last()
-                                        .unwrap_or(&c.name)
-                                        .to_string(),
-                                );
+                                cols.push(c.name.split('.').last().unwrap_or(&c.name).to_string());
                                 types.push(c.data_type.clone());
                                 sources.push(ProjectionSource::ColumnIndex(idx));
                             }
@@ -1909,7 +2081,9 @@ impl Executor {
                         ProjectionSource::ColumnIndex(idx) => {
                             row.values.get(*idx).cloned().unwrap_or(Value::Null)
                         }
-                        ProjectionSource::Expr(expr) => eval_expr(expr, Some(&row), Some(&combined_schema))?,
+                        ProjectionSource::Expr(expr) => {
+                            eval_expr(expr, Some(&row), Some(&combined_schema))?
+                        }
                     };
                     values.push(val);
                 }
@@ -2260,7 +2434,10 @@ impl Executor {
                     let rewritten_order_by_for_sort =
                         rewrite_order_by_for_pre_projection_sort(order_by)?;
                     let sorted: BoxedOperator = if !rewritten_order_by_for_sort.is_empty() {
-                        Box::new(SortOperator::new(scan_operator, rewritten_order_by_for_sort))
+                        Box::new(SortOperator::new(
+                            scan_operator,
+                            rewritten_order_by_for_sort,
+                        ))
                     } else {
                         scan_operator
                     };
@@ -2287,8 +2464,7 @@ impl Executor {
 
             let mut operator: BoxedOperator = if !is_distinct_on && !order_by.is_empty() {
                 let rewritten_order_by = rewrite_order_by_for_post_projection_sort(order_by)?;
-                let sort_operator =
-                    Box::new(SortOperator::new(post_project, rewritten_order_by));
+                let sort_operator = Box::new(SortOperator::new(post_project, rewritten_order_by));
                 if limit.is_some() || offset > 0 {
                     Box::new(LimitOperator::new(sort_operator, limit, offset))
                 } else {
@@ -2332,7 +2508,8 @@ impl Executor {
         }
 
         let base_operator = if let Some(rows) = preloaded_rows {
-            let mut op: BoxedOperator = Box::new(TableScanOperator::new_with_rows(schema.clone(), rows));
+            let mut op: BoxedOperator =
+                Box::new(TableScanOperator::new_with_rows(schema.clone(), rows));
             if let Some(filter_expr) = filter {
                 op = Box::new(FilterOperator::new(op, filter_expr.clone()));
             }
@@ -2426,7 +2603,8 @@ impl Executor {
         preloaded_rows: Option<Vec<Row>>,
     ) -> Result<ExecuteResult> {
         let scan_operator: BoxedOperator = if let Some(rows) = preloaded_rows {
-            let mut op: BoxedOperator = Box::new(TableScanOperator::new_with_rows(schema.clone(), rows));
+            let mut op: BoxedOperator =
+                Box::new(TableScanOperator::new_with_rows(schema.clone(), rows));
             if let Some(filter_expr) = filter {
                 op = Box::new(FilterOperator::new(op, filter_expr.clone()));
             }
@@ -2731,7 +2909,10 @@ mod tests {
 
         let schema = make_schema(
             "join_result",
-            &[("ix.indexrelid", DataType::Int64), ("ix.indexdef", DataType::Text)],
+            &[
+                ("ix.indexrelid", DataType::Int64),
+                ("ix.indexdef", DataType::Text),
+            ],
         );
 
         let mut group_by_exprs = vec![Expr::CompoundIdentifier(vec![
@@ -2771,18 +2952,12 @@ mod tests {
         assert_eq!(group_by_exprs.len(), original_len);
     }
 
-
-
     #[test]
     fn test_extract_limit_offset_from_text_literals() {
         let query = parse_query("SELECT * FROM users LIMIT '10' OFFSET '5'");
         assert_eq!(extract_limit(&query), Some(10));
         assert_eq!(extract_offset(&query), 5);
     }
-
-
-
-
 
     #[test]
     fn test_extract_aggregate_info_sum_avg_float8_types() {
@@ -2798,12 +2973,6 @@ mod tests {
             vec![701, 701]
         );
     }
-
-
-
-
-
-
 
     fn make_schema(table_name: &str, cols: &[(&str, DataType)]) -> TableSchema {
         TableSchema {
@@ -2833,9 +3002,14 @@ mod tests {
 
     #[test]
     fn test_rewrite_expr_unambiguous_column() {
-        let users = make_schema("users", &[("id", DataType::Int32), ("name", DataType::Text)]);
-        let orders =
-            make_schema("orders", &[("id", DataType::Int32), ("user_id", DataType::Int32)]);
+        let users = make_schema(
+            "users",
+            &[("id", DataType::Int32), ("name", DataType::Text)],
+        );
+        let orders = make_schema(
+            "orders",
+            &[("id", DataType::Int32), ("user_id", DataType::Int32)],
+        );
         let aliases = vec![("u".to_string(), users), ("o".to_string(), orders)];
 
         let expr = Expr::Identifier(Ident::new("name"));
@@ -3154,8 +3328,11 @@ mod tests {
             Executor::extract_aggregate_info(&select.projection, &schema);
         // Should find AVG(x) as a nested aggregate
         assert_eq!(agg_exprs.len(), 1);
-        assert!(names[0].contains("avg") || names[0].contains("AVG") || names[0] == "rounded_avg",
-            "expected aggregate name to relate to avg, got: {:?}", names);
+        assert!(
+            names[0].contains("avg") || names[0].contains("AVG") || names[0] == "rounded_avg",
+            "expected aggregate name to relate to avg, got: {:?}",
+            names
+        );
     }
 
     #[test]
@@ -3172,5 +3349,4 @@ mod tests {
             "expected at least one aggregate from nested COUNT(*)"
         );
     }
-
 }

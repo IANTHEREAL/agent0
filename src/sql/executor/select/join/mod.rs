@@ -11,7 +11,9 @@ mod window;
 pub(in crate::sql::executor::select) const JOIN_LOCKING_CLAUSE_UNSUPPORTED: &str =
     "SELECT ... FOR UPDATE/SHARE with JOIN or multiple FROM items is not supported yet";
 
-pub(in crate::sql::executor::select) fn ensure_no_locking_clauses_for_join(query: &Query) -> Result<()> {
+pub(in crate::sql::executor::select) fn ensure_no_locking_clauses_for_join(
+    query: &Query,
+) -> Result<()> {
     if query.locks.is_empty() {
         return Ok(());
     }

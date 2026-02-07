@@ -1,8 +1,8 @@
-use super::super::ddl;
-use super::core::Executor;
 use super::super::coercion::infer_data_type;
+use super::super::ddl;
 use super::super::names;
 use super::super::{parse_sql, ExecuteResult, Session};
+use super::core::Executor;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Ident, ObjectName, Query, Statement};
@@ -103,13 +103,15 @@ fn parse_refresh_materialized_view_name(sql: &str) -> Result<ObjectName> {
             .get(i + 2)
             .ok_or_else(|| anyhow!("Invalid REFRESH MATERIALIZED VIEW syntax"))?,
         "VIEW",
-    )
-    {
+    ) {
         return Err(anyhow!("Invalid REFRESH MATERIALIZED VIEW syntax"));
     }
     i += 3;
 
-    if tokens.get(i).is_some_and(|t| is_unquoted_keyword(t, "CONCURRENTLY")) {
+    if tokens
+        .get(i)
+        .is_some_and(|t| is_unquoted_keyword(t, "CONCURRENTLY"))
+    {
         i += 1;
     }
 
@@ -139,15 +141,16 @@ fn parse_drop_materialized_view(sql: &str) -> Result<(Vec<ObjectName>, bool)> {
             .get(i + 2)
             .ok_or_else(|| anyhow!("Invalid DROP MATERIALIZED VIEW syntax"))?,
         "VIEW",
-    )
-    {
+    ) {
         return Err(anyhow!("Invalid DROP MATERIALIZED VIEW syntax"));
     }
     i += 3;
 
     let mut if_exists = false;
     if tokens.get(i).is_some_and(|t| is_unquoted_keyword(t, "IF"))
-        && tokens.get(i + 1).is_some_and(|t| is_unquoted_keyword(t, "EXISTS"))
+        && tokens
+            .get(i + 1)
+            .is_some_and(|t| is_unquoted_keyword(t, "EXISTS"))
     {
         if_exists = true;
         i += 2;
@@ -181,8 +184,8 @@ mod tests {
 
     #[test]
     fn parse_refresh_materialized_view_preserves_quoted_ident_case() {
-        let name = parse_refresh_materialized_view_name(r#"REFRESH MATERIALIZED VIEW "MyMV";"#)
-            .unwrap();
+        let name =
+            parse_refresh_materialized_view_name(r#"REFRESH MATERIALIZED VIEW "MyMV";"#).unwrap();
         assert_eq!(name.0.len(), 1);
         assert_eq!(name.0[0].value, "MyMV");
         assert_eq!(name.0[0].quote_style, Some('"'));
@@ -241,7 +244,14 @@ impl Executor {
         or_replace: bool,
     ) -> Result<ExecuteResult> {
         let result = self
-            .execute_query_with_ctes(txn, db_id, sequence_values, search_path, query, &HashMap::new())
+            .execute_query_with_ctes(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                query,
+                &HashMap::new(),
+            )
             .await?;
         let (columns, rows) = match result {
             ExecuteResult::Select {
@@ -254,7 +264,11 @@ impl Executor {
         };
 
         let resolved = names::resolve_ddl_object_name(name, search_path)?;
-        if !self.store().schema_exists(txn, db_id, &resolved.schema).await? {
+        if !self
+            .store()
+            .schema_exists(txn, db_id, &resolved.schema)
+            .await?
+        {
             return Err(anyhow!("schema '{}' does not exist", resolved.schema));
         }
         let view_name = resolved.full;
@@ -353,12 +367,7 @@ impl Executor {
                 search_path,
             )
             .await?
-            .ok_or_else(|| {
-                anyhow!(
-                    "Materialized view '{}' does not exist",
-                    view_name_for_error
-                )
-            })?;
+            .ok_or_else(|| anyhow!("Materialized view '{}' does not exist", view_name_for_error))?;
             let view_full_name = resolved.full;
 
             let query_str: String = self
@@ -374,7 +383,14 @@ impl Executor {
             };
 
             let result = self
-                .execute_query_with_ctes(txn, db_id, sequence_values, search_path, &query, &HashMap::new())
+                .execute_query_with_ctes(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    &query,
+                    &HashMap::new(),
+                )
                 .await?;
             let rows = match result {
                 ExecuteResult::Select { rows, .. } => rows,
@@ -438,7 +454,7 @@ impl Executor {
                 &names,
                 if_exists,
             )
-                .await
+            .await
         }
         .await;
 
@@ -463,7 +479,11 @@ impl Executor {
         body: &[Statement],
     ) -> Result<ExecuteResult> {
         let resolved = names::resolve_ddl_object_name(name, search_path)?;
-        if !self.store().schema_exists(txn, db_id, &resolved.schema).await? {
+        if !self
+            .store()
+            .schema_exists(txn, db_id, &resolved.schema)
+            .await?
+        {
             return Err(anyhow!("schema '{}' does not exist", resolved.schema));
         }
         let proc_name = resolved.full;
@@ -625,7 +645,7 @@ impl Executor {
                         &stmt,
                         current_role.as_deref(),
                     )
-                        .await?;
+                    .await?;
                 }
             }
 
@@ -701,7 +721,11 @@ impl Executor {
                 .expect("Transaction must be active");
             let proc_obj = object_name_from_token(&proc_name)?;
             let resolved = names::resolve_ddl_object_name(&proc_obj, search_path)?;
-            if !self.store().schema_exists(txn, db_id, &resolved.schema).await? {
+            if !self
+                .store()
+                .schema_exists(txn, db_id, &resolved.schema)
+                .await?
+            {
                 return Err(anyhow!("schema '{}' does not exist", resolved.schema));
             }
             let proc_full_name = resolved.full;
@@ -780,7 +804,10 @@ impl Executor {
                 None => names::resolve_ddl_object_name(&proc_obj, search_path)?.full,
             };
 
-            let dropped = self.store().drop_procedure(txn, db_id, &proc_full_name).await?;
+            let dropped = self
+                .store()
+                .drop_procedure(txn, db_id, &proc_full_name)
+                .await?;
             if !dropped && !if_exists {
                 return Err(anyhow!("Procedure '{}' does not exist", proc_full_name));
             }

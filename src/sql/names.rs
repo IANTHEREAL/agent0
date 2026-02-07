@@ -126,7 +126,11 @@ pub(crate) async fn resolve_existing_table_name(
         None => {
             for schema in search_path_schemas(search_path) {
                 let resolved = ResolvedName::new(schema.to_string(), obj.clone())?;
-                if store.get_schema(txn, db_id, &resolved.full).await?.is_some() {
+                if store
+                    .get_schema(txn, db_id, &resolved.full)
+                    .await?
+                    .is_some()
+                {
                     return Ok(Some(resolved));
                 }
             }
@@ -214,7 +218,11 @@ pub(crate) async fn resolve_existing_procedure_name(
         None => {
             for schema in search_path_schemas(search_path) {
                 let resolved = ResolvedName::new(schema.to_string(), obj.clone())?;
-                if store.get_procedure(txn, db_id, &resolved.full).await?.is_some() {
+                if store
+                    .get_procedure(txn, db_id, &resolved.full)
+                    .await?
+                    .is_some()
+                {
                     return Ok(Some(resolved));
                 }
             }
@@ -242,7 +250,11 @@ pub(crate) async fn resolve_existing_function_name(
         None => {
             for schema in search_path_schemas(search_path) {
                 let resolved = ResolvedName::new(schema.to_string(), obj.clone())?;
-                if store.get_function(txn, db_id, &resolved.full).await?.is_some() {
+                if store
+                    .get_function(txn, db_id, &resolved.full)
+                    .await?
+                    .is_some()
+                {
                     return Ok(Some(resolved));
                 }
             }
@@ -270,7 +282,11 @@ pub(crate) async fn resolve_existing_sequence_name(
         None => {
             for schema in search_path_schemas(search_path) {
                 let resolved = ResolvedName::new(schema.to_string(), obj.clone())?;
-                if store.get_sequence(txn, db_id, &resolved.full).await?.is_some() {
+                if store
+                    .get_sequence(txn, db_id, &resolved.full)
+                    .await?
+                    .is_some()
+                {
                     return Ok(Some(resolved));
                 }
             }

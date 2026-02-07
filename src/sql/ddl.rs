@@ -10,12 +10,12 @@ use sqlparser::ast::{
 use tikv_client::Transaction;
 
 use super::coercion::{coerce_value_for_column, convert_data_type, infer_data_type};
-use super::names::normalize_ident;
-use super::projection::fill_row_defaults;
 use super::dml;
 use super::gin;
 use super::index_helpers;
 use super::names;
+use super::names::normalize_ident;
+use super::projection::fill_row_defaults;
 use super::sequences;
 use super::{expr::eval_expr, ExecuteResult};
 use crate::storage::TikvStore;
@@ -34,7 +34,10 @@ enum GinColumnType {
     Tsvector,
 }
 
-fn supported_gin_index_column(schema: &TableSchema, index: &IndexDef) -> Option<(usize, GinColumnType)> {
+fn supported_gin_index_column(
+    schema: &TableSchema,
+    index: &IndexDef,
+) -> Option<(usize, GinColumnType)> {
     if !index
         .method
         .as_deref()
@@ -67,29 +70,25 @@ fn extract_gin_token_hashes_from_row(
     };
 
     match col_type {
-        GinColumnType::Array => {
-            match row.values.get(col_idx) {
-                Some(Value::Null) | None => Ok(Vec::new()),
-                Some(Value::Array(arr)) => Ok(gin::extract_array_gin_tokens(arr)),
-                Some(other) => Err(anyhow!(
-                    "GIN index '{}' requires ARRAY value, got {}",
-                    index.name,
-                    other.data_type().unwrap_or(DataType::Text)
-                )),
-            }
-        }
-        GinColumnType::Tsvector => {
-            match row.values.get(col_idx) {
-                Some(Value::Null) | None => Ok(Vec::new()),
-                Some(Value::Tsvector(s)) => Ok(gin::extract_tsvector_gin_tokens(s)),
-                Some(Value::Text(s)) => Ok(gin::extract_tsvector_gin_tokens(s)),
-                Some(other) => Err(anyhow!(
-                    "GIN index '{}' requires TSVECTOR value, got {}",
-                    index.name,
-                    other.data_type().unwrap_or(DataType::Text)
-                )),
-            }
-        }
+        GinColumnType::Array => match row.values.get(col_idx) {
+            Some(Value::Null) | None => Ok(Vec::new()),
+            Some(Value::Array(arr)) => Ok(gin::extract_array_gin_tokens(arr)),
+            Some(other) => Err(anyhow!(
+                "GIN index '{}' requires ARRAY value, got {}",
+                index.name,
+                other.data_type().unwrap_or(DataType::Text)
+            )),
+        },
+        GinColumnType::Tsvector => match row.values.get(col_idx) {
+            Some(Value::Null) | None => Ok(Vec::new()),
+            Some(Value::Tsvector(s)) => Ok(gin::extract_tsvector_gin_tokens(s)),
+            Some(Value::Text(s)) => Ok(gin::extract_tsvector_gin_tokens(s)),
+            Some(other) => Err(anyhow!(
+                "GIN index '{}' requires TSVECTOR value, got {}",
+                index.name,
+                other.data_type().unwrap_or(DataType::Text)
+            )),
+        },
         GinColumnType::Jsonb => {
             let json_text = match row.values.get(col_idx) {
                 Some(Value::Null) | None => return Ok(Vec::new()),
@@ -103,8 +102,9 @@ fn extract_gin_token_hashes_from_row(
                 }
             };
 
-            let json: serde_json::Value = serde_json::from_str(json_text)
-                .map_err(|e| anyhow!("Invalid JSONB value for GIN index '{}': {}", index.name, e))?;
+            let json: serde_json::Value = serde_json::from_str(json_text).map_err(|e| {
+                anyhow!("Invalid JSONB value for GIN index '{}': {}", index.name, e)
+            })?;
             let tokens = gin::extract_gin_tokens(&json);
             let mut hashes = tokens.key_values;
             hashes.reserve(tokens.key_exists.len());
@@ -134,15 +134,14 @@ async fn resolve_column_data_type(
                     Ok((convert_data_type(sql_type)?, false))
                 }
                 _ => {
-                    let resolved_type =
-                        names::resolve_existing_type_name(
-                            store.as_ref(),
-                            txn,
-                            db_id,
-                            name,
-                            search_path,
-                        )
-                            .await?;
+                    let resolved_type = names::resolve_existing_type_name(
+                        store.as_ref(),
+                        txn,
+                        db_id,
+                        name,
+                        search_path,
+                    )
+                    .await?;
                     let Some(resolved_type) = resolved_type else {
                         return Ok((convert_data_type(sql_type)?, false));
                     };
@@ -178,11 +177,7 @@ async fn create_implicit_sequences_for_schema(
                 .create_sequence(
                     txn,
                     db_id,
-                    sequences::build_implicit_sequence_def(
-                        &schema.name,
-                        &col.name,
-                        &col.data_type,
-                    ),
+                    sequences::build_implicit_sequence_def(&schema.name, &col.name, &col.data_type),
                 )
                 .await?;
         }
@@ -511,7 +506,10 @@ fn coerce_value_for_type_change(val: Value, target_col: &ColumnDef) -> Result<Va
             if coerced.data_type().as_ref() == Some(new_type) {
                 Ok(coerced)
             } else {
-                Err(SqlError::Unsupported(format!("Unsupported type conversion to {}", new_type)).into())
+                Err(
+                    SqlError::Unsupported(format!("Unsupported type conversion to {}", new_type))
+                        .into(),
+                )
             }
         }
     }
@@ -639,9 +637,7 @@ pub async fn execute_create_table(
                             search_path,
                         )
                         .await?
-                        .ok_or_else(|| {
-                            SqlError::RelationNotFound(foreign_table.to_string())
-                        })?
+                        .ok_or_else(|| SqlError::RelationNotFound(foreign_table.to_string()))?
                         .full
                     };
                     let ref_cols: Vec<String> =
@@ -718,10 +714,7 @@ pub async fn execute_create_table(
     let pk_constraint_name = if pk_indices.is_empty() {
         None
     } else {
-        Some(
-            pk_constraint_name
-                .unwrap_or_else(|| format!("{}_pkey", table_object_name)),
-        )
+        Some(pk_constraint_name.unwrap_or_else(|| format!("{}_pkey", table_object_name)))
     };
 
     let table_id = store.next_table_id(txn, db_id).await?;
@@ -1133,9 +1126,14 @@ pub async fn execute_create_index(
                 while let Some(batch) = scanner.next_batch(txn).await? {
                     for pair in batch {
                         let key: &[u8] = pair.key().as_ref().into();
-                        let pk_bytes = key.strip_prefix(data_key_prefix.as_slice()).ok_or_else(|| {
-                            anyhow!("corrupted row key while backfilling index '{}'", idx_name_str)
-                        })?;
+                        let pk_bytes =
+                            key.strip_prefix(data_key_prefix.as_slice())
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "corrupted row key while backfilling index '{}'",
+                                        idx_name_str
+                                    )
+                                })?;
                         let pk_values =
                             crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
 
@@ -1146,9 +1144,7 @@ pub async fn execute_create_index(
                             continue;
                         }
                         let idx_values = index_helpers::get_index_values_with_expressions(
-                            &new_index,
-                            &schema,
-                            &row,
+                            &new_index, &schema, &row,
                         )?;
                         store
                             .create_index_entry(
@@ -1169,9 +1165,7 @@ pub async fn execute_create_index(
                         continue;
                     }
                     let idx_values = index_helpers::get_index_values_with_expressions(
-                        &new_index,
-                        &schema,
-                        &row,
+                        &new_index, &schema, &row,
                     )?;
                     let pk_values = schema.get_pk_values(&row);
                     store
@@ -1199,9 +1193,14 @@ pub async fn execute_create_index(
                 while let Some(batch) = scanner.next_batch(txn).await? {
                     for pair in batch {
                         let key: &[u8] = pair.key().as_ref().into();
-                        let pk_bytes = key.strip_prefix(data_key_prefix.as_slice()).ok_or_else(|| {
-                            anyhow!("corrupted row key while backfilling index '{}'", idx_name_str)
-                        })?;
+                        let pk_bytes =
+                            key.strip_prefix(data_key_prefix.as_slice())
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "corrupted row key while backfilling index '{}'",
+                                        idx_name_str
+                                    )
+                                })?;
                         let pk_values =
                             crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
 
@@ -1287,23 +1286,18 @@ pub async fn execute_drop_view(
 ) -> Result<ExecuteResult> {
     let mut last = String::new();
     for name in names {
-        let resolved = match names::resolve_existing_view_name(
-            store.as_ref(),
-            txn,
-            db_id,
-            name,
-            search_path,
-        )
-        .await?
-        {
-            Some(resolved) => resolved,
-            None => {
-                if !if_exists {
-                    return Err(anyhow!("View '{}' does not exist", name));
+        let resolved =
+            match names::resolve_existing_view_name(store.as_ref(), txn, db_id, name, search_path)
+                .await?
+            {
+                Some(resolved) => resolved,
+                None => {
+                    if !if_exists {
+                        return Err(anyhow!("View '{}' does not exist", name));
+                    }
+                    continue;
                 }
-                continue;
-            }
-        };
+            };
         if !store.drop_view(txn, db_id, &resolved.full).await? && !if_exists {
             return Err(anyhow!("View '{}' does not exist", resolved.full));
         }
@@ -1388,7 +1382,9 @@ pub async fn execute_drop_materialized_view(
             }
         };
 
-        let exists = store.drop_materialized_view(txn, db_id, &resolved.full).await?;
+        let exists = store
+            .drop_materialized_view(txn, db_id, &resolved.full)
+            .await?;
         if !exists && !if_exists {
             return Err(anyhow!(
                 "Materialized view '{}' does not exist",
@@ -1411,7 +1407,11 @@ pub async fn execute_refresh_materialized_view(
     name: &str,
     rows: Vec<Row>,
 ) -> Result<ExecuteResult> {
-    if store.get_materialized_view(txn, db_id, name).await?.is_none() {
+    if store
+        .get_materialized_view(txn, db_id, name)
+        .await?
+        .is_none()
+    {
         return Err(anyhow!("Materialized view '{}' does not exist", name));
     }
 
@@ -1482,7 +1482,7 @@ pub async fn execute_truncate(
     let resolved =
         names::resolve_existing_table_name(store.as_ref(), txn, db_id, table_name, search_path)
             .await?
-        .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
+            .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
     let t = resolved.full;
     if !store.truncate_table(txn, db_id, &t).await? {
         return Err(anyhow!("Table '{}' does not exist", t));
@@ -1503,17 +1503,19 @@ pub async fn execute_drop_index(
         let index = schema.indexes.remove(pos);
         if schema.pk_indices.is_empty() {
             let pk_types: Vec<DataType> = vec![DataType::Uuid];
-            let (start, end) =
-                crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+            let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
             let data_key_prefix = start.clone();
             let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
             while let Some(batch) = scanner.next_batch(txn).await? {
                 for pair in batch {
                     let key: &[u8] = pair.key().as_ref().into();
-                    let pk_bytes = key.strip_prefix(data_key_prefix.as_slice()).ok_or_else(|| {
-                        anyhow!("corrupted row key while dropping index '{}'", idx_name)
-                    })?;
-                    let pk_values = crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
+                    let pk_bytes =
+                        key.strip_prefix(data_key_prefix.as_slice())
+                            .ok_or_else(|| {
+                                anyhow!("corrupted row key while dropping index '{}'", idx_name)
+                            })?;
+                    let pk_values =
+                        crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
 
                     let mut row = crate::storage::deserialize_row(pair.value())?;
                     fill_row_defaults(&mut row, schema)?;
@@ -1610,9 +1612,10 @@ pub async fn execute_alter_table(
     name: &ObjectName,
     operation: &AlterTableOperation,
 ) -> Result<ExecuteResult> {
-    let resolved = names::resolve_existing_table_name(store.as_ref(), txn, db_id, name, search_path)
-        .await?
-        .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?;
+    let resolved =
+        names::resolve_existing_table_name(store.as_ref(), txn, db_id, name, search_path)
+            .await?
+            .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?;
     let table_object_name = resolved.name.clone();
     let t = resolved.full;
     let mut result_table_name = t.clone();
@@ -1635,7 +1638,8 @@ pub async fn execute_alter_table(
                 return Err(anyhow!("Column exists"));
             }
             let (data_type, mut is_serial) =
-                resolve_column_data_type(store, txn, db_id, search_path, &column_def.data_type).await?;
+                resolve_column_data_type(store, txn, db_id, search_path, &column_def.data_type)
+                    .await?;
             let mut nullable = true;
             let mut default_expr = None;
             for opt in &column_def.options {
@@ -1658,7 +1662,8 @@ pub async fn execute_alter_table(
                 nullable = false;
             }
             if !nullable && default_expr.is_none() {
-                let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                let (start, end) =
+                    crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                 let range: tikv_client::BoundRange = (start..end).into();
                 let existing_rows: Vec<_> = txn.scan(range, 1).await?.collect();
                 if !existing_rows.is_empty() {
@@ -1687,11 +1692,7 @@ pub async fn execute_alter_table(
                                 .expect("column just pushed")
                                 .name
                                 .as_str(),
-                            &schema
-                                .columns
-                                .last()
-                                .expect("column just pushed")
-                                .data_type,
+                            &schema.columns.last().expect("column just pushed").data_type,
                         ),
                     )
                     .await?;
@@ -1765,7 +1766,8 @@ pub async fn execute_alter_table(
                     expressions: Vec::new(),
                 };
 
-                let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                let (start, end) =
+                    crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                 let data_key_prefix = start.clone();
                 let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
                     vec![DataType::Uuid]
@@ -1785,12 +1787,14 @@ pub async fn execute_alter_table(
                         let idx_values = schema.get_index_values(&new_index, &row);
                         let pk_values = if schema.pk_indices.is_empty() {
                             let key: &[u8] = pair.key().as_ref().into();
-                            let pk_bytes = key.strip_prefix(data_key_prefix.as_slice()).ok_or_else(|| {
-                                anyhow!(
-                                    "corrupted row key while backfilling constraint '{}'",
-                                    new_index.name
-                                )
-                            })?;
+                            let pk_bytes = key
+                                .strip_prefix(data_key_prefix.as_slice())
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "corrupted row key while backfilling constraint '{}'",
+                                        new_index.name
+                                    )
+                                })?;
                             crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?
                         } else {
                             schema.get_pk_values(&row)
@@ -1842,9 +1846,7 @@ pub async fn execute_alter_table(
                 let ref_schema = store
                     .get_schema(txn, db_id, &ref_table)
                     .await?
-                    .ok_or_else(|| {
-                    SqlError::RelationNotFound(ref_table.clone())
-                })?;
+                    .ok_or_else(|| SqlError::RelationNotFound(ref_table.clone()))?;
                 let ref_cols: Vec<String> = referred_columns.iter().map(normalize_ident).collect();
                 let fk_name = name
                     .as_ref()
@@ -1890,7 +1892,8 @@ pub async fn execute_alter_table(
                     };
 
                 // PostgreSQL validates existing rows by default (unless NOT VALID).
-                let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                let (start, end) =
+                    crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                 let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                 while let Some(batch) = scanner.next_batch(txn).await? {
                     for pair in batch {
@@ -1969,7 +1972,8 @@ pub async fn execute_alter_table(
                 }
 
                 // PostgreSQL validates existing rows by default (unless NOT VALID).
-                let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                let (start, end) =
+                    crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                 let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                 while let Some(batch) = scanner.next_batch(txn).await? {
                     for pair in batch {
@@ -2014,7 +2018,10 @@ pub async fn execute_alter_table(
             cascade,
         } => {
             if *cascade {
-                return Err(SqlError::Unsupported("DROP CONSTRAINT ... CASCADE is not supported".into()).into());
+                return Err(SqlError::Unsupported(
+                    "DROP CONSTRAINT ... CASCADE is not supported".into(),
+                )
+                .into());
             }
 
             let constraint_name = normalize_ident(name);
@@ -2028,7 +2035,8 @@ pub async fn execute_alter_table(
                     }
                 };
                 if constraint_name == pk_name {
-                    let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                    let (start, end) =
+                        crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                     let range: tikv_client::BoundRange = (start..end).into();
                     let existing_rows: Vec<_> = txn.scan(range, 1).await?.collect();
                     if !existing_rows.is_empty() {
@@ -2126,7 +2134,10 @@ pub async fn execute_alter_table(
             ..
         } => {
             if *cascade {
-                return Err(SqlError::Unsupported("DROP COLUMN ... CASCADE is not supported".into()).into());
+                return Err(SqlError::Unsupported(
+                    "DROP COLUMN ... CASCADE is not supported".into(),
+                )
+                .into());
             }
 
             let col_name = normalize_ident(column_name);
@@ -2168,7 +2179,8 @@ pub async fn execute_alter_table(
                         }
                     }
 
-                    let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                    let (start, end) =
+                        crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                     let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                     while let Some(batch) = scanner.next_batch(txn).await? {
                         for pair in batch {
@@ -2354,7 +2366,8 @@ pub async fn execute_alter_table(
                         });
                     }
 
-                    let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                    let (start, end) =
+                        crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                     let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
                     while let Some(batch) = scanner.next_batch(txn).await? {
                         for pair in batch {
@@ -2422,7 +2435,8 @@ pub async fn execute_alter_table(
                     let mut target_col = schema.columns[col_idx].clone();
                     target_col.data_type = new_type.clone();
 
-                    let (start, end) = crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                    let (start, end) =
+                        crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                     let data_key_prefix = start.clone();
                     let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
                         vec![DataType::Uuid]

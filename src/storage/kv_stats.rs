@@ -64,4 +64,3 @@ pub fn record_gin_scan_keys(keys: usize) {
         s.gin_scan_keys.fetch_add(keys as u64, Ordering::Relaxed);
     });
 }
-

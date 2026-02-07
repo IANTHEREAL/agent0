@@ -1,4 +1,7 @@
-use super::helpers::{bool_col, int_array_col, int_col, int_val, null_val, schema_oid, text_array_col, text_col, text_val};
+use super::helpers::{
+    bool_col, int_array_col, int_col, int_val, null_val, schema_oid, text_array_col, text_col,
+    text_val,
+};
 use super::{ScanContext, VirtualTable};
 use crate::types::{Row, TableSchema, Value};
 use anyhow::Result;

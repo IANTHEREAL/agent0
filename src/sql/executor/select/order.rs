@@ -251,5 +251,4 @@ impl Executor {
         });
         indexed.into_iter().map(|(_, r)| r).collect()
     }
-
 }

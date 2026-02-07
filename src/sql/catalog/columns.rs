@@ -1,6 +1,6 @@
 use super::helpers::{
-    data_type_to_pg_type, data_type_to_udt_name, int_col, int_val, null_val,
-    split_schema_and_name, text_col, text_val,
+    data_type_to_pg_type, data_type_to_udt_name, int_col, int_val, null_val, split_schema_and_name,
+    text_col, text_val,
 };
 use super::{ScanContext, VirtualTable};
 use crate::sql::sequences;

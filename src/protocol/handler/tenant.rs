@@ -20,4 +20,3 @@ pub(super) fn parse_tenant_username(username: &str) -> (Option<String>, String) 
     // No separator or invalid format - use as-is without keyspace override
     (None, username.to_string())
 }
-

@@ -87,10 +87,7 @@ impl VirtualTable for PgDescription {
                     ]));
                 }
                 CommentTarget::Table { full_name } => {
-                    let Some(schema) = ctx
-                        .store
-                        .get_schema(ctx.txn, ctx.db_id, &full_name)
-                        .await?
+                    let Some(schema) = ctx.store.get_schema(ctx.txn, ctx.db_id, &full_name).await?
                     else {
                         continue;
                     };

@@ -7,15 +7,15 @@
 //! The actual background processing loop is implemented in Phase 2/3 of the
 //! design and is added incrementally to keep modules easy to reason about.
 
-use super::trigger_queue::{encode_trigger_queue_key, TriggerEvent, TriggerOp};
 use super::executor::Executor;
 use super::parse_sql;
-use crate::types::{Row, TriggerDef};
+use super::trigger_queue::{encode_trigger_queue_key, TriggerEvent, TriggerOp};
 use crate::observability;
 use crate::pool::TikvClientPool;
+use crate::sql::error::SqlError;
 use crate::storage::TikvStore;
 use crate::types::TableSchema;
-use crate::sql::error::SqlError;
+use crate::types::{Row, TriggerDef};
 use anyhow::Result;
 use dashmap::{DashMap, DashSet};
 use futures::stream::{self, StreamExt};
@@ -222,7 +222,10 @@ impl TriggerWorker {
                 }
                 if discovered > 0 {
                     marked_any = true;
-                    info!("trigger worker bootstrap: discovered {} keyspaces", discovered);
+                    info!(
+                        "trigger worker bootstrap: discovered {} keyspaces",
+                        discovered
+                    );
                 }
             }
             Err(e) => {
@@ -269,7 +272,10 @@ impl TriggerWorker {
             return existing.clone();
         }
         let quota = Arc::new(KeyspaceQuota::new(&self.config));
-        self.quotas.entry(keyspace.to_string()).or_insert(quota).clone()
+        self.quotas
+            .entry(keyspace.to_string())
+            .or_insert(quota)
+            .clone()
     }
 
     fn should_process_keyspace(&self, keyspace: &str, now: Instant) -> bool {
@@ -284,11 +290,14 @@ impl TriggerWorker {
     }
 
     fn record_keyspace_failure(&self, keyspace: &str, now: Instant) -> (Duration, u32) {
-        let mut entry = self.keyspace_backoff.entry(keyspace.to_string()).or_insert(KeyspaceBackoff {
-            next_retry_at: now,
-            delay_ms: 0,
-            failures: 0,
-        });
+        let mut entry =
+            self.keyspace_backoff
+                .entry(keyspace.to_string())
+                .or_insert(KeyspaceBackoff {
+                    next_retry_at: now,
+                    delay_ms: 0,
+                    failures: 0,
+                });
 
         entry.failures = entry.failures.saturating_add(1);
         entry.delay_ms = match entry.delay_ms {
@@ -827,7 +836,10 @@ impl TriggerWorker {
         let cutoff_orphan_ms = now_ms_i64()
             .saturating_sub((self.config.orphan_timeout_sec.saturating_mul(1000)) as i64);
         let cutoff_dlq_ms = now_ms_i64().saturating_sub(
-            (self.config.dlq_retention_days.saturating_mul(24 * 3600 * 1000)) as i64,
+            (self
+                .config
+                .dlq_retention_days
+                .saturating_mul(24 * 3600 * 1000)) as i64,
         );
 
         let mut txn = store.begin().await?;
@@ -856,7 +868,9 @@ impl TriggerWorker {
         cutoff_claimed_ms: i64,
         quota: &Arc<KeyspaceQuota>,
     ) -> Result<usize> {
-        use super::trigger_queue::{encode_trigger_dlq_key, encode_trigger_queue_prefix, EventStatus};
+        use super::trigger_queue::{
+            encode_trigger_dlq_key, encode_trigger_queue_prefix, EventStatus,
+        };
         use std::ops::Bound;
 
         let prefix = encode_trigger_queue_prefix();
@@ -1089,8 +1103,7 @@ impl TriggerWorker {
         if upper == "NULL" {
             return Ok(false);
         }
-        if upper.starts_with("RETURN NEW") || upper.starts_with("RETURN OLD") || upper == "RETURN"
-        {
+        if upper.starts_with("RETURN NEW") || upper.starts_with("RETURN OLD") || upper == "RETURN" {
             return Ok(true);
         }
         if upper.starts_with("RETURN NULL") {
@@ -1253,10 +1266,7 @@ fn plpgsql_outer_block_range(body: &str) -> Option<(usize, usize)> {
             if let Some(tag_end) = bytes[i + 1..].iter().position(|b| *b == b'$') {
                 let tag_end = i + 1 + tag_end;
                 let tag = &body[i + 1..tag_end];
-                if tag
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-                {
+                if tag.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
                     let delim = &body[i..=tag_end];
                     if let Some(close_pos) = body[tag_end + 1..].find(delim) {
                         i = tag_end + 1 + close_pos + delim.len();
@@ -1302,7 +1312,8 @@ fn plpgsql_outer_block_range(body: &str) -> Option<(usize, usize)> {
                 let mut next_token_end = j;
                 let mut next_token: Option<&str> = None;
                 if next_token_end < bytes.len()
-                    && (bytes[next_token_end].is_ascii_alphabetic() || bytes[next_token_end] == b'_')
+                    && (bytes[next_token_end].is_ascii_alphabetic()
+                        || bytes[next_token_end] == b'_')
                 {
                     let next_start = next_token_end;
                     next_token_end += 1;
@@ -1803,12 +1814,8 @@ mod tests {
         let result = substitute_row_references("NEW.id + NEW.id2", &schema, &new_values, None);
         assert_eq!(result, "7 + 3");
 
-        let result = substitute_row_references(
-            "OLD.id2 + OLD.id",
-            &schema,
-            &new_values,
-            Some(&old_row),
-        );
+        let result =
+            substitute_row_references("OLD.id2 + OLD.id", &schema, &new_values, Some(&old_row));
         assert_eq!(result, "11 + 9");
     }
 
@@ -1865,12 +1872,8 @@ mod tests {
         let result = substitute_row_references("NEW.added IS NULL", &schema, &new_values, None);
         assert_eq!(result, "NULL IS NULL");
 
-        let result = substitute_row_references(
-            "OLD.added IS NULL",
-            &schema,
-            &new_values,
-            Some(&old_row),
-        );
+        let result =
+            substitute_row_references("OLD.added IS NULL", &schema, &new_values, Some(&old_row));
         assert_eq!(result, "NULL IS NULL");
     }
 
@@ -1911,10 +1914,7 @@ mod tests {
         let new_values = vec![Value::Int32(1), Value::Int32(9)];
         let expr = "'NEW.aa' || NEW.aa::TEXT /* NEW.aa */ -- NEW.aa";
         let result = substitute_row_references(expr, &schema, &new_values, None);
-        assert_eq!(
-            result,
-            "'NEW.aa' || 9::TEXT /* NEW.aa */ -- NEW.aa"
-        );
+        assert_eq!(result, "'NEW.aa' || 9::TEXT /* NEW.aa */ -- NEW.aa");
     }
 
     #[test]
@@ -1941,7 +1941,8 @@ mod tests {
 
     #[test]
     fn plpgsql_outer_block_range_does_not_stop_at_case_end_semicolon() {
-        let body = "BEGIN\n  NEW.col := CASE WHEN 1=1 THEN 2 ELSE 3 END;\n  SELECT 2;\nEND;\n-- end";
+        let body =
+            "BEGIN\n  NEW.col := CASE WHEN 1=1 THEN 2 ELSE 3 END;\n  SELECT 2;\nEND;\n-- end";
         let (start, end) = plpgsql_outer_block_range(body).expect("expected BEGIN..END;");
         let block = &body[start..end];
         assert!(block.contains("NEW.col := CASE"));

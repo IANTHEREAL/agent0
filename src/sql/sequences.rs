@@ -1,6 +1,6 @@
+use crate::sql::error::SqlError;
 use crate::storage::TikvStore;
 use crate::types::{DataType, IndexDef, SequenceBacking, SequenceDef, SequenceState, Value};
-use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, MinMaxValue, ObjectName, SequenceOptions,
@@ -12,10 +12,10 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 
 use super::catalog_oids;
-use super::expr::{eval_expr, eval_join_expr, JoinEvalContext};
 use super::coercion::value_to_sql_expr;
-use super::names::normalize_ident;
+use super::expr::{eval_expr, eval_join_expr, JoinEvalContext};
 use super::names;
+use super::names::normalize_ident;
 use super::plpgsql;
 use super::ExecuteResult;
 

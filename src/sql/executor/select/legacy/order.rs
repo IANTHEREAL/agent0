@@ -51,12 +51,8 @@ impl Executor {
                     let val_b = b_keys.get(idx).cloned().unwrap_or(Value::Null);
                     let asc = order_expr.asc.unwrap_or(true);
                     let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
-                    let ord = crate::sql::expr::compare_order_by_values(
-                        &val_a,
-                        &val_b,
-                        asc,
-                        nulls_first,
-                    );
+                    let ord =
+                        crate::sql::expr::compare_order_by_values(&val_a, &val_b, asc, nulls_first);
                     if !matches!(ord, std::cmp::Ordering::Equal) {
                         return ord;
                     }
@@ -83,12 +79,8 @@ impl Executor {
                         eval_expr(actual_expr, Some(b), Some(schema)).unwrap_or(Value::Null);
                     let asc = order_expr.asc.unwrap_or(true);
                     let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
-                    let ord = crate::sql::expr::compare_order_by_values(
-                        &val_a,
-                        &val_b,
-                        asc,
-                        nulls_first,
-                    );
+                    let ord =
+                        crate::sql::expr::compare_order_by_values(&val_a, &val_b, asc, nulls_first);
                     if !matches!(ord, std::cmp::Ordering::Equal) {
                         return ord;
                     }
@@ -145,5 +137,4 @@ impl Executor {
             std::cmp::Ordering::Equal
         });
     }
-
 }

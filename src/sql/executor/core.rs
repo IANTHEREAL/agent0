@@ -1,39 +1,39 @@
 //! SQL executor
 
-use super::super::ddl;
-use super::super::dml;
 use super::super::alter_owner;
 use super::super::alter_sequence_owned_by;
-use super::super::comment_on;
-use super::triggers::strip_leading_sql_comments;
-use super::super::explain;
 use super::super::coercion::parse_value_for_copy;
+use super::super::comment_on;
+use super::super::ddl;
+use super::super::dml;
+use super::super::explain;
+use super::super::names;
 use super::super::names::normalize_ident;
 use super::super::projection::{fill_row_defaults, get_expr_name, infer_expr_type};
-use super::super::names;
 use super::super::query;
 use super::super::rbac;
 use super::super::sequences;
 use super::super::statement_time;
 use super::super::udt;
 use super::super::{parse_sql, ExecuteResult, ExecuteResults, InFailedSqlTransaction, Session};
+use super::triggers::strip_leading_sql_comments;
 use crate::auth::AuthManager;
 use crate::observability::TenantObservability;
 use crate::session_context;
+use crate::sql::error::SqlError;
 use crate::storage::{with_kv_read_stats, KvReadStatsSnapshot, TikvStore};
 use crate::types::{DataType, Row, TableSchema, Value};
-use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, SetOperator, SetQuantifier,
-    ReferentialAction, Statement, TableFactor, Visit, Visitor,
+    Expr, FunctionArg, FunctionArgExpr, Query, ReferentialAction, SelectItem, SetExpr, SetOperator,
+    SetQuantifier, Statement, TableFactor, Visit, Visitor,
 };
 
 use std::collections::HashMap;
+use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::{ops::ControlFlow};
 use tikv_client::Transaction;
 use tracing::debug;
 
@@ -130,14 +130,17 @@ fn set_variable_value_to_string(value: &[Expr]) -> Result<String> {
             // `SET TIME ZONE INTERVAL '+00:00' HOUR TO MINUTE`.
             // We accept hour-to-minute intervals and store the literal value (e.g. "+00:00")
             // for readback via `SHOW` / `current_setting`.
-            if matches!(interval.leading_field, Some(sqlparser::ast::DateTimeField::Hour))
-                && matches!(
-                    interval.last_field,
-                    Some(sqlparser::ast::DateTimeField::Minute)
-                )
-            {
+            if matches!(
+                interval.leading_field,
+                Some(sqlparser::ast::DateTimeField::Hour)
+            ) && matches!(
+                interval.last_field,
+                Some(sqlparser::ast::DateTimeField::Minute)
+            ) {
                 let Some(s) = try_parse_const_text(interval.value.as_ref()) else {
-                    return Err(SqlError::Unsupported(format!("Unsupported SET value: {}", expr)).into());
+                    return Err(
+                        SqlError::Unsupported(format!("Unsupported SET value: {}", expr)).into(),
+                    );
                 };
                 Ok(s)
             } else {
@@ -206,9 +209,21 @@ fn unwrap_top_level_cast<'a>(
     let mut cast_to: Option<&'a sqlparser::ast::DataType> = None;
     loop {
         match expr {
-            Expr::Cast { expr: inner, data_type, .. }
-            | Expr::TryCast { expr: inner, data_type, .. }
-            | Expr::SafeCast { expr: inner, data_type, .. } => {
+            Expr::Cast {
+                expr: inner,
+                data_type,
+                ..
+            }
+            | Expr::TryCast {
+                expr: inner,
+                data_type,
+                ..
+            }
+            | Expr::SafeCast {
+                expr: inner,
+                data_type,
+                ..
+            } => {
                 cast_to = Some(data_type);
                 expr = inner.as_ref();
             }
@@ -233,14 +248,16 @@ fn cast_current_setting_value(value: Value, target_type: &DataType) -> Result<Va
     match target_type {
         DataType::Text => Ok(Value::Text(s)),
         DataType::Int32 => {
-            let v: i32 = s.parse().map_err(|_| {
-                SqlError::InvalidInputSyntax { type_name: "integer".into(), value: s.clone() }
+            let v: i32 = s.parse().map_err(|_| SqlError::InvalidInputSyntax {
+                type_name: "integer".into(),
+                value: s.clone(),
             })?;
             Ok(Value::Int32(v))
         }
         DataType::Int64 => {
-            let v: i64 = s.parse().map_err(|_| {
-                SqlError::InvalidInputSyntax { type_name: "bigint".into(), value: s.clone() }
+            let v: i64 = s.parse().map_err(|_| SqlError::InvalidInputSyntax {
+                type_name: "bigint".into(),
+                value: s.clone(),
             })?;
             Ok(Value::Int64(v))
         }
@@ -251,7 +268,11 @@ fn cast_current_setting_value(value: Value, target_type: &DataType) -> Result<Va
             } else if v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") {
                 Ok(Value::Boolean(false))
             } else {
-                Err(SqlError::InvalidInputSyntax { type_name: "boolean".into(), value: s.clone() }.into())
+                Err(SqlError::InvalidInputSyntax {
+                    type_name: "boolean".into(),
+                    value: s.clone(),
+                }
+                .into())
             }
         }
         _ => Ok(Value::Text(s)),
@@ -262,7 +283,8 @@ fn is_set_config_function(name: &sqlparser::ast::ObjectName) -> bool {
     match name.0.as_slice() {
         [ident] => ident.value.eq_ignore_ascii_case("set_config"),
         [schema, ident] => {
-            schema.value.eq_ignore_ascii_case("pg_catalog") && ident.value.eq_ignore_ascii_case("set_config")
+            schema.value.eq_ignore_ascii_case("pg_catalog")
+                && ident.value.eq_ignore_ascii_case("set_config")
         }
         _ => false,
     }
@@ -279,7 +301,10 @@ fn is_current_setting_function(name: &sqlparser::ast::ObjectName) -> bool {
     }
 }
 
-fn try_execute_set_config_select(session: &mut Session, query: &Query) -> Result<Option<ExecuteResult>> {
+fn try_execute_set_config_select(
+    session: &mut Session,
+    query: &Query,
+) -> Result<Option<ExecuteResult>> {
     if query.with.is_some() {
         return Ok(None);
     }
@@ -1623,7 +1648,9 @@ impl Executor {
             let resolved = match resolved {
                 Some(r) => r,
                 None if if_exists => {
-                    return Ok(ExecuteResult::CommandComplete { tag: "ALTER SEQUENCE" });
+                    return Ok(ExecuteResult::CommandComplete {
+                        tag: "ALTER SEQUENCE",
+                    });
                 }
                 None => return Err(anyhow!("Sequence '{}' does not exist", sequence_name)),
             };
@@ -1687,7 +1714,8 @@ impl Executor {
         session: &mut Session,
         sql: &str,
     ) -> Result<ExecuteResult> {
-        let comment_on::CommentOnCommand { target, comment } = comment_on::parse_comment_on_sql(sql)?;
+        let comment_on::CommentOnCommand { target, comment } =
+            comment_on::parse_comment_on_sql(sql)?;
 
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {
@@ -1764,7 +1792,13 @@ impl Executor {
                     }
 
                     self.store
-                        .set_column_comment(txn, db_id, &resolved_table.full, &column, comment.as_deref())
+                        .set_column_comment(
+                            txn,
+                            db_id,
+                            &resolved_table.full,
+                            &column,
+                            comment.as_deref(),
+                        )
                         .await?;
                 }
             }
@@ -1806,8 +1840,11 @@ impl Executor {
             } => {
                 let resolved = names::resolve_ddl_object_name(name, search_path)?;
                 let table_full_name = resolved.full.clone();
-                let already_exists =
-                    *if_not_exists && self.store.table_exists(txn, db_id, &table_full_name).await?;
+                let already_exists = *if_not_exists
+                    && self
+                        .store
+                        .table_exists(txn, db_id, &table_full_name)
+                        .await?;
 
                 let result = if let Some(q) = query {
                     self.execute_create_table_as(
@@ -1894,12 +1931,26 @@ impl Executor {
                 use sqlparser::ast::ObjectType;
                 match object_type {
                     ObjectType::Table => {
-                        ddl::execute_drop_table(&self.store, txn, db_id, search_path, names, *if_exists)
-                            .await
+                        ddl::execute_drop_table(
+                            &self.store,
+                            txn,
+                            db_id,
+                            search_path,
+                            names,
+                            *if_exists,
+                        )
+                        .await
                     }
                     ObjectType::View => {
-                        ddl::execute_drop_view(&self.store, txn, db_id, search_path, names, *if_exists)
-                            .await
+                        ddl::execute_drop_view(
+                            &self.store,
+                            txn,
+                            db_id,
+                            search_path,
+                            names,
+                            *if_exists,
+                        )
+                        .await
                     }
                     ObjectType::Index => {
                         self.execute_drop_index(txn, db_id, search_path, names, *if_exists)
@@ -1940,7 +1991,8 @@ impl Executor {
                 name, operations, ..
             } => {
                 for op in operations {
-                    self.execute_alter_table(txn, db_id, search_path, name, op).await?;
+                    self.execute_alter_table(txn, db_id, search_path, name, op)
+                        .await?;
                 }
                 let table_name = name.0.last().unwrap().value.clone();
                 Ok(ExecuteResult::AlterTable { table_name })
@@ -2020,7 +2072,8 @@ impl Executor {
                 name,
                 representation,
             } => {
-                udt::execute_create_type(&self.store, txn, db_id, search_path, name, representation).await
+                udt::execute_create_type(&self.store, txn, db_id, search_path, name, representation)
+                    .await
             }
             Statement::CreateSchema {
                 schema_name,
@@ -2031,7 +2084,10 @@ impl Executor {
                     SchemaName::Simple(name) => name,
                     SchemaName::NamedAuthorization(name, _) => name,
                     SchemaName::UnnamedAuthorization(_) => {
-                        return Err(SqlError::Unsupported("Unsupported CREATE SCHEMA syntax".into()).into());
+                        return Err(SqlError::Unsupported(
+                            "Unsupported CREATE SCHEMA syntax".into(),
+                        )
+                        .into());
                     }
                 };
                 let (schema_prefix, schema) = names::split_object_name(schema_obj)?;
@@ -2041,14 +2097,23 @@ impl Executor {
                 self.store
                     .create_schema(txn, db_id, &schema, *if_not_exists)
                     .await?;
-                Ok(ExecuteResult::CommandComplete { tag: "CREATE SCHEMA" })
+                Ok(ExecuteResult::CommandComplete {
+                    tag: "CREATE SCHEMA",
+                })
             }
             Statement::CreateFunction { .. } => Ok(ExecuteResult::Empty),
             Statement::CreateProcedure {
                 name, params, body, ..
             } => {
-                self.execute_create_procedure(txn, db_id, search_path, name, params.as_deref(), body)
-                    .await
+                self.execute_create_procedure(
+                    txn,
+                    db_id,
+                    search_path,
+                    name,
+                    params.as_deref(),
+                    body,
+                )
+                .await
             }
             Statement::CreateSequence {
                 name,
@@ -2088,7 +2153,11 @@ impl Executor {
                 } else {
                     let resolved = names::resolve_ddl_object_name(name, search_path)?;
                     let view_full_name = resolved.full.clone();
-                    let existed = self.store.get_view(txn, db_id, &view_full_name).await?.is_some();
+                    let existed = self
+                        .store
+                        .get_view(txn, db_id, &view_full_name)
+                        .await?
+                        .is_some();
 
                     let result = ddl::execute_create_view(
                         &self.store,
@@ -2527,45 +2596,45 @@ impl Executor {
                                 };
                                 match (source, pattern) {
                                     (Some(source), Some(pattern)) => {
-                                    let flags = if let Some(arg2) = arg2 {
-                                        match sequences::eval_expr_with_sequences(
-                                            &self.store,
-                                            txn,
-                                            db_id,
-                                            sequence_values,
-                                            search_path,
-                                            arg2,
-                                            None,
-                                            None,
-                                        )
-                                        .await?
-                                        {
-                                            Value::Text(s) => s,
-                                            Value::Null => String::new(),
-                                            v => v.to_string(),
+                                        let flags = if let Some(arg2) = arg2 {
+                                            match sequences::eval_expr_with_sequences(
+                                                &self.store,
+                                                txn,
+                                                db_id,
+                                                sequence_values,
+                                                search_path,
+                                                arg2,
+                                                None,
+                                                None,
+                                            )
+                                            .await?
+                                            {
+                                                Value::Text(s) => s,
+                                                Value::Null => String::new(),
+                                                v => v.to_string(),
+                                            }
+                                        } else {
+                                            String::new()
+                                        };
+                                        let case_insensitive =
+                                            flags.to_ascii_lowercase().contains('i');
+                                        let regex_pattern = if case_insensitive {
+                                            format!("(?i){}", pattern)
+                                        } else {
+                                            pattern
+                                        };
+                                        let re = regex::Regex::new(&regex_pattern)
+                                            .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+                                        let mut parts = Vec::new();
+                                        let mut last_end = 0usize;
+                                        for m in re.find_iter(&source) {
+                                            parts.push(Value::Text(
+                                                source[last_end..m.start()].to_string(),
+                                            ));
+                                            last_end = m.end();
                                         }
-                                    } else {
-                                        String::new()
-                                    };
-                                    let case_insensitive =
-                                        flags.to_ascii_lowercase().contains('i');
-                                    let regex_pattern = if case_insensitive {
-                                        format!("(?i){}", pattern)
-                                    } else {
-                                        pattern
-                                    };
-                                    let re = regex::Regex::new(&regex_pattern)
-                                        .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
-                                    let mut parts = Vec::new();
-                                    let mut last_end = 0usize;
-                                    for m in re.find_iter(&source) {
-                                        parts.push(Value::Text(
-                                            source[last_end..m.start()].to_string(),
-                                        ));
-                                        last_end = m.end();
-                                    }
-                                    parts.push(Value::Text(source[last_end..].to_string()));
-                                    parts
+                                        parts.push(Value::Text(source[last_end..].to_string()));
+                                        parts
                                     }
                                     _ => Vec::new(),
                                 }
@@ -2622,45 +2691,49 @@ impl Executor {
                                 };
                                 match (source, pattern) {
                                     (Some(source), Some(pattern)) => {
-                                    let flags = if let Some(arg2) = arg2 {
-                                        match sequences::eval_expr_with_sequences(
-                                            &self.store,
-                                            txn,
-                                            db_id,
-                                            sequence_values,
-                                            search_path,
-                                            arg2,
-                                            None,
-                                            None,
-                                        )
-                                        .await?
-                                        {
-                                            Value::Text(s) => s,
-                                            Value::Null => String::new(),
-                                            v => v.to_string(),
+                                        let flags = if let Some(arg2) = arg2 {
+                                            match sequences::eval_expr_with_sequences(
+                                                &self.store,
+                                                txn,
+                                                db_id,
+                                                sequence_values,
+                                                search_path,
+                                                arg2,
+                                                None,
+                                                None,
+                                            )
+                                            .await?
+                                            {
+                                                Value::Text(s) => s,
+                                                Value::Null => String::new(),
+                                                v => v.to_string(),
+                                            }
+                                        } else {
+                                            String::new()
+                                        };
+                                        let global = flags.to_ascii_lowercase().contains('g');
+                                        let case_insensitive =
+                                            flags.to_ascii_lowercase().contains('i');
+                                        let regex_pattern = if case_insensitive {
+                                            format!("(?i){}", pattern)
+                                        } else {
+                                            pattern
+                                        };
+                                        let re = regex::Regex::new(&regex_pattern)
+                                            .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+                                        let mut out = Vec::new();
+                                        if global {
+                                            for caps in re.captures_iter(&source) {
+                                                out.push(Value::Array(regexp_captures_to_values(
+                                                    &caps,
+                                                )));
+                                            }
+                                        } else if let Some(caps) = re.captures(&source) {
+                                            out.push(Value::Array(regexp_captures_to_values(
+                                                &caps,
+                                            )));
                                         }
-                                    } else {
-                                        String::new()
-                                    };
-                                    let global = flags.to_ascii_lowercase().contains('g');
-                                    let case_insensitive =
-                                        flags.to_ascii_lowercase().contains('i');
-                                    let regex_pattern = if case_insensitive {
-                                        format!("(?i){}", pattern)
-                                    } else {
-                                        pattern
-                                    };
-                                    let re = regex::Regex::new(&regex_pattern)
-                                        .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
-                                    let mut out = Vec::new();
-                                    if global {
-                                        for caps in re.captures_iter(&source) {
-                                            out.push(Value::Array(regexp_captures_to_values(&caps)));
-                                        }
-                                    } else if let Some(caps) = re.captures(&source) {
-                                        out.push(Value::Array(regexp_captures_to_values(&caps)));
-                                    }
-                                    out
+                                        out
                                     }
                                     _ => Vec::new(),
                                 }
@@ -2795,45 +2868,45 @@ impl Executor {
                                 };
                                 match (source, pattern) {
                                     (Some(source), Some(pattern)) => {
-                                    let flags = if let Some(arg2) = arg2 {
-                                        match sequences::eval_expr_with_sequences(
-                                            &self.store,
-                                            txn,
-                                            db_id,
-                                            sequence_values,
-                                            search_path,
-                                            arg2,
-                                            None,
-                                            None,
-                                        )
-                                        .await?
-                                        {
-                                            Value::Text(s) => s,
-                                            Value::Null => String::new(),
-                                            v => v.to_string(),
+                                        let flags = if let Some(arg2) = arg2 {
+                                            match sequences::eval_expr_with_sequences(
+                                                &self.store,
+                                                txn,
+                                                db_id,
+                                                sequence_values,
+                                                search_path,
+                                                arg2,
+                                                None,
+                                                None,
+                                            )
+                                            .await?
+                                            {
+                                                Value::Text(s) => s,
+                                                Value::Null => String::new(),
+                                                v => v.to_string(),
+                                            }
+                                        } else {
+                                            String::new()
+                                        };
+                                        let case_insensitive =
+                                            flags.to_ascii_lowercase().contains('i');
+                                        let regex_pattern = if case_insensitive {
+                                            format!("(?i){}", pattern)
+                                        } else {
+                                            pattern
+                                        };
+                                        let re = regex::Regex::new(&regex_pattern)
+                                            .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+                                        let mut parts = Vec::new();
+                                        let mut last_end = 0usize;
+                                        for m in re.find_iter(&source) {
+                                            parts.push(Value::Text(
+                                                source[last_end..m.start()].to_string(),
+                                            ));
+                                            last_end = m.end();
                                         }
-                                    } else {
-                                        String::new()
-                                    };
-                                    let case_insensitive =
-                                        flags.to_ascii_lowercase().contains('i');
-                                    let regex_pattern = if case_insensitive {
-                                        format!("(?i){}", pattern)
-                                    } else {
-                                        pattern
-                                    };
-                                    let re = regex::Regex::new(&regex_pattern)
-                                        .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
-                                    let mut parts = Vec::new();
-                                    let mut last_end = 0usize;
-                                    for m in re.find_iter(&source) {
-                                        parts.push(Value::Text(
-                                            source[last_end..m.start()].to_string(),
-                                        ));
-                                        last_end = m.end();
-                                    }
-                                    parts.push(Value::Text(source[last_end..].to_string()));
-                                    parts
+                                        parts.push(Value::Text(source[last_end..].to_string()));
+                                        parts
                                     }
                                     _ => Vec::new(),
                                 }
@@ -2890,45 +2963,49 @@ impl Executor {
                                 };
                                 match (source, pattern) {
                                     (Some(source), Some(pattern)) => {
-                                    let flags = if let Some(arg2) = arg2 {
-                                        match sequences::eval_expr_with_sequences(
-                                            &self.store,
-                                            txn,
-                                            db_id,
-                                            sequence_values,
-                                            search_path,
-                                            arg2,
-                                            None,
-                                            None,
-                                        )
-                                        .await?
-                                        {
-                                            Value::Text(s) => s,
-                                            Value::Null => String::new(),
-                                            v => v.to_string(),
+                                        let flags = if let Some(arg2) = arg2 {
+                                            match sequences::eval_expr_with_sequences(
+                                                &self.store,
+                                                txn,
+                                                db_id,
+                                                sequence_values,
+                                                search_path,
+                                                arg2,
+                                                None,
+                                                None,
+                                            )
+                                            .await?
+                                            {
+                                                Value::Text(s) => s,
+                                                Value::Null => String::new(),
+                                                v => v.to_string(),
+                                            }
+                                        } else {
+                                            String::new()
+                                        };
+                                        let global = flags.to_ascii_lowercase().contains('g');
+                                        let case_insensitive =
+                                            flags.to_ascii_lowercase().contains('i');
+                                        let regex_pattern = if case_insensitive {
+                                            format!("(?i){}", pattern)
+                                        } else {
+                                            pattern
+                                        };
+                                        let re = regex::Regex::new(&regex_pattern)
+                                            .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+                                        let mut out = Vec::new();
+                                        if global {
+                                            for caps in re.captures_iter(&source) {
+                                                out.push(Value::Array(regexp_captures_to_values(
+                                                    &caps,
+                                                )));
+                                            }
+                                        } else if let Some(caps) = re.captures(&source) {
+                                            out.push(Value::Array(regexp_captures_to_values(
+                                                &caps,
+                                            )));
                                         }
-                                    } else {
-                                        String::new()
-                                    };
-                                    let global = flags.to_ascii_lowercase().contains('g');
-                                    let case_insensitive =
-                                        flags.to_ascii_lowercase().contains('i');
-                                    let regex_pattern = if case_insensitive {
-                                        format!("(?i){}", pattern)
-                                    } else {
-                                        pattern
-                                    };
-                                    let re = regex::Regex::new(&regex_pattern)
-                                        .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
-                                    let mut out = Vec::new();
-                                    if global {
-                                        for caps in re.captures_iter(&source) {
-                                            out.push(Value::Array(regexp_captures_to_values(&caps)));
-                                        }
-                                    } else if let Some(caps) = re.captures(&source) {
-                                        out.push(Value::Array(regexp_captures_to_values(&caps)));
-                                    }
-                                    out
+                                        out
                                     }
                                     _ => Vec::new(),
                                 }
@@ -2970,7 +3047,12 @@ impl Executor {
                         values.push(val);
                     }
                 }
-                _ => return Err(SqlError::Unsupported("Unsupported select item in tableless query".into()).into()),
+                _ => {
+                    return Err(SqlError::Unsupported(
+                        "Unsupported select item in tableless query".into(),
+                    )
+                    .into())
+                }
             }
         }
 
@@ -3073,8 +3155,12 @@ impl Executor {
             let op_type = match (op, query::is_set_quantifier_all(quantifier)) {
                 (SetOperator::Union, true) => crate::sql::operators::SetOperationType::UnionAll,
                 (SetOperator::Union, false) => crate::sql::operators::SetOperationType::Union,
-                (SetOperator::Intersect, true) => crate::sql::operators::SetOperationType::IntersectAll,
-                (SetOperator::Intersect, false) => crate::sql::operators::SetOperationType::Intersect,
+                (SetOperator::Intersect, true) => {
+                    crate::sql::operators::SetOperationType::IntersectAll
+                }
+                (SetOperator::Intersect, false) => {
+                    crate::sql::operators::SetOperationType::Intersect
+                }
                 (SetOperator::Except, true) => crate::sql::operators::SetOperationType::ExceptAll,
                 (SetOperator::Except, false) => crate::sql::operators::SetOperationType::Except,
             };
@@ -3082,15 +3168,18 @@ impl Executor {
             let left_schema = TableSchema {
                 name: "set_op_left".to_string(),
                 table_id: 0,
-                columns: left_cols.iter().map(|name| crate::types::ColumnDef {
-                    name: name.clone(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                }).collect(),
+                columns: left_cols
+                    .iter()
+                    .map(|name| crate::types::ColumnDef {
+                        name: name.clone(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    })
+                    .collect(),
                 version: 1,
                 pk_constraint_name: None,
                 pk_indices: vec![],
@@ -3101,8 +3190,14 @@ impl Executor {
             };
             let right_schema = left_schema.clone();
 
-            let left_op = Box::new(crate::sql::operators::TableScanOperator::new_with_rows(left_schema, left_rows));
-            let right_op = Box::new(crate::sql::operators::TableScanOperator::new_with_rows(right_schema, right_rows));
+            let left_op = Box::new(crate::sql::operators::TableScanOperator::new_with_rows(
+                left_schema,
+                left_rows,
+            ));
+            let right_op = Box::new(crate::sql::operators::TableScanOperator::new_with_rows(
+                right_schema,
+                right_rows,
+            ));
 
             let mut set_op: crate::sql::operators::BoxedOperator = Box::new(
                 crate::sql::operators::SetOperationOperator::new(left_op, right_op, op_type),
@@ -3115,7 +3210,8 @@ impl Executor {
                 db_id,
                 search_path,
                 sequence_values,
-            ).await?;
+            )
+            .await?;
 
             Ok(ExecuteResult::Select {
                 column_types: None,
@@ -3150,8 +3246,15 @@ impl Executor {
                         limit_by: vec![],
                         for_clause: None,
                     };
-                    self.execute_query_with_ctes(txn, db_id, sequence_values, search_path, &query, ctes)
-                        .await
+                    self.execute_query_with_ctes(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        &query,
+                        ctes,
+                    )
+                    .await
                 }
                 SetExpr::SetOperation {
                     op,
@@ -3497,12 +3600,14 @@ fn get_unsupported_reason(sql_upper: &str) -> Option<String> {
 mod tests {
     use super::{
         cast_current_setting_value, get_skip_reason, get_unsupported_reason,
-        is_current_setting_function, is_set_config_function,
-        parse_search_path_guc_value, set_variable_value_to_string, starts_with_ignore_ascii_case,
-        try_parse_const_bool, try_parse_const_text, unwrap_top_level_cast,
+        is_current_setting_function, is_set_config_function, parse_search_path_guc_value,
+        set_variable_value_to_string, starts_with_ignore_ascii_case, try_parse_const_bool,
+        try_parse_const_text, unwrap_top_level_cast,
     };
     use crate::types::Value;
-    use sqlparser::ast::{DataType, DateTimeField, Expr, Ident, Interval, ObjectName, Value as SqlValue};
+    use sqlparser::ast::{
+        DataType, DateTimeField, Expr, Ident, Interval, ObjectName, Value as SqlValue,
+    };
 
     #[test]
     fn test_starts_with_ignore_ascii_case_is_byte_safe() {
@@ -3513,11 +3618,8 @@ mod tests {
     #[test]
     fn test_set_variable_value_to_string_basic() {
         assert_eq!(
-            set_variable_value_to_string(&[Expr::Value(SqlValue::Number(
-                "0".to_string(),
-                false
-            ))])
-            .unwrap(),
+            set_variable_value_to_string(&[Expr::Value(SqlValue::Number("0".to_string(), false))])
+                .unwrap(),
             "0"
         );
         assert_eq!(
@@ -3544,7 +3646,9 @@ mod tests {
     #[test]
     fn test_set_variable_value_to_string_timezone_interval() {
         let expr = Expr::Interval(Interval {
-            value: Box::new(Expr::Value(SqlValue::SingleQuotedString("+00:00".to_string()))),
+            value: Box::new(Expr::Value(SqlValue::SingleQuotedString(
+                "+00:00".to_string(),
+            ))),
             leading_field: Some(DateTimeField::Hour),
             leading_precision: None,
             last_field: Some(DateTimeField::Minute),
@@ -3632,8 +3736,11 @@ mod tests {
 
     #[test]
     fn test_cast_current_setting_value_integer() {
-        let v = cast_current_setting_value(Value::Text("160000".to_string()), &crate::types::DataType::Int32)
-            .unwrap();
+        let v = cast_current_setting_value(
+            Value::Text("160000".to_string()),
+            &crate::types::DataType::Int32,
+        )
+        .unwrap();
         assert_eq!(v, Value::Int32(160000));
     }
 

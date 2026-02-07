@@ -16,7 +16,10 @@ fn is_empty_simple_query(query: &str) -> bool {
     trimmed.is_empty() || trimmed == ";"
 }
 
-pub(in crate::protocol::handler) fn update_tx_status_after_execution(status: TransactionStatus, tag: &Tag) -> TransactionStatus {
+pub(in crate::protocol::handler) fn update_tx_status_after_execution(
+    status: TransactionStatus,
+    tag: &Tag,
+) -> TransactionStatus {
     if *tag == Tag::new("ROLLBACK") {
         // `ROLLBACK TO SAVEPOINT` clears the failed-transaction state without ending the
         // transaction block, so ReadyForQuery must move from `E` -> `T`.
@@ -159,57 +162,57 @@ where
             match <H as ExtendedQueryHandler>::do_query(handler, client, portal.as_ref(), max_rows)
                 .await?
             {
-            Response::EmptyQuery => {
-                client
-                    .feed(PgWireBackendMessage::EmptyQueryResponse(
-                        EmptyQueryResponse::new(),
-                    ))
-                    .await?;
-            }
-            Response::Query(results) => {
-                if max_rows == 0 {
-                    pgwire::api::query::send_query_response(client, results, false).await?;
-                } else {
-                    send_limited_query_response(
-                        client,
-                        suspended_portals,
-                        portal_name,
-                        results,
-                        max_rows,
-                    )
-                    .await?;
+                Response::EmptyQuery => {
+                    client
+                        .feed(PgWireBackendMessage::EmptyQueryResponse(
+                            EmptyQueryResponse::new(),
+                        ))
+                        .await?;
                 }
-            }
-            Response::Execution(tag) => {
-                transaction_status = update_tx_status_after_execution(transaction_status, &tag);
-                pgwire::api::query::send_execution_response(client, tag).await?;
-            }
-            Response::TransactionStart(tag) => {
-                pgwire::api::query::send_execution_response(client, tag).await?;
-                transaction_status = transaction_status.to_in_transaction_state();
-            }
-            Response::TransactionEnd(tag) => {
-                pgwire::api::query::send_execution_response(client, tag).await?;
-                transaction_status = transaction_status.to_idle_state();
-            }
-            Response::Error(err) => {
-                client
-                    .send(PgWireBackendMessage::ErrorResponse((*err).into()))
-                    .await?;
-                transaction_status = transaction_status.to_error_state();
-            }
-            Response::CopyIn(result) => {
-                client.set_state(PgWireConnectionState::CopyInProgress(true));
-                pgwire::api::copy::send_copy_in_response(client, result).await?;
-            }
-            Response::CopyOut(result) => {
-                client.set_state(PgWireConnectionState::CopyInProgress(true));
-                pgwire::api::copy::send_copy_out_response(client, result).await?;
-            }
-            Response::CopyBoth(result) => {
-                client.set_state(PgWireConnectionState::CopyInProgress(true));
-                pgwire::api::copy::send_copy_both_response(client, result).await?;
-            }
+                Response::Query(results) => {
+                    if max_rows == 0 {
+                        pgwire::api::query::send_query_response(client, results, false).await?;
+                    } else {
+                        send_limited_query_response(
+                            client,
+                            suspended_portals,
+                            portal_name,
+                            results,
+                            max_rows,
+                        )
+                        .await?;
+                    }
+                }
+                Response::Execution(tag) => {
+                    transaction_status = update_tx_status_after_execution(transaction_status, &tag);
+                    pgwire::api::query::send_execution_response(client, tag).await?;
+                }
+                Response::TransactionStart(tag) => {
+                    pgwire::api::query::send_execution_response(client, tag).await?;
+                    transaction_status = transaction_status.to_in_transaction_state();
+                }
+                Response::TransactionEnd(tag) => {
+                    pgwire::api::query::send_execution_response(client, tag).await?;
+                    transaction_status = transaction_status.to_idle_state();
+                }
+                Response::Error(err) => {
+                    client
+                        .send(PgWireBackendMessage::ErrorResponse((*err).into()))
+                        .await?;
+                    transaction_status = transaction_status.to_error_state();
+                }
+                Response::CopyIn(result) => {
+                    client.set_state(PgWireConnectionState::CopyInProgress(true));
+                    pgwire::api::copy::send_copy_in_response(client, result).await?;
+                }
+                Response::CopyOut(result) => {
+                    client.set_state(PgWireConnectionState::CopyInProgress(true));
+                    pgwire::api::copy::send_copy_out_response(client, result).await?;
+                }
+                Response::CopyBoth(result) => {
+                    client.set_state(PgWireConnectionState::CopyInProgress(true));
+                    pgwire::api::copy::send_copy_both_response(client, result).await?;
+                }
             }
         }
 

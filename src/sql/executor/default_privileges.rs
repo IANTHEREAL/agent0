@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Result};
 
-use super::core::Executor;
 use super::super::default_privileges::{
     apply_default_privileges_grant, apply_default_privileges_revoke,
     parse_alter_default_privileges_sql, AlterDefaultPrivilegesCommand, AlterDefaultPrivilegesOp,
 };
 use super::super::{ExecuteResult, Session};
+use super::core::Executor;
 use crate::sql::error::SqlError;
 
 impl Executor {
@@ -52,8 +52,8 @@ impl Executor {
                 || self
                     .auth_manager()
                     .get_role(txn, &target_role)
-                .await?
-                .is_some();
+                    .await?
+                    .is_some();
             if !role_exists {
                 return Err(anyhow!("role \"{}\" does not exist", target_role));
             }
@@ -103,16 +103,8 @@ impl Executor {
                     with_grant_option,
                 } => {
                     for grantee in grantees {
-                        let exists = self
-                            .auth_manager()
-                            .get_user(txn, grantee)
-                            .await?
-                            .is_some()
-                            || self
-                                .auth_manager()
-                                .get_role(txn, grantee)
-                                .await?
-                                .is_some();
+                        let exists = self.auth_manager().get_user(txn, grantee).await?.is_some()
+                            || self.auth_manager().get_role(txn, grantee).await?.is_some();
                         if !exists {
                             return Err(anyhow!("role \"{}\" does not exist", grantee));
                         }
@@ -131,7 +123,10 @@ impl Executor {
                         .await?;
                     }
                 }
-                AlterDefaultPrivilegesOp::Revoke { privileges, grantees } => {
+                AlterDefaultPrivilegesOp::Revoke {
+                    privileges,
+                    grantees,
+                } => {
                     for schema in schema_scopes {
                         apply_default_privileges_revoke(
                             txn,

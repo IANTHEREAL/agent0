@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    AlterRoleOperation, Expr, GrantObjects, Ident, ObjectName, Password as SqlPassword,
-    Privileges, ResetConfig, SetConfigValue, Value as SqlValue,
+    AlterRoleOperation, Expr, GrantObjects, Ident, ObjectName, Password as SqlPassword, Privileges,
+    ResetConfig, SetConfigValue, Value as SqlValue,
 };
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -312,7 +312,10 @@ async fn expand_privilege_objects(
             for name in tables {
                 let (schema_opt, table) = super::names::split_object_name(name)?;
                 let schema = schema_opt.unwrap_or_else(|| "public".to_string());
-                out.push(PrivilegeObject::Table { schema, name: table });
+                out.push(PrivilegeObject::Table {
+                    schema,
+                    name: table,
+                });
             }
             Ok(out)
         }
@@ -420,7 +423,8 @@ pub async fn execute_revoke(
             auth_manager.update_user(txn, user).await?;
         } else if let Some(mut role) = auth_manager.get_role(txn, &username).await? {
             role.privileges.retain(|p| {
-                !(privs.contains(&p.privilege) && expanded_objects.iter().any(|obj| p.object == *obj))
+                !(privs.contains(&p.privilege)
+                    && expanded_objects.iter().any(|obj| p.object == *obj))
             });
             auth_manager.update_role(txn, role).await?;
         } else {

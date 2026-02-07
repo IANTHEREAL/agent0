@@ -2,10 +2,10 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::{Ident, ObjectName};
 use tikv_client::Transaction;
 
-use super::core::Executor;
 use super::super::names;
 use super::super::udt;
 use super::super::{ExecuteResult, Session};
+use super::core::Executor;
 
 fn trim_sql_end(sql: &str) -> &str {
     sql.trim()
@@ -102,7 +102,10 @@ fn parse_object_name_token(token: &str) -> Result<ObjectName> {
     }
 
     let parts = if parts.len() >= 2 {
-        vec![parts[parts.len() - 2].clone(), parts[parts.len() - 1].clone()]
+        vec![
+            parts[parts.len() - 2].clone(),
+            parts[parts.len() - 1].clone(),
+        ]
     } else {
         vec![parts[0].clone()]
     };

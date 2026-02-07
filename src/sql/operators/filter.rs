@@ -4,8 +4,7 @@ use sqlparser::ast::Expr;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::expr::{
-    coerce_text_literal_to_bool, eval_expr_with_query_ctx,
-    validate_bool_expr_in_boolean_context,
+    coerce_text_literal_to_bool, eval_expr_with_query_ctx, validate_bool_expr_in_boolean_context,
 };
 use crate::sql::query_context::QueryContext;
 use crate::types::{Row, TableSchema, Value};
@@ -26,11 +25,7 @@ impl FilterOperator {
         }
     }
 
-    fn evaluate_predicate(
-        &self,
-        row: &Row,
-        query_ctx: Option<&QueryContext>,
-    ) -> Result<bool> {
+    fn evaluate_predicate(&self, row: &Row, query_ctx: Option<&QueryContext>) -> Result<bool> {
         let result = eval_expr_with_query_ctx(
             &self.predicate,
             Some(row),
@@ -146,11 +141,14 @@ mod tests {
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
-        
+
         let predicate = Expr::BinaryOp {
             left: Box::new(Expr::Identifier(Ident::new("id"))),
             op: BinaryOperator::Gt,
-            right: Box::new(Expr::Value(sqlparser::ast::Value::Number("5".to_string(), false))),
+            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
+                "5".to_string(),
+                false,
+            ))),
         };
 
         let filter = FilterOperator::new(child, predicate.clone());
@@ -166,7 +164,7 @@ mod tests {
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema.clone()));
-        
+
         let predicate = Expr::Identifier(Ident::new("active"));
         let filter = FilterOperator::new(child, predicate);
 
@@ -184,16 +182,18 @@ mod tests {
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema.clone()));
 
-        let predicate =
-            Expr::Value(sqlparser::ast::Value::SingleQuotedString("true".to_string()));
+        let predicate = Expr::Value(sqlparser::ast::Value::SingleQuotedString(
+            "true".to_string(),
+        ));
         let filter = FilterOperator::new(child, predicate);
 
         let row = Row::new(vec![Value::Int32(1), Value::Boolean(false)]);
         assert!(filter.evaluate_predicate(&row, None).unwrap());
 
         let child = Box::new(TableScanOperator::new(schema));
-        let predicate =
-            Expr::Value(sqlparser::ast::Value::SingleQuotedString("false".to_string()));
+        let predicate = Expr::Value(sqlparser::ast::Value::SingleQuotedString(
+            "false".to_string(),
+        ));
         let filter = FilterOperator::new(child, predicate);
         assert!(!filter.evaluate_predicate(&row, None).unwrap());
     }

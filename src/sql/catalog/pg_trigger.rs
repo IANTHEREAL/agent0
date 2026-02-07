@@ -42,11 +42,7 @@ impl VirtualTable for PgTrigger {
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
         let mut table_oids: HashMap<String, i64> = HashMap::new();
         for table_name in ctx.user_tables {
-            if let Some(schema) = ctx
-                .store
-                .get_schema(ctx.txn, ctx.db_id, table_name)
-                .await?
-            {
+            if let Some(schema) = ctx.store.get_schema(ctx.txn, ctx.db_id, table_name).await? {
                 table_oids.insert(
                     table_name.to_string(),
                     catalog_oids::pg_class_table_oid(schema.table_id)?,

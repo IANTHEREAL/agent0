@@ -4,15 +4,15 @@ use super::super::dml;
 use super::super::expr::{
     coerce_text_literal_to_bool, validate_bool_expr_in_boolean_context, JoinEvalContext,
 };
-use super::super::names::normalize_ident;
 use super::super::names;
+use super::super::names::normalize_ident;
 use super::super::trigger_queue::TriggerOp;
 use super::super::trigger_worker;
 use super::super::triggers;
 use super::super::ExecuteResult;
 use super::core::Executor;
-use crate::types::{Row, TableSchema, Value};
 use crate::sql::error::SqlError;
+use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     Assignment, DataType as SqlDataType, Expr, Ident, ObjectName, OnInsert, Query, SelectItem,
@@ -157,9 +157,14 @@ impl Executor {
             .ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
         let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
-        let trigger_func_cache =
-            triggers::prefetch_trigger_functions(&self.store(), txn, db_id, &trigger_defs, "INSERT")
-                .await?;
+        let trigger_func_cache = triggers::prefetch_trigger_functions(
+            &self.store(),
+            txn,
+            db_id,
+            &trigger_defs,
+            "INSERT",
+        )
+        .await?;
 
         let mut affected = 0;
         let mut ret_rows = Vec::new();
@@ -377,7 +382,10 @@ impl Executor {
             None
         } else {
             if using.len() != 1 {
-                return Err(SqlError::Unsupported("DELETE ... USING multiple tables not supported".into()).into());
+                return Err(SqlError::Unsupported(
+                    "DELETE ... USING multiple tables not supported".into(),
+                )
+                .into());
             }
             let using_table = &using[0];
             let (using_resolved, using_alias) = match &using_table.relation {
@@ -572,9 +580,14 @@ impl Executor {
             .ok_or_else(|| SqlError::RelationNotFound(t.clone()))?;
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
         let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
-        let trigger_func_cache_update =
-            triggers::prefetch_trigger_functions(&self.store(), txn, db_id, &trigger_defs, "UPDATE")
-                .await?;
+        let trigger_func_cache_update = triggers::prefetch_trigger_functions(
+            &self.store(),
+            txn,
+            db_id,
+            &trigger_defs,
+            "UPDATE",
+        )
+        .await?;
         if schema.pk_indices.is_empty() {
             return Err(anyhow!("No PK"));
         }

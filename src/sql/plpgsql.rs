@@ -245,18 +245,14 @@ fn parse_statements(content: &str) -> Result<Vec<PlpgsqlStatement>> {
         remaining = remaining.trim();
 
         let remaining_upper = remaining.to_uppercase();
-        if remaining_upper.starts_with("IF ")
-            || remaining_upper.starts_with("IF\n")
-        {
+        if remaining_upper.starts_with("IF ") || remaining_upper.starts_with("IF\n") {
             let (if_stmt, rest) = parse_if_statement(remaining)?;
             statements.push(if_stmt);
             remaining = rest;
             continue;
         }
 
-        if remaining_upper.starts_with("ELSIF ")
-            || remaining_upper.starts_with("ELSIF\n")
-        {
+        if remaining_upper.starts_with("ELSIF ") || remaining_upper.starts_with("ELSIF\n") {
             let synthetic_if = format!("IF{} END IF", &remaining[5..]);
             let (if_stmt, _rest) = parse_if_statement(&synthetic_if)?;
             statements.push(if_stmt);
@@ -496,8 +492,16 @@ pub fn execute_plpgsql_function<'a>(
         }
         for (name, default_expr) in var_defaults {
             let value = if let Some(expr_str) = default_expr {
-                evaluate_expression(store, txn, db_id, sequence_values, search_path, &ctx, &expr_str)
-                    .await?
+                evaluate_expression(
+                    store,
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    &ctx,
+                    &expr_str,
+                )
+                .await?
             } else {
                 Value::Null
             };
@@ -732,8 +736,8 @@ pub(crate) fn replace_identifier(s: &str, name: &str, replacement: &str) -> Stri
             && bytes[i..i + name_bytes.len()].eq_ignore_ascii_case(name_bytes)
         {
             let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
-            let after_ok = i + name_bytes.len() == bytes.len()
-                || !is_ident_char(bytes[i + name_bytes.len()]);
+            let after_ok =
+                i + name_bytes.len() == bytes.len() || !is_ident_char(bytes[i + name_bytes.len()]);
 
             if before_ok && after_ok {
                 result.extend_from_slice(replacement.as_bytes());
@@ -799,7 +803,8 @@ pub async fn try_execute_user_function(
 ) -> Result<Option<Value>> {
     let func_obj = names::object_name_from_str(func_name)?;
     let resolved =
-        names::resolve_existing_function_name(store.as_ref(), txn, db_id, &func_obj, search_path).await?;
+        names::resolve_existing_function_name(store.as_ref(), txn, db_id, &func_obj, search_path)
+            .await?;
 
     let full_name = match resolved {
         Some(r) => r.full,
@@ -824,9 +829,17 @@ pub async fn try_execute_user_function(
         }
     };
 
-    execute_user_function_by_name(store, txn, db_id, sequence_values, search_path, &full_name, args)
-        .await
-        .map(Some)
+    execute_user_function_by_name(
+        store,
+        txn,
+        db_id,
+        sequence_values,
+        search_path,
+        &full_name,
+        args,
+    )
+    .await
+    .map(Some)
 }
 
 async fn execute_user_function_by_name(
@@ -852,11 +865,28 @@ async fn execute_user_function_by_name(
     }
 
     if lang == "sql" {
-        return execute_sql_function(store, txn, db_id, sequence_values, search_path, &func_def, args)
-            .await;
+        return execute_sql_function(
+            store,
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            &func_def,
+            args,
+        )
+        .await;
     }
 
-    execute_plpgsql_function(store, txn, db_id, sequence_values, search_path, &func_def, args).await
+    execute_plpgsql_function(
+        store,
+        txn,
+        db_id,
+        sequence_values,
+        search_path,
+        &func_def,
+        args,
+    )
+    .await
 }
 
 async fn execute_sql_function(

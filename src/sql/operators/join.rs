@@ -135,8 +135,13 @@ impl NestedLoopJoinOperator {
             match result {
                 Value::Boolean(b) => Ok(b),
                 Value::Null => Ok(false),
-                Value::Text(s) => parse_bool_pg(&s)
-                    .ok_or_else(|| SqlError::InvalidInputSyntax { type_name: "boolean".into(), value: s.clone() }.into()),
+                Value::Text(s) => parse_bool_pg(&s).ok_or_else(|| {
+                    SqlError::InvalidInputSyntax {
+                        type_name: "boolean".into(),
+                        value: s.clone(),
+                    }
+                    .into()
+                }),
                 _ => Err(anyhow!("Join condition must evaluate to boolean")),
             }
         } else {
@@ -416,7 +421,9 @@ mod tests {
             JoinType::Inner
         );
         assert_eq!(
-            JoinType::from(&JoinOperator::LeftOuter(sqlparser::ast::JoinConstraint::None)),
+            JoinType::from(&JoinOperator::LeftOuter(
+                sqlparser::ast::JoinConstraint::None
+            )),
             JoinType::Left
         );
         assert_eq!(
@@ -426,7 +433,9 @@ mod tests {
             JoinType::Right
         );
         assert_eq!(
-            JoinType::from(&JoinOperator::FullOuter(sqlparser::ast::JoinConstraint::None)),
+            JoinType::from(&JoinOperator::FullOuter(
+                sqlparser::ast::JoinConstraint::None
+            )),
             JoinType::Full
         );
         assert_eq!(JoinType::from(&JoinOperator::CrossJoin), JoinType::Cross);

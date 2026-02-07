@@ -451,5 +451,4 @@ impl Executor {
         }
         Ok((cols, result_rows))
     }
-
 }

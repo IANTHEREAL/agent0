@@ -20,11 +20,11 @@ use std::sync::atomic::AtomicI32;
 use std::sync::Arc;
 use tikv_client::Transaction;
 
-mod encode;
 mod copy;
+mod dynamic;
+mod encode;
 mod errors;
 mod legacy;
-mod dynamic;
 mod params;
 mod portal;
 mod query_parser;
@@ -171,10 +171,7 @@ fn resolve_copy_columns(
             return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
                 "ERROR".to_string(),
                 "42701".to_string(),
-                format!(
-                    "column \"{}\" specified more than once",
-                    def.name
-                ),
+                format!("column \"{}\" specified more than once", def.name),
             ))));
         }
 
@@ -1245,7 +1242,6 @@ async fn infer_result_fields_from_query_ast(
         _ => stub_describe_field(),
     }
 }
-
 
 #[cfg(test)]
 mod tests;

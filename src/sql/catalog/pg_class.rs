@@ -1,4 +1,6 @@
-use super::helpers::{access_method_oid, bool_col, int_col, int_val, schema_oid, text_col, text_val};
+use super::helpers::{
+    access_method_oid, bool_col, int_col, int_val, schema_oid, text_col, text_val,
+};
 use super::{ScanContext, VirtualTable};
 use crate::sql::catalog_oids;
 use crate::types::{Row, TableSchema, Value};
@@ -49,8 +51,7 @@ impl VirtualTable for PgClass {
         let mut rows = Vec::new();
 
         for full_table_name in ctx.user_tables {
-            let (table_schema, table_name) =
-                super::helpers::split_schema_and_name(full_table_name);
+            let (table_schema, table_name) = super::helpers::split_schema_and_name(full_table_name);
             let namespace_oid = schema_oid(ctx.schema_oids, &table_schema);
             if let Some(schema) = ctx
                 .store

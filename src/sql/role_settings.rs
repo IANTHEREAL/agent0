@@ -29,8 +29,7 @@ fn key_for(role_name: &str, database_oid: u32) -> Vec<u8> {
 }
 
 fn role_prefix(role_name: &str) -> Vec<u8> {
-    let mut key =
-        Vec::with_capacity(DB_ROLE_SETTING_KEY_PREFIX.len() + role_name.len() + 1);
+    let mut key = Vec::with_capacity(DB_ROLE_SETTING_KEY_PREFIX.len() + role_name.len() + 1);
     key.extend_from_slice(DB_ROLE_SETTING_KEY_PREFIX);
     key.extend_from_slice(role_name.as_bytes());
     key.push(ROLE_SEPARATOR);

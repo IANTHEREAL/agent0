@@ -8,11 +8,11 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
+use super::coercion::coerce_value_for_column;
 use super::expr::eval_expr;
 use super::gin;
-use super::coercion::coerce_value_for_column;
-use super::projection::{eval_default_expr, infer_expr_type};
 use super::index_helpers;
+use super::projection::{eval_default_expr, infer_expr_type};
 use super::sequences;
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, IndexDef, Row, TableSchema, Value};
@@ -109,7 +109,10 @@ enum GinColumnType {
     Tsvector,
 }
 
-fn supported_gin_index_column(schema: &TableSchema, index: &IndexDef) -> Option<(usize, GinColumnType)> {
+fn supported_gin_index_column(
+    schema: &TableSchema,
+    index: &IndexDef,
+) -> Option<(usize, GinColumnType)> {
     if !index
         .method
         .as_deref()
@@ -142,29 +145,25 @@ fn extract_gin_token_hashes_from_row(
     };
 
     match col_type {
-        GinColumnType::Array => {
-            match row.values.get(col_idx) {
-                Some(Value::Null) | None => Ok(Vec::new()),
-                Some(Value::Array(arr)) => Ok(gin::extract_array_gin_tokens(arr)),
-                Some(other) => Err(anyhow!(
-                    "GIN index '{}' requires ARRAY value, got {}",
-                    index.name,
-                    other.data_type().unwrap_or(DataType::Text)
-                )),
-            }
-        }
-        GinColumnType::Tsvector => {
-            match row.values.get(col_idx) {
-                Some(Value::Null) | None => Ok(Vec::new()),
-                Some(Value::Tsvector(s)) => Ok(gin::extract_tsvector_gin_tokens(s)),
-                Some(Value::Text(s)) => Ok(gin::extract_tsvector_gin_tokens(s)),
-                Some(other) => Err(anyhow!(
-                    "GIN index '{}' requires TSVECTOR value, got {}",
-                    index.name,
-                    other.data_type().unwrap_or(DataType::Text)
-                )),
-            }
-        }
+        GinColumnType::Array => match row.values.get(col_idx) {
+            Some(Value::Null) | None => Ok(Vec::new()),
+            Some(Value::Array(arr)) => Ok(gin::extract_array_gin_tokens(arr)),
+            Some(other) => Err(anyhow!(
+                "GIN index '{}' requires ARRAY value, got {}",
+                index.name,
+                other.data_type().unwrap_or(DataType::Text)
+            )),
+        },
+        GinColumnType::Tsvector => match row.values.get(col_idx) {
+            Some(Value::Null) | None => Ok(Vec::new()),
+            Some(Value::Tsvector(s)) => Ok(gin::extract_tsvector_gin_tokens(s)),
+            Some(Value::Text(s)) => Ok(gin::extract_tsvector_gin_tokens(s)),
+            Some(other) => Err(anyhow!(
+                "GIN index '{}' requires TSVECTOR value, got {}",
+                index.name,
+                other.data_type().unwrap_or(DataType::Text)
+            )),
+        },
         GinColumnType::Jsonb => {
             let json_text = match row.values.get(col_idx) {
                 Some(Value::Null) | None => return Ok(Vec::new()),
@@ -178,8 +177,9 @@ fn extract_gin_token_hashes_from_row(
                 }
             };
 
-            let json: serde_json::Value = serde_json::from_str(json_text)
-                .map_err(|e| anyhow!("Invalid JSONB value for GIN index '{}': {}", index.name, e))?;
+            let json: serde_json::Value = serde_json::from_str(json_text).map_err(|e| {
+                anyhow!("Invalid JSONB value for GIN index '{}': {}", index.name, e)
+            })?;
             let tokens = gin::extract_gin_tokens(&json);
             let mut hashes = tokens.key_values;
             hashes.reserve(tokens.key_exists.len());
@@ -476,7 +476,11 @@ pub async fn execute_insert_row(
                                         if schema.pk_indices.is_empty() {
                                             if !schema.foreign_keys.is_empty() {
                                                 validate_foreign_keys(
-                                                    store, txn, db_id, schema, &updated_row,
+                                                    store,
+                                                    txn,
+                                                    db_id,
+                                                    schema,
+                                                    &updated_row,
                                                 )
                                                 .await?;
                                             }
@@ -582,7 +586,14 @@ pub async fn execute_insert_row(
 
                                 if schema.pk_indices.is_empty() {
                                     if !schema.foreign_keys.is_empty() {
-                                        validate_foreign_keys(store, txn, db_id, schema, &updated_row).await?;
+                                        validate_foreign_keys(
+                                            store,
+                                            txn,
+                                            db_id,
+                                            schema,
+                                            &updated_row,
+                                        )
+                                        .await?;
                                     }
                                     update_row_indexes(
                                         store,
@@ -593,7 +604,7 @@ pub async fn execute_insert_row(
                                         existing_row,
                                         &updated_row,
                                     )
-                                        .await?;
+                                    .await?;
                                     store
                                         .upsert_by_pk(
                                             txn,
@@ -1288,16 +1299,17 @@ pub async fn execute_update_row(
             .batch_get_rows(txn, db_id, schema.table_id, vec![new_pks.clone()], schema)
             .await?;
         if !existing.is_empty() {
-            let pk_cols: Vec<_> = schema.pk_indices.iter().map(|&i| schema.columns[i].name.clone()).collect();
+            let pk_cols: Vec<_> = schema
+                .pk_indices
+                .iter()
+                .map(|&i| schema.columns[i].name.clone())
+                .collect();
             let pk_vals: Vec<_> = new_pks.iter().map(|v| format!("{}", v)).collect();
             let default_pk_name = format!(
                 "{}_pkey",
                 schema.name.rsplit('.').next().unwrap_or(&schema.name)
             );
-            let pk_constraint_name = schema
-                .pk_constraint_name
-                .clone()
-                .unwrap_or(default_pk_name);
+            let pk_constraint_name = schema.pk_constraint_name.clone().unwrap_or(default_pk_name);
             return Err(SqlError::UniqueViolation {
                 constraint: pk_constraint_name.clone(),
                 message: format!(
@@ -1312,7 +1324,14 @@ pub async fn execute_update_row(
         let gin_hashes = extract_gin_token_hashes_from_row(schema, index, old_row)?;
         if !gin_hashes.is_empty() {
             store
-                .delete_gin_index_entries(txn, db_id, schema.table_id, index.id, &gin_hashes, &old_pks)
+                .delete_gin_index_entries(
+                    txn,
+                    db_id,
+                    schema.table_id,
+                    index.id,
+                    &gin_hashes,
+                    &old_pks,
+                )
                 .await?;
             continue;
         }
@@ -1324,7 +1343,15 @@ pub async fn execute_update_row(
         if old_matches {
             let old_idx = index_helpers::get_index_values_with_expressions(index, schema, old_row)?;
             store
-                .delete_index_entry(txn, db_id, schema.table_id, index.id, &old_idx, &old_pks, index.unique)
+                .delete_index_entry(
+                    txn,
+                    db_id,
+                    schema.table_id,
+                    index.id,
+                    &old_idx,
+                    &old_pks,
+                    index.unique,
+                )
                 .await?;
         }
     }
@@ -1333,13 +1360,22 @@ pub async fn execute_update_row(
         store.delete_by_pk(txn, db_id, table_name, &old_pks).await?;
     }
 
-    store.upsert(txn, db_id, table_name, new_row.clone()).await?;
+    store
+        .upsert(txn, db_id, table_name, new_row.clone())
+        .await?;
 
     for index in &schema.indexes {
         let gin_hashes = extract_gin_token_hashes_from_row(schema, index, &new_row)?;
         if !gin_hashes.is_empty() {
             store
-                .create_gin_index_entries(txn, db_id, schema.table_id, index.id, &gin_hashes, &new_pks)
+                .create_gin_index_entries(
+                    txn,
+                    db_id,
+                    schema.table_id,
+                    index.id,
+                    &gin_hashes,
+                    &new_pks,
+                )
                 .await?;
             continue;
         }
@@ -1352,7 +1388,15 @@ pub async fn execute_update_row(
             let new_idx =
                 index_helpers::get_index_values_with_expressions(index, schema, &new_row)?;
             store
-                .create_index_entry(txn, db_id, schema.table_id, index.id, &new_idx, &new_pks, index.unique)
+                .create_index_entry(
+                    txn,
+                    db_id,
+                    schema.table_id,
+                    index.id,
+                    &new_idx,
+                    &new_pks,
+                    index.unique,
+                )
                 .await?;
         }
     }
@@ -1516,15 +1560,16 @@ pub async fn fill_missing_columns(
 
         if c.is_serial {
             let seq_full_name = match sequence_defs.as_ref() {
-                Some(defs) => match sequences::find_owned_sequence_full_name(defs, &schema.name, &c.name)?
-                {
-                    Some(full_name) => full_name,
-                    None => format!(
-                        "{}.{}",
-                        table_schema,
-                        sequences::implicit_sequence_name(table_name, &c.name)
-                    ),
-                },
+                Some(defs) => {
+                    match sequences::find_owned_sequence_full_name(defs, &schema.name, &c.name)? {
+                        Some(full_name) => full_name,
+                        None => format!(
+                            "{}.{}",
+                            table_schema,
+                            sequences::implicit_sequence_name(table_name, &c.name)
+                        ),
+                    }
+                }
                 None => format!(
                     "{}.{}",
                     table_schema,
@@ -1546,19 +1591,22 @@ pub async fn fill_missing_columns(
                 })?),
             };
         } else if let Some(def) = &c.default_expr {
-            row_vals[i] =
-                eval_default_expr_maybe_sequence(
-                    store,
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    def,
-                )
-                    .await?;
+            row_vals[i] = eval_default_expr_maybe_sequence(
+                store,
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                def,
+            )
+            .await?;
         } else if !c.nullable {
             let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-            let row_str = row_vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ");
+            let row_str = row_vals
+                .iter()
+                .map(|v| format!("{}", v))
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(SqlError::NotNullViolation {
                 column: c.name.clone(),
                 relation: short_table.to_string(),
@@ -1577,7 +1625,11 @@ pub fn coerce_row_values(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Res
         let coerced = coerce_value_for_column(row_vals[i].clone(), c)?;
         if coerced == Value::Null && !c.nullable {
             let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-            let row_str = row_vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ");
+            let row_str = row_vals
+                .iter()
+                .map(|v| format!("{}", v))
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(SqlError::NotNullViolation {
                 column: c.name.clone(),
                 relation: short_table.to_string(),
@@ -1611,12 +1663,18 @@ pub fn validate_check_constraints(schema: &TableSchema, row: &Row) -> Result<()>
                     .map(|n| n.to_string())
                     .unwrap_or_else(|| format!("({})", check.expr));
                 let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-                let row_str = row.values.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ");
+                let row_str = row
+                    .values
+                    .iter()
+                    .map(|v| format!("{}", v))
+                    .collect::<Vec<_>>()
+                    .join(", ");
                 return Err(SqlError::CheckViolation {
                     table: short_table.to_string(),
                     constraint: name.to_string(),
                     detail: row_str,
-                }.into());
+                }
+                .into());
             }
             Value::Null => {}
             _ => {
@@ -1660,12 +1718,12 @@ pub async fn validate_foreign_keys(
             .get_schema(txn, db_id, &fk.ref_table)
             .await?
             .ok_or_else(|| {
-            anyhow!(
-                "Referenced table '{}' not found for foreign key '{}'",
-                fk.ref_table,
-                fk.name
-            )
-        })?;
+                anyhow!(
+                    "Referenced table '{}' not found for foreign key '{}'",
+                    fk.ref_table,
+                    fk.name
+                )
+            })?;
 
         let ref_rows = store
             .batch_get_rows(
@@ -1752,7 +1810,11 @@ pub async fn compute_update_values(
         let coerced = coerce_value_for_column(raw_val, col)?;
         if coerced == Value::Null && !col.nullable {
             let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-            let row_str = vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ");
+            let row_str = vals
+                .iter()
+                .map(|v| format!("{}", v))
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(SqlError::NotNullViolation {
                 column: col.name.clone(),
                 relation: short_table.to_string(),

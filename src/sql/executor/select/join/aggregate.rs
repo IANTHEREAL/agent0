@@ -107,8 +107,9 @@ impl Executor {
                     s
                 })
                 .collect();
-            let having_aggs =
-                crate::sql::executor::operators::collect_nested_aggregates(&rewritten_having_for_agg);
+            let having_aggs = crate::sql::executor::operators::collect_nested_aggregates(
+                &rewritten_having_for_agg,
+            );
             for f in having_aggs {
                 Executor::add_aggregate_from_function(
                     f,
@@ -294,5 +295,4 @@ impl Executor {
             timezone: crate::session_context::current_timezone(),
         }))
     }
-
 }

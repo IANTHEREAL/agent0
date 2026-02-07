@@ -282,9 +282,9 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                 // (common for binary integers). Otherwise, treat as text.
                 t if *t == Type::UNKNOWN => {
                     let bytes = param_bytes.as_ref();
-                    let has_control_bytes = bytes.iter().any(|b| {
-                        *b == 0 || (*b < 0x20 && !matches!(*b, b'\t' | b'\n' | b'\r'))
-                    });
+                    let has_control_bytes = bytes
+                        .iter()
+                        .any(|b| *b == 0 || (*b < 0x20 && !matches!(*b, b'\t' | b'\n' | b'\r')));
 
                     if has_control_bytes {
                         match bytes.len() {

@@ -66,9 +66,7 @@ impl VirtualTable for PgIndex {
                     let index_col_count = idx.columns.len() + idx.expressions.len();
                     let mut col_indices: Vec<i64> = Vec::new();
                     for col_name in &idx.columns {
-                        if let Some(pos) =
-                            schema.columns.iter().position(|c| &c.name == col_name)
-                        {
+                        if let Some(pos) = schema.columns.iter().position(|c| &c.name == col_name) {
                             col_indices.push((pos + 1) as i64);
                         }
                     }

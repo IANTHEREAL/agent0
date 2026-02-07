@@ -228,4 +228,3 @@ pub(in crate::protocol::handler) fn encode_value(
         Value::Tsvector(s) | Value::Tsquery(s) => encoder.encode_field(s),
     }
 }
-

@@ -1,7 +1,7 @@
 //! Session management for transactions
 
-use crate::storage::TikvStore;
 use crate::observability::TenantObservability;
+use crate::storage::TikvStore;
 use crate::txn::SavepointState;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -160,14 +160,24 @@ impl SessionSettings {
             }
             "timezone" => Some(self.timezone.as_deref().unwrap_or("UTC").to_string()),
             "application_name" => Some(self.application_name.as_deref().unwrap_or("").to_string()),
-            "client_encoding" => Some(self.client_encoding.as_deref().unwrap_or("UTF8").to_string()),
+            "client_encoding" => Some(
+                self.client_encoding
+                    .as_deref()
+                    .unwrap_or("UTF8")
+                    .to_string(),
+            ),
             "standard_conforming_strings" => Some(
                 self.standard_conforming_strings
                     .as_deref()
                     .unwrap_or("on")
                     .to_string(),
             ),
-            "check_function_bodies" => Some(self.check_function_bodies.as_deref().unwrap_or("on").to_string()),
+            "check_function_bodies" => Some(
+                self.check_function_bodies
+                    .as_deref()
+                    .unwrap_or("on")
+                    .to_string(),
+            ),
             "xmloption" => Some(self.xmloption.as_deref().unwrap_or("content").to_string()),
             "client_min_messages" => Some(
                 self.client_min_messages
@@ -176,7 +186,9 @@ impl SessionSettings {
                     .to_string(),
             ),
             "row_security" => Some(self.row_security.as_deref().unwrap_or("on").to_string()),
-            "default_tablespace" => Some(self.default_tablespace.as_deref().unwrap_or("").to_string()),
+            "default_tablespace" => {
+                Some(self.default_tablespace.as_deref().unwrap_or("").to_string())
+            }
             "default_table_access_method" => Some(
                 self.default_table_access_method
                     .as_deref()
@@ -330,7 +342,10 @@ impl Session {
 
     /// Check if currently in a transaction block
     pub fn is_in_transaction(&self) -> bool {
-        matches!(self.state, TransactionState::Active(_) | TransactionState::Failed(_))
+        matches!(
+            self.state,
+            TransactionState::Active(_) | TransactionState::Failed(_)
+        )
     }
 
     pub fn is_transaction_failed(&self) -> bool {
@@ -367,9 +382,11 @@ impl Session {
         &mut self,
     ) -> Option<(&mut Transaction, &mut HashMap<String, i64>, &[String])> {
         match &mut self.state {
-            TransactionState::Active(txn) | TransactionState::Failed(txn) => {
-                Some((txn, &mut self.last_sequence_values, self.settings.search_path()))
-            }
+            TransactionState::Active(txn) | TransactionState::Failed(txn) => Some((
+                txn,
+                &mut self.last_sequence_values,
+                self.settings.search_path(),
+            )),
             _ => None,
         }
     }
@@ -542,16 +559,28 @@ mod tests {
     fn test_session_settings_defaults_and_overrides() {
         let mut settings = SessionSettings::new();
 
-        assert_eq!(settings.show_value("server_version").as_deref(), Some("16.0"));
+        assert_eq!(
+            settings.show_value("server_version").as_deref(),
+            Some("16.0")
+        );
         assert_eq!(
             settings.show_value("server_version_num").as_deref(),
             Some("160000")
         );
         assert_eq!(settings.show_value("timezone").as_deref(), Some("UTC"));
         assert_eq!(settings.show_value("application_name").as_deref(), Some(""));
-        assert_eq!(settings.show_value("search_path").as_deref(), Some("public"));
-        assert_eq!(settings.show_value("statement_timeout").as_deref(), Some("0"));
-        assert_eq!(settings.show_value("client_encoding").as_deref(), Some("UTF8"));
+        assert_eq!(
+            settings.show_value("search_path").as_deref(),
+            Some("public")
+        );
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("0")
+        );
+        assert_eq!(
+            settings.show_value("client_encoding").as_deref(),
+            Some("UTF8")
+        );
 
         assert!(settings
             .set_known_setting("client_min_messages", "warning".to_string())
@@ -595,7 +624,9 @@ mod tests {
             Some("read committed")
         );
         assert_eq!(
-            settings.show_value("transaction.isolation.level").as_deref(),
+            settings
+                .show_value("transaction.isolation.level")
+                .as_deref(),
             Some("read committed")
         );
     }
@@ -607,12 +638,18 @@ mod tests {
         settings
             .set_known_setting("statement_timeout", "20".to_string())
             .unwrap();
-        assert_eq!(settings.show_value("statement_timeout").as_deref(), Some("20"));
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("20")
+        );
 
         settings
             .set_known_setting("statement_timeout", "1s".to_string())
             .unwrap();
-        assert_eq!(settings.show_value("statement_timeout").as_deref(), Some("1000"));
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("1000")
+        );
 
         assert!(settings
             .set_known_setting("statement_timeout", "-1".to_string())

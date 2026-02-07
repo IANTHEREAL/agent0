@@ -1,10 +1,10 @@
 //! Subquery resolution for the SQL executor
 
-use super::core::Executor;
-use super::super::expr::{coerce_text_literal_to_bool, eval_binary_op_public};
 use super::super::coercion::value_to_sql_expr;
+use super::super::expr::{coerce_text_literal_to_bool, eval_binary_op_public};
 use super::super::names::normalize_ident;
 use super::super::ExecuteResult;
+use super::core::Executor;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
@@ -81,7 +81,7 @@ impl Executor {
                             inner_expr,
                             ctes,
                         )
-                            .await?,
+                        .await?,
                     );
                     Ok(Expr::InList {
                         expr: resolved_inner,
@@ -91,12 +91,26 @@ impl Executor {
                 }
                 Expr::BinaryOp { left, op, right } => {
                     let resolved_left = Box::new(
-                        self.resolve_subqueries(txn, db_id, sequence_values, search_path, left, ctes)
-                            .await?,
+                        self.resolve_subqueries(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            left,
+                            ctes,
+                        )
+                        .await?,
                     );
                     let resolved_right = Box::new(
-                        self.resolve_subqueries(txn, db_id, sequence_values, search_path, right, ctes)
-                            .await?,
+                        self.resolve_subqueries(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            right,
+                            ctes,
+                        )
+                        .await?,
                     );
                     Ok(Expr::BinaryOp {
                         left: resolved_left,
@@ -106,8 +120,15 @@ impl Executor {
                 }
                 Expr::UnaryOp { op, expr: inner } => {
                     let resolved = Box::new(
-                        self.resolve_subqueries(txn, db_id, sequence_values, search_path, inner, ctes)
-                            .await?,
+                        self.resolve_subqueries(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            inner,
+                            ctes,
+                        )
+                        .await?,
                     );
                     Ok(Expr::UnaryOp {
                         op: op.clone(),
@@ -116,8 +137,15 @@ impl Executor {
                 }
                 Expr::Nested(inner) => {
                     let resolved = Box::new(
-                        self.resolve_subqueries(txn, db_id, sequence_values, search_path, inner, ctes)
-                            .await?,
+                        self.resolve_subqueries(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            inner,
+                            ctes,
+                        )
+                        .await?,
                     );
                     Ok(Expr::Nested(resolved))
                 }
@@ -127,8 +155,15 @@ impl Executor {
                     format,
                 } => {
                     let resolved = Box::new(
-                        self.resolve_subqueries(txn, db_id, sequence_values, search_path, inner, ctes)
-                            .await?,
+                        self.resolve_subqueries(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            inner,
+                            ctes,
+                        )
+                        .await?,
                     );
                     Ok(Expr::Cast {
                         expr: resolved,
@@ -187,8 +222,15 @@ impl Executor {
                 } => {
                     let resolved_operand = if let Some(op) = operand {
                         Some(Box::new(
-                            self.resolve_subqueries(txn, db_id, sequence_values, search_path, op, ctes)
-                                .await?,
+                            self.resolve_subqueries(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                op,
+                                ctes,
+                            )
+                            .await?,
                         ))
                     } else {
                         None
@@ -196,15 +238,29 @@ impl Executor {
                     let mut resolved_conditions = Vec::with_capacity(conditions.len());
                     for cond in conditions {
                         resolved_conditions.push(
-                            self.resolve_subqueries(txn, db_id, sequence_values, search_path, cond, ctes)
-                                .await?,
+                            self.resolve_subqueries(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                cond,
+                                ctes,
+                            )
+                            .await?,
                         );
                     }
                     let mut resolved_results = Vec::with_capacity(results.len());
                     for res in results {
                         resolved_results.push(
-                            self.resolve_subqueries(txn, db_id, sequence_values, search_path, res, ctes)
-                                .await?,
+                            self.resolve_subqueries(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                res,
+                                ctes,
+                            )
+                            .await?,
                         );
                     }
                     let resolved_else = if let Some(else_expr) = else_result {
@@ -217,7 +273,7 @@ impl Executor {
                                 else_expr,
                                 ctes,
                             )
-                                .await?,
+                            .await?,
                         ))
                     } else {
                         None
@@ -245,7 +301,7 @@ impl Executor {
                                         e,
                                         ctes,
                                     )
-                                        .await?,
+                                    .await?,
                                 ),
                             ),
                             other => other.clone(),
@@ -315,8 +371,15 @@ impl Executor {
                         SelectItem::UnnamedExpr(e.clone())
                     } else {
                         SelectItem::UnnamedExpr(
-                            self.resolve_subqueries(txn, db_id, sequence_values, search_path, e, ctes)
-                                .await?,
+                            self.resolve_subqueries(
+                                txn,
+                                db_id,
+                                sequence_values,
+                                search_path,
+                                e,
+                                ctes,
+                            )
+                            .await?,
                         )
                     }
                 }
@@ -329,7 +392,14 @@ impl Executor {
                     } else {
                         SelectItem::ExprWithAlias {
                             expr: self
-                                .resolve_subqueries(txn, db_id, sequence_values, search_path, expr, ctes)
+                                .resolve_subqueries(
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    expr,
+                                    ctes,
+                                )
                                 .await?,
                             alias: alias.clone(),
                         }

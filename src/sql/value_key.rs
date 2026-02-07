@@ -59,7 +59,9 @@ fn canonicalize_value_for_key(value: &Value) -> Value {
     match value {
         Value::Float64(f) => Value::Float64(canonicalize_f64_for_key(*f)),
         Value::Numeric(d) => Value::Numeric(canonicalize_decimal_for_key(d)),
-        Value::Array(values) => Value::Array(values.iter().map(canonicalize_value_for_key).collect()),
+        Value::Array(values) => {
+            Value::Array(values.iter().map(canonicalize_value_for_key).collect())
+        }
         _ => value.clone(),
     }
 }

@@ -9,7 +9,6 @@ pub(super) struct GenerateSeriesOffsetLimitPushdownPlan {
     pub(super) clear_query_offset_limit_fetch: bool,
 }
 
-
 pub(super) fn generate_series_offset_limit_pushdown_eligible(
     query: &Query,
     select: &sqlparser::ast::Select,
@@ -171,4 +170,3 @@ pub(super) fn plan_generate_series_offset_limit_pushdown(
         clear_query_offset_limit_fetch: offset != 0 || limit.is_some(),
     }
 }
-

@@ -1,6 +1,6 @@
+use super::super::{ExecuteResult, ExecuteResults, Session};
 use super::core::Executor;
 use super::triggers::strip_leading_sql_comments;
-use super::super::{ExecuteResult, ExecuteResults, Session};
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use tracing::warn;
@@ -32,10 +32,7 @@ fn validate_database_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 63 {
         return Err(anyhow!("invalid database name: {}", name));
     }
-    if !name
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'_')
-    {
+    if !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
         return Err(anyhow!("invalid database name: {}", name));
     }
     Ok(())
@@ -175,7 +172,11 @@ fn parse_create_database_sql(sql: &str) -> Result<CreateDatabaseCommand> {
     expect(&tokens, &mut pos, "DATABASE")?;
 
     let mut if_not_exists = false;
-    if tokens.get(pos).copied().unwrap_or("").eq_ignore_ascii_case("IF")
+    if tokens
+        .get(pos)
+        .copied()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("IF")
         && tokens
             .get(pos + 1)
             .copied()
@@ -276,7 +277,9 @@ fn parse_create_database_sql(sql: &str) -> Result<CreateDatabaseCommand> {
             continue;
         }
 
-        return Err(SqlError::Unsupported(format!("Unsupported CREATE DATABASE option: {}", tok)).into());
+        return Err(
+            SqlError::Unsupported(format!("Unsupported CREATE DATABASE option: {}", tok)).into(),
+        );
     }
 
     Ok(CreateDatabaseCommand {
@@ -305,7 +308,11 @@ fn parse_drop_database_sql(sql: &str) -> Result<DropDatabaseCommand> {
     expect(&tokens, &mut pos, "DATABASE")?;
 
     let mut if_exists = false;
-    if tokens.get(pos).copied().unwrap_or("").eq_ignore_ascii_case("IF")
+    if tokens
+        .get(pos)
+        .copied()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("IF")
         && tokens
             .get(pos + 1)
             .copied()
@@ -379,7 +386,12 @@ fn parse_alter_database_sql(sql: &str) -> Result<AlterDatabaseCommand> {
 
     if op.eq_ignore_ascii_case("OWNER") {
         pos += 1;
-        if tokens.get(pos).copied().unwrap_or("").eq_ignore_ascii_case("TO") {
+        if tokens
+            .get(pos)
+            .copied()
+            .unwrap_or("")
+            .eq_ignore_ascii_case("TO")
+        {
             pos += 1;
         } else if tokens.get(pos).copied() == Some("=") {
             pos += 1;
@@ -393,10 +405,7 @@ fn parse_alter_database_sql(sql: &str) -> Result<AlterDatabaseCommand> {
         if pos < tokens.len() {
             return Err(SqlError::Unsupported("Unsupported ALTER DATABASE syntax".into()).into());
         }
-        return Ok(AlterDatabaseCommand::Owner {
-            name,
-            new_owner,
-        });
+        return Ok(AlterDatabaseCommand::Owner { name, new_owner });
     }
 
     Err(SqlError::Unsupported("Unsupported ALTER DATABASE operation".into()).into())
@@ -411,10 +420,16 @@ impl Executor {
         let cmd = parse_create_database_sql(sql)?;
 
         if !session.is_superuser() {
-            return Err(SqlError::PermissionDenied { object_type: "database".into(), object_name: cmd.name.clone() }.into());
+            return Err(SqlError::PermissionDenied {
+                object_type: "database".into(),
+                object_name: cmd.name.clone(),
+            }
+            .into());
         }
         if session.is_in_transaction() {
-            return Err(anyhow!("CREATE DATABASE cannot run inside a transaction block"));
+            return Err(anyhow!(
+                "CREATE DATABASE cannot run inside a transaction block"
+            ));
         }
 
         session.begin().await?;
@@ -464,10 +479,16 @@ impl Executor {
         let cmd = parse_drop_database_sql(sql)?;
 
         if !session.is_superuser() {
-            return Err(SqlError::PermissionDenied { object_type: "database".into(), object_name: cmd.name.clone() }.into());
+            return Err(SqlError::PermissionDenied {
+                object_type: "database".into(),
+                object_name: cmd.name.clone(),
+            }
+            .into());
         }
         if session.is_in_transaction() {
-            return Err(anyhow!("DROP DATABASE cannot run inside a transaction block"));
+            return Err(anyhow!(
+                "DROP DATABASE cannot run inside a transaction block"
+            ));
         }
 
         session.begin().await?;
@@ -508,7 +529,9 @@ impl Executor {
             }
         }
 
-        results.push(ExecuteResult::CommandComplete { tag: "DROP DATABASE" });
+        results.push(ExecuteResult::CommandComplete {
+            tag: "DROP DATABASE",
+        });
         Ok(ExecuteResults(results))
     }
 
@@ -524,10 +547,16 @@ impl Executor {
                 AlterDatabaseCommand::Rename { old_name, .. } => old_name.clone(),
                 AlterDatabaseCommand::Owner { name, .. } => name.clone(),
             };
-            return Err(SqlError::PermissionDenied { object_type: "database".into(), object_name: db_name }.into());
+            return Err(SqlError::PermissionDenied {
+                object_type: "database".into(),
+                object_name: db_name,
+            }
+            .into());
         }
         if session.is_in_transaction() {
-            return Err(anyhow!("ALTER DATABASE cannot run inside a transaction block"));
+            return Err(anyhow!(
+                "ALTER DATABASE cannot run inside a transaction block"
+            ));
         }
 
         session.begin().await?;

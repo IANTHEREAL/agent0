@@ -1,9 +1,9 @@
+use super::super::expr::eval_expr;
+use super::super::names;
+use super::super::names::normalize_ident;
+use super::super::Session;
 use super::core::Executor;
 use super::triggers::strip_leading_sql_comments;
-use super::super::names::normalize_ident;
-use super::super::names;
-use super::super::expr::eval_expr;
-use super::super::Session;
 use crate::extensions::{descriptor, InstalledExtension};
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
@@ -127,7 +127,11 @@ impl Executor {
             match v {
                 Value::Text(s) => Ok(s),
                 Value::Null => Err(anyhow!("http: {} must not be NULL", what)),
-                other => Err(anyhow!("http: {} must be TEXT, got {}", what, other.data_type().unwrap_or(crate::types::DataType::Text))),
+                other => Err(anyhow!(
+                    "http: {} must be TEXT, got {}",
+                    what,
+                    other.data_type().unwrap_or(crate::types::DataType::Text)
+                )),
             }
         }
 
@@ -231,7 +235,11 @@ impl Executor {
         let (if_not_exists, ext_name) = parse_create_extension_sql(sql)?;
 
         if !session.is_superuser() {
-            return Err(SqlError::PermissionDenied { object_type: "extension".into(), object_name: ext_name.clone() }.into());
+            return Err(SqlError::PermissionDenied {
+                object_type: "extension".into(),
+                object_name: ext_name.clone(),
+            }
+            .into());
         }
 
         let desc = descriptor(&ext_name)
@@ -298,7 +306,11 @@ impl Executor {
         let (if_exists, ext_name) = parse_drop_extension_sql(sql)?;
 
         if !session.is_superuser() {
-            return Err(SqlError::PermissionDenied { object_type: "extension".into(), object_name: ext_name.clone() }.into());
+            return Err(SqlError::PermissionDenied {
+                object_type: "extension".into(),
+                object_name: ext_name.clone(),
+            }
+            .into());
         }
 
         let is_autocommit = !session.is_in_transaction();

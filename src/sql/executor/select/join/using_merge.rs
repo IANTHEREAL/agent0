@@ -33,7 +33,10 @@ pub(in crate::sql::executor::select) fn build_coalesce_for_merge(mc: &UsingMerge
 
 /// Replace bare-identifier references to merge columns with COALESCE expressions.
 /// Qualified references (e.g. `t.col`) are left untouched.
-pub(in crate::sql::executor::select) fn replace_using_merge_refs(expr: &Expr, merge_columns: &[UsingMergeColumn]) -> Expr {
+pub(in crate::sql::executor::select) fn replace_using_merge_refs(
+    expr: &Expr,
+    merge_columns: &[UsingMergeColumn],
+) -> Expr {
     if merge_columns.is_empty() {
         return expr.clone();
     }

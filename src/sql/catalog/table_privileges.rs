@@ -90,11 +90,7 @@ impl VirtualTable for TablePrivileges {
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
         let mut tables: std::collections::HashSet<String> =
             ctx.user_tables.iter().cloned().collect();
-        let views = ctx
-            .store
-            .list_views(ctx.txn, ctx.db_id)
-            .await
-            ?;
+        let views = ctx.store.list_views(ctx.txn, ctx.db_id).await?;
         for view_def in views {
             tables.insert(format!("{}.{}", view_def.schema, view_def.name));
         }

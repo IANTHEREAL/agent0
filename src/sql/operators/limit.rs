@@ -151,7 +151,10 @@ mod tests {
 
         let child2 = Box::new(TableScanOperator::new(schema.clone()));
         let limit2 = LimitOperator::new(child2, Some(10), 5);
-        assert_eq!(limit2.explain_info(), Some("limit=10, offset=5".to_string()));
+        assert_eq!(
+            limit2.explain_info(),
+            Some("limit=10, offset=5".to_string())
+        );
 
         let child3 = Box::new(TableScanOperator::new(schema.clone()));
         let limit3 = LimitOperator::new(child3, None, 5);

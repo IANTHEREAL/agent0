@@ -13,8 +13,8 @@
 //! - Join keys are hashed/compared directly from rows by column indices to avoid allocating
 //!   intermediate key vectors on the hot path.
 
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 
 use anyhow::{anyhow, Result};
@@ -138,9 +138,7 @@ pub fn join_keys_equal(left: &[Value], right: &[Value]) -> bool {
 fn values_equal_for_join(left: &Value, right: &Value) -> bool {
     match (left, right) {
         (Value::Null, _) | (_, Value::Null) => false,
-        (Value::Float64(a), Value::Float64(b)) => {
-            a == b || (a.is_nan() && b.is_nan())
-        }
+        (Value::Float64(a), Value::Float64(b)) => a == b || (a.is_nan() && b.is_nan()),
         (Value::Int32(a), Value::Int64(b)) => i64::from(*a) == *b,
         (Value::Int64(a), Value::Int32(b)) => *a == i64::from(*b),
         (Value::Numeric(a), Value::Numeric(b)) => a.normalize() == b.normalize(),
@@ -587,8 +585,10 @@ impl PhysicalOperator for HashJoinOperator {
         self.build_child.open(ctx).await?;
         self.probe_child.open(ctx).await?;
 
-        let mut hash_table =
-            JoinHashTable::with_capacity(self.build_key_indices.clone(), self.build_child.estimated_rows().unwrap_or(0));
+        let mut hash_table = JoinHashTable::with_capacity(
+            self.build_key_indices.clone(),
+            self.build_child.estimated_rows().unwrap_or(0),
+        );
 
         while let Some(row) = self.build_child.next(ctx).await? {
             hash_table.insert(row);
@@ -643,8 +643,7 @@ impl PhysicalOperator for HashJoinOperator {
         };
 
         let make_output_row = |probe_row: &Row, build_row: &Row| -> Row {
-            let mut values =
-                Vec::with_capacity(probe_row.values.len() + build_row.values.len());
+            let mut values = Vec::with_capacity(probe_row.values.len() + build_row.values.len());
             if left_is_build {
                 values.extend(build_row.values.iter().cloned());
                 values.extend(probe_row.values.iter().cloned());
@@ -795,11 +794,7 @@ impl PhysicalOperator for HashJoinOperator {
                             let pos = *bucket_row_idx;
                             *bucket_row_idx += 1;
                             let global_idx = bucket.global_indices[pos];
-                            if build_matched
-                                .get(global_idx)
-                                .copied()
-                                .unwrap_or(false)
-                            {
+                            if build_matched.get(global_idx).copied().unwrap_or(false) {
                                 continue;
                             }
                             let row = &bucket.rows[pos];
@@ -813,11 +808,7 @@ impl PhysicalOperator for HashJoinOperator {
                         let pos = *null_key_pos;
                         *null_key_pos += 1;
                         let global_idx = null_key_start_index.saturating_add(pos);
-                        if build_matched
-                            .get(global_idx)
-                            .copied()
-                            .unwrap_or(false)
-                        {
+                        if build_matched.get(global_idx).copied().unwrap_or(false) {
                             continue;
                         }
                         let row = &null_key_rows[pos];
@@ -963,7 +954,10 @@ mod tests {
             hash_join_key(&[Value::Numeric(d1)]),
             hash_join_key(&[Value::Numeric(d2)])
         );
-        assert!(join_keys_equal(&[Value::Numeric(d1)], &[Value::Numeric(d2)]));
+        assert!(join_keys_equal(
+            &[Value::Numeric(d1)],
+            &[Value::Numeric(d2)]
+        ));
     }
 
     #[test]
@@ -1018,8 +1012,10 @@ mod tests {
     fn test_hash_join_outer_side_mapping_is_logical() {
         // Validate the critical mapping: join type is relative to logical left/right,
         // while build/probe are chosen independently (left_is_build).
-        let left_child: BoxedOperator = Box::new(super::super::scan::TableScanOperator::new(schema_left()));
-        let right_child: BoxedOperator = Box::new(super::super::scan::TableScanOperator::new(schema_right()));
+        let left_child: BoxedOperator =
+            Box::new(super::super::scan::TableScanOperator::new(schema_left()));
+        let right_child: BoxedOperator =
+            Box::new(super::super::scan::TableScanOperator::new(schema_right()));
 
         let op = HashJoinOperator::new(
             left_child,
@@ -1034,8 +1030,10 @@ mod tests {
         assert!(op.build_outer);
         assert!(!op.probe_outer);
 
-        let left_child: BoxedOperator = Box::new(super::super::scan::TableScanOperator::new(schema_left()));
-        let right_child: BoxedOperator = Box::new(super::super::scan::TableScanOperator::new(schema_right()));
+        let left_child: BoxedOperator =
+            Box::new(super::super::scan::TableScanOperator::new(schema_left()));
+        let right_child: BoxedOperator =
+            Box::new(super::super::scan::TableScanOperator::new(schema_right()));
         let op = HashJoinOperator::new(
             left_child,
             right_child,

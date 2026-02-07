@@ -74,7 +74,9 @@ impl TenantHandle {
 
 impl Clone for TenantHandle {
     fn clone(&self) -> Self {
-        self.entry.active_connections.fetch_add(1, Ordering::Relaxed);
+        self.entry
+            .active_connections
+            .fetch_add(1, Ordering::Relaxed);
         self.entry.last_idle_at.store(0, Ordering::Relaxed);
         Self {
             entry: self.entry.clone(),
@@ -84,7 +86,10 @@ impl Clone for TenantHandle {
 
 impl Drop for TenantHandle {
     fn drop(&mut self) {
-        let prev = self.entry.active_connections.fetch_sub(1, Ordering::Relaxed);
+        let prev = self
+            .entry
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
         if prev == 1 {
             // This was the last handle — record idle start time.
             self.entry
@@ -244,19 +249,14 @@ impl TikvClientPool {
 
     /// Shared TikvStore creation logic. Resolves the "default" keyspace name
     /// and creates the store with bootstrap.
-    async fn create_store(
-        &self,
-        key: &str,
-        keyspace: Option<String>,
-    ) -> Result<Arc<TikvStore>> {
+    async fn create_store(&self, key: &str, keyspace: Option<String>) -> Result<Arc<TikvStore>> {
         let actual_keyspace = if key == "default" {
             Some("DEFAULT".to_string())
         } else {
             keyspace
         };
 
-        let result =
-            TikvStore::new_with_keyspace(self.pd_endpoints.clone(), actual_keyspace).await;
+        let result = TikvStore::new_with_keyspace(self.pd_endpoints.clone(), actual_keyspace).await;
 
         let store = match result {
             Ok(s) => s,
@@ -534,9 +534,7 @@ mod tests {
 
         let num_handles = 100u32;
 
-        let handles: Vec<TenantHandle> = (0..num_handles)
-            .map(|_| make_handle(&entry))
-            .collect();
+        let handles: Vec<TenantHandle> = (0..num_handles).map(|_| make_handle(&entry)).collect();
 
         assert_eq!(entry.active_connections(), num_handles);
 
@@ -567,9 +565,7 @@ mod tests {
         let entry_b = pool.inject_entry("tenant_b").await;
         let entry_c = pool.inject_entry("tenant_c").await;
 
-        entry_a
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
+        entry_a.active_connections.fetch_add(1, Ordering::Relaxed);
 
         entry_b
             .last_idle_at
@@ -594,12 +590,8 @@ mod tests {
         let entry_b = pool.inject_entry("b").await;
         let _entry_c = pool.inject_entry("c").await;
 
-        entry_a
-            .active_connections
-            .fetch_add(1, Ordering::Relaxed);
-        entry_b
-            .active_connections
-            .fetch_add(3, Ordering::Relaxed);
+        entry_a.active_connections.fetch_add(1, Ordering::Relaxed);
+        entry_b.active_connections.fetch_add(3, Ordering::Relaxed);
 
         assert_eq!(pool.active_tenant_count().await, 2);
         assert_eq!(pool.tenant_count().await, 3);
