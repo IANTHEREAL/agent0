@@ -1,6 +1,7 @@
 use super::super::*;
 use super::table_factor::extract_virtual_table_filter;
 use super::using_merge::{rewrite_for_using_join, UsingMergeColumn};
+use crate::sql::error::SqlError;
 
 fn eval_bool_expr(
     expr: &Expr,
@@ -14,6 +15,37 @@ fn eval_bool_expr(
         Value::Boolean(b) => Ok(b),
         Value::Null => Ok(false),
         _ => Err(anyhow!(err_msg)),
+    }
+}
+
+fn join_operator_on_constraint(op: &sqlparser::ast::JoinOperator) -> Result<Option<Expr>> {
+    use sqlparser::ast::{JoinConstraint, JoinOperator};
+
+    match op {
+        JoinOperator::Inner(JoinConstraint::On(expr))
+        | JoinOperator::LeftOuter(JoinConstraint::On(expr))
+        | JoinOperator::RightOuter(JoinConstraint::On(expr))
+        | JoinOperator::FullOuter(JoinConstraint::On(expr)) => Ok(Some(expr.clone())),
+        JoinOperator::CrossJoin => Ok(None),
+        JoinOperator::Inner(JoinConstraint::None)
+        | JoinOperator::LeftOuter(JoinConstraint::None)
+        | JoinOperator::RightOuter(JoinConstraint::None)
+        | JoinOperator::FullOuter(JoinConstraint::None) => Ok(None),
+        JoinOperator::Inner(JoinConstraint::Using(_))
+        | JoinOperator::LeftOuter(JoinConstraint::Using(_))
+        | JoinOperator::RightOuter(JoinConstraint::Using(_))
+        | JoinOperator::FullOuter(JoinConstraint::Using(_))
+        | JoinOperator::Inner(JoinConstraint::Natural)
+        | JoinOperator::LeftOuter(JoinConstraint::Natural)
+        | JoinOperator::RightOuter(JoinConstraint::Natural)
+        | JoinOperator::FullOuter(JoinConstraint::Natural) => Err(SqlError::Unsupported(
+            "LATERAL JOIN executor does not support USING/NATURAL join constraints".into(),
+        )
+        .into()),
+        _ => Err(SqlError::Unsupported(
+            "Unsupported JOIN operator in LATERAL JOIN executor".into(),
+        )
+        .into()),
     }
 }
 
@@ -90,6 +122,14 @@ impl Executor {
 
         for join in &from_item.joins {
             let jt = JoinType::from(&join.join_operator);
+            if matches!(jt, JoinType::Right | JoinType::Full) {
+                return Err(SqlError::Unsupported(
+                    "LATERAL JOIN executor does not support RIGHT/FULL joins".into(),
+                )
+                .into());
+            }
+
+            let join_on_constraint = join_operator_on_constraint(&join.join_operator)?;
 
             if let TableFactor::Derived {
                 lateral: true,
@@ -108,6 +148,8 @@ impl Executor {
                     .unwrap_or_default();
 
                 let mut lateral_schema: Option<TableSchema> = None;
+                let mut temp_combined_schema: Option<TableSchema> = None;
+                let mut rewritten_on_constraint: Option<Expr> = None;
                 let mut new_rows: Vec<Row> = Vec::new();
 
                 for left_row in &current_rows {
@@ -180,8 +222,44 @@ impl Executor {
                             foreign_keys: vec![],
                             owner: String::new(),
                         });
+
+                        if let Some(cond) = join_on_constraint.as_ref() {
+                            let mut temp_aliases = table_aliases.clone();
+                            temp_aliases.push((
+                                lateral_alias_name.clone(),
+                                lateral_schema.as_ref().unwrap().clone(),
+                            ));
+                            rewritten_on_constraint =
+                                Some(rewrite_expr_for_multi_join(cond, &temp_aliases)?);
+                        }
+
+                        let mut cols = combined_columns.clone();
+                        for col in lateral_schema.as_ref().unwrap().columns.iter() {
+                            cols.push(ColumnDef {
+                                name: format!("{}.{}", lateral_alias_name, col.name),
+                                data_type: col.data_type.clone(),
+                                nullable: true,
+                                primary_key: false,
+                                unique: false,
+                                is_serial: false,
+                                default_expr: None,
+                            });
+                        }
+                        temp_combined_schema = Some(TableSchema {
+                            name: "lateral_join_result".to_string(),
+                            table_id: 0,
+                            columns: cols,
+                            version: 1,
+                            pk_constraint_name: None,
+                            pk_indices: vec![],
+                            indexes: vec![],
+                            check_constraints: vec![],
+                            foreign_keys: vec![],
+                            owner: String::new(),
+                        });
                     }
 
+                    let mut matched = false;
                     if sub_rows.is_empty() {
                         if matches!(jt, JoinType::Left) {
                             let lat_cols = lateral_schema
@@ -193,9 +271,38 @@ impl Executor {
                             new_rows.push(Row::new(values));
                         }
                     } else {
+                        let combined_schema = temp_combined_schema
+                            .as_ref()
+                            .ok_or_else(|| anyhow!("LATERAL JOIN: failed to build join schema"))?;
+
                         for sub_row in &sub_rows {
                             let mut values = left_row.values.clone();
                             values.extend(sub_row.values.iter().cloned());
+                            let combined_row = Row::new(values);
+
+                            let passes = if let Some(cond) = &rewritten_on_constraint {
+                                eval_bool_expr(
+                                    cond,
+                                    &combined_row,
+                                    combined_schema,
+                                    "Join condition must evaluate to boolean",
+                                )?
+                            } else {
+                                true
+                            };
+
+                            if passes {
+                                matched = true;
+                                new_rows.push(combined_row);
+                            }
+                        }
+                        if !matched && matches!(jt, JoinType::Left) {
+                            let lat_cols = lateral_schema
+                                .as_ref()
+                                .map(|s| s.columns.len())
+                                .unwrap_or(0);
+                            let mut values = left_row.values.clone();
+                            values.extend(std::iter::repeat(Value::Null).take(lat_cols));
                             new_rows.push(Row::new(values));
                         }
                     }
@@ -264,17 +371,6 @@ impl Executor {
                     rows
                 };
 
-                let condition = match &join.join_operator {
-                    sqlparser::ast::JoinOperator::Inner(JoinConstraint::On(expr))
-                    | sqlparser::ast::JoinOperator::LeftOuter(JoinConstraint::On(expr))
-                    | sqlparser::ast::JoinOperator::RightOuter(JoinConstraint::On(expr))
-                    | sqlparser::ast::JoinOperator::FullOuter(JoinConstraint::On(expr)) => {
-                        Some(expr.clone())
-                    }
-                    sqlparser::ast::JoinOperator::CrossJoin => None,
-                    _ => None,
-                };
-
                 for col in &right_schema.columns {
                     combined_columns.push(ColumnDef {
                         name: format!("{}.{}", right_alias, col.name),
@@ -303,7 +399,7 @@ impl Executor {
                 let mut temp_table_aliases = table_aliases.clone();
                 temp_table_aliases.push((right_alias.clone(), right_schema.clone()));
 
-                let rewritten_condition = if let Some(cond) = condition.as_ref() {
+                let rewritten_condition = if let Some(cond) = join_on_constraint.as_ref() {
                     Some(rewrite_expr_for_multi_join(cond, &temp_table_aliases)?)
                 } else {
                     None

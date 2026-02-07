@@ -22,6 +22,7 @@ tests/139_select_star_hidden_subquery_cols_issue430.sql
 tests/139_chained_using_outer_issue425.sql
 tests/139_join_using_qualified_wildcard_issue424.sql
 tests/139_nested_join_table_factor_issue427.sql
+tests/152_lateral_join_on_constraint.sql
 
 [orm]
 orm-tests/pg-client/
