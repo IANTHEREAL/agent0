@@ -18,9 +18,13 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       pull-requests: read
+      issues: read
     steps:
       - name: Enforce governance invariants
         uses: actions/github-script@v7
+        env:
+          GOV_LINT_MAX_CHANGED_FILES: "100"
+          GOV_LINT_MAX_CHANGED_LINES: "5000"
         with:
           script: |
             const pr = context.payload.pull_request;
@@ -28,6 +32,9 @@ jobs:
               core.setFailed("governance-lint must run on pull_request events.");
               return;
             }
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
 
             const labels = (pr.labels ?? []).map((l) => (l.name ?? "").toString());
             const labelsLower = labels.map((l) => l.toLowerCase());
@@ -48,15 +55,100 @@ jobs:
             }
 
             const body = (pr.body ?? "").toString();
-            const issueRefRe = /#\d+/;
-            if (!issueRefRe.test(body)) {
+            const issueCandidates = Array.from(body.matchAll(/#(\d+)/g))
+              .map((m) => Number(m[1]))
+              .filter((n) => Number.isInteger(n) && n > 0);
+            const uniqueIssueCandidates = Array.from(new Set(issueCandidates)).slice(0, 20);
+
+            if (!uniqueIssueCandidates.length) {
               failures.push(
                 "SSOT: PR body must reference a tracking issue as `#<id>` (e.g. `#399`, `Fixes #399`).",
               );
             }
 
+            const referencedIssues = [];
+            for (const issueNumber of uniqueIssueCandidates) {
+              try {
+                const { data } = await github.rest.issues.get({
+                  owner,
+                  repo,
+                  issue_number: issueNumber,
+                });
+
+                if (data.pull_request) {
+                  continue;
+                }
+
+                const issueLabels = (data.labels ?? [])
+                  .map((label) => {
+                    if (typeof label === "string") {
+                      return label;
+                    }
+                    return (label.name ?? "").toString();
+                  })
+                  .filter((label) => label.trim().length > 0);
+
+                referencedIssues.push({
+                  number: issueNumber,
+                  labelsLower: issueLabels.map((label) => label.toLowerCase()),
+                });
+              } catch (e) {
+                if (e?.status === 404) {
+                  continue;
+                }
+                core.setFailed(
+                  `governance-lint: failed to validate issue reference #${issueNumber} via GitHub API (status=${e?.status ?? "unknown"}).`,
+                );
+                return;
+              }
+            }
+
+            if (uniqueIssueCandidates.length && referencedIssues.length === 0) {
+              failures.push(
+                "SSOT: PR body must reference at least one tracking Issue (not a PR) as `#<id>` (e.g. `#399`, `Fixes #399`).",
+              );
+            }
+
+            const isNumber = (value) => typeof value === "number" && Number.isFinite(value);
+            let changedFiles = pr.changed_files;
+            let additions = pr.additions;
+            let deletions = pr.deletions;
+            if (!isNumber(changedFiles) || !isNumber(additions) || !isNumber(deletions)) {
+              const { data } = await github.rest.pulls.get({
+                owner,
+                repo,
+                pull_number: pr.number,
+              });
+              changedFiles = data.changed_files;
+              additions = data.additions;
+              deletions = data.deletions;
+            }
+
+            const parsedMaxChangedFiles = Number.parseInt(process.env.GOV_LINT_MAX_CHANGED_FILES ?? "100", 10);
+            const parsedMaxChangedLines = Number.parseInt(process.env.GOV_LINT_MAX_CHANGED_LINES ?? "5000", 10);
+            const maxChangedFiles = Number.isFinite(parsedMaxChangedFiles) ? parsedMaxChangedFiles : 100;
+            const maxChangedLines = Number.isFinite(parsedMaxChangedLines) ? parsedMaxChangedLines : 5000;
+
+            const changedLines = additions + deletions;
+            const isOversizedPr = changedFiles > maxChangedFiles || changedLines > maxChangedLines;
+            const hasAcApprovedIssueRef = referencedIssues.some((issue) => issue.labelsLower.includes("ac:approved"));
+
+            if (isOversizedPr && !hasAcApprovedIssueRef) {
+              failures.push(
+                [
+                  "Oversized PR: AC approval is required before merge.",
+                  `- Size: changed_files=${changedFiles}, additions=${additions}, deletions=${deletions} (changed_lines=${changedLines})`,
+                  `- Threshold: changed_files>${maxChangedFiles} OR changed_lines>${maxChangedLines}`,
+                  "- Fix: split the PR, or link an AC-approved decision Issue in the PR body (an Issue labeled `ac:approved`).",
+                ].join("\\n"),
+              );
+            }
+
             core.info(`PR #${pr.number}: labels=[${labels.join(", ")}]`);
             core.info(`PR body length: ${body.length}`);
+            core.info(
+              `PR size: changed_files=${changedFiles}, additions=${additions}, deletions=${deletions} (changed_lines=${changedLines})`,
+            );
 
             if (failures.length) {
               core.setFailed(failures.join("\\n"));
