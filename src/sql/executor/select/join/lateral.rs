@@ -1,7 +1,9 @@
 use super::super::*;
-use super::table_factor::extract_virtual_table_filter;
 use super::using_merge::{rewrite_for_using_join, UsingMergeColumn};
 use crate::sql::error::SqlError;
+use crate::sql::executor::table_utils::{
+    extract_virtual_table_filter, normalize_virtual_table_filter_for_pushdown,
+};
 
 fn eval_bool_expr(
     expr: &Expr,
@@ -67,6 +69,7 @@ impl Executor {
 
         let virtual_filter = resolved_selection
             .map(extract_virtual_table_filter)
+            .map(normalize_virtual_table_filter_for_pushdown)
             .unwrap_or_default();
 
         let from_item = &select.from[0];

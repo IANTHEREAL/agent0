@@ -10,7 +10,9 @@ use super::core::Executor;
 use crate::sql::error::SqlError;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Ident, Query, Statement};
+use sqlparser::ast::{
+    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, Ident, Query, Statement, Value as SqlValue,
+};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
@@ -21,6 +23,113 @@ tokio::task_local! {
 }
 
 const MAX_VIEW_EXPANSION_DEPTH: usize = 64;
+
+pub(crate) fn normalize_virtual_table_filter_for_pushdown(
+    filter: VirtualTableFilter,
+) -> VirtualTableFilter {
+    if filter.table_schema.is_some() && filter.table_name.is_some() {
+        filter
+    } else {
+        VirtualTableFilter::default()
+    }
+}
+
+pub(crate) fn extract_virtual_table_filter(expr: &Expr) -> VirtualTableFilter {
+    fn column_ref_name(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.as_str()),
+            Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.as_str()),
+            _ => None,
+        }
+    }
+
+    fn string_literal(expr: &Expr) -> Option<&str> {
+        match expr {
+            Expr::Value(SqlValue::SingleQuotedString(s))
+            | Expr::Value(SqlValue::DoubleQuotedString(s))
+            | Expr::Value(SqlValue::NationalStringLiteral(s)) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    fn merge_string_slot(slot: &mut Option<String>, val: &str) {
+        match slot {
+            None => *slot = Some(val.to_string()),
+            Some(existing) => {
+                if !existing.eq_ignore_ascii_case(val) {
+                    *slot = None;
+                }
+            }
+        }
+    }
+
+    fn visit(expr: &Expr, out: &mut VirtualTableFilter, saw_or: &mut bool) {
+        match expr {
+            Expr::BinaryOp { left, op, right } => {
+                if matches!(op, BinaryOperator::Or) {
+                    *saw_or = true;
+                    return;
+                }
+
+                if matches!(op, BinaryOperator::And) {
+                    visit(left, out, saw_or);
+                    visit(right, out, saw_or);
+                    return;
+                }
+
+                if matches!(op, BinaryOperator::Eq) {
+                    let (col, lit) = if let (Some(col), Some(lit)) =
+                        (column_ref_name(left), string_literal(right))
+                    {
+                        (col, lit)
+                    } else if let (Some(col), Some(lit)) =
+                        (column_ref_name(right), string_literal(left))
+                    {
+                        (col, lit)
+                    } else {
+                        return;
+                    };
+
+                    if col.eq_ignore_ascii_case("table_name") || col.eq_ignore_ascii_case("relname")
+                    {
+                        merge_string_slot(&mut out.table_name, lit);
+                    } else if col.eq_ignore_ascii_case("table_schema") {
+                        merge_string_slot(&mut out.table_schema, lit);
+                    }
+                }
+            }
+            Expr::Nested(inner)
+            | Expr::UnaryOp { expr: inner, .. }
+            | Expr::Cast { expr: inner, .. }
+            | Expr::TryCast { expr: inner, .. } => {
+                visit(inner, out, saw_or);
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => {
+                visit(expr, out, saw_or);
+                visit(low, out, saw_or);
+                visit(high, out, saw_or);
+            }
+            Expr::InList { expr, list, .. } => {
+                visit(expr, out, saw_or);
+                for item in list {
+                    visit(item, out, saw_or);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = VirtualTableFilter::default();
+    let mut saw_or = false;
+    visit(expr, &mut out, &mut saw_or);
+    if saw_or {
+        VirtualTableFilter::default()
+    } else {
+        out
+    }
+}
 
 pub(crate) async fn with_view_expansion_stack<T>(future: impl Future<Output = T>) -> T {
     if VIEW_EXPANSION_STACK.try_with(|_| ()).is_ok() {
@@ -1014,6 +1123,71 @@ impl Executor {
                 _ => Err(anyhow!("Derived table must return SELECT result")),
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod virtual_table_filter_tests {
+    use super::*;
+    use sqlparser::ast::{SetExpr, Statement};
+
+    #[test]
+    fn extract_virtual_table_filter_collects_schema_and_table_name() {
+        let stmt = &parse_sql(
+            "SELECT * FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'my_table'",
+        )
+        .unwrap()[0];
+        let Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let selection = select.selection.as_ref().expect("expected WHERE");
+
+        let filter = extract_virtual_table_filter(selection);
+        assert_eq!(filter.table_schema.as_deref(), Some("public"));
+        assert_eq!(filter.table_name.as_deref(), Some("my_table"));
+    }
+
+    #[test]
+    fn virtual_table_filter_pushdown_requires_schema_and_table() {
+        let filter = VirtualTableFilter {
+            table_schema: None,
+            table_name: Some("t".to_string()),
+        };
+        let safe = normalize_virtual_table_filter_for_pushdown(filter);
+        assert!(safe.table_schema.is_none());
+        assert!(safe.table_name.is_none());
+
+        let filter = VirtualTableFilter {
+            table_schema: Some("public".to_string()),
+            table_name: Some("t".to_string()),
+        };
+        let safe = normalize_virtual_table_filter_for_pushdown(filter.clone());
+        assert_eq!(safe.table_schema, filter.table_schema);
+        assert_eq!(safe.table_name, filter.table_name);
+    }
+
+    #[test]
+    fn extract_virtual_table_filter_rejects_or_expressions() {
+        let stmt = &parse_sql(
+            "SELECT * FROM information_schema.columns \
+             WHERE table_schema = 'public' AND (table_name = 'a' OR table_name = 'b')",
+        )
+        .unwrap()[0];
+        let Statement::Query(query) = stmt else {
+            panic!("expected query");
+        };
+        let SetExpr::Select(select) = query.body.as_ref() else {
+            panic!("expected select");
+        };
+        let selection = select.selection.as_ref().expect("expected WHERE");
+
+        let filter = extract_virtual_table_filter(selection);
+        assert!(filter.table_schema.is_none());
+        assert!(filter.table_name.is_none());
     }
 }
 

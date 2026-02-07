@@ -26,6 +26,9 @@ use super::operators::{
     projection_may_have_udf, rewrite_agg_refs_to_columns, use_operator_execution,
 };
 use crate::sql::error::SqlError;
+use crate::sql::executor::table_utils::{
+    extract_virtual_table_filter, normalize_virtual_table_filter_for_pushdown,
+};
 use crate::sql::information_schema::VirtualTableFilter;
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
@@ -264,6 +267,14 @@ impl Executor {
 
         let mut generate_series_offset_limit_pushed_down = false;
         let mut query_with_evaluated_offset_limit_fetch: Option<Query> = None;
+
+        let virtual_filter = select
+            .selection
+            .as_ref()
+            .map(extract_virtual_table_filter)
+            .map(normalize_virtual_table_filter_for_pushdown)
+            .unwrap_or_default();
+
         let (t, outer_alias, schema, all_rows_base, is_virtual, rows_loaded) = match &select.from[0]
             .relation
         {
@@ -343,13 +354,14 @@ impl Executor {
                                 None => obj_name.clone(),
                             };
                             let (schema, rows) = self
-                                .get_table_data(
+                                .get_table_data_filtered(
                                     txn,
                                     db_id,
                                     sequence_values,
                                     search_path,
                                     &lookup_name,
                                     ctes,
+                                    &virtual_filter,
                                 )
                                 .await?;
                             let is_virtual = schema.table_id == 0;
@@ -412,13 +424,14 @@ impl Executor {
                                 None => obj_name.clone(),
                             };
                             let (schema, rows) = self
-                                .get_table_data(
+                                .get_table_data_filtered(
                                     txn,
                                     db_id,
                                     sequence_values,
                                     search_path,
                                     &lookup_name,
                                     ctes,
+                                    &virtual_filter,
                                 )
                                 .await?;
                             let is_virtual = schema.table_id == 0;
