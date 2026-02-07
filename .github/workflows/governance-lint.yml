@@ -1,0 +1,66 @@
+name: governance-lint
+
+on:
+  pull_request:
+    branches: [main, master]
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+      - labeled
+      - unlabeled
+      - ready_for_review
+  workflow_dispatch:
+
+jobs:
+  governance-lint:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    steps:
+      - name: Enforce governance invariants
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.setFailed("governance-lint must run on pull_request events.");
+              return;
+            }
+
+            const labels = (pr.labels ?? []).map((l) => (l.name ?? "").toString());
+            const labelsLower = labels.map((l) => l.toLowerCase());
+            const hasLabel = (name) => labelsLower.includes(name.toLowerCase());
+
+            const failures = [];
+
+            if (hasLabel("state:stale-plan")) {
+              failures.push(
+                "Stop-the-line: label `state:stale-plan` is present. Remove it only after required ACKs (`ACK: updated DoD`) are collected and SSOT is updated.",
+              );
+            }
+
+            if (hasLabel("ac:needed")) {
+              failures.push(
+                "Stop-the-line: label `ac:needed` is present. Merge is blocked until an `[AC] Decision` is `ac:approved` and propagated.",
+              );
+            }
+
+            const body = (pr.body ?? "").toString();
+            const issueRefRe = /#\d+/;
+            if (!issueRefRe.test(body)) {
+              failures.push(
+                "SSOT: PR body must reference a tracking issue as `#<id>` (e.g. `#399`, `Fixes #399`).",
+              );
+            }
+
+            core.info(`PR #${pr.number}: labels=[${labels.join(", ")}]`);
+            core.info(`PR body length: ${body.length}`);
+
+            if (failures.length) {
+              core.setFailed(failures.join("\\n"));
+              return;
+            }
+
+            core.info("governance-lint: PASS");
