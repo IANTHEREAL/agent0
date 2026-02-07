@@ -42,7 +42,7 @@
 - **Trigger execution model** (high level): BEFORE triggers execute in-statement; AFTER triggers are enqueued and processed asynchronously by a worker (exact queue/storage details are implementation-defined and may evolve).
   - Evidence: `src/sql/triggers.rs`, `src/sql/trigger_queue.rs`, `src/sql/trigger_worker.rs`, `src/sql/executor/triggers.rs`, `tests/53_trigger_execution.sql`.
 - **Index access paths are planner-driven**: plan selection (btree vs GIN-like) is chosen based on schema/index metadata + predicates; the index encoding itself is specified in `./storage-format.md`.
-  - Evidence: `src/sql/planner.rs`, `src/sql/executor/select.rs`.
+  - Evidence: `src/sql/planner.rs`, `src/sql/executor/select/mod.rs`.
 
 ## Configuration
 This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md`:
