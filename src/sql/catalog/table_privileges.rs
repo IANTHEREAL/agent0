@@ -35,6 +35,7 @@ fn is_grantable_text(with_grant_option: bool) -> Value {
 
 fn table_privilege_row(
     grantee: &str,
+    table_catalog: &str,
     table_schema: &str,
     table_name: &str,
     privilege_type: &str,
@@ -44,7 +45,7 @@ fn table_privilege_row(
     Row::new(vec![
         text_val("postgres"),                 // grantor
         text_val(grantee),                    // grantee
-        text_val("postgres"),                 // table_catalog
+        text_val(table_catalog),              // table_catalog
         text_val(table_schema),               // table_schema
         text_val(table_name),                 // table_name
         text_val(privilege_type),             // privilege_type
@@ -132,6 +133,7 @@ impl VirtualTable for TablePrivileges {
                     for priv_type in privilege_type_strings(&gp.privilege) {
                         rows.push(table_privilege_row(
                             &grantee,
+                            ctx.database_name,
                             &schema,
                             &name,
                             priv_type,

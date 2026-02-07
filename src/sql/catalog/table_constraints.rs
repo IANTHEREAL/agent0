@@ -58,10 +58,10 @@ impl VirtualTable for TableConstraints {
                         .clone()
                         .unwrap_or_else(|| format!("{}_pkey", table_name));
                     rows.push(Row::new(vec![
-                        text_val("postgres"),
+                        text_val(ctx.database_name),
                         text_val(&table_schema),
                         text_val(&pk_name),
-                        text_val("postgres"),
+                        text_val(ctx.database_name),
                         text_val(&table_schema),
                         text_val(&table_name),
                         text_val("PRIMARY KEY"),
@@ -78,10 +78,10 @@ impl VirtualTable for TableConstraints {
                     if idx.unique {
                         seen_unique_constraints.insert(idx.name.clone());
                         rows.push(Row::new(vec![
-                            text_val("postgres"),
+                            text_val(ctx.database_name),
                             text_val(&table_schema),
                             text_val(&idx.name),
-                            text_val("postgres"),
+                            text_val(ctx.database_name),
                             text_val(&table_schema),
                             text_val(&table_name),
                             text_val("UNIQUE"),
@@ -99,10 +99,10 @@ impl VirtualTable for TableConstraints {
                             continue;
                         }
                         rows.push(Row::new(vec![
-                            text_val("postgres"),
+                            text_val(ctx.database_name),
                             text_val(&table_schema),
                             text_val(&constraint_name),
-                            text_val("postgres"),
+                            text_val(ctx.database_name),
                             text_val(&table_schema),
                             text_val(&table_name),
                             text_val("UNIQUE"),
@@ -115,10 +115,10 @@ impl VirtualTable for TableConstraints {
 
                 for fk in &table_def.foreign_keys {
                     rows.push(Row::new(vec![
-                        text_val("postgres"),
+                        text_val(ctx.database_name),
                         text_val(&table_schema),
                         text_val(&fk.name),
-                        text_val("postgres"),
+                        text_val(ctx.database_name),
                         text_val(&table_schema),
                         text_val(&table_name),
                         text_val("FOREIGN KEY"),
@@ -134,10 +134,10 @@ impl VirtualTable for TableConstraints {
                         .clone()
                         .unwrap_or_else(|| format!("{}_check{}", table_name, i + 1));
                     rows.push(Row::new(vec![
-                        text_val("postgres"),
+                        text_val(ctx.database_name),
                         text_val(&table_schema),
                         text_val(&name),
-                        text_val("postgres"),
+                        text_val(ctx.database_name),
                         text_val(&table_schema),
                         text_val(&table_name),
                         text_val("CHECK"),

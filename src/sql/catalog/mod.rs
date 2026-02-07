@@ -46,6 +46,7 @@ pub struct ScanContext<'a> {
     pub store: &'a Arc<TikvStore>,
     pub txn: &'a mut Transaction,
     pub db_id: u64,
+    pub database_name: &'a str,
     pub user_tables: &'a [String],
     pub schemas: &'a [String],
     pub schema_oids: &'a HashMap<String, u32>,

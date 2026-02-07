@@ -54,6 +54,11 @@ CREATE DATABASE createdb_103_iso;
 \connect createdb_103_iso
 CREATE TABLE public.isot (id INT PRIMARY KEY);
 SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema='public' AND table_name='isot' ORDER BY table_schema, table_name;
+SELECT count(*) FROM information_schema.tables WHERE table_schema='public' AND table_name='isot' AND table_catalog = current_database();
+SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='isot' AND column_name='id' AND table_catalog = current_database();
+SELECT count(*) FROM information_schema.table_constraints WHERE table_schema='public' AND table_name='isot' AND constraint_type='PRIMARY KEY' AND constraint_catalog = current_database() AND table_catalog = current_database();
+SELECT count(*) FROM information_schema.key_column_usage WHERE table_schema='public' AND table_name='isot' AND column_name='id' AND constraint_catalog = current_database() AND table_catalog = current_database();
+SELECT count(*) FROM information_schema.constraint_column_usage WHERE table_schema='public' AND table_name='isot' AND column_name='id' AND constraint_catalog = current_database() AND table_catalog = current_database();
 \connect postgres
 SELECT table_schema, table_name FROM information_schema.tables WHERE table_schema='public' AND table_name='isot' ORDER BY table_schema, table_name;
 

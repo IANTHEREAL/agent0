@@ -7,6 +7,21 @@ createdb_103_opts
 table_schema|table_name
 public|isot
 (1 row)
+count
+1
+(1 row)
+count
+1
+(1 row)
+count
+1
+(1 row)
+count
+1
+(1 row)
+count
+1
+(1 row)
 table_schema|table_name
 (0 rows)
 datname

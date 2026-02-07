@@ -143,7 +143,7 @@ impl VirtualTable for Columns {
                     };
 
                     rows.push(Row::new(vec![
-                        text_val("postgres"),
+                        text_val(ctx.database_name),
                         text_val(&table_schema),
                         text_val(&table_name),
                         text_val(&col.name),
@@ -168,7 +168,7 @@ impl VirtualTable for Columns {
                         null_val(),
                         null_val(),
                         null_val(),
-                        text_val("postgres"),
+                        text_val(ctx.database_name),
                         text_val(udt_schema),
                         text_val(udt_name),
                         null_val(),

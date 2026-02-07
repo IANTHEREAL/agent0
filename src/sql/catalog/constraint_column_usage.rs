@@ -57,11 +57,11 @@ impl VirtualTable for ConstraintColumnUsage {
                     for &col_idx in &table_def.pk_indices {
                         let col_name = &table_def.columns[col_idx].name;
                         rows.push(Row::new(vec![
-                            text_val("postgres"),
+                            text_val(ctx.database_name),
                             text_val(&table_schema),
                             text_val(&table_name),
                             text_val(col_name),
-                            text_val("postgres"),
+                            text_val(ctx.database_name),
                             text_val(&table_schema),
                             text_val(&pk_name),
                         ]));
@@ -72,11 +72,11 @@ impl VirtualTable for ConstraintColumnUsage {
                     if idx.unique {
                         for col_name in &idx.columns {
                             rows.push(Row::new(vec![
-                                text_val("postgres"),
+                                text_val(ctx.database_name),
                                 text_val(&table_schema),
                                 text_val(&table_name),
                                 text_val(col_name),
-                                text_val("postgres"),
+                                text_val(ctx.database_name),
                                 text_val(&table_schema),
                                 text_val(&idx.name),
                             ]));
@@ -88,11 +88,11 @@ impl VirtualTable for ConstraintColumnUsage {
                     let (ref_schema, ref_table_name) = split_schema_and_name(&fk.ref_table);
                     for col_name in &fk.ref_columns {
                         rows.push(Row::new(vec![
-                            text_val("postgres"),
+                            text_val(ctx.database_name),
                             text_val(&ref_schema),
                             text_val(&ref_table_name),
                             text_val(col_name),
-                            text_val("postgres"),
+                            text_val(ctx.database_name),
                             text_val(&table_schema),
                             text_val(&fk.name),
                         ]));

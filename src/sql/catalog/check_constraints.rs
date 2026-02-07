@@ -52,7 +52,7 @@ impl VirtualTable for CheckConstraints {
                         .clone()
                         .unwrap_or_else(|| format!("{}_check{}", table_name, i + 1));
                     rows.push(Row::new(vec![
-                        text_val("postgres"),
+                        text_val(ctx.database_name),
                         text_val(&table_schema),
                         text_val(&name),
                         text_val(&check.expr),

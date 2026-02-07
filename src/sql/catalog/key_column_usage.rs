@@ -59,10 +59,10 @@ impl VirtualTable for KeyColumnUsage {
                     for (i, &col_idx) in table_def.pk_indices.iter().enumerate() {
                         let col_name = &table_def.columns[col_idx].name;
                         rows.push(Row::new(vec![
-                            text_val("postgres"),
+                            text_val(ctx.database_name),
                             text_val(&table_schema),
                             text_val(&pk_name),
-                            text_val("postgres"),
+                            text_val(ctx.database_name),
                             text_val(&table_schema),
                             text_val(&table_name),
                             text_val(col_name),
@@ -76,10 +76,10 @@ impl VirtualTable for KeyColumnUsage {
                     if idx.unique {
                         for (i, col_name) in idx.columns.iter().enumerate() {
                             rows.push(Row::new(vec![
-                                text_val("postgres"),
+                                text_val(ctx.database_name),
                                 text_val(&table_schema),
                                 text_val(&idx.name),
-                                text_val("postgres"),
+                                text_val(ctx.database_name),
                                 text_val(&table_schema),
                                 text_val(&table_name),
                                 text_val(col_name),
@@ -93,10 +93,10 @@ impl VirtualTable for KeyColumnUsage {
                 for fk in &table_def.foreign_keys {
                     for (i, col_name) in fk.columns.iter().enumerate() {
                         rows.push(Row::new(vec![
-                            text_val("postgres"),
+                            text_val(ctx.database_name),
                             text_val(&table_schema),
                             text_val(&fk.name),
-                            text_val("postgres"),
+                            text_val(ctx.database_name),
                             text_val(&table_schema),
                             text_val(&table_name),
                             text_val(col_name),

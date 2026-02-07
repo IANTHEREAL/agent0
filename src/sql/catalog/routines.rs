@@ -45,7 +45,7 @@ impl VirtualTable for Routines {
         let mut rows = Vec::with_capacity(funcs.len());
         for func in funcs {
             rows.push(Row::new(vec![
-                text_val("postgres"),
+                text_val(ctx.database_name),
                 text_val(&func.schema),
                 text_val(&func.name),
                 text_val("FUNCTION"),

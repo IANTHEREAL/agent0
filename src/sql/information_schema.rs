@@ -1,4 +1,5 @@
 use super::catalog::{global_catalog, ScanContext};
+use super::expr;
 use crate::storage::TikvStore;
 use crate::types::{Row, TableSchema};
 use anyhow::{anyhow, Result};
@@ -48,11 +49,22 @@ pub async fn get_information_schema_data_filtered(
 
     let schemas = store.list_schemas(txn, db_id).await?;
     let schema_oids = store.list_schema_oids(txn, db_id).await?;
+    let database_name = match expr::get_current_database_name() {
+        Some(name) => name,
+        None => Arc::<str>::from(
+            store
+                .get_database_by_id(txn, db_id)
+                .await?
+                .ok_or_else(|| anyhow!("database definition not found for db_id={}", db_id))?
+                .name,
+        ),
+    };
 
     let mut scan_ctx = ScanContext {
         store,
         txn,
         db_id,
+        database_name: database_name.as_ref(),
         user_tables: &user_tables,
         schemas: &schemas,
         schema_oids: &schema_oids,

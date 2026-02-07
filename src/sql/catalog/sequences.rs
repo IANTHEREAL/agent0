@@ -49,7 +49,7 @@ impl VirtualTable for Sequences {
         let mut rows = Vec::with_capacity(seqs.len());
         for seq in seqs {
             rows.push(Row::new(vec![
-                text_val("postgres"),
+                text_val(ctx.database_name),
                 text_val(&seq.schema),
                 text_val(&seq.name),
                 text_val("bigint"),

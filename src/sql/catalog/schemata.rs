@@ -45,7 +45,7 @@ impl VirtualTable for Schemata {
             .iter()
             .map(|schema| {
                 Row::new(vec![
-                    text_val("postgres"),
+                    text_val(ctx.database_name),
                     text_val(schema),
                     text_val("postgres"),
                     null_val(),

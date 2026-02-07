@@ -57,7 +57,7 @@ impl VirtualTable for Tables {
                 .map(|s| s.owner)
                 .unwrap_or_else(|| "postgres".to_string());
             rows.push(Row::new(vec![
-                text_val("postgres"),
+                text_val(ctx.database_name),
                 text_val(&table_schema),
                 text_val(&table_name),
                 text_val("BASE TABLE"),
@@ -80,7 +80,7 @@ impl VirtualTable for Tables {
             .unwrap_or_default();
         for view_def in views {
             rows.push(Row::new(vec![
-                text_val("postgres"),
+                text_val(ctx.database_name),
                 text_val(&view_def.schema),
                 text_val(&view_def.name),
                 text_val("VIEW"),

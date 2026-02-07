@@ -62,10 +62,10 @@ impl VirtualTable for ReferentialConstraints {
                     let update_rule = fk_action_str(&fk.on_update);
                     let delete_rule = fk_action_str(&fk.on_delete);
                     rows.push(Row::new(vec![
-                        text_val("postgres"),
+                        text_val(ctx.database_name),
                         text_val(&table_schema),
                         text_val(&fk.name),
-                        text_val("postgres"),
+                        text_val(ctx.database_name),
                         text_val(&ref_schema),
                         text_val(&ref_pk_name),
                         text_val("NONE"),
