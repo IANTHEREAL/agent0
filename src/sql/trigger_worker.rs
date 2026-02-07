@@ -177,6 +177,7 @@ impl KeyspaceQuota {
 pub(crate) struct TriggerWorker {
     worker_id: String,
     active_keyspaces: DashSet<String>,
+    active_keyspaces_marked_at: DashMap<String, Instant>,
     quotas: DashMap<String, Arc<KeyspaceQuota>>,
     keyspace_backoff: DashMap<String, KeyspaceBackoff>,
     config: TriggerWorkerConfig,
@@ -196,6 +197,7 @@ impl TriggerWorker {
         Self {
             worker_id: format!("worker-{}", std::process::id()),
             active_keyspaces: DashSet::new(),
+            active_keyspaces_marked_at: DashMap::new(),
             quotas: DashMap::new(),
             keyspace_backoff: DashMap::new(),
             config: TriggerWorkerConfig::from_env(),
@@ -249,6 +251,8 @@ impl TriggerWorker {
 
     pub(crate) fn mark_active(&self, keyspace: &str) {
         self.active_keyspaces.insert(keyspace.to_string());
+        self.active_keyspaces_marked_at
+            .insert(keyspace.to_string(), Instant::now());
     }
 
     pub(crate) fn take_active_keyspaces_snapshot(&self) -> Vec<String> {
@@ -257,6 +261,7 @@ impl TriggerWorker {
 
     pub(crate) fn remove_active(&self, keyspace: &str) {
         self.active_keyspaces.remove(keyspace);
+        self.active_keyspaces_marked_at.remove(keyspace);
     }
 
     pub(crate) fn get_quota(&self, keyspace: &str) -> Arc<KeyspaceQuota> {
@@ -378,7 +383,24 @@ impl TriggerWorker {
         if events.is_empty() {
             let _ = txn.rollback().await;
             // Nothing pending; stop polling this keyspace until new enqueue.
-            self.remove_active(keyspace);
+            //
+            // NOTE: trigger enqueue happens in-transaction and marks the keyspace active before the
+            // enclosing statement commits. The worker can observe the keyspace as active but not see
+            // the uncommitted queue keys yet; if we remove it immediately, the newly-committed event
+            // may be left pending indefinitely (until another enqueue re-activates the keyspace).
+            //
+            // Mitigation: keep polling briefly after the last activation so we don't miss events
+            // that commit slightly after activation.
+            let idle_grace = Duration::from_secs(1);
+            let should_remove = self
+                .active_keyspaces_marked_at
+                .get(keyspace)
+                .map(|v| v.elapsed() >= idle_grace)
+                .unwrap_or(true);
+
+            if should_remove {
+                self.remove_active(keyspace);
+            }
             return Ok(());
         }
         txn.commit().await?;
