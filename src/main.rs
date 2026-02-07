@@ -23,6 +23,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 
 const DEFAULT_PG_PORT: u16 = 5433;
 const DEFAULT_PD_ENDPOINTS: &str = "127.0.0.1:2379";
+const DEFAULT_PG_LISTEN_ADDR: &str = "127.0.0.1";
 
 async fn create_keyspace(pd_endpoint: &str, keyspace_name: &str) -> Result<()> {
     let url = format!("http://{}/pd/api/v2/keyspaces", pd_endpoint);
@@ -80,6 +81,11 @@ async fn async_main() -> Result<()> {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(DEFAULT_PG_PORT);
+    let pg_listen_addr = env::var("PG_LISTEN_ADDR")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_PG_LISTEN_ADDR.to_string());
     let default_keyspace = env::var("PG_KEYSPACE").ok();
 
     let tls_cert = env::var("PG_TLS_CERT").ok();
@@ -88,6 +94,7 @@ async fn async_main() -> Result<()> {
     info!("pg-tikv starting up...");
     info!("PD endpoints: {}", pd_endpoints);
     info!("PostgreSQL port: {}", pg_port);
+    info!("PostgreSQL listen addr: {}", pg_listen_addr);
     if let Some(ks) = &default_keyspace {
         info!("Default keyspace: {}", ks);
     } else {
@@ -172,12 +179,19 @@ async fn async_main() -> Result<()> {
 
     sql::trigger_worker::spawn_trigger_worker(client_pool.clone());
 
-    let addr = format!("0.0.0.0:{}", pg_port);
+    let addr = format!("{}:{}", pg_listen_addr, pg_port);
     let listener = TcpListener::bind(&addr).await?;
     info!("PostgreSQL server listening on {}", addr);
+    let connect_host: &str = if pg_listen_addr == "0.0.0.0" {
+        "127.0.0.1"
+    } else if pg_listen_addr == "::" {
+        "::1"
+    } else {
+        &pg_listen_addr
+    };
     info!(
-        "Connect using: psql -h 127.0.0.1 -p {} -U <keyspace>.<user>",
-        pg_port
+        "Connect using: psql -h {} -p {} -U <keyspace>.<user>",
+        connect_host, pg_port
     );
 
     loop {

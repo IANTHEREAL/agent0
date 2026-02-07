@@ -26,6 +26,7 @@
 |---|---|---|---|---|
 | `PD_ENDPOINTS` | env | `127.0.0.1:2379` | `src/main.rs` (`async_main`) | Comma-separated PD endpoints. |
 | `PG_PORT` | env | `5433` | `src/main.rs` (`async_main`) | Listening port; parse failures fall back to default. |
+| `PG_LISTEN_ADDR` | env | `127.0.0.1` | `src/main.rs` (`async_main`) | Listening address; set to `0.0.0.0` to accept non-loopback connections. |
 | `PG_KEYSPACE` | env | `default` | `src/main.rs` (`async_main`); `src/sql/trigger_worker.rs` (`bootstrap_active_keyspaces`) | Default tenant keyspace when client username has no explicit keyspace; also used as trigger worker fallback active keyspace. |
 | `PG_TLS_CERT` | env | unset (TLS disabled) | `src/main.rs` (`async_main`) | TLS is enabled only when both `PG_TLS_CERT` and `PG_TLS_KEY` are set and `tls::setup_tls` succeeds. |
 | `PG_TLS_KEY` | env | unset (TLS disabled) | `src/main.rs` (`async_main`) | See `PG_TLS_CERT`. |
