@@ -409,6 +409,7 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
         },
         SqlDataType::Date => Ok(DataType::Date),
         SqlDataType::Time(_, _) => Ok(DataType::Time),
+        SqlDataType::Interval => Ok(DataType::Interval),
         SqlDataType::Uuid => Ok(DataType::Uuid),
         SqlDataType::JSON => Ok(DataType::Json),
         SqlDataType::Custom(name, modifiers) => {

@@ -25,6 +25,7 @@ mod names;
 pub mod operators;
 mod parser;
 mod pg_numeric;
+pub(crate) mod pg_types;
 mod planner;
 mod plpgsql;
 mod projection;

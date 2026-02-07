@@ -1,0 +1,10 @@
+oid|typname
+1083|time
+1186|interval
+1700|numeric
+(3 rows)
+attname|atttypid|formatted
+n|1700|numeric
+t|1083|time
+i|1186|interval
+(3 rows)

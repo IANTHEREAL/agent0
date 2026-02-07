@@ -1,6 +1,7 @@
 use super::helpers::{bool_col, int_col, int_val, name_col, text_col, text_val};
 use super::{ScanContext, VirtualTable};
 use crate::sql::catalog_oids;
+use crate::sql::pg_types;
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -63,34 +64,8 @@ impl VirtualTable for PgAttribute {
                             .unwrap_or(25);
                         (oid, 4)
                     } else {
-                        let oid = match col.data_type {
-                            DataType::Boolean => 16,
-                            DataType::Int32 => 23,
-                            DataType::Int64 => 20,
-                            DataType::Float64 => 701,
-                            DataType::Text => 25,
-                            DataType::Bytes => 17,
-                            DataType::Timestamp => 1114,
-                            DataType::TimestampTz => 1184,
-                            DataType::Date => 1082,
-                            DataType::Uuid => 2950,
-                            DataType::Json => 114,
-                            DataType::Jsonb => 3802,
-                            DataType::Vector(_) => 16385,
-                            _ => 25,
-                        };
-
-                        let len = match col.data_type {
-                            DataType::Boolean => 1,
-                            DataType::Int32 => 4,
-                            DataType::Int64 => 8,
-                            DataType::Float64 => 8,
-                            DataType::Timestamp => 8,
-                            DataType::TimestampTz => 8,
-                            DataType::Date => 4,
-                            _ => -1,
-                        };
-                        (oid, len)
+                        let (oid, typlen) = pg_types::oid_and_typlen_for_datatype(&col.data_type);
+                        (oid, typlen as i64)
                     };
 
                     rows.push(Row::new(vec![

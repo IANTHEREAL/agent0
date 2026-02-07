@@ -851,21 +851,7 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                 Value::Null => return Ok(Value::Null),
                 _ => 0,
             };
-            let type_name = match oid {
-                16 => "bool",
-                20 => "int8",
-                23 => "int4",
-                701 => "float8",
-                25 => "text",
-                17 => "bytea",
-                1114 => "timestamp",
-                1184 => "timestamptz",
-                2950 => "uuid",
-                114 => "json",
-                3802 => "jsonb",
-                16385 => "vector",
-                _ => "text",
-            };
+            let type_name = crate::sql::pg_types::typname_for_oid(oid).unwrap_or("text");
             Ok(Value::Text(type_name.to_string()))
         }
         // OBJ_DESCRIPTION, COL_DESCRIPTION, SHOBJ_DESCRIPTION, PG_GET_SERIAL_SEQUENCE are handled by the registry

@@ -1,5 +1,6 @@
 use super::helpers::{int_col, int_val, schema_oid, text_col, text_val};
 use super::{ScanContext, VirtualTable};
+use crate::sql::pg_types;
 use crate::types::{Row, TableSchema, UserTypeKind};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -51,36 +52,22 @@ impl VirtualTable for PgType {
         let mut rows = Vec::new();
         let pg_catalog_oid = schema_oid(ctx.schema_oids, "pg_catalog");
 
-        #[rustfmt::skip]
-        let builtin_types: &[(i64, &str, i64, &str, &str, &str, i64)] = &[
-            (16, "bool", 1, "t", "b", "B", 0),
-            (17, "bytea", -1, "f", "b", "U", 0),
-            (20, "int8", 8, "t", "b", "N", 0),
-            (21, "int2", 2, "t", "b", "N", 0),
-            (23, "int4", 4, "t", "b", "N", 0),
-            (25, "text", -1, "f", "b", "S", 100),
-            (26, "oid", 4, "t", "b", "N", 0),
-            (114, "json", -1, "f", "b", "U", 0),
-            (700, "float4", 4, "t", "b", "N", 0),
-            (701, "float8", 8, "t", "b", "N", 0),
-            (1042, "bpchar", -1, "f", "b", "S", 100),
-            (1043, "varchar", -1, "f", "b", "S", 100),
-            (1082, "date", 4, "t", "b", "D", 0),
-            (1114, "timestamp", 8, "t", "b", "D", 0),
-            (1184, "timestamptz", 8, "t", "b", "D", 0),
-            (1186, "interval", 16, "f", "b", "T", 0),
-            (1700, "numeric", -1, "f", "b", "N", 0),
-            (2950, "uuid", 16, "f", "b", "U", 0),
-            (3802, "jsonb", -1, "f", "b", "U", 0),
-        ];
-
-        for &(oid, typname, typlen, typbyval, typtype, typcategory, typcollation) in builtin_types {
+        for &pg_types::BuiltinPgType {
+            oid,
+            typname,
+            typlen,
+            typbyval,
+            typtype,
+            typcategory,
+            typcollation,
+        } in pg_types::BUILTIN_PG_TYPES
+        {
             rows.push(Row::new(vec![
                 int_val(oid),
                 text_val(typname),
                 int_val(pg_catalog_oid),
                 int_val(10),
-                int_val(typlen),
+                int_val(typlen as i64),
                 text_val(typbyval),
                 text_val(typtype),
                 text_val(typcategory),
@@ -93,24 +80,6 @@ impl VirtualTable for PgType {
                 int_val(typcollation),
             ]));
         }
-
-        rows.push(Row::new(vec![
-            int_val(16385),
-            text_val("vector"),
-            int_val(pg_catalog_oid),
-            int_val(10),
-            int_val(-1),
-            text_val("f"),
-            text_val("b"),
-            text_val("A"),
-            text_val("f"),
-            text_val("t"),
-            text_val(","),
-            int_val(0),
-            int_val(0),
-            int_val(0),
-            int_val(0),
-        ]));
 
         const HSTORE_OID: i64 = 16386;
         const HSTORE_ARRAY_OID: i64 = 16387;
