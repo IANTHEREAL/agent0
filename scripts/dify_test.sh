@@ -39,6 +39,7 @@ Commands:
 
 Environment Variables:
     PG_TIKV_PORT    pg-tikv port (default: 5433)
+    PG_TIKV_HOST    pg-tikv listen address (default: 0.0.0.0)
     PD_ENDPOINTS    TiKV PD endpoints (default: 127.0.0.1:46515)
     DIFY_KEYSPACE   Keyspace/tenant name (default: dify)
 
@@ -75,7 +76,7 @@ start_pgtikv() {
     cd "$PG_TIKV_DIR"
     PD_ENDPOINTS="$PD_ENDPOINTS" \
     PG_PORT="$PG_TIKV_PORT" \
-    PG_HOST="$PG_TIKV_HOST" \
+    PG_LISTEN_ADDR="$PG_TIKV_HOST" \
     ./target/release/pg-tikv > /tmp/pgtikv-dify.log 2>&1 &
     
     # Wait for startup

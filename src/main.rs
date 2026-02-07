@@ -179,9 +179,8 @@ async fn async_main() -> Result<()> {
 
     sql::trigger_worker::spawn_trigger_worker(client_pool.clone());
 
-    let addr = format!("{}:{}", pg_listen_addr, pg_port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("PostgreSQL server listening on {}", addr);
+    let listener = TcpListener::bind((pg_listen_addr.as_str(), pg_port)).await?;
+    info!("PostgreSQL server listening on {}", listener.local_addr()?);
     let connect_host: &str = if pg_listen_addr == "0.0.0.0" {
         "127.0.0.1"
     } else if pg_listen_addr == "::" {

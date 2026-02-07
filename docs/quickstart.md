@@ -85,7 +85,7 @@ PG_KEYSPACE=default \
 
 ## Security Note
 
-By default, pg-tikv binds to `0.0.0.0:${PG_PORT}` and bootstraps a superuser `admin` with password `admin` per keyspace. Do not expose this to the public internet. For production-like usage, change the default password and enable TLS (see `docs/authentication.md` and `docs/release-notes-v0.1.0.md`).
+By default, pg-tikv binds to `127.0.0.1:${PG_PORT}`. To accept non-loopback connections, explicitly set `PG_LISTEN_ADDR=0.0.0.0` (or a specific interface address). The current bootstrap behavior creates a superuser `admin` with password `admin` per keyspace; do not expose this to the public internet. For production-like usage, change the default password and enable TLS (see `docs/authentication.md` and `docs/release-notes-v0.1.0.md`).
 
 ## Connecting
 

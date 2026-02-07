@@ -166,9 +166,10 @@ pg-tikv uses the `tracing` crate for logging. Log level is set to INFO by defaul
 INFO pg-tikv starting up...
 INFO PD endpoints: 127.0.0.1:2379
 INFO PostgreSQL port: 5433
+INFO PostgreSQL listen addr: 127.0.0.1
 INFO Default keyspace: default
-INFO Password authentication: disabled
-INFO PostgreSQL server listening on 0.0.0.0:5433
+INFO Password authentication: enabled (via AuthManager)
+INFO PostgreSQL server listening on 127.0.0.1:5433
 INFO New connection from 127.0.0.1:54321
 INFO Extracted keyspace 'tenant_a' from username 'tenant_a.admin'
 INFO Authentication successful for user 'admin' with keyspace Some("tenant_a")

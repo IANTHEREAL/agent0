@@ -12,7 +12,7 @@ This document tracks compatibility issues found when running [Dify](https://gith
 
 ```bash
 # pg-tikv running on
-PG_HOST=0.0.0.0
+PG_LISTEN_ADDR=0.0.0.0
 PG_PORT=5433
 PD_ENDPOINTS=127.0.0.1:36701  # Use actual PD port from tikv_admin.py
 
@@ -194,7 +194,7 @@ cd ~/lab/pg-tikv
 uv run scripts/tikv_admin.py start --name dify-test --persistent
 
 # 2. Start pg-tikv
-PD_ENDPOINTS=127.0.0.1:<pd_port> PG_PORT=5433 PG_HOST=0.0.0.0 ./target/release/pg-tikv
+PD_ENDPOINTS=127.0.0.1:<pd_port> PG_PORT=5433 PG_LISTEN_ADDR=0.0.0.0 ./target/release/pg-tikv
 
 # 3. Configure and start Dify
 cd ~/lab/dify/docker
