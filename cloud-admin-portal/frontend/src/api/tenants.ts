@@ -2,6 +2,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query"
 import { ApiError, apiRequest } from "./client"
 import type {
   Tenant,
+  TenantListResponse,
   CreateTenantRequest,
   CreateTenantResponse,
   TenantConnectRequest,
@@ -14,7 +15,8 @@ import type {
 export function useTenants() {
   return useQuery({
     queryKey: ["tenants"],
-    queryFn: () => apiRequest<Tenant[]>("/tenants"),
+    queryFn: () => apiRequest<TenantListResponse>("/tenants"),
+    select: (data) => data.items,
   })
 }
 

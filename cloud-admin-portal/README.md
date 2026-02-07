@@ -1,58 +1,100 @@
 # pg-tikv Cloud Admin Portal
 
-A modern web interface for managing pg-tikv multi-tenant database instances.
+A modern web interface and CLI for managing pg-tikv multi-tenant database instances.
 
 ## Features
 
-- **Tenant Management**: Create, view, and disable database tenants
+- **Tenant Management**: Create, view, disable, and remove database tenants with state machine (CREATING → ACTIVE → DISABLING → DISABLED)
 - **User Management**: Manage users within each tenant with secure credential handling
-- **Per-Tenant Authentication**: No global portal auth - authenticate per tenant when needed
-- **Modern UI**: Built with React, TypeScript, and shadcn/ui components
-- **Production Ready**: Docker deployment with nginx reverse proxy
+- **Per-Tenant Observability**: Built-in metrics and query sampling via bootstrapped observer accounts
+- **API Key Authentication**: Optional `X-API-Key` header for all endpoints
+- **Background Reconciler**: Automatically recovers stuck CREATING/DISABLING tenants
+- **Audit Logging**: All tenant/user operations logged with operator, timestamps, and metadata
+- **CLI Tool**: `pgtikv-ctl` for command-line tenant and user management
+- **Dual Database**: SQLite for development, PostgreSQL for production
+- **Modern UI**: React frontend with shadcn/ui components
 
 ## Architecture
 
 ```
 cloud-admin-portal/
-├── backend/              # FastAPI Python backend
-│   ├── app/
-│   │   ├── api/          # REST API endpoints
-│   │   ├── models/       # Pydantic models
-│   │   └── services/     # Business logic
-│   └── Dockerfile
-├── frontend/             # React TypeScript frontend
+├── backend-rs/              # Rust backend (production)
 │   ├── src/
-│   │   ├── api/          # API client hooks
-│   │   ├── components/   # React components
-│   │   ├── hooks/        # Custom hooks
-│   │   └── pages/        # Page components
-│   └── Dockerfile
-├── deploy/               # Deployment configuration
-│   ├── docker-compose.yml
-│   └── nginx/
-└── scripts/              # Helper scripts
+│   │   ├── api/             # axum handlers (tenants, users, system, audit)
+│   │   ├── services/        # PD client, pg-tikv client, reconciler
+│   │   ├── config.rs        # Env-based configuration
+│   │   ├── db.rs            # sqlx AnyPool (SQLite/PostgreSQL)
+│   │   ├── auth.rs          # API key + tenant session extractors
+│   │   ├── session.rs       # In-memory session manager
+│   │   ├── main.rs          # pgtikv-admin server binary
+│   │   └── cli.rs           # pgtikv-ctl CLI binary
+│   └── Cargo.toml
+├── backend/                 # Python backend (legacy, tests still valid)
+│   ├── app/
+│   └── tests/
+├── frontend/                # React TypeScript frontend
+│   └── src/
+├── deploy/                  # Docker Compose + nginx
+└── scripts/                 # dev.sh, build.sh
 ```
 
 ## Quick Start
 
-### Development
+### Build
 
 ```bash
-# Start both frontend and backend with one command
-./scripts/dev.sh
+cd backend-rs
+cargo build --release
 ```
 
-Or start them separately:
+Produces two binaries in `target/release/`:
+- **`pgtikv-admin`** — HTTP API server
+- **`pgtikv-ctl`** — CLI tool
+
+### Run Server
 
 ```bash
-# Backend (terminal 1)
-cd backend
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8090
+# Minimal (SQLite, no auth)
+./target/release/pgtikv-admin
 
-# Frontend (terminal 2)
+# Production
+PGTIKV_DATABASE_URL=postgres://user:pass@localhost/portal \
+PGTIKV_PD_ENDPOINTS=10.0.0.1:2379 \
+PGTIKV_API_KEYS=my-secret-key \
+./target/release/pgtikv-admin
+```
+
+### CLI Usage
+
+```bash
+# List tenants
+pgtikv-ctl tenants list
+
+# Create tenant
+pgtikv-ctl tenants create --admin-user admin
+
+# Get tenant details
+pgtikv-ctl tenants get <tenant_id>
+
+# Connect to tenant (get session for user management)
+pgtikv-ctl connect <tenant_id> --admin-user admin --admin-password secret
+
+# List users (requires session)
+pgtikv-ctl users list <tenant_id> --session <session_id>
+
+# Create user
+pgtikv-ctl users create <tenant_id> --username myuser --session <session_id>
+
+# Health check
+pgtikv-ctl health
+
+# JSON output
+pgtikv-ctl --json tenants list
+```
+
+### Frontend
+
+```bash
 cd frontend
 npm install
 npm run dev
@@ -61,15 +103,6 @@ npm run dev
 **URLs:**
 - Frontend: http://localhost:5173
 - Backend API: http://localhost:8090/api
-- API Docs: http://localhost:8090/api/docs
-
-### Production
-
-```bash
-cd deploy
-cp .env.example .env
-docker-compose up -d
-```
 
 ## Configuration
 
@@ -81,29 +114,21 @@ docker-compose up -d
 | `PGTIKV_PG_HOST` | `127.0.0.1` | pg-tikv server host (internal) |
 | `PGTIKV_PG_PORT` | `5433` | pg-tikv server port (internal) |
 | `PGTIKV_PG_PUBLIC_ENDPOINTS` | `127.0.0.1:5433` | Public pg-tikv endpoints for clients (comma-separated) |
-| `PGTIKV_API_PORT` | `8080` | API server port |
-| `PGTIKV_CORS_ORIGINS` | `["http://localhost:5173"]` | Allowed CORS origins |
+| `PGTIKV_API_PORT` | `8090` | API server port |
+| `PGTIKV_API_HOST` | `0.0.0.0` | API server bind address |
+| `PGTIKV_DATABASE_URL` | `sqlite://data/portal.db?mode=rwc` | Metadata database (SQLite or PostgreSQL) |
+| `PGTIKV_API_KEYS` | (empty) | Comma-separated API keys (empty = no auth) |
+| `PGTIKV_CORS_ORIGINS` | `http://localhost:5173,http://localhost:3000` | Allowed CORS origins |
+| `PGTIKV_RECONCILER_ENABLED` | `true` | Enable background reconciler |
+| `PGTIKV_RECONCILER_INTERVAL_SECONDS` | `300` | Reconciler cycle interval |
+| `PGTIKV_SESSION_TTL_HOURS` | `1` | Tenant session expiry |
 
-**Multi-Endpoint Configuration for Load Balancing:**
+### CLI Environment Variables
 
-The portal supports multiple public endpoints for load balancing scenarios:
-
-```bash
-# Single endpoint (default)
-PGTIKV_PG_PUBLIC_ENDPOINTS=pg.example.com:5433
-
-# Multiple endpoints for load balancing
-PGTIKV_PG_PUBLIC_ENDPOINTS=pg1.example.com:5433,pg2.example.com:5433,pg3.example.com:5433
-
-# With regions (configure in production deployment)
-# Endpoints can be tagged with region info for geographic routing
-```
-
-The portal will display all configured endpoints to users with:
-- Endpoint type (primary/replica/load_balancer)
-- Priority ranking
-- Connection commands for each endpoint
-- Region information (if configured)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PGTIKV_API_URL` | `http://localhost:8090/api` | API base URL |
+| `PGTIKV_API_KEY` | (empty) | API key for authentication |
 
 ### Frontend Environment Variables
 
@@ -117,56 +142,88 @@ The portal will display all configured endpoints to users with:
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/tenants` | List all tenants |
+| GET | `/api/tenants` | List tenants (paginated, filterable) |
 | POST | `/api/tenants` | Create new tenant |
-| GET | `/api/tenants/{name}` | Get tenant details |
-| DELETE | `/api/tenants/{name}` | Disable tenant |
-| POST | `/api/tenants/{name}/connect` | Connect to tenant (get session) |
+| GET | `/api/tenants/{id}` | Get tenant details with endpoints |
+| PUT | `/api/tenants/{id}` | Update tenant metadata (notes, tags) |
+| DELETE | `/api/tenants/{id}` | Disable tenant |
+| POST | `/api/tenants/{id}/remove` | Remove tenant (same as delete) |
+| POST | `/api/tenants/{id}/connect` | Get tenant session |
+| POST | `/api/tenants/{id}/query` | Execute SQL (requires session) |
+| GET | `/api/tenants/{id}/observability` | Get metrics + query samples |
+| POST | `/api/tenants/{id}/observability/bootstrap` | Bootstrap observer account |
 
-### Users (requires tenant session)
+### Users (requires `X-Tenant-Session` header)
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/tenants/{name}/users` | List users |
-| POST | `/api/tenants/{name}/users` | Create user |
-| DELETE | `/api/tenants/{name}/users/{user}` | Delete user |
-| POST | `/api/tenants/{name}/users/{user}/password` | Reset password |
+| GET | `/api/tenants/{id}/users` | List users |
+| POST | `/api/tenants/{id}/users` | Create user |
+| DELETE | `/api/tenants/{id}/users/{username}` | Delete user |
+| POST | `/api/tenants/{id}/users/{username}/password` | Reset password |
 
 ### System
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/health` | Health check |
-| GET | `/api/info` | API information |
+| GET | `/api/health` | Health check (includes PD status) |
+| GET | `/api/info` | API version info |
+| GET | `/api/audit-logs` | Query audit logs (filterable) |
 
-## Authentication Model
+## Authentication
 
-This portal uses **per-tenant authentication** instead of a global portal login:
+### API Key Authentication
 
-1. **Tenant list/create/delete**: No authentication required
-2. **User management**: Requires connecting to the tenant first
-   - Call `POST /api/tenants/{name}/connect` with tenant admin credentials
-   - Returns a session ID valid for 1 hour
-   - Include session ID in `X-Tenant-Session` header for user operations
+When `PGTIKV_API_KEYS` is set, all endpoints require an `X-API-Key` header:
 
-This design ensures that only users with valid tenant credentials can manage that tenant's users.
+```bash
+curl -H "X-API-Key: my-secret" http://localhost:8090/api/tenants
+```
+
+### Per-Tenant Session
+
+User management requires connecting to the tenant first:
+
+1. `POST /api/tenants/{id}/connect` with `{ "admin_user": "admin", "admin_password": "..." }`
+2. Returns `{ "session_id": "...", "expires_at": "..." }`
+3. Include `X-Tenant-Session: <session_id>` header for user management APIs
+4. Sessions expire after 1 hour (configurable via `PGTIKV_SESSION_TTL_HOURS`)
+
+## Tenant State Machine
+
+```
+CREATING → ACTIVE (success) or CREATE_FAILED (failure)
+ACTIVE → DISABLING → DISABLED (delete/remove)
+ACTIVE → SUSPENDED (future)
+
+Reconciler: CREATING(>10min) → check PD → ACTIVE or CREATE_FAILED
+Reconciler: DISABLING(>10min) → DISABLED
+```
 
 ## Development
 
-### Backend Tests
+### Python Backend (Legacy)
 
 ```bash
 cd backend
-source .venv/bin/activate
-pytest -v
+uv sync
+uv run pytest -v                    # 10 tests
 ```
 
-### Frontend Build
+### Frontend
 
 ```bash
 cd frontend
-npm run build
-npx tsc --noEmit
+npx tsc --noEmit                    # Type check
+npm run build                       # Production build
+```
+
+### Rust Backend
+
+```bash
+cd backend-rs
+cargo check                         # Type check
+cargo build --release               # Build both binaries
 ```
 
 ## License
