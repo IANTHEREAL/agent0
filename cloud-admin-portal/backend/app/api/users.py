@@ -1,10 +1,9 @@
-import secrets
-import string
-from typing import List, Optional
+from typing import List
 
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
+from ..auth import require_api_key
 from ..config import get_settings, Settings
 from ..database import get_db
 from ..models import (
@@ -14,67 +13,21 @@ from ..models import (
     PasswordResetResponse,
     MessageResponse,
 )
-from ..models.db import TenantDB
 from ..services import PgTikvClient
 from ..services.audit import get_audit_service
-from ..session import session_manager, TenantSession
-
+from ..session import TenantSession
+from .deps import get_pg_client, get_tenant_or_404, get_tenant_session, generate_password
 
 router = APIRouter()
 
 
-def get_pg_client(settings: Settings = Depends(get_settings)) -> PgTikvClient:
-    return PgTikvClient(settings.pg_host, settings.pg_port)
-
-
-def generate_password(length: int = 16) -> str:
-    alphabet = string.ascii_letters + string.digits + "!@#$%^&*"
-    return "".join(secrets.choice(alphabet) for _ in range(length))
-
-
-def get_tenant_or_404(tenant_id: str, db: Session) -> TenantDB:
-    tenant = db.query(TenantDB).filter(
-        TenantDB.id == tenant_id,
-        TenantDB.is_deleted == False
-    ).first()
-    if not tenant:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Tenant '{tenant_id}' not found",
-        )
-    return tenant
-
-
-async def get_tenant_session(
-    tenant_id: str,
-    x_tenant_session: Optional[str] = Header(None, alias="X-Tenant-Session"),
-) -> TenantSession:
-    if not x_tenant_session:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Tenant session required. Use POST /api/tenants/{id}/connect first.",
-        )
-
-    session = session_manager.validate_session(x_tenant_session, tenant_id)
-    if not session:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired tenant session",
-        )
-
-    return session
-
-
-@router.get(
-    "/tenants/{tenant_id}/users",
-    response_model=List[UserResponse],
-    summary="List users in tenant",
-)
+@router.get("/tenants/{tenant_id}/users", response_model=List[UserResponse])
 async def list_users(
     tenant_id: str,
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
     db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
 ):
     tenant = get_tenant_or_404(tenant_id, db)
     users = pg.list_users(tenant.keyspace, session.admin_user, session.admin_password)
@@ -94,7 +47,6 @@ async def list_users(
     "/tenants/{tenant_id}/users",
     response_model=UserCreateResponse,
     status_code=status.HTTP_201_CREATED,
-    summary="Create user in tenant",
 )
 async def create_user(
     tenant_id: str,
@@ -103,6 +55,7 @@ async def create_user(
     pg: PgTikvClient = Depends(get_pg_client),
     settings: Settings = Depends(get_settings),
     db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
 ):
     tenant = get_tenant_or_404(tenant_id, db)
     password = request.password or generate_password()
@@ -143,17 +96,14 @@ async def create_user(
         )
 
 
-@router.delete(
-    "/tenants/{tenant_id}/users/{username}",
-    response_model=MessageResponse,
-    summary="Delete user from tenant",
-)
+@router.delete("/tenants/{tenant_id}/users/{username}", response_model=MessageResponse)
 async def delete_user(
     tenant_id: str,
     username: str,
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
     db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
 ):
     tenant = get_tenant_or_404(tenant_id, db)
     audit = get_audit_service(db)
@@ -169,7 +119,6 @@ async def delete_user(
             )
 
         audit.log_user_deleted(tenant_id, username, success=True, operator=session.admin_user)
-
         return MessageResponse(message=f"User '{username}' deleted")
 
     except HTTPException:
@@ -182,17 +131,14 @@ async def delete_user(
         )
 
 
-@router.post(
-    "/tenants/{tenant_id}/users/{username}/password",
-    response_model=PasswordResetResponse,
-    summary="Reset user password",
-)
+@router.post("/tenants/{tenant_id}/users/{username}/password", response_model=PasswordResetResponse)
 async def reset_password(
     tenant_id: str,
     username: str,
     session: TenantSession = Depends(get_tenant_session),
     pg: PgTikvClient = Depends(get_pg_client),
     db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
 ):
     tenant = get_tenant_or_404(tenant_id, db)
     new_password = generate_password()
@@ -215,7 +161,6 @@ async def reset_password(
             )
 
         audit.log_password_reset(tenant_id, username, success=True, operator=session.admin_user)
-
         return PasswordResetResponse(username=username, password=new_password)
 
     except HTTPException:

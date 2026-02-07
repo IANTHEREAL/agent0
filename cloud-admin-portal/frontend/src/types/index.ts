@@ -23,6 +23,14 @@ export interface Tenant {
   notes?: string | null
   tags?: string[] | null
   updated_at?: string | null
+  state_reason?: string | null
+}
+
+export interface TenantListResponse {
+  items: Tenant[]
+  total: number
+  page: number
+  size: number
 }
 
 export interface CreateTenantRequest {

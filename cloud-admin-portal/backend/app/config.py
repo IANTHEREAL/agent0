@@ -70,9 +70,35 @@ class Settings(BaseSettings):
         description="Enable debug mode"
     )
 
+    # API Key Authentication
+    api_keys: str = Field(
+        default="",
+        description=(
+            "Comma-separated API keys for portal authentication. "
+            "Empty = auth disabled (dev mode). "
+            "Example: PGTIKV_API_KEYS=key1,key2,key3"
+        )
+    )
+
+    # Reconciler
+    reconciler_enabled: bool = Field(
+        default=True,
+        description="Enable background reconciler that syncs DB state with PD"
+    )
+    reconciler_interval_seconds: int = Field(
+        default=300,
+        description="Reconciler check interval in seconds"
+    )
+
     class Config:
         env_prefix = "PGTIKV_"
         case_sensitive = False
+
+    def get_api_key_list(self) -> list[str]:
+        """Parse api_keys into a list. Empty list = auth disabled."""
+        if not self.api_keys.strip():
+            return []
+        return [k.strip() for k in self.api_keys.split(",") if k.strip()]
 
     def parse_public_endpoints(self) -> list[tuple[str, int]]:
         """Parse pg_public_endpoints into list of (host, port) tuples.

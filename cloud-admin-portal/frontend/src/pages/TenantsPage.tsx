@@ -137,17 +137,21 @@ export function TenantsPage() {
                         <span
                           className={cn(
                             "inline-flex items-center gap-1.5 text-xs",
-                            tenant.state === "ENABLED"
+                            tenant.state === "ACTIVE"
                               ? "text-green-600"
-                              : "text-red-600"
+                              : tenant.state === "CREATING" || tenant.state === "DISABLING"
+                                ? "text-yellow-600"
+                                : "text-red-600"
                           )}
                         >
                           <span
                             className={cn(
                               "w-1.5 h-1.5 rounded-full",
-                              tenant.state === "ENABLED"
+                              tenant.state === "ACTIVE"
                                 ? "bg-green-500"
-                                : "bg-red-500"
+                                : tenant.state === "CREATING" || tenant.state === "DISABLING"
+                                  ? "bg-yellow-500"
+                                  : "bg-red-500"
                             )}
                           />
                           {tenant.state}

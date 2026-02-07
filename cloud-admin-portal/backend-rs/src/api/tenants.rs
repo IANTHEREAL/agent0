@@ -1,0 +1,487 @@
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::Json;
+use rand::Rng;
+
+use crate::auth::{ApiKeyAuth, TenantSessionExtractor};
+use crate::db;
+use crate::error::AppError;
+use crate::models::*;
+use crate::services::pd_client::PdClient;
+use crate::services::pg_client::PgClient;
+use crate::AppState;
+
+const OBSERVABILITY_USER: &str = "_pgtikv_sys_observer";
+
+fn generate_tenant_id() -> String {
+    let mut rng = rand::thread_rng();
+    let charset = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    (0..12)
+        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .collect()
+}
+
+fn make_keyspace(id: &str) -> String {
+    format!("ks_{id}")
+}
+
+fn generate_password() -> String {
+    let mut rng = rand::thread_rng();
+    let charset = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";
+    (0..16)
+        .map(|_| charset[rng.gen_range(0..charset.len())] as char)
+        .collect()
+}
+
+// ── List tenants ─────────────────────────────────────────────────
+
+pub async fn list_tenants(
+    State(state): State<AppState>,
+    _auth: ApiKeyAuth,
+    Query(params): Query<ListTenantsParams>,
+) -> Result<Json<TenantListResponse>, AppError> {
+    let page = params.page.unwrap_or(1);
+    let size = params.size.unwrap_or(50);
+
+    let (tenants, total) =
+        db::list_tenants(&state.db, page, size, params.state.as_deref(), params.q.as_deref()).await?;
+
+    let items: Vec<TenantResponse> = tenants.iter().map(|t| t.to_response()).collect();
+
+    Ok(Json(TenantListResponse {
+        items,
+        total,
+        page,
+        size,
+    }))
+}
+
+// ── Create tenant ────────────────────────────────────────────────
+
+pub async fn create_tenant(
+    State(state): State<AppState>,
+    _auth: ApiKeyAuth,
+    Json(request): Json<CreateTenantRequest>,
+) -> Result<(StatusCode, Json<CreateTenantResponse>), AppError> {
+    let tenant_id = generate_tenant_id();
+    let keyspace = make_keyspace(&tenant_id);
+    let admin_user = request.admin_user.unwrap_or_else(|| "admin".to_string());
+    let password = request.admin_password.unwrap_or_else(generate_password);
+
+    // Check for ID collision
+    if db::get_tenant_by_id(&state.db, &tenant_id).await?.is_some() {
+        return Err(AppError::conflict("ID collision, please retry"));
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    db::insert_tenant(&state.db, &tenant_id, &keyspace, "CREATING", &now).await?;
+
+    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
+    if !pd.create_keyspace(&keyspace).await {
+        db::update_tenant_state(&state.db, &tenant_id, "CREATE_FAILED", Some("Failed to create keyspace in PD")).await?;
+        db::insert_audit_log(
+            &state.db, "CREATE", "TENANT", &tenant_id,
+            Some(&tenant_id), None, false,
+            Some("Failed to create keyspace in PD"), None,
+        ).await.ok();
+        return Err(AppError::internal("Failed to create keyspace in TiKV"));
+    }
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+    if !pg.bootstrap_admin_password(&keyspace, &admin_user, &password).await {
+        db::update_tenant_state(
+            &state.db, &tenant_id, "CREATE_FAILED",
+            Some("Keyspace created but password bootstrap failed"),
+        ).await?;
+        db::insert_audit_log(
+            &state.db, "CREATE", "TENANT", &tenant_id,
+            Some(&tenant_id), None, false,
+            Some("Password bootstrap failed"), None,
+        ).await.ok();
+        return Err(AppError::internal(
+            "Failed to set admin password. Keyspace created but password unchanged.",
+        ));
+    }
+
+    db::update_tenant_state(&state.db, &tenant_id, "ACTIVE", None).await?;
+    db::insert_audit_log(
+        &state.db, "CREATE", "TENANT", &tenant_id,
+        Some(&tenant_id), None, true, None, None,
+    ).await.ok();
+
+    let endpoints = state.config.parse_public_endpoints();
+    let (host, port) = endpoints.first().cloned().unwrap_or_else(|| ("127.0.0.1".into(), 5433));
+
+    Ok((
+        StatusCode::CREATED,
+        Json(CreateTenantResponse {
+            id: tenant_id,
+            admin_user: admin_user.clone(),
+            admin_password: password.clone(),
+            connection_string: format!(
+                "postgresql://{keyspace}.{admin_user}:{password}@{host}:{port}/postgres"
+            ),
+            created_at: now,
+        }),
+    ))
+}
+
+// ── Get tenant ───────────────────────────────────────────────────
+
+pub async fn get_tenant(
+    State(state): State<AppState>,
+    _auth: ApiKeyAuth,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<TenantResponse>, AppError> {
+    let tenant = db::get_tenant(&state.db, &tenant_id)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
+
+    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
+    if pd.get_keyspace(&tenant.keyspace).await.is_none() {
+        return Err(AppError::not_found(format!(
+            "Tenant '{tenant_id}' keyspace not found in TiKV"
+        )));
+    }
+
+    let endpoint_tuples = state.config.parse_public_endpoints();
+    let endpoints: Vec<Endpoint> = endpoint_tuples
+        .iter()
+        .enumerate()
+        .map(|(i, (host, port))| Endpoint {
+            host: host.clone(),
+            port: *port,
+            ep_type: if endpoint_tuples.len() > 1 {
+                "load_balancer".into()
+            } else {
+                "primary".into()
+            },
+            priority: 100 - (i as i32) * 10,
+            description: if endpoint_tuples.len() > 1 {
+                Some(format!("pg-tikv endpoint {}", i + 1))
+            } else {
+                Some("pg-tikv primary endpoint".into())
+            },
+        })
+        .collect();
+
+    let mut resp = tenant.to_response();
+    resp.endpoints = Some(endpoints);
+    Ok(Json(resp))
+}
+
+// ── Delete tenant ────────────────────────────────────────────────
+
+pub async fn delete_tenant(
+    State(state): State<AppState>,
+    _auth: ApiKeyAuth,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<MessageResponse>, AppError> {
+    let tenant = db::get_tenant(&state.db, &tenant_id)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
+
+    db::update_tenant_state(&state.db, &tenant_id, "DISABLING", None).await?;
+
+    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
+    if !pd.disable_keyspace(&tenant.keyspace).await {
+        db::update_tenant_state(
+            &state.db, &tenant_id, "ACTIVE",
+            Some("Failed to disable keyspace in PD"),
+        ).await?;
+        db::insert_audit_log(
+            &state.db, "DELETE", "TENANT", &tenant_id,
+            Some(&tenant_id), None, false,
+            Some("Failed to disable keyspace"), None,
+        ).await.ok();
+        return Err(AppError::internal("Failed to disable tenant"));
+    }
+
+    db::update_tenant_state(&state.db, &tenant_id, "DISABLED", Some("Deleted via API")).await?;
+    db::insert_audit_log(
+        &state.db, "DELETE", "TENANT", &tenant_id,
+        Some(&tenant_id), None, true, None, None,
+    ).await.ok();
+
+    Ok(Json(MessageResponse {
+        message: format!("Tenant '{tenant_id}' disabled"),
+    }))
+}
+
+// ── Remove tenant ────────────────────────────────────────────────
+
+pub async fn remove_tenant(
+    State(state): State<AppState>,
+    _auth: ApiKeyAuth,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<MessageResponse>, AppError> {
+    let tenant = db::get_tenant(&state.db, &tenant_id)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
+
+    db::update_tenant_state(&state.db, &tenant_id, "DISABLING", None).await?;
+
+    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
+    if !pd.disable_keyspace(&tenant.keyspace).await {
+        db::update_tenant_state(
+            &state.db, &tenant_id, "ACTIVE",
+            Some("Failed to disable keyspace in PD"),
+        ).await?;
+        db::insert_audit_log(
+            &state.db, "DELETE", "TENANT", &tenant_id,
+            Some(&tenant_id), None, false,
+            Some("Failed to disable keyspace"), None,
+        ).await.ok();
+        return Err(AppError::internal("Failed to disable keyspace in TiKV"));
+    }
+
+    db::update_tenant_state(&state.db, &tenant_id, "DISABLED", Some("Removed via portal")).await?;
+    db::insert_audit_log(
+        &state.db, "DELETE", "TENANT", &tenant_id,
+        Some(&tenant_id), None, true, None, None,
+    ).await.ok();
+
+    Ok(Json(MessageResponse {
+        message: format!("Tenant '{tenant_id}' removed from portal"),
+    }))
+}
+
+// ── Update tenant ────────────────────────────────────────────────
+
+pub async fn update_tenant(
+    State(state): State<AppState>,
+    _auth: ApiKeyAuth,
+    Path(tenant_id): Path<String>,
+    Json(request): Json<TenantUpdateRequest>,
+) -> Result<Json<TenantResponse>, AppError> {
+    let _tenant = db::get_tenant(&state.db, &tenant_id)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
+
+    let tags_json = request
+        .tags
+        .as_ref()
+        .map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".into()));
+
+    db::update_tenant_metadata(
+        &state.db,
+        &tenant_id,
+        request.notes.as_deref(),
+        tags_json.as_deref(),
+    )
+    .await?;
+
+    db::insert_audit_log(
+        &state.db, "UPDATE", "TENANT", &tenant_id,
+        Some(&tenant_id), None, true, None, None,
+    ).await.ok();
+
+    let updated = db::get_tenant(&state.db, &tenant_id)
+        .await?
+        .ok_or_else(|| AppError::internal("Tenant disappeared after update"))?;
+
+    Ok(Json(updated.to_response()))
+}
+
+// ── Connect tenant ───────────────────────────────────────────────
+
+pub async fn connect_tenant(
+    State(state): State<AppState>,
+    _auth: ApiKeyAuth,
+    Path(tenant_id): Path<String>,
+    Json(request): Json<TenantConnectRequest>,
+) -> Result<Json<TenantConnectResponse>, AppError> {
+    let tenant = db::get_tenant(&state.db, &tenant_id)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
+
+    if tenant.state == "SUSPENDED" {
+        return Err(AppError::forbidden("Tenant is suspended"));
+    }
+
+    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
+    if pd.get_keyspace(&tenant.keyspace).await.is_none() {
+        return Err(AppError::not_found(format!(
+            "Tenant '{tenant_id}' keyspace not found"
+        )));
+    }
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+    if !pg.test_connection(&tenant.keyspace, &request.admin_user, &request.admin_password).await {
+        return Err(AppError::unauthorized("Invalid tenant credentials"));
+    }
+
+    let session = state.sessions.create_session(
+        &tenant_id,
+        &tenant.keyspace,
+        &request.admin_user,
+        &request.admin_password,
+    );
+
+    Ok(Json(TenantConnectResponse {
+        session_id: session.session_id,
+        expires_at: session.expires_at,
+    }))
+}
+
+// ── Execute query ────────────────────────────────────────────────
+
+pub async fn execute_query(
+    State(state): State<AppState>,
+    _auth: ApiKeyAuth,
+    Path(tenant_id): Path<String>,
+    headers: HeaderMap,
+    Json(request): Json<SqlQueryRequest>,
+) -> Result<Json<SqlQueryResponse>, AppError> {
+    let session = TenantSessionExtractor::from_headers(&headers, &tenant_id, &state)?;
+
+    let sql = request.sql.trim().to_string();
+    if sql.is_empty() {
+        return Ok(Json(SqlQueryResponse {
+            success: false,
+            result: None,
+            error: Some("Empty SQL query".into()),
+        }));
+    }
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+    match pg
+        .run_sql(&session.keyspace, &session.admin_user, &session.admin_password, &sql)
+        .await
+    {
+        Ok(output) => Ok(Json(SqlQueryResponse {
+            success: true,
+            result: Some(output),
+            error: None,
+        })),
+        Err(e) => Ok(Json(SqlQueryResponse {
+            success: false,
+            result: None,
+            error: Some(e),
+        })),
+    }
+}
+
+// ── Get observability ────────────────────────────────────────────
+
+pub async fn get_observability(
+    State(state): State<AppState>,
+    _auth: ApiKeyAuth,
+    Path(tenant_id): Path<String>,
+) -> Result<Json<TenantObservabilityResponse>, AppError> {
+    let tenant = db::get_tenant(&state.db, &tenant_id)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
+
+    let cred = db::get_credential(&state.db, &tenant_id, "OBSERVABILITY")
+        .await?
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::CONFLICT,
+                "Observability account not bootstrapped for this tenant",
+            )
+        })?;
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+
+    let summary_val = pg
+        .get_observability_summary(&tenant.keyspace, &cred.username, &cred.password_enc)
+        .await
+        .map_err(|e| AppError::bad_gateway(e))?
+        .ok_or_else(|| AppError::bad_gateway("Failed to fetch observability summary"))?;
+
+    let summary = ObservabilitySummary {
+        window_seconds: summary_val["window_seconds"].as_i64().unwrap_or(0),
+        statement_count: summary_val["statement_count"].as_i64().unwrap_or(0),
+        txn_commit_count: summary_val["txn_commit_count"].as_i64().unwrap_or(0),
+        error_count: summary_val["error_count"].as_i64().unwrap_or(0),
+        qps: summary_val["qps"].as_f64().unwrap_or(0.0),
+        tps: summary_val["tps"].as_f64().unwrap_or(0.0),
+        latency_avg_ms: summary_val["latency_avg_ms"].as_f64().unwrap_or(0.0),
+        latency_p99_ms: summary_val["latency_p99_ms"].as_f64().unwrap_or(0.0),
+        active_connections: summary_val["active_connections"].as_i64().unwrap_or(0),
+    };
+
+    let samples_val = pg
+        .get_observability_samples(&tenant.keyspace, &cred.username, &cred.password_enc)
+        .await;
+
+    let samples: Vec<QuerySample> = samples_val
+        .iter()
+        .map(|s| QuerySample {
+            query: s["query"].as_str().unwrap_or("").to_string(),
+            sample_count: s["sample_count"].as_i64().unwrap_or(0),
+            error_count: s["error_count"].as_i64().unwrap_or(0),
+            latency_avg_ms: s["latency_avg_ms"].as_f64().unwrap_or(0.0),
+            latency_p99_ms: s["latency_p99_ms"].as_f64().unwrap_or(0.0),
+            latency_max_ms: s["latency_max_ms"].as_f64().unwrap_or(0.0),
+            last_seen_ms_ago: s["last_seen_ms_ago"].as_i64().unwrap_or(0),
+        })
+        .collect();
+
+    Ok(Json(TenantObservabilityResponse { summary, samples }))
+}
+
+// ── Bootstrap observability ──────────────────────────────────────
+
+pub async fn bootstrap_observability(
+    State(state): State<AppState>,
+    _auth: ApiKeyAuth,
+    Path(tenant_id): Path<String>,
+    Json(request): Json<TenantConnectRequest>,
+) -> Result<Json<MessageResponse>, AppError> {
+    let tenant = db::get_tenant(&state.db, &tenant_id)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
+
+    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
+    if pd.get_keyspace(&tenant.keyspace).await.is_none() {
+        return Err(AppError::not_found(format!(
+            "Tenant '{tenant_id}' keyspace not found"
+        )));
+    }
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+    if !pg.test_connection(&tenant.keyspace, &request.admin_user, &request.admin_password).await {
+        return Err(AppError::unauthorized("Invalid tenant credentials"));
+    }
+
+    let obs_password = generate_password();
+
+    let created = pg
+        .create_user(
+            &tenant.keyspace,
+            &request.admin_user,
+            &request.admin_password,
+            OBSERVABILITY_USER,
+            &obs_password,
+            false,
+        )
+        .await;
+
+    if !created {
+        let rotated = pg
+            .reset_password(
+                &tenant.keyspace,
+                &request.admin_user,
+                &request.admin_password,
+                OBSERVABILITY_USER,
+                &obs_password,
+            )
+            .await;
+        if !rotated {
+            return Err(AppError::bad_gateway(
+                "Failed to create or rotate observability account",
+            ));
+        }
+    }
+
+    db::upsert_credential(&state.db, &tenant_id, "OBSERVABILITY", OBSERVABILITY_USER, &obs_password)
+        .await?;
+
+    Ok(Json(MessageResponse {
+        message: format!(
+            "Observability account '{OBSERVABILITY_USER}' bootstrapped for tenant '{tenant_id}'"
+        ),
+    }))
+}

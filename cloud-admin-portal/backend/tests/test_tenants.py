@@ -7,7 +7,26 @@ class TestListTenants:
         response = client.get("/api/tenants")
         assert response.status_code == 200
         data = response.json()
-        assert isinstance(data, list)
+        assert "items" in data
+        assert "total" in data
+        assert "page" in data
+        assert "size" in data
+        assert isinstance(data["items"], list)
+        assert data["page"] == 1
+        assert data["size"] == 50
+
+    def test_list_tenants_pagination(self, client):
+        response = client.get("/api/tenants?page=1&size=10")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["page"] == 1
+        assert data["size"] == 10
+
+    def test_list_tenants_filter_by_state(self, client):
+        response = client.get("/api/tenants?state=ACTIVE")
+        assert response.status_code == 200
+        data = response.json()
+        assert isinstance(data["items"], list)
 
 
 class TestGetTenant:
@@ -37,6 +56,13 @@ class TestDeleteTenant:
     def test_delete_tenant_not_found(self, client):
         response = client.delete("/api/tenants/nonexistent12")
         assert response.status_code in [200, 404]
+
+
+class TestRemoveTenant:
+
+    def test_remove_tenant_not_found(self, client):
+        response = client.post("/api/tenants/nonexistent12/remove")
+        assert response.status_code == 404
 
 
 class TestTenantObservability:

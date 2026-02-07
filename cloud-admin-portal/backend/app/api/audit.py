@@ -3,6 +3,7 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 
+from ..auth import require_api_key
 from ..database import get_db
 from ..models import AuditLogResponse
 from ..models.db import AuditLogDB
@@ -24,6 +25,7 @@ async def query_audit_logs(
     limit: int = Query(100, ge=1, le=1000, description="Maximum number of logs to return"),
     offset: int = Query(0, ge=0, description="Number of logs to skip"),
     db: Session = Depends(get_db),
+    _auth=Depends(require_api_key),
 ):
     query = db.query(AuditLogDB)
 
