@@ -2,6 +2,21 @@ use super::super::*;
 use super::table_factor::extract_virtual_table_filter;
 use super::using_merge::{rewrite_for_using_join, UsingMergeColumn};
 
+fn eval_bool_expr(
+    expr: &Expr,
+    row: &Row,
+    schema: &TableSchema,
+    err_msg: &'static str,
+) -> Result<bool> {
+    let value = eval_expr(expr, Some(row), Some(schema))?;
+    let value = coerce_text_literal_to_bool(expr, value)?;
+    match value {
+        Value::Boolean(b) => Ok(b),
+        Value::Null => Ok(false),
+        _ => Err(anyhow!(err_msg)),
+    }
+}
+
 impl Executor {
     pub(super) async fn execute_lateral_join(
         &self,
@@ -288,10 +303,11 @@ impl Executor {
                 let mut temp_table_aliases = table_aliases.clone();
                 temp_table_aliases.push((right_alias.clone(), right_schema.clone()));
 
-                let rewritten_condition = condition.as_ref().map(|cond| {
-                    rewrite_expr_for_multi_join(cond, &temp_table_aliases)
-                        .unwrap_or_else(|_| cond.clone())
-                });
+                let rewritten_condition = if let Some(cond) = condition.as_ref() {
+                    Some(rewrite_expr_for_multi_join(cond, &temp_table_aliases)?)
+                } else {
+                    None
+                };
 
                 let mut new_rows: Vec<Row> = Vec::new();
                 for left_row in &current_rows {
@@ -301,12 +317,15 @@ impl Executor {
                         combined.extend(right_row.values.iter().cloned());
                         let combined_row = Row::new(combined);
 
-                        let passes = match &rewritten_condition {
-                            Some(cond) => matches!(
-                                eval_expr(cond, Some(&combined_row), Some(&temp_combined_schema)),
-                                Ok(Value::Boolean(true))
-                            ),
-                            None => true,
+                        let passes = if let Some(cond) = &rewritten_condition {
+                            eval_bool_expr(
+                                cond,
+                                &combined_row,
+                                &temp_combined_schema,
+                                "Join condition must evaluate to boolean",
+                            )?
+                        } else {
+                            true
                         };
 
                         if passes {
@@ -347,67 +366,92 @@ impl Executor {
 
         if let Some(filter) = resolved_selection {
             let rewritten = rewrite_for_using_join(filter, &table_aliases, &merge_columns)?;
-            combined_rows.retain(|row| {
-                matches!(
-                    eval_expr(&rewritten, Some(row), Some(&combined_schema)),
-                    Ok(Value::Boolean(true))
-                )
-            });
+            let mut filtered = Vec::with_capacity(combined_rows.len());
+            for row in combined_rows.drain(..) {
+                if eval_bool_expr(
+                    &rewritten,
+                    &row,
+                    &combined_schema,
+                    "Filter predicate must evaluate to boolean",
+                )? {
+                    filtered.push(row);
+                }
+            }
+            combined_rows = filtered;
         }
 
         let rewritten_projection: Vec<SelectItem> = resolved_projection
             .iter()
-            .map(|item| match item {
-                SelectItem::UnnamedExpr(e) => {
-                    let rewritten = rewrite_for_using_join(e, &table_aliases, &merge_columns)
-                        .unwrap_or_else(|_| e.clone());
-                    SelectItem::UnnamedExpr(rewritten)
-                }
-                SelectItem::ExprWithAlias { expr, alias } => {
-                    let rewritten = rewrite_for_using_join(expr, &table_aliases, &merge_columns)
-                        .unwrap_or_else(|_| expr.clone());
-                    SelectItem::ExprWithAlias {
-                        expr: rewritten,
+            .map(|item| -> Result<SelectItem> {
+                match item {
+                    SelectItem::UnnamedExpr(e) => Ok(SelectItem::UnnamedExpr(
+                        rewrite_for_using_join(e, &table_aliases, &merge_columns)?,
+                    )),
+                    SelectItem::ExprWithAlias { expr, alias } => Ok(SelectItem::ExprWithAlias {
+                        expr: rewrite_for_using_join(expr, &table_aliases, &merge_columns)?,
                         alias: alias.clone(),
-                    }
+                    }),
+                    SelectItem::Wildcard(_) => Ok(SelectItem::Wildcard(
+                        sqlparser::ast::WildcardAdditionalOptions::default(),
+                    )),
+                    other => Ok(other.clone()),
                 }
-                SelectItem::Wildcard(_) => {
-                    SelectItem::Wildcard(sqlparser::ast::WildcardAdditionalOptions::default())
-                }
-                other => other.clone(),
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         if !query.order_by.is_empty() {
             let order_exprs: Vec<_> = query
                 .order_by
                 .iter()
                 .map(|o| {
-                    let rewritten = rewrite_for_using_join(&o.expr, &table_aliases, &merge_columns)
-                        .unwrap_or_else(|_| o.expr.clone());
-                    (rewritten, o.asc.unwrap_or(true))
+                    let expr = rewrite_for_using_join(&o.expr, &table_aliases, &merge_columns)?;
+                    let asc = o.asc.unwrap_or(true);
+                    let nulls_first = o.nulls_first.unwrap_or(!asc);
+                    Ok((expr, asc, nulls_first))
                 })
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
 
-            combined_rows.sort_by(|a, b| {
-                for (expr, asc) in &order_exprs {
-                    let va =
-                        eval_expr(expr, Some(a), Some(&combined_schema)).unwrap_or(Value::Null);
-                    let vb =
-                        eval_expr(expr, Some(b), Some(&combined_schema)).unwrap_or(Value::Null);
-                    let cmp_val = crate::sql::expr::compare_values(&va, &vb).unwrap_or(0);
-                    let cmp = match cmp_val {
-                        n if n < 0 => std::cmp::Ordering::Less,
-                        0 => std::cmp::Ordering::Equal,
-                        _ => std::cmp::Ordering::Greater,
+            let store = self.store();
+            let mut keyed_rows: Vec<(Vec<Value>, Row)> = Vec::with_capacity(combined_rows.len());
+            for row in combined_rows.drain(..) {
+                let mut keys = Vec::with_capacity(order_exprs.len());
+                for (expr, _asc, _nulls_first) in &order_exprs {
+                    let value = if sequences::expr_needs_async_eval(expr) {
+                        sequences::eval_expr_with_sequences(
+                            &store,
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            expr,
+                            Some(&row),
+                            Some(&combined_schema),
+                        )
+                        .await?
+                    } else {
+                        eval_expr(expr, Some(&row), Some(&combined_schema))?
                     };
-                    let cmp = if *asc { cmp } else { cmp.reverse() };
-                    if cmp != std::cmp::Ordering::Equal {
-                        return cmp;
+                    keys.push(value);
+                }
+                keyed_rows.push((keys, row));
+            }
+
+            keyed_rows.sort_by(|(keys_a, _), (keys_b, _)| {
+                for (i, (_expr, asc, nulls_first)) in order_exprs.iter().enumerate() {
+                    let ordering = crate::sql::expr::compare_order_by_values(
+                        &keys_a[i],
+                        &keys_b[i],
+                        *asc,
+                        *nulls_first,
+                    );
+                    if ordering != std::cmp::Ordering::Equal {
+                        return ordering;
                     }
                 }
                 std::cmp::Ordering::Equal
             });
+
+            combined_rows = keyed_rows.into_iter().map(|(_, row)| row).collect();
         }
 
         let offset = extract_offset(query);
@@ -472,5 +516,4 @@ impl Executor {
             timezone: crate::session_context::current_timezone(),
         })
     }
-
 }

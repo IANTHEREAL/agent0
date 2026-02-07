@@ -265,7 +265,7 @@ impl Executor {
                     Some(schema) => format!("{}.{}", schema, obj_name),
                     None => obj_name.clone(),
                 };
-                match self
+                let (schema, rows) = self
                     .get_table_data_filtered(
                         txn,
                         db_id,
@@ -275,11 +275,8 @@ impl Executor {
                         ctes,
                         virtual_filter,
                     )
-                    .await
-                {
-                    Ok((schema, rows)) => Ok(Some((alias_str, schema, Some(rows)))),
-                    Err(_) => Ok(None),
-                }
+                    .await?;
+                Ok(Some((alias_str, schema, Some(rows))))
             }
             TableFactor::Derived {
                 subquery, alias, ..
@@ -375,5 +372,4 @@ impl Executor {
             _ => Ok(None),
         }
     }
-
 }
