@@ -1,3 +1,4 @@
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use sqlparser::ast::{Expr, JoinOperator};
@@ -40,6 +41,7 @@ pub struct NestedLoopJoinOperator {
     opened: bool,
 }
 
+#[allow(dead_code)] // Operator framework
 impl NestedLoopJoinOperator {
     pub fn new(
         left: BoxedOperator,
@@ -134,7 +136,7 @@ impl NestedLoopJoinOperator {
                 Value::Boolean(b) => Ok(b),
                 Value::Null => Ok(false),
                 Value::Text(s) => parse_bool_pg(&s)
-                    .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s)),
+                    .ok_or_else(|| SqlError::InvalidInputSyntax { type_name: "boolean".into(), value: s.clone() }.into()),
                 _ => Err(anyhow!("Join condition must evaluate to boolean")),
             }
         } else {

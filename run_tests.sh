@@ -10,7 +10,9 @@ PG_PASSWORD=${PG_PASSWORD:-admin}
 # Report file
 REPORT_DIR="$SCRIPT_DIR/test-reports"
 REPORT_TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-REPORT_FILE="$REPORT_DIR/test-report-$REPORT_TIMESTAMP.md"
+GIT_SHA="$(git rev-parse HEAD 2>/dev/null || echo "unknown")"
+GIT_SHA_SHORT="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+REPORT_FILE="$REPORT_DIR/test-report-$REPORT_TIMESTAMP-$GIT_SHA_SHORT.md"
 mkdir -p "$REPORT_DIR"
 
 # Timing
@@ -49,7 +51,7 @@ cat > "$REPORT_FILE" << EOF
 
 **Generated**: $(date '+%Y-%m-%d %H:%M:%S')
 **Host**: $(hostname)
-**Git**: $(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+**Git**: ${GIT_SHA} (${GIT_SHA_SHORT})
 **Rust**: $(rustc --version 2>/dev/null || echo "unknown")
 **Node**: $(node --version 2>/dev/null || echo "unknown")
 

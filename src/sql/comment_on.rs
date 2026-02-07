@@ -1,4 +1,5 @@
-use super::helpers::normalize_ident;
+use super::names::normalize_ident;
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Ident, ObjectName};
 
@@ -107,7 +108,9 @@ fn parse_object_name_max2(input: &str, idx: &mut usize) -> Result<ObjectName> {
         let second = parse_ident(input, idx)?;
         skip_ws(input, idx);
         if input[*idx..].starts_with('.') {
-            return Err(anyhow!("Unsupported object name (too many parts)"));
+            return Err(
+                SqlError::Unsupported("Unsupported object name (too many parts)".into()).into(),
+            );
         }
         Ok(ObjectName(vec![first, second]))
     } else {
@@ -279,7 +282,7 @@ pub(crate) fn parse_comment_on_sql(sql: &str) -> Result<CommentOnCommand> {
         let (table, column) = parse_column_target(sql, &mut idx)?;
         CommentOnTarget::Column { table, column }
     } else {
-        return Err(anyhow!("Unsupported COMMENT ON statement"));
+        return Err(SqlError::Unsupported("Unsupported COMMENT ON statement".into()).into());
     };
 
     expect_keyword(sql, &mut idx, "IS")?;
@@ -347,4 +350,3 @@ mod tests {
         assert_eq!(cmd.comment.as_deref(), Some("a'b"));
     }
 }
-

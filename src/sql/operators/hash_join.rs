@@ -29,6 +29,7 @@ use crate::types::{ColumnDef, Row, TableSchema, Value};
 ///
 /// Hashing is defined to be compatible with [`join_keys_equal`]:
 /// if `join_keys_equal(a, b)` is `true`, then `hash_join_key(a) == hash_join_key(b)`.
+#[allow(dead_code)] // Public API for hash join callers and tests
 pub fn hash_join_key(values: &[Value]) -> u64 {
     let mut hasher = DefaultHasher::new();
     values.len().hash(&mut hasher);
@@ -124,6 +125,7 @@ fn hash_single_value_for_join<H: Hasher>(hasher: &mut H, value: &Value) {
 /// - `NaN == NaN` (returns `true`, PostgreSQL-like)
 /// - `Int32` and `Int64` are compared as `i64`
 /// - `Numeric` is normalized before compare (`1.0 == 1.00`)
+#[allow(dead_code)] // Public API for hash join callers and tests
 pub fn join_keys_equal(left: &[Value], right: &[Value]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -297,6 +299,7 @@ impl JoinHashTable {
         row_key_has_null_for_join(row, &self.key_indices)
     }
 
+    #[allow(dead_code)] // Used by tests and future probe-by-value path
     fn row_key_equals_values(&self, row: &Row, probe_key: &[Value]) -> bool {
         if self.key_indices.len() != probe_key.len() {
             return false;
@@ -340,6 +343,7 @@ impl JoinHashTable {
             .map(|b| (b.rows.as_slice(), b.global_indices.as_slice()))
     }
 
+    #[allow(dead_code)] // Operator framework
     pub fn all_rows_with_indices(&self) -> impl Iterator<Item = (usize, &Row)> + '_ {
         self.buckets
             .values()
@@ -390,6 +394,7 @@ enum HashJoinState {
 pub struct HashJoinOperator {
     build_child: BoxedOperator,
     probe_child: BoxedOperator,
+    #[allow(dead_code)] // Used in explain_info()
     join_type: HashJoinType,
     left_is_build: bool,
     build_key_indices: Vec<usize>,
@@ -402,6 +407,7 @@ pub struct HashJoinOperator {
     state: HashJoinState,
 }
 
+#[allow(dead_code)] // Operator framework — helpers used by PhysicalOperator trait impl
 impl HashJoinOperator {
     /// Create a new hash join operator.
     ///
@@ -484,6 +490,11 @@ impl HashJoinOperator {
             config,
             state: HashJoinState::Created,
         }
+    }
+
+    pub fn with_output_schema(mut self, schema: TableSchema) -> Self {
+        self.output_schema = schema;
+        self
     }
 
     fn make_output_row(&self, probe_row: &Row, build_row: &Row) -> Row {
@@ -1036,6 +1047,56 @@ mod tests {
             HashJoinConfig::default(),
         );
         assert!(!op.build_outer);
+        assert!(op.probe_outer);
+    }
+
+    #[test]
+    fn test_hash_table_empty_probe() {
+        let table = JoinHashTable::new(vec![0]);
+
+        let hash = hash_join_key(&[Value::Int32(1)]);
+        assert!(table.buckets.get(&hash).is_none());
+    }
+
+    #[test]
+    fn test_hash_table_many_duplicate_keys() {
+        let mut table = JoinHashTable::new(vec![0]);
+        for i in 0..100 {
+            table.insert(Row::new(vec![
+                Value::Int32(1),
+                Value::Text(format!("row_{}", i)),
+            ]));
+        }
+        table.finalize();
+
+        let hash = hash_join_key(&[Value::Int32(1)]);
+        let bucket = table.buckets.get(&hash).unwrap();
+        assert_eq!(bucket.rows.len(), 100);
+
+        for row in &bucket.rows {
+            assert!(table.row_key_equals_values(row, &[Value::Int32(1)]));
+        }
+    }
+
+    #[test]
+    fn test_hash_join_full_outer_mapping() {
+        let left_child: BoxedOperator =
+            Box::new(super::super::scan::TableScanOperator::new(schema_left()));
+        let right_child: BoxedOperator =
+            Box::new(super::super::scan::TableScanOperator::new(schema_right()));
+
+        let op = HashJoinOperator::new(
+            left_child,
+            right_child,
+            HashJoinType::Full,
+            vec![0],
+            vec![0],
+            true,
+            None,
+            HashJoinConfig::default(),
+        );
+
+        assert!(op.build_outer);
         assert!(op.probe_outer);
     }
 }

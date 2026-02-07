@@ -3,7 +3,11 @@ use async_trait::async_trait;
 use sqlparser::ast::Expr;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::{coerce_text_literal_to_bool, eval_expr, validate_bool_expr_in_boolean_context};
+use crate::sql::expr::{
+    coerce_text_literal_to_bool, eval_expr_with_query_ctx,
+    validate_bool_expr_in_boolean_context,
+};
+use crate::sql::query_context::QueryContext;
 use crate::types::{Row, TableSchema, Value};
 
 #[derive(Debug)]
@@ -22,8 +26,17 @@ impl FilterOperator {
         }
     }
 
-    fn evaluate_predicate(&self, row: &Row) -> Result<bool> {
-        let result = eval_expr(&self.predicate, Some(row), Some(self.child.schema()))?;
+    fn evaluate_predicate(
+        &self,
+        row: &Row,
+        query_ctx: Option<&QueryContext>,
+    ) -> Result<bool> {
+        let result = eval_expr_with_query_ctx(
+            &self.predicate,
+            Some(row),
+            Some(self.child.schema()),
+            query_ctx,
+        )?;
         let result = coerce_text_literal_to_bool(&self.predicate, result)?;
         match result {
             Value::Boolean(b) => Ok(b),
@@ -56,7 +69,7 @@ impl PhysicalOperator for FilterOperator {
         }
 
         while let Some(row) = self.child.next(ctx).await? {
-            if self.evaluate_predicate(&row)? {
+            if self.evaluate_predicate(&row, ctx.query_ctx)? {
                 return Ok(Some(row));
             }
         }
@@ -160,8 +173,8 @@ mod tests {
         let row_true = Row::new(vec![Value::Int32(1), Value::Boolean(true)]);
         let row_false = Row::new(vec![Value::Int32(2), Value::Boolean(false)]);
 
-        assert!(filter.evaluate_predicate(&row_true).unwrap());
-        assert!(!filter.evaluate_predicate(&row_false).unwrap());
+        assert!(filter.evaluate_predicate(&row_true, None).unwrap());
+        assert!(!filter.evaluate_predicate(&row_false, None).unwrap());
     }
 
     #[test]
@@ -176,12 +189,96 @@ mod tests {
         let filter = FilterOperator::new(child, predicate);
 
         let row = Row::new(vec![Value::Int32(1), Value::Boolean(false)]);
-        assert!(filter.evaluate_predicate(&row).unwrap());
+        assert!(filter.evaluate_predicate(&row, None).unwrap());
 
         let child = Box::new(TableScanOperator::new(schema));
         let predicate =
             Expr::Value(sqlparser::ast::Value::SingleQuotedString("false".to_string()));
         let filter = FilterOperator::new(child, predicate);
-        assert!(!filter.evaluate_predicate(&row).unwrap());
+        assert!(!filter.evaluate_predicate(&row, None).unwrap());
+    }
+
+    #[test]
+    fn test_filter_predicate_null_returns_false() {
+        use super::super::scan::TableScanOperator;
+
+        let schema = test_schema();
+        let child = Box::new(TableScanOperator::new(schema));
+
+        // Predicate: active (column is NULL → should return false)
+        let predicate = Expr::Identifier(Ident::new("active"));
+        let filter = FilterOperator::new(child, predicate);
+
+        let row_null = Row::new(vec![Value::Int32(1), Value::Null]);
+        assert!(!filter.evaluate_predicate(&row_null, None).unwrap());
+    }
+
+    #[test]
+    fn test_filter_predicate_comparison_operators() {
+        use super::super::scan::TableScanOperator;
+
+        let schema = test_schema();
+
+        // Predicate: id > 2
+        let child = Box::new(TableScanOperator::new(schema.clone()));
+        let predicate = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("id"))),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
+                "2".to_string(),
+                false,
+            ))),
+        };
+        let filter = FilterOperator::new(child, predicate);
+
+        let row1 = Row::new(vec![Value::Int32(1), Value::Boolean(true)]);
+        let row2 = Row::new(vec![Value::Int32(2), Value::Boolean(true)]);
+        let row3 = Row::new(vec![Value::Int32(3), Value::Boolean(true)]);
+
+        assert!(!filter.evaluate_predicate(&row1, None).unwrap());
+        assert!(!filter.evaluate_predicate(&row2, None).unwrap());
+        assert!(filter.evaluate_predicate(&row3, None).unwrap());
+
+        // Predicate: id = 2
+        let child = Box::new(TableScanOperator::new(schema));
+        let predicate = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("id"))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
+                "2".to_string(),
+                false,
+            ))),
+        };
+        let filter = FilterOperator::new(child, predicate);
+
+        assert!(!filter.evaluate_predicate(&row1, None).unwrap());
+        assert!(filter.evaluate_predicate(&row2, None).unwrap());
+        assert!(!filter.evaluate_predicate(&row3, None).unwrap());
+    }
+
+    #[test]
+    fn test_filter_predicate_is_null() {
+        use super::super::scan::TableScanOperator;
+
+        let schema = test_schema();
+
+        // Predicate: active IS NULL
+        let child = Box::new(TableScanOperator::new(schema.clone()));
+        let predicate = Expr::IsNull(Box::new(Expr::Identifier(Ident::new("active"))));
+        let filter = FilterOperator::new(child, predicate);
+
+        let row_null = Row::new(vec![Value::Int32(1), Value::Null]);
+        let row_true = Row::new(vec![Value::Int32(2), Value::Boolean(true)]);
+
+        assert!(filter.evaluate_predicate(&row_null, None).unwrap());
+        assert!(!filter.evaluate_predicate(&row_true, None).unwrap());
+
+        // Predicate: active IS NOT NULL
+        let child = Box::new(TableScanOperator::new(schema));
+        let predicate = Expr::IsNotNull(Box::new(Expr::Identifier(Ident::new("active"))));
+        let filter = FilterOperator::new(child, predicate);
+
+        assert!(!filter.evaluate_predicate(&row_null, None).unwrap());
+        assert!(filter.evaluate_predicate(&row_true, None).unwrap());
     }
 }

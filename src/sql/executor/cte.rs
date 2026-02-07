@@ -1,11 +1,11 @@
 //! CTE (Common Table Expression) execution for the SQL executor
 
 use super::core::Executor;
-use super::super::helpers::{cte_is_recursive, normalize_ident, set_expr_references_table};
+use super::super::names::normalize_ident;
 use super::super::ExecuteResult;
 use crate::types::{ColumnDef, DataType, Row, TableSchema};
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{Ident, Query, SetExpr, SetOperator, SetQuantifier};
+use sqlparser::ast::{Ident, Query, SetExpr, SetOperator, SetQuantifier, TableFactor};
 use std::collections::HashMap;
 use tikv_client::Transaction;
 
@@ -282,5 +282,52 @@ impl Executor {
         }
 
         Ok((schema, all_rows))
+    }
+}
+
+/// Check if a CTE is recursive (references itself in the UNION)
+pub(crate) fn cte_is_recursive(query: &Query, cte_name: &str) -> bool {
+    if let SetExpr::SetOperation { left, right, .. } = &*query.body {
+        set_expr_references_table(right, cte_name) || set_expr_references_table(left, cte_name)
+    } else {
+        false
+    }
+}
+
+/// Check if a SetExpr references a specific table
+pub(crate) fn set_expr_references_table(expr: &SetExpr, table_name: &str) -> bool {
+    match expr {
+        SetExpr::Select(select) => {
+            for from in &select.from {
+                if table_factor_references(&from.relation, table_name) {
+                    return true;
+                }
+                for join in &from.joins {
+                    if table_factor_references(&join.relation, table_name) {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            set_expr_references_table(left, table_name)
+                || set_expr_references_table(right, table_name)
+        }
+        SetExpr::Query(q) => set_expr_references_table(&q.body, table_name),
+        _ => false,
+    }
+}
+
+/// Check if a TableFactor references a specific table
+pub(crate) fn table_factor_references(factor: &TableFactor, table_name: &str) -> bool {
+    match factor {
+        TableFactor::Table { name, .. } => {
+            name.0.last().map(|i| i.value.to_lowercase()) == Some(table_name.to_lowercase())
+        }
+        TableFactor::Derived { subquery, .. } => {
+            set_expr_references_table(&subquery.body, table_name)
+        }
+        _ => false,
     }
 }

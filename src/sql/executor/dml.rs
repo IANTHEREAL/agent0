@@ -2,9 +2,9 @@
 
 use super::super::dml;
 use super::super::expr::{
-    coerce_text_literal_to_bool, validate_bool_expr_in_boolean_context, JoinContext,
+    coerce_text_literal_to_bool, validate_bool_expr_in_boolean_context, JoinEvalContext,
 };
-use super::super::helpers::normalize_ident;
+use super::super::names::normalize_ident;
 use super::super::names;
 use super::super::trigger_queue::TriggerOp;
 use super::super::trigger_worker;
@@ -12,6 +12,7 @@ use super::super::triggers;
 use super::super::ExecuteResult;
 use super::core::Executor;
 use crate::types::{Row, TableSchema, Value};
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     Assignment, DataType as SqlDataType, Expr, Ident, ObjectName, OnInsert, Query, SelectItem,
@@ -348,14 +349,14 @@ impl Executor {
                     .unwrap_or_else(|| resolved.name.clone());
                 (resolved, alias)
             }
-            _ => return Err(anyhow!("Unsupported DELETE target")),
+            _ => return Err(SqlError::Unsupported("Unsupported DELETE target".into()).into()),
         };
         let t = resolved_target.full.clone();
         let schema = self
             .store()
             .get_schema(txn, db_id, &t)
             .await?
-            .ok_or_else(|| anyhow!("Table not found"))?;
+            .ok_or_else(|| SqlError::RelationNotFound(t.clone()))?;
         let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
         if schema.pk_indices.is_empty() {
             return Err(anyhow!("No PK"));
@@ -376,7 +377,7 @@ impl Executor {
             None
         } else {
             if using.len() != 1 {
-                return Err(anyhow!("DELETE ... USING multiple tables not supported"));
+                return Err(SqlError::Unsupported("DELETE ... USING multiple tables not supported".into()).into());
             }
             let using_table = &using[0];
             let (using_resolved, using_alias) = match &using_table.relation {
@@ -389,20 +390,20 @@ impl Executor {
                         search_path,
                     )
                     .await?
-                    .ok_or_else(|| anyhow!("USING table '{}' does not exist", name))?;
+                    .ok_or_else(|| SqlError::RelationNotFound(name.to_string()))?;
                     let alias = alias
                         .as_ref()
                         .map(|a| normalize_ident(&a.name))
                         .unwrap_or_else(|| resolved.name.clone());
                     (resolved, alias)
                 }
-                _ => return Err(anyhow!("Unsupported USING table")),
+                _ => return Err(SqlError::Unsupported("Unsupported USING table".into()).into()),
             };
             let using_schema = self
                 .store()
                 .get_schema(txn, db_id, &using_resolved.full)
                 .await?
-                .ok_or_else(|| anyhow!("USING table not found"))?;
+                .ok_or_else(|| SqlError::RelationNotFound(using_resolved.full.clone()))?;
             let using_rows = self
                 .scan_and_fill(txn, db_id, &using_resolved.full, &using_schema)
                 .await?;
@@ -442,13 +443,12 @@ impl Executor {
                                 &r,
                                 using_row,
                             );
-                        let ctx = JoinContext {
-                            tables: HashMap::new(),
-                            column_offsets: &column_offsets,
-                            merged_column_offsets: None,
-                            combined_row: &combined_row,
-                            combined_schema: &combined_schema,
-                        };
+                        let ctx = JoinEvalContext::new(
+                            &column_offsets,
+                            None,
+                            &combined_row,
+                            &combined_schema,
+                        );
                         let value = self
                             .eval_expr_join_maybe_sequence(
                                 txn,
@@ -555,7 +555,7 @@ impl Executor {
             )
             .await?
             .ok_or_else(|| anyhow!("Table '{}' does not exist", name))?,
-            _ => return Err(anyhow!("Unsupported")),
+            _ => return Err(SqlError::Unsupported("Unsupported".into()).into()),
         };
         let t = resolved_target.full.clone();
         let table_alias = match &table.relation {
@@ -569,7 +569,7 @@ impl Executor {
             .store()
             .get_schema(txn, db_id, &t)
             .await?
-            .ok_or_else(|| anyhow!("Table not found"))?;
+            .ok_or_else(|| SqlError::RelationNotFound(t.clone()))?;
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
         let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
         let trigger_func_cache_update =
@@ -600,9 +600,9 @@ impl Executor {
                         search_path,
                     )
                     .await?
-                    .ok_or_else(|| anyhow!("FROM table '{}' does not exist", name))?
+                    .ok_or_else(|| SqlError::RelationNotFound(name.to_string()))?
                 }
-                _ => return Err(anyhow!("Unsupported FROM table")),
+                _ => return Err(SqlError::Unsupported("Unsupported FROM table".into()).into()),
             };
             let from_name = from_resolved.full.clone();
             let from_alias_str = match &from_table.relation {
@@ -616,7 +616,7 @@ impl Executor {
                 .store()
                 .get_schema(txn, db_id, &from_name)
                 .await?
-                .ok_or_else(|| anyhow!("FROM table not found"))?;
+                .ok_or_else(|| SqlError::RelationNotFound(from_name.clone()))?;
             let fr = self.scan_and_fill(txn, db_id, &from_name, &fs).await?;
             (Some(fs), Some(fr), Some(from_alias_str))
         } else {
@@ -666,13 +666,12 @@ impl Executor {
                             let mut combined_values = r.values.clone();
                             combined_values.extend(from_row.values.clone());
                             let combined_row = Row::new(combined_values);
-                            let ctx = JoinContext {
-                                tables: HashMap::new(),
-                                column_offsets: &column_offsets,
-                                merged_column_offsets: None,
-                                combined_row: &combined_row,
-                                combined_schema: &combined_schema,
-                            };
+                            let ctx = JoinEvalContext::new(
+                                &column_offsets,
+                                None,
+                                &combined_row,
+                                &combined_schema,
+                            );
                             let value = self
                                 .eval_expr_join_maybe_sequence(
                                     txn,

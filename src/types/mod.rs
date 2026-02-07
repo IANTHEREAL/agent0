@@ -78,6 +78,7 @@ pub enum DataType {
     TimestampTz,
     Tsvector,
     Tsquery,
+    Name,
 }
 
 impl DataType {
@@ -88,6 +89,7 @@ impl DataType {
             DataType::Int64 => 8,
             DataType::Float64 => 8,
             DataType::Text => 32,
+            DataType::Name => 32,
             DataType::Bytes => 32,
             DataType::Timestamp => 8,
             DataType::Interval => 8,
@@ -115,6 +117,7 @@ impl fmt::Display for DataType {
             DataType::Int64 => write!(f, "BIGINT"),
             DataType::Float64 => write!(f, "DOUBLE"),
             DataType::Text => write!(f, "TEXT"),
+            DataType::Name => write!(f, "NAME"),
             DataType::Bytes => write!(f, "BYTEA"),
             DataType::Timestamp => write!(f, "TIMESTAMP"),
             DataType::Interval => write!(f, "INTERVAL"),
@@ -673,6 +676,21 @@ impl ViewDef {
     pub fn full_name(&self) -> String {
         format!("{}.{}", self.schema, self.name)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TablePrivilegeGrant {
+    pub grantor: String,
+    pub grantee: String,
+    pub privilege_type: String,
+    pub is_grantable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefaultTablePrivilegeGrant {
+    pub grantee: String,
+    pub privilege_type: String,
+    pub is_grantable: bool,
 }
 
 #[cfg(test)]

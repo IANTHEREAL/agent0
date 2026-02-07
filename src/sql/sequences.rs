@@ -1,5 +1,6 @@
 use crate::storage::TikvStore;
 use crate::types::{DataType, IndexDef, SequenceBacking, SequenceDef, SequenceState, Value};
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, MinMaxValue, ObjectName, SequenceOptions,
@@ -11,8 +12,9 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 
 use super::catalog_oids;
-use super::expr::{eval_expr, eval_expr_join, JoinContext};
-use super::helpers::{normalize_ident, value_to_sql_expr};
+use super::expr::{eval_expr, eval_join_expr, JoinEvalContext};
+use super::coercion::value_to_sql_expr;
+use super::names::normalize_ident;
 use super::names;
 use super::plpgsql;
 use super::ExecuteResult;
@@ -519,7 +521,7 @@ fn function_name_upper(func: &Function) -> String {
 fn extract_arg_expr<'a>(args: &'a [FunctionArg], idx: usize) -> Result<&'a Expr> {
     match args.get(idx) {
         Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(expr))) => Ok(expr),
-        Some(_) => Err(anyhow!("Unsupported function argument")),
+        Some(_) => Err(SqlError::Unsupported("Unsupported function argument".into()).into()),
         None => Err(anyhow!("Missing function argument")),
     }
 }
@@ -683,10 +685,10 @@ pub(crate) async fn eval_expr_join_with_sequences(
     last_sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     expr: &Expr,
-    join_ctx: &JoinContext<'_>,
+    join_ctx: &JoinEvalContext<'_>,
 ) -> Result<crate::types::Value> {
     if !expr_needs_async_eval(expr) {
-        return eval_expr_join(expr, join_ctx);
+        return eval_join_expr(join_ctx, expr);
     }
     let rewritten = replace_sequence_functions_join(
         store,
@@ -698,7 +700,7 @@ pub(crate) async fn eval_expr_join_with_sequences(
         join_ctx,
     )
     .await?;
-    eval_expr_join(&rewritten, join_ctx)
+    eval_join_expr(join_ctx, &rewritten)
 }
 
 pub(crate) fn replace_sequence_functions<'a>(
@@ -1545,7 +1547,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
     last_sequence_values: &'a mut HashMap<String, i64>,
     search_path: &'a [String],
     expr: &'a Expr,
-    join_ctx: &'a JoinContext<'a>,
+    join_ctx: &'a JoinEvalContext<'a>,
 ) -> Pin<Box<dyn Future<Output = Result<Expr>> + Send + 'a>> {
     Box::pin(async move {
         match expr {
@@ -1562,7 +1564,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             txn,
                             db_id,
                             search_path,
-                            eval_expr_join(arg0, join_ctx)?,
+                            eval_join_expr(join_ctx, arg0)?,
                         )
                         .await?;
                         let val = store.nextval_sequence(txn, db_id, &full_name).await?;
@@ -1576,7 +1578,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             txn,
                             db_id,
                             search_path,
-                            eval_expr_join(arg0, join_ctx)?,
+                            eval_join_expr(join_ctx, arg0)?,
                         )
                         .await?;
                         if store.get_sequence(txn, db_id, &full_name).await?.is_none() {
@@ -1602,10 +1604,10 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             txn,
                             db_id,
                             search_path,
-                            eval_expr_join(arg0, join_ctx)?,
+                            eval_join_expr(join_ctx, arg0)?,
                         )
                         .await?;
-                        let val = eval_expr_join(arg1, join_ctx)?;
+                        let val = eval_join_expr(join_ctx, arg1)?;
                         let value_i64 = match val {
                             crate::types::Value::Int32(n) => n as i64,
                             crate::types::Value::Int64(n) => n,
@@ -1620,7 +1622,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         };
                         let is_called = if func.args.len() >= 3 {
                             let arg2 = extract_arg_expr(&func.args, 2)?;
-                            match eval_expr_join(arg2, join_ctx)? {
+                            match eval_join_expr(join_ctx, arg2)? {
                                 crate::types::Value::Boolean(b) => b,
                                 crate::types::Value::Text(s) => matches!(
                                     s.to_lowercase().as_str(),
@@ -1650,7 +1652,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                                 )));
                             }
                         };
-                        let oid_val = eval_expr_join(arg0, join_ctx)?;
+                        let oid_val = eval_join_expr(join_ctx, arg0)?;
                         let Some(oid) = value_to_i64(&oid_val) else {
                             return Ok(value_to_sql_expr(&Value::Text("CREATE INDEX".to_string())));
                         };

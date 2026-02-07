@@ -1,6 +1,7 @@
 use super::core::Executor;
 use super::triggers::strip_leading_sql_comments;
 use super::super::{ExecuteResult, ExecuteResults, Session};
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use tracing::warn;
 
@@ -275,7 +276,7 @@ fn parse_create_database_sql(sql: &str) -> Result<CreateDatabaseCommand> {
             continue;
         }
 
-        return Err(anyhow!("Unsupported CREATE DATABASE option: {}", tok));
+        return Err(SqlError::Unsupported(format!("Unsupported CREATE DATABASE option: {}", tok)).into());
     }
 
     Ok(CreateDatabaseCommand {
@@ -324,7 +325,7 @@ fn parse_drop_database_sql(sql: &str) -> Result<DropDatabaseCommand> {
     validate_database_name(&name)?;
 
     if pos < tokens.len() {
-        return Err(anyhow!("Unsupported DROP DATABASE syntax"));
+        return Err(SqlError::Unsupported("Unsupported DROP DATABASE syntax".into()).into());
     }
 
     Ok(DropDatabaseCommand { name, if_exists })
@@ -368,7 +369,7 @@ fn parse_alter_database_sql(sql: &str) -> Result<AlterDatabaseCommand> {
         let new_name = parse_identifier_token(new_token)?.to_ascii_lowercase();
         validate_database_name(&new_name)?;
         if pos < tokens.len() {
-            return Err(anyhow!("Unsupported ALTER DATABASE syntax"));
+            return Err(SqlError::Unsupported("Unsupported ALTER DATABASE syntax".into()).into());
         }
         return Ok(AlterDatabaseCommand::Rename {
             old_name: name,
@@ -390,7 +391,7 @@ fn parse_alter_database_sql(sql: &str) -> Result<AlterDatabaseCommand> {
         pos += 1;
         let new_owner = parse_identifier_token(owner_token)?.to_ascii_lowercase();
         if pos < tokens.len() {
-            return Err(anyhow!("Unsupported ALTER DATABASE syntax"));
+            return Err(SqlError::Unsupported("Unsupported ALTER DATABASE syntax".into()).into());
         }
         return Ok(AlterDatabaseCommand::Owner {
             name,
@@ -398,7 +399,7 @@ fn parse_alter_database_sql(sql: &str) -> Result<AlterDatabaseCommand> {
         });
     }
 
-    Err(anyhow!("Unsupported ALTER DATABASE operation"))
+    Err(SqlError::Unsupported("Unsupported ALTER DATABASE operation".into()).into())
 }
 
 impl Executor {
@@ -410,7 +411,7 @@ impl Executor {
         let cmd = parse_create_database_sql(sql)?;
 
         if !session.is_superuser() {
-            return Err(anyhow!("permission denied to create database"));
+            return Err(SqlError::PermissionDenied { object_type: "database".into(), object_name: cmd.name.clone() }.into());
         }
         if session.is_in_transaction() {
             return Err(anyhow!("CREATE DATABASE cannot run inside a transaction block"));
@@ -463,7 +464,7 @@ impl Executor {
         let cmd = parse_drop_database_sql(sql)?;
 
         if !session.is_superuser() {
-            return Err(anyhow!("permission denied to drop database"));
+            return Err(SqlError::PermissionDenied { object_type: "database".into(), object_name: cmd.name.clone() }.into());
         }
         if session.is_in_transaction() {
             return Err(anyhow!("DROP DATABASE cannot run inside a transaction block"));
@@ -519,7 +520,11 @@ impl Executor {
         let cmd = parse_alter_database_sql(sql)?;
 
         if !session.is_superuser() {
-            return Err(anyhow!("permission denied to alter database"));
+            let db_name = match &cmd {
+                AlterDatabaseCommand::Rename { old_name, .. } => old_name.clone(),
+                AlterDatabaseCommand::Owner { name, .. } => name.clone(),
+            };
+            return Err(SqlError::PermissionDenied { object_type: "database".into(), object_name: db_name }.into());
         }
         if session.is_in_transaction() {
             return Err(anyhow!("ALTER DATABASE cannot run inside a transaction block"));

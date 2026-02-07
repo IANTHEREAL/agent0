@@ -1,11 +1,11 @@
-#![allow(dead_code)]
-
+use crate::sql::query_context::QueryContext;
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::Expr;
 use std::collections::HashMap;
 
 pub trait EvalContext {
+    #[allow(dead_code)] // Part of EvalContext trait API
     fn row(&self) -> Option<&Row>;
 
     fn resolve_column(&self, name: &str) -> Result<Value>;
@@ -17,29 +17,54 @@ pub trait EvalContext {
     fn is_timestamptz(&self, expr: &Expr) -> bool;
 
     fn column_type(&self, expr: &Expr) -> Option<&DataType>;
+
+    fn query_context(&self) -> Option<&QueryContext> {
+        None
+    }
 }
 
 pub struct SingleTableContext<'a> {
     row: Option<&'a Row>,
     schema: Option<&'a TableSchema>,
+    query_ctx: Option<&'a QueryContext>,
 }
 
 impl<'a> SingleTableContext<'a> {
     pub fn new(row: Option<&'a Row>, schema: Option<&'a TableSchema>) -> Self {
-        Self { row, schema }
+        Self {
+            row,
+            schema,
+            query_ctx: None,
+        }
     }
 
+    pub fn with_query_ctx(
+        row: Option<&'a Row>,
+        schema: Option<&'a TableSchema>,
+        query_ctx: &'a QueryContext,
+    ) -> Self {
+        Self {
+            row,
+            schema,
+            query_ctx: Some(query_ctx),
+        }
+    }
+
+    #[allow(dead_code)] // Public API
     pub fn empty() -> Self {
         Self {
             row: None,
             schema: None,
+            query_ctx: None,
         }
     }
 
+    #[allow(dead_code)] // Public API
     pub fn row(&self) -> Option<&Row> {
         self.row
     }
 
+    #[allow(dead_code)] // Public API
     pub fn get_schema(&self) -> Option<&TableSchema> {
         self.schema
     }
@@ -113,6 +138,10 @@ impl EvalContext for SingleTableContext<'_> {
             _ => None,
         }
     }
+
+    fn query_context(&self) -> Option<&QueryContext> {
+        self.query_ctx
+    }
 }
 
 pub struct JoinEvalContext<'a> {
@@ -120,6 +149,7 @@ pub struct JoinEvalContext<'a> {
     pub merged_column_offsets: Option<&'a HashMap<String, Vec<usize>>>,
     pub combined_row: &'a Row,
     pub combined_schema: &'a TableSchema,
+    pub query_ctx: Option<&'a QueryContext>,
 }
 
 impl<'a> JoinEvalContext<'a> {
@@ -134,15 +164,7 @@ impl<'a> JoinEvalContext<'a> {
             merged_column_offsets,
             combined_row,
             combined_schema,
-        }
-    }
-
-    pub fn from_join_context(ctx: &'a super::JoinContext<'a>) -> Self {
-        Self {
-            column_offsets: ctx.column_offsets,
-            merged_column_offsets: ctx.merged_column_offsets,
-            combined_row: ctx.combined_row,
-            combined_schema: ctx.combined_schema,
+            query_ctx: None,
         }
     }
 }
@@ -301,6 +323,10 @@ impl EvalContext for JoinEvalContext<'_> {
             }
             _ => None,
         }
+    }
+
+    fn query_context(&self) -> Option<&QueryContext> {
+        self.query_ctx
     }
 }
 

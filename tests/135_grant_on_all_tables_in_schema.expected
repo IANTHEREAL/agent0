@@ -4,3 +4,5 @@ gaats_schema1|t2|gaats_grantee|SELECT
 (2 rows)
 table_schema|table_name|grantee|privilege_type
 (0 rows)
+table_schema|table_name|grantee|privilege_type
+(0 rows)

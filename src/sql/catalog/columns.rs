@@ -1,0 +1,197 @@
+use super::helpers::{
+    data_type_to_pg_type, data_type_to_udt_name, int_col, int_val, null_val,
+    split_schema_and_name, text_col, text_val,
+};
+use super::{ScanContext, VirtualTable};
+use crate::sql::sequences;
+use crate::types::{DataType, Row, TableSchema};
+use anyhow::Result;
+use async_trait::async_trait;
+
+pub struct Columns;
+
+#[async_trait]
+impl VirtualTable for Columns {
+    fn name(&self) -> &str {
+        "columns"
+    }
+
+    fn schema_name(&self) -> &str {
+        "information_schema"
+    }
+
+    fn schema(&self) -> TableSchema {
+        TableSchema {
+            table_id: 0,
+            name: "columns".to_string(),
+            columns: vec![
+                text_col("table_catalog"),
+                text_col("table_schema"),
+                text_col("table_name"),
+                text_col("column_name"),
+                int_col("ordinal_position"),
+                text_col("column_default"),
+                text_col("is_nullable"),
+                text_col("data_type"),
+                int_col("character_maximum_length"),
+                int_col("character_octet_length"),
+                int_col("numeric_precision"),
+                int_col("numeric_precision_radix"),
+                int_col("numeric_scale"),
+                int_col("datetime_precision"),
+                text_col("interval_type"),
+                int_col("interval_precision"),
+                text_col("character_set_catalog"),
+                text_col("character_set_schema"),
+                text_col("character_set_name"),
+                text_col("collation_catalog"),
+                text_col("collation_schema"),
+                text_col("collation_name"),
+                text_col("domain_catalog"),
+                text_col("domain_schema"),
+                text_col("domain_name"),
+                text_col("udt_catalog"),
+                text_col("udt_schema"),
+                text_col("udt_name"),
+                text_col("scope_catalog"),
+                text_col("scope_schema"),
+                text_col("scope_name"),
+                int_col("maximum_cardinality"),
+                text_col("dtd_identifier"),
+                text_col("is_self_referencing"),
+                text_col("is_identity"),
+                text_col("identity_generation"),
+                text_col("identity_start"),
+                text_col("identity_increment"),
+                text_col("identity_maximum"),
+                text_col("identity_minimum"),
+                text_col("identity_cycle"),
+                text_col("is_generated"),
+                text_col("generation_expression"),
+                text_col("is_updatable"),
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        }
+    }
+
+    async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>> {
+        let mut rows = Vec::new();
+        let sequence_defs = ctx.store.list_sequences(ctx.txn, ctx.db_id).await?;
+
+        for full_table_name in ctx.user_tables {
+            let (table_schema, table_name) = split_schema_and_name(full_table_name);
+            if let Some(schema) = ctx
+                .store
+                .get_schema(ctx.txn, ctx.db_id, full_table_name)
+                .await?
+            {
+                for (i, col) in schema.columns.iter().enumerate() {
+                    let (data_type_str, udt_schema, udt_name) = match &col.data_type {
+                        DataType::UserDefined(full_udt) => {
+                            let (schema_name, type_name) = full_udt
+                                .rsplit_once('.')
+                                .unwrap_or(("public", full_udt.as_str()));
+                            ("USER-DEFINED", schema_name, type_name)
+                        }
+                        _ => {
+                            let pg_type = data_type_to_pg_type(&col.data_type);
+                            let udt = data_type_to_udt_name(&col.data_type);
+                            (pg_type, "pg_catalog", udt)
+                        }
+                    };
+                    let is_nullable = if col.nullable { "YES" } else { "NO" };
+                    let ordinal = (i + 1) as i64;
+
+                    let (char_max_len, num_precision, num_scale) = match &col.data_type {
+                        DataType::Int32 => (null_val(), int_val(32), int_val(0)),
+                        DataType::Int64 => (null_val(), int_val(64), int_val(0)),
+                        DataType::Float64 => (null_val(), int_val(53), null_val()),
+                        DataType::Text => (null_val(), null_val(), null_val()),
+                        DataType::Numeric { precision, scale } => {
+                            let p = precision.map(|v| int_val(v as i64)).unwrap_or(null_val());
+                            let s = scale.map(|v| int_val(v as i64)).unwrap_or(null_val());
+                            (null_val(), p, s)
+                        }
+                        _ => (null_val(), null_val(), null_val()),
+                    };
+
+                    let column_default = if col.is_serial {
+                        let seq_full_name = match sequences::find_owned_sequence_full_name(
+                            &sequence_defs,
+                            full_table_name,
+                            &col.name,
+                        )? {
+                            Some(full_name) => full_name,
+                            None => format!(
+                                "{}.{}",
+                                table_schema,
+                                sequences::implicit_sequence_name(&table_name, &col.name)
+                            ),
+                        };
+                        text_val(&format!("nextval('{}'::regclass)", seq_full_name))
+                    } else {
+                        col.default_expr
+                            .as_ref()
+                            .map(|s| text_val(s))
+                            .unwrap_or(null_val())
+                    };
+
+                    rows.push(Row::new(vec![
+                        text_val("postgres"),
+                        text_val(&table_schema),
+                        text_val(&table_name),
+                        text_val(&col.name),
+                        int_val(ordinal),
+                        column_default,
+                        text_val(is_nullable),
+                        text_val(data_type_str),
+                        char_max_len,
+                        null_val(),
+                        num_precision,
+                        int_val(2),
+                        num_scale,
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        text_val("postgres"),
+                        text_val(udt_schema),
+                        text_val(udt_name),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        text_val(&ordinal.to_string()),
+                        text_val("NO"),
+                        text_val("NO"),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        null_val(),
+                        text_val("NEVER"),
+                        null_val(),
+                        text_val("YES"),
+                    ]));
+                }
+            }
+        }
+
+        Ok(rows)
+    }
+}

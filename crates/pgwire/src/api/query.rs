@@ -281,6 +281,20 @@ pub trait ExtendedQueryHandler: Send + Sync {
             TARGET_TYPE_BYTE_STATEMENT => {
                 if let Some(stmt) = client.portal_store().get_statement(name) {
                     let describe_response = self.do_describe_statement(client, &stmt).await?;
+                    // Persist inferred parameter types back into the stored statement so that
+                    // subsequent Bind/Execute can decode parameters correctly.
+                    if let Some(parameter_types) = describe_response.parameters() {
+                        if !parameter_types.is_empty()
+                            && stmt.parameter_types.as_slice() != parameter_types
+                        {
+                            let updated = StoredStatement {
+                                id: stmt.id.clone(),
+                                statement: stmt.statement.clone(),
+                                parameter_types: parameter_types.to_vec(),
+                            };
+                            client.portal_store().put_statement(Arc::new(updated));
+                        }
+                    }
                     send_describe_response(client, &describe_response).await?;
                 } else {
                     return Err(PgWireError::StatementNotFound(name.to_owned()));

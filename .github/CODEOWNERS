@@ -1,0 +1,11 @@
+# SoT (Source of Truth) docs & drift-prevention gates
+#
+# Ownership policy (Phase 2-B / issue #368):
+# - Do not guess per-module owners until we have explicit evidence.
+# - Use a single fallback owner for the whole SoT layer.
+
+/docs/sot/modules.yaml @c4pt0r
+/docs/sot/README.md @c4pt0r
+/docs/sot/*.md @c4pt0r
+/scripts/doc_lint.py @c4pt0r
+/.github/workflows/doc-lint.yml @c4pt0r

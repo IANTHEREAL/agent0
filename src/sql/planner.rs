@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use sqlparser::ast::{BinaryOperator, Expr, JsonOperator};
 
 use super::expr::eval_expr;
-use super::helpers::normalize_ident;
+use super::names::normalize_ident;
 use super::operators::HashJoinConfig;
 use crate::types::{DataType, IndexDef, TableSchema, Value};
 
@@ -51,6 +51,10 @@ pub fn choose_join_algorithm(
         return JoinAlgorithmChoice::NestedLoop;
     };
 
+    if !hash_join_keys_type_compatible(left_schema, right_schema, &left_keys, &right_keys) {
+        return JoinAlgorithmChoice::NestedLoop;
+    }
+
     if left_row_estimate + right_row_estimate < config.min_rows_threshold {
         return JoinAlgorithmChoice::NestedLoop;
     }
@@ -60,6 +64,41 @@ pub fn choose_join_algorithm(
         left_is_build,
         left_key_indices: left_keys,
         right_key_indices: right_keys,
+    }
+}
+
+fn hash_join_keys_type_compatible(
+    left_schema: &TableSchema,
+    right_schema: &TableSchema,
+    left_keys: &[usize],
+    right_keys: &[usize],
+) -> bool {
+    if left_keys.len() != right_keys.len() {
+        return false;
+    }
+
+    left_keys
+        .iter()
+        .copied()
+        .zip(right_keys.iter().copied())
+        .all(|(li, ri)| {
+            let Some(left_col) = left_schema.columns.get(li) else {
+                return false;
+            };
+            let Some(right_col) = right_schema.columns.get(ri) else {
+                return false;
+            };
+            hash_join_key_type_compatible(&left_col.data_type, &right_col.data_type)
+        })
+}
+
+fn hash_join_key_type_compatible(left: &DataType, right: &DataType) -> bool {
+    match (left, right) {
+        (DataType::Int32, DataType::Int64) | (DataType::Int64, DataType::Int32) => true,
+        (DataType::Numeric { .. }, DataType::Numeric { .. }) => true,
+        (DataType::Timestamp, DataType::TimestampTz)
+        | (DataType::TimestampTz, DataType::Timestamp) => true,
+        _ => left == right,
     }
 }
 
@@ -95,19 +134,19 @@ fn extract_column_pair(
     left_schema: &TableSchema,
     right_schema: &TableSchema,
 ) -> Option<(Vec<usize>, Vec<usize>)> {
-    let left_col = extract_column_name(left_expr)?;
-    let right_col = extract_column_name(right_expr)?;
+    let left_col = extract_column_ref(left_expr)?;
+    let right_col = extract_column_ref(right_expr)?;
 
     if let (Some(li), Some(ri)) = (
-        left_schema.column_index(&left_col),
-        right_schema.column_index(&right_col),
+        resolve_column_index(left_schema, &left_col),
+        resolve_column_index(right_schema, &right_col),
     ) {
         return Some((vec![li], vec![ri]));
     }
 
     if let (Some(li), Some(ri)) = (
-        left_schema.column_index(&right_col),
-        right_schema.column_index(&left_col),
+        resolve_column_index(left_schema, &right_col),
+        resolve_column_index(right_schema, &left_col),
     ) {
         return Some((vec![li], vec![ri]));
     }
@@ -133,7 +172,6 @@ pub enum ScanType {
     GinIndexScan {
         index_id: u64,
         index_name: String,
-        #[allow(dead_code)]
         column: String,
         pattern: Value,
         estimated_rows: usize,
@@ -154,7 +192,6 @@ pub struct PredicateInfo {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub enum PredicateOp {
     Eq,
     Ne,
@@ -162,7 +199,9 @@ pub enum PredicateOp {
     Le,
     Gt,
     Ge,
+    #[allow(dead_code)] // planner predicate type, not yet used in index selection
     Like,
+    #[allow(dead_code)] // planner predicate type, not yet used in index selection
     In,
     IsNull,
     IsNotNull,
@@ -356,7 +395,7 @@ fn evaluate_index(
                 .iter()
                 .find(|c| c.name.eq_ignore_ascii_case(col))
             {
-                super::helpers::coerce_value_for_column(pred.value.clone(), col_def)
+                super::coercion::coerce_value_for_column(pred.value.clone(), col_def)
                     .unwrap_or_else(|_| pred.value.clone())
             } else {
                 pred.value.clone()
@@ -465,7 +504,7 @@ fn extract_gin_contains_predicate(expr: &Expr) -> Option<(String, Value)> {
         }
         Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::PGCustomBinaryOperator(ops) if ops.len() == 1 && ops[0] == "@@") =>
         {
-            let column = extract_column_name(left)?;
+            let column = extract_column_ref(left)?.name;
             let pattern = eval_expr(right, None, None).ok()?;
             Some((column, pattern))
         }
@@ -474,7 +513,7 @@ fn extract_gin_contains_predicate(expr: &Expr) -> Option<(String, Value)> {
             operator,
             right,
         } if matches!(operator, JsonOperator::AtArrow) => {
-            let column = extract_column_name(left)?;
+            let column = extract_column_ref(left)?.name;
             let pattern = eval_expr(right, None, None).ok()?;
             Some((column, pattern))
         }
@@ -483,7 +522,7 @@ fn extract_gin_contains_predicate(expr: &Expr) -> Option<(String, Value)> {
             operator,
             right,
         } if matches!(operator, JsonOperator::AtAt) => {
-            let column = extract_column_name(left)?;
+            let column = extract_column_ref(left)?.name;
             let pattern = eval_expr(right, None, None).ok()?;
             Some((column, pattern))
         }
@@ -491,119 +530,65 @@ fn extract_gin_contains_predicate(expr: &Expr) -> Option<(String, Value)> {
     }
 }
 
-fn extract_column_name(expr: &Expr) -> Option<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ColumnRef {
+    qualifier: Option<String>,
+    name: String,
+}
+
+fn extract_column_ref(expr: &Expr) -> Option<ColumnRef> {
     match expr {
-        Expr::Identifier(ident) => Some(normalize_ident(ident)),
-        Expr::CompoundIdentifier(parts) => parts.last().map(normalize_ident),
-        Expr::Nested(inner) => extract_column_name(inner),
+        Expr::Identifier(ident) => Some(ColumnRef {
+            qualifier: None,
+            name: normalize_ident(ident),
+        }),
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            let qualifier = parts.get(parts.len().saturating_sub(2)).map(normalize_ident);
+            let name = parts.last().map(normalize_ident)?;
+            Some(ColumnRef { qualifier, name })
+        }
+        Expr::Nested(inner) => extract_column_ref(inner),
         _ => None,
     }
 }
 
-#[allow(dead_code)]
-pub fn extract_index_values(
-    predicates: &[PredicateInfo],
-    index_columns: &[String],
-) -> Option<Vec<Value>> {
-    let mut values = Vec::with_capacity(index_columns.len());
-
-    for col in index_columns {
-        let pred = predicates
+fn resolve_column_index(schema: &TableSchema, col: &ColumnRef) -> Option<usize> {
+    if let Some(qualifier) = col.qualifier.as_deref() {
+        let qualified = format!("{}.{}", qualifier, col.name);
+        if let Some(idx) = schema.column_index(&qualified) {
+            return Some(idx);
+        }
+        if let Some(idx) = schema
+            .columns
             .iter()
-            .find(|p| p.column == *col && p.op == PredicateOp::Eq)?;
-        values.push(pred.value.clone());
-    }
-
-    Some(values)
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct JoinTableInfo {
-    pub name: String,
-    pub alias: String,
-    pub estimated_rows: usize,
-}
-
-#[allow(dead_code)]
-pub fn optimize_join_order(tables: &[JoinTableInfo]) -> Vec<usize> {
-    if tables.len() <= 1 {
-        return (0..tables.len()).collect();
-    }
-
-    let mut indices: Vec<usize> = (0..tables.len()).collect();
-    indices.sort_by_key(|&i| tables[i].estimated_rows);
-    indices
-}
-
-#[allow(dead_code)]
-pub fn estimate_join_cost(left_rows: usize, right_rows: usize, selectivity: f64) -> f64 {
-    let scan_cost = (left_rows + right_rows) as f64;
-    let join_cost = (left_rows * right_rows) as f64 * selectivity;
-    scan_cost + join_cost
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct PushdownResult {
-    pub table_predicates: HashMap<String, Vec<PredicateInfo>>,
-    pub remaining_predicates: Vec<PredicateInfo>,
-}
-
-#[allow(dead_code)]
-pub fn pushdown_predicates(
-    predicates: &[PredicateInfo],
-    table_columns: &HashMap<String, Vec<String>>,
-) -> PushdownResult {
-    let mut table_predicates: HashMap<String, Vec<PredicateInfo>> = HashMap::new();
-    let mut remaining_predicates = Vec::new();
-
-    for pred in predicates {
-        let mut pushed = false;
-        for (table_name, columns) in table_columns {
-            if columns.contains(&pred.column) {
-                table_predicates
-                    .entry(table_name.clone())
-                    .or_default()
-                    .push(pred.clone());
-                pushed = true;
-                break;
-            }
-        }
-        if !pushed {
-            remaining_predicates.push(pred.clone());
+            .position(|c| c.name.eq_ignore_ascii_case(&qualified))
+        {
+            return Some(idx);
         }
     }
 
-    PushdownResult {
-        table_predicates,
-        remaining_predicates,
+    if let Some(idx) = schema.column_index(&col.name) {
+        return Some(idx);
     }
-}
-
-#[allow(dead_code)]
-pub fn extract_table_predicates(
-    predicates: &[PredicateInfo],
-    table_alias: &str,
-    table_columns: &[String],
-) -> Vec<PredicateInfo> {
-    predicates
+    if let Some(idx) = schema
+        .columns
         .iter()
-        .filter(|p| {
-            let col_name = if p.column.contains('.') {
-                let parts: Vec<&str> = p.column.split('.').collect();
-                if parts.len() == 2 && parts[0] == table_alias {
-                    parts[1].to_string()
-                } else {
-                    return false;
-                }
-            } else {
-                p.column.clone()
-            };
-            table_columns.contains(&col_name)
-        })
-        .cloned()
-        .collect()
+        .position(|c| c.name.eq_ignore_ascii_case(&col.name))
+    {
+        return Some(idx);
+    }
+
+    let mut match_idx: Option<usize> = None;
+    for (idx, schema_col) in schema.columns.iter().enumerate() {
+        let unqualified = schema_col.name.rsplit('.').next().unwrap_or(&schema_col.name);
+        if unqualified.eq_ignore_ascii_case(&col.name) {
+            if match_idx.is_some() {
+                return None;
+            }
+            match_idx = Some(idx);
+        }
+    }
+    match_idx
 }
 
 #[cfg(test)]
@@ -684,6 +669,28 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_equi_join_keys_matches_qualified_output_schema() {
+        let left = schema_with_cols("join", &["a.id", "a.v", "b.user_id"]);
+        let right = schema_with_cols("c", &["id"]);
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::CompoundIdentifier(vec![
+                Ident::new("a"),
+                Ident::new("id"),
+            ])),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::CompoundIdentifier(vec![
+                Ident::new("c"),
+                Ident::new("id"),
+            ])),
+        };
+
+        let (lk, rk) = extract_equi_join_keys(&expr, &left, &right).unwrap();
+        assert_eq!(lk, vec![0]);
+        assert_eq!(rk, vec![0]);
+    }
+
+    #[test]
     fn test_extract_equi_join_keys_multi_key_and() {
         let left = schema_with_cols("l", &["a", "b"]);
         let right = schema_with_cols("r", &["x", "y"]);
@@ -705,6 +712,82 @@ mod tests {
         let (lk, rk) = extract_equi_join_keys(&expr, &left, &right).unwrap();
         assert_eq!(lk, vec![0, 1]);
         assert_eq!(rk, vec![0, 1]);
+    }
+
+    #[test]
+    fn test_extract_equi_join_keys_qualified_refs_against_unqualified_schemas() {
+        let left = schema_with_cols("l", &["id"]);
+        let right = schema_with_cols("r", &["user_id"]);
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::CompoundIdentifier(vec![
+                Ident::new("l"),
+                Ident::new("id"),
+            ])),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::CompoundIdentifier(vec![
+                Ident::new("r"),
+                Ident::new("user_id"),
+            ])),
+        };
+
+        let (lk, rk) = extract_equi_join_keys(&expr, &left, &right).unwrap();
+        assert_eq!(lk, vec![0]);
+        assert_eq!(rk, vec![0]);
+    }
+
+    #[test]
+    fn test_extract_equi_join_keys_unqualified_ref_against_qualified_schema_unique() {
+        let left = schema_with_cols("join", &["a.id", "a.v"]);
+        let right = schema_with_cols("c", &["id"]);
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("id"))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::CompoundIdentifier(vec![
+                Ident::new("c"),
+                Ident::new("id"),
+            ])),
+        };
+
+        let (lk, rk) = extract_equi_join_keys(&expr, &left, &right).unwrap();
+        assert_eq!(lk, vec![0]);
+        assert_eq!(rk, vec![0]);
+    }
+
+    #[test]
+    fn test_choose_join_algorithm_with_qualified_left_schema() {
+        let left = schema_with_cols("join", &["a.id", "a.v", "b.id"]);
+        let right = schema_with_cols("c", &["id"]);
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::CompoundIdentifier(vec![
+                Ident::new("a"),
+                Ident::new("id"),
+            ])),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::CompoundIdentifier(vec![
+                Ident::new("c"),
+                Ident::new("id"),
+            ])),
+        };
+
+        let cfg = HashJoinConfig {
+            max_memory_bytes: 1,
+            min_rows_threshold: 1,
+        };
+
+        match choose_join_algorithm(Some(&expr), &left, &right, 1000, 1000, &cfg) {
+            JoinAlgorithmChoice::HashJoin {
+                left_key_indices,
+                right_key_indices,
+                ..
+            } => {
+                assert_eq!(left_key_indices, vec![0]);
+                assert_eq!(right_key_indices, vec![0]);
+            }
+            other => panic!("expected HashJoin, got {:?}", other),
+        }
     }
 
     #[test]
@@ -732,6 +815,54 @@ mod tests {
             JoinAlgorithmChoice::HashJoin { left_is_build, .. } => assert!(!left_is_build),
             other => panic!("expected HashJoin, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_choose_join_algorithm_type_mismatch_falls_back() {
+        let left = TableSchema::new(
+            "l".to_string(),
+            1,
+            vec![crate::types::ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Text,
+                nullable: true,
+                primary_key: true,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            vec![0],
+        );
+        let right = TableSchema::new(
+            "r".to_string(),
+            2,
+            vec![crate::types::ColumnDef {
+                name: "id".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                primary_key: true,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            vec![0],
+        );
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("id"))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Identifier(Ident::new("id"))),
+        };
+
+        let cfg = HashJoinConfig {
+            max_memory_bytes: 1,
+            min_rows_threshold: 0,
+        };
+
+        assert_eq!(
+            choose_join_algorithm(Some(&expr), &left, &right, 1000, 1000, &cfg),
+            JoinAlgorithmChoice::NestedLoop
+        );
     }
 
     #[test]
@@ -885,48 +1016,6 @@ mod tests {
             ScanType::GinIndexScan { index_id, .. } => assert_eq!(index_id, 7),
             other => panic!("expected GinIndexScan, got {:?}", other),
         }
-    }
-
-    #[test]
-    fn test_optimize_join_order_two_tables() {
-        let tables = vec![
-            JoinTableInfo {
-                name: "small".to_string(),
-                alias: "s".to_string(),
-                estimated_rows: 100,
-            },
-            JoinTableInfo {
-                name: "large".to_string(),
-                alias: "l".to_string(),
-                estimated_rows: 10000,
-            },
-        ];
-        let order = optimize_join_order(&tables);
-        assert_eq!(order[0], 0);
-    }
-
-    #[test]
-    fn test_pushdown_predicates() {
-        let predicates = vec![
-            PredicateInfo {
-                column: "a".to_string(),
-                op: PredicateOp::Eq,
-                value: Value::Int32(1),
-            },
-            PredicateInfo {
-                column: "b".to_string(),
-                op: PredicateOp::Eq,
-                value: Value::Int32(2),
-            },
-        ];
-        let mut table_columns = HashMap::new();
-        table_columns.insert("t1".to_string(), vec!["a".to_string()]);
-        table_columns.insert("t2".to_string(), vec!["b".to_string()]);
-
-        let result = pushdown_predicates(&predicates, &table_columns);
-        assert_eq!(result.table_predicates.get("t1").unwrap().len(), 1);
-        assert_eq!(result.table_predicates.get("t2").unwrap().len(), 1);
-        assert!(result.remaining_predicates.is_empty());
     }
 
     #[test]
@@ -1120,159 +1209,6 @@ mod tests {
     }
 
     #[test]
-    fn test_optimize_join_order_three_tables() {
-        let tables = vec![
-            JoinTableInfo {
-                name: "medium".to_string(),
-                alias: "m".to_string(),
-                estimated_rows: 1000,
-            },
-            JoinTableInfo {
-                name: "large".to_string(),
-                alias: "l".to_string(),
-                estimated_rows: 100000,
-            },
-            JoinTableInfo {
-                name: "small".to_string(),
-                alias: "s".to_string(),
-                estimated_rows: 10,
-            },
-        ];
-        let order = optimize_join_order(&tables);
-        assert_eq!(order, vec![2, 0, 1]);
-    }
-
-    #[test]
-    fn test_optimize_join_order_single_table() {
-        let tables = vec![JoinTableInfo {
-            name: "only".to_string(),
-            alias: "o".to_string(),
-            estimated_rows: 500,
-        }];
-        let order = optimize_join_order(&tables);
-        assert_eq!(order, vec![0]);
-    }
-
-    #[test]
-    fn test_optimize_join_order_empty() {
-        let tables: Vec<JoinTableInfo> = vec![];
-        let order = optimize_join_order(&tables);
-        assert!(order.is_empty());
-    }
-
-    #[test]
-    fn test_estimate_join_cost() {
-        let cost = estimate_join_cost(100, 1000, 0.01);
-        assert!(cost > 0.0);
-
-        let cost_small = estimate_join_cost(10, 10, 0.1);
-        let cost_large = estimate_join_cost(1000, 1000, 0.1);
-        assert!(cost_large > cost_small);
-    }
-
-    #[test]
-    fn test_pushdown_predicates_with_remaining() {
-        let predicates = vec![
-            PredicateInfo {
-                column: "a".to_string(),
-                op: PredicateOp::Eq,
-                value: Value::Int32(1),
-            },
-            PredicateInfo {
-                column: "unknown".to_string(),
-                op: PredicateOp::Eq,
-                value: Value::Int32(99),
-            },
-        ];
-        let mut table_columns = HashMap::new();
-        table_columns.insert("t1".to_string(), vec!["a".to_string()]);
-
-        let result = pushdown_predicates(&predicates, &table_columns);
-        assert_eq!(result.table_predicates.get("t1").unwrap().len(), 1);
-        assert_eq!(result.remaining_predicates.len(), 1);
-        assert_eq!(result.remaining_predicates[0].column, "unknown");
-    }
-
-    #[test]
-    fn test_pushdown_predicates_empty() {
-        let predicates: Vec<PredicateInfo> = vec![];
-        let table_columns: HashMap<String, Vec<String>> = HashMap::new();
-
-        let result = pushdown_predicates(&predicates, &table_columns);
-        assert!(result.table_predicates.is_empty());
-        assert!(result.remaining_predicates.is_empty());
-    }
-
-    #[test]
-    fn test_extract_table_predicates_with_alias() {
-        let predicates = vec![
-            PredicateInfo {
-                column: "t.col1".to_string(),
-                op: PredicateOp::Eq,
-                value: Value::Int32(1),
-            },
-            PredicateInfo {
-                column: "other.col2".to_string(),
-                op: PredicateOp::Eq,
-                value: Value::Int32(2),
-            },
-            PredicateInfo {
-                column: "col3".to_string(),
-                op: PredicateOp::Eq,
-                value: Value::Int32(3),
-            },
-        ];
-        let table_columns = vec!["col1".to_string(), "col3".to_string()];
-
-        let extracted = extract_table_predicates(&predicates, "t", &table_columns);
-        assert_eq!(extracted.len(), 2);
-    }
-
-    #[test]
-    fn test_extract_index_values_success() {
-        let predicates = vec![
-            PredicateInfo {
-                column: "a".to_string(),
-                op: PredicateOp::Eq,
-                value: Value::Int32(1),
-            },
-            PredicateInfo {
-                column: "b".to_string(),
-                op: PredicateOp::Eq,
-                value: Value::Int32(2),
-            },
-        ];
-        let index_columns = vec!["a".to_string(), "b".to_string()];
-        let values = extract_index_values(&predicates, &index_columns);
-        assert!(values.is_some());
-        assert_eq!(values.unwrap().len(), 2);
-    }
-
-    #[test]
-    fn test_extract_index_values_missing_column() {
-        let predicates = vec![PredicateInfo {
-            column: "a".to_string(),
-            op: PredicateOp::Eq,
-            value: Value::Int32(1),
-        }];
-        let index_columns = vec!["a".to_string(), "b".to_string()];
-        let values = extract_index_values(&predicates, &index_columns);
-        assert!(values.is_none());
-    }
-
-    #[test]
-    fn test_extract_index_values_non_eq_predicate() {
-        let predicates = vec![PredicateInfo {
-            column: "a".to_string(),
-            op: PredicateOp::Lt,
-            value: Value::Int32(1),
-        }];
-        let index_columns = vec!["a".to_string()];
-        let values = extract_index_values(&predicates, &index_columns);
-        assert!(values.is_none());
-    }
-
-    #[test]
     fn test_predicate_op_reversed() {
         let expr = Expr::BinaryOp {
             left: Box::new(Expr::Value(sqlparser::ast::Value::Number(
@@ -1286,6 +1222,92 @@ mod tests {
         assert_eq!(predicates.len(), 1);
         assert_eq!(predicates[0].column, "x");
         assert_eq!(predicates[0].op, PredicateOp::Gt);
+    }
+
+    #[test]
+    fn test_choose_join_algorithm_no_condition() {
+        let left = schema_with_cols("l", &["id"]);
+        let right = schema_with_cols("r", &["id"]);
+        let cfg = HashJoinConfig::default();
+
+        assert_eq!(
+            choose_join_algorithm(None, &left, &right, 1000, 1000, &cfg),
+            JoinAlgorithmChoice::NestedLoop
+        );
+    }
+
+    #[test]
+    fn test_choose_join_algorithm_non_equi_returns_nested_loop() {
+        let left = schema_with_cols("l", &["id"]);
+        let right = schema_with_cols("r", &["id"]);
+        let cfg = HashJoinConfig::default();
+
+        let gt_expr = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("id"))),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expr::Identifier(Ident::new("id"))),
+        };
+
+        assert_eq!(
+            choose_join_algorithm(Some(&gt_expr), &left, &right, 1000, 1000, &cfg),
+            JoinAlgorithmChoice::NestedLoop
+        );
+    }
+
+    #[test]
+    fn test_choose_join_algorithm_smaller_table_is_build() {
+        let left = schema_with_cols("l", &["id"]);
+        let right = schema_with_cols("r", &["id"]);
+        let cfg = HashJoinConfig {
+            max_memory_bytes: usize::MAX,
+            min_rows_threshold: 0,
+        };
+
+        let eq_expr = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("id"))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Identifier(Ident::new("id"))),
+        };
+
+        match choose_join_algorithm(Some(&eq_expr), &left, &right, 100, 10000, &cfg) {
+            JoinAlgorithmChoice::HashJoin { left_is_build, .. } => assert!(left_is_build),
+            other => panic!("expected HashJoin, got {:?}", other),
+        }
+
+        match choose_join_algorithm(Some(&eq_expr), &left, &right, 10000, 100, &cfg) {
+            JoinAlgorithmChoice::HashJoin { left_is_build, .. } => assert!(!left_is_build),
+            other => panic!("expected HashJoin, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_extract_equi_join_keys_non_eq_returns_none() {
+        let left = schema_with_cols("l", &["id"]);
+        let right = schema_with_cols("r", &["id"]);
+
+        let gt_expr = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("id"))),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expr::Identifier(Ident::new("id"))),
+        };
+
+        assert!(extract_equi_join_keys(&gt_expr, &left, &right).is_none());
+    }
+
+    #[test]
+    fn test_extract_equi_join_keys_nested_expression() {
+        let left = schema_with_cols("l", &["id"]);
+        let right = schema_with_cols("r", &["user_id"]);
+
+        let nested = Expr::Nested(Box::new(Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("id"))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Identifier(Ident::new("user_id"))),
+        }));
+
+        let (lk, rk) = extract_equi_join_keys(&nested, &left, &right).unwrap();
+        assert_eq!(lk, vec![0]);
+        assert_eq!(rk, vec![0]);
     }
 
     #[test]

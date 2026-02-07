@@ -4,7 +4,8 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::{ObjectName, UserDefinedTypeRepresentation};
 use tikv_client::Transaction;
 
-use super::helpers::{convert_data_type, normalize_ident};
+use super::coercion::convert_data_type;
+use super::names::normalize_ident;
 use super::names;
 use super::ExecuteResult;
 use crate::storage::TikvStore;

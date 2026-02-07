@@ -31,14 +31,14 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
     inferrer.infer(expr).unwrap_or(DataType::Text)
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // new type inference module, not yet fully integrated
 pub fn try_infer_expr_type(expr: &Expr, schema: &TableSchema) -> Result<DataType, TypeError> {
     let ctx = TypeContext::single(schema);
     let mut inferrer = TypeInferrer::new(ctx);
     inferrer.infer(expr)
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // new type inference module, not yet fully integrated
 pub fn infer_expr_type_join(
     expr: &Expr,
     left_alias: &str,

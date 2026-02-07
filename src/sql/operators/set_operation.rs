@@ -284,4 +284,58 @@ mod tests {
             SetOperationOperator::row_to_key(&row2)
         );
     }
+
+    #[test]
+    fn test_row_to_key_multi_column_distinct() {
+        let row_a = Row::new(vec![Value::Int32(1), Value::Text("a".to_string())]);
+        let row_b = Row::new(vec![Value::Int32(1), Value::Text("b".to_string())]);
+        let row_a2 = Row::new(vec![Value::Int32(1), Value::Text("a".to_string())]);
+
+        assert_ne!(
+            SetOperationOperator::row_to_key(&row_a),
+            SetOperationOperator::row_to_key(&row_b)
+        );
+        assert_eq!(
+            SetOperationOperator::row_to_key(&row_a),
+            SetOperationOperator::row_to_key(&row_a2)
+        );
+    }
+
+    #[test]
+    fn test_row_to_key_null_values() {
+        let row_null = Row::new(vec![Value::Null]);
+        let row_int = Row::new(vec![Value::Int32(0)]);
+
+        assert_ne!(
+            SetOperationOperator::row_to_key(&row_null),
+            SetOperationOperator::row_to_key(&row_int)
+        );
+
+        let row_null2 = Row::new(vec![Value::Null]);
+        assert_eq!(
+            SetOperationOperator::row_to_key(&row_null),
+            SetOperationOperator::row_to_key(&row_null2)
+        );
+    }
+
+    #[test]
+    fn test_set_operation_all_variant_names() {
+        let schema = test_schema();
+
+        let variants = vec![
+            (SetOperationType::Union, "Union"),
+            (SetOperationType::UnionAll, "UnionAll"),
+            (SetOperationType::Intersect, "Intersect"),
+            (SetOperationType::IntersectAll, "IntersectAll"),
+            (SetOperationType::Except, "Except"),
+            (SetOperationType::ExceptAll, "ExceptAll"),
+        ];
+
+        for (op_type, expected_name) in variants {
+            let left = Box::new(TableScanOperator::new(schema.clone()));
+            let right = Box::new(TableScanOperator::new(schema.clone()));
+            let op = SetOperationOperator::new(left, right, op_type);
+            assert_eq!(op.name(), expected_name);
+        }
+    }
 }

@@ -9,6 +9,7 @@
 //! - JSONB operators (?, @>, <@)
 //! - Array operators (&&)
 
+use crate::sql::error::SqlError;
 use crate::types::Value;
 use anyhow::{anyhow, Result};
 use rust_decimal::Decimal;
@@ -303,7 +304,7 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
             super::super::fts::ts_match(&left, &right)
         }
 
-        _ => Err(anyhow!("Unsupported binary operator: {:?}", op)),
+        _ => Err(SqlError::Unsupported(format!("Unsupported binary operator: {:?}", op)).into()),
     }
 }
 
@@ -451,7 +452,7 @@ pub(super) fn add_values(left: Value, right: Value) -> Result<Value> {
             ))
         }
         (Value::Interval(l), Value::Interval(r)) => Ok(Value::Interval(l + r)),
-        _ => Err(anyhow!("Unsupported types for addition")),
+        _ => Err(SqlError::Unsupported("Unsupported types for addition".into()).into()),
     }
 }
 
@@ -494,7 +495,7 @@ pub(super) fn sub_values(left: Value, right: Value) -> Result<Value> {
             ))
         }
         (Value::Interval(l), Value::Interval(r)) => Ok(Value::Interval(l - r)),
-        _ => Err(anyhow!("Unsupported types for subtraction")),
+        _ => Err(SqlError::Unsupported("Unsupported types for subtraction".into()).into()),
     }
 }
 
@@ -561,7 +562,7 @@ fn mul_values(left: Value, right: Value) -> Result<Value> {
         return Ok(numeric::numeric_mul(l, r)?.into_value());
     }
 
-    Err(anyhow!("Unsupported types for multiplication"))
+    Err(SqlError::Unsupported("Unsupported types for multiplication".into()).into())
 }
 
 fn div_values(left: Value, right: Value) -> Result<Value> {
@@ -575,7 +576,7 @@ fn div_values(left: Value, right: Value) -> Result<Value> {
         return Ok(numeric::numeric_div(l, r)?.into_value());
     }
 
-    Err(anyhow!("Unsupported types for division"))
+    Err(SqlError::Unsupported("Unsupported types for division".into()).into())
 }
 
 fn mod_values(left: Value, right: Value) -> Result<Value> {
@@ -586,7 +587,7 @@ fn mod_values(left: Value, right: Value) -> Result<Value> {
         return Ok(numeric::numeric_mod(l, r)?.into_value());
     }
 
-    Err(anyhow!("Unsupported types for modulo"))
+    Err(SqlError::Unsupported("Unsupported types for modulo".into()).into())
 }
 
 /// Compare two values. Returns:
@@ -657,11 +658,19 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         (Value::Boolean(l), Value::Boolean(r)) => Ok(l.cmp(r) as i8),
         (Value::Boolean(l), Value::Text(t)) => match parse_bool_pg(t) {
             Some(r) => Ok(l.cmp(&r) as i8),
-            None => Err(anyhow!("invalid input syntax for type boolean: \"{}\"", t)),
+            None => Err(SqlError::InvalidInputSyntax {
+                type_name: "boolean".into(),
+                value: t.clone(),
+            }
+            .into()),
         },
         (Value::Text(t), Value::Boolean(r)) => match parse_bool_pg(t) {
             Some(l) => Ok(l.cmp(r) as i8),
-            None => Err(anyhow!("invalid input syntax for type boolean: \"{}\"", t)),
+            None => Err(SqlError::InvalidInputSyntax {
+                type_name: "boolean".into(),
+                value: t.clone(),
+            }
+            .into()),
         },
         (Value::Timestamp(l), Value::Timestamp(r)) => Ok(l.cmp(r) as i8),
         (Value::Date(l), Value::Date(r)) => Ok(l.cmp(r) as i8),
@@ -694,14 +703,22 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
             if let Ok(r) = uuid::Uuid::parse_str(t) {
                 Ok(l.cmp(r.as_bytes()) as i8)
             } else {
-                Err(anyhow!("invalid input syntax for type uuid: \"{}\"", t))
+                Err(SqlError::InvalidInputSyntax {
+                    type_name: "uuid".into(),
+                    value: t.clone(),
+                }
+                .into())
             }
         }
         (Value::Text(t), Value::Uuid(r)) => {
             if let Ok(l) = uuid::Uuid::parse_str(t) {
                 Ok(l.as_bytes().cmp(r) as i8)
             } else {
-                Err(anyhow!("invalid input syntax for type uuid: \"{}\"", t))
+                Err(SqlError::InvalidInputSyntax {
+                    type_name: "uuid".into(),
+                    value: t.clone(),
+                }
+                .into())
             }
         }
         (Value::Bytes(l), Value::Bytes(r)) => Ok(l.cmp(r) as i8),

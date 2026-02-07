@@ -10,7 +10,7 @@ use sqlparser::ast::{JoinConstraint, JoinOperator, Select, TableWithJoins};
 
 use crate::types::{DataType, TableSchema};
 
-use super::helpers::normalize_ident;
+use super::names::normalize_ident;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoinWildcardColumn {
@@ -26,6 +26,13 @@ pub(crate) struct JoinWildcardPlan {
     pub(crate) any_merge: bool,
 }
 
+fn is_internal_column_name(name: &str) -> bool {
+    name.rsplit('.')
+        .next()
+        .unwrap_or(name)
+        .starts_with("__tipg_subquery_")
+}
+
 fn build_plan_for_table_with_joins(
     twj: &TableWithJoins,
     start_idx: usize,
@@ -36,11 +43,16 @@ fn build_plan_for_table_with_joins(
         .columns
         .iter()
         .enumerate()
-        .map(|(col_idx, col)| JoinWildcardColumn {
-            name: col.name.clone(),
-            source_idx: start_idx,
-            col_idx,
-            data_type: col.data_type.clone(),
+        .filter_map(|(col_idx, col)| {
+            if is_internal_column_name(&col.name) {
+                return None;
+            }
+            Some(JoinWildcardColumn {
+                name: col.name.clone(),
+                source_idx: start_idx,
+                col_idx,
+                data_type: col.data_type.clone(),
+            })
         })
         .collect();
 
@@ -58,6 +70,7 @@ fn build_plan_for_table_with_joins(
                 let right_set: HashSet<&str> = right_schema
                     .columns
                     .iter()
+                    .filter(|c| !is_internal_column_name(&c.name))
                     .map(|c| c.name.as_str())
                     .collect();
                 let mut seen: HashSet<String> = HashSet::new();
@@ -78,6 +91,7 @@ fn build_plan_for_table_with_joins(
                 let mut dedup: HashSet<String> = HashSet::new();
                 cols.iter()
                     .map(normalize_ident)
+                    .filter(|c| !is_internal_column_name(c))
                     .filter(|c| dedup.insert(c.clone()))
                     .collect()
             }
@@ -90,11 +104,16 @@ fn build_plan_for_table_with_joins(
                     .columns
                     .iter()
                     .enumerate()
-                    .map(|(col_idx, col)| JoinWildcardColumn {
-                        name: col.name.clone(),
-                        source_idx: right_idx,
-                        col_idx,
-                        data_type: col.data_type.clone(),
+                    .filter_map(|(col_idx, col)| {
+                        if is_internal_column_name(&col.name) {
+                            return None;
+                        }
+                        Some(JoinWildcardColumn {
+                            name: col.name.clone(),
+                            source_idx: right_idx,
+                            col_idx,
+                            data_type: col.data_type.clone(),
+                        })
                     }),
             );
             continue;
@@ -110,13 +129,19 @@ fn build_plan_for_table_with_joins(
             }
         }
 
-        merged.extend(out.into_iter().filter(|c| !join_set.contains(c.name.as_str())));
+        merged.extend(
+            out.into_iter()
+                .filter(|c| !join_set.contains(c.name.as_str())),
+        );
         merged.extend(
             right_schema
                 .columns
                 .iter()
                 .enumerate()
                 .filter_map(|(col_idx, col)| {
+                    if is_internal_column_name(&col.name) {
+                        return None;
+                    }
                     if join_set.contains(col.name.as_str()) {
                         None
                     } else {

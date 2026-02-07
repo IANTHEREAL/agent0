@@ -2,8 +2,9 @@ use super::encoding::*;
 use super::kv_stats;
 use crate::txn::{txn_delete, txn_put};
 use crate::types::{
-    DataType, DatabaseDef, FunctionDef, Row, SequenceBacking, SequenceDef, SequenceState,
-    TableSchema, TriggerDef, UserTypeDef, Value, ViewDef,
+    DataType, DatabaseDef, DefaultTablePrivilegeGrant, FunctionDef, Row, SequenceBacking,
+    SequenceDef, SequenceState, TablePrivilegeGrant, TableSchema, TriggerDef, UserTypeDef, Value,
+    ViewDef,
 };
 use crate::extensions::InstalledExtension;
 use anyhow::{anyhow, Context, Result};
@@ -965,6 +966,136 @@ impl TikvStore {
         Ok(true)
     }
 
+    pub async fn list_procedures(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<String>> {
+        let prefix = encode_procedure_prefix_v2(db_id);
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (prefix.clone()..end).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+
+        let mut procedures = Vec::new();
+        for pair in pairs {
+            let key: &[u8] = pair.key().as_ref().into();
+            if key.starts_with(&prefix) {
+                let name = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
+                procedures.push(name);
+            }
+        }
+        Ok(procedures)
+    }
+
+    pub async fn drop_schema_cascade(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        schema: &str,
+        if_exists: bool,
+    ) -> Result<bool> {
+        if schema.is_empty() {
+            return Err(anyhow!("schema name must not be empty"));
+        }
+        if schema.contains('.') {
+            return Err(anyhow!("schema name '{}' must not contain '.'", schema));
+        }
+        if Self::is_builtin_schema(schema) {
+            return Err(anyhow!("cannot drop schema '{}'", schema));
+        }
+
+        let key = self.key(&encode_schema_def_key_v2(db_id, schema));
+        if txn.get(key.clone()).await?.is_none() {
+            if if_exists {
+                return Ok(false);
+            }
+            return Err(anyhow!("Schema '{}' does not exist", schema));
+        }
+
+        let schema_prefix = format!("{}.", schema);
+
+        // Avoid stale cached table lists during CASCADE cleanup.
+        self.invalidate_table_cache(db_id).await;
+
+        for view in self.list_views(txn, db_id).await? {
+            if view.schema == schema {
+                let _ = self.drop_view(txn, db_id, &view.full_name()).await?;
+            }
+        }
+
+        for matview in self.list_materialized_views(txn, db_id).await? {
+            if matview.starts_with(&schema_prefix) {
+                let _ = self.drop_materialized_view(txn, db_id, &matview).await?;
+            }
+        }
+
+        let sequences = self.list_sequences(txn, db_id).await?;
+        for def in &sequences {
+            if def.schema == schema {
+                let _ = self.drop_sequence(txn, db_id, &def.full_name()).await?;
+            }
+        }
+
+        let mut owned_sequences: HashMap<String, Vec<String>> = HashMap::new();
+        for def in sequences {
+            let Some((owned_table, _)) = &def.owned_by else {
+                continue;
+            };
+            owned_sequences
+                .entry(owned_table.clone())
+                .or_default()
+                .push(def.full_name());
+        }
+
+        for table in self.list_tables(txn, db_id).await? {
+            if !table.starts_with(&schema_prefix) {
+                continue;
+            }
+
+            for trigger in self.list_triggers_for_table(txn, db_id, &table).await? {
+                let _ = self
+                    .drop_trigger(txn, db_id, &table, trigger.name.as_str())
+                    .await?;
+            }
+
+            if let Some(seqs) = owned_sequences.get(&table) {
+                for seq in seqs {
+                    let _ = self.drop_sequence(txn, db_id, seq).await?;
+                }
+            }
+
+            let _ = self.drop_table(txn, db_id, &table).await?;
+        }
+
+        for trigger in self.list_triggers(txn, db_id).await? {
+            if trigger.table.starts_with(&schema_prefix) {
+                let _ = self
+                    .drop_trigger(txn, db_id, &trigger.table, trigger.name.as_str())
+                    .await?;
+            }
+        }
+
+        for ty in self.list_types(txn, db_id).await? {
+            if ty.schema == schema {
+                let full_name = format!("{}.{}", ty.schema, ty.name);
+                let _ = self.drop_type(txn, db_id, &full_name).await?;
+            }
+        }
+
+        for func in self.list_functions(txn, db_id).await? {
+            if func.schema == schema {
+                let full_name = format!("{}.{}", func.schema, func.name);
+                let _ = self.drop_function(txn, db_id, &full_name, true).await?;
+            }
+        }
+
+        for proc_name in self.list_procedures(txn, db_id).await? {
+            if proc_name.starts_with(&schema_prefix) {
+                let _ = self.drop_procedure(txn, db_id, &proc_name).await?;
+            }
+        }
+
+        self.drop_schema_restrict(txn, db_id, schema, if_exists).await?;
+        Ok(true)
+    }
+
     pub async fn list_schemas(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<String>> {
         {
             let cache = self.cache.read().await;
@@ -1433,6 +1564,133 @@ impl TikvStore {
         }
     }
 
+    pub async fn get_table_privileges(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_full_name: &str,
+    ) -> Result<Vec<TablePrivilegeGrant>> {
+        let key = self.key(&encode_table_privileges_key_v2(db_id, table_full_name));
+        match txn.get(key).await? {
+            Some(data) => Ok(bincode::deserialize(&data)?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub async fn grant_table_privilege(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_full_name: &str,
+        grant: TablePrivilegeGrant,
+    ) -> Result<()> {
+        let key = self.key(&encode_table_privileges_key_v2(db_id, table_full_name));
+        let mut grants: Vec<TablePrivilegeGrant> = match txn.get(key.clone()).await? {
+            Some(data) => bincode::deserialize(&data)?,
+            None => Vec::new(),
+        };
+        grants.retain(|g| !(g.grantee == grant.grantee && g.privilege_type == grant.privilege_type));
+        grants.push(grant);
+        let data = bincode::serialize(&grants)?;
+        txn_put(txn, key, data).await?;
+        Ok(())
+    }
+
+    pub async fn revoke_table_privilege(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_full_name: &str,
+        grantee: &str,
+        privilege_type: &str,
+    ) -> Result<()> {
+        let key = self.key(&encode_table_privileges_key_v2(db_id, table_full_name));
+        let Some(data) = txn.get(key.clone()).await? else {
+            return Ok(());
+        };
+        let mut grants: Vec<TablePrivilegeGrant> = bincode::deserialize(&data)?;
+        grants.retain(|g| !(g.grantee == grantee && g.privilege_type == privilege_type));
+        if grants.is_empty() {
+            txn_delete(txn, key).await?;
+        } else {
+            txn_put(txn, key, bincode::serialize(&grants)?).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn get_default_table_privileges(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        owner: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<DefaultTablePrivilegeGrant>> {
+        let key = self.key(&encode_default_table_privileges_key_v2(db_id, owner, schema));
+        match txn.get(key).await? {
+            Some(data) => Ok(bincode::deserialize(&data)?),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    pub async fn grant_default_table_privilege(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        owner: &str,
+        schema: Option<&str>,
+        grant: DefaultTablePrivilegeGrant,
+    ) -> Result<()> {
+        let key = self.key(&encode_default_table_privileges_key_v2(db_id, owner, schema));
+        let mut grants: Vec<DefaultTablePrivilegeGrant> = match txn.get(key.clone()).await? {
+            Some(data) => bincode::deserialize(&data)?,
+            None => Vec::new(),
+        };
+        grants.retain(|g| !(g.grantee == grant.grantee && g.privilege_type == grant.privilege_type));
+        grants.push(grant);
+        txn_put(txn, key, bincode::serialize(&grants)?).await?;
+        Ok(())
+    }
+
+    pub async fn revoke_default_table_privilege(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        owner: &str,
+        schema: Option<&str>,
+        grantee: &str,
+        privilege_type: &str,
+    ) -> Result<()> {
+        let key = self.key(&encode_default_table_privileges_key_v2(db_id, owner, schema));
+        let Some(data) = txn.get(key.clone()).await? else {
+            return Ok(());
+        };
+        let mut grants: Vec<DefaultTablePrivilegeGrant> = bincode::deserialize(&data)?;
+        grants.retain(|g| !(g.grantee == grantee && g.privilege_type == privilege_type));
+        if grants.is_empty() {
+            txn_delete(txn, key).await?;
+        } else {
+            txn_put(txn, key, bincode::serialize(&grants)?).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn delete_default_table_privileges_for_owner(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        owner: &str,
+    ) -> Result<()> {
+        let prefix = encode_default_table_privileges_key_v2(db_id, owner, None);
+        let mut end = prefix.clone();
+        end.push(0xFF);
+        let range: BoundRange = (self.key(&prefix)..self.key(&end)).into();
+        let pairs = txn.scan(range, SCAN_LIMIT).await?;
+        for pair in pairs {
+            txn_delete(txn, pair.into_key().into()).await?;
+        }
+        Ok(())
+    }
+
     pub async fn drop_table(
         &self,
         txn: &mut Transaction,
@@ -1482,6 +1740,13 @@ impl TikvStore {
             .await?;
             self.delete_column_comments_for_table(txn, db_id, table_name)
                 .await?;
+
+            // Table privileges are stored under a dedicated key to support `information_schema.table_privileges`.
+            txn_delete(
+                txn,
+                self.key(&encode_table_privileges_key_v2(db_id, table_name)),
+            )
+            .await?;
 
             info!("Dropped table '{}'", table_name);
             self.invalidate_table_cache(db_id).await;

@@ -27,8 +27,8 @@ use super::{
     BoxedOperator, FilterOperator, IndexScanOperator, LimitOperator, ProjectOperator, SortOperator,
     TableScanOperator,
 };
+use crate::sql::coercion::coerce_value_for_column;
 use crate::sql::expr::eval_expr;
-use crate::sql::helpers::coerce_value_for_column;
 use crate::sql::planner::{choose_best_access_path_for_filter, ScanType};
 use crate::storage::TikvStore;
 use crate::types::{DataType, TableSchema, Value};
@@ -129,6 +129,7 @@ fn filter_is_exact_index_lookup(
 /// The planner uses cost-based optimization to choose access paths (full scan vs index scan)
 /// and constructs a tree of physical operators that implement the Volcano iterator model.
 pub struct PhysicalPlanner {
+    #[allow(dead_code)] // used by future index-aware planning
     store: Arc<TikvStore>,
     search_path: Vec<String>,
 }
@@ -196,7 +197,10 @@ impl PhysicalPlanner {
                 } else {
                     None
                 };
-                Box::new(TableScanOperator::new_with_scan_limit(schema.clone(), scan_limit))
+                Box::new(TableScanOperator::new_with_scan_limit(
+                    schema.clone(),
+                    scan_limit,
+                ))
             }
             ScanType::IndexScan {
                 index_id,
@@ -206,8 +210,9 @@ impl PhysicalPlanner {
             } => {
                 let scan_limit = if order_by.is_empty()
                     && scan_upper_bound.is_some()
-                    && filter.is_some_and(|f| filter_is_exact_index_lookup(f, &schema, index_id, &values))
-                {
+                    && filter.is_some_and(|f| {
+                        filter_is_exact_index_lookup(f, &schema, index_id, &values)
+                    }) {
                     scan_upper_bound
                 } else {
                     None
@@ -230,8 +235,7 @@ impl PhysicalPlanner {
                     && scan_upper_bound.is_some()
                     && filter.is_some_and(|f| {
                         filter_is_exact_index_lookup(f, &schema, index_id, &prefix_values)
-                    })
-                {
+                    }) {
                     scan_upper_bound
                 } else {
                     None
@@ -262,14 +266,12 @@ impl PhysicalPlanner {
         Ok(root)
     }
 
-    /// Get the store reference.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // accessor for future index-aware planning
     pub fn store(&self) -> &Arc<TikvStore> {
         &self.store
     }
 
-    /// Get the search path.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // accessor for future index-aware planning
     pub fn search_path(&self) -> &[String] {
         &self.search_path
     }
@@ -280,10 +282,12 @@ impl PhysicalPlanner {
 /// This provides a fluent API for building operator trees, useful for testing
 /// and for more complex query patterns.
 #[derive(Debug)]
+#[allow(dead_code)] // Operator framework — fluent builder API for future use
 pub struct OperatorBuilder {
     root: BoxedOperator,
 }
 
+#[allow(dead_code)] // Operator framework
 impl OperatorBuilder {
     /// Start building with a scan operator.
     pub fn scan(schema: TableSchema) -> Self {
@@ -507,6 +511,58 @@ mod tests {
         .build();
 
         assert_eq!(op.name(), "IndexScan");
+    }
+
+    #[test]
+    fn test_collect_eq_predicates_single() {
+        let expr = make_eq_expr("id", 42);
+        let mut out = HashMap::new();
+        assert!(super::collect_eq_predicates(&expr, &mut out).is_some());
+        assert_eq!(out.len(), 1);
+        assert!(matches!(
+            out.get("id"),
+            Some(Value::Int32(42)) | Some(Value::Int64(42))
+        ));
+    }
+
+    #[test]
+    fn test_collect_eq_predicates_and_conjunction() {
+        let expr = Expr::BinaryOp {
+            left: Box::new(make_eq_expr("a", 1)),
+            op: BinaryOperator::And,
+            right: Box::new(make_eq_expr("b", 2)),
+        };
+        let mut out = HashMap::new();
+        assert!(super::collect_eq_predicates(&expr, &mut out).is_some());
+        assert_eq!(out.len(), 2);
+        assert!(out.contains_key("a"));
+        assert!(out.contains_key("b"));
+    }
+
+    #[test]
+    fn test_collect_eq_predicates_non_eq_returns_none() {
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("id"))),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
+                "5".to_string(),
+                false,
+            ))),
+        };
+        let mut out = HashMap::new();
+        assert!(super::collect_eq_predicates(&expr, &mut out).is_none());
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn test_collect_eq_predicates_conflicting_values() {
+        let expr = Expr::BinaryOp {
+            left: Box::new(make_eq_expr("id", 1)),
+            op: BinaryOperator::And,
+            right: Box::new(make_eq_expr("id", 2)),
+        };
+        let mut out = HashMap::new();
+        assert!(super::collect_eq_predicates(&expr, &mut out).is_none());
     }
 
     #[test]

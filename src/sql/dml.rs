@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Assignment, Expr, Ident, OnConflictAction, OnInsert, SelectItem};
 use sqlparser::dialect::PostgreSqlDialect;
@@ -9,7 +10,8 @@ use tikv_client::Transaction;
 
 use super::expr::eval_expr;
 use super::gin;
-use super::helpers::{coerce_value_for_column, eval_default_expr, infer_expr_type};
+use super::coercion::coerce_value_for_column;
+use super::projection::{eval_default_expr, infer_expr_type};
 use super::index_helpers;
 use super::sequences;
 use crate::storage::TikvStore;
@@ -259,7 +261,7 @@ pub fn build_returning_columns(
                         ret_cols.push(c.name.clone());
                     }
                 }
-                _ => return Err(anyhow!("Unsupported RETURNING")),
+                _ => return Err(SqlError::Unsupported("Unsupported RETURNING".into()).into()),
             }
         }
     }
@@ -622,23 +624,25 @@ pub async fn execute_insert_row(
                                 let cols = index.columns.join(", ");
                                 let vals: Vec<String> =
                                     idx_values.iter().map(|v| format!("{}", v)).collect();
-                                return Err(anyhow!(
-                                    "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
-                                    index.name,
-                                    cols,
-                                    vals.join(", ")
-                                ));
+                                return Err(SqlError::UniqueViolation {
+                                    constraint: index.name.clone(),
+                                    message: format!(
+                                        "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+                                        index.name, cols, vals.join(", ")
+                                    ),
+                                }.into());
                             }
                             _ => {
                                 let cols = index.columns.join(", ");
                                 let vals: Vec<String> =
                                     idx_values.iter().map(|v| format!("{}", v)).collect();
-                                return Err(anyhow!(
-                                    "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
-                                    index.name,
-                                    cols,
-                                    vals.join(", ")
-                                ));
+                                return Err(SqlError::UniqueViolation {
+                                    constraint: index.name.clone(),
+                                    message: format!(
+                                        "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+                                        index.name, cols, vals.join(", ")
+                                    ),
+                                }.into());
                             }
                         }
                     }
@@ -1294,12 +1298,13 @@ pub async fn execute_update_row(
                 .pk_constraint_name
                 .clone()
                 .unwrap_or(default_pk_name);
-            return Err(anyhow!(
-                "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
-                pk_constraint_name,
-                pk_cols.join(", "),
-                pk_vals.join(", ")
-            ));
+            return Err(SqlError::UniqueViolation {
+                constraint: pk_constraint_name.clone(),
+                message: format!(
+                    "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
+                    pk_constraint_name, pk_cols.join(", "), pk_vals.join(", ")
+                ),
+            }.into());
         }
     }
 
@@ -1553,12 +1558,15 @@ pub async fn fill_missing_columns(
                     .await?;
         } else if !c.nullable {
             let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-            return Err(anyhow!(
-                "null value in column \"{}\" of relation \"{}\" violates not-null constraint\nDETAIL:  Failing row contains ({}).",
-                c.name,
-                short_table,
-                row_vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ")
-            ));
+            let row_str = row_vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ");
+            return Err(SqlError::NotNullViolation {
+                column: c.name.clone(),
+                relation: short_table.to_string(),
+                message: format!(
+                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint\nDETAIL:  Failing row contains ({}).",
+                    c.name, short_table, row_str
+                ),
+            }.into());
         }
     }
     Ok(())
@@ -1569,12 +1577,15 @@ pub fn coerce_row_values(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Res
         let coerced = coerce_value_for_column(row_vals[i].clone(), c)?;
         if coerced == Value::Null && !c.nullable {
             let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-            return Err(anyhow!(
-                "null value in column \"{}\" of relation \"{}\" violates not-null constraint\nDETAIL:  Failing row contains ({}).",
-                c.name,
-                short_table,
-                row_vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ")
-            ));
+            let row_str = row_vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ");
+            return Err(SqlError::NotNullViolation {
+                column: c.name.clone(),
+                relation: short_table.to_string(),
+                message: format!(
+                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint\nDETAIL:  Failing row contains ({}).",
+                    c.name, short_table, row_str
+                ),
+            }.into());
         }
         row_vals[i] = coerced;
     }
@@ -1597,21 +1608,15 @@ pub fn validate_check_constraints(schema: &TableSchema, row: &Row) -> Result<()>
                 let name = check
                     .name
                     .as_ref()
-                    .map(|n| format!("\"{}\"", n))
+                    .map(|n| n.to_string())
                     .unwrap_or_else(|| format!("({})", check.expr));
                 let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-                let row_vals_str = row
-                    .values
-                    .iter()
-                    .map(|v| format!("{}", v))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(anyhow!(
-                    "new row for relation \"{}\" violates check constraint {}\nDETAIL:  Failing row contains ({}).",
-                    short_table,
-                    name,
-                    row_vals_str
-                ));
+                let row_str = row.values.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ");
+                return Err(SqlError::CheckViolation {
+                    table: short_table.to_string(),
+                    constraint: name.to_string(),
+                    detail: row_str,
+                }.into());
             }
             Value::Null => {}
             _ => {
@@ -1747,12 +1752,15 @@ pub async fn compute_update_values(
         let coerced = coerce_value_for_column(raw_val, col)?;
         if coerced == Value::Null && !col.nullable {
             let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-            return Err(anyhow!(
-                "null value in column \"{}\" of relation \"{}\" violates not-null constraint\nDETAIL:  Failing row contains ({}).",
-                col.name,
-                short_table,
-                vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ")
-            ));
+            let row_str = vals.iter().map(|v| format!("{}", v)).collect::<Vec<_>>().join(", ");
+            return Err(SqlError::NotNullViolation {
+                column: col.name.clone(),
+                relation: short_table.to_string(),
+                message: format!(
+                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint\nDETAIL:  Failing row contains ({}).",
+                    col.name, short_table, row_str
+                ),
+            }.into());
         }
         vals[indices[i]] = coerced;
     }

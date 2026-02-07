@@ -1,6 +1,6 @@
 use super::super::ddl;
 use super::core::Executor;
-use super::super::helpers::infer_data_type;
+use super::super::coercion::infer_data_type;
 use super::super::names;
 use super::super::{parse_sql, ExecuteResult, Session};
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
@@ -518,6 +518,7 @@ impl Executor {
             session.begin().await?;
         }
 
+        let current_role = session.current_user().map(|u| u.to_string());
         let result = async {
             let db_id = session.current_database_id();
             let (txn, sequence_values, search_path) = session
@@ -616,7 +617,14 @@ impl Executor {
 
                 let stmts = parse_sql(&expanded_stmt)?;
                 for stmt in stmts {
-                    self.execute_statement_on_txn(txn, db_id, sequence_values, search_path, &stmt)
+                    self.execute_statement_on_txn(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        &stmt,
+                        current_role.as_deref(),
+                    )
                         .await?;
                 }
             }

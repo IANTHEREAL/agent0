@@ -1,4 +1,5 @@
-use super::helpers::normalize_ident;
+use super::names::normalize_ident;
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Ident, ObjectName};
 
@@ -100,7 +101,9 @@ fn parse_object_name_max2(input: &str, idx: &mut usize) -> Result<ObjectName> {
         let second = parse_ident(input, idx)?;
         skip_ws(input, idx);
         if input[*idx..].starts_with('.') {
-            return Err(anyhow!("Unsupported object name (too many parts)"));
+            return Err(
+                SqlError::Unsupported("Unsupported object name (too many parts)".into()).into(),
+            );
         }
         Ok(ObjectName(vec![first, second]))
     } else {
@@ -133,7 +136,9 @@ fn parse_owned_by_target(input: &str, idx: &mut usize) -> Result<Option<(ObjectN
     let third = parse_ident(input, idx)?;
     skip_ws(input, idx);
     if input[*idx..].starts_with('.') {
-        return Err(anyhow!("OWNED BY target must be at most schema.table.column"));
+        return Err(anyhow!(
+            "OWNED BY target must be at most schema.table.column"
+        ));
     }
 
     Ok(Some((
@@ -189,8 +194,8 @@ mod tests {
 
     #[test]
     fn parse_owned_by_table_column_if_exists() {
-        let cmd = parse_alter_sequence_owned_by_sql("ALTER SEQUENCE IF EXISTS s OWNED BY t.id")
-            .unwrap();
+        let cmd =
+            parse_alter_sequence_owned_by_sql("ALTER SEQUENCE IF EXISTS s OWNED BY t.id").unwrap();
         assert!(cmd.if_exists);
         assert_eq!(cmd.sequence_name.0.len(), 1);
         let (tbl, col) = cmd.owned_by.expect("expected owned-by target");
@@ -205,4 +210,3 @@ mod tests {
         assert!(cmd.owned_by.is_none());
     }
 }
-

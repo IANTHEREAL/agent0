@@ -45,6 +45,18 @@ WHERE grantee = 'gaats_grantee'
   AND table_schema = 'gaats_schema2'
 ORDER BY table_schema, table_name, grantee, privilege_type;
 
+-- Revoke should remove the per-table grants created above
+SET ROLE gaats_owner;
+REVOKE SELECT ON ALL TABLES IN SCHEMA gaats_schema1 FROM gaats_grantee;
+RESET ROLE;
+
+SELECT table_schema, table_name, grantee, privilege_type
+FROM information_schema.table_privileges
+WHERE grantee = 'gaats_grantee'
+  AND table_schema = 'gaats_schema1'
+  AND table_name IN ('t1', 't2', 't_after')
+ORDER BY table_schema, table_name, grantee, privilege_type;
+
 -- Cleanup
 DROP SCHEMA IF EXISTS gaats_schema1 CASCADE;
 DROP SCHEMA IF EXISTS gaats_schema2 CASCADE;

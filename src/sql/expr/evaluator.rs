@@ -5,6 +5,7 @@ use super::{
     like_match, parse_interval_from_expr, parse_interval_string, parse_timestamp_string,
     parse_timezone_offset_seconds, similar_to_match,
 };
+use crate::sql::error::SqlError;
 use crate::types::{DataType, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{BinaryOperator, Expr, GroupByExpr, Query, SelectItem, SetExpr};
@@ -80,7 +81,11 @@ fn eval_array_subquery_with_context<C: EvalContext, Q: AsRef<Query>>(
             || query.offset.is_some()
             || query.fetch.is_some()
         {
-            return Err(anyhow!("Unsupported ARRAY(subquery) shape: {:?}", query));
+            return Err(SqlError::Unsupported(format!(
+                "Unsupported ARRAY(subquery) shape: {:?}",
+                query
+            ))
+            .into());
         }
 
         match &*query.body {
@@ -111,7 +116,11 @@ fn eval_array_subquery_with_context<C: EvalContext, Q: AsRef<Query>>(
         || select.distinct.is_some()
         || select.projection.len() != 1
     {
-        return Err(anyhow!("Unsupported ARRAY(subquery) shape: {:?}", query));
+        return Err(SqlError::Unsupported(format!(
+            "Unsupported ARRAY(subquery) shape: {:?}",
+            query
+        ))
+        .into());
     }
 
     let proj_expr = match &select.projection[0] {
@@ -328,6 +337,38 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(
     }
 }
 
+fn parse_any_text_operand_to_array(s: &str) -> Result<Vec<Value>> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let inner = trimmed
+        .strip_prefix('{')
+        .and_then(|t| t.strip_suffix('}'))
+        .unwrap_or(trimmed);
+
+    let mut values = Vec::new();
+    let tokens: Box<dyn Iterator<Item = &str>> = if inner.contains(',') {
+        Box::new(inner.split(','))
+    } else {
+        Box::new(inner.split_whitespace())
+    };
+
+    for token in tokens {
+        let token = token.trim();
+        if token.is_empty() {
+            continue;
+        }
+        let n: i64 = token
+            .parse()
+            .map_err(|_| anyhow!("ANY requires an array operand"))?;
+        values.push(Value::Int64(n));
+    }
+
+    Ok(values)
+}
+
 pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
     match expr {
         Expr::Value(v) => eval_value(v),
@@ -407,9 +448,11 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                                 .map(Value::Int64)
                                 .ok_or_else(|| anyhow!("bigint out of range")),
                             Value::Float64(f) => Ok(Value::Float64(-f)),
-                            Value::Text(_) => {
-                                Err(anyhow!("invalid input syntax for type numeric: \"{}\"", s))
+                            Value::Text(_) => Err(SqlError::InvalidInputSyntax {
+                                type_name: "numeric".into(),
+                                value: s.to_string(),
                             }
+                            .into()),
                             other => Err(anyhow!("Cannot negate {:?}", other)),
                         }
                     }
@@ -423,7 +466,9 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                         other => Err(anyhow!("NOT requires boolean, got {:?}", other)),
                     }
                 }
-                _ => Err(anyhow!("Unsupported unary operator: {:?}", op)),
+                _ => Err(
+                    SqlError::Unsupported(format!("Unsupported unary operator: {:?}", op)).into(),
+                ),
             }
         }
         Expr::Nested(expr) => eval_expr_impl(ctx, expr),
@@ -826,6 +871,8 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             let right_val = eval_expr_impl(ctx, right)?;
             let arr = match right_val {
                 Value::Array(arr) => arr,
+                Value::Text(s) => parse_any_text_operand_to_array(&s)?,
+                Value::Null => return Ok(Value::Null),
                 _ => return Err(anyhow!("ANY requires an array operand")),
             };
             let mut saw_null = false;
@@ -855,6 +902,8 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             let right_val = eval_expr_impl(ctx, right)?;
             let arr = match right_val {
                 Value::Array(arr) => arr,
+                Value::Text(s) => parse_any_text_operand_to_array(&s)?,
+                Value::Null => return Ok(Value::Null),
                 _ => return Err(anyhow!("ALL requires an array operand")),
             };
             if arr.is_empty() {
@@ -878,7 +927,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                 Ok(Value::Boolean(true))
             }
         }
-        _ => Err(anyhow!("Unsupported expression: {:?}", expr)),
+        _ => Err(SqlError::Unsupported(format!("Unsupported expression: {:?}", expr)).into()),
     }
 }
 
@@ -1026,7 +1075,7 @@ fn eval_extract_with_context<C: EvalContext>(
         sqlparser::ast::DateTimeField::Week => dt.iso_week().week() as f64,
         sqlparser::ast::DateTimeField::Quarter => ((dt.month() - 1) / 3 + 1) as f64,
         sqlparser::ast::DateTimeField::Epoch => ts as f64 / 1000.0,
-        _ => return Err(anyhow!("Unsupported EXTRACT field")),
+        _ => return Err(SqlError::Unsupported("Unsupported EXTRACT field".into()).into()),
     };
     Ok(Value::Float64(result))
 }

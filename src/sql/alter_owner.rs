@@ -1,4 +1,5 @@
-use super::helpers::normalize_ident;
+use super::names::normalize_ident;
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Ident, ObjectName};
 
@@ -107,7 +108,9 @@ fn parse_object_name(input: &str, idx: &mut usize) -> Result<ObjectName> {
         let second = parse_ident(input, idx)?;
         skip_ws(input, idx);
         if input[*idx..].starts_with('.') {
-            return Err(anyhow!("Unsupported object name (too many parts)"));
+            return Err(
+                SqlError::Unsupported("Unsupported object name (too many parts)".into()).into(),
+            );
         }
         Ok(ObjectName(vec![first, second]))
     } else {
@@ -183,7 +186,9 @@ pub(crate) fn parse_alter_owner_sql(sql: &str) -> Result<AlterOwnerCommand> {
     } else if consume_keyword(sql, &mut idx, "FUNCTION") {
         AlterOwnerKind::Function
     } else {
-        return Err(anyhow!("Unsupported ALTER ... OWNER TO statement"));
+        return Err(
+            SqlError::Unsupported("Unsupported ALTER ... OWNER TO statement".into()).into(),
+        );
     };
 
     let if_exists = if consume_keyword(sql, &mut idx, "IF") {
@@ -222,8 +227,7 @@ mod tests {
 
     #[test]
     fn parse_alter_table_owner() {
-        let cmd =
-            parse_alter_owner_sql("ALTER TABLE public.accounts OWNER TO postgres;").unwrap();
+        let cmd = parse_alter_owner_sql("ALTER TABLE public.accounts OWNER TO postgres;").unwrap();
         assert_eq!(cmd.kind, AlterOwnerKind::Table);
         assert!(!cmd.if_exists);
         assert_eq!(cmd.name.0.len(), 2);
@@ -232,9 +236,8 @@ mod tests {
 
     #[test]
     fn parse_alter_table_owner_if_exists_only() {
-        let cmd =
-            parse_alter_owner_sql("ALTER TABLE IF EXISTS ONLY public.t OWNER TO \"Alice\";")
-                .unwrap();
+        let cmd = parse_alter_owner_sql("ALTER TABLE IF EXISTS ONLY public.t OWNER TO \"Alice\";")
+            .unwrap();
         assert_eq!(cmd.kind, AlterOwnerKind::Table);
         assert!(cmd.if_exists);
         assert_eq!(cmd.name.0.len(), 2);
@@ -268,4 +271,3 @@ mod tests {
         assert_eq!(cmd.new_owner, "postgres");
     }
 }
-

@@ -1,7 +1,15 @@
-use super::helpers::normalize_ident;
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
-use sqlparser::ast::ObjectName;
+use sqlparser::ast::{Ident, ObjectName};
 use tikv_client::Transaction;
+
+pub fn normalize_ident(ident: &Ident) -> String {
+    if ident.quote_style.is_some() {
+        ident.value.clone()
+    } else {
+        ident.value.to_lowercase()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ResolvedName {
@@ -65,7 +73,7 @@ pub(crate) fn split_object_name(name: &ObjectName) -> Result<(Option<String>, St
     match parts.as_slice() {
         [single] => Ok((None, single.clone())),
         [schema, obj] => Ok((Some(schema.clone()), obj.clone())),
-        _ => Err(anyhow!("unsupported object name '{}'", name)),
+        _ => Err(SqlError::Unsupported(format!("unsupported object name '{}'", name)).into()),
     }
 }
 

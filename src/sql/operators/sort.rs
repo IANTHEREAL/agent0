@@ -259,4 +259,121 @@ mod tests {
             std::cmp::Ordering::Equal
         );
     }
+
+    #[test]
+    fn test_compare_keys_desc_ordering() {
+        use super::super::scan::TableScanOperator;
+        use sqlparser::ast::Expr;
+
+        let schema = test_schema();
+        let child = Box::new(TableScanOperator::new(schema));
+
+        let order_by = vec![OrderByExpr {
+            expr: Expr::Identifier(Ident::new("id")),
+            asc: Some(false),
+            nulls_first: None,
+        }];
+
+        let sort = SortOperator::new(child, order_by);
+
+        let keys1 = vec![Value::Int32(1)];
+        let keys2 = vec![Value::Int32(2)];
+
+        assert_eq!(
+            sort.compare_keys(&keys1, &keys2),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            sort.compare_keys(&keys2, &keys1),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_compare_keys_null_handling() {
+        use super::super::scan::TableScanOperator;
+        use sqlparser::ast::Expr;
+
+        let schema = test_schema();
+
+        // ASC + NULLS FIRST: NULL < non-NULL
+        let child = Box::new(TableScanOperator::new(schema.clone()));
+        let order_by = vec![OrderByExpr {
+            expr: Expr::Identifier(Ident::new("id")),
+            asc: Some(true),
+            nulls_first: Some(true),
+        }];
+        let sort = SortOperator::new(child, order_by);
+
+        let null_key = vec![Value::Null];
+        let val_key = vec![Value::Int32(1)];
+
+        assert_eq!(
+            sort.compare_keys(&null_key, &val_key),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            sort.compare_keys(&val_key, &null_key),
+            std::cmp::Ordering::Greater
+        );
+
+        // ASC + NULLS LAST: NULL > non-NULL
+        let child = Box::new(TableScanOperator::new(schema));
+        let order_by = vec![OrderByExpr {
+            expr: Expr::Identifier(Ident::new("id")),
+            asc: Some(true),
+            nulls_first: Some(false),
+        }];
+        let sort = SortOperator::new(child, order_by);
+
+        assert_eq!(
+            sort.compare_keys(&null_key, &val_key),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            sort.compare_keys(&val_key, &null_key),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn test_compare_keys_multi_column_tiebreak() {
+        use super::super::scan::TableScanOperator;
+        use sqlparser::ast::Expr;
+
+        let schema = test_schema();
+        let child = Box::new(TableScanOperator::new(schema));
+
+        let order_by = vec![
+            OrderByExpr {
+                expr: Expr::Identifier(Ident::new("name")),
+                asc: Some(true),
+                nulls_first: None,
+            },
+            OrderByExpr {
+                expr: Expr::Identifier(Ident::new("id")),
+                asc: Some(false),
+                nulls_first: None,
+            },
+        ];
+
+        let sort = SortOperator::new(child, order_by);
+
+        // Same first key, tiebreak by second key (DESC)
+        let keys_a = vec![Value::Text("Alice".to_string()), Value::Int32(1)];
+        let keys_b = vec![Value::Text("Alice".to_string()), Value::Int32(2)];
+
+        // Second column is DESC, so 2 comes before 1
+        assert_eq!(
+            sort.compare_keys(&keys_a, &keys_b),
+            std::cmp::Ordering::Greater
+        );
+
+        // Different first key — tiebreak not needed
+        let keys_c = vec![Value::Text("Bob".to_string()), Value::Int32(1)];
+        assert_eq!(
+            sort.compare_keys(&keys_a, &keys_c),
+            std::cmp::Ordering::Less
+        );
+    }
 }

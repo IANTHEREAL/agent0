@@ -599,6 +599,10 @@ fn extract_subquery(sql: &str, start: usize) -> Option<(String, usize)> {
 fn preprocess_sql(sql: &str) -> String {
     let mut result = sql.to_string();
 
+    if let Some(reset) = preprocess_reset_role(&result) {
+        result = reset;
+    }
+
     if let Some(explained) = preprocess_explain(&result) {
         result = explained;
     }
@@ -616,12 +620,26 @@ fn preprocess_sql(sql: &str) -> String {
 
     result = rewrite_vector_distance_ops(&result);
 
+    // sqlparser-rs doesn't support PostgreSQL's `RESET ROLE`, but it does support the equivalent
+    // `SET ROLE NONE`.
+    result = rewrite_reset_role(&result);
+
     // sqlparser-rs expects a quoted string after `AT TIME ZONE`, but PostgreSQL also allows
     // prepared statement placeholders (`$n`). This rewrite is only used for parse-time validation
     // (see `parse_sql()`), and the original SQL is preserved for execution/binding.
     result = rewrite_at_time_zone_placeholders(&result);
 
     result
+}
+
+fn preprocess_reset_role(sql: &str) -> Option<String> {
+    let trimmed = sql.trim();
+    let trimmed = trimmed.trim_end_matches(';').trim();
+    if trimmed.eq_ignore_ascii_case("RESET ROLE") {
+        Some("SET ROLE NONE".to_string())
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -839,6 +857,22 @@ fn tokenize_sql_for_rewrite(sql: &str) -> Vec<Token> {
                 });
                 continue;
             }
+        }
+
+        // JSON access operators: ->  ->>
+        if bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'>' {
+            if i + 2 < bytes.len() && bytes[i + 2] == b'>' {
+                i += 3;
+            } else {
+                i += 2;
+            }
+            tokens.push(Token {
+                kind: TokenKind::Operator,
+                start,
+                end: i,
+                text: sql[start..i].to_string(),
+            });
+            continue;
         }
 
         // Fallback: single char
@@ -1218,6 +1252,66 @@ fn rewrite_at_time_zone_placeholders(sql: &str) -> String {
     out
 }
 
+fn rewrite_reset_role(sql: &str) -> String {
+    let tokens = tokenize_sql_for_rewrite(sql);
+    if tokens.is_empty() {
+        return sql.to_string();
+    }
+
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+
+    let mut stmt_start = 0usize;
+    for (idx, tok) in tokens.iter().enumerate() {
+        if tok.kind == TokenKind::Punct && tok.text == ";" {
+            collect_reset_role_rewrite(&tokens, stmt_start, idx, &mut replacements);
+            stmt_start = idx + 1;
+        }
+    }
+    collect_reset_role_rewrite(&tokens, stmt_start, tokens.len(), &mut replacements);
+
+    if replacements.is_empty() {
+        return sql.to_string();
+    }
+
+    // Apply replacements from right to left so offsets remain valid.
+    replacements.sort_by_key(|(s, _, _)| *s);
+    let mut out = sql.to_string();
+    for (start, end, repl) in replacements.into_iter().rev() {
+        out.replace_range(start..end, &repl);
+    }
+    out
+}
+
+fn collect_reset_role_rewrite(
+    tokens: &[Token],
+    stmt_start: usize,
+    stmt_end: usize,
+    replacements: &mut Vec<(usize, usize, String)>,
+) {
+    let idx = skip_ws_comments_forward(tokens, stmt_start, stmt_end);
+    if idx >= stmt_end
+        || tokens[idx].kind != TokenKind::Word
+        || !tokens[idx].text.eq_ignore_ascii_case("RESET")
+    {
+        return;
+    }
+
+    let mut j = idx + 1;
+    j = skip_ws_comments_forward(tokens, j, stmt_end);
+    if j >= stmt_end
+        || tokens[j].kind != TokenKind::Word
+        || !tokens[j].text.eq_ignore_ascii_case("ROLE")
+    {
+        return;
+    }
+
+    let k = skip_ws_comments_forward(tokens, j + 1, stmt_end);
+    if k != stmt_end {
+        return;
+    }
+
+    replacements.push((tokens[idx].start, tokens[j].end, "SET ROLE NONE".to_string()));
+}
 fn find_keyword_outside_strings(query: &str, keyword: &str) -> Option<usize> {
     let bytes = query.as_bytes();
     let kw = keyword.as_bytes();
@@ -1392,9 +1486,32 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_reset_role_rewrite() {
+        let stmts = parse_sql("RESET ROLE").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(
+            stmts[0],
+            Statement::SetRole {
+                role_name: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn test_parse_create_table() {
         let stmts = parse_sql("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").unwrap();
         assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_reset_role() {
+        let stmts = parse_sql("RESET ROLE").unwrap();
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0] {
+            Statement::SetRole { role_name, .. } => assert!(role_name.is_none()),
+            other => panic!("expected SET ROLE, got {:?}", other),
+        }
     }
 
     #[test]
@@ -1429,6 +1546,33 @@ mod tests {
         let stmts =
             parse_sql("SELECT TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE $1").unwrap();
         assert_eq!(stmts.len(), 1);
+    }
+
+    #[test]
+    fn test_parse_reset_role_via_rewrite() {
+        let stmts = parse_sql("RESET ROLE").unwrap();
+        assert_eq!(stmts.len(), 1);
+        assert!(matches!(
+            stmts[0],
+            Statement::SetRole {
+                role_name: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn test_rewrite_reset_role_is_statement_aware() {
+        assert_eq!(preprocess_sql("RESET ROLE"), "SET ROLE NONE");
+        assert_eq!(preprocess_sql("SELECT 'RESET ROLE'"), "SELECT 'RESET ROLE'");
+        assert_eq!(
+            preprocess_sql("-- RESET ROLE\nSELECT 1"),
+            "-- RESET ROLE\nSELECT 1"
+        );
+        assert_eq!(
+            preprocess_sql("RESET ROLE; SELECT 'RESET ROLE';"),
+            "SET ROLE NONE; SELECT 'RESET ROLE';"
+        );
     }
 
     #[test]
@@ -1689,6 +1833,16 @@ mod tests {
     fn test_rewrite_vector_distance_no_false_positive_in_strings() {
         let result = rewrite_vector_distance_ops("SELECT '<->' FROM t");
         assert_eq!(result, "SELECT '<->' FROM t");
+    }
+
+    #[test]
+    fn test_rewrite_jsonb_exists_ops_keeps_arrow_left_expr() {
+        let sql = "SELECT 1 WHERE data->'tags' ? 'sale'";
+        let rewritten = rewrite_jsonb_exists_ops(sql);
+        assert_eq!(
+            rewritten,
+            "SELECT 1 WHERE (JSONB_EXISTS(data->'tags', 'sale'))"
+        );
     }
 
     #[test]

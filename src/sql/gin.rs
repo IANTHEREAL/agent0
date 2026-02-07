@@ -25,12 +25,7 @@ pub(crate) struct GinTokens {
 }
 
 impl GinTokens {
-    #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
-        self.key_values.is_empty() && self.key_exists.is_empty()
-    }
-
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in tests for GIN token verification
     pub(crate) fn iter_hashes(&self) -> impl Iterator<Item = u64> + '_ {
         self.key_values
             .iter()

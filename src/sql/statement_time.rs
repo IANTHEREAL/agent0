@@ -16,7 +16,7 @@ pub(super) fn statement_timestamp_millis() -> Option<i64> {
     STATEMENT_TIMESTAMP_MILLIS.try_with(|v| *v).ok()
 }
 
-pub(super) fn statement_timestamp_millis_or_now() -> i64 {
+pub(crate) fn statement_timestamp_millis_or_now() -> i64 {
     statement_timestamp_millis().unwrap_or_else(now_timestamp_millis)
 }
 

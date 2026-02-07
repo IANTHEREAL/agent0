@@ -10,6 +10,7 @@ pub fn type_precedence(dt: &DataType) -> i32 {
         DataType::Numeric { .. } => 40,
         DataType::Float64 => 50,
         DataType::Text => 100,
+        DataType::Name => 100,
         DataType::Date => 60,
         DataType::Time => 61,
         DataType::Timestamp => 70,
@@ -34,7 +35,7 @@ pub fn is_numeric(dt: &DataType) -> bool {
     )
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // new type inference module, not yet fully integrated
 pub fn is_temporal(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -46,7 +47,7 @@ pub fn is_temporal(dt: &DataType) -> bool {
     )
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // new type inference module, not yet fully integrated
 pub fn can_coerce(from: &DataType, to: &DataType) -> bool {
     if from == to {
         return true;
@@ -62,8 +63,8 @@ pub fn can_coerce(from: &DataType, to: &DataType) -> bool {
         (DataType::Date, DataType::Timestamp | DataType::TimestampTz) => true,
         (DataType::Timestamp, DataType::TimestampTz) => true,
 
-        // Text accepts most types
-        (_, DataType::Text) => true,
+        // Text-like types accept most types
+        (_, DataType::Text | DataType::Name) => true,
 
         // JSON compatibility
         (DataType::Json, DataType::Jsonb) => true,
@@ -103,8 +104,11 @@ pub fn common_type(a: &DataType, b: &DataType) -> Option<DataType> {
             Some(DataType::Jsonb)
         }
 
-        // Text as universal fallback
-        (DataType::Text, _) | (_, DataType::Text) => Some(DataType::Text),
+        // Text-like as universal fallback
+        (DataType::Text, _)
+        | (_, DataType::Text)
+        | (DataType::Name, _)
+        | (_, DataType::Name) => Some(DataType::Text),
 
         _ => None,
     }

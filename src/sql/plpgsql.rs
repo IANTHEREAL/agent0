@@ -30,15 +30,6 @@ impl PlpgsqlContext {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn get_var(&self, name: &str) -> Option<&Value> {
-        let name_lower = name.to_lowercase();
-        self.variables
-            .iter()
-            .find(|(k, _)| k.to_lowercase() == name_lower)
-            .map(|(_, v)| v)
-    }
-
     pub fn set_var(&mut self, name: &str, value: Value) {
         let name_lower = name.to_lowercase();
         let key = self

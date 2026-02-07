@@ -5,6 +5,7 @@ use super::{ExecutionContext, PhysicalOperator};
 use crate::types::{Row, TableSchema};
 
 #[derive(Debug)]
+#[allow(dead_code)] // Operator framework — used by future CTE operator path
 pub struct CTEScanOperator {
     schema: TableSchema,
     rows: Vec<Row>,
@@ -13,6 +14,7 @@ pub struct CTEScanOperator {
 }
 
 impl CTEScanOperator {
+    #[allow(dead_code)] // Operator framework
     pub fn new(schema: TableSchema, rows: Vec<Row>) -> Self {
         Self {
             schema,

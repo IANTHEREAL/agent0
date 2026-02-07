@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! Key encoding for TiKV
 //!
 //! Key layout:
@@ -8,6 +7,8 @@
 //! - `_sys_ext_{extname}` -> InstalledExtension (bincode)
 //! - `_sys_extcfg_{extname}` -> ExtensionConfig (reserved, bincode/json)
 //! - `_sys_comment_{kind}\0{payload...}` -> UTF-8 comment text (see `encode_comment_*_key()`)
+//! - `d_{db_id}_sys_tblpriv_{table_full_name}` -> Vec<TablePrivilegeGrant> (bincode)
+//! - `d_{db_id}_sys_defpriv_tbl_{owner}\0{schema}` -> Vec<DefaultTablePrivilegeGrant> (bincode)
 //! - `t_{table_id}_{row_key}` -> Row (serialized)
 //! - `i_{table_id}_{index_id}_{index_values}` -> PK (Unique Index)
 //! - `i_{table_id}_{index_id}_{index_values}_{pk}` -> Empty (Non-Unique Index)
@@ -24,11 +25,17 @@ use serde::{Deserialize, Serialize};
 /// System key prefixes
 const SYS_NEXT_TABLE_ID: &[u8] = b"_sys_next_table_id";
 const SYS_NEXT_DATABASE_ID: &[u8] = b"_sys_next_database_id";
+#[allow(dead_code)] // V1 storage format — kept for backward compatibility
 const SYS_NEXT_TYPE_OID: &[u8] = b"_sys_next_type_oid";
+#[allow(dead_code)] // V1 storage format
 const SYS_NEXT_SCHEMA_OID: &[u8] = b"_sys_next_schema_oid";
+#[allow(dead_code)] // V1 storage format
 const SYS_NEXT_SEQUENCE_OID: &[u8] = b"_sys_next_sequence_oid";
+#[allow(dead_code)] // V1 storage format
 const SYS_NEXT_FUNCTION_OID: &[u8] = b"_sys_next_function_oid";
+#[allow(dead_code)] // V1 storage format
 const SYS_NEXT_TRIGGER_OID: &[u8] = b"_sys_next_trigger_oid";
+#[allow(dead_code)] // V1 storage format
 const SYS_NEXT_VIEW_OID: &[u8] = b"_sys_next_view_oid";
 const SYS_FORMAT_VERSION: &[u8] = b"_sys_format_version";
 const SYS_DATABASE_BY_NAME_PREFIX: &[u8] = b"_sys_dbname_";
@@ -61,17 +68,26 @@ const DB_SYS_EXTENSION_PREFIX: &[u8] = b"sys_ext_";
 const DB_SYS_EXTENSIONCFG_PREFIX: &[u8] = b"sys_extcfg_";
 const DB_SYS_COMMENT_PREFIX: &[u8] = b"sys_comment_";
 const DB_SYS_SEQ_PREFIX: &[u8] = b"sys_seq_";
+const DB_SYS_TABLE_PRIV_PREFIX: &[u8] = b"sys_tblpriv_";
+const DB_SYS_DEFAULT_TABLE_PRIV_PREFIX: &[u8] = b"sys_defpriv_tbl_";
 const SYS_SCHEMA_PREFIX: &[u8] = b"_sys_schema_";
+#[allow(dead_code)] // V1 storage format
 const SYS_SCHEMADEF_PREFIX: &[u8] = b"_sys_schemadef_";
+#[allow(dead_code)] // V1 storage format
 const SYS_VIEW_PREFIX: &[u8] = b"_sys_view_";
 const SYS_MATVIEW_PREFIX: &[u8] = b"_sys_matview_";
 const SYS_PROCEDURE_PREFIX: &[u8] = b"_sys_proc_";
 const SYS_FUNCTION_PREFIX: &[u8] = b"_sys_func_";
 const SYS_TRIGGER_PREFIX: &[u8] = b"_sys_trigger_";
+#[allow(dead_code)] // V1 storage format
 const SYS_TYPE_PREFIX: &[u8] = b"_sys_type_";
+#[allow(dead_code)] // V1 storage format
 const SYS_SEQUENCE_PREFIX: &[u8] = b"_sys_seqdef_";
+#[allow(dead_code)] // V1 storage format
 const SYS_EXTENSION_PREFIX: &[u8] = b"_sys_ext_";
+#[allow(dead_code)] // V1 storage format
 const SYS_EXTENSIONCFG_PREFIX: &[u8] = b"_sys_extcfg_";
+#[allow(dead_code)] // V1 storage format
 const SYS_COMMENT_PREFIX: &[u8] = b"_sys_comment_";
 const TABLE_DATA_PREFIX: &[u8] = b"t_";
 const TABLE_INDEX_PREFIX: &[u8] = b"i_";
@@ -89,31 +105,37 @@ pub fn encode_next_table_id_key() -> Vec<u8> {
 }
 
 /// Encode the system key for next type OID (user-defined types)
+#[allow(dead_code)] // V1 storage format
 pub fn encode_next_type_oid_key() -> Vec<u8> {
     SYS_NEXT_TYPE_OID.to_vec()
 }
 
 /// Encode the system key for next schema OID (user-defined schemas)
+#[allow(dead_code)] // V1 storage format
 pub fn encode_next_schema_oid_key() -> Vec<u8> {
     SYS_NEXT_SCHEMA_OID.to_vec()
 }
 
 /// Encode the system key for next sequence OID (standalone + implicit sequences)
+#[allow(dead_code)] // V1 storage format
 pub fn encode_next_sequence_oid_key() -> Vec<u8> {
     SYS_NEXT_SEQUENCE_OID.to_vec()
 }
 
 /// Encode the system key for next function OID (user-defined functions)
+#[allow(dead_code)] // V1 storage format
 pub fn encode_next_function_oid_key() -> Vec<u8> {
     SYS_NEXT_FUNCTION_OID.to_vec()
 }
 
 /// Encode the system key for next trigger OID (user-defined triggers)
+#[allow(dead_code)] // V1 storage format
 pub fn encode_next_trigger_oid_key() -> Vec<u8> {
     SYS_NEXT_TRIGGER_OID.to_vec()
 }
 
 /// Encode the system key for next view OID (user-defined views)
+#[allow(dead_code)] // V1 storage format
 pub fn encode_next_view_oid_key() -> Vec<u8> {
     SYS_NEXT_VIEW_OID.to_vec()
 }
@@ -244,6 +266,28 @@ pub fn encode_schema_def_key_v2(db_id: u64, schema_name: &str) -> Vec<u8> {
 pub fn encode_schema_def_prefix_v2(db_id: u64) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_SCHEMADEF_PREFIX);
+    key
+}
+
+pub fn encode_table_privileges_key_v2(db_id: u64, table_full_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_TABLE_PRIV_PREFIX);
+    key.extend_from_slice(table_full_name.as_bytes());
+    key
+}
+
+pub fn encode_default_table_privileges_key_v2(
+    db_id: u64,
+    owner: &str,
+    schema: Option<&str>,
+) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_DEFAULT_TABLE_PRIV_PREFIX);
+    key.extend_from_slice(owner.as_bytes());
+    key.push(0);
+    if let Some(schema) = schema {
+        key.extend_from_slice(schema.as_bytes());
+    }
     key
 }
 
@@ -427,18 +471,21 @@ pub(crate) fn encode_comment_column_key_v2(
 }
 
 /// Encode the schema key for a table
+#[allow(dead_code)] // V1 storage format
 pub fn encode_schema_key(table_name: &str) -> Vec<u8> {
     let mut key = SYS_SCHEMA_PREFIX.to_vec();
     key.extend_from_slice(table_name.as_bytes());
     key
 }
 
+#[allow(dead_code)] // V1 storage format
 pub fn encode_schema_def_key(schema_name: &str) -> Vec<u8> {
     let mut key = SYS_SCHEMADEF_PREFIX.to_vec();
     key.extend_from_slice(schema_name.as_bytes());
     key
 }
 
+#[allow(dead_code)] // V1 storage format
 pub fn encode_schema_def_prefix() -> Vec<u8> {
     SYS_SCHEMADEF_PREFIX.to_vec()
 }
@@ -446,12 +493,14 @@ pub fn encode_schema_def_prefix() -> Vec<u8> {
 /// Encode the key for a user-defined type definition.
 ///
 /// `full_name` should be `schema.name` (e.g. `public.role`).
+#[allow(dead_code)] // V1 storage format
 pub fn encode_type_key(full_name: &str) -> Vec<u8> {
     let mut key = SYS_TYPE_PREFIX.to_vec();
     key.extend_from_slice(full_name.as_bytes());
     key
 }
 
+#[allow(dead_code)] // V1 storage format
 pub fn encode_type_prefix() -> Vec<u8> {
     SYS_TYPE_PREFIX.to_vec()
 }
@@ -459,63 +508,72 @@ pub fn encode_type_prefix() -> Vec<u8> {
 /// Encode the key for a sequence definition.
 ///
 /// `full_name` should be `schema.name` (e.g. `public.my_seq`).
+#[allow(dead_code)] // V1 storage format
 pub fn encode_sequence_key(full_name: &str) -> Vec<u8> {
     let mut key = SYS_SEQUENCE_PREFIX.to_vec();
     key.extend_from_slice(full_name.as_bytes());
     key
 }
 
+#[allow(dead_code)] // V1 storage format
 pub fn encode_sequence_prefix() -> Vec<u8> {
     SYS_SEQUENCE_PREFIX.to_vec()
 }
 
 /// Encode the key for an installed extension.
+#[allow(dead_code)] // V1 storage format
 pub fn encode_extension_key(ext_name: &str) -> Vec<u8> {
     let mut key = SYS_EXTENSION_PREFIX.to_vec();
     key.extend_from_slice(ext_name.as_bytes());
     key
 }
 
+#[allow(dead_code)] // V1 storage format
 pub fn encode_extension_prefix() -> Vec<u8> {
     SYS_EXTENSION_PREFIX.to_vec()
 }
 
 /// Encode the key for an extension config blob.
+#[allow(dead_code)] // V1 storage format
 pub fn encode_extension_config_key(ext_name: &str) -> Vec<u8> {
     let mut key = SYS_EXTENSIONCFG_PREFIX.to_vec();
     key.extend_from_slice(ext_name.as_bytes());
     key
 }
 
+#[allow(dead_code)] // V1 storage format
 pub fn encode_view_key(view_name: &str) -> Vec<u8> {
     let mut key = SYS_VIEW_PREFIX.to_vec();
     key.extend_from_slice(view_name.as_bytes());
     key
 }
 
+#[allow(dead_code)] // V1 storage format
 pub fn encode_view_prefix() -> Vec<u8> {
     SYS_VIEW_PREFIX.to_vec()
 }
 
 /// Encode the key for a materialized view definition
+#[allow(dead_code)] // V1 storage format
 pub fn encode_matview_key(matview_name: &str) -> Vec<u8> {
     let mut key = SYS_MATVIEW_PREFIX.to_vec();
     key.extend_from_slice(matview_name.as_bytes());
     key
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // V1 storage format
 pub fn encode_matview_prefix() -> Vec<u8> {
     SYS_MATVIEW_PREFIX.to_vec()
 }
 
+#[allow(dead_code)] // V1 storage format
 pub fn encode_procedure_key(proc_name: &str) -> Vec<u8> {
     let mut key = SYS_PROCEDURE_PREFIX.to_vec();
     key.extend_from_slice(proc_name.as_bytes());
     key
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // V1 storage format
 pub fn encode_procedure_prefix() -> Vec<u8> {
     SYS_PROCEDURE_PREFIX.to_vec()
 }
@@ -523,13 +581,14 @@ pub fn encode_procedure_prefix() -> Vec<u8> {
 /// Encode the key for a function definition.
 ///
 /// `full_name` should be `schema.name` (e.g. `public.last_updated`).
+#[allow(dead_code)] // V1 storage format
 pub fn encode_function_key(full_name: &str) -> Vec<u8> {
     let mut key = SYS_FUNCTION_PREFIX.to_vec();
     key.extend_from_slice(full_name.as_bytes());
     key
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // V1 storage format
 pub fn encode_function_prefix() -> Vec<u8> {
     SYS_FUNCTION_PREFIX.to_vec()
 }
@@ -538,6 +597,7 @@ pub fn encode_function_prefix() -> Vec<u8> {
 ///
 /// Triggers are keyed by `<table_full_name>/<trigger_name>` to avoid collisions
 /// between tables (PostgreSQL trigger names are scoped to a table).
+#[allow(dead_code)] // V1 storage format
 pub fn encode_trigger_key(table_full_name: &str, trigger_name: &str) -> Vec<u8> {
     let mut key = SYS_TRIGGER_PREFIX.to_vec();
     key.extend_from_slice(table_full_name.as_bytes());
@@ -546,12 +606,12 @@ pub fn encode_trigger_key(table_full_name: &str, trigger_name: &str) -> Vec<u8> 
     key
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // V1 storage format
 pub fn encode_trigger_prefix() -> Vec<u8> {
     SYS_TRIGGER_PREFIX.to_vec()
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // V1 storage format
 pub fn encode_trigger_table_prefix(table_full_name: &str) -> Vec<u8> {
     let mut key = SYS_TRIGGER_PREFIX.to_vec();
     key.extend_from_slice(table_full_name.as_bytes());
@@ -559,10 +619,12 @@ pub fn encode_trigger_table_prefix(table_full_name: &str) -> Vec<u8> {
     key
 }
 
+#[allow(dead_code)] // V1 storage format
 pub(crate) fn encode_comment_prefix() -> Vec<u8> {
     SYS_COMMENT_PREFIX.to_vec()
 }
 
+#[allow(dead_code)] // V1 storage format
 pub(crate) fn encode_comment_extension_key(ext_name: &str) -> Vec<u8> {
     let mut key = SYS_COMMENT_PREFIX.to_vec();
     key.push(b'e');
@@ -571,6 +633,7 @@ pub(crate) fn encode_comment_extension_key(ext_name: &str) -> Vec<u8> {
     key
 }
 
+#[allow(dead_code)] // V1 storage format
 pub(crate) fn encode_comment_function_key(func_full_name: &str) -> Vec<u8> {
     let mut key = SYS_COMMENT_PREFIX.to_vec();
     key.push(b'f');
@@ -579,6 +642,7 @@ pub(crate) fn encode_comment_function_key(func_full_name: &str) -> Vec<u8> {
     key
 }
 
+#[allow(dead_code)] // V1 storage format
 pub(crate) fn encode_comment_table_key(table_full_name: &str) -> Vec<u8> {
     let mut key = SYS_COMMENT_PREFIX.to_vec();
     key.push(b't');
@@ -587,6 +651,7 @@ pub(crate) fn encode_comment_table_key(table_full_name: &str) -> Vec<u8> {
     key
 }
 
+#[allow(dead_code)] // V1 storage format
 pub(crate) fn encode_comment_column_key(table_full_name: &str, column_name: &str) -> Vec<u8> {
     let mut key = SYS_COMMENT_PREFIX.to_vec();
     key.push(b'c');
@@ -598,6 +663,7 @@ pub(crate) fn encode_comment_column_key(table_full_name: &str, column_name: &str
 }
 
 /// Encode a data key for a row
+#[allow(dead_code)] // V1 storage format
 pub fn encode_data_key(table_id: u64, row_key: &[u8]) -> Vec<u8> {
     let mut key = TABLE_DATA_PREFIX.to_vec();
     key.extend_from_slice(&table_id.to_be_bytes());
@@ -619,6 +685,7 @@ pub fn encode_data_key_v2(db_id: u64, table_id: u64, row_key: &[u8]) -> Vec<u8> 
 /// Encode an index key using memcomparable format for correct sort order.
 /// If pk is None, it's a unique index key (Value -> PK)
 /// If pk is Some, it's a non-unique index key (Value+PK -> Empty)
+#[allow(dead_code)] // V1 storage format
 pub fn encode_index_key(
     table_id: u64,
     index_id: u64,
@@ -676,6 +743,7 @@ pub fn encode_index_key_v2(
 ///
 /// The returned key ends with a separator byte so callers can construct a range
 /// for scanning all postings for a token hash.
+#[allow(dead_code)] // V1 storage format
 pub fn encode_gin_index_prefix(table_id: u64, index_id: u64, token_hash: u64) -> Vec<u8> {
     let mut key = TABLE_INDEX_PREFIX.to_vec();
     key.extend_from_slice(&table_id.to_be_bytes());
@@ -708,6 +776,7 @@ pub fn encode_gin_index_prefix_v2(
 }
 
 /// Encode a full GIN-like inverted index key for `token_hash` pointing to the row `pk_key`.
+#[allow(dead_code)] // V1 storage format
 pub fn encode_gin_index_key(
     table_id: u64,
     index_id: u64,
@@ -735,6 +804,7 @@ pub fn encode_gin_index_key_v2(
 /// Return the raw key range for scanning all GIN postings for a token hash.
 ///
 /// The range is `[start, end)` in lexicographic order.
+#[allow(dead_code)] // V1 storage format
 pub fn encode_gin_index_token_range(
     table_id: u64,
     index_id: u64,
@@ -925,7 +995,7 @@ pub fn decode_value_memcomparable(data: &[u8], data_type: &DataType) -> Result<(
             let v: f64 = serde::Deserialize::deserialize(&mut deserializer)?;
             (Value::Float64(v), deserializer.position())
         }
-        DataType::Text | DataType::UserDefined(_) => {
+        DataType::Text | DataType::Name | DataType::UserDefined(_) => {
             let v: String = serde::Deserialize::deserialize(&mut deserializer)?;
             (Value::Text(v), deserializer.position())
         }
@@ -1074,6 +1144,7 @@ pub fn decode_pk_from_index_suffix(pk_bytes: &[u8], pk_types: &[DataType]) -> Re
 }
 
 /// Get the key range for scanning all rows of a table
+#[allow(dead_code)] // V1 storage format
 pub fn encode_table_data_range(table_id: u64) -> (Vec<u8>, Vec<u8>) {
     let mut start = TABLE_DATA_PREFIX.to_vec();
     start.extend_from_slice(&table_id.to_be_bytes());

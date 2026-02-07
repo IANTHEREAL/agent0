@@ -46,7 +46,7 @@ pub enum PlanNode {
         child: Box<PlanNode>,
     },
     Limit {
-        #[allow(dead_code)]
+        #[allow(dead_code)] // structural field in explain plan representation
         count: usize,
         cost: PlanCost,
         child: Box<PlanNode>,

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 /// Result of executing a SQL statement
 #[derive(Debug)]
-#[allow(dead_code)]
+#[allow(dead_code)] // variant name fields are structural, for future logging/error reporting
 pub enum ExecuteResult {
     /// SELECT result with rows
     Select {
@@ -114,6 +114,8 @@ pub enum ExecuteResult {
         tables: Vec<String>,
     },
     /// DESCRIBE table result
+    #[allow(dead_code)]
+    // variant constructed in protocol layer, field for schema introspection
     Describe {
         schema: TableSchema,
     },
@@ -145,28 +147,6 @@ pub enum ExecuteResult {
     Notice {
         message: String,
     },
-}
-
-impl ExecuteResult {
-    #[allow(dead_code)]
-    pub fn affected_rows(&self) -> u64 {
-        match self {
-            ExecuteResult::Insert { affected_rows } => *affected_rows,
-            ExecuteResult::Delete { affected_rows } => *affected_rows,
-            ExecuteResult::Update { affected_rows } => *affected_rows,
-            _ => 0,
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn is_query(&self) -> bool {
-        matches!(
-            self,
-            ExecuteResult::Select { .. }
-                | ExecuteResult::ShowTables { .. }
-                | ExecuteResult::Describe { .. }
-        )
-    }
 }
 
 /// Results from executing multiple statements in a batch

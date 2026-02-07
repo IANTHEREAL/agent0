@@ -17,6 +17,11 @@ tests/96_dify_schema.sql
 tests/97_comment_on.sql
 tests/125_pr285_compat_regressions.sql
 tests/126_timestamptz_offset_input_issue270.sql
+tests/128_hash_join_type_compat_issue426.sql
+tests/139_select_star_hidden_subquery_cols_issue430.sql
+tests/139_chained_using_outer_issue425.sql
+tests/139_join_using_qualified_wildcard_issue424.sql
+tests/139_nested_join_table_factor_issue427.sql
 
 [orm]
 orm-tests/pg-client/

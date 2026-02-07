@@ -1,0 +1,24 @@
+name: doc-lint
+
+on:
+  pull_request:
+    branches: [main, master]
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  doc-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          uv-version: "0.9.26"
+
+      - name: "Run doc-lint (local: `uv run scripts/doc_lint.py`)"
+        run: |
+          echo "Local reproduce: uv run scripts/doc_lint.py"
+          uv run scripts/doc_lint.py

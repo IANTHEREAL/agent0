@@ -1,10 +1,11 @@
 use super::core::Executor;
 use super::triggers::strip_leading_sql_comments;
-use super::super::helpers::normalize_ident;
+use super::super::names::normalize_ident;
 use super::super::names;
 use super::super::expr::eval_expr;
 use super::super::Session;
 use crate::extensions::{descriptor, InstalledExtension};
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, ObjectName, TableAlias};
 use tikv_client::Transaction;
@@ -230,7 +231,7 @@ impl Executor {
         let (if_not_exists, ext_name) = parse_create_extension_sql(sql)?;
 
         if !session.is_superuser() {
-            return Err(anyhow!("permission denied to create extension"));
+            return Err(SqlError::PermissionDenied { object_type: "extension".into(), object_name: ext_name.clone() }.into());
         }
 
         let desc = descriptor(&ext_name)
@@ -297,7 +298,7 @@ impl Executor {
         let (if_exists, ext_name) = parse_drop_extension_sql(sql)?;
 
         if !session.is_superuser() {
-            return Err(anyhow!("permission denied to drop extension"));
+            return Err(SqlError::PermissionDenied { object_type: "extension".into(), object_name: ext_name.clone() }.into());
         }
 
         let is_autocommit = !session.is_in_transaction();

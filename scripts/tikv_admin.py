@@ -40,6 +40,7 @@ import re
 import argparse
 import shutil
 import atexit
+import random
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Optional, List, Dict
@@ -229,6 +230,46 @@ def wait_for_cluster_ready(host: str, pd_port: int, timeout: int = 120) -> bool:
     return wait_for_port(check_host, pd_port, timeout)
 
 
+def ports_are_free(ports: List[int]) -> bool:
+    """Return true if none of the ports are currently listening on 127.0.0.1."""
+    return all(not is_port_in_use(port) for port in ports)
+
+
+def pick_port_offset(host: str, *, max_attempts: int = 64) -> Optional[int]:
+    """Pick a `tiup playground --port-offset` that avoids port collisions.
+
+    `tiup playground` uses multiple fixed ports (PD client/peer, TiKV, TiKV status).
+    `--port-offset` shifts all of them together, which is safer than picking only one port.
+    """
+
+    # tiup playground defaults (client-facing ports)
+    PD_CLIENT = 2379
+    PD_PEER = 2380
+    TIKV = 20160
+    TIKV_STATUS = 20180
+
+    # Try a few nice offsets first, then random ones.
+    preferred = [0, 10000, 20000, 30000, 40000]
+    rng = random.Random()
+
+    for attempt in range(max_attempts):
+        if attempt < len(preferred):
+            offset = preferred[attempt]
+        else:
+            offset = rng.randint(1, 43000)
+
+        pd_port = PD_CLIENT + offset
+        tikv_port = TIKV + offset
+        if tikv_port > 65535 or (TIKV_STATUS + offset) > 65535 or (PD_PEER + offset) > 65535:
+            continue
+
+        # Check the key ports that commonly collide.
+        if ports_are_free([pd_port, PD_PEER + offset, tikv_port, TIKV_STATUS + offset]):
+            return offset
+
+    return None
+
+
 def start_cluster(
     name: str = DEFAULT_CLUSTER_NAME,
     mode: ClusterMode = ClusterMode.ONE_TIME,
@@ -264,6 +305,46 @@ enable-ttl = true
     # So the actual data directory will be: {tiup_home}/data/pg-tikv-{name}
     data_dir = tiup_home / "data" / f"pg-tikv-{name}"
 
+    if pd_port is not None and pd_port < 2379:
+        log_error(f"Invalid --pd-port {pd_port}: must be >= 2379")
+        return None
+
+    if pd_port is not None:
+        port_offset = pd_port - 2379
+    else:
+        port_offset = pick_port_offset(host)
+        if port_offset is None:
+            log_error("Failed to pick a free port offset for tiup playground")
+            return None
+
+    pd_port_actual = 2379 + port_offset
+    tikv_port_actual = 20160 + port_offset
+    pd_peer_port = pd_port_actual + 1
+    tikv_status_port = tikv_port_actual + 20
+
+    if (
+        pd_port_actual <= 0
+        or tikv_port_actual <= 0
+        or pd_peer_port > 65535
+        or tikv_status_port > 65535
+        or tikv_port_actual > 65535
+    ):
+        log_error(
+            "Invalid port-offset configuration: "
+            f"pd={pd_port_actual}, pd_peer={pd_peer_port}, "
+            f"tikv={tikv_port_actual}, tikv_status={tikv_status_port}"
+        )
+        return None
+
+    if pd_port is not None and not ports_are_free(
+        [pd_port_actual, pd_peer_port, tikv_port_actual, tikv_status_port]
+    ):
+        log_error(
+            f"Cannot start cluster on --pd-port {pd_port}: port(s) already in use "
+            f"(pd={pd_port_actual}, pd_peer={pd_peer_port}, tikv={tikv_port_actual}, tikv_status={tikv_status_port})"
+        )
+        return None
+
     cmd = [
         "tiup", "playground",
         "--mode", "tikv-slim",
@@ -271,10 +352,9 @@ enable-ttl = true
         "--tag", f"pg-tikv-{name}",
         "--host", host,
         "--without-monitor",
+        "--port-offset",
+        str(port_offset),
     ]
-
-    if pd_port:
-        cmd.extend(["--pd.port", str(pd_port)])
 
     # Set TIUP_HOME to control where playground stores data
     env = os.environ.copy()
@@ -294,14 +374,10 @@ enable-ttl = true
             env=env,
         )
     
-    # Determine the actual PD port (default is 2379)
-    pd_port_actual = pd_port if pd_port else 2379
-    tikv_port_actual = 20160  # TiKV default port
-
     log_info(f"Cluster process started (PID: {proc.pid})")
     log_info(f"Waiting for PD to be ready on port {pd_port_actual}...")
 
-    if not wait_for_cluster_ready(host, pd_port_actual, timeout=120):
+    if not wait_for_cluster_ready(host, pd_port_actual, timeout=120) or proc.poll() is not None:
         log_error(f"Failed to start cluster - PD port {pd_port_actual} is not accessible")
         log_error(f"Check log file: {log_file}")
         proc.terminate()

@@ -1,3 +1,4 @@
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
@@ -152,7 +153,7 @@ pub fn numeric_mul(left: NumericValue, right: NumericValue) -> Result<NumericVal
 
 pub fn numeric_div(left: NumericValue, right: NumericValue) -> Result<NumericValue> {
     if right.is_zero() {
-        return Err(anyhow!("Division by zero"));
+        return Err(SqlError::DivisionByZero.into());
     }
 
     let (l, r) = NumericValue::promote_pair(left, right)?;
@@ -182,16 +183,6 @@ pub fn numeric_mod(left: NumericValue, right: NumericValue) -> Result<NumericVal
     }
 }
 
-#[allow(dead_code)]
-pub fn numeric_neg(val: NumericValue) -> NumericValue {
-    match val {
-        NumericValue::Int32(n) => NumericValue::Int32(-n),
-        NumericValue::Int64(n) => NumericValue::Int64(-n),
-        NumericValue::Float64(n) => NumericValue::Float64(-n),
-        NumericValue::Decimal(n) => NumericValue::Decimal(-n),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,19 +206,16 @@ mod tests {
     #[test]
     fn test_promote_int_to_float() {
         let (l, r) =
-            NumericValue::promote_pair(NumericValue::Int32(1), NumericValue::Float64(2.0))
-                .unwrap();
+            NumericValue::promote_pair(NumericValue::Int32(1), NumericValue::Float64(2.0)).unwrap();
         assert!(matches!(l, NumericValue::Float64(_)));
         assert!(matches!(r, NumericValue::Float64(2.0)));
     }
 
     #[test]
     fn test_promote_int_to_decimal() {
-        let (l, r) = NumericValue::promote_pair(
-            NumericValue::Int32(1),
-            NumericValue::Decimal(Decimal::TWO),
-        )
-        .unwrap();
+        let (l, r) =
+            NumericValue::promote_pair(NumericValue::Int32(1), NumericValue::Decimal(Decimal::TWO))
+                .unwrap();
         assert!(matches!(l, NumericValue::Decimal(_)));
         assert!(matches!(r, NumericValue::Decimal(_)));
     }
@@ -281,8 +269,11 @@ mod tests {
 
     #[test]
     fn test_div_decimal_pg_scale_rounding() {
-        let result = numeric_div(NumericValue::Decimal(Decimal::from(800)), NumericValue::Int32(3))
-            .unwrap();
+        let result = numeric_div(
+            NumericValue::Decimal(Decimal::from(800)),
+            NumericValue::Int32(3),
+        )
+        .unwrap();
 
         match result {
             NumericValue::Decimal(d) => assert_eq!(d.to_string(), "266.6666666666666667"),
@@ -292,8 +283,8 @@ mod tests {
 
     #[test]
     fn test_div_decimal_pg_scale_firstdigit_adjust() {
-        let result = numeric_div(NumericValue::Decimal(Decimal::ONE), NumericValue::Int32(3))
-            .unwrap();
+        let result =
+            numeric_div(NumericValue::Decimal(Decimal::ONE), NumericValue::Int32(3)).unwrap();
 
         match result {
             NumericValue::Decimal(d) => assert_eq!(d.to_string(), "0.33333333333333333333"),

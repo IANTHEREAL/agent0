@@ -15,6 +15,7 @@ use crate::observability;
 use crate::pool::TikvClientPool;
 use crate::storage::TikvStore;
 use crate::types::TableSchema;
+use crate::sql::error::SqlError;
 use anyhow::Result;
 use dashmap::{DashMap, DashSet};
 use futures::stream::{self, StreamExt};
@@ -241,7 +242,7 @@ impl TriggerWorker {
         &self.config
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // trigger worker lifecycle API
     pub(crate) fn worker_id(&self) -> &str {
         &self.worker_id
     }
@@ -297,7 +298,7 @@ impl TriggerWorker {
         (delay, entry.failures)
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // trigger worker lifecycle API
     pub(crate) fn shutdown(&self) {
         self.shutdown.store(true, Ordering::Relaxed);
     }
@@ -663,7 +664,7 @@ impl TriggerWorker {
         let schema = store
             .get_schema(&mut txn, db_id, &event.table_name)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Table '{}' not found", event.table_name))?;
+            .ok_or_else(|| SqlError::RelationNotFound(event.table_name.clone()))?;
 
         let trigger = store
             .get_trigger(&mut txn, db_id, &event.table_name, &event.trigger_name)
@@ -1109,7 +1110,7 @@ impl TriggerWorker {
                                         super::expr::eval_expr(&expr, None, None)?
                                     };
 
-                                    let coerced = super::helpers::coerce_value_for_column(
+                                    let coerced = super::coercion::coerce_value_for_column(
                                         value,
                                         &schema.columns[idx],
                                     )?;
@@ -1135,6 +1136,7 @@ impl TriggerWorker {
                     sequence_values,
                     &self.default_search_path,
                     s,
+                    None,
                 )
                 .await?;
         }

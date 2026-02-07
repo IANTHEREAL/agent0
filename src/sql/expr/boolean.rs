@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue};
 
+use crate::sql::error::SqlError;
 use crate::types::{DataType, TableSchema, Value};
 
 fn unwrap_nested_expr(expr: &Expr) -> &Expr {
@@ -31,9 +32,13 @@ pub(crate) fn coerce_text_literal_to_bool(expr: &Expr, value: Value) -> Result<V
         return Ok(Value::Text(s));
     }
 
-    super::parse_bool_pg(&s)
-        .map(Value::Boolean)
-        .ok_or_else(|| anyhow!("invalid input syntax for type boolean: \"{}\"", s))
+    super::parse_bool_pg(&s).map(Value::Boolean).ok_or_else(|| {
+        SqlError::InvalidInputSyntax {
+            type_name: "boolean".into(),
+            value: s.clone(),
+        }
+        .into()
+    })
 }
 
 fn resolve_column_type<'a>(schema: &'a TableSchema, expr: &Expr) -> Option<&'a DataType> {
@@ -74,7 +79,11 @@ pub(crate) fn validate_bool_expr_in_boolean_context(
             if super::parse_bool_pg(s).is_some() {
                 Ok(())
             } else {
-                Err(anyhow!("invalid input syntax for type boolean: \"{}\"", s))
+                Err(SqlError::InvalidInputSyntax {
+                    type_name: "boolean".into(),
+                    value: s.clone(),
+                }
+                .into())
             }
         }
 

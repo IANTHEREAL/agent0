@@ -100,8 +100,36 @@ impl Drop for ViewInferenceGuard {
 }
 
 fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
+    // Try typed SqlError first (new structured error path)
+    if let Some(sql_err) = err.downcast_ref::<crate::sql::error::SqlError>() {
+        return sql_err.sqlstate();
+    }
+    // Legacy check
     if err.is::<InFailedSqlTransaction>() {
-        "25P02"
+        return "25P02";
+    }
+    // String-match fallback for errors not yet migrated to SqlError
+    let msg = err.to_string();
+    if msg.starts_with("invalid input syntax for type") {
+        "22P02"
+    } else if msg.starts_with("column \"") && msg.ends_with("\" does not exist") {
+        "42703"
+    } else if msg.contains("is ambiguous") {
+        "42702"
+    } else if msg.starts_with("relation \"") && msg.contains("does not exist") {
+        "42P01"
+    } else if msg.contains("duplicate key value violates unique constraint") {
+        "23505"
+    } else if msg.contains("violates not-null constraint") {
+        "23502"
+    } else if msg.contains("violates check constraint") {
+        "23514"
+    } else if msg.contains("Division by zero") {
+        "22012"
+    } else if msg.starts_with("permission denied") {
+        "42501"
+    } else if msg.contains("does not exist") && msg.starts_with("function") {
+        "42883"
     } else {
         "XX000"
     }
@@ -235,6 +263,7 @@ fn should_accept_sql_without_sqlparser(sql_upper: &str) -> bool {
     if sql_upper.starts_with("CREATE DATABASE")
         || sql_upper.starts_with("DROP DATABASE")
         || sql_upper.starts_with("ALTER DATABASE")
+        || sql_upper.starts_with("ALTER DEFAULT PRIVILEGES")
         || sql_upper.starts_with("CREATE EXTENSION")
         || sql_upper.starts_with("DROP EXTENSION")
         || sql_upper.starts_with("COMMENT ON")
@@ -3798,7 +3827,37 @@ impl ExtendedQueryHandler for DynamicPgHandler {
             .as_deref()
             .unwrap_or(pgwire::api::DEFAULT_NAME);
 
-        if let Some(statement) = client.portal_store().get_statement(statement_name) {
+        if let Some(mut statement) = client.portal_store().get_statement(statement_name) {
+            // Some clients (e.g. pgx/GORM) omit parameter type OIDs in Parse and expect the server
+            // to infer types. Ensure the portal references a statement with inferred types so that
+            // binary parameters are decoded correctly during execution.
+            let param_count = message.parameters.len();
+            let needs_inference = param_count > 0
+                && (statement.parameter_types.len() < param_count
+                    || statement
+                        .parameter_types
+                        .iter()
+                        .take(param_count)
+                        .any(|t| *t == Type::UNKNOWN));
+
+            if needs_inference {
+                if let Ok(describe_response) =
+                    self.do_describe_statement(client, statement.as_ref()).await
+                {
+                    if describe_response.parameters.len() >= param_count
+                        && describe_response.parameters != statement.parameter_types
+                    {
+                        let updated = Arc::new(StoredStatement::new(
+                            statement.id.clone(),
+                            statement.statement.clone(),
+                            describe_response.parameters,
+                        ));
+                        client.portal_store().put_statement(updated.clone());
+                        statement = updated;
+                    }
+                }
+            }
+
             let portal = Portal::try_new(&message, statement)?;
             client.portal_store().put_portal(Arc::new(portal));
             client
@@ -4336,27 +4395,58 @@ fn substitute_parameters(query: &str, portal: &Portal<String>) -> PgWireResult<S
                     quote_sql_string_literal(s)
                 }
                 // Type::UNKNOWN (OID 705) - pgx/GORM sends binary unknown when type is not inferred.
-                // Treat as text - decode UTF-8 and quote. If not valid UTF-8, try as integer.
+                // Prefer fixed-width numeric decoding when payload contains NUL/control bytes
+                // (common for binary integers). Otherwise, treat as text.
                 t if *t == Type::UNKNOWN => {
-                    if let Ok(s) = std::str::from_utf8(param_bytes.as_ref()) {
-                        // Try to parse as integer first (common case for LIMIT $1)
+                    let bytes = param_bytes.as_ref();
+                    let has_control_bytes = bytes.iter().any(|b| {
+                        *b == 0 || (*b < 0x20 && !matches!(*b, b'\t' | b'\n' | b'\r'))
+                    });
+
+                    if has_control_bytes {
+                        match bytes.len() {
+                            8 => {
+                                let arr: [u8; 8] = bytes.try_into().unwrap();
+                                i64::from_be_bytes(arr).to_string()
+                            }
+                            4 => {
+                                let arr: [u8; 4] = bytes.try_into().unwrap();
+                                i32::from_be_bytes(arr).to_string()
+                            }
+                            2 => {
+                                let arr: [u8; 2] = bytes.try_into().unwrap();
+                                i16::from_be_bytes(arr).to_string()
+                            }
+                            1 => (bytes[0] as i8).to_string(),
+                            _ => {
+                                let hex = hex::encode(bytes);
+                                format!("'\\x{}'::bytea", hex)
+                            }
+                        }
+                    } else if let Ok(s) = std::str::from_utf8(bytes) {
+                        // Common case: drivers send "binary" for unknown but the payload is ASCII.
+                        // Try to parse as integer first (LIMIT/OFFSET), otherwise quote as text.
                         if let Ok(v) = s.trim().parse::<i64>() {
                             v.to_string()
                         } else {
                             quote_sql_string_literal(s)
                         }
-                    } else if param_bytes.len() == 8 {
-                        // Try as big-endian i64 (binary integer)
-                        let arr: [u8; 8] = param_bytes.as_ref().try_into().unwrap();
-                        i64::from_be_bytes(arr).to_string()
-                    } else if param_bytes.len() == 4 {
-                        // Try as big-endian i32 (binary integer)
-                        let arr: [u8; 4] = param_bytes.as_ref().try_into().unwrap();
-                        i32::from_be_bytes(arr).to_string()
                     } else {
-                        // Fallback: hex encode as bytea
-                        let hex = hex::encode(param_bytes.as_ref());
-                        format!("'\\x{}'::bytea", hex)
+                        // Non-UTF8 and no obvious control bytes: best-effort numeric decode by size.
+                        match bytes.len() {
+                            8 => {
+                                let arr: [u8; 8] = bytes.try_into().unwrap();
+                                i64::from_be_bytes(arr).to_string()
+                            }
+                            4 => {
+                                let arr: [u8; 4] = bytes.try_into().unwrap();
+                                i32::from_be_bytes(arr).to_string()
+                            }
+                            _ => {
+                                let hex = hex::encode(bytes);
+                                format!("'\\x{}'::bytea", hex)
+                            }
+                        }
                     }
                 }
                 _ => {
@@ -5168,7 +5258,37 @@ impl ExtendedQueryHandler for PgHandler {
             .as_deref()
             .unwrap_or(pgwire::api::DEFAULT_NAME);
 
-        if let Some(statement) = client.portal_store().get_statement(statement_name) {
+        if let Some(mut statement) = client.portal_store().get_statement(statement_name) {
+            // Some clients (e.g. pgx/GORM) omit parameter type OIDs in Parse and expect the server
+            // to infer types. Ensure the portal references a statement with inferred types so that
+            // binary parameters are decoded correctly during execution.
+            let param_count = message.parameters.len();
+            let needs_inference = param_count > 0
+                && (statement.parameter_types.len() < param_count
+                    || statement
+                        .parameter_types
+                        .iter()
+                        .take(param_count)
+                        .any(|t| *t == Type::UNKNOWN));
+
+            if needs_inference {
+                if let Ok(describe_response) =
+                    self.do_describe_statement(client, statement.as_ref()).await
+                {
+                    if describe_response.parameters.len() >= param_count
+                        && describe_response.parameters != statement.parameter_types
+                    {
+                        let updated = Arc::new(StoredStatement::new(
+                            statement.id.clone(),
+                            statement.statement.clone(),
+                            describe_response.parameters,
+                        ));
+                        client.portal_store().put_statement(updated.clone());
+                        statement = updated;
+                    }
+                }
+            }
+
             let portal = Portal::try_new(&message, statement)?;
             client.portal_store().put_portal(Arc::new(portal));
             client
@@ -5350,12 +5470,14 @@ fn datatype_to_pgtype(dt: Option<&DataType>) -> Type {
         Some(DataType::Jsonb) => Type::JSONB,
         Some(DataType::Time) => Type::TIME,
         Some(DataType::Numeric { .. }) => Type::NUMERIC,
+        Some(DataType::Name) => Type::NAME,
         Some(DataType::Array(inner)) => match inner.as_ref() {
             DataType::Boolean => Type::BOOL_ARRAY,
             DataType::Int32 => Type::INT4_ARRAY,
             DataType::Int64 => Type::INT8_ARRAY,
             DataType::Float64 => Type::FLOAT8_ARRAY,
             DataType::Text => Type::TEXT_ARRAY,
+            DataType::Name => Type::NAME_ARRAY,
             DataType::Timestamp => Type::TIMESTAMP_ARRAY,
             DataType::TimestampTz => Type::TIMESTAMPTZ_ARRAY,
             DataType::Date => Type::DATE_ARRAY,
@@ -6014,11 +6136,53 @@ mod tests {
 
     #[test]
     fn test_sqlstate_for_executor_error() {
+        // Test legacy InFailedSqlTransaction
         let failed = anyhow::Error::new(InFailedSqlTransaction);
         assert_eq!(sqlstate_for_executor_error(&failed), "25P02");
 
+        // Test generic error (default)
         let other = anyhow::anyhow!("boom");
         assert_eq!(sqlstate_for_executor_error(&other), "XX000");
+
+        // Test string-match fallback: invalid input syntax
+        let invalid_syntax = anyhow::anyhow!("invalid input syntax for type integer: \"abc\"");
+        assert_eq!(sqlstate_for_executor_error(&invalid_syntax), "22P02");
+
+        // Test string-match fallback: column not found
+        let col_not_found = anyhow::anyhow!("column \"age\" does not exist");
+        assert_eq!(sqlstate_for_executor_error(&col_not_found), "42703");
+
+        // Test string-match fallback: ambiguous column
+        let ambiguous = anyhow::anyhow!("column reference \"id\" is ambiguous");
+        assert_eq!(sqlstate_for_executor_error(&ambiguous), "42702");
+
+        // Test string-match fallback: relation not found
+        let rel_not_found = anyhow::anyhow!("relation \"users\" does not exist");
+        assert_eq!(sqlstate_for_executor_error(&rel_not_found), "42P01");
+
+        // Test string-match fallback: unique constraint violation
+        let unique_violation = anyhow::anyhow!("duplicate key value violates unique constraint \"pk_users\"");
+        assert_eq!(sqlstate_for_executor_error(&unique_violation), "23505");
+
+        // Test string-match fallback: not-null constraint violation
+        let not_null = anyhow::anyhow!("violates not-null constraint on column \"email\"");
+        assert_eq!(sqlstate_for_executor_error(&not_null), "23502");
+
+        // Test string-match fallback: check constraint violation
+        let check = anyhow::anyhow!("violates check constraint \"age_positive\"");
+        assert_eq!(sqlstate_for_executor_error(&check), "23514");
+
+        // Test string-match fallback: division by zero
+        let div_zero = anyhow::anyhow!("Division by zero");
+        assert_eq!(sqlstate_for_executor_error(&div_zero), "22012");
+
+        // Test string-match fallback: permission denied
+        let perm_denied = anyhow::anyhow!("permission denied for table users");
+        assert_eq!(sqlstate_for_executor_error(&perm_denied), "42501");
+
+        // Test string-match fallback: function not found
+        let func_not_found = anyhow::anyhow!("function my_func does not exist");
+        assert_eq!(sqlstate_for_executor_error(&func_not_found), "42883");
     }
 
     #[test]
@@ -7294,6 +7458,26 @@ mod tests {
         assert_eq!(
             substitute_parameters("SELECT $1::text", &portal).unwrap(),
             "SELECT '001'::text"
+        );
+    }
+
+    #[test]
+    fn test_substitute_parameters_unknown_binary_int8_with_nul_renders_number() {
+        let stmt = Arc::new(StoredStatement::new(
+            "stmt".to_string(),
+            "SELECT $1".to_string(),
+            vec![],
+        ));
+        let mut portal: Portal<String> = Portal::default();
+        portal.name = "portal".to_string();
+        portal.statement = stmt;
+        portal.parameter_format = Format::UnifiedBinary;
+        portal.parameters = vec![Some(Bytes::copy_from_slice(&1i64.to_be_bytes()))];
+        portal.result_column_format = Format::UnifiedText;
+
+        assert_eq!(
+            substitute_parameters("SELECT $1", &portal).unwrap(),
+            "SELECT 1"
         );
     }
 

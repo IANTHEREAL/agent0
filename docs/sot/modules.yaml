@@ -1,0 +1,333 @@
+schema_version: 1
+
+baseline:
+  branch: refactor/sql-module-restructure
+  commit: b0ea7d1eb9af806b1487503efad9bb2661f1faa3
+
+sources:
+  evidence_snapshot: https://github.com/c4pt0r/tipg/issues/368#issuecomment-3847303069
+  gate_inventory: https://github.com/c4pt0r/tipg/issues/368#issuecomment-3847468216
+  ownership_evidence: https://github.com/c4pt0r/tipg/issues/368#issuecomment-3847519866
+
+modules:
+  - module_id: protocol-pgwire
+    doc_path: docs/sot/protocol-pgwire.md
+    scope:
+      - pgwire startup + auth handshake (wire-level messages)
+      - simple/extended query protocol framing and message handling
+      - tenant username parsing (`tenant.user` / `tenant:user`) and startup parameters
+      - COPY protocol surface (client-facing framing)
+    non_goals:
+      - 'RBAC policy semantics and privilege model (authoritative: `auth-rbac`)'
+      - 'SQL parsing/planning/execution semantics (authoritative: `sql-engine`)'
+      - 'storage/keyspace isolation invariants (authoritative: `storage-format`)'
+    code_entrypoints:
+      - path: src/main.rs
+        symbols: [main]
+      - path: src/protocol/handler.rs
+        symbols:
+          - DynamicPgHandler
+          - authenticate_user
+          - parse_tenant_username
+      - path: src/protocol/copy_format.rs
+      - path: crates/pgwire/src/api/auth/mod.rs
+        symbols: [StartupHandler]
+      - path: crates/pgwire/src/api/auth/cleartext.rs
+      - path: crates/pgwire/src/tokio/server.rs
+      - path: crates/pgwire/src/messages/codec.rs
+    gate_tests:
+      - ci:.github/workflows/regression-gate.yml/regression-gate
+      - ci:.github/workflows/orm-tests.yml/test
+      - cmd:./scripts/regression_gate.sh
+    owners: [TBD]
+    status: PARTIAL
+    coverage_gaps:
+      - No CODEOWNERS/maintainer ownership signal on baseline commit.
+      - Owners are still `TBD` (needs maintainer confirmation).
+    next_step:
+      - Confirm owners and add CODEOWNERS for `src/protocol/**` and `crates/pgwire/**`.
+      - Keep protocol contracts aligned with gate coverage (pg-client/extended protocol/COPY) as tests evolve.
+    xref:
+      - module_id: auth-rbac
+        reason: Authentication/authorization semantics (policy + privilege model)
+      - module_id: storage-format
+        reason: Tenant isolation invariants and keyspace routing behavior
+      - module_id: ops-config
+        reason: TLS + protocol-related config knobs/limits
+
+  - module_id: sql-engine
+    doc_path: docs/sot/sql-engine.md
+    scope:
+      - SQL parsing/planning/execution semantics (DDL/DML/queries)
+      - expression evaluation and type/coercion behavior
+      - trigger execution model (BEFORE + async AFTER queue/worker)
+      - SQL-visible internal surfaces owned by the engine (e.g. observability sys tables)
+    non_goals:
+      - 'persistent storage encoding and key layout (authoritative: `storage-format`)'
+      - 'pgwire message framing and protocol-level behavior (authoritative: `protocol-pgwire`)'
+      - 'RBAC policy definitions (authoritative: `auth-rbac`)'
+    code_entrypoints:
+      - path: src/sql/parser.rs
+        symbols: [parse_sql]
+      - path: src/sql/planner.rs
+        symbols: [choose_join_algorithm]
+      - path: src/sql/executor/core.rs
+        symbols: [Executor]
+      - path: src/sql/expr/mod.rs
+        symbols: [eval_expr, eval_join_expr]
+      - path: src/sql/triggers.rs
+      - path: src/sql/trigger_queue.rs
+      - path: src/sql/trigger_worker.rs
+      - path: src/sql/executor/triggers.rs
+      - path: src/observability.rs
+    gate_tests:
+      - ci:.github/workflows/regression-gate.yml/regression-gate
+      - ci:.github/workflows/orm-tests.yml/test
+      - cmd:python3 scripts/integration_test.py --dsn "$PG_DSN" tests/
+    owners: [TBD]
+    status: PARTIAL
+    coverage_gaps:
+      - No CODEOWNERS/maintainer ownership signal on baseline commit.
+      - Observability sys tables lack an explicit assertion-level gate (see gate inventory).
+    next_step:
+      - Confirm owners and add CODEOWNERS for `src/sql/**`.
+      - Keep `docs/sot/sql-engine.md` aligned with code/tests and cross-links as semantics evolve.
+      - Add dedicated tests for observability sys tables and make them part of regression gate.
+    xref:
+      - module_id: catalog-introspection
+        reason: Catalog/information_schema surfaces are specified there
+      - module_id: storage-format
+        reason: Storage format + transaction boundaries underpin engine semantics
+      - module_id: auth-rbac
+        reason: Privilege checks and RBAC interactions
+      - module_id: extensions-gin
+        reason: Extension-provided SQL semantics and indexes
+      - module_id: ops-config
+        reason: Config keys that affect planner/executor/triggers/observability
+
+  - module_id: storage-format
+    doc_path: docs/sot/storage-format.md
+    scope:
+      - key layout / encoding rules (v2 prefixes, `_sys_*`, `t_*/i_*`)
+      - TiKV store abstraction (`TikvStore`) and format version enforcement
+      - transaction primitives and keyspace isolation invariants
+      - keyspace routing (pool/client selection) and database prefix invariants
+    non_goals:
+      - 'SQL query semantics and planner/executor behavior (authoritative: `sql-engine`)'
+      - 'pgwire protocol and startup messaging (authoritative: `protocol-pgwire`)'
+      - 'auth/RBAC semantics (authoritative: `auth-rbac`)'
+    code_entrypoints:
+      - path: src/storage/encoding.rs
+      - path: src/storage/tikv_store.rs
+        symbols: [TikvStore]
+      - path: src/pool.rs
+        symbols: [TikvClientPool]
+      - path: src/txn/mod.rs
+      - path: src/main.rs
+        symbols: [create_keyspace]
+    gate_tests:
+      - ci:.github/workflows/regression-gate.yml/regression-gate
+      - ci:.github/workflows/orm-tests.yml/test
+      - cmd:cargo test
+    owners: [TBD]
+    status: PARTIAL
+    coverage_gaps:
+      - No CODEOWNERS/maintainer ownership signal on baseline commit.
+      - Existing non-SoT docs contain verified drift for key layout (see evidence snapshot).
+    next_step:
+      - Confirm owners and add CODEOWNERS for `src/storage/**`, `src/txn/**`, `src/pool.rs`.
+      - Keep `docs/sot/storage-format.md` aligned; consider cross-linking non-SoT docs to reduce drift.
+    xref:
+      - module_id: protocol-pgwire
+        reason: Tenant username parsing feeds keyspace routing inputs
+      - module_id: ops-config
+        reason: '`PD_ENDPOINTS`/`PG_KEYSPACE` and other storage-related config knobs'
+
+  - module_id: catalog-introspection
+    doc_path: docs/sot/catalog-introspection.md
+    scope:
+      - '`information_schema` and `pg_catalog` coverage (what exists vs stubs)'
+      - OID/type catalog behavior and server introspection contract
+    non_goals:
+      - 'SQL planner/executor semantics outside of introspection queries (authoritative: `sql-engine`)'
+      - 'storage encoding details (authoritative: `storage-format`)'
+      - 'pgwire protocol framing (authoritative: `protocol-pgwire`)'
+    code_entrypoints:
+      - path: src/sql/information_schema.rs
+      - path: src/sql/catalog/mod.rs
+      - path: src/sql/catalog/pg_attribute.rs
+      - path: src/sql/catalog/pg_type.rs
+      - path: src/sql/catalog/pg_tables.rs
+      - path: src/sql/catalog_oids.rs
+    gate_tests:
+      - ci:.github/workflows/orm-tests.yml/test
+      - cmd:python3 scripts/integration_test.py --dsn "$PG_DSN" tests/34_information_schema.sql
+    owners: [TBD]
+    status: PARTIAL
+    coverage_gaps:
+      - No CODEOWNERS/maintainer ownership signal on baseline commit.
+      - Owners are still `TBD` (needs maintainer confirmation).
+      - Catalog coverage is still partial; many fields are placeholders and the matrix needs expansion beyond the minimum set.
+    next_step:
+      - Confirm owners and add CODEOWNERS for `src/sql/catalog/**` and `src/sql/information_schema.rs`.
+      - Expand the “implemented vs stubbed” matrix and add explicit gaps/next steps for ORM-facing coverage.
+    xref:
+      - module_id: sql-engine
+        reason: Planner/executor behavior for introspection queries
+      - module_id: ops-config
+        reason: Introspection-related config (if any) must be uniquely defined there
+
+  - module_id: auth-rbac
+    doc_path: docs/sot/auth-rbac.md
+    scope:
+      - authentication primitives (users/passwords) and password hashing/verification
+      - role/privilege model (GRANT/REVOKE, role membership, enforcement points)
+      - security defaults and permission boundaries for built-in features
+    non_goals:
+      - 'pgwire auth message framing (authoritative: `protocol-pgwire`)'
+      - 'SQL engine semantics not related to privileges (authoritative: `sql-engine`)'
+      - 'extension-specific policy (authoritative: `extensions-gin` for extension surfaces)'
+    code_entrypoints:
+      - path: src/auth/mod.rs
+      - path: src/auth/password.rs
+      - path: src/auth/rbac.rs
+        symbols: [AuthManager]
+      - path: src/sql/rbac.rs
+      - path: src/protocol/handler.rs
+        symbols: [authenticate_user]
+    gate_tests:
+      - ci:.github/workflows/orm-tests.yml/test
+      - cmd:python3 scripts/integration_test.py --dsn "$PG_DSN" tests/23_rbac.sql
+    owners: [TBD]
+    status: PARTIAL
+    coverage_gaps:
+      - No CODEOWNERS/maintainer ownership signal on baseline commit.
+      - Owners are still `TBD` (needs maintainer confirmation).
+      - Privilege enforcement beyond coarse superuser checks is not wired into executor on the baseline (no `check_privilege` call sites).
+    next_step:
+      - Confirm owners and add CODEOWNERS for `src/auth/**` and RBAC-related `src/sql/**` files.
+      - Define enforcement scope for stored GRANT/REVOKE privileges and add dedicated regression coverage.
+    xref:
+      - module_id: protocol-pgwire
+        reason: Wire-level handshake messages and auth mechanism negotiation
+      - module_id: extensions-gin
+        reason: HTTP extension + index features rely on RBAC boundaries
+      - module_id: ops-config
+        reason: Security-related configuration keys and defaults
+
+  - module_id: extensions-gin
+    doc_path: docs/sot/extensions-gin.md
+    scope:
+      - HTTP extension framework and security model (including SSRF protection)
+      - GIN-like index semantics and full-text search (FTS) behavior
+      - extension-owned configuration keys and feature flags (defined once; see `ops-config`)
+    non_goals:
+      - 'core SQL engine semantics outside of extensions (authoritative: `sql-engine`)'
+      - 'base RBAC privilege model (authoritative: `auth-rbac`)'
+      - 'generic storage format rules (authoritative: `storage-format`, except extension-specific encodings)'
+    code_entrypoints:
+      - path: src/extensions/http.rs
+      - path: src/extensions/context.rs
+      - path: src/sql/executor/extensions.rs
+      - path: src/sql/gin.rs
+      - path: src/sql/fts.rs
+      - path: src/storage/encoding.rs
+    gate_tests:
+      - ci:.github/workflows/orm-tests.yml/test
+      - cmd:python3 scripts/integration_test.py --dsn "$PG_DSN" tests/86_extensions_framework_http.sql
+    owners: [TBD]
+    status: PARTIAL
+    coverage_gaps:
+      - No CODEOWNERS/maintainer ownership signal on baseline commit.
+    next_step:
+      - Confirm owners and add CODEOWNERS for `src/extensions/**` and extension-related `src/sql/**` files.
+      - Keep `docs/sot/extensions-gin.md` aligned; keep security-sensitive behavior explicit and gated.
+    xref:
+      - module_id: auth-rbac
+        reason: Permission checks and role requirements for extension execution
+      - module_id: storage-format
+        reason: Extension-specific index encodings and data layout interactions
+      - module_id: ops-config
+        reason: Extension configuration keys must be uniquely defined there
+
+  - module_id: testing-gates
+    doc_path: docs/sot/testing-gates.md
+    scope:
+      - CI workflows/jobs that act as merge gates
+      - local reproducibility (how to run the same gates locally)
+      - 'mapping: module → gate(s) (what verifies what)'
+    non_goals:
+      - 'feature semantics (authoritative: the corresponding module SoT doc)'
+      - 'adding/removing/tuning gates without DR/ADR (see #368 hard rule)'
+    code_entrypoints:
+      - path: .github/workflows/regression-gate.yml
+      - path: .github/workflows/orm-tests.yml
+      - path: .github/workflows/gorm-smoke.yml
+      - path: .github/workflows/sqlalchemy-smoke.yml
+      - path: .github/workflows/doc-lint.yml
+      - path: scripts/regression_gate.sh
+      - path: run_tests.sh
+      - path: scripts/integration_test.py
+      - path: scripts/e2e_tests.sh
+      - path: scripts/doc_lint.py
+    gate_tests:
+      - ci:.github/workflows/orm-tests.yml/lint
+      - ci:.github/workflows/orm-tests.yml/test
+      - ci:.github/workflows/regression-gate.yml/regression-gate
+      - ci:.github/workflows/doc-lint.yml/doc-lint
+      - ci:.github/workflows/gorm-smoke.yml/gorm-smoke
+      - ci:.github/workflows/sqlalchemy-smoke.yml/sqlalchemy-smoke
+    owners: [TBD]
+    status: PARTIAL
+    coverage_gaps:
+      - No CODEOWNERS/maintainer ownership signal on baseline commit.
+      - Config key uniqueness beyond minimal header-level SSOT checks is not implemented yet (Phase 2 follow-up).
+    next_step:
+      - Confirm owners and add CODEOWNERS for `.github/workflows/**` and `scripts/**`.
+      - Keep `doc-lint` gate stable and incrementally extend checks (config key uniqueness, xref coverage).
+    xref:
+      - module_id: protocol-pgwire
+        reason: Gate coverage includes pg-client protocol suites
+      - module_id: sql-engine
+        reason: Integration tests in `tests/**` exercise engine semantics
+      - module_id: ops-config
+        reason: Local gate execution depends on environment/config prerequisites
+
+  - module_id: ops-config
+    doc_path: docs/sot/ops-config.md
+    scope:
+      - configuration keys and defaults (env vars + CLI flags if any)
+      - TLS configuration and security defaults
+      - runtime limits/backpressure knobs and their operational meaning
+      - 'config key uniqueness: keys MUST be defined exactly once across SoT docs'
+    non_goals:
+      - 'feature semantics (authoritative: other SoT module docs)'
+      - duplicating config definitions across multiple docs (use cross-links instead)
+    code_entrypoints:
+      - path: src/main.rs
+      - path: src/tls.rs
+      - path: src/observability.rs
+      - path: src/extensions/http.rs
+      - path: src/sql/trigger_worker.rs
+      - path: src/protocol/handler.rs
+      - path: docs/configuration.md
+    gate_tests:
+      - ci:.github/workflows/orm-tests.yml/test
+      - ci:.github/workflows/orm-tests.yml/lint
+    owners: [TBD]
+    status: PARTIAL
+    coverage_gaps:
+      - No CODEOWNERS/maintainer ownership signal on baseline commit.
+      - TLS handshake is not explicitly gated in CI (see gate inventory).
+      - Non-SoT config docs contain verified drift vs `src/**` env var reads (see evidence snapshot).
+    next_step:
+      - Confirm owners and add CODEOWNERS for `src/main.rs`, `src/tls.rs`, and config-heavy modules.
+      - Add a TLS-enabled gate (smoke or integration) and document it in `testing-gates`.
+      - Add config-key uniqueness checks for `docs/sot/**` (Phase 2) and document it in `testing-gates`.
+    xref:
+      - module_id: protocol-pgwire
+        reason: TLS and protocol limits affect connection-level behavior
+      - module_id: sql-engine
+        reason: Engine behavior is influenced by env-configured knobs
+      - module_id: extensions-gin
+        reason: Extension flags and security knobs must be uniquely defined here

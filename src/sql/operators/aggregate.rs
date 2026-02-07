@@ -15,6 +15,8 @@ pub struct AggregateExpr {
     pub func_name: String,
     pub arg: Option<Expr>,
     pub distinct: bool,
+    pub delimiter: Option<String>,
+    pub filter: Option<Expr>,
 }
 
 #[derive(Debug)]
@@ -88,8 +90,12 @@ impl HashAggregateOperator {
         }
     }
 
-    fn create_aggregator(func_name: &str) -> Result<Aggregator> {
-        Aggregator::new(func_name)
+    fn create_aggregator(agg_expr: &AggregateExpr) -> Result<Aggregator> {
+        if agg_expr.func_name == "STRING_AGG" {
+            let delim = agg_expr.delimiter.as_deref().unwrap_or(",").to_string();
+            return Ok(Aggregator::new_string_agg(delim));
+        }
+        Aggregator::new(&agg_expr.func_name)
     }
 }
 
@@ -127,7 +133,7 @@ impl PhysicalOperator for HashAggregateOperator {
                 let aggregators: Vec<Aggregator> = self
                     .aggregate_exprs
                     .iter()
-                    .map(|agg_expr| Self::create_aggregator(&agg_expr.func_name))
+                    .map(|agg_expr| Self::create_aggregator(agg_expr))
                     .collect::<Result<Vec<_>>>()?;
                 let seen_distinct = (0..self.aggregate_exprs.len())
                     .map(|_| HashSet::new())
@@ -147,6 +153,13 @@ impl PhysicalOperator for HashAggregateOperator {
                 .ok_or_else(|| anyhow!("Aggregate group state missing"))?;
 
             for (i, agg_expr) in self.aggregate_exprs.iter().enumerate() {
+                if let Some(ref filter_expr) = agg_expr.filter {
+                    let filter_val = eval_expr(filter_expr, Some(row), Some(input_schema))?;
+                    if !matches!(filter_val, Value::Boolean(true)) {
+                        continue;
+                    }
+                }
+
                 let val = if let Some(arg) = &agg_expr.arg {
                     eval_expr(arg, Some(row), Some(input_schema))?
                 } else {
@@ -170,7 +183,7 @@ impl PhysicalOperator for HashAggregateOperator {
         if groups.is_empty() && self.group_by_exprs.is_empty() {
             let mut values = Vec::new();
             for agg_expr in &self.aggregate_exprs {
-                let agg = Self::create_aggregator(&agg_expr.func_name)?;
+                let agg = Self::create_aggregator(agg_expr)?;
                 values.push(agg.result());
             }
             self.result_rows.push(Row::new(values));
@@ -296,6 +309,8 @@ mod tests {
             func_name: "SUM".to_string(),
             arg: Some(Expr::Identifier(Ident::new("amount"))),
             distinct: false,
+            delimiter: None,
+            filter: None,
         }];
 
         let op = HashAggregateOperator::new(
@@ -325,11 +340,15 @@ mod tests {
                 func_name: "COUNT".to_string(),
                 arg: None,
                 distinct: false,
+                delimiter: None,
+                filter: None,
             },
             AggregateExpr {
                 func_name: "SUM".to_string(),
                 arg: Some(Expr::Identifier(Ident::new("amount"))),
                 distinct: false,
+                delimiter: None,
+                filter: None,
             },
         ];
 
@@ -359,6 +378,8 @@ mod tests {
             func_name: "COUNT".to_string(),
             arg: None,
             distinct: false,
+            delimiter: None,
+            filter: None,
         }];
 
         let op = HashAggregateOperator::new(
@@ -374,5 +395,90 @@ mod tests {
         let info = op.explain_info().unwrap();
         assert!(info.contains("aggs="));
         assert!(!info.contains("group_by="));
+    }
+
+    #[test]
+    fn test_hash_aggregate_multiple_group_columns() {
+        let schema = test_schema();
+        let child = Box::new(TableScanOperator::new(schema));
+
+        let group_by_exprs = vec![
+            Expr::Identifier(Ident::new("category")),
+            Expr::Identifier(Ident::new("amount")),
+        ];
+        let aggregate_exprs = vec![AggregateExpr {
+            func_name: "COUNT".to_string(),
+            arg: None,
+            distinct: false,
+            delimiter: None,
+            filter: None,
+        }];
+
+        let op = HashAggregateOperator::new(
+            child,
+            group_by_exprs,
+            aggregate_exprs,
+            vec!["category".to_string(), "amount".to_string()],
+            vec![DataType::Text, DataType::Int32],
+            vec!["count".to_string()],
+            vec![DataType::Int64],
+        );
+
+        assert_eq!(op.schema().columns.len(), 3);
+        assert_eq!(op.schema().columns[0].name, "category");
+        assert_eq!(op.schema().columns[1].name, "amount");
+        assert_eq!(op.schema().columns[2].name, "count");
+
+        let info = op.explain_info().unwrap();
+        assert!(info.contains("category"));
+        assert!(info.contains("amount"));
+    }
+
+    #[test]
+    fn test_hash_aggregate_string_agg_delimiter() {
+        let agg_expr = AggregateExpr {
+            func_name: "STRING_AGG".to_string(),
+            arg: Some(Expr::Identifier(Ident::new("category"))),
+            distinct: false,
+            delimiter: Some(", ".to_string()),
+            filter: None,
+        };
+
+        let aggregator = HashAggregateOperator::create_aggregator(&agg_expr).unwrap();
+        assert_eq!(aggregator.result(), Value::Null);
+    }
+
+    #[test]
+    fn test_hash_aggregate_with_filter_creation() {
+        let schema = test_schema();
+        let child = Box::new(TableScanOperator::new(schema));
+
+        let aggregate_exprs = vec![AggregateExpr {
+            func_name: "SUM".to_string(),
+            arg: Some(Expr::Identifier(Ident::new("amount"))),
+            distinct: false,
+            delimiter: None,
+            filter: Some(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new("amount"))),
+                op: sqlparser::ast::BinaryOperator::Gt,
+                right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
+                    "100".to_string(),
+                    false,
+                ))),
+            }),
+        }];
+
+        let op = HashAggregateOperator::new(
+            child,
+            vec![],
+            aggregate_exprs.clone(),
+            vec![],
+            vec![],
+            vec!["filtered_sum".to_string()],
+            vec![DataType::Int64],
+        );
+
+        assert_eq!(op.name(), "HashAggregate");
+        assert!(op.aggregate_exprs[0].filter.is_some());
     }
 }

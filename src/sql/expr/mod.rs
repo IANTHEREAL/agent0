@@ -8,16 +8,14 @@ mod numeric;
 mod operators;
 
 pub use context::{JoinEvalContext, SingleTableContext};
-#[allow(unused_imports)]
 pub use context::EvalContext;
-#[allow(unused_imports)]
-pub use evaluator::eval_expr_impl as eval_expr_unified;
 pub(crate) use boolean::{coerce_text_literal_to_bool, validate_bool_expr_in_boolean_context};
 
 pub(crate) fn parse_bool_pg(s: &str) -> Option<bool> {
     operators::parse_bool_pg(s)
 }
 
+use crate::sql::error::SqlError;
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Context, Result};
 use rust_decimal::Decimal;
@@ -52,14 +50,22 @@ pub fn set_connection_id(id: i32) {
     CONNECTION_ID_FALLBACK.with(|c| c.set(id));
 }
 
-fn get_connection_id() -> i32 {
+pub(crate) fn get_connection_id_value() -> i32 {
     CONNECTION_ID
         .try_with(|c| *c)
         .unwrap_or_else(|_| CONNECTION_ID_FALLBACK.with(|c| c.get()))
 }
 
-fn current_database_name() -> Option<Arc<str>> {
+fn get_connection_id() -> i32 {
+    get_connection_id_value()
+}
+
+pub(crate) fn get_current_database_name() -> Option<Arc<str>> {
     CURRENT_DATABASE_NAME.try_with(|name| name.clone()).ok()
+}
+
+fn current_database_name() -> Option<Arc<str>> {
+    get_current_database_name()
 }
 
 pub(crate) async fn with_query_context<R, Fut>(
@@ -88,22 +94,7 @@ where
     }
 }
 
-pub struct JoinContext<'a> {
-    #[allow(dead_code)]
-    pub tables: HashMap<String, (&'a TableSchema, &'a Row)>,
-    pub column_offsets: &'a HashMap<String, usize>,
-    /// Offsets for merged output columns produced by `USING`/`NATURAL` joins.
-    ///
-    /// For outer joins, the merged join key should behave like `COALESCE(left, right)` so that
-    /// right-only rows in `RIGHT/FULL` joins expose the right-side key when the left side is NULL.
-    ///
-    /// This must not affect qualified column access (e.g. `left_alias.key`), which should still
-    /// read the underlying left/right columns directly.
-    pub merged_column_offsets: Option<&'a HashMap<String, Vec<usize>>>,
-    pub combined_row: &'a Row,
-    #[allow(dead_code)]
-    pub combined_schema: &'a TableSchema,
-}
+
 
 fn sql_datatype_is_timestamptz(dt: &sqlparser::ast::DataType) -> Option<bool> {
     match dt {
@@ -201,34 +192,33 @@ fn expr_is_timestamptz_join_with_schema(
     }
 }
 
-pub fn eval_expr_join(expr: &Expr, ctx: &JoinContext) -> Result<Value> {
+pub fn eval_join_expr(ctx: &JoinEvalContext, expr: &Expr) -> Result<Value> {
     stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
-        let eval_ctx = JoinEvalContext::from_join_context(ctx);
-        evaluator::eval_expr_impl(&eval_ctx, expr)
+        evaluator::eval_expr_impl(ctx, expr)
     })
-}
-
-#[allow(dead_code)]
-pub fn eval_with_context(expr: &Expr, ctx: &SingleTableContext) -> Result<Value> {
-    eval_expr(expr, ctx.row(), ctx.get_schema())
-}
-
-#[allow(dead_code)]
-pub fn eval_with_join_context(expr: &Expr, ctx: &JoinEvalContext) -> Result<Value> {
-    let join_ctx = JoinContext {
-        tables: HashMap::new(),
-        column_offsets: ctx.column_offsets,
-        merged_column_offsets: ctx.merged_column_offsets,
-        combined_row: ctx.combined_row,
-        combined_schema: ctx.combined_schema,
-    };
-    eval_expr_join(expr, &join_ctx)
 }
 
 pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -> Result<Value> {
     stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
         let ctx = SingleTableContext::new(row, schema);
         evaluator::eval_expr_impl(&ctx, expr)
+    })
+}
+
+pub fn eval_expr_with_query_ctx(
+    expr: &Expr,
+    row: Option<&Row>,
+    schema: Option<&TableSchema>,
+    query_ctx: Option<&super::query_context::QueryContext>,
+) -> Result<Value> {
+    stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
+        if let Some(qc) = query_ctx {
+            let ctx = SingleTableContext::with_query_ctx(row, schema, qc);
+            evaluator::eval_expr_impl(&ctx, expr)
+        } else {
+            let ctx = SingleTableContext::new(row, schema);
+            evaluator::eval_expr_impl(&ctx, expr)
+        }
     })
 }
 
@@ -271,7 +261,7 @@ fn interval_from_field(num: i64, field: &sqlparser::ast::DateTimeField) -> Resul
         sqlparser::ast::DateTimeField::Hour => IntervalValue::from_millis(num * 60 * 60 * 1000),
         sqlparser::ast::DateTimeField::Minute => IntervalValue::from_millis(num * 60 * 1000),
         sqlparser::ast::DateTimeField::Second => IntervalValue::from_millis(num * 1000),
-        _ => return Err(anyhow!("Unsupported interval field")),
+        _ => return Err(SqlError::Unsupported("Unsupported interval field".into()).into()),
     };
     Ok(Value::Interval(iv))
 }
@@ -343,6 +333,61 @@ fn eval_row_object_expr<C: EvalContext>(
         obj.insert(format!("f{}", idx + 1), value_to_json(&v));
     }
     Ok(Some(serde_json::Value::Object(obj)))
+}
+
+fn split_qualified_column_name(name: &str) -> (&str, &str) {
+    match name.rsplit_once('.') {
+        Some((qualifier, col)) => (qualifier, col),
+        None => ("", name),
+    }
+}
+
+fn value_to_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int32(n) => Some(*n as i64),
+        Value::Int64(n) => Some(*n),
+        Value::Float64(n) => Some(*n as i64),
+        Value::Text(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn resolve_text_col_from_row_context_by_oid<C: EvalContext>(
+    ctx: &C,
+    oid_arg: Option<i64>,
+    id_col_name: &str,
+    def_col_name: &str,
+) -> Option<Value> {
+    let (row, schema) = (ctx.row()?, ctx.schema()?);
+
+    // Prefer matching `<qualifier>.<def_col_name>` where `<qualifier>.<id_col_name> == oid_arg`.
+    for (def_idx, col) in schema.columns.iter().enumerate() {
+        let (def_qualifier, def_unqualified) = split_qualified_column_name(&col.name);
+        if !def_unqualified.eq_ignore_ascii_case(def_col_name) {
+            continue;
+        }
+
+        let def_val = row.values.get(def_idx)?.clone();
+        if matches!(def_val, Value::Null) {
+            continue;
+        }
+
+        let Some(oid) = oid_arg else {
+            return Some(def_val);
+        };
+
+        let relid_idx = schema.columns.iter().position(|c| {
+            let (qualifier, unqualified) = split_qualified_column_name(&c.name);
+            qualifier.eq_ignore_ascii_case(def_qualifier)
+                && unqualified.eq_ignore_ascii_case(id_col_name)
+        })?;
+        let relid_val = row.values.get(relid_idx)?;
+        if value_to_i64(relid_val) == Some(oid) {
+            return Some(def_val);
+        }
+    }
+
+    None
 }
 
 fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Result<Value> {
@@ -644,7 +689,10 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                 Some(Value::Int64(p)) => (*p).clamp(0, 6) as u32,
                 _ => 6_u32,
             };
-            let ts = super::statement_time::statement_timestamp_millis_or_now();
+            let ts = ctx
+                .query_context()
+                .map(|qc| qc.statement_timestamp_ms)
+                .unwrap_or_else(super::statement_time::statement_timestamp_millis_or_now);
             let ts = crate::types::timestamp::truncate_timestamp_millis(ts, precision);
             Ok(Value::Timestamp(ts))
         }
@@ -743,45 +791,36 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
         "SET_CONFIG" => Ok(Value::Text(String::new())),
         // PG_IS_IN_RECOVERY, PG_ENCODING_TO_CHAR, HAS_SCHEMA_PRIVILEGE, HAS_TABLE_PRIVILEGE,
         // HAS_DATABASE_PRIVILEGE are handled by the registry (functions/pg_compat.rs)
-        "PG_BACKEND_PID" => Ok(Value::Int32(get_connection_id())),
+        "PG_BACKEND_PID" => Ok(Value::Int32(
+            ctx.query_context()
+                .map(|qc| qc.connection_id)
+                .unwrap_or_else(get_connection_id),
+        )),
         "VERSION" => Ok(Value::Text(VERSION_STRING.to_string())),
         "CURRENT_DATABASE" => Ok(Value::Text(
-            current_database_name()
-                .map(|name| name.as_ref().to_string())
+            ctx.query_context()
+                .map(|qc| qc.database_name.as_ref().to_string())
+                .or_else(|| current_database_name().map(|n| n.as_ref().to_string()))
                 .unwrap_or_else(|| "postgres".to_string()),
         )),
         "CURRENT_SCHEMA" => Ok(Value::Text("public".to_string())),
         "CURRENT_USER" | "SESSION_USER" | "USER" => Ok(Value::Text("postgres".to_string())),
         "PG_GET_USERBYID" => Ok(Value::Text("postgres".to_string())),
         "PG_GET_INDEXDEF" => {
-            if let Some(schema) = ctx.schema() {
-                if let Some(col) = schema
-                    .columns
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case("indexdef"))
-                {
-                    if let Ok(val) = ctx.resolve_column(&col.name) {
-                        if !matches!(val, Value::Null) {
-                            return Ok(val);
-                        }
-                    }
-                }
+            let oid_arg = args.first().and_then(value_to_i64);
+            if let Some(val) =
+                resolve_text_col_from_row_context_by_oid(ctx, oid_arg, "indexrelid", "indexdef")
+            {
+                return Ok(val);
             }
             Ok(Value::Text("CREATE INDEX".to_string()))
         }
         "PG_GET_CONSTRAINTDEF" => {
-            if let Some(schema) = ctx.schema() {
-                if let Some(col) = schema
-                    .columns
-                    .iter()
-                    .find(|c| c.name.eq_ignore_ascii_case("constraintdef"))
-                {
-                    if let Ok(val) = ctx.resolve_column(&col.name) {
-                        if !matches!(val, Value::Null) {
-                            return Ok(val);
-                        }
-                    }
-                }
+            let oid_arg = args.first().and_then(value_to_i64);
+            if let Some(val) =
+                resolve_text_col_from_row_context_by_oid(ctx, oid_arg, "oid", "constraintdef")
+            {
+                return Ok(val);
             }
             Ok(Value::Text(String::new()))
         }
@@ -872,7 +911,7 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
         // JSONB_SET, JSON_SET, JSONB_ARRAY_ELEMENTS, JSON_ARRAY_ELEMENTS, JSONB_ARRAY_ELEMENTS_TEXT,
         // JSON_ARRAY_ELEMENTS_TEXT, JSONB_EACH, JSON_EACH, JSONB_EACH_TEXT, JSON_EACH_TEXT are handled by the registry (functions/json.rs)
 
-        _ => Err(anyhow!("Unsupported function: {}", func_name)),
+        _ => Err(SqlError::Unsupported(format!("Unsupported function: {}", func_name)).into()),
     }
 }
 
@@ -1026,7 +1065,7 @@ fn cast_to_bytea(v: Value) -> Result<Value> {
         Value::Text(s) => {
             if let Some(rest) = s.strip_prefix("\\x") {
                 let bytes = hex::decode(rest)
-                    .map_err(|e| anyhow!("invalid input syntax for type bytea: {}", e))?;
+                    .map_err(|e| SqlError::InvalidInputSyntax { type_name: "bytea".into(), value: e.to_string() })?;
                 Ok(Value::Bytes(bytes))
             } else {
                 Ok(Value::Bytes(s.into_bytes()))
@@ -1077,14 +1116,14 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                 Value::Int32(i) => Decimal::from(i),
                 Value::Int64(i) => Decimal::from(i),
                 Value::Float64(f) => Decimal::try_from(f)
-                    .map_err(|_| anyhow!("invalid input syntax for type numeric: \"{}\"", f))?,
+                    .map_err(|_| SqlError::InvalidInputSyntax { type_name: "numeric".into(), value: f.to_string() })?,
                 Value::Text(s) => Decimal::from_str(s.trim())
-                    .map_err(|_| anyhow!("invalid input syntax for type numeric: \"{}\"", s))?,
+                    .map_err(|_| SqlError::InvalidInputSyntax { type_name: "numeric".into(), value: s.clone() })?,
                 other => {
-                    return Err(anyhow!(
-                        "cannot cast {} to numeric",
-                        other.data_type().unwrap_or(crate::types::DataType::Text)
-                    ))
+                    return Err(SqlError::InvalidCast {
+                        from: other.data_type().unwrap_or(crate::types::DataType::Text),
+                        to: crate::types::DataType::Numeric { precision: None, scale: None },
+                    }.into())
                 }
             };
             if let Some(s) = scale {
@@ -1181,7 +1220,7 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
             crate::types::date::date_days_to_timestamp_millis(days).map(Value::Timestamp)
         }
         (Value::Text(s), SqlType::Time(_, _)) => {
-            use crate::sql::helpers::parse_time_string;
+            use crate::sql::coercion::parse_time_string;
             parse_time_string(&s)
                 .map(Value::Time)
                 .ok_or_else(|| anyhow!("Invalid time format: {}", s))
@@ -1206,7 +1245,7 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                             other => other.to_string(),
                         };
                         serde_json::from_str::<serde_json::Value>(&s)
-                            .map_err(|e| anyhow!("invalid input syntax for type json: {}", e))?;
+                            .map_err(|e| SqlError::InvalidInputSyntax { type_name: "json".into(), value: e.to_string() })?;
                         Ok(Value::Json(s))
                     }
                     "BYTEA" => cast_to_bytea(v),
@@ -1218,13 +1257,16 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                             other => other.to_string(),
                         };
                         let parsed: serde_json::Value = serde_json::from_str(&s)
-                            .map_err(|e| anyhow!("invalid input syntax for type jsonb: {}", e))?;
+                            .map_err(|e| SqlError::InvalidInputSyntax { type_name: "jsonb".into(), value: e.to_string() })?;
                         Ok(Value::Jsonb(parsed.to_string()))
                     }
                     "VECTOR" => match &v {
                         Value::Text(s) => parse_vector_literal(s).map(Value::Vector),
                         Value::Vector(_) => Ok(v),
-                        _ => Err(anyhow!("Cannot cast {} to vector", v)),
+                        _ => Err(SqlError::InvalidCast {
+                            from: v.data_type().unwrap_or(crate::types::DataType::Text),
+                            to: crate::types::DataType::Vector(0),
+                        }.into()),
                     },
                     "REGTYPE" => {
                         let s = match &v {
@@ -1596,7 +1638,7 @@ fn eval_date_trunc_from_args(args: Vec<Value>) -> Result<Value> {
             .and_hms_opt(dt.hour(), dt.minute(), 0)
             .ok_or_else(|| anyhow!("Failed to create datetime for minute truncation"))?
             .and_utc(),
-        _ => return Err(anyhow!("Unsupported DATE_TRUNC field: {}", field)),
+        _ => return Err(SqlError::Unsupported(format!("Unsupported DATE_TRUNC field: {}", field)).into()),
     };
     Ok(Value::Timestamp(truncated.timestamp_millis()))
 }
@@ -1607,10 +1649,6 @@ pub fn eval_value_public(v: &SqlValue) -> Result<Value> {
 
 pub fn eval_binary_op_public(left: Value, op: &BinaryOperator, right: Value) -> Result<Value> {
     eval_binary_op(left, op, right)
-}
-
-pub fn cast_value_public(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value> {
-    cast_value(val, data_type)
 }
 
 fn eval_value(v: &SqlValue) -> Result<Value> {
@@ -1657,7 +1695,7 @@ fn eval_value(v: &SqlValue) -> Result<Value> {
             }
             Ok(Value::Text(body.clone()))
         }
-        _ => Err(anyhow!("Unsupported value literal: {:?}", v)),
+        _ => Err(SqlError::Unsupported(format!("Unsupported value literal: {:?}", v)).into()),
     }
 }
 
@@ -1752,7 +1790,7 @@ pub(super) fn eval_json_access(left: Value, operator: &JsonOperator, right: Valu
                 }
                 return Ok(Value::Boolean(true));
             }
-            _ => return Err(anyhow!("Unsupported operator for arrays: {:?}", operator)),
+            _ => return Err(SqlError::Unsupported(format!("Unsupported operator for arrays: {:?}", operator)).into()),
         }
     }
 
@@ -1816,7 +1854,7 @@ pub(super) fn eval_json_access(left: Value, operator: &JsonOperator, right: Valu
                     json_delete_path(&mut json_val, &path);
                     Ok(Value::Jsonb(json_val.to_string()))
                 }
-                _ => Err(anyhow!("Unsupported JSON operator: {:?}", operator)),
+                _ => Err(SqlError::Unsupported(format!("Unsupported JSON operator: {:?}", operator)).into()),
             }
         }
         _ => {
@@ -1867,7 +1905,7 @@ pub(super) fn eval_json_access(left: Value, operator: &JsonOperator, right: Valu
                             Ok(Value::Text(val.to_string()))
                         }
                     },
-                    _ => Err(anyhow!("Unsupported JSON operator: {:?}", operator)),
+                    _ => Err(SqlError::Unsupported(format!("Unsupported JSON operator: {:?}", operator)).into()),
                 },
             }
         }
@@ -2158,1879 +2196,4 @@ fn vector_norm(vec: &[f64]) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use super::super::statement_time;
-    use crate::types::ColumnDef;
-    use rust_decimal::Decimal;
-    use sqlparser::dialect::PostgreSqlDialect;
-    use sqlparser::parser::Parser;
-    use std::collections::HashMap;
-    use std::str::FromStr;
-
-    fn parse_expr(sql: &str) -> Expr {
-        let full_sql = format!("SELECT {}", sql);
-        let dialect = PostgreSqlDialect {};
-        let ast = Parser::parse_sql(&dialect, &full_sql).unwrap();
-        if let sqlparser::ast::Statement::Query(q) = &ast[0] {
-            if let sqlparser::ast::SetExpr::Select(s) = &*q.body {
-                if let sqlparser::ast::SelectItem::UnnamedExpr(e) = &s.projection[0] {
-                    return e.clone();
-                }
-            }
-        }
-        panic!("Failed to parse expression");
-    }
-
-    #[test]
-    fn test_version_includes_pg_tikv() {
-        let v = eval_expr(&parse_expr("version()"), None, None).unwrap();
-        let Value::Text(s) = v else {
-            panic!("version() must return text");
-        };
-        assert!(s.starts_with("PostgreSQL "));
-        assert!(s.contains("pg-tikv "));
-    }
-
-    #[test]
-    fn test_eval_expr_join_function_resolves_qualified_column() {
-        let expr = parse_expr("LOWER(b.name)");
-
-        let combined_schema = TableSchema {
-            name: "join".to_string(),
-            columns: vec![
-                ColumnDef {
-                    name: "name".to_string(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                },
-                ColumnDef {
-                    name: "name".to_string(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                },
-            ],
-            ..Default::default()
-        };
-
-        let combined_row = Row::new(vec![
-            Value::Text("Alice".to_string()),
-            Value::Text("Bob".to_string()),
-        ]);
-
-        let mut column_offsets = HashMap::new();
-        column_offsets.insert("a.name".to_string(), 0);
-        column_offsets.insert("b.name".to_string(), 1);
-        column_offsets.insert("name".to_string(), 0);
-
-        let ctx = JoinContext {
-            tables: HashMap::new(),
-            column_offsets: &column_offsets,
-            merged_column_offsets: None,
-            combined_row: &combined_row,
-            combined_schema: &combined_schema,
-        };
-
-        let val = eval_expr_join(&expr, &ctx).unwrap();
-        assert_eq!(val, Value::Text("bob".to_string()));
-    }
-
-    #[test]
-    fn test_eval_literal_values() {
-        assert_eq!(
-            eval_expr(&parse_expr("42"), None, None).unwrap(),
-            Value::Int32(42)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("3.14"), None, None).unwrap(),
-            Value::Numeric(Decimal::from_str("3.14").unwrap())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'hello'"), None, None).unwrap(),
-            Value::Text("hello".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("$$hello$$"), None, None).unwrap(),
-            Value::Text("hello".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("$tag$hello$tag$"), None, None).unwrap(),
-            Value::Text("hello".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("$$ $1 $$"), None, None).unwrap(),
-            Value::Text(" $1 ".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("NULL"), None, None).unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("true"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("false"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-    }
-
-    #[test]
-    fn test_at_time_zone_timestamp_to_timestamptz() {
-        let expr = parse_expr("TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'UTC'");
-        let val = eval_expr(&expr, None, None).unwrap();
-        assert_eq!(val, parse_timestamp_string("2024-01-15 10:00:00").unwrap());
-    }
-
-    #[test]
-    fn test_at_time_zone_timestamp_to_timestamptz_with_offset() {
-        let expr = parse_expr("TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'Asia/Shanghai'");
-        let val = eval_expr(&expr, None, None).unwrap();
-        assert_eq!(val, parse_timestamp_string("2024-01-15 02:00:00").unwrap());
-    }
-
-    #[test]
-    fn test_at_time_zone_chain_conversion() {
-        let expr = parse_expr(
-            "TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York'",
-        );
-        let val = eval_expr(&expr, None, None).unwrap();
-        assert_eq!(val, parse_timestamp_string("2024-01-15 05:00:00").unwrap());
-    }
-
-    #[test]
-    fn test_at_time_zone_timestamptz_to_timestamp() {
-        let expr =
-            parse_expr("TIMESTAMPTZ '2024-01-15T10:00:00Z' AT TIME ZONE 'America/New_York'");
-        let val = eval_expr(&expr, None, None).unwrap();
-        assert_eq!(val, parse_timestamp_string("2024-01-15 05:00:00").unwrap());
-    }
-
-    #[test]
-    fn test_eval_arithmetic() {
-        assert_eq!(
-            eval_expr(&parse_expr("1 + 2"), None, None).unwrap(),
-            Value::Int32(3)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("10 - 4"), None, None).unwrap(),
-            Value::Int32(6)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("3 * 5"), None, None).unwrap(),
-            Value::Int32(15)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("20 / 4"), None, None).unwrap(),
-            Value::Int32(5)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("17 % 5"), None, None).unwrap(),
-            Value::Int32(2)
-        );
-    }
-
-    #[test]
-    fn test_eval_comparison() {
-        assert_eq!(
-            eval_expr(&parse_expr("5 > 3"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("5 < 3"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("5 = 5"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("5 <> 3"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("5 >= 5"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("5 <= 6"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-    }
-
-    #[test]
-    fn test_eval_logical() {
-        assert_eq!(
-            eval_expr(&parse_expr("true AND true"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("true AND false"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("true OR false"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("false OR false"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("NOT true"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("NOT false"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-    }
-
-    #[test]
-    fn test_eval_logical_null_semantics_and_short_circuit() {
-        assert_eq!(
-            eval_expr(&parse_expr("CAST(NULL AS BOOLEAN) AND TRUE"), None, None).unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("FALSE AND CAST(NULL AS BOOLEAN)"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("CAST(NULL AS BOOLEAN) OR TRUE"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("NOT CAST(NULL AS BOOLEAN)"), None, None).unwrap(),
-            Value::Null
-        );
-
-        // Short-circuit: RHS must not be evaluated when LHS determines result
-        assert_eq!(
-            eval_expr(&parse_expr("FALSE AND (1 / 0 = 0)"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("TRUE OR (1 / 0 = 0)"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-    }
-
-	    #[test]
-	    fn test_eval_logical_short_circuit_does_not_hide_type_errors() {
-	        // Short-circuit must not mask RHS type errors.
-	        assert!(eval_expr(&parse_expr("TRUE OR 42"), None, None).is_err());
-	        assert!(eval_expr(&parse_expr("FALSE AND 1 / 0"), None, None).is_err());
-	        assert!(eval_expr(&parse_expr("TRUE OR (FALSE AND 42)"), None, None).is_err());
-	        assert!(eval_expr(&parse_expr("FALSE AND (TRUE OR 42)"), None, None).is_err());
-	        assert!(
-	            eval_expr(&parse_expr("TRUE OR (1 LIKE 'a%')"), None, None)
-	                .unwrap_err()
-	                .to_string()
-	                .contains("LIKE requires text operands")
-	        );
-	        assert!(
-	            eval_expr(
-	                &parse_expr("TRUE OR (CASE WHEN 1 LIKE 'a%' THEN TRUE ELSE FALSE END)"),
-	                None,
-	                None
-	            )
-	            .unwrap_err()
-	            .to_string()
-	            .contains("LIKE requires text operands")
-	        );
-	        assert!(
-	            eval_expr(&parse_expr("FALSE AND (1 ILIKE 'a%')"), None, None)
-	                .unwrap_err()
-	                .to_string()
-	                .contains("ILIKE requires text operands")
-	        );
-	        assert!(
-	            eval_expr(&parse_expr("TRUE OR (1 && 2)"), None, None)
-	                .unwrap_err()
-	                .to_string()
-	                .contains("&& operator requires array operands")
-	        );
-
-	        // Explicit NULL is allowed as a boolean operand.
-	        assert_eq!(
-	            eval_expr(&parse_expr("FALSE AND NULL"), None, None).unwrap(),
-	            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("TRUE OR NULL"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-    }
-
-    #[test]
-    fn test_eval_nested() {
-        assert_eq!(
-            eval_expr(&parse_expr("(1 + 2) * 3"), None, None).unwrap(),
-            Value::Int32(9)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("10 / (2 + 3)"), None, None).unwrap(),
-            Value::Int32(2)
-        );
-    }
-
-    #[test]
-    fn test_eval_unary_minus() {
-        assert_eq!(
-            eval_expr(&parse_expr("-5"), None, None).unwrap(),
-            Value::Int32(-5)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("-3.14"), None, None).unwrap(),
-            Value::Numeric(Decimal::from_str("-3.14").unwrap())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("-'10'"), None, None).unwrap(),
-            Value::Int32(-10)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("-'1.5'"), None, None).unwrap(),
-            Value::Float64(-1.5)
-        );
-        assert!(eval_expr(&parse_expr("-'nope'"), None, None).is_err());
-    }
-
-    #[test]
-    fn test_eval_is_null() {
-        assert_eq!(
-            eval_expr(&parse_expr("NULL IS NULL"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("5 IS NULL"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("NULL IS NOT NULL"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("5 IS NOT NULL"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-    }
-
-    #[test]
-    fn test_eval_in_list() {
-        assert_eq!(
-            eval_expr(&parse_expr("5 IN (1, 3, 5, 7)"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("4 IN (1, 3, 5, 7)"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("4 NOT IN (1, 3, 5, 7)"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'a' IN ('a', 'b', 'c')"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-    }
-
-    #[test]
-    fn test_eval_between() {
-        assert_eq!(
-            eval_expr(&parse_expr("5 BETWEEN 1 AND 10"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("15 BETWEEN 1 AND 10"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("5 NOT BETWEEN 10 AND 20"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("1 BETWEEN 1 AND 1"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-    }
-
-    #[test]
-    fn test_compare_values() {
-        assert_eq!(
-            compare_values(&Value::Int32(5), &Value::Int32(3)).unwrap(),
-            1
-        );
-        assert_eq!(
-            compare_values(&Value::Int32(3), &Value::Int32(5)).unwrap(),
-            -1
-        );
-        assert_eq!(
-            compare_values(&Value::Int32(5), &Value::Int32(5)).unwrap(),
-            0
-        );
-        assert_eq!(
-            compare_values(&Value::Text("b".to_string()), &Value::Text("a".to_string())).unwrap(),
-            1
-        );
-        assert_eq!(
-            compare_values(&Value::Bytes(vec![0x00]), &Value::Bytes(vec![0x01])).unwrap(),
-            -1
-        );
-        assert_eq!(
-            compare_values(&Value::Bytes(vec![0x01, 0x00]), &Value::Bytes(vec![0x01])).unwrap(),
-            1
-        );
-        assert_eq!(
-            compare_values(
-                &Value::Bytes(vec![0xde, 0xad]),
-                &Value::Bytes(vec![0xde, 0xad])
-            )
-            .unwrap(),
-            0
-        );
-        assert_eq!(compare_values(&Value::Null, &Value::Int32(5)).unwrap(), -1);
-        assert_eq!(compare_values(&Value::Int32(5), &Value::Null).unwrap(), 1);
-
-        assert_eq!(
-            compare_values(&Value::Boolean(true), &Value::Text("true".to_string())).unwrap(),
-            0
-        );
-        assert_eq!(
-            compare_values(&Value::Text("false".to_string()), &Value::Boolean(false)).unwrap(),
-            0
-        );
-        assert!(compare_values(&Value::Boolean(true), &Value::Text("nope".to_string())).is_err());
-
-        // PostgreSQL-like float NaN semantics:
-        // - NaN compares equal to NaN
-        // - NaN compares greater than all non-NaN values
-        assert_eq!(
-            compare_values(&Value::Float64(f64::NAN), &Value::Float64(1.0)).unwrap(),
-            1
-        );
-        assert_eq!(
-            compare_values(&Value::Float64(1.0), &Value::Float64(f64::NAN)).unwrap(),
-            -1
-        );
-        assert_eq!(
-            compare_values(&Value::Float64(f64::NAN), &Value::Float64(f64::NAN)).unwrap(),
-            0
-        );
-        assert_eq!(
-            compare_values(&Value::Float64(f64::NAN), &Value::Int32(1)).unwrap(),
-            1
-        );
-        assert_eq!(
-            compare_values(&Value::Int32(1), &Value::Float64(f64::NAN)).unwrap(),
-            -1
-        );
-    }
-
-    #[test]
-    fn test_float_nan_comparisons() {
-        assert_eq!(
-            eval_expr(&parse_expr("CAST('NaN' AS DOUBLE PRECISION) = 1"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr(
-                    "CAST('NaN' AS DOUBLE PRECISION) = CAST('NaN' AS DOUBLE PRECISION)"
-                ),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("CAST('NaN' AS DOUBLE PRECISION) > 1"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-    }
-
-    #[test]
-    fn test_compare_values_nan_semantics() {
-        let nan1 = f64::from_bits(0x7ff8_0000_0000_0001);
-        let nan2 = f64::from_bits(0x7ff8_0000_0000_0002);
-        assert!(nan1.is_nan() && nan2.is_nan());
-
-        assert_eq!(
-            compare_values(&Value::Float64(nan1), &Value::Float64(nan2)).unwrap(),
-            0
-        );
-        assert_eq!(
-            compare_values(&Value::Float64(nan1), &Value::Float64(1.0)).unwrap(),
-            1
-        );
-        assert_eq!(
-            compare_values(&Value::Float64(1.0), &Value::Float64(nan1)).unwrap(),
-            -1
-        );
-    }
-
-    #[test]
-    fn test_compare_order_by_values_nulls() {
-        use std::cmp::Ordering;
-
-        // ASC defaults to NULLS LAST.
-        assert_eq!(
-            compare_order_by_values(&Value::Null, &Value::Date(0), true, false),
-            Ordering::Greater
-        );
-        assert_eq!(
-            compare_order_by_values(&Value::Date(0), &Value::Null, true, false),
-            Ordering::Less
-        );
-
-        // DESC defaults to NULLS FIRST.
-        assert_eq!(
-            compare_order_by_values(&Value::Null, &Value::Date(0), false, true),
-            Ordering::Less
-        );
-        assert_eq!(
-            compare_order_by_values(&Value::Date(0), &Value::Null, false, true),
-            Ordering::Greater
-        );
-    }
-
-    #[test]
-    fn test_compare_order_by_values_nan() {
-        use std::cmp::Ordering;
-
-        assert_eq!(
-            compare_order_by_values(&Value::Float64(f64::NAN), &Value::Float64(1.0), true, false),
-            Ordering::Greater
-        );
-        assert_eq!(
-            compare_order_by_values(&Value::Float64(1.0), &Value::Float64(f64::NAN), true, false),
-            Ordering::Less
-        );
-
-        // DESC should put NaN first (since NaN is treated as greatest).
-        assert_eq!(
-            compare_order_by_values(&Value::Float64(f64::NAN), &Value::Float64(1.0), false, false),
-            Ordering::Less
-        );
-    }
-
-    #[test]
-    fn test_jsonb_exists_function() {
-        assert_eq!(
-            eval_expr(
-                &parse_expr("JSONB_EXISTS('{\"a\": 1, \"b\": 2}'::jsonb, 'a')"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr("JSONB_EXISTS('{\"a\": 1}'::jsonb, 'c')"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr("JSONB_EXISTS('[\"a\", \"b\"]'::jsonb, 'b')"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Boolean(true)
-        );
-    }
-
-    #[test]
-    fn test_to_char_format_tokens() {
-        assert_eq!(
-            eval_expr(
-                &parse_expr("TO_CHAR(TIMESTAMP '2024-01-15 14:30:45', 'YYYY-MM')"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Text("2024-01".to_string())
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr("TO_CHAR(DATE '2024-01-15', 'YYYY-MM')"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Text("2024-01".to_string())
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr("TO_CHAR(TIMESTAMP '2024-01-15 14:30:45', 'YYYY-MM-DD HH24:MI:SS')"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Text("2024-01-15 14:30:45".to_string())
-        );
-    }
-
-    #[test]
-    fn test_null_comparison_three_valued_logic() {
-        assert_eq!(
-            eval_expr(&parse_expr("NULL = 5"), None, None).unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("5 = NULL"), None, None).unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("NULL >= 0"), None, None).unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("NULL < 10"), None, None).unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("NULL <> 5"), None, None).unwrap(),
-            Value::Null
-        );
-    }
-
-    #[test]
-    fn test_division_by_zero() {
-        assert!(eval_expr(&parse_expr("5 / 0"), None, None).is_err());
-        assert!(eval_expr(&parse_expr("5 % 0"), None, None).is_err());
-    }
-
-    #[test]
-    fn test_function_args_do_not_drop_errors() {
-        assert!(eval_expr(&parse_expr("COALESCE(5 / 0, 1)"), None, None).is_err());
-        assert!(eval_expr(&parse_expr("COALESCE(NULL, 5 / 0, 1)"), None, None).is_err());
-        assert_eq!(
-            eval_expr(&parse_expr("COALESCE(1, 5 / 0)"), None, None).unwrap(),
-            Value::Int32(1)
-        );
-        assert!(eval_expr(&parse_expr("NULLIF(5 / 0, 1)"), None, None).is_err());
-        assert!(eval_expr(&parse_expr("GREATEST(1, 5 / 0)"), None, None).is_err());
-    }
-
-    #[test]
-    fn test_function_column_references_use_row_context() {
-        use crate::types::ColumnDef;
-
-        let schema = TableSchema::new(
-            "public.atm_users".to_string(),
-            1,
-            vec![ColumnDef {
-                name: "nickname".to_string(),
-                data_type: DataType::Text,
-                nullable: true,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-            }],
-            vec![],
-        );
-        let row = Row::new(vec![Value::Null]);
-        assert_eq!(
-            eval_expr(
-                &parse_expr("COALESCE(nickname, 'NULL')"),
-                Some(&row),
-                Some(&schema),
-            )
-            .unwrap(),
-            Value::Text("NULL".to_string())
-        );
-
-        let row_with_value = Row::new(vec![Value::Text("hi".to_string())]);
-        assert_eq!(
-            eval_expr(
-                &parse_expr("COALESCE(nickname, 'NULL')"),
-                Some(&row_with_value),
-                Some(&schema)
-            )
-            .unwrap(),
-            Value::Text("hi".to_string())
-        );
-    }
-
-    #[test]
-    fn test_mixed_type_arithmetic() {
-        let result = eval_expr(&parse_expr("1 + 2.5"), None, None).unwrap();
-        assert_eq!(result, Value::Numeric(Decimal::from_str("3.5").unwrap()));
-    }
-
-    #[test]
-    fn test_string_concat() {
-        assert_eq!(
-            eval_expr(&parse_expr("'Hello' || ' ' || 'World'"), None, None).unwrap(),
-            Value::Text("Hello World".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'Count: ' || 42"), None, None).unwrap(),
-            Value::Text("Count: 42".to_string())
-        );
-    }
-
-    #[test]
-    fn test_case_when() {
-        assert_eq!(
-            eval_expr(
-                &parse_expr("CASE WHEN 1 = 1 THEN 'yes' ELSE 'no' END"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Text("yes".to_string())
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr("CASE WHEN 1 = 2 THEN 'yes' ELSE 'no' END"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Text("no".to_string())
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr("CASE WHEN 'true' THEN 'yes' ELSE 'no' END"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Text("yes".to_string())
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr("CASE WHEN 'false' THEN 'yes' ELSE 'no' END"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Text("no".to_string())
-        );
-        assert!(
-            eval_expr(
-                &parse_expr("CASE WHEN 'nope' THEN 'yes' ELSE 'no' END"),
-                None,
-                None
-            )
-            .is_err()
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr("CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Text("two".to_string())
-        );
-    }
-
-    #[test]
-    fn test_string_functions() {
-        assert_eq!(
-            eval_expr(&parse_expr("UPPER('hello')"), None, None).unwrap(),
-            Value::Text("HELLO".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("LOWER('HELLO')"), None, None).unwrap(),
-            Value::Text("hello".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("LENGTH('hello')"), None, None).unwrap(),
-            Value::Int32(5)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("CONCAT('a', 'b', 'c')"), None, None).unwrap(),
-            Value::Text("abc".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("LEFT('hello', 2)"), None, None).unwrap(),
-            Value::Text("he".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("RIGHT('hello', 2)"), None, None).unwrap(),
-            Value::Text("lo".to_string())
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr("REPLACE('hello world', 'world', 'there')"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Text("hello there".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("REVERSE('hello')"), None, None).unwrap(),
-            Value::Text("olleh".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("REPEAT('ab', 3)"), None, None).unwrap(),
-            Value::Text("ababab".to_string())
-        );
-    }
-
-    #[test]
-    fn test_math_functions() {
-        assert_eq!(
-            eval_expr(&parse_expr("ABS(-5)"), None, None).unwrap(),
-            Value::Int32(5)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("CEIL(4.3)"), None, None).unwrap(),
-            Value::Float64(5.0)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("FLOOR(4.7)"), None, None).unwrap(),
-            Value::Float64(4.0)
-        );
-        let round_result = eval_expr(&parse_expr("ROUND(4.567, 2)"), None, None).unwrap();
-        assert!(matches!(round_result, Value::Float64(f) if (f - 4.57).abs() < 0.001));
-        assert_eq!(
-            eval_expr(&parse_expr("SQRT(16)"), None, None).unwrap(),
-            Value::Float64(4.0)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("POWER(2, 10)"), None, None).unwrap(),
-            Value::Float64(1024.0)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("MOD(17, 5)"), None, None).unwrap(),
-            Value::Int32(2)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("SIGN(-5)"), None, None).unwrap(),
-            Value::Int32(-1)
-        );
-    }
-
-    #[test]
-    fn test_coalesce_nullif() {
-        assert_eq!(
-            eval_expr(&parse_expr("COALESCE(NULL, NULL, 'default')"), None, None).unwrap(),
-            Value::Text("default".to_string())
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr("COALESCE('first', NULL, 'default')"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Text("first".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("NULLIF(5, 5)"), None, None).unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("NULLIF(5, 3)"), None, None).unwrap(),
-            Value::Int32(5)
-        );
-    }
-
-    #[test]
-    fn test_greatest_least() {
-        assert_eq!(
-            eval_expr(&parse_expr("GREATEST(1, 5, 3)"), None, None).unwrap(),
-            Value::Int32(5)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("LEAST(1, 5, 3)"), None, None).unwrap(),
-            Value::Int32(1)
-        );
-    }
-
-    #[test]
-    fn test_like_pattern() {
-        assert_eq!(
-            eval_expr(&parse_expr("'hello' LIKE 'h%'"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'hello' LIKE '%llo'"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'hello' LIKE 'h_llo'"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'hello' LIKE 'world'"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'hello' NOT LIKE 'world'"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'hello' LIKE '%.%'"), None, None).unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'a.b' LIKE '%.%'"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-    }
-
-    #[test]
-    fn test_like_null_semantics() {
-        assert_eq!(
-            eval_expr(&parse_expr("CAST(NULL AS TEXT) LIKE 'a%'"), None, None).unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'a' LIKE CAST(NULL AS TEXT)"), None, None).unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("CAST(NULL AS TEXT) ILIKE 'a%'"), None, None).unwrap(),
-            Value::Null
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'a' ILIKE CAST(NULL AS TEXT)"), None, None).unwrap(),
-            Value::Null
-        );
-        assert!(eval_expr(&parse_expr("1 LIKE NULL"), None, None).is_err());
-        assert!(eval_expr(&parse_expr("NULL LIKE 1"), None, None).is_err());
-    }
-
-    #[test]
-    fn test_ilike_pattern() {
-        assert_eq!(
-            eval_expr(&parse_expr("'Hello' ILIKE 'h%'"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'HELLO' ILIKE '%llo'"), None, None).unwrap(),
-            Value::Boolean(true)
-        );
-    }
-
-    #[test]
-    fn test_cast() {
-        assert_eq!(
-            eval_expr(&parse_expr("CAST(123 AS TEXT)"), None, None).unwrap(),
-            Value::Text("123".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("CAST('456' AS INTEGER)"), None, None).unwrap(),
-            Value::Int32(456)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("CAST(3.14 AS INTEGER)"), None, None).unwrap(),
-            Value::Int32(3)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'123'::int8"), None, None).unwrap(),
-            Value::Int64(123)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("'456'::bigint"), None, None).unwrap(),
-            Value::Int64(456)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("123::text"), None, None).unwrap(),
-            Value::Text("123".to_string())
-        );
-    }
-
-    #[test]
-    fn test_trim() {
-        assert_eq!(
-            eval_expr(&parse_expr("TRIM('  hello  ')"), None, None).unwrap(),
-            Value::Text("hello".to_string())
-        );
-    }
-
-    #[test]
-    fn test_position() {
-        assert_eq!(
-            eval_expr(&parse_expr("POSITION('lo' IN 'hello')"), None, None).unwrap(),
-            Value::Int32(4)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("POSITION('xyz' IN 'hello')"), None, None).unwrap(),
-            Value::Int32(0)
-        );
-    }
-
-    #[test]
-    fn test_substring() {
-        assert_eq!(
-            eval_expr(&parse_expr("SUBSTRING('hello' FROM 2 FOR 3)"), None, None).unwrap(),
-            Value::Text("ell".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("SUBSTRING('hello' FROM 2)"), None, None).unwrap(),
-            Value::Text("ello".to_string())
-        );
-    }
-
-    #[test]
-    fn test_interval_parsing() {
-        use crate::types::IntervalValue;
-        let result = parse_interval_string("1 day").unwrap();
-        assert_eq!(
-            result,
-            Value::Interval(IntervalValue::from_millis(24 * 60 * 60 * 1000))
-        );
-
-        let result = parse_interval_string("2 hours").unwrap();
-        assert_eq!(
-            result,
-            Value::Interval(IntervalValue::from_millis(2 * 60 * 60 * 1000))
-        );
-
-        let result = parse_interval_string("30 minutes").unwrap();
-        assert_eq!(
-            result,
-            Value::Interval(IntervalValue::from_millis(30 * 60 * 1000))
-        );
-
-        let result = parse_interval_string("1 week").unwrap();
-        assert_eq!(
-            result,
-            Value::Interval(IntervalValue::from_millis(7 * 24 * 60 * 60 * 1000))
-        );
-
-        let result = parse_interval_string("1 month").unwrap();
-        assert_eq!(result, Value::Interval(IntervalValue::from_months(1)));
-    }
-
-    #[test]
-    fn test_interval_expression() {
-        use crate::types::IntervalValue;
-        let result = eval_expr(&parse_expr("INTERVAL '1 day'"), None, None).unwrap();
-        assert_eq!(
-            result,
-            Value::Interval(IntervalValue::from_millis(24 * 60 * 60 * 1000))
-        );
-
-        let result = eval_expr(&parse_expr("INTERVAL '2' DAY"), None, None).unwrap();
-        assert_eq!(
-            result,
-            Value::Interval(IntervalValue::from_millis(2 * 24 * 60 * 60 * 1000))
-        );
-
-        let result = eval_expr(&parse_expr("INTERVAL '3' HOUR"), None, None).unwrap();
-        assert_eq!(
-            result,
-            Value::Interval(IntervalValue::from_millis(3 * 60 * 60 * 1000))
-        );
-
-        let result = eval_expr(&parse_expr("INTERVAL '1' MONTH"), None, None).unwrap();
-        assert_eq!(result, Value::Interval(IntervalValue::from_months(1)));
-    }
-
-    #[test]
-    fn test_interval_expression_month_out_of_range_errors() {
-        let err = eval_expr(&parse_expr("INTERVAL '2147483648' MONTH"), None, None).unwrap_err();
-        assert!(err.to_string().contains("Interval out of range"));
-
-        let err = eval_expr(&parse_expr("INTERVAL '214748365' YEAR"), None, None).unwrap_err();
-        assert!(err.to_string().contains("Interval out of range"));
-    }
-
-    #[test]
-    fn test_timestamp_interval_arithmetic() {
-        use crate::types::IntervalValue;
-        let ts = Value::Timestamp(1000 * 60 * 60 * 24);
-        let iv = Value::Interval(IntervalValue::from_millis(1000 * 60 * 60));
-
-        let result = operators::add_values(ts.clone(), iv.clone()).unwrap();
-        assert_eq!(result, Value::Timestamp(1000 * 60 * 60 * 25));
-
-        let result = operators::sub_values(ts.clone(), iv.clone()).unwrap();
-        assert_eq!(result, Value::Timestamp(1000 * 60 * 60 * 23));
-    }
-
-    #[test]
-    fn test_timestamp_cast() {
-        let result = parse_timestamp_string("2024-01-01 00:00:00").unwrap();
-        assert!(matches!(result, Value::Timestamp(_)));
-
-        let result = parse_timestamp_string("2024-01-01").unwrap();
-        assert!(matches!(result, Value::Timestamp(_)));
-
-        let result = parse_timestamp_string("2026-01-22T04:36:12.931807").unwrap();
-        assert!(matches!(result, Value::Timestamp(_)));
-
-        let result = parse_timestamp_string("2024-01-15T10:30:00").unwrap();
-        assert!(matches!(result, Value::Timestamp(_)));
-    }
-
-    #[test]
-    fn test_timestamp_cast_accepts_postgres_timestamptz_offsets() {
-        let expected = chrono::DateTime::parse_from_rfc3339("2026-02-02T23:39:52.850+00:00")
-            .unwrap()
-            .timestamp_millis();
-
-        assert_eq!(
-            parse_timestamp_string("2026-02-02 23:39:52.850 +00:00").unwrap(),
-            Value::Timestamp(expected)
-        );
-        assert_eq!(
-            parse_timestamp_string("2026-02-02 23:39:52.850+00:00").unwrap(),
-            Value::Timestamp(expected)
-        );
-        assert_eq!(
-            parse_timestamp_string("2026-02-02 23:39:52.850000+00:00").unwrap(),
-            Value::Timestamp(expected)
-        );
-
-        let expected_plus2 =
-            chrono::DateTime::parse_from_rfc3339("2026-02-02T21:39:52.850+00:00")
-                .unwrap()
-                .timestamp_millis();
-        assert_eq!(
-            parse_timestamp_string("2026-02-02 23:39:52.850 +02:00").unwrap(),
-            Value::Timestamp(expected_plus2)
-        );
-
-        // `+HH` offsets are also accepted by PostgreSQL (interpreted as `+HH:00`).
-        assert_eq!(
-            parse_timestamp_string("2026-02-02 23:39:52.850 +02").unwrap(),
-            Value::Timestamp(expected_plus2)
-        );
-    }
-
-    #[test]
-    fn test_now_plus_interval() {
-        let result = eval_expr(&parse_expr("NOW() + INTERVAL '1 DAY'"), None, None).unwrap();
-        assert!(matches!(result, Value::Timestamp(_)));
-    }
-
-    #[test]
-    fn test_string_concat_to_interval() {
-        use crate::types::IntervalValue;
-        let result = eval_expr(&parse_expr("('1' || ' day')::interval"), None, None).unwrap();
-        assert_eq!(
-            result,
-            Value::Interval(IntervalValue::from_millis(24 * 60 * 60 * 1000))
-        );
-    }
-
-    #[test]
-    fn test_complex_datetime_expression() {
-        let result = eval_expr(
-            &parse_expr("now()::timestamp + ('1' || ' day')::interval"),
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(matches!(result, Value::Timestamp(_)));
-    }
-
-    #[test]
-    fn test_int8_cast_from_int() {
-        assert_eq!(
-            eval_expr(&parse_expr("42::int8"), None, None).unwrap(),
-            Value::Int64(42)
-        );
-    }
-
-    #[test]
-    fn test_int8_cast_from_text() {
-        assert_eq!(
-            eval_expr(&parse_expr("'999'::int8"), None, None).unwrap(),
-            Value::Int64(999)
-        );
-    }
-
-    #[test]
-    fn test_gen_random_uuid() {
-        let result = eval_expr(&parse_expr("gen_random_uuid()"), None, None).unwrap();
-        assert!(matches!(result, Value::Uuid(_)));
-    }
-
-    #[test]
-    fn test_uuid_cast_from_text() {
-        let result = eval_expr(
-            &parse_expr("'550e8400-e29b-41d4-a716-446655440000'::uuid"),
-            None,
-            None,
-        )
-        .unwrap();
-        if let Value::Uuid(bytes) = result {
-            let uuid = uuid::Uuid::from_bytes(bytes);
-            assert_eq!(uuid.to_string(), "550e8400-e29b-41d4-a716-446655440000");
-        } else {
-            panic!("Expected UUID value");
-        }
-    }
-
-    #[test]
-    fn test_bytea_send_functions() {
-        assert_eq!(
-            eval_expr(&parse_expr("int8send(72623859790382856::bigint)"), None, None).unwrap(),
-            Value::Bytes(vec![1, 2, 3, 4, 5, 6, 7, 8])
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("int4send(16909060)"), None, None).unwrap(),
-            Value::Bytes(vec![1, 2, 3, 4])
-        );
-
-        let uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        assert_eq!(
-            eval_expr(
-                &parse_expr("uuid_send('550e8400-e29b-41d4-a716-446655440000'::uuid)"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Bytes(uuid.as_bytes().to_vec())
-        );
-    }
-
-    #[test]
-    fn test_set_bit_get_bit_bytea() {
-        assert_eq!(
-            eval_expr(&parse_expr(r"set_bit('\x00'::bytea, 0, 1)"), None, None).unwrap(),
-            Value::Bytes(vec![0x80])
-        );
-        assert_eq!(
-            eval_expr(&parse_expr(r"set_bit('\x00'::bytea, 7, 1)"), None, None).unwrap(),
-            Value::Bytes(vec![0x01])
-        );
-        assert_eq!(
-            eval_expr(&parse_expr(r"get_bit('\x80'::bytea, 0)"), None, None).unwrap(),
-            Value::Int32(1)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr(r"get_bit('\x80'::bytea, 7)"), None, None).unwrap(),
-            Value::Int32(0)
-        );
-    }
-
-    #[test]
-    fn test_uuidv7_expression_components() {
-        let expr = r#"encode(
-            set_bit(
-                set_bit(
-                    overlay(
-                        uuid_send('550e8400-e29b-41d4-a716-446655440000'::uuid)
-                        placing substring(int8send(1705312800000::bigint) from 3)
-                        from 1 for 6
-                    ),
-                    52, 1
-                ),
-                53, 1
-            ),
-            'hex'
-        )::uuid"#;
-
-        let result = eval_expr(&parse_expr(expr), None, None).unwrap();
-        let Value::Uuid(bytes) = result else {
-            panic!("expected UUID result");
-        };
-
-        let base_uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
-        let mut expected = base_uuid.as_bytes().to_vec();
-
-        let ts: i64 = 1705312800000;
-        let ts_bytes = ts.to_be_bytes();
-        expected[..6].copy_from_slice(&ts_bytes[2..]);
-        // uuidv7 sets version bits (52/53) to 1.
-        expected[6] |= 0x0c;
-
-        assert_eq!(bytes.as_slice(), expected.as_slice());
-    }
-
-    #[test]
-    fn test_encode_decode_escape() {
-        assert_eq!(
-            eval_expr(
-                &parse_expr(r"encode('\x48656c6c6f'::bytea, 'escape')"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Text("Hello".to_string())
-        );
-
-        assert_eq!(
-            eval_expr(&parse_expr("decode('Hello', 'escape')"), None, None).unwrap(),
-            Value::Bytes(b"Hello".to_vec())
-        );
-
-        assert_eq!(
-            eval_expr(&parse_expr(r"decode('\000', 'escape')"), None, None).unwrap(),
-            Value::Bytes(vec![0])
-        );
-    }
-
-    #[test]
-    fn test_decode_escape_invalid_sequence_errors() {
-        assert!(eval_expr(&parse_expr(r"decode('\8', 'escape')"), None, None).is_err());
-        assert!(eval_expr(&parse_expr(r"decode('\999', 'escape')"), None, None).is_err());
-    }
-
-    #[test]
-    fn test_json_arrow_object_key() {
-        assert_eq!(
-            eval_expr(
-                &parse_expr(r#"'{"name": "Alice", "age": 30}' -> 'name'"#),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Jsonb("\"Alice\"".to_string())
-        );
-    }
-
-    #[test]
-    fn test_json_long_arrow_object_key() {
-        assert_eq!(
-            eval_expr(
-                &parse_expr(r#"'{"name": "Alice", "age": 30}' ->> 'name'"#),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Text("Alice".to_string())
-        );
-    }
-
-    #[test]
-    fn test_json_arrow_array_index() {
-        assert_eq!(
-            eval_expr(&parse_expr(r#"'[1, 2, 3]' -> 0"#), None, None).unwrap(),
-            Value::Jsonb("1".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr(r#"'["a", "b", "c"]' -> 1"#), None, None).unwrap(),
-            Value::Jsonb("\"b\"".to_string())
-        );
-    }
-
-    #[test]
-    fn test_json_long_arrow_array_index() {
-        assert_eq!(
-            eval_expr(&parse_expr(r#"'["a", "b", "c"]' ->> 1"#), None, None).unwrap(),
-            Value::Text("b".to_string())
-        );
-    }
-
-    #[test]
-    fn test_json_nested_access() {
-        let intermediate = eval_expr(
-            &parse_expr(r#"'{"user": {"name": "Bob"}}' -> 'user'"#),
-            None,
-            None,
-        )
-        .unwrap();
-        assert_eq!(intermediate, Value::Jsonb("{\"name\":\"Bob\"}".to_string()));
-
-        assert_eq!(
-            eval_expr(&parse_expr(r#"'{"name": "Bob"}' ->> 'name'"#), None, None).unwrap(),
-            Value::Text("Bob".to_string())
-        );
-
-        assert_eq!(
-            eval_expr(
-                &parse_expr(r#"'{"user": {"name": "Bob"}}' -> 'user' ->> 'name'"#),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Text("Bob".to_string())
-        );
-    }
-
-    #[test]
-    fn test_json_null_key() {
-        assert_eq!(
-            eval_expr(
-                &parse_expr(r#"'{"name": "Alice"}' -> 'missing'"#),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Null
-        );
-    }
-
-    #[test]
-    fn test_json_number_extraction() {
-        assert_eq!(
-            eval_expr(&parse_expr(r#"'{"count": 42}' ->> 'count'"#), None, None).unwrap(),
-            Value::Text("42".to_string())
-        );
-    }
-
-    #[test]
-    fn test_array_literal() {
-        assert_eq!(
-            eval_expr(&parse_expr("ARRAY[1, 2, 3]"), None, None).unwrap(),
-            Value::Array(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)])
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("ARRAY['a', 'b', 'c']"), None, None).unwrap(),
-            Value::Array(vec![
-                Value::Text("a".to_string()),
-                Value::Text("b".to_string()),
-                Value::Text("c".to_string())
-            ])
-        );
-    }
-
-    #[test]
-    fn test_array_subquery_preserves_array_dimensions() {
-        assert_eq!(
-            eval_expr(&parse_expr("ARRAY(SELECT ARRAY[1, 2])"), None, None).unwrap(),
-            Value::Array(vec![Value::Array(vec![Value::Int32(1), Value::Int32(2)])])
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr("ARRAY(SELECT string_to_array('a,b', ','))"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Array(vec![Value::Array(vec![
-                Value::Text("a".to_string()),
-                Value::Text("b".to_string()),
-            ])])
-        );
-    }
-
-    #[test]
-    fn test_array_subquery_flattens_set_returning_projection() {
-        assert_eq!(
-            eval_expr(
-                &parse_expr(r#"ARRAY(SELECT jsonb_array_elements_text('["a","b"]'))"#),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Array(vec![
-                Value::Text("a".to_string()),
-                Value::Text("b".to_string()),
-            ])
-        );
-    }
-
-    #[test]
-    fn test_array_subquery_flattens_set_returning_projection_nested_query() {
-        assert_eq!(
-            eval_expr(
-                &parse_expr(r#"ARRAY((SELECT jsonb_array_elements_text('["a","b"]')))"#),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Array(vec![
-                Value::Text("a".to_string()),
-                Value::Text("b".to_string()),
-            ])
-        );
-    }
-
-    #[test]
-    fn test_array_indexing() {
-        assert_eq!(
-            eval_expr(&parse_expr("(ARRAY[10, 20, 30])[2]"), None, None).unwrap(),
-            Value::Int32(20)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("(ARRAY['a', 'b', 'c'])[1]"), None, None).unwrap(),
-            Value::Text("a".to_string())
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("(ARRAY[1, 2, 3])[5]"), None, None).unwrap(),
-            Value::Null
-        );
-    }
-
-    #[test]
-    fn test_array_length() {
-        assert_eq!(
-            eval_expr(&parse_expr("array_length(ARRAY[1, 2, 3], 1)"), None, None).unwrap(),
-            Value::Int32(3)
-        );
-    }
-
-    #[test]
-    fn test_array_position() {
-        assert_eq!(
-            eval_expr(
-                &parse_expr("array_position(ARRAY['a', 'b', 'c'], 'b')"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Int32(2)
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("array_position(ARRAY[1, 2, 3], 5)"), None, None).unwrap(),
-            Value::Null
-        );
-    }
-
-    #[test]
-    fn test_array_cat() {
-        assert_eq!(
-            eval_expr(
-                &parse_expr("array_cat(ARRAY[1, 2], ARRAY[3, 4])"),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Array(vec![
-                Value::Int32(1),
-                Value::Int32(2),
-                Value::Int32(3),
-                Value::Int32(4)
-            ])
-        );
-    }
-
-    #[test]
-    fn test_array_append_prepend() {
-        assert_eq!(
-            eval_expr(&parse_expr("array_append(ARRAY[1, 2], 3)"), None, None).unwrap(),
-            Value::Array(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)])
-        );
-        assert_eq!(
-            eval_expr(&parse_expr("array_prepend(0, ARRAY[1, 2])"), None, None).unwrap(),
-            Value::Array(vec![Value::Int32(0), Value::Int32(1), Value::Int32(2)])
-        );
-    }
-
-    #[test]
-    fn test_cardinality() {
-        assert_eq!(
-            eval_expr(&parse_expr("cardinality(ARRAY[1, 2, 3, 4])"), None, None).unwrap(),
-            Value::Int32(4)
-        );
-    }
-
-    #[test]
-    fn test_json_cast() {
-        assert_eq!(
-            eval_expr(&parse_expr(r#"'{"a": 1}'::json ->> 'a'"#), None, None).unwrap(),
-            Value::Text("1".to_string())
-        );
-    }
-
-    #[test]
-    fn test_jsonb_cast() {
-        assert_eq!(
-            eval_expr(&parse_expr(r#"'{"b": 2}'::jsonb ->> 'b'"#), None, None).unwrap(),
-            Value::Text("2".to_string())
-        );
-    }
-
-    #[test]
-    fn test_json_comparison_blocked() {
-        let json_val = Value::Json(r#"{"a":1}"#.to_string());
-        let int_val = Value::Int32(1);
-        assert!(compare_values(&json_val, &int_val).is_err());
-    }
-
-    #[test]
-    fn test_jsonb_comparison_blocked() {
-        let jsonb_val = Value::Jsonb(r#"{"a":1}"#.to_string());
-        let int_val = Value::Int32(1);
-        assert!(compare_values(&jsonb_val, &int_val).is_err());
-    }
-
-    #[test]
-    fn test_json_contains_at_arrow() {
-        assert_eq!(
-            eval_expr(
-                &parse_expr(r#"'{"a":1,"b":2}'::jsonb @> '{"a":1}'::jsonb"#),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr(r#"'{"a":1}'::jsonb @> '{"a":1,"b":2}'::jsonb"#),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Boolean(false)
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr(r#"'{"a":1}'::jsonb @> '{"a":1.0}'::jsonb"#),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr(r#"'[{"a":1,"b":2}]'::jsonb @> '[{"a":1}]'::jsonb"#),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Boolean(true)
-        );
-    }
-
-    #[test]
-    fn test_json_contained_by_arrow_at() {
-        assert_eq!(
-            eval_expr(
-                &parse_expr(r#"'{"a":1}'::jsonb <@ '{"a":1,"b":2}'::jsonb"#),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Boolean(true)
-        );
-        assert_eq!(
-            eval_expr(
-                &parse_expr(r#"'{"a":1,"b":2}'::jsonb <@ '{"a":1}'::jsonb"#),
-                None,
-                None
-            )
-            .unwrap(),
-            Value::Boolean(false)
-        );
-    }
-
-    #[test]
-    fn test_parse_vector_literal() {
-        let vec = parse_vector_literal("[1.0, 2.0, 3.0]").unwrap();
-        assert_eq!(vec, vec![1.0, 2.0, 3.0]);
-
-        let vec2 = parse_vector_literal("[1,2,3]").unwrap();
-        assert_eq!(vec2, vec![1.0, 2.0, 3.0]);
-
-        assert!(parse_vector_literal("not a vector").is_err());
-        assert!(parse_vector_literal("[1, 2, abc]").is_err());
-    }
-
-    #[test]
-    fn test_l2_distance() {
-        let v1 = vec![1.0, 0.0, 0.0];
-        let v2 = vec![0.0, 1.0, 0.0];
-        let dist = l2_distance(&v1, &v2).unwrap();
-        assert!((dist - 1.414213).abs() < 0.001);
-
-        let v3 = vec![1.0, 2.0, 3.0];
-        let v4 = vec![1.0, 2.0, 3.0];
-        let dist2 = l2_distance(&v3, &v4).unwrap();
-        assert!(dist2.abs() < 0.001); // Same vectors = 0 distance
-    }
-
-    #[test]
-    fn test_cosine_distance() {
-        let v1 = vec![1.0, 0.0, 0.0];
-        let v2 = vec![1.0, 0.0, 0.0];
-        let dist = cosine_distance(&v1, &v2).unwrap();
-        assert!(dist.abs() < 0.001); // Same vectors = 0 distance
-
-        let v3 = vec![1.0, 0.0, 0.0];
-        let v4 = vec![0.0, 1.0, 0.0];
-        let dist2 = cosine_distance(&v3, &v4).unwrap();
-        assert!((dist2 - 1.0).abs() < 0.001); // Orthogonal = max distance
-    }
-
-    #[test]
-    fn test_inner_product() {
-        let v1 = vec![1.0, 2.0, 3.0];
-        let v2 = vec![4.0, 5.0, 6.0];
-        let prod = inner_product(&v1, &v2).unwrap();
-        assert_eq!(prod, -(4.0 + 10.0 + 18.0)); // negative for ORDER BY
-    }
-
-    #[test]
-    fn test_vector_norm() {
-        let v1 = vec![3.0, 4.0];
-        let norm = vector_norm(&v1);
-        assert_eq!(norm, 5.0); // 3-4-5 triangle
-
-        let v2 = vec![1.0, 0.0, 0.0];
-        let norm2 = vector_norm(&v2);
-        assert_eq!(norm2, 1.0);
-    }
-
-    #[test]
-    fn test_extract_vector() {
-        // Test with Vector value
-        let vec_val = Value::Vector(vec![1.0, 2.0, 3.0]);
-        let extracted = extract_vector(&vec_val).unwrap();
-        assert_eq!(extracted, vec![1.0, 2.0, 3.0]);
-
-        // Test with Array value
-        let arr_val = Value::Array(vec![
-            Value::Float64(1.0),
-            Value::Float64(2.0),
-            Value::Float64(3.0),
-        ]);
-        let extracted2 = extract_vector(&arr_val).unwrap();
-        assert_eq!(extracted2, vec![1.0, 2.0, 3.0]);
-
-        // Test with Int32 array
-        let arr_int = Value::Array(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)]);
-        let extracted3 = extract_vector(&arr_int).unwrap();
-        assert_eq!(extracted3, vec![1.0, 2.0, 3.0]);
-
-        // Test with Text value (NEW - for ORM compatibility)
-        let text_val = Value::Text("[1.5, 2.5, 3.5]".to_string());
-        let extracted4 = extract_vector(&text_val).unwrap();
-        assert_eq!(extracted4, vec![1.5, 2.5, 3.5]);
-
-        // Test with Text value with spaces
-        let text_val2 = Value::Text(" [ 1.0 , 2.0 , 3.0 ] ".to_string());
-        let extracted5 = extract_vector(&text_val2).unwrap();
-        assert_eq!(extracted5, vec![1.0, 2.0, 3.0]);
-
-        // Test with empty text vector
-        let text_empty = Value::Text("[]".to_string());
-        let extracted6 = extract_vector(&text_empty).unwrap();
-        assert_eq!(extracted6, Vec::<f64>::new());
-    }
-
-    #[test]
-    fn test_format_width_and_identifier_quoting() {
-        assert_eq!(
-            eval_expr(&parse_expr("FORMAT('%10s', 'test')"), None, None).unwrap(),
-            Value::Text("      test".to_string())
-        );
-
-        assert_eq!(
-            eval_expr(&parse_expr("FORMAT('%I', 'column_name')"), None, None).unwrap(),
-            Value::Text("column_name".to_string())
-        );
-
-        assert_eq!(
-            eval_expr(&parse_expr("FORMAT('%I', 'column name')"), None, None).unwrap(),
-            Value::Text("\"column name\"".to_string())
-        );
-
-        assert_eq!(
-            eval_expr(&parse_expr("FORMAT('%L', 'value''s')"), None, None).unwrap(),
-            Value::Text("'value''s'".to_string())
-        );
-    }
-
-    #[test]
-    fn test_format_rejects_precision_like_postgres() {
-        let err = eval_expr(&parse_expr("FORMAT('%.3s', 'hello')"), None, None).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("unrecognized format() type specifier \".\""),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn test_quote_ident_and_pg_typeof_array() {
-        assert_eq!(
-            eval_expr(&parse_expr("QUOTE_IDENT('column')"), None, None).unwrap(),
-            Value::Text("\"column\"".to_string())
-        );
-
-        assert_eq!(
-            eval_expr(&parse_expr("PG_TYPEOF(ARRAY[1,2,3])"), None, None).unwrap(),
-            Value::Text("integer[]".to_string())
-        );
-    }
-
-    #[test]
-    fn test_pg_encoding_to_char_reports_utf8() {
-        let expr = parse_expr("pg_encoding_to_char(6)");
-        let val = eval_expr(&expr, None, None).unwrap();
-        assert_eq!(val, Value::Text("UTF8".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_current_database_reads_task_local_context() {
-        let expr = parse_expr("current_database()");
-        let val = with_query_context(123, Arc::from("mydb"), async {
-            eval_expr(&expr, None, None).unwrap()
-        })
-        .await;
-        assert_eq!(val, Value::Text("mydb".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_current_timestamp_precision_truncates_to_second() {
-        let fixed = 1_700_000_001_234_i64;
-        let expr = parse_expr("CURRENT_TIMESTAMP(0)");
-        let val = statement_time::with_statement_timestamp_millis(fixed, async {
-            eval_expr(&expr, None, None).unwrap()
-        })
-        .await;
-        assert_eq!(val, Value::Timestamp(1_700_000_001_000));
-    }
-
-    #[tokio::test]
-    async fn test_now_precision_matches_current_timestamp_precision() {
-        let fixed = 1_700_000_001_234_i64;
-        let expr = parse_expr("NOW(0) = CURRENT_TIMESTAMP(0)");
-        let val = statement_time::with_statement_timestamp_millis(fixed, async {
-            eval_expr(&expr, None, None).unwrap()
-        })
-        .await;
-        assert_eq!(val, Value::Boolean(true));
-    }
-
-    #[tokio::test]
-    async fn test_current_timestamp_equals_date_trunc_second_within_statement() {
-        let fixed = 1_700_000_001_234_i64;
-        let expr = parse_expr("CURRENT_TIMESTAMP(0) = DATE_TRUNC('second', CURRENT_TIMESTAMP)");
-        let val = statement_time::with_statement_timestamp_millis(fixed, async {
-            eval_expr(&expr, None, None).unwrap()
-        })
-        .await;
-        assert_eq!(val, Value::Boolean(true));
-    }
-
-    #[test]
-    fn test_date_trunc_second_handles_negative_timestamps() {
-        let expr = parse_expr("DATE_TRUNC('second', TIMESTAMP '1969-12-31 23:59:58.766')");
-        let val = eval_expr(&expr, None, None).unwrap();
-        assert_eq!(val, parse_timestamp_string("1969-12-31 23:59:58").unwrap());
-    }
-
-    #[test]
-    fn test_cast_timestamp_to_text_formats_timestamp() {
-        let expr = parse_expr("TIMESTAMP '2024-01-15 10:30:00'::text");
-        let val = eval_expr(&expr, None, None).unwrap();
-        assert_eq!(val, Value::Text("2024-01-15 10:30:00".to_string()));
-    }
-
-    #[tokio::test]
-    async fn test_cast_timestamptz_to_text_includes_offset() {
-        use std::sync::Arc;
-
-        let expr = parse_expr("TIMESTAMPTZ '2024-01-15T10:00:00Z'::text");
-        let val = crate::session_context::with_timezone(Arc::from("America/Los_Angeles"), async {
-            eval_expr(&expr, None, None).unwrap()
-        })
-        .await;
-        assert_eq!(val, Value::Text("2024-01-15 02:00:00-08".to_string()));
-    }
-}
+mod tests;

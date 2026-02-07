@@ -6,11 +6,11 @@ use std::sync::OnceLock;
 use crate::types::DataType;
 
 #[derive(Clone)]
-#[allow(dead_code)]
 pub enum ReturnType {
     Fixed(DataType),
     SameAsArg(usize),
     FirstNonNull,
+    #[allow(dead_code)] // new type inference module, not yet fully integrated
     NumericPromotion,
     Custom(fn(&[DataType]) -> DataType),
 }
@@ -87,7 +87,7 @@ impl FunctionRegistry {
         self.functions.insert(name.to_uppercase(), sig);
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // new type inference module, not yet fully integrated
     pub fn get(&self, name: &str) -> Option<&FunctionSignature> {
         self.functions.get(&name.to_uppercase())
     }

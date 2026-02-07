@@ -40,8 +40,3 @@ fn init_registry() -> HashMap<&'static str, SqlFn> {
 pub fn get_registry() -> &'static HashMap<&'static str, SqlFn> {
     REGISTRY.get_or_init(init_registry)
 }
-
-#[allow(dead_code)]
-pub fn lookup(name: &str) -> Option<&'static SqlFn> {
-    get_registry().get(name.to_ascii_uppercase().as_str())
-}

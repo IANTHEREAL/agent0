@@ -7,10 +7,9 @@ use super::super::alter_sequence_owned_by;
 use super::super::comment_on;
 use super::triggers::strip_leading_sql_comments;
 use super::super::explain;
-use super::super::helpers::{
-    fill_row_defaults, get_expr_name, get_skip_reason, get_unsupported_reason, infer_expr_type,
-    normalize_ident, parse_value_for_copy,
-};
+use super::super::coercion::parse_value_for_copy;
+use super::super::names::normalize_ident;
+use super::super::projection::{fill_row_defaults, get_expr_name, infer_expr_type};
 use super::super::names;
 use super::super::query;
 use super::super::rbac;
@@ -23,6 +22,7 @@ use crate::observability::TenantObservability;
 use crate::session_context;
 use crate::storage::{with_kv_read_stats, KvReadStatsSnapshot, TikvStore};
 use crate::types::{DataType, Row, TableSchema, Value};
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use sqlparser::ast::{
@@ -99,7 +99,7 @@ fn is_retryable_tikv_error(err: &anyhow::Error) -> bool {
 
 fn set_variable_value_to_string(value: &[Expr]) -> Result<String> {
     if value.len() != 1 {
-        return Err(anyhow!("Unsupported SET value list"));
+        return Err(SqlError::Unsupported("Unsupported SET value list".into()).into());
     }
     let expr = &value[0];
     match expr {
@@ -137,14 +137,14 @@ fn set_variable_value_to_string(value: &[Expr]) -> Result<String> {
                 )
             {
                 let Some(s) = try_parse_const_text(interval.value.as_ref()) else {
-                    return Err(anyhow!("Unsupported SET value: {}", expr));
+                    return Err(SqlError::Unsupported(format!("Unsupported SET value: {}", expr)).into());
                 };
                 Ok(s)
             } else {
-                Err(anyhow!("Unsupported SET value: {}", expr))
+                Err(SqlError::Unsupported(format!("Unsupported SET value: {}", expr)).into())
             }
         }
-        _ => Err(anyhow!("Unsupported SET value: {}", expr)),
+        _ => Err(SqlError::Unsupported(format!("Unsupported SET value: {}", expr)).into()),
     }
 }
 
@@ -234,13 +234,13 @@ fn cast_current_setting_value(value: Value, target_type: &DataType) -> Result<Va
         DataType::Text => Ok(Value::Text(s)),
         DataType::Int32 => {
             let v: i32 = s.parse().map_err(|_| {
-                anyhow!("invalid input syntax for type integer: \"{}\"", s)
+                SqlError::InvalidInputSyntax { type_name: "integer".into(), value: s.clone() }
             })?;
             Ok(Value::Int32(v))
         }
         DataType::Int64 => {
             let v: i64 = s.parse().map_err(|_| {
-                anyhow!("invalid input syntax for type bigint: \"{}\"", s)
+                SqlError::InvalidInputSyntax { type_name: "bigint".into(), value: s.clone() }
             })?;
             Ok(Value::Int64(v))
         }
@@ -251,7 +251,7 @@ fn cast_current_setting_value(value: Value, target_type: &DataType) -> Result<Va
             } else if v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") {
                 Ok(Value::Boolean(false))
             } else {
-                Err(anyhow!("invalid input syntax for type boolean: \"{}\"", s))
+                Err(SqlError::InvalidInputSyntax { type_name: "boolean".into(), value: s.clone() }.into())
             }
         }
         _ => Ok(Value::Text(s)),
@@ -459,7 +459,7 @@ fn try_execute_current_setting_select(
 
     let mut output_type = DataType::Text;
     if let Some(cast_to) = cast_to {
-        if let Ok(t) = crate::sql::helpers::convert_data_type(cast_to) {
+        if let Ok(t) = crate::sql::coercion::convert_data_type(cast_to) {
             output_type = t;
         } else {
             return Ok(None);
@@ -577,7 +577,6 @@ fn is_observability_tableless_query(stmt: &Statement) -> bool {
 pub struct Executor {
     store: Arc<TikvStore>,
     auth_manager: AuthManager,
-    #[allow(dead_code)]
     tenant_keyspace: String,
     observability: Arc<TenantObservability>,
 }
@@ -600,7 +599,6 @@ impl Executor {
         self.store.clone()
     }
 
-    #[allow(dead_code)]
     pub fn tenant_keyspace(&self) -> &str {
         &self.tenant_keyspace
     }
@@ -609,7 +607,7 @@ impl Executor {
         &self.observability
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // accessor for future permission checks
     pub fn auth_manager(&self) -> &AuthManager {
         &self.auth_manager
     }
@@ -780,6 +778,20 @@ impl Executor {
                 {
                     let start = Instant::now();
                     let res = self.execute_alter_owner_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
+
+                if sql_upper.starts_with("ALTER DEFAULT PRIVILEGES") {
+                    let start = Instant::now();
+                    let res = self
+                        .execute_alter_default_privileges_cmd(session, sql)
+                        .await;
                     if res.is_err() && session.is_in_transaction() {
                         session.mark_transaction_failed();
                     }
@@ -990,6 +1002,7 @@ impl Executor {
                         Statement::SetVariable { .. }
                         | Statement::SetTimeZone { .. }
                         | Statement::SetNames { .. }
+                        | Statement::SetRole { .. }
                         | Statement::SetTransaction { .. } => {
                             results.push(ExecuteResult::CommandComplete { tag: "SET" });
                             continue;
@@ -1033,20 +1046,20 @@ impl Executor {
                                 if session.is_in_transaction() {
                                     session.mark_transaction_failed();
                                 }
-                                return Err(anyhow!(
-                                    "permission denied for role '{}'",
-                                    OBSERVABILITY_USER
-                                ));
+                                return Err(SqlError::PermissionDenied {
+                                    object_type: "role".into(),
+                                    object_name: OBSERVABILITY_USER.to_string(),
+                                }.into());
                             }
                         }
                         _ => {
                             if session.is_in_transaction() {
                                 session.mark_transaction_failed();
                             }
-                            return Err(anyhow!(
-                                "permission denied for role '{}'",
-                                OBSERVABILITY_USER
-                            ));
+                            return Err(SqlError::PermissionDenied {
+                                object_type: "role".into(),
+                                object_name: OBSERVABILITY_USER.to_string(),
+                            }.into());
                         }
                     }
                 }
@@ -1098,6 +1111,76 @@ impl Executor {
                                 session.rollback().await?;
                                 Ok(vec![ExecuteResult::TransactionEnd { tag: "ROLLBACK" }])
                             }
+	                            Statement::SetRole { role_name, .. } => {
+	                                if let Some(role_ident) = role_name.as_ref() {
+	                                    if role_ident.quote_style.is_none()
+	                                        && role_ident.value.eq_ignore_ascii_case("default")
+	                                    {
+	                                        session.reset_role();
+	                                    } else {
+	                                        let role_name = role_ident.value.clone();
+	                                    let session_user = session
+	                                        .session_user()
+	                                        .map(|u| u.to_string())
+	                                        .ok_or_else(|| anyhow!("Missing session user"))?;
+
+	                                    let is_autocommit = !session.is_in_transaction();
+	                                    if is_autocommit {
+	                                        session.begin().await?;
+	                                    }
+
+	                                    let result = async {
+	                                        let (txn, _sequence_values, _search_path) = session
+	                                            .get_mut_txn_sequence_values_and_search_path()
+	                                            .expect("Transaction must be active");
+
+	                                        let user = self.auth_manager.get_user(txn, &role_name).await?;
+	                                        let role = self.auth_manager.get_role(txn, &role_name).await?;
+	                                        let is_superuser = user
+	                                            .as_ref()
+	                                            .map(|u| u.is_superuser)
+	                                            .or_else(|| role.as_ref().map(|r| r.is_superuser))
+	                                            .ok_or_else(|| anyhow!("role \"{}\" does not exist", role_name))?;
+
+	                                        let session_user_def =
+	                                            self.auth_manager.get_user(txn, &session_user).await?;
+	                                        let can_set_role = match session_user_def.as_ref() {
+	                                            Some(user) if user.is_superuser => true,
+	                                            Some(user) => {
+	                                                role_name == session_user
+	                                                    || user.roles.contains(&role_name)
+	                                            }
+	                                            None => role_name == session_user,
+	                                        };
+	                                        if !can_set_role {
+	                                            return Err(SqlError::PermissionDenied {
+	                                                object_type: "role".into(),
+	                                                object_name: role_name.clone(),
+	                                            }
+	                                            .into());
+	                                        }
+	                                        Ok::<bool, anyhow::Error>(is_superuser)
+	                                    }
+	                                    .await;
+
+                                    if is_autocommit {
+                                        if result.is_ok() {
+                                            session.commit().await?;
+                                        } else {
+                                            session.rollback().await?;
+                                        }
+                                    }
+
+	                                    let is_superuser = result?;
+	                                    session.set_current_role(role_name, is_superuser);
+	                                    }
+	                                } else {
+	                                    // `SET ROLE NONE` (and our `RESET ROLE` rewrite) resets to the
+	                                    // session user.
+	                                    session.reset_role();
+	                                }
+	                                Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
+	                            }
                             Statement::SetVariable {
                                 variable, value, ..
                             } => {
@@ -1223,6 +1306,7 @@ impl Executor {
                                     }
 
                                     let timeout = session.statement_timeout();
+                                    let current_role = session.current_user().map(|u| u.to_string());
                                     let fut = async {
                                         let (txn, sequence_values, search_path) = session
                                             .get_mut_txn_sequence_values_and_search_path()
@@ -1242,6 +1326,7 @@ impl Executor {
                                                 sequence_values,
                                                 search_path,
                                                 stmt,
+                                                current_role.as_deref(),
                                             )
                                             .await?;
                                         Ok::<(Vec<ExecuteResult>, ExecuteResult), anyhow::Error>((
@@ -1707,6 +1792,7 @@ impl Executor {
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         stmt: &Statement,
+        current_role: Option<&str>,
     ) -> Result<ExecuteResult> {
         match stmt {
             Statement::CreateTable {
@@ -1718,7 +1804,12 @@ impl Executor {
                 temporary,
                 ..
             } => {
-                if let Some(q) = query {
+                let resolved = names::resolve_ddl_object_name(name, search_path)?;
+                let table_full_name = resolved.full.clone();
+                let already_exists =
+                    *if_not_exists && self.store.table_exists(txn, db_id, &table_full_name).await?;
+
+                let result = if let Some(q) = query {
                     self.execute_create_table_as(
                         txn,
                         db_id,
@@ -1730,7 +1821,7 @@ impl Executor {
                         *if_not_exists,
                         *temporary,
                     )
-                    .await
+                    .await?
                 } else {
                     ddl::execute_create_table(
                         &self.store,
@@ -1742,8 +1833,29 @@ impl Executor {
                         constraints,
                         *if_not_exists,
                     )
-                    .await
+                    .await?
+                };
+
+                if !already_exists {
+                    let owner = current_role.unwrap_or("postgres");
+                    if let Some(mut schema) =
+                        self.store.get_schema(txn, db_id, &table_full_name).await?
+                    {
+                        schema.owner = owner.to_string();
+                        self.store.update_schema(txn, db_id, schema).await?;
+                    }
+
+                    super::super::default_privileges::apply_default_table_privileges_for_new_table(
+                        &self.auth_manager,
+                        txn,
+                        db_id,
+                        owner,
+                        &table_full_name,
+                    )
+                    .await?;
                 }
+
+                Ok(result)
             }
             Statement::CreateIndex {
                 name,
@@ -1776,6 +1888,7 @@ impl Executor {
                 object_type,
                 names,
                 if_exists,
+                cascade,
                 ..
             } => {
                 use sqlparser::ast::ObjectType;
@@ -1807,8 +1920,15 @@ impl Executor {
                         .await
                     }
                     ObjectType::Schema => {
-                        self.execute_drop_schema(txn, db_id, search_path, names, *if_exists)
-                            .await
+                        self.execute_drop_schema(
+                            txn,
+                            db_id,
+                            search_path,
+                            names,
+                            *if_exists,
+                            *cascade,
+                        )
+                        .await
                     }
                     _ => Ok(ExecuteResult::Empty),
                 }
@@ -1911,7 +2031,7 @@ impl Executor {
                     SchemaName::Simple(name) => name,
                     SchemaName::NamedAuthorization(name, _) => name,
                     SchemaName::UnnamedAuthorization(_) => {
-                        return Err(anyhow!("Unsupported CREATE SCHEMA syntax"));
+                        return Err(SqlError::Unsupported("Unsupported CREATE SCHEMA syntax".into()).into());
                     }
                 };
                 let (schema_prefix, schema) = names::split_object_name(schema_obj)?;
@@ -1966,7 +2086,11 @@ impl Executor {
                     )
                     .await
                 } else {
-                    ddl::execute_create_view(
+                    let resolved = names::resolve_ddl_object_name(name, search_path)?;
+                    let view_full_name = resolved.full.clone();
+                    let existed = self.store.get_view(txn, db_id, &view_full_name).await?.is_some();
+
+                    let result = ddl::execute_create_view(
                         &self.store,
                         txn,
                         db_id,
@@ -1975,7 +2099,21 @@ impl Executor {
                         query,
                         *or_replace,
                     )
-                    .await
+                    .await?;
+
+                    if !existed {
+                        let owner = current_role.unwrap_or("postgres");
+                        super::super::default_privileges::apply_default_table_privileges_for_new_table(
+                            &self.auth_manager,
+                            txn,
+                            db_id,
+                            owner,
+                            &view_full_name,
+                        )
+                        .await?;
+                    }
+
+                    Ok(result)
                 }
             }
             Statement::AlterIndex { name, .. } => Ok(ExecuteResult::AlterIndex {
@@ -2005,7 +2143,8 @@ impl Executor {
                 .await
             }
             Statement::AlterRole { name, operation } => {
-                rbac::execute_alter_role(&self.auth_manager, txn, name, operation).await
+                rbac::execute_alter_role(&self.store, &self.auth_manager, txn, name, operation)
+                    .await
             }
             Statement::Grant {
                 privileges,
@@ -2015,10 +2154,12 @@ impl Executor {
                 ..
             } => {
                 rbac::execute_grant(
+                    &self.store,
                     &self.auth_manager,
                     txn,
+                    db_id,
                     privileges,
-                    &Some(objects.clone()),
+                    objects,
                     grantees,
                     *with_grant_option,
                 )
@@ -2031,10 +2172,12 @@ impl Executor {
                 ..
             } => {
                 rbac::execute_revoke(
+                    &self.store,
                     &self.auth_manager,
                     txn,
+                    db_id,
                     privileges,
-                    &Some(objects.clone()),
+                    objects,
                     grantees,
                 )
                 .await
@@ -2095,7 +2238,7 @@ impl Executor {
                     func_name: last_name.unwrap_or_else(|| "unknown".to_string()),
                 })
             }
-            _ => Err(anyhow!("Unsupported statement: {:?}", stmt)),
+            _ => Err(SqlError::Unsupported(format!("Unsupported statement: {:?}", stmt)).into()),
         }
     }
 
@@ -2133,7 +2276,7 @@ impl Executor {
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         expr: &Expr,
-        join_ctx: &super::super::expr::JoinContext<'_>,
+        join_ctx: &super::super::expr::JoinEvalContext<'_>,
     ) -> Result<Value> {
         if sequences::expr_needs_async_eval(expr) {
             sequences::eval_expr_join_with_sequences(
@@ -2147,49 +2290,8 @@ impl Executor {
             )
             .await
         } else {
-            super::super::expr::eval_expr_join(expr, join_ctx)
+            super::super::expr::eval_join_expr(join_ctx, expr)
         }
-    }
-
-    pub(crate) fn eval_scalar_subquery_in_join<'a>(
-        &'a self,
-        txn: &'a mut Transaction,
-        db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
-        search_path: &'a [String],
-        subquery: &'a Query,
-        join_ctx: &'a super::super::expr::JoinContext<'a>,
-        outer_ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
-        Box::pin(async move {
-            let substituted_query = super::super::helpers::substitute_join_context_values_in_query(
-                subquery,
-                join_ctx.column_offsets,
-                join_ctx.combined_row,
-            );
-            let result = self
-                .execute_query_with_outer_ctes(
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    &substituted_query,
-                    outer_ctes,
-                )
-                .await?;
-            match result {
-                ExecuteResult::Select { rows, .. } => {
-                    if rows.is_empty() {
-                        Ok(Value::Null)
-                    } else if rows.len() == 1 {
-                        Ok(rows[0].values.first().cloned().unwrap_or(Value::Null))
-                    } else {
-                        Err(anyhow!("Scalar subquery returned more than one row"))
-                    }
-                }
-                _ => Err(anyhow!("Subquery must return a SELECT result")),
-            }
-        })
     }
 
     pub(crate) async fn execute_query(
@@ -2868,7 +2970,7 @@ impl Executor {
                         values.push(val);
                     }
                 }
-                _ => return Err(anyhow!("Unsupported select item in tableless query")),
+                _ => return Err(SqlError::Unsupported("Unsupported select item in tableless query".into()).into()),
             }
         }
 
@@ -2968,12 +3070,52 @@ impl Executor {
                 return Err(anyhow!("Column count mismatch in set operation"));
             }
 
-            let is_all = query::is_set_quantifier_all(quantifier);
-            let rows = match op {
-                SetOperator::Union => query::apply_union(left_rows, right_rows, is_all),
-                SetOperator::Intersect => query::apply_intersect(left_rows, right_rows, is_all),
-                SetOperator::Except => query::apply_except(left_rows, right_rows, is_all),
+            let op_type = match (op, query::is_set_quantifier_all(quantifier)) {
+                (SetOperator::Union, true) => crate::sql::operators::SetOperationType::UnionAll,
+                (SetOperator::Union, false) => crate::sql::operators::SetOperationType::Union,
+                (SetOperator::Intersect, true) => crate::sql::operators::SetOperationType::IntersectAll,
+                (SetOperator::Intersect, false) => crate::sql::operators::SetOperationType::Intersect,
+                (SetOperator::Except, true) => crate::sql::operators::SetOperationType::ExceptAll,
+                (SetOperator::Except, false) => crate::sql::operators::SetOperationType::Except,
             };
+
+            let left_schema = TableSchema {
+                name: "set_op_left".to_string(),
+                table_id: 0,
+                columns: left_cols.iter().map(|name| crate::types::ColumnDef {
+                    name: name.clone(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                }).collect(),
+                version: 1,
+                pk_constraint_name: None,
+                pk_indices: vec![],
+                indexes: vec![],
+                check_constraints: vec![],
+                foreign_keys: vec![],
+                owner: String::new(),
+            };
+            let right_schema = left_schema.clone();
+
+            let left_op = Box::new(crate::sql::operators::TableScanOperator::new_with_rows(left_schema, left_rows));
+            let right_op = Box::new(crate::sql::operators::TableScanOperator::new_with_rows(right_schema, right_rows));
+
+            let mut set_op: crate::sql::operators::BoxedOperator = Box::new(
+                crate::sql::operators::SetOperationOperator::new(left_op, right_op, op_type),
+            );
+
+            let rows = crate::sql::operators::execute_operator_tree(
+                &mut set_op,
+                txn,
+                self.store(),
+                db_id,
+                search_path,
+                sequence_values,
+            ).await?;
 
             Ok(ExecuteResult::Select {
                 column_types: None,
@@ -3030,7 +3172,7 @@ impl Executor {
                     )
                     .await
                 }
-                _ => Err(anyhow!("Unsupported set expression")),
+                _ => Err(SqlError::Unsupported("Unsupported set expression".into()).into()),
             }
         })
     }
@@ -3042,15 +3184,22 @@ impl Executor {
         _search_path: &[String],
         names: &[sqlparser::ast::ObjectName],
         if_exists: bool,
+        cascade: bool,
     ) -> Result<ExecuteResult> {
         for name in names {
             let (schema_prefix, schema) = names::split_object_name(name)?;
             if schema_prefix.is_some() {
                 return Err(anyhow!("Invalid schema name '{}'", name));
             }
-            self.store
-                .drop_schema_restrict(txn, db_id, &schema, if_exists)
-                .await?;
+            if cascade {
+                self.store
+                    .drop_schema_cascade(txn, db_id, &schema, if_exists)
+                    .await?;
+            } else {
+                self.store
+                    .drop_schema_restrict(txn, db_id, &schema, if_exists)
+                    .await?;
+            }
         }
         Ok(ExecuteResult::CommandComplete { tag: "DROP SCHEMA" })
     }
@@ -3243,7 +3392,7 @@ impl Executor {
                 .store
                 .get_schema(txn, db_id, table_name)
                 .await?
-                .ok_or_else(|| anyhow!("Table '{}' not found", table_name))?;
+                .ok_or_else(|| SqlError::RelationNotFound(table_name.to_string()))?;
 
             let enum_cache = dml::build_enum_label_cache(&self.store, txn, db_id, &schema).await?;
 
@@ -3303,10 +3452,52 @@ impl Executor {
     }
 }
 
+fn get_skip_reason(sql_upper: &str) -> Option<String> {
+    if sql_upper.starts_with("\\") {
+        return Some("psql meta-command not supported".into());
+    }
+    if sql_upper.starts_with("COPY ") || sql_upper.contains(" FROM STDIN") {
+        return Some("COPY not supported".into());
+    }
+    None
+}
+
+fn get_unsupported_reason(sql_upper: &str) -> Option<String> {
+    if sql_upper.starts_with("CREATE DOMAIN") {
+        return Some("CREATE DOMAIN not supported".into());
+    }
+    if sql_upper.starts_with("CREATE AGGREGATE") {
+        return Some("CREATE AGGREGATE not supported".into());
+    }
+    if sql_upper.starts_with("ALTER TYPE") {
+        return Some("ALTER TYPE not supported".into());
+    }
+    if sql_upper.starts_with("ALTER DOMAIN") {
+        return Some("ALTER DOMAIN not supported".into());
+    }
+    if sql_upper.starts_with("ALTER AGGREGATE") {
+        return Some("ALTER AGGREGATE not supported".into());
+    }
+    if sql_upper.starts_with("ALTER FUNCTION") {
+        if sql_upper.contains(" OWNER TO ") {
+            return None;
+        }
+        return Some("ALTER FUNCTION not supported".into());
+    }
+    if sql_upper.starts_with("ALTER SEQUENCE") {
+        if sql_upper.contains(" OWNER TO ") || sql_upper.contains(" OWNED BY ") {
+            return None;
+        }
+        return Some("ALTER SEQUENCE not supported".into());
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        cast_current_setting_value, is_current_setting_function, is_set_config_function,
+        cast_current_setting_value, get_skip_reason, get_unsupported_reason,
+        is_current_setting_function, is_set_config_function,
         parse_search_path_guc_value, set_variable_value_to_string, starts_with_ignore_ascii_case,
         try_parse_const_bool, try_parse_const_text, unwrap_top_level_cast,
     };
@@ -3523,5 +3714,20 @@ mod tests {
             let anyhow_err = anyhow::Error::new(pessimistic_err);
             assert!(!is_retryable_tikv_error(&anyhow_err));
         }
+    }
+
+    #[test]
+    fn test_get_skip_reason() {
+        assert!(get_skip_reason("DROP DATABASE test").is_none());
+        assert!(get_skip_reason("CREATE DATABASE test").is_none());
+        assert!(get_skip_reason("SELECT * FROM foo").is_none());
+    }
+
+    #[test]
+    fn test_get_unsupported_reason() {
+        assert!(get_unsupported_reason("CREATE DOMAIN foo").is_some());
+        assert!(get_unsupported_reason("SELECT * FROM foo").is_none());
+        assert!(get_unsupported_reason("SELECT $$abc$$").is_none());
+        assert!(get_unsupported_reason("SELECT $tag$abc$tag$").is_none());
     }
 }

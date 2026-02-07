@@ -1,0 +1,29 @@
+[project]
+name = "pg-vector-search"
+version = "0.1.0"
+description = "Semantic search demo with pgvector + OpenAI embeddings on PostgreSQL"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "psycopg2-binary>=2.9.9",
+    "openai>=1.0.0",
+    "pgvector>=0.3.0",
+    "python-dotenv>=1.0.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipython>=8.12.0",
+    "pytest>=7.4.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "ipython>=8.12.0",
+    "pytest>=7.4.0",
+]

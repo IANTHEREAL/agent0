@@ -2,6 +2,7 @@ use crate::sql::names;
 use crate::sql::plpgsql;
 use crate::sql::{parse_sql, ExecuteResult};
 use crate::types::{FunctionDef, Row, TableSchema, Value};
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, ObjectName, TableAlias};
 use std::collections::HashMap;
@@ -106,9 +107,9 @@ fn eval_function_args(args: &[FunctionArg]) -> Result<Vec<Value>> {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
             FunctionArg::Named { arg, .. } => match arg {
                 FunctionArgExpr::Expr(e) => e,
-                _ => return Err(anyhow!("Unsupported function argument type")),
+                _ => return Err(SqlError::Unsupported("Unsupported function argument type".into()).into()),
             },
-            _ => return Err(anyhow!("Unsupported function argument type")),
+            _ => return Err(SqlError::Unsupported("Unsupported function argument type".into()).into()),
         };
         let val = eval_expr(expr, None, None)?;
         values.push(val);
@@ -149,7 +150,7 @@ async fn execute_sql_table_function(
     })?;
 
     let result = executor
-        .execute_statement_on_txn(txn, db_id, sequence_values, search_path, stmt)
+        .execute_statement_on_txn(txn, db_id, sequence_values, search_path, stmt, None)
         .await?;
 
     match result {

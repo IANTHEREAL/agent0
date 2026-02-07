@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 
 use super::{ExecutionContext, PhysicalOperator};
-use crate::sql::helpers::fill_row_defaults;
+use crate::sql::projection::fill_row_defaults;
 use crate::types::{Row, TableSchema, Value};
 
 #[derive(Debug)]
@@ -38,7 +38,6 @@ impl TableScanOperator {
         }
     }
 
-    #[allow(dead_code)]
     pub fn new_with_rows(schema: TableSchema, rows: Vec<Row>) -> Self {
         Self {
             schema,
@@ -71,14 +70,20 @@ impl PhysicalOperator for TableScanOperator {
 
         if !self.preloaded {
             self.buffer.clear();
-            let rows = ctx
-                .store
-                .scan(ctx.txn, ctx.db_id, &self.schema.name, self.scan_limit)
-                .await?;
-            self.buffer = rows
-                .into_iter()
-                .map(|r| fill_row_defaults_scan(r, &self.schema))
-                .collect::<Result<Vec<_>>>()?;
+            let table_name_lower = self.schema.name.to_lowercase();
+            if let Some((cte_schema, cte_rows)) = ctx.cte_tables.get(&table_name_lower) {
+                self.schema = cte_schema.clone();
+                self.buffer = cte_rows.clone();
+            } else {
+                let rows = ctx
+                    .store
+                    .scan(ctx.txn, ctx.db_id, &self.schema.name, self.scan_limit)
+                    .await?;
+                self.buffer = rows
+                    .into_iter()
+                    .map(|r| fill_row_defaults_scan(r, &self.schema))
+                    .collect::<Result<Vec<_>>>()?;
+            }
         }
 
         Ok(())
@@ -130,6 +135,7 @@ pub struct IndexScanOperator {
 }
 
 impl IndexScanOperator {
+    #[allow(dead_code)] // Operator framework
     pub fn new(
         schema: TableSchema,
         index_id: u64,

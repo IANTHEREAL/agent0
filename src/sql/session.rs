@@ -210,9 +210,11 @@ pub struct Session {
     savepoints: Arc<SavepointState>,
     last_sequence_values: HashMap<String, i64>,
     settings: SessionSettings,
-    #[allow(dead_code)]
+    /// Authenticated session user (login role). This does not change with `SET ROLE`.
+    session_user: Option<String>,
+    session_user_is_superuser: bool,
+    /// Current effective role. This can change with `SET ROLE` / `RESET ROLE`.
     current_user: Option<String>,
-    #[allow(dead_code)]
     is_superuser: bool,
     current_database_id: u64,
     current_database_name: Arc<str>,
@@ -236,6 +238,8 @@ impl Session {
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
             settings: SessionSettings::new(),
+            session_user: None,
+            session_user_is_superuser: false,
             current_user: None,
             is_superuser: false,
             current_database_id: database_id,
@@ -261,33 +265,50 @@ impl Session {
             savepoints: Arc::new(SavepointState::new()),
             last_sequence_values: HashMap::new(),
             settings: SessionSettings::new(),
+            session_user: Some(username.clone()),
+            session_user_is_superuser: is_superuser,
             current_user: Some(username),
-            is_superuser,
+            is_superuser: is_superuser,
             current_database_id: database_id,
             current_database_name: Arc::from(database_name),
             connection_id,
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // session accessor API
     pub fn store(&self) -> Arc<TikvStore> {
         self.store.clone()
     }
 
-    #[allow(dead_code)]
     pub fn current_user(&self) -> Option<&str> {
         self.current_user.as_deref()
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // accessor for session_user vs current_user
+    pub fn session_user(&self) -> Option<&str> {
+        self.session_user.as_deref()
+    }
+
     pub fn is_superuser(&self) -> bool {
         self.is_superuser
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // session accessor API
     pub fn set_user(&mut self, username: String, is_superuser: bool) {
+        self.session_user = Some(username.clone());
+        self.session_user_is_superuser = is_superuser;
         self.current_user = Some(username);
         self.is_superuser = is_superuser;
+    }
+
+    pub(crate) fn set_current_role(&mut self, role: String, is_superuser: bool) {
+        self.current_user = Some(role);
+        self.is_superuser = is_superuser;
+    }
+
+    pub(crate) fn reset_role(&mut self) {
+        self.current_user = self.session_user.clone();
+        self.is_superuser = self.session_user_is_superuser;
     }
 
     pub fn connection_id(&self) -> i32 {
@@ -298,7 +319,7 @@ impl Session {
         self.current_database_id
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // session accessor API
     pub fn current_database(&self) -> &str {
         &self.current_database_name
     }
@@ -353,7 +374,6 @@ impl Session {
         }
     }
 
-    #[allow(dead_code)]
     pub fn search_path(&self) -> &[String] {
         self.settings.search_path()
     }

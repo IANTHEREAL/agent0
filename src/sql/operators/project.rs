@@ -3,13 +3,15 @@ use async_trait::async_trait;
 use sqlparser::ast::Expr;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::eval_expr;
+use crate::sql::expr::eval_expr_with_query_ctx;
+use crate::sql::query_context::QueryContext;
 use crate::types::{ColumnDef, DataType, Row, TableSchema};
 
 #[derive(Debug)]
 pub struct ProjectOperator {
     child: BoxedOperator,
     expressions: Vec<Expr>,
+    #[allow(dead_code)] // Preserved for EXPLAIN output in future
     output_names: Vec<String>,
     output_schema: TableSchema,
     opened: bool,
@@ -56,12 +58,13 @@ impl ProjectOperator {
         }
     }
 
-    fn project_row(&self, input: &Row) -> Result<Row> {
+    fn project_row(&self, input: &Row, query_ctx: Option<&QueryContext>) -> Result<Row> {
         let child_schema = self.child.schema();
         let mut values = Vec::with_capacity(self.expressions.len());
 
         for expr in &self.expressions {
-            let value = eval_expr(expr, Some(input), Some(child_schema))?;
+            let value =
+                eval_expr_with_query_ctx(expr, Some(input), Some(child_schema), query_ctx)?;
             values.push(value);
         }
 
@@ -87,7 +90,7 @@ impl PhysicalOperator for ProjectOperator {
         }
 
         if let Some(row) = self.child.next(ctx).await? {
-            let projected = self.project_row(&row)?;
+            let projected = self.project_row(&row, ctx.query_ctx)?;
             Ok(Some(projected))
         } else {
             Ok(None)
@@ -209,5 +212,88 @@ mod tests {
             project.explain_info(),
             Some("columns=[id, name]".to_string())
         );
+    }
+
+    #[test]
+    fn test_project_row_column_subset() {
+        use super::super::scan::TableScanOperator;
+        use crate::types::Value;
+
+        let schema = test_schema();
+        let child = Box::new(TableScanOperator::new(schema));
+
+        let expressions = vec![Expr::Identifier(Ident::new("name"))];
+        let output_names = vec!["name".to_string()];
+        let output_types = vec![DataType::Text];
+
+        let project = ProjectOperator::new(child, expressions, output_names, output_types);
+
+        let input = Row::new(vec![
+            Value::Int32(1),
+            Value::Text("Alice".to_string()),
+            Value::Int32(30),
+        ]);
+        let result = project.project_row(&input, None).unwrap();
+
+        assert_eq!(result.values.len(), 1);
+        assert_eq!(result.values[0], Value::Text("Alice".to_string()));
+    }
+
+    #[test]
+    fn test_project_row_arithmetic_expression() {
+        use super::super::scan::TableScanOperator;
+        use sqlparser::ast::BinaryOperator;
+        use crate::types::Value;
+
+        let schema = test_schema();
+        let child = Box::new(TableScanOperator::new(schema));
+
+        let expressions = vec![Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("id"))),
+            op: BinaryOperator::Plus,
+            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
+                "10".to_string(),
+                false,
+            ))),
+        }];
+        let output_names = vec!["id_plus_10".to_string()];
+        let output_types = vec![DataType::Int32];
+
+        let project = ProjectOperator::new(child, expressions, output_names, output_types);
+
+        let input = Row::new(vec![
+            Value::Int32(5),
+            Value::Text("Alice".to_string()),
+            Value::Int32(30),
+        ]);
+        let result = project.project_row(&input, None).unwrap();
+
+        assert_eq!(result.values.len(), 1);
+        assert_eq!(result.values[0], Value::Int32(15));
+    }
+
+    #[test]
+    fn test_project_row_null_propagation() {
+        use super::super::scan::TableScanOperator;
+        use crate::types::Value;
+
+        let schema = test_schema();
+        let child = Box::new(TableScanOperator::new(schema));
+
+        let expressions = vec![
+            Expr::Identifier(Ident::new("id")),
+            Expr::Identifier(Ident::new("name")),
+        ];
+        let output_names = vec!["id".to_string(), "name".to_string()];
+        let output_types = vec![DataType::Int32, DataType::Text];
+
+        let project = ProjectOperator::new(child, expressions, output_names, output_types);
+
+        let input = Row::new(vec![Value::Int32(1), Value::Null, Value::Int32(30)]);
+        let result = project.project_row(&input, None).unwrap();
+
+        assert_eq!(result.values.len(), 2);
+        assert_eq!(result.values[0], Value::Int32(1));
+        assert_eq!(result.values[1], Value::Null);
     }
 }

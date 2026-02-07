@@ -81,6 +81,7 @@ pub enum PrivilegeObject {
 }
 
 impl PrivilegeObject {
+    #[allow(dead_code)]
     pub fn table(name: &str) -> Self {
         PrivilegeObject::Table {
             schema: "public".to_string(),

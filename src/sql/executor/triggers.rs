@@ -3,6 +3,7 @@ use super::super::names;
 use super::super::plpgsql;
 use super::super::{ExecuteResult, Session};
 use crate::types::{FunctionDef, TriggerDef};
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::ObjectName;
 
@@ -282,44 +283,6 @@ fn strip_default_clause(arg: &str) -> &str {
         return arg[..pos].trim_end();
     }
     arg
-}
-
-#[allow(dead_code)]
-fn looks_like_type_keyword(token: &str) -> bool {
-    matches!(
-        token.to_ascii_lowercase().as_str(),
-        "bool"
-            | "boolean"
-            | "int"
-            | "integer"
-            | "int2"
-            | "smallint"
-            | "int4"
-            | "int8"
-            | "bigint"
-            | "serial"
-            | "bigserial"
-            | "float"
-            | "float4"
-            | "float8"
-            | "double"
-            | "real"
-            | "numeric"
-            | "decimal"
-            | "text"
-            | "varchar"
-            | "character"
-            | "char"
-            | "timestamp"
-            | "timestamptz"
-            | "date"
-            | "time"
-            | "interval"
-            | "uuid"
-            | "json"
-            | "jsonb"
-            | "bytea"
-    )
 }
 
 fn parse_arg_types(args: &str) -> Vec<String> {
@@ -788,7 +751,7 @@ impl Executor {
                     search_path,
                 )
                     .await?
-                    .ok_or_else(|| anyhow!("Table '{}' not found", table))?;
+                    .ok_or_else(|| SqlError::RelationNotFound(table.to_string()))?;
 
             let func_resolved = names::resolve_existing_function_name(
                 self.store().as_ref(),
@@ -880,7 +843,7 @@ impl Executor {
                             table_name: resolved.full,
                         });
                     }
-                    return Err(anyhow!("Table '{}' not found", table));
+                    return Err(SqlError::RelationNotFound(table.to_string()).into());
                 }
             };
 

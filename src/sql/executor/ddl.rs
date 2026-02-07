@@ -4,6 +4,7 @@ use super::super::ddl;
 use super::super::names;
 use super::super::ExecuteResult;
 use super::Executor;
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     AlterTableOperation, ColumnDef as SqlColumnDef, Expr, Ident, ObjectName, OrderByExpr, Query,
@@ -182,7 +183,7 @@ impl Executor {
             .store()
             .get_schema(txn, db_id, &tbl_name)
             .await?
-            .ok_or_else(|| anyhow!("Table not found"))?;
+            .ok_or_else(|| SqlError::RelationNotFound(tbl_name.clone()))?;
         let needs_backfill = using
             .map(|u| u.value.eq_ignore_ascii_case("btree") || u.value.eq_ignore_ascii_case("gin"))
             .unwrap_or(true);
@@ -265,7 +266,7 @@ impl Executor {
                 .store()
                 .get_schema(txn, db_id, &table_name)
                 .await?
-                .ok_or_else(|| anyhow!("Table '{}' not found", table_name))?;
+                .ok_or_else(|| SqlError::RelationNotFound(table_name.clone()))?;
             let rows = if schema.pk_indices.is_empty() {
                 Vec::new()
             } else {

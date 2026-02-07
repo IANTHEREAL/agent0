@@ -3,7 +3,7 @@
 use crate::types::DataType;
 
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
+#[allow(dead_code)] // new type inference module, not yet fully integrated
 pub enum TypeError {
     /// Column does not exist
     ColumnNotFound {

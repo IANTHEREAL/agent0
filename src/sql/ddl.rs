@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption,
@@ -8,9 +9,9 @@ use sqlparser::ast::{
 };
 use tikv_client::Transaction;
 
-use super::helpers::{
-    coerce_value_for_column, convert_data_type, fill_row_defaults, infer_data_type, normalize_ident,
-};
+use super::coercion::{coerce_value_for_column, convert_data_type, infer_data_type};
+use super::names::normalize_ident;
+use super::projection::fill_row_defaults;
 use super::dml;
 use super::gin;
 use super::index_helpers;
@@ -510,7 +511,7 @@ fn coerce_value_for_type_change(val: Value, target_col: &ColumnDef) -> Result<Va
             if coerced.data_type().as_ref() == Some(new_type) {
                 Ok(coerced)
             } else {
-                Err(anyhow!("Unsupported type conversion to {}", new_type))
+                Err(SqlError::Unsupported(format!("Unsupported type conversion to {}", new_type)).into())
             }
         }
     }
@@ -639,7 +640,7 @@ pub async fn execute_create_table(
                         )
                         .await?
                         .ok_or_else(|| {
-                            anyhow!("Referenced table '{}' does not exist", foreign_table)
+                            SqlError::RelationNotFound(foreign_table.to_string())
                         })?
                         .full
                     };
@@ -796,7 +797,7 @@ pub async fn execute_create_table(
                         search_path,
                     )
                     .await?
-                    .ok_or_else(|| anyhow!("Referenced table '{}' does not exist", foreign_table))?
+                    .ok_or_else(|| SqlError::RelationNotFound(foreign_table.to_string()))?
                     .full
                 };
                 let ref_cols: Vec<String> = referred_columns.iter().map(normalize_ident).collect();
@@ -1057,7 +1058,7 @@ pub async fn execute_create_index(
     let mut schema = store
         .get_schema(txn, db_id, tbl_name)
         .await?
-        .ok_or_else(|| anyhow!("Table not found"))?;
+        .ok_or_else(|| SqlError::RelationNotFound(tbl_name.to_string()))?;
 
     if schema.indexes.iter().any(|i| i.name == idx_name_str) {
         if if_not_exists {
@@ -1836,13 +1837,13 @@ pub async fn execute_alter_table(
                     search_path,
                 )
                 .await?
-                .ok_or_else(|| anyhow!("Referenced table '{}' does not exist", foreign_table))?
+                .ok_or_else(|| SqlError::RelationNotFound(foreign_table.to_string()))?
                 .full;
                 let ref_schema = store
                     .get_schema(txn, db_id, &ref_table)
                     .await?
                     .ok_or_else(|| {
-                    anyhow!("Referenced table '{}' not found for foreign key", ref_table)
+                    SqlError::RelationNotFound(ref_table.clone())
                 })?;
                 let ref_cols: Vec<String> = referred_columns.iter().map(normalize_ident).collect();
                 let fk_name = name
@@ -2013,7 +2014,7 @@ pub async fn execute_alter_table(
             cascade,
         } => {
             if *cascade {
-                return Err(anyhow!("DROP CONSTRAINT ... CASCADE is not supported"));
+                return Err(SqlError::Unsupported("DROP CONSTRAINT ... CASCADE is not supported".into()).into());
             }
 
             let constraint_name = normalize_ident(name);
@@ -2125,7 +2126,7 @@ pub async fn execute_alter_table(
             ..
         } => {
             if *cascade {
-                return Err(anyhow!("DROP COLUMN ... CASCADE is not supported"));
+                return Err(SqlError::Unsupported("DROP COLUMN ... CASCADE is not supported".into()).into());
             }
 
             let col_name = normalize_ident(column_name);
@@ -2489,7 +2490,7 @@ pub async fn execute_alter_table(
                 }
             }
         }
-        _ => return Err(anyhow!("Unsupported ALTER")),
+        _ => return Err(SqlError::Unsupported("Unsupported ALTER".into()).into()),
     }
 
     Ok(ExecuteResult::AlterTable {
