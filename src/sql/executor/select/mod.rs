@@ -40,21 +40,21 @@ use tikv_client::Transaction;
 use tracing::debug;
 
 mod analysis;
-mod pushdown;
-mod order;
-mod legacy;
 mod join;
+mod legacy;
+mod order;
+mod pushdown;
 
 use analysis::{expr_has_subquery, projection_has_non_window_aggregate};
-use pushdown::{
-    generate_series_offset_limit_pushdown_eligible, normalize_query_offset_limit_fetch_expressions,
-    plan_generate_series_offset_limit_pushdown,
-};
+use join::ensure_no_locking_clauses_for_join;
 use order::{
     expand_projection_exprs_for_positional_order_by, expr_matches, extract_grouping_sets,
     resolve_group_by_exprs, resolve_order_by_exprs_for_non_agg,
 };
-use join::ensure_no_locking_clauses_for_join;
+use pushdown::{
+    generate_series_offset_limit_pushdown_eligible, normalize_query_offset_limit_fetch_expressions,
+    plan_generate_series_offset_limit_pushdown,
+};
 
 impl Executor {
     pub(crate) fn execute_query_with_outer_ctes<'a>(
@@ -1368,7 +1368,6 @@ impl Executor {
         }
         Ok(result)
     }
-
 }
 
 #[cfg(test)]

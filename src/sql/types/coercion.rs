@@ -105,10 +105,9 @@ pub fn common_type(a: &DataType, b: &DataType) -> Option<DataType> {
         }
 
         // Text-like as universal fallback
-        (DataType::Text, _)
-        | (_, DataType::Text)
-        | (DataType::Name, _)
-        | (_, DataType::Name) => Some(DataType::Text),
+        (DataType::Text, _) | (_, DataType::Text) | (DataType::Name, _) | (_, DataType::Name) => {
+            Some(DataType::Text)
+        }
 
         _ => None,
     }

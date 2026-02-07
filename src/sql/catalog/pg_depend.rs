@@ -51,7 +51,11 @@ impl VirtualTable for PgDepend {
             let Some((owned_table, owned_col)) = seq.owned_by.as_ref() else {
                 continue;
             };
-            let Some(schema) = ctx.store.get_schema(ctx.txn, ctx.db_id, owned_table).await? else {
+            let Some(schema) = ctx
+                .store
+                .get_schema(ctx.txn, ctx.db_id, owned_table)
+                .await?
+            else {
                 continue;
             };
             let Some(col_idx) = schema.columns.iter().position(|c| c.name == *owned_col) else {

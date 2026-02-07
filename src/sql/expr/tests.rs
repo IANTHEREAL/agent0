@@ -1,5 +1,5 @@
-use super::*;
 use super::super::statement_time;
+use super::*;
 use crate::types::ColumnDef;
 use rust_decimal::Decimal;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -70,12 +70,7 @@ fn test_eval_expr_join_function_resolves_qualified_column() {
     column_offsets.insert("b.name".to_string(), 1);
     column_offsets.insert("name".to_string(), 0);
 
-    let ctx = JoinEvalContext::new(
-        &column_offsets,
-        None,
-        &combined_row,
-        &combined_schema,
-    );
+    let ctx = JoinEvalContext::new(&column_offsets, None, &combined_row, &combined_schema);
 
     let val = eval_join_expr(&ctx, &expr).unwrap();
     assert_eq!(val, Value::Text("bob".to_string()));
@@ -111,10 +106,7 @@ fn test_pg_get_indexdef_uses_qualified_indexdef_column() {
     };
 
     let expected = "CREATE INDEX ix_t_a ON public.ix_t USING btree (a)";
-    let row = Row::new(vec![
-        Value::Int64(42),
-        Value::Text(expected.to_string()),
-    ]);
+    let row = Row::new(vec![Value::Int64(42), Value::Text(expected.to_string())]);
 
     let val = eval_expr(&expr, Some(&row), Some(&schema)).unwrap();
     assert_eq!(val, Value::Text(expected.to_string()));
@@ -150,10 +142,7 @@ fn test_pg_get_constraintdef_uses_qualified_constraintdef_column() {
     };
 
     let expected = "PRIMARY KEY (id)";
-    let row = Row::new(vec![
-        Value::Int64(50001),
-        Value::Text(expected.to_string()),
-    ]);
+    let row = Row::new(vec![Value::Int64(50001), Value::Text(expected.to_string())]);
 
     let val = eval_expr(&expr, Some(&row), Some(&schema)).unwrap();
     assert_eq!(val, Value::Text(expected.to_string()));
@@ -224,8 +213,7 @@ fn test_at_time_zone_chain_conversion() {
 
 #[test]
 fn test_at_time_zone_timestamptz_to_timestamp() {
-    let expr =
-        parse_expr("TIMESTAMPTZ '2024-01-15T10:00:00Z' AT TIME ZONE 'America/New_York'");
+    let expr = parse_expr("TIMESTAMPTZ '2024-01-15T10:00:00Z' AT TIME ZONE 'America/New_York'");
     let val = eval_expr(&expr, None, None).unwrap();
     assert_eq!(val, parse_timestamp_string("2024-01-15 05:00:00").unwrap());
 }
@@ -340,46 +328,40 @@ fn test_eval_logical_null_semantics_and_short_circuit() {
     );
 }
 
-    #[test]
-    fn test_eval_logical_short_circuit_does_not_hide_type_errors() {
-        // Short-circuit must not mask RHS type errors.
-        assert!(eval_expr(&parse_expr("TRUE OR 42"), None, None).is_err());
-        assert!(eval_expr(&parse_expr("FALSE AND 1 / 0"), None, None).is_err());
-        assert!(eval_expr(&parse_expr("TRUE OR (FALSE AND 42)"), None, None).is_err());
-        assert!(eval_expr(&parse_expr("FALSE AND (TRUE OR 42)"), None, None).is_err());
-        assert!(
-            eval_expr(&parse_expr("TRUE OR (1 LIKE 'a%')"), None, None)
-                .unwrap_err()
-                .to_string()
-                .contains("LIKE requires text operands")
-        );
-        assert!(
-            eval_expr(
-                &parse_expr("TRUE OR (CASE WHEN 1 LIKE 'a%' THEN TRUE ELSE FALSE END)"),
-                None,
-                None
-            )
+#[test]
+fn test_eval_logical_short_circuit_does_not_hide_type_errors() {
+    // Short-circuit must not mask RHS type errors.
+    assert!(eval_expr(&parse_expr("TRUE OR 42"), None, None).is_err());
+    assert!(eval_expr(&parse_expr("FALSE AND 1 / 0"), None, None).is_err());
+    assert!(eval_expr(&parse_expr("TRUE OR (FALSE AND 42)"), None, None).is_err());
+    assert!(eval_expr(&parse_expr("FALSE AND (TRUE OR 42)"), None, None).is_err());
+    assert!(eval_expr(&parse_expr("TRUE OR (1 LIKE 'a%')"), None, None)
+        .unwrap_err()
+        .to_string()
+        .contains("LIKE requires text operands"));
+    assert!(eval_expr(
+        &parse_expr("TRUE OR (CASE WHEN 1 LIKE 'a%' THEN TRUE ELSE FALSE END)"),
+        None,
+        None
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("LIKE requires text operands"));
+    assert!(
+        eval_expr(&parse_expr("FALSE AND (1 ILIKE 'a%')"), None, None)
             .unwrap_err()
             .to_string()
-            .contains("LIKE requires text operands")
-        );
-        assert!(
-            eval_expr(&parse_expr("FALSE AND (1 ILIKE 'a%')"), None, None)
-                .unwrap_err()
-                .to_string()
-                .contains("ILIKE requires text operands")
-        );
-        assert!(
-            eval_expr(&parse_expr("TRUE OR (1 && 2)"), None, None)
-                .unwrap_err()
-                .to_string()
-                .contains("&& operator requires array operands")
-        );
+            .contains("ILIKE requires text operands")
+    );
+    assert!(eval_expr(&parse_expr("TRUE OR (1 && 2)"), None, None)
+        .unwrap_err()
+        .to_string()
+        .contains("&& operator requires array operands"));
 
-        // Explicit NULL is allowed as a boolean operand.
-        assert_eq!(
-            eval_expr(&parse_expr("FALSE AND NULL"), None, None).unwrap(),
-            Value::Boolean(false)
+    // Explicit NULL is allowed as a boolean operand.
+    assert_eq!(
+        eval_expr(&parse_expr("FALSE AND NULL"), None, None).unwrap(),
+        Value::Boolean(false)
     );
     assert_eq!(
         eval_expr(&parse_expr("TRUE OR NULL"), None, None).unwrap(),
@@ -555,14 +537,17 @@ fn test_compare_values() {
 #[test]
 fn test_float_nan_comparisons() {
     assert_eq!(
-        eval_expr(&parse_expr("CAST('NaN' AS DOUBLE PRECISION) = 1"), None, None).unwrap(),
+        eval_expr(
+            &parse_expr("CAST('NaN' AS DOUBLE PRECISION) = 1"),
+            None,
+            None
+        )
+        .unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
         eval_expr(
-            &parse_expr(
-                "CAST('NaN' AS DOUBLE PRECISION) = CAST('NaN' AS DOUBLE PRECISION)"
-            ),
+            &parse_expr("CAST('NaN' AS DOUBLE PRECISION) = CAST('NaN' AS DOUBLE PRECISION)"),
             None,
             None
         )
@@ -570,7 +555,12 @@ fn test_float_nan_comparisons() {
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("CAST('NaN' AS DOUBLE PRECISION) > 1"), None, None).unwrap(),
+        eval_expr(
+            &parse_expr("CAST('NaN' AS DOUBLE PRECISION) > 1"),
+            None,
+            None
+        )
+        .unwrap(),
         Value::Boolean(true)
     );
 }
@@ -635,7 +625,12 @@ fn test_compare_order_by_values_nan() {
 
     // DESC should put NaN first (since NaN is treated as greatest).
     assert_eq!(
-        compare_order_by_values(&Value::Float64(f64::NAN), &Value::Float64(1.0), false, false),
+        compare_order_by_values(
+            &Value::Float64(f64::NAN),
+            &Value::Float64(1.0),
+            false,
+            false
+        ),
         Ordering::Less
     );
 }
@@ -841,14 +836,12 @@ fn test_case_when() {
         .unwrap(),
         Value::Text("no".to_string())
     );
-    assert!(
-        eval_expr(
-            &parse_expr("CASE WHEN 'nope' THEN 'yes' ELSE 'no' END"),
-            None,
-            None
-        )
-        .is_err()
-    );
+    assert!(eval_expr(
+        &parse_expr("CASE WHEN 'nope' THEN 'yes' ELSE 'no' END"),
+        None,
+        None
+    )
+    .is_err());
     assert_eq!(
         eval_expr(
             &parse_expr("CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END"),
@@ -1214,10 +1207,9 @@ fn test_timestamp_cast_accepts_postgres_timestamptz_offsets() {
         Value::Timestamp(expected)
     );
 
-    let expected_plus2 =
-        chrono::DateTime::parse_from_rfc3339("2026-02-02T21:39:52.850+00:00")
-            .unwrap()
-            .timestamp_millis();
+    let expected_plus2 = chrono::DateTime::parse_from_rfc3339("2026-02-02T21:39:52.850+00:00")
+        .unwrap()
+        .timestamp_millis();
     assert_eq!(
         parse_timestamp_string("2026-02-02 23:39:52.850 +02:00").unwrap(),
         Value::Timestamp(expected_plus2)
@@ -1298,7 +1290,12 @@ fn test_uuid_cast_from_text() {
 #[test]
 fn test_bytea_send_functions() {
     assert_eq!(
-        eval_expr(&parse_expr("int8send(72623859790382856::bigint)"), None, None).unwrap(),
+        eval_expr(
+            &parse_expr("int8send(72623859790382856::bigint)"),
+            None,
+            None
+        )
+        .unwrap(),
         Value::Bytes(vec![1, 2, 3, 4, 5, 6, 7, 8])
     );
     assert_eq!(
@@ -2008,21 +2005,14 @@ fn test_current_timestamp_reads_from_query_context() {
 async fn test_query_context_overrides_task_local() {
     use crate::sql::query_context::QueryContext;
 
-    let qc = QueryContext::new(
-        777,
-        Arc::from("qc_db"),
-        1_600_000_000_000,
-        Arc::from("UTC"),
-    );
+    let qc = QueryContext::new(777, Arc::from("qc_db"), 1_600_000_000_000, Arc::from("UTC"));
 
     let pid_expr = parse_expr("pg_backend_pid()");
     let db_expr = parse_expr("current_database()");
 
     let (pid, db) = with_query_context(123, Arc::from("task_local_db"), async {
-        let pid =
-            eval_expr_with_query_ctx(&pid_expr, None, None, Some(&qc)).unwrap();
-        let db =
-            eval_expr_with_query_ctx(&db_expr, None, None, Some(&qc)).unwrap();
+        let pid = eval_expr_with_query_ctx(&pid_expr, None, None, Some(&qc)).unwrap();
+        let db = eval_expr_with_query_ctx(&db_expr, None, None, Some(&qc)).unwrap();
         (pid, db)
     })
     .await;

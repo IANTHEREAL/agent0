@@ -7,8 +7,8 @@
 use crate::types::Row;
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TRIGGER_QUEUE_PREFIX: &[u8] = b"_sys_tq_";

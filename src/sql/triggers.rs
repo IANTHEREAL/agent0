@@ -768,7 +768,8 @@ mod tests {
         let result = substitute_row_references("NEW.id + NEW.id2", &schema, &new_values, None);
         assert_eq!(result, "7 + 3");
 
-        let result = substitute_row_references("OLD.id2 + OLD.id", &schema, &new_values, Some(&old_row));
+        let result =
+            substitute_row_references("OLD.id2 + OLD.id", &schema, &new_values, Some(&old_row));
         assert_eq!(result, "11 + 9");
     }
 
@@ -848,10 +849,7 @@ mod tests {
         let new_values = vec![Value::Int32(1), Value::Int32(9)];
         let expr = "'NEW.aa' || NEW.aa::TEXT /* NEW.aa */ -- NEW.aa";
         let result = substitute_row_references(expr, &schema, &new_values, None);
-        assert_eq!(
-            result,
-            "'NEW.aa' || 9::TEXT /* NEW.aa */ -- NEW.aa"
-        );
+        assert_eq!(result, "'NEW.aa' || 9::TEXT /* NEW.aa */ -- NEW.aa");
     }
 
     #[test]

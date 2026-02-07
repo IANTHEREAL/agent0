@@ -35,7 +35,9 @@ where
     // See `sql::expr::with_query_context` for rationale.
     #[cfg(debug_assertions)]
     {
-        STATEMENT_TIMESTAMP_MILLIS.scope(ts_millis, Box::pin(fut)).await
+        STATEMENT_TIMESTAMP_MILLIS
+            .scope(ts_millis, Box::pin(fut))
+            .await
     }
 
     #[cfg(not(debug_assertions))]
@@ -51,10 +53,9 @@ mod tests {
     #[tokio::test]
     async fn statement_timestamp_scope_is_visible() {
         let fixed = 1_700_000_000_123_i64;
-        let got = with_statement_timestamp_millis(fixed, async {
-            statement_timestamp_millis().unwrap()
-        })
-        .await;
+        let got =
+            with_statement_timestamp_millis(fixed, async { statement_timestamp_millis().unwrap() })
+                .await;
         assert_eq!(got, fixed);
     }
 }

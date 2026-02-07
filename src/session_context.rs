@@ -22,4 +22,3 @@ where
 {
     TIMEZONE.scope(timezone, fut).await
 }
-

@@ -1,8 +1,8 @@
 //! CTE (Common Table Expression) execution for the SQL executor
 
-use super::core::Executor;
 use super::super::names::normalize_ident;
 use super::super::ExecuteResult;
+use super::core::Executor;
 use crate::types::{ColumnDef, DataType, Row, TableSchema};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Ident, Query, SetExpr, SetOperator, SetQuantifier, TableFactor};
@@ -72,9 +72,9 @@ impl Executor {
                             } else {
                                 vec![DataType::Text; col_names.len()]
                             };
-	                            let schema = TableSchema {
-	                                table_id: 0,
-	                                name: cte_name.clone(),
+                            let schema = TableSchema {
+                                table_id: 0,
+                                name: cte_name.clone(),
                                 columns: col_names
                                     .iter()
                                     .enumerate()
@@ -91,14 +91,14 @@ impl Executor {
                                         default_expr: None,
                                     })
                                     .collect(),
-	                                pk_constraint_name: None,
+                                pk_constraint_name: None,
                                 pk_indices: vec![],
-	                                indexes: vec![],
-	                                version: 1,
-	                                check_constraints: vec![],
-	                                foreign_keys: vec![],
-	                                owner: String::new(),
-	                            };
+                                indexes: vec![],
+                                version: 1,
+                                check_constraints: vec![],
+                                foreign_keys: vec![],
+                                owner: String::new(),
+                            };
                             ctes.insert(cte_name, (schema, rows));
                         }
                         _ => return Err(anyhow!("CTE must be a SELECT query")),
@@ -197,9 +197,9 @@ impl Executor {
         } else {
             vec![DataType::Text; col_names.len()]
         };
-	        let schema = TableSchema {
-	            table_id: 0,
-	            name: cte_name.to_string(),
+        let schema = TableSchema {
+            table_id: 0,
+            name: cte_name.to_string(),
             columns: col_names
                 .iter()
                 .enumerate()
@@ -215,12 +215,12 @@ impl Executor {
                 .collect(),
             pk_constraint_name: None,
             pk_indices: vec![],
-	            indexes: vec![],
-	            version: 1,
-	            check_constraints: vec![],
-	            foreign_keys: vec![],
-	            owner: String::new(),
-	        };
+            indexes: vec![],
+            version: 1,
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
 
         let mut working_table = all_rows.clone();
         let max_iterations = 1000;
@@ -246,16 +246,16 @@ impl Executor {
                 limit_by: vec![],
                 for_clause: None,
             };
-        let recursive_result = self
-            .execute_query_with_ctes(
-                txn,
-                db_id,
-                sequence_values,
-                search_path,
-                &recursive_query,
-                &temp_ctes,
-            )
-            .await?;
+            let recursive_result = self
+                .execute_query_with_ctes(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    &recursive_query,
+                    &temp_ctes,
+                )
+                .await?;
 
             let new_rows = match recursive_result {
                 ExecuteResult::Select { rows, .. } => rows,

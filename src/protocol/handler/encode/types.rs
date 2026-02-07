@@ -45,4 +45,3 @@ pub(in crate::protocol::handler) fn datatype_to_pgtype(dt: Option<&DataType>) ->
         | None => Type::TEXT,
     }
 }
-

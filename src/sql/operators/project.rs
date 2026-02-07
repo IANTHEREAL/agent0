@@ -63,8 +63,7 @@ impl ProjectOperator {
         let mut values = Vec::with_capacity(self.expressions.len());
 
         for expr in &self.expressions {
-            let value =
-                eval_expr_with_query_ctx(expr, Some(input), Some(child_schema), query_ctx)?;
+            let value = eval_expr_with_query_ctx(expr, Some(input), Some(child_schema), query_ctx)?;
             values.push(value);
         }
 
@@ -242,8 +241,8 @@ mod tests {
     #[test]
     fn test_project_row_arithmetic_expression() {
         use super::super::scan::TableScanOperator;
-        use sqlparser::ast::BinaryOperator;
         use crate::types::Value;
+        use sqlparser::ast::BinaryOperator;
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));

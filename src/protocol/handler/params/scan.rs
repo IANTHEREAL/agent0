@@ -117,7 +117,10 @@ pub(in crate::protocol::handler) fn count_sql_parameters(sql: &str) -> usize {
     max_param
 }
 
-pub(in crate::protocol::handler) fn infer_parameter_types(sql: &str, param_count: usize) -> Vec<Type> {
+pub(in crate::protocol::handler) fn infer_parameter_types(
+    sql: &str,
+    param_count: usize,
+) -> Vec<Type> {
     // Default to TEXT: drivers can encode any value to TEXT, server does implicit conversion.
     // UNKNOWN (OID 705) breaks pgx/GORM which cannot encode time.Time to unknown type.
     let mut types = vec![Type::TEXT; param_count];

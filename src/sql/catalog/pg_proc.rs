@@ -71,11 +71,7 @@ impl VirtualTable for PgProc {
             ]));
         }
 
-        if let Some(ext) = ctx
-            .store
-            .get_extension(ctx.txn, ctx.db_id, "http")
-            .await?
-        {
+        if let Some(ext) = ctx.store.get_extension(ctx.txn, ctx.db_id, "http").await? {
             if ext.enabled {
                 for (oid, name) in [
                     (1101_i64, "http_get"),

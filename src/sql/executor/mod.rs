@@ -5,15 +5,15 @@
 mod core;
 mod cte;
 mod database;
-mod default_privileges;
 mod ddl;
+mod default_privileges;
 mod dml;
 mod extensions;
 mod operators;
-mod table_utils;
 mod procedure;
 mod select;
 pub(crate) mod subquery;
+mod table_utils;
 pub(crate) mod triggers;
 mod udt;
 mod user_function;

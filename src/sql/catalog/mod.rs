@@ -9,8 +9,8 @@ mod pg_attribute;
 mod pg_class;
 mod pg_collation;
 mod pg_constraint;
-mod pg_db_role_setting;
 mod pg_database;
+mod pg_db_role_setting;
 mod pg_depend;
 mod pg_description;
 mod pg_enum;
@@ -30,8 +30,8 @@ mod referential_constraints;
 mod routines;
 mod schemata;
 mod sequences;
-mod table_privileges;
 mod table_constraints;
+mod table_privileges;
 mod tables;
 
 use crate::storage::TikvStore;
@@ -113,8 +113,6 @@ impl CatalogRegistry {
     pub fn get(&self, name: &str) -> Option<&dyn VirtualTable> {
         self.tables.get(name).map(|t| t.as_ref())
     }
-
-
 }
 
 static CATALOG: std::sync::LazyLock<CatalogRegistry> =

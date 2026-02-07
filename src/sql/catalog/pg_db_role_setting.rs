@@ -58,4 +58,3 @@ impl VirtualTable for PgDbRoleSetting {
         Ok(rows)
     }
 }
-

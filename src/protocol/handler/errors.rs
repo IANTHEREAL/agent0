@@ -102,4 +102,3 @@ pub(super) fn syntax_error_pgwire_error(message: String) -> PgWireError {
         message,
     )))
 }
-

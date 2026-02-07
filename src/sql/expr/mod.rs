@@ -1,15 +1,15 @@
 //! Expression evaluation logic
 
-mod context;
 mod boolean;
+mod context;
 mod evaluator;
 pub mod functions;
 mod numeric;
 mod operators;
 
-pub use context::{JoinEvalContext, SingleTableContext};
-pub use context::EvalContext;
 pub(crate) use boolean::{coerce_text_literal_to_bool, validate_bool_expr_in_boolean_context};
+pub use context::EvalContext;
+pub use context::{JoinEvalContext, SingleTableContext};
 
 pub(crate) fn parse_bool_pg(s: &str) -> Option<bool> {
     operators::parse_bool_pg(s)
@@ -82,19 +82,23 @@ where
     {
         let fut = Box::pin(fut);
         CONNECTION_ID
-            .scope(connection_id, CURRENT_DATABASE_NAME.scope(database_name, fut))
+            .scope(
+                connection_id,
+                CURRENT_DATABASE_NAME.scope(database_name, fut),
+            )
             .await
     }
 
     #[cfg(not(debug_assertions))]
     {
         CONNECTION_ID
-            .scope(connection_id, CURRENT_DATABASE_NAME.scope(database_name, fut))
+            .scope(
+                connection_id,
+                CURRENT_DATABASE_NAME.scope(database_name, fut),
+            )
             .await
     }
 }
-
-
 
 fn sql_datatype_is_timestamptz(dt: &sqlparser::ast::DataType) -> Option<bool> {
     match dt {
@@ -115,12 +119,18 @@ fn sql_datatype_is_timestamptz(dt: &sqlparser::ast::DataType) -> Option<bool> {
 fn expr_is_timestamptz(expr: &Expr, schema: Option<&TableSchema>) -> bool {
     match expr {
         Expr::Identifier(ident) => schema
-            .and_then(|s| s.column_index(&ident.value).map(|idx| &s.columns[idx].data_type))
+            .and_then(|s| {
+                s.column_index(&ident.value)
+                    .map(|idx| &s.columns[idx].data_type)
+            })
             .is_some_and(|dt| matches!(dt, DataType::TimestampTz)),
         Expr::CompoundIdentifier(parts) => parts
             .last()
             .and_then(|ident| {
-                schema.and_then(|s| s.column_index(&ident.value).map(|idx| &s.columns[idx].data_type))
+                schema.and_then(|s| {
+                    s.column_index(&ident.value)
+                        .map(|idx| &s.columns[idx].data_type)
+                })
             })
             .is_some_and(|dt| matches!(dt, DataType::TimestampTz)),
         Expr::Function(func) => func.name.0.last().is_some_and(|ident| {
@@ -157,11 +167,17 @@ fn expr_is_timestamptz_join_with_schema(
                 }
                 let key = format!("{}.{}", parts[0].value, parts[1].value);
                 if let Some(&offset) = column_offsets.get(&key) {
-                    return combined_schema.columns.get(offset).map(|col| &col.data_type);
+                    return combined_schema
+                        .columns
+                        .get(offset)
+                        .map(|col| &col.data_type);
                 }
                 for (k, &offset) in column_offsets {
                     if k.eq_ignore_ascii_case(&key) {
-                        return combined_schema.columns.get(offset).map(|col| &col.data_type);
+                        return combined_schema
+                            .columns
+                            .get(offset)
+                            .map(|col| &col.data_type);
                     }
                 }
                 None
@@ -291,10 +307,7 @@ fn eval_function_args<C: EvalContext>(
     Ok(args)
 }
 
-fn eval_row_object_expr<C: EvalContext>(
-    ctx: &C,
-    expr: &Expr,
-) -> Result<Option<serde_json::Value>> {
+fn eval_row_object_expr<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Option<serde_json::Value>> {
     fn row_values<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Option<Vec<Value>>> {
         match expr {
             Expr::Nested(inner) => row_values(ctx, inner),
@@ -910,18 +923,13 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
         // TRANSACTION_TIMESTAMP, TXID_CURRENT, PG_COLUMN_SIZE, PG_TABLE_IS_VISIBLE are handled by the registry (functions/pg_compat.rs)
         // JSONB_SET, JSON_SET, JSONB_ARRAY_ELEMENTS, JSON_ARRAY_ELEMENTS, JSONB_ARRAY_ELEMENTS_TEXT,
         // JSON_ARRAY_ELEMENTS_TEXT, JSONB_EACH, JSON_EACH, JSONB_EACH_TEXT, JSON_EACH_TEXT are handled by the registry (functions/json.rs)
-
         _ => Err(SqlError::Unsupported(format!("Unsupported function: {}", func_name)).into()),
     }
 }
 
 fn like_match(s: &str, pattern: &str, escape_char: Option<char>, case_insensitive: bool) -> bool {
     if case_insensitive {
-        return like_match_impl(
-            &s.to_lowercase(),
-            &pattern.to_lowercase(),
-            escape_char,
-        );
+        return like_match_impl(&s.to_lowercase(), &pattern.to_lowercase(), escape_char);
     }
     like_match_impl(s, pattern, escape_char)
 }
@@ -1064,8 +1072,10 @@ fn cast_to_bytea(v: Value) -> Result<Value> {
         Value::Bytes(_) => Ok(v),
         Value::Text(s) => {
             if let Some(rest) = s.strip_prefix("\\x") {
-                let bytes = hex::decode(rest)
-                    .map_err(|e| SqlError::InvalidInputSyntax { type_name: "bytea".into(), value: e.to_string() })?;
+                let bytes = hex::decode(rest).map_err(|e| SqlError::InvalidInputSyntax {
+                    type_name: "bytea".into(),
+                    value: e.to_string(),
+                })?;
                 Ok(Value::Bytes(bytes))
             } else {
                 Ok(Value::Bytes(s.into_bytes()))
@@ -1115,15 +1125,27 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                 Value::Numeric(d) => d,
                 Value::Int32(i) => Decimal::from(i),
                 Value::Int64(i) => Decimal::from(i),
-                Value::Float64(f) => Decimal::try_from(f)
-                    .map_err(|_| SqlError::InvalidInputSyntax { type_name: "numeric".into(), value: f.to_string() })?,
-                Value::Text(s) => Decimal::from_str(s.trim())
-                    .map_err(|_| SqlError::InvalidInputSyntax { type_name: "numeric".into(), value: s.clone() })?,
+                Value::Float64(f) => {
+                    Decimal::try_from(f).map_err(|_| SqlError::InvalidInputSyntax {
+                        type_name: "numeric".into(),
+                        value: f.to_string(),
+                    })?
+                }
+                Value::Text(s) => {
+                    Decimal::from_str(s.trim()).map_err(|_| SqlError::InvalidInputSyntax {
+                        type_name: "numeric".into(),
+                        value: s.clone(),
+                    })?
+                }
                 other => {
                     return Err(SqlError::InvalidCast {
                         from: other.data_type().unwrap_or(crate::types::DataType::Text),
-                        to: crate::types::DataType::Numeric { precision: None, scale: None },
-                    }.into())
+                        to: crate::types::DataType::Numeric {
+                            precision: None,
+                            scale: None,
+                        },
+                    }
+                    .into())
                 }
             };
             if let Some(s) = scale {
@@ -1244,8 +1266,12 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                             Value::Jsonb(s) => s.clone(),
                             other => other.to_string(),
                         };
-                        serde_json::from_str::<serde_json::Value>(&s)
-                            .map_err(|e| SqlError::InvalidInputSyntax { type_name: "json".into(), value: e.to_string() })?;
+                        serde_json::from_str::<serde_json::Value>(&s).map_err(|e| {
+                            SqlError::InvalidInputSyntax {
+                                type_name: "json".into(),
+                                value: e.to_string(),
+                            }
+                        })?;
                         Ok(Value::Json(s))
                     }
                     "BYTEA" => cast_to_bytea(v),
@@ -1256,8 +1282,11 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                             Value::Jsonb(s) => return Ok(Value::Jsonb(s.clone())),
                             other => other.to_string(),
                         };
-                        let parsed: serde_json::Value = serde_json::from_str(&s)
-                            .map_err(|e| SqlError::InvalidInputSyntax { type_name: "jsonb".into(), value: e.to_string() })?;
+                        let parsed: serde_json::Value =
+                            serde_json::from_str(&s).map_err(|e| SqlError::InvalidInputSyntax {
+                                type_name: "jsonb".into(),
+                                value: e.to_string(),
+                            })?;
                         Ok(Value::Jsonb(parsed.to_string()))
                     }
                     "VECTOR" => match &v {
@@ -1266,7 +1295,8 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                         _ => Err(SqlError::InvalidCast {
                             from: v.data_type().unwrap_or(crate::types::DataType::Text),
                             to: crate::types::DataType::Vector(0),
-                        }.into()),
+                        }
+                        .into()),
                     },
                     "REGTYPE" => {
                         let s = match &v {
@@ -1400,7 +1430,8 @@ pub(super) fn parse_timestamp_string(s: &str) -> Result<Value> {
         }
     }
     if let Ok(dt) = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d") {
-        let datetime = dt.and_hms_opt(0, 0, 0)
+        let datetime = dt
+            .and_hms_opt(0, 0, 0)
             .ok_or_else(|| anyhow!("Failed to create datetime from date"))?;
         return Ok(Value::Timestamp(
             Utc.from_utc_datetime(&datetime).timestamp_millis(),
@@ -1638,7 +1669,11 @@ fn eval_date_trunc_from_args(args: Vec<Value>) -> Result<Value> {
             .and_hms_opt(dt.hour(), dt.minute(), 0)
             .ok_or_else(|| anyhow!("Failed to create datetime for minute truncation"))?
             .and_utc(),
-        _ => return Err(SqlError::Unsupported(format!("Unsupported DATE_TRUNC field: {}", field)).into()),
+        _ => {
+            return Err(
+                SqlError::Unsupported(format!("Unsupported DATE_TRUNC field: {}", field)).into(),
+            )
+        }
     };
     Ok(Value::Timestamp(truncated.timestamp_millis()))
 }
@@ -1759,7 +1794,11 @@ pub fn compare_order_by_values(
     operators::compare_order_by_values(left, right, asc, nulls_first)
 }
 
-pub(super) fn eval_json_access(left: Value, operator: &JsonOperator, right: Value) -> Result<Value> {
+pub(super) fn eval_json_access(
+    left: Value,
+    operator: &JsonOperator,
+    right: Value,
+) -> Result<Value> {
     // Handle @@ operator for full-text search (tsvector @@ tsquery)
     if matches!(operator, JsonOperator::AtAt) {
         return super::fts::ts_match(&left, &right);
@@ -1773,7 +1812,10 @@ pub(super) fn eval_json_access(left: Value, operator: &JsonOperator, right: Valu
                     return Err(anyhow!("@> on arrays requires array operand on right"));
                 };
                 for r in right_arr {
-                    if !left_arr.iter().any(|l| compare_values(l, r).unwrap_or(1) == 0) {
+                    if !left_arr
+                        .iter()
+                        .any(|l| compare_values(l, r).unwrap_or(1) == 0)
+                    {
                         return Ok(Value::Boolean(false));
                     }
                 }
@@ -1784,13 +1826,22 @@ pub(super) fn eval_json_access(left: Value, operator: &JsonOperator, right: Valu
                     return Err(anyhow!("<@ on arrays requires array operand on right"));
                 };
                 for l in left_arr {
-                    if !right_arr.iter().any(|r| compare_values(l, r).unwrap_or(1) == 0) {
+                    if !right_arr
+                        .iter()
+                        .any(|r| compare_values(l, r).unwrap_or(1) == 0)
+                    {
                         return Ok(Value::Boolean(false));
                     }
                 }
                 return Ok(Value::Boolean(true));
             }
-            _ => return Err(SqlError::Unsupported(format!("Unsupported operator for arrays: {:?}", operator)).into()),
+            _ => {
+                return Err(SqlError::Unsupported(format!(
+                    "Unsupported operator for arrays: {:?}",
+                    operator
+                ))
+                .into())
+            }
         }
     }
 
@@ -1854,7 +1905,11 @@ pub(super) fn eval_json_access(left: Value, operator: &JsonOperator, right: Valu
                     json_delete_path(&mut json_val, &path);
                     Ok(Value::Jsonb(json_val.to_string()))
                 }
-                _ => Err(SqlError::Unsupported(format!("Unsupported JSON operator: {:?}", operator)).into()),
+                _ => Err(SqlError::Unsupported(format!(
+                    "Unsupported JSON operator: {:?}",
+                    operator
+                ))
+                .into()),
             }
         }
         _ => {
@@ -1905,7 +1960,11 @@ pub(super) fn eval_json_access(left: Value, operator: &JsonOperator, right: Valu
                             Ok(Value::Text(val.to_string()))
                         }
                     },
-                    _ => Err(SqlError::Unsupported(format!("Unsupported JSON operator: {:?}", operator)).into()),
+                    _ => Err(SqlError::Unsupported(format!(
+                        "Unsupported JSON operator: {:?}",
+                        operator
+                    ))
+                    .into()),
                 },
             }
         }

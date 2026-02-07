@@ -17,4 +17,3 @@ impl ServerParameterProvider for PgServerParameterProvider {
         Some(params)
     }
 }
-

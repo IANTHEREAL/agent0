@@ -3,15 +3,15 @@ use super::value::encode_value;
 use crate::sql::ExecuteResult;
 use crate::types::{DataType, Value};
 use futures::stream;
-use pgwire::api::results::{
-    DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag,
-};
+use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::api::Type;
 use pgwire::error::PgWireResult;
 use pgwire::messages::data::DataRow;
 use std::sync::Arc;
 
-pub(in crate::protocol::handler) fn result_to_response(result: ExecuteResult) -> PgWireResult<Response<'static>> {
+pub(in crate::protocol::handler) fn result_to_response(
+    result: ExecuteResult,
+) -> PgWireResult<Response<'static>> {
     match result {
         ExecuteResult::Select {
             columns,

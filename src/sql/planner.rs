@@ -543,7 +543,9 @@ fn extract_column_ref(expr: &Expr) -> Option<ColumnRef> {
             name: normalize_ident(ident),
         }),
         Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
-            let qualifier = parts.get(parts.len().saturating_sub(2)).map(normalize_ident);
+            let qualifier = parts
+                .get(parts.len().saturating_sub(2))
+                .map(normalize_ident);
             let name = parts.last().map(normalize_ident)?;
             Some(ColumnRef { qualifier, name })
         }
@@ -580,7 +582,11 @@ fn resolve_column_index(schema: &TableSchema, col: &ColumnRef) -> Option<usize> 
 
     let mut match_idx: Option<usize> = None;
     for (idx, schema_col) in schema.columns.iter().enumerate() {
-        let unqualified = schema_col.name.rsplit('.').next().unwrap_or(&schema_col.name);
+        let unqualified = schema_col
+            .name
+            .rsplit('.')
+            .next()
+            .unwrap_or(&schema_col.name);
         if unqualified.eq_ignore_ascii_case(&col.name) {
             if match_idx.is_some() {
                 return None;

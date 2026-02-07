@@ -5,8 +5,8 @@ use sqlparser::ast::{ObjectName, UserDefinedTypeRepresentation};
 use tikv_client::Transaction;
 
 use super::coercion::convert_data_type;
-use super::names::normalize_ident;
 use super::names;
+use super::names::normalize_ident;
 use super::ExecuteResult;
 use crate::storage::TikvStore;
 use crate::types::{UserTypeDef, UserTypeKind};

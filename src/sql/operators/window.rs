@@ -134,7 +134,11 @@ impl WindowOperator {
         }
     }
 
-    fn compute_window_functions(&self, rows: &[Row], schema: &TableSchema) -> Result<Vec<Vec<Value>>> {
+    fn compute_window_functions(
+        &self,
+        rows: &[Row],
+        schema: &TableSchema,
+    ) -> Result<Vec<Vec<Value>>> {
         let num_funcs = self.window_functions.len();
         let mut results: Vec<Vec<Value>> = vec![vec![Value::Null; num_funcs]; rows.len()];
 
@@ -174,18 +178,59 @@ impl WindowOperator {
                 // Compute function for this partition
                 match wf.func_name.as_str() {
                     "row_number" => self.compute_row_number(&row_indices, wf_idx, &mut results),
-                    "rank" => self.compute_rank(rows, schema, wf, &row_indices, wf_idx, &mut results),
-                    "dense_rank" => self.compute_dense_rank(rows, schema, wf, &row_indices, wf_idx, &mut results),
-                    "sum" => self.compute_sum(rows, schema, wf, &row_indices, wf_idx, &mut results)?,
+                    "rank" => {
+                        self.compute_rank(rows, schema, wf, &row_indices, wf_idx, &mut results)
+                    }
+                    "dense_rank" => self.compute_dense_rank(
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                    ),
+                    "sum" => {
+                        self.compute_sum(rows, schema, wf, &row_indices, wf_idx, &mut results)?
+                    }
                     "count" => self.compute_count(wf, &row_indices, wf_idx, &mut results),
-                    "avg" => self.compute_avg(rows, schema, wf, &row_indices, wf_idx, &mut results)?,
-                    "min" => self.compute_min(rows, schema, wf, &row_indices, wf_idx, &mut results)?,
-                    "max" => self.compute_max(rows, schema, wf, &row_indices, wf_idx, &mut results)?,
-                    "lag" => self.compute_lag(rows, schema, wf, &row_indices, wf_idx, &mut results)?,
-                    "lead" => self.compute_lead(rows, schema, wf, &row_indices, wf_idx, &mut results)?,
-                    "first_value" => self.compute_first_value(rows, schema, wf, &row_indices, wf_idx, &mut results)?,
-                    "last_value" => self.compute_last_value(rows, schema, wf, &row_indices, wf_idx, &mut results)?,
-                    _ => return Err(SqlError::Unsupported(format!("Unsupported window function: {}", wf.func_name)).into()),
+                    "avg" => {
+                        self.compute_avg(rows, schema, wf, &row_indices, wf_idx, &mut results)?
+                    }
+                    "min" => {
+                        self.compute_min(rows, schema, wf, &row_indices, wf_idx, &mut results)?
+                    }
+                    "max" => {
+                        self.compute_max(rows, schema, wf, &row_indices, wf_idx, &mut results)?
+                    }
+                    "lag" => {
+                        self.compute_lag(rows, schema, wf, &row_indices, wf_idx, &mut results)?
+                    }
+                    "lead" => {
+                        self.compute_lead(rows, schema, wf, &row_indices, wf_idx, &mut results)?
+                    }
+                    "first_value" => self.compute_first_value(
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                    )?,
+                    "last_value" => self.compute_last_value(
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                    )?,
+                    _ => {
+                        return Err(SqlError::Unsupported(format!(
+                            "Unsupported window function: {}",
+                            wf.func_name
+                        ))
+                        .into())
+                    }
                 }
             }
         }
@@ -214,7 +259,9 @@ impl WindowOperator {
             let current_values: Vec<Value> = wf
                 .order_by
                 .iter()
-                .map(|o| eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema)).unwrap_or(Value::Null))
+                .map(|o| {
+                    eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema)).unwrap_or(Value::Null)
+                })
                 .collect();
             if let Some(prev) = &prev_values {
                 if !order_by_values_are_peers(prev, &current_values, &wf.order_by) {
@@ -241,7 +288,9 @@ impl WindowOperator {
             let current_values: Vec<Value> = wf
                 .order_by
                 .iter()
-                .map(|o| eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema)).unwrap_or(Value::Null))
+                .map(|o| {
+                    eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema)).unwrap_or(Value::Null)
+                })
                 .collect();
             if let Some(prev) = &prev_values {
                 if !order_by_values_are_peers(prev, &current_values, &wf.order_by) {
@@ -494,8 +543,7 @@ impl WindowOperator {
                     if n < 0 {
                         return Err(anyhow!("LAG offset must be non-negative"));
                     }
-                    usize::try_from(n)
-                        .map_err(|_| anyhow!("LAG offset too large: {}", n))?
+                    usize::try_from(n).map_err(|_| anyhow!("LAG offset too large: {}", n))?
                 }
                 _ => 1,
             },
@@ -543,8 +591,7 @@ impl WindowOperator {
                     if n < 0 {
                         return Err(anyhow!("LEAD offset must be non-negative"));
                     }
-                    usize::try_from(n)
-                        .map_err(|_| anyhow!("LEAD offset too large: {}", n))?
+                    usize::try_from(n).map_err(|_| anyhow!("LEAD offset too large: {}", n))?
                 }
                 _ => 1,
             },

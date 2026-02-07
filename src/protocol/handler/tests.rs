@@ -1,19 +1,19 @@
 use super::*;
+use crate::sql::InFailedSqlTransaction;
+use crate::types::Value;
 use async_trait::async_trait;
 use bytes::Buf;
 use bytes::Bytes;
-use crate::sql::InFailedSqlTransaction;
-use crate::types::Value;
-use pgwire::api::portal::Portal;
 use pgwire::api::portal::Format;
+use pgwire::api::portal::Portal;
 use pgwire::api::query::ExtendedQueryHandler;
 use pgwire::api::results::DataRowEncoder;
 use pgwire::api::stmt::NoopQueryParser;
 use pgwire::api::stmt::QueryParser;
 use pgwire::api::stmt::StoredStatement;
 use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, PgWireConnectionState, Type};
 use pgwire::api::DefaultClient;
+use pgwire::api::{ClientInfo, ClientPortalStore, PgWireConnectionState, Type};
 use pgwire::messages::response::CommandComplete;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -47,10 +47,7 @@ struct RecordingSink {
 impl Sink<PgWireBackendMessage> for RecordingSink {
     type Error = PgWireError;
 
-    fn poll_ready(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_ready(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
@@ -59,17 +56,11 @@ impl Sink<PgWireBackendMessage> for RecordingSink {
         Ok(())
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -173,7 +164,8 @@ fn test_sqlstate_for_executor_error() {
     assert_eq!(sqlstate_for_executor_error(&rel_not_found), "42P01");
 
     // Test string-match fallback: unique constraint violation
-    let unique_violation = anyhow::anyhow!("duplicate key value violates unique constraint \"pk_users\"");
+    let unique_violation =
+        anyhow::anyhow!("duplicate key value violates unique constraint \"pk_users\"");
     assert_eq!(sqlstate_for_executor_error(&unique_violation), "23505");
 
     // Test string-match fallback: not-null constraint violation
@@ -414,9 +406,7 @@ async fn execute_honors_max_rows_and_suspends_portal() {
 
     let mut client = TestClient::new();
     client.set_state(PgWireConnectionState::ReadyForQuery);
-    client
-        .portal_store()
-        .put_portal(Arc::new(portal.clone()));
+    client.portal_store().put_portal(Arc::new(portal.clone()));
 
     on_execute_with_tx_status_fix(
         &handler,
@@ -526,7 +516,9 @@ async fn execute_errors_when_suspended_portal_count_exceeds_limit() {
         .expect("execute should suspend");
 
         let msgs = std::mem::take(&mut client.sent);
-        assert!(msgs.iter().any(|m| matches!(m, PgWireBackendMessage::DataRow(_))));
+        assert!(msgs
+            .iter()
+            .any(|m| matches!(m, PgWireBackendMessage::DataRow(_))));
         assert!(msgs
             .iter()
             .any(|m| matches!(m, PgWireBackendMessage::PortalSuspended(_))));
@@ -601,7 +593,10 @@ async fn execute_max_rows_zero_returns_all_rows() {
     .expect("execute");
 
     let msgs = std::mem::take(&mut client.sent);
-    assert!(matches!(msgs.last(), Some(PgWireBackendMessage::CommandComplete(_))));
+    assert!(matches!(
+        msgs.last(),
+        Some(PgWireBackendMessage::CommandComplete(_))
+    ));
     assert_eq!(
         msgs.iter()
             .filter_map(|m| match m {
@@ -716,8 +711,7 @@ fn test_infer_wildcard_multiway_natural_join_dedups_columns() {
     ];
 
     let schema_refs: Vec<&TableSchema> = sources.iter().map(|s| &s.schema).collect();
-    let plan =
-        crate::sql::wildcard::build_join_wildcard_plan(select, &schema_refs).expect("plan");
+    let plan = crate::sql::wildcard::build_join_wildcard_plan(select, &schema_refs).expect("plan");
     assert!(plan.any_merge);
     let names: Vec<String> = plan.columns.into_iter().map(|c| c.name).collect();
     assert_eq!(names, vec!["id", "a1", "b1", "c1"]);
@@ -772,8 +766,7 @@ fn test_infer_wildcard_multiway_using_join_dedups_columns() {
     ];
 
     let schema_refs: Vec<&TableSchema> = sources.iter().map(|s| &s.schema).collect();
-    let plan =
-        crate::sql::wildcard::build_join_wildcard_plan(select, &schema_refs).expect("plan");
+    let plan = crate::sql::wildcard::build_join_wildcard_plan(select, &schema_refs).expect("plan");
     assert!(plan.any_merge);
     let names: Vec<String> = plan.columns.into_iter().map(|c| c.name).collect();
     assert_eq!(names, vec!["id", "a1", "b1", "c1"]);
@@ -804,8 +797,7 @@ fn test_infer_wildcard_natural_join_common_cols_is_case_sensitive() {
     ];
 
     let schema_refs: Vec<&TableSchema> = sources.iter().map(|s| &s.schema).collect();
-    let plan =
-        crate::sql::wildcard::build_join_wildcard_plan(select, &schema_refs).expect("plan");
+    let plan = crate::sql::wildcard::build_join_wildcard_plan(select, &schema_refs).expect("plan");
     assert!(!plan.any_merge);
     let names: Vec<String> = plan.columns.into_iter().map(|c| c.name).collect();
     assert_eq!(names, vec!["Foo", "foo"]);
@@ -961,8 +953,7 @@ fn test_parse_copy_command_no_columns() {
 
 #[test]
 fn test_parse_copy_command_with_public_schema() {
-    let result =
-        DynamicPgHandler::parse_copy_command("COPY public.users (id, name) FROM stdin");
+    let result = DynamicPgHandler::parse_copy_command("COPY public.users (id, name) FROM stdin");
     assert_eq!(
         result,
         Some((
@@ -1202,10 +1193,7 @@ fn test_substitute_placeholders_preserves_dollar_quoted_strings() {
     );
 
     assert_eq!(
-        substitute_placeholders_outside_strings_and_dollar(
-            "SELECT 'it''s $1' AS msg, $1",
-            &values
-        ),
+        substitute_placeholders_outside_strings_and_dollar("SELECT 'it''s $1' AS msg, $1", &values),
         "SELECT 'it''s $1' AS msg, 111"
     );
 }
@@ -1349,13 +1337,10 @@ async fn test_extended_query_notice_respects_client_min_messages() {
         ExecuteResult::CommandComplete { tag: "DROP TABLE" },
     ]);
 
-    let _resp = send_notices_and_get_last_response(
-        &mut client,
-        Some("warning".to_string()),
-        results,
-    )
-    .await
-    .unwrap();
+    let _resp =
+        send_notices_and_get_last_response(&mut client, Some("warning".to_string()), results)
+            .await
+            .unwrap();
 
     assert!(client.messages.is_empty());
 }
@@ -1395,8 +1380,7 @@ fn test_infer_parameter_types_where_clause_defaults_to_text() {
 
 #[test]
 fn test_infer_parameter_types_mixed() {
-    let types =
-        infer_parameter_types("SELECT * FROM users WHERE id = $1 LIMIT $2 OFFSET $3", 3);
+    let types = infer_parameter_types("SELECT * FROM users WHERE id = $1 LIMIT $2 OFFSET $3", 3);
     assert_eq!(types, vec![Type::TEXT, Type::INT8, Type::INT8]);
 }
 
@@ -1557,8 +1541,7 @@ fn test_substitute_parameters_uuid_binary_format_renders_uuid_literal() {
         "SELECT $1".to_string(),
         vec![Type::UUID],
     ));
-    let uuid =
-        uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid");
+    let uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").expect("valid uuid");
     let mut portal: Portal<String> = Portal::default();
     portal.name = "portal".to_string();
     portal.statement = stmt;

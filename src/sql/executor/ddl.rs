@@ -77,7 +77,11 @@ impl Executor {
         _temporary: bool,
     ) -> Result<ExecuteResult> {
         let resolved = names::resolve_ddl_object_name(name, search_path)?;
-        if !self.store().schema_exists(txn, db_id, &resolved.schema).await? {
+        if !self
+            .store()
+            .schema_exists(txn, db_id, &resolved.schema)
+            .await?
+        {
             return Err(anyhow!("schema '{}' does not exist", resolved.schema));
         }
         let table_name = resolved.full;
@@ -120,7 +124,11 @@ impl Executor {
         result: ExecuteResult,
     ) -> Result<ExecuteResult> {
         let resolved = names::resolve_ddl_object_name(target_name, search_path)?;
-        if !self.store().schema_exists(txn, db_id, &resolved.schema).await? {
+        if !self
+            .store()
+            .schema_exists(txn, db_id, &resolved.schema)
+            .await?
+        {
             return Err(anyhow!("schema '{}' does not exist", resolved.schema));
         }
         let table_name = resolved.full;
@@ -158,16 +166,15 @@ impl Executor {
         if_not_exists: bool,
         predicate: Option<&Expr>,
     ) -> Result<ExecuteResult> {
-        let resolved =
-            names::resolve_existing_table_name(
-                self.store().as_ref(),
-                txn,
-                db_id,
-                table_name,
-                search_path,
-            )
-                .await?
-                .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
+        let resolved = names::resolve_existing_table_name(
+            self.store().as_ref(),
+            txn,
+            db_id,
+            table_name,
+            search_path,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
         let tbl_name = resolved.full;
         let (idx_schema_opt, idx_name_str) = names::split_object_name(idx_name)?;
         if let Some(idx_schema) = idx_schema_opt {
@@ -247,13 +254,13 @@ impl Executor {
                 }
             }
 
-            let table_name = match pick_drop_index_target(explicit_schema, search_path, &matching_tables)
-            {
-                Ok(table_name) => table_name,
-                Err(DropIndexResolutionError::Ambiguous) => {
-                    return Err(anyhow!("Index '{}' is ambiguous", idx_name));
-                }
-            };
+            let table_name =
+                match pick_drop_index_target(explicit_schema, search_path, &matching_tables) {
+                    Ok(table_name) => table_name,
+                    Err(DropIndexResolutionError::Ambiguous) => {
+                        return Err(anyhow!("Index '{}' is ambiguous", idx_name));
+                    }
+                };
 
             let Some(table_name) = table_name else {
                 if if_exists {

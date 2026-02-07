@@ -20,13 +20,13 @@ pub(crate) fn contains(container: &JsonValue, containee: &JsonValue) -> bool {
                 Some(container_val) => contains(container_val, containee_val),
                 None => false,
             }),
-        (JsonValue::Array(container_arr), JsonValue::Array(containee_arr)) => containee_arr
-            .iter()
-            .all(|containee_elem| {
+        (JsonValue::Array(container_arr), JsonValue::Array(containee_arr)) => {
+            containee_arr.iter().all(|containee_elem| {
                 container_arr
                     .iter()
                     .any(|container_elem| contains(container_elem, containee_elem))
-            }),
+            })
+        }
         _ => scalar_eq(container, containee),
     }
 }
@@ -154,7 +154,10 @@ mod tests {
     fn contains_objects_nested() {
         assert!(contains(&j(r#"{"a":1,"b":2}"#), &j(r#"{"a":1}"#)));
         assert!(!contains(&j(r#"{"a":1}"#), &j(r#"{"a":1,"b":2}"#)));
-        assert!(contains(&j(r#"{"a":{"b":1,"c":2}}"#), &j(r#"{"a":{"b":1}}"#)));
+        assert!(contains(
+            &j(r#"{"a":{"b":1,"c":2}}"#),
+            &j(r#"{"a":{"b":1}}"#)
+        ));
         assert!(contains(&j(r#"{"a":{"b":1}}"#), &j(r#"{"a":{}}"#)));
     }
 
@@ -164,10 +167,7 @@ mod tests {
         assert!(!contains(&j(r#"[1,2]"#), &j(r#"[1,2,3]"#)));
 
         // Recursive containment for array elements (PostgreSQL jsonb semantics).
-        assert!(contains(
-            &j(r#"[{"a":1,"b":2}]"#),
-            &j(r#"[{"a":1}]"#)
-        ));
+        assert!(contains(&j(r#"[{"a":1,"b":2}]"#), &j(r#"[{"a":1}]"#)));
     }
 
     #[test]

@@ -1,8 +1,8 @@
+use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::plpgsql;
 use crate::sql::{parse_sql, ExecuteResult};
 use crate::types::{FunctionDef, Row, TableSchema, Value};
-use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, ObjectName, TableAlias};
 use std::collections::HashMap;
@@ -69,22 +69,22 @@ impl Executor {
                 return Ok(None);
             }
 
-        let call_args = eval_function_args(args)?;
+            let call_args = eval_function_args(args)?;
 
-        let expected_arity = func_def.arg_types.len();
-        let actual_arity = call_args.len();
-        if actual_arity != expected_arity {
-            return Err(anyhow!(
-                "function {}() requires {} argument{}, but {} {} provided",
-                full_name.rsplit('.').next().unwrap_or(&full_name),
-                expected_arity,
-                if expected_arity == 1 { "" } else { "s" },
-                actual_arity,
-                if actual_arity == 1 { "was" } else { "were" },
-            ));
-        }
+            let expected_arity = func_def.arg_types.len();
+            let actual_arity = call_args.len();
+            if actual_arity != expected_arity {
+                return Err(anyhow!(
+                    "function {}() requires {} argument{}, but {} {} provided",
+                    full_name.rsplit('.').next().unwrap_or(&full_name),
+                    expected_arity,
+                    if expected_arity == 1 { "" } else { "s" },
+                    actual_arity,
+                    if actual_arity == 1 { "was" } else { "were" },
+                ));
+            }
 
-        let result = execute_sql_table_function(
+            let result = execute_sql_table_function(
                 self,
                 txn,
                 db_id,
@@ -107,9 +107,17 @@ fn eval_function_args(args: &[FunctionArg]) -> Result<Vec<Value>> {
             FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
             FunctionArg::Named { arg, .. } => match arg {
                 FunctionArgExpr::Expr(e) => e,
-                _ => return Err(SqlError::Unsupported("Unsupported function argument type".into()).into()),
+                _ => {
+                    return Err(
+                        SqlError::Unsupported("Unsupported function argument type".into()).into(),
+                    )
+                }
             },
-            _ => return Err(SqlError::Unsupported("Unsupported function argument type".into()).into()),
+            _ => {
+                return Err(
+                    SqlError::Unsupported("Unsupported function argument type".into()).into(),
+                )
+            }
         };
         let val = eval_expr(expr, None, None)?;
         values.push(val);

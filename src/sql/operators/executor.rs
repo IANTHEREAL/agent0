@@ -16,8 +16,7 @@ fn build_query_ctx_from_task_locals() -> QueryContext {
 
     QueryContext::new(
         get_connection_id_value(),
-        get_current_database_name()
-            .unwrap_or_else(|| Arc::from("postgres")),
+        get_current_database_name().unwrap_or_else(|| Arc::from("postgres")),
         statement_timestamp_millis_or_now(),
         crate::session_context::current_timezone(),
     )

@@ -8,15 +8,18 @@ use super::params::{
     count_sql_parameters, dummy_sql_expr_for_param_type, infer_parameter_types,
     substitute_parameters, substitute_placeholders_outside_strings_and_dollar,
 };
-use super::portal::{on_execute_with_tx_status_fix, on_query_with_tx_status_fix, SuspendedPortalState};
+use super::portal::{
+    on_execute_with_tx_status_fix, on_query_with_tx_status_fix, SuspendedPortalState,
+};
 use super::query_parser::strip_leading_whitespace_and_comments;
 use super::tenant::parse_tenant_username;
 use super::{
     client_allows_notice, count_placeholders_in_expr, extract_placeholder_index_from_expr,
     infer_result_fields_from_query_ast, infer_types_from_expr, parse_startup_options,
-    rollback_autocommit_or_mark_failed, resolve_copy_columns, resolve_table_for_insert,
-    send_notices_and_get_last_response, stub_describe_field, CopyContext, CONNECTION_ID_COUNTER,
-    METADATA_ACTUAL_USER, METADATA_KEYSPACE, PgServerParameterProvider, TipgQueryParser,
+    resolve_copy_columns, resolve_table_for_insert, rollback_autocommit_or_mark_failed,
+    send_notices_and_get_last_response, stub_describe_field, CopyContext,
+    PgServerParameterProvider, TipgQueryParser, CONNECTION_ID_COUNTER, METADATA_ACTUAL_USER,
+    METADATA_KEYSPACE,
 };
 use crate::auth::AuthManager;
 use crate::observability;
@@ -536,9 +539,8 @@ impl DynamicPgHandler {
         }
 
         // Regex: COPY [schema.]table_name (col1, col2, ...) FROM stdin
-        let re =
-            regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin")
-                .ok()?;
+        let re = regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*\(([^)]+)\)\s+FROM\s+stdin")
+            .ok()?;
         if let Some(caps) = re.captures(query) {
             let schema = caps.get(1).map(|m| m.as_str().to_string());
             let table = caps.get(2)?.as_str().to_string();
@@ -1374,62 +1376,63 @@ impl CopyHandler for DynamicPgHandler {
                 if final_line_bytes.as_slice() == b"\\." {
                     ctx.reached_end_marker = true;
                 } else if !ctx.reached_end_marker {
-                let line = String::from_utf8_lossy(&final_line_bytes);
-                let values: Vec<&str> = line.split('\t').collect();
+                    let line = String::from_utf8_lossy(&final_line_bytes);
+                    let values: Vec<&str> = line.split('\t').collect();
 
-                if values.len() != ctx.columns.len() {
-                    rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
-                    return Err(copy_row_column_mismatch_error(
-                        values.len(),
-                        ctx.columns.len(),
-                    ));
-                }
+                    if values.len() != ctx.columns.len() {
+                        rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
+                        return Err(copy_row_column_mismatch_error(
+                            values.len(),
+                            ctx.columns.len(),
+                        ));
+                    }
 
-                let mut col_values: Vec<(String, Value)> = Vec::with_capacity(ctx.columns.len());
-                for ((col_name, col_type), val) in ctx
-                    .columns
-                    .iter()
-                    .zip(ctx.column_types.iter())
-                    .zip(values.iter())
-                {
-                    let value = if *val == "\\N" {
-                        Value::Null
-                    } else if let Some(dt) = col_type.as_ref() {
-                        executor.parse_value_for_copy(val, dt).map_err(|e| {
-                            PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_string(),
-                                "22P02".to_string(),
-                                e.to_string(),
-                            )))
-                        })?
-                    } else {
-                        Value::Text(val.to_string())
-                    };
-                    col_values.push((col_name.clone(), value));
-                }
+                    let mut col_values: Vec<(String, Value)> =
+                        Vec::with_capacity(ctx.columns.len());
+                    for ((col_name, col_type), val) in ctx
+                        .columns
+                        .iter()
+                        .zip(ctx.column_types.iter())
+                        .zip(values.iter())
+                    {
+                        let value = if *val == "\\N" {
+                            Value::Null
+                        } else if let Some(dt) = col_type.as_ref() {
+                            executor.parse_value_for_copy(val, dt).map_err(|e| {
+                                PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "22P02".to_string(),
+                                    e.to_string(),
+                                )))
+                            })?
+                        } else {
+                            Value::Text(val.to_string())
+                        };
+                        col_values.push((col_name.clone(), value));
+                    }
 
-                let savepoints = session.savepoints();
-                let insert_res = crate::txn::with_savepoints(savepoints, async {
-                    executor
-                        .execute_copy_insert(session, &ctx.table_name, col_values)
-                        .await
-                        .map_err(|e| {
-                            error!("COPY insert error: {}", e);
-                            PgWireError::UserError(Box::new(ErrorInfo::new(
-                                "ERROR".to_string(),
-                                "XX000".to_string(),
-                                e.to_string(),
-                            )))
-                        })
-                })
-                .await;
+                    let savepoints = session.savepoints();
+                    let insert_res = crate::txn::with_savepoints(savepoints, async {
+                        executor
+                            .execute_copy_insert(session, &ctx.table_name, col_values)
+                            .await
+                            .map_err(|e| {
+                                error!("COPY insert error: {}", e);
+                                PgWireError::UserError(Box::new(ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "XX000".to_string(),
+                                    e.to_string(),
+                                )))
+                            })
+                    })
+                    .await;
 
-                if let Err(e) = insert_res {
-                    rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
-                    return Err(e);
-                }
+                    if let Err(e) = insert_res {
+                        rollback_autocommit_or_mark_failed(session, ctx.started_txn).await;
+                        return Err(e);
+                    }
 
-                ctx.row_count = ctx.row_count.saturating_add(1);
+                    ctx.row_count = ctx.row_count.saturating_add(1);
                 }
             }
 

@@ -128,10 +128,7 @@ mod tests {
     #[test]
     fn test_parse_timezone_offset_seconds_numeric_offsets() {
         assert_eq!(parse_timezone_offset_seconds("+08:00").unwrap(), 8 * 3600);
-        assert_eq!(
-            parse_timezone_offset_seconds("-05:00").unwrap(),
-            -5 * 3600
-        );
+        assert_eq!(parse_timezone_offset_seconds("-05:00").unwrap(), -5 * 3600);
         assert_eq!(parse_timezone_offset_seconds("+8").unwrap(), 8 * 3600);
         assert_eq!(parse_timezone_offset_seconds("-0").unwrap(), 0);
     }
@@ -142,4 +139,3 @@ mod tests {
         assert!(err.to_string().contains("unknown time zone"));
     }
 }
-

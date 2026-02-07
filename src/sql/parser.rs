@@ -1235,7 +1235,11 @@ fn rewrite_at_time_zone_placeholders(sql: &str) -> String {
             continue;
         }
 
-        replacements.push((tok.start, tokens[j + 1].end, "AT TIME ZONE 'UTC'".to_string()));
+        replacements.push((
+            tok.start,
+            tokens[j + 1].end,
+            "AT TIME ZONE 'UTC'".to_string(),
+        ));
         idx = j + 2;
     }
 
@@ -1310,7 +1314,11 @@ fn collect_reset_role_rewrite(
         return;
     }
 
-    replacements.push((tokens[idx].start, tokens[j].end, "SET ROLE NONE".to_string()));
+    replacements.push((
+        tokens[idx].start,
+        tokens[j].end,
+        "SET ROLE NONE".to_string(),
+    ));
 }
 fn find_keyword_outside_strings(query: &str, keyword: &str) -> Option<usize> {
     let bytes = query.as_bytes();
@@ -1543,8 +1551,7 @@ mod tests {
 
     #[test]
     fn test_parse_at_time_zone_placeholder() {
-        let stmts =
-            parse_sql("SELECT TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE $1").unwrap();
+        let stmts = parse_sql("SELECT TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE $1").unwrap();
         assert_eq!(stmts.len(), 1);
     }
 

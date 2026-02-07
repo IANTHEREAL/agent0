@@ -246,18 +246,12 @@ mod tests {
         let keys1 = vec![Value::Int32(1)];
         let keys2 = vec![Value::Int32(2)];
 
-        assert_eq!(
-            sort.compare_keys(&keys1, &keys2),
-            std::cmp::Ordering::Less
-        );
+        assert_eq!(sort.compare_keys(&keys1, &keys2), std::cmp::Ordering::Less);
         assert_eq!(
             sort.compare_keys(&keys2, &keys1),
             std::cmp::Ordering::Greater
         );
-        assert_eq!(
-            sort.compare_keys(&keys1, &keys1),
-            std::cmp::Ordering::Equal
-        );
+        assert_eq!(sort.compare_keys(&keys1, &keys1), std::cmp::Ordering::Equal);
     }
 
     #[test]
@@ -283,10 +277,7 @@ mod tests {
             sort.compare_keys(&keys1, &keys2),
             std::cmp::Ordering::Greater
         );
-        assert_eq!(
-            sort.compare_keys(&keys2, &keys1),
-            std::cmp::Ordering::Less
-        );
+        assert_eq!(sort.compare_keys(&keys2, &keys1), std::cmp::Ordering::Less);
     }
 
     #[test]

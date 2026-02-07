@@ -2,13 +2,13 @@
 //!
 //! Extracted from join.rs during Phase 2 refactoring (B.2a).
 
-use super::super::names::normalize_ident;
 use super::super::information_schema::VirtualTableFilter;
 use super::super::names;
+use super::super::names::normalize_ident;
 use super::super::{parse_sql, ExecuteResult};
 use super::core::Executor;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use crate::sql::error::SqlError;
+use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Ident, Query, Statement};
 use std::cell::RefCell;
@@ -864,12 +864,7 @@ impl Executor {
 
         let max_rows = max_generate_series_rows();
         let (values, data_type) = generate_series_values_limited(
-            &start_val,
-            &stop_val,
-            &step_val,
-            offset,
-            limit,
-            max_rows,
+            &start_val, &stop_val, &step_val, offset, limit, max_rows,
         )?;
 
         let col_name = if let Some(ta) = table_alias {
@@ -1060,14 +1055,14 @@ pub(crate) fn generate_series_values_limited(
     let mut remaining = limit.unwrap_or(usize::MAX);
 
     match (start, stop) {
-	        (Value::Int32(s), Value::Int32(e)) => {
-	            let step_val = match step {
-	                Value::Null => 1,
-	                Value::Int32(st) => *st,
-	                Value::Int64(st) => i32::try_from(*st)
-	                    .map_err(|_| anyhow!("step out of range for integer generate_series"))?,
-	                _ => return Err(anyhow!("Invalid step type for integer generate_series")),
-	            };
+        (Value::Int32(s), Value::Int32(e)) => {
+            let step_val = match step {
+                Value::Null => 1,
+                Value::Int32(st) => *st,
+                Value::Int64(st) => i32::try_from(*st)
+                    .map_err(|_| anyhow!("step out of range for integer generate_series"))?,
+                _ => return Err(anyhow!("Invalid step type for integer generate_series")),
+            };
             if step_val == 0 {
                 return Err(anyhow!("step size cannot equal zero"));
             }
@@ -1075,16 +1070,16 @@ pub(crate) fn generate_series_values_limited(
                 return Ok((Vec::new(), DataType::Int32));
             }
 
-	            let mut current = *s;
-	            if offset > 0 {
-	                let offset_i128 = offset as i128;
-	                let delta_i128 = i128::from(step_val) * offset_i128;
-	                let current_i128 = i128::from(*s) + delta_i128;
-	                let Ok(cur) = i32::try_from(current_i128) else {
-	                    return Ok((Vec::new(), DataType::Int32));
-	                };
-	                current = cur;
-	            }
+            let mut current = *s;
+            if offset > 0 {
+                let offset_i128 = offset as i128;
+                let delta_i128 = i128::from(step_val) * offset_i128;
+                let current_i128 = i128::from(*s) + delta_i128;
+                let Ok(cur) = i32::try_from(current_i128) else {
+                    return Ok((Vec::new(), DataType::Int32));
+                };
+                current = cur;
+            }
 
             let mut values = Vec::new();
             if step_val > 0 {
@@ -1120,13 +1115,13 @@ pub(crate) fn generate_series_values_limited(
             }
             Ok((values, DataType::Int32))
         }
-	        (Value::Int64(s), Value::Int64(e)) => {
-	            let step_val = match step {
-	                Value::Null => 1i64,
-	                Value::Int32(st) => *st as i64,
-	                Value::Int64(st) => *st,
-	                _ => return Err(anyhow!("Invalid step type for bigint generate_series")),
-	            };
+        (Value::Int64(s), Value::Int64(e)) => {
+            let step_val = match step {
+                Value::Null => 1i64,
+                Value::Int32(st) => *st as i64,
+                Value::Int64(st) => *st,
+                _ => return Err(anyhow!("Invalid step type for bigint generate_series")),
+            };
             if step_val == 0 {
                 return Err(anyhow!("step size cannot equal zero"));
             }
@@ -1134,16 +1129,16 @@ pub(crate) fn generate_series_values_limited(
                 return Ok((Vec::new(), DataType::Int64));
             }
 
-	            let mut current = *s;
-	            if offset > 0 {
-	                let offset_i128 = offset as i128;
-	                let delta_i128 = i128::from(step_val) * offset_i128;
-	                let current_i128 = i128::from(*s) + delta_i128;
-	                let Ok(cur) = i64::try_from(current_i128) else {
-	                    return Ok((Vec::new(), DataType::Int64));
-	                };
-	                current = cur;
-	            }
+            let mut current = *s;
+            if offset > 0 {
+                let offset_i128 = offset as i128;
+                let delta_i128 = i128::from(step_val) * offset_i128;
+                let current_i128 = i128::from(*s) + delta_i128;
+                let Ok(cur) = i64::try_from(current_i128) else {
+                    return Ok((Vec::new(), DataType::Int64));
+                };
+                current = cur;
+            }
 
             let mut values = Vec::new();
             if step_val > 0 {
@@ -1179,7 +1174,7 @@ pub(crate) fn generate_series_values_limited(
             }
             Ok((values, DataType::Int64))
         }
-	        (Value::Int32(_), Value::Int64(_)) | (Value::Int64(_), Value::Int32(_)) => {
+        (Value::Int32(_), Value::Int64(_)) | (Value::Int64(_), Value::Int32(_)) => {
             let s64 = match start {
                 Value::Int32(v) => *v as i64,
                 Value::Int64(v) => *v,
@@ -1203,16 +1198,16 @@ pub(crate) fn generate_series_values_limited(
                 return Ok((Vec::new(), DataType::Int64));
             }
 
-	            let mut current = s64;
-	            if offset > 0 {
-	                let offset_i128 = offset as i128;
-	                let delta_i128 = i128::from(step_val) * offset_i128;
-	                let current_i128 = i128::from(s64) + delta_i128;
-	                let Ok(cur) = i64::try_from(current_i128) else {
-	                    return Ok((Vec::new(), DataType::Int64));
-	                };
-	                current = cur;
-	            }
+            let mut current = s64;
+            if offset > 0 {
+                let offset_i128 = offset as i128;
+                let delta_i128 = i128::from(step_val) * offset_i128;
+                let current_i128 = i128::from(s64) + delta_i128;
+                let Ok(cur) = i64::try_from(current_i128) else {
+                    return Ok((Vec::new(), DataType::Int64));
+                };
+                current = cur;
+            }
 
             let mut values = Vec::new();
             if step_val > 0 {
@@ -1303,32 +1298,32 @@ pub(crate) fn generate_series_values_limited(
                             current = next;
                         }
                     }
-	                } else {
-	                    if step_val > 0.0 {
-	                        if current < *e {
-	                            let next = current + step_val;
-	                            if next == current {
-	                                return Err(anyhow!(
-	                                    "generate_series step is too small to make progress for float8"
-	                                ));
-	                            }
-	                        }
-	                    } else {
-	                        if current > *e {
-	                            let next = current + step_val;
-	                            if next == current {
-	                                return Err(anyhow!(
-	                                    "generate_series step is too small to make progress for float8"
-	                                ));
-	                            }
-	                        }
-	                    }
+                } else {
+                    if step_val > 0.0 {
+                        if current < *e {
+                            let next = current + step_val;
+                            if next == current {
+                                return Err(anyhow!(
+                                    "generate_series step is too small to make progress for float8"
+                                ));
+                            }
+                        }
+                    } else {
+                        if current > *e {
+                            let next = current + step_val;
+                            if next == current {
+                                return Err(anyhow!(
+                                    "generate_series step is too small to make progress for float8"
+                                ));
+                            }
+                        }
+                    }
 
-	                    let prev = step_val.mul_add((offset - 1) as f64, current);
-	                    if step_val > 0.0 {
-	                        if prev >= *e {
-	                            return Ok((Vec::new(), DataType::Float64));
-	                        }
+                    let prev = step_val.mul_add((offset - 1) as f64, current);
+                    if step_val > 0.0 {
+                        if prev >= *e {
+                            return Ok((Vec::new(), DataType::Float64));
+                        }
                     } else {
                         if prev <= *e {
                             return Ok((Vec::new(), DataType::Float64));
@@ -1412,7 +1407,7 @@ pub(crate) fn generate_series_values_limited(
                 Ok((values, DataType::Float64))
             }
         }
-	        (Value::Timestamp(s), Value::Timestamp(e)) => {
+        (Value::Timestamp(s), Value::Timestamp(e)) => {
             let step_interval = match step {
                 Value::Interval(iv) => iv.clone(),
                 _ => {
@@ -1430,16 +1425,16 @@ pub(crate) fn generate_series_values_limited(
                 return Ok((Vec::new(), DataType::Timestamp));
             }
 
-	            let mut current = *s;
-	            if offset > 0 {
-	                let offset_i128 = offset as i128;
-	                let delta_i128 = i128::from(step_ms) * offset_i128;
-	                let current_i128 = i128::from(*s) + delta_i128;
-	                let Ok(cur) = i64::try_from(current_i128) else {
-	                    return Ok((Vec::new(), DataType::Timestamp));
-	                };
-	                current = cur;
-	            }
+            let mut current = *s;
+            if offset > 0 {
+                let offset_i128 = offset as i128;
+                let delta_i128 = i128::from(step_ms) * offset_i128;
+                let current_i128 = i128::from(*s) + delta_i128;
+                let Ok(cur) = i64::try_from(current_i128) else {
+                    return Ok((Vec::new(), DataType::Timestamp));
+                };
+                current = cur;
+            }
 
             let mut values = Vec::new();
             if step_ms > 0 {
@@ -1603,8 +1598,8 @@ pub(crate) fn generate_series_values_limited(
 
                     let mut current = crate::types::date::date_days_to_naive_date(*s)?;
                     let stop = crate::types::date::date_days_to_naive_date(*e)?;
-                    let step_forward = step_interval.months > 0
-                        || (step_interval.months == 0 && step_days > 0);
+                    let step_forward =
+                        step_interval.months > 0 || (step_interval.months == 0 && step_days > 0);
 
                     if offset > 0 {
                         for _ in 0..offset {
@@ -1615,55 +1610,57 @@ pub(crate) fn generate_series_values_limited(
                         }
                     }
 
-	                    if step_forward {
-	                        while current <= stop {
-	                            if remaining == 0 {
-	                                break;
-	                            }
-	                            if values.len() >= max_rows {
-	                                return Err(too_many_rows());
-	                            }
-	                            values.push(Value::Timestamp(naive_date_midnight_timestamptz(current)?));
-	                            remaining = remaining.saturating_sub(1);
-	                            if current == stop {
-	                                break;
-	                            }
-	                            let next = match apply_step(current) {
-	                                Some(next) => next,
-	                                None => break,
-	                            };
-	                            if next <= current {
-	                                return Err(anyhow!(
+                    if step_forward {
+                        while current <= stop {
+                            if remaining == 0 {
+                                break;
+                            }
+                            if values.len() >= max_rows {
+                                return Err(too_many_rows());
+                            }
+                            values
+                                .push(Value::Timestamp(naive_date_midnight_timestamptz(current)?));
+                            remaining = remaining.saturating_sub(1);
+                            if current == stop {
+                                break;
+                            }
+                            let next = match apply_step(current) {
+                                Some(next) => next,
+                                None => break,
+                            };
+                            if next <= current {
+                                return Err(anyhow!(
                                     "generate_series interval step does not make forward progress for date"
                                 ));
                             }
                             current = next;
                         }
-	                    } else {
-	                        while current >= stop {
-	                            if remaining == 0 {
-	                                break;
-	                            }
-	                            if values.len() >= max_rows {
-	                                return Err(too_many_rows());
-	                            }
-	                            values.push(Value::Timestamp(naive_date_midnight_timestamptz(current)?));
-	                            remaining = remaining.saturating_sub(1);
-	                            if current == stop {
-	                                break;
-	                            }
-	                            let next = match apply_step(current) {
-	                                Some(next) => next,
-	                                None => break,
-	                            };
-	                            if next >= current {
-	                                return Err(anyhow!(
+                    } else {
+                        while current >= stop {
+                            if remaining == 0 {
+                                break;
+                            }
+                            if values.len() >= max_rows {
+                                return Err(too_many_rows());
+                            }
+                            values
+                                .push(Value::Timestamp(naive_date_midnight_timestamptz(current)?));
+                            remaining = remaining.saturating_sub(1);
+                            if current == stop {
+                                break;
+                            }
+                            let next = match apply_step(current) {
+                                Some(next) => next,
+                                None => break,
+                            };
+                            if next >= current {
+                                return Err(anyhow!(
                                     "generate_series interval step does not make backward progress for date"
                                 ));
-	                            }
-	                            current = next;
-	                        }
-	                    }
+                            }
+                            current = next;
+                        }
+                    }
                 }
             } else {
                 let start_ms = date_midnight_timestamptz(*s)?;
@@ -1719,8 +1716,12 @@ pub(crate) fn generate_series_values_limited(
             let step_val = match step {
                 Value::Null => rust_decimal::Decimal::ONE,
                 Value::Numeric(st) => *st,
-                Value::Float64(st) => rust_decimal::Decimal::try_from(*st)
-                    .map_err(|_| SqlError::InvalidInputSyntax { type_name: "numeric".into(), value: st.to_string() })?,
+                Value::Float64(st) => rust_decimal::Decimal::try_from(*st).map_err(|_| {
+                    SqlError::InvalidInputSyntax {
+                        type_name: "numeric".into(),
+                        value: st.to_string(),
+                    }
+                })?,
                 Value::Int32(st) => rust_decimal::Decimal::from(*st),
                 Value::Int64(st) => rust_decimal::Decimal::from(*st),
                 _ => return Err(anyhow!("Invalid step type for numeric generate_series")),
@@ -1953,10 +1954,10 @@ mod tests {
     }
 
     #[test]
-	    fn generate_series_int64_edge_overflow_does_not_loop() {
-	        let (values, ty) = generate_series_values(
-	            &Value::Int64(i64::MAX - 1),
-	            &Value::Int64(i64::MAX),
+    fn generate_series_int64_edge_overflow_does_not_loop() {
+        let (values, ty) = generate_series_values(
+            &Value::Int64(i64::MAX - 1),
+            &Value::Int64(i64::MAX),
             &Value::Int64(1),
         )
         .unwrap();
@@ -1973,32 +1974,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ty, DataType::Int64);
-	        assert_eq!(
-	            values,
-	            vec![Value::Int64(i64::MIN + 1), Value::Int64(i64::MIN)]
-	        );
-	    }
+        assert_eq!(
+            values,
+            vec![Value::Int64(i64::MIN + 1), Value::Int64(i64::MIN)]
+        );
+    }
 
-	    #[test]
-	    #[cfg(target_pointer_width = "64")]
-	    fn generate_series_limited_offset_mul_overflow_still_returns_rows() {
-	        let (values, ty) = generate_series_values_limited(
-	            &Value::Int64(-9_000_000_000_000_000_000i64),
-	            &Value::Int64(9_000_000_000_000_000_000i64),
-	            &Value::Int64(2),
-	            5_000_000_000_000_000_000usize,
-	            Some(1),
-	            10,
-	        )
-	        .unwrap();
-	        assert_eq!(ty, DataType::Int64);
-	        assert_eq!(values, vec![Value::Int64(1_000_000_000_000_000_000i64)]);
-	    }
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn generate_series_limited_offset_mul_overflow_still_returns_rows() {
+        let (values, ty) = generate_series_values_limited(
+            &Value::Int64(-9_000_000_000_000_000_000i64),
+            &Value::Int64(9_000_000_000_000_000_000i64),
+            &Value::Int64(2),
+            5_000_000_000_000_000_000usize,
+            Some(1),
+            10,
+        )
+        .unwrap();
+        assert_eq!(ty, DataType::Int64);
+        assert_eq!(values, vec![Value::Int64(1_000_000_000_000_000_000i64)]);
+    }
 
-	    #[test]
-	    fn generate_series_timestamp_overflow_does_not_loop() {
-	        let (values, ty) = generate_series_values(
-	            &Value::Timestamp(1),
+    #[test]
+    fn generate_series_timestamp_overflow_does_not_loop() {
+        let (values, ty) = generate_series_values(
+            &Value::Timestamp(1),
             &Value::Timestamp(1),
             &Value::Interval(crate::types::IntervalValue::from_millis(i64::MAX)),
         )
@@ -2009,8 +2010,7 @@ mod tests {
 
     #[test]
     fn generate_series_date_overflow_does_not_loop() {
-        let step =
-            Value::Interval(crate::types::IntervalValue::from_millis(i64::MAX));
+        let step = Value::Interval(crate::types::IntervalValue::from_millis(i64::MAX));
         let (values, ty) = generate_series_values(&Value::Date(1), &Value::Date(1), &step).unwrap();
         assert_eq!(ty, DataType::TimestampTz);
 
@@ -2027,7 +2027,9 @@ mod tests {
     fn generate_series_date_sub_day_step_includes_intermediate() {
         let start_days = crate::types::date::parse_date_days("2024-01-01").unwrap();
         let stop_days = crate::types::date::parse_date_days("2024-01-02").unwrap();
-        let step = Value::Interval(crate::types::IntervalValue::from_millis(12 * 60 * 60 * 1000));
+        let step = Value::Interval(crate::types::IntervalValue::from_millis(
+            12 * 60 * 60 * 1000,
+        ));
 
         let (values, ty) = with_session_timezone("America/Los_Angeles", || {
             generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
@@ -2128,7 +2130,9 @@ mod tests {
     fn generate_series_date_interval_does_not_truncate_remainder() {
         let start_days = crate::types::date::parse_date_days("2024-01-01").unwrap();
         let stop_days = crate::types::date::parse_date_days("2024-01-03").unwrap();
-        let step = Value::Interval(crate::types::IntervalValue::from_millis(36 * 60 * 60 * 1000));
+        let step = Value::Interval(crate::types::IntervalValue::from_millis(
+            36 * 60 * 60 * 1000,
+        ));
 
         let (values, ty) = with_session_timezone("America/Los_Angeles", || {
             generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
@@ -2190,7 +2194,11 @@ mod tests {
 
         assert_eq!(
             values,
-            vec![Value::Timestamp(t1), Value::Timestamp(t2), Value::Timestamp(t3)]
+            vec![
+                Value::Timestamp(t1),
+                Value::Timestamp(t2),
+                Value::Timestamp(t3)
+            ]
         );
     }
 
@@ -2198,7 +2206,9 @@ mod tests {
     fn generate_series_date_day_step_across_dst_start_keeps_local_midnight() {
         let start_days = crate::types::date::parse_date_days("2024-03-09").unwrap();
         let stop_days = crate::types::date::parse_date_days("2024-03-11").unwrap();
-        let step = Value::Interval(crate::types::IntervalValue::from_millis(24 * 60 * 60 * 1000));
+        let step = Value::Interval(crate::types::IntervalValue::from_millis(
+            24 * 60 * 60 * 1000,
+        ));
 
         let (values, ty) = with_session_timezone("America/Los_Angeles", || {
             generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
@@ -2230,7 +2240,11 @@ mod tests {
 
         assert_eq!(
             values,
-            vec![Value::Timestamp(t1), Value::Timestamp(t2), Value::Timestamp(t3)]
+            vec![
+                Value::Timestamp(t1),
+                Value::Timestamp(t2),
+                Value::Timestamp(t3)
+            ]
         );
     }
 
@@ -2238,7 +2252,9 @@ mod tests {
     fn generate_series_date_day_step_across_dst_end_keeps_local_midnight() {
         let start_days = crate::types::date::parse_date_days("2024-11-02").unwrap();
         let stop_days = crate::types::date::parse_date_days("2024-11-04").unwrap();
-        let step = Value::Interval(crate::types::IntervalValue::from_millis(24 * 60 * 60 * 1000));
+        let step = Value::Interval(crate::types::IntervalValue::from_millis(
+            24 * 60 * 60 * 1000,
+        ));
 
         let (values, ty) = with_session_timezone("America/Los_Angeles", || {
             generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
@@ -2270,7 +2286,11 @@ mod tests {
 
         assert_eq!(
             values,
-            vec![Value::Timestamp(t1), Value::Timestamp(t2), Value::Timestamp(t3)]
+            vec![
+                Value::Timestamp(t1),
+                Value::Timestamp(t2),
+                Value::Timestamp(t3)
+            ]
         );
     }
 
@@ -2283,9 +2303,8 @@ mod tests {
             -31_i64 * 24 * 60 * 60 * 1000,
         ));
 
-        let err =
-            generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
-                .unwrap_err();
+        let err = generate_series_values(&Value::Date(start_days), &Value::Date(stop_days), &step)
+            .unwrap_err();
         assert!(err
             .to_string()
             .contains("does not make forward progress for date"));
@@ -2321,33 +2340,32 @@ mod tests {
     }
 
     #[test]
-	    fn generate_series_float8_progress_guard_errors_even_with_limit() {
-	        let err = generate_series_values_limited(
-	            &Value::Float64(1e16),
-	            &Value::Float64(1e16 + 1e6),
-	            &Value::Float64(1.0),
-	            0,
-	            Some(1),
-	            10,
-	        )
-	        .unwrap_err();
-	        assert!(err.to_string().contains("too small to make progress"));
-	    }
+    fn generate_series_float8_progress_guard_errors_even_with_limit() {
+        let err = generate_series_values_limited(
+            &Value::Float64(1e16),
+            &Value::Float64(1e16 + 1e6),
+            &Value::Float64(1.0),
+            0,
+            Some(1),
+            10,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("too small to make progress"));
+    }
 
-	    #[test]
-	    fn generate_series_float8_progress_guard_errors_even_with_large_offset() {
-	        let err = generate_series_values_limited(
-	            &Value::Float64(1e16),
-	            &Value::Float64(1e16 + 1e6),
-	            &Value::Float64(1.0),
-	            999_998,
-	            Some(1),
-	            10,
-	        )
-	        .unwrap_err();
-	        assert!(err.to_string().contains("too small to make progress"));
-	    }
-
+    #[test]
+    fn generate_series_float8_progress_guard_errors_even_with_large_offset() {
+        let err = generate_series_values_limited(
+            &Value::Float64(1e16),
+            &Value::Float64(1e16 + 1e6),
+            &Value::Float64(1.0),
+            999_998,
+            Some(1),
+            10,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("too small to make progress"));
+    }
 
     #[test]
     fn generate_series_numeric_max_does_not_panic_or_loop() {

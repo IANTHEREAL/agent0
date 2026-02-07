@@ -1,9 +1,9 @@
-use super::core::Executor;
 use super::super::names;
 use super::super::plpgsql;
 use super::super::{ExecuteResult, Session};
-use crate::types::{FunctionDef, TriggerDef};
+use super::core::Executor;
 use crate::sql::error::SqlError;
+use crate::types::{FunctionDef, TriggerDef};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::ObjectName;
 
@@ -632,7 +632,11 @@ impl Executor {
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
             let resolved = names::resolve_ddl_object_name(&name, search_path)?;
-            if !self.store().schema_exists(txn, db_id, &resolved.schema).await? {
+            if !self
+                .store()
+                .schema_exists(txn, db_id, &resolved.schema)
+                .await?
+            {
                 return Err(anyhow!("schema '{}' does not exist", resolved.schema));
             }
             def.schema = resolved.schema.clone();
@@ -742,16 +746,15 @@ impl Executor {
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
 
-            let table_resolved =
-                names::resolve_existing_table_name(
-                    self.store().as_ref(),
-                    txn,
-                    db_id,
-                    &table,
-                    search_path,
-                )
-                    .await?
-                    .ok_or_else(|| SqlError::RelationNotFound(table.to_string()))?;
+            let table_resolved = names::resolve_existing_table_name(
+                self.store().as_ref(),
+                txn,
+                db_id,
+                &table,
+                search_path,
+            )
+            .await?
+            .ok_or_else(|| SqlError::RelationNotFound(table.to_string()))?;
 
             let func_resolved = names::resolve_existing_function_name(
                 self.store().as_ref(),
@@ -821,15 +824,14 @@ impl Executor {
                 .get_mut_txn_sequence_values_and_search_path()
                 .expect("Transaction must be active");
 
-            let table_resolved =
-                names::resolve_existing_table_name(
-                    self.store().as_ref(),
-                    txn,
-                    db_id,
-                    &table,
-                    search_path,
-                )
-                    .await?;
+            let table_resolved = names::resolve_existing_table_name(
+                self.store().as_ref(),
+                txn,
+                db_id,
+                &table,
+                search_path,
+            )
+            .await?;
             let table_resolved = match table_resolved {
                 Some(resolved) => resolved,
                 None => {

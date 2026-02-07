@@ -67,7 +67,11 @@ fn default_table_priv_owner_from_key(key: &[u8]) -> Option<&[u8]> {
     Some(&rest[..end])
 }
 
-async fn put_default_table_privs(txn: &mut Transaction, key: Vec<u8>, grants: Vec<DefaultTablePrivilegeGrant>) -> Result<()> {
+async fn put_default_table_privs(
+    txn: &mut Transaction,
+    key: Vec<u8>,
+    grants: Vec<DefaultTablePrivilegeGrant>,
+) -> Result<()> {
     if grants.is_empty() {
         txn_delete(txn, key).await?;
         return Ok(());
@@ -149,8 +153,8 @@ pub async fn apply_default_table_privileges_for_new_table(
     owner_role: &str,
     table_full_name: &str,
 ) -> Result<()> {
-    let (table_schema, table_name) =
-        names::parse_full_name(table_full_name).unwrap_or(("public".to_string(), table_full_name.to_string()));
+    let (table_schema, table_name) = names::parse_full_name(table_full_name)
+        .unwrap_or(("public".to_string(), table_full_name.to_string()));
 
     let schema_grants =
         get_default_table_privileges(txn, owner_role, db_id, Some(&table_schema)).await?;
@@ -227,7 +231,10 @@ async fn grant_table_privilege(
 
 /// Remove default privilege entries owned by `role` and drop any grants that
 /// reference `role` as a grantee.
-pub async fn cleanup_default_table_privileges_for_role(txn: &mut Transaction, role: &str) -> Result<()> {
+pub async fn cleanup_default_table_privileges_for_role(
+    txn: &mut Transaction,
+    role: &str,
+) -> Result<()> {
     let prefix = default_table_priv_prefix_for_scan();
     let mut end = prefix.clone();
     end.push(0xFF);
@@ -368,7 +375,12 @@ pub fn parse_alter_default_privileges_sql(sql: &str) -> Result<AlterDefaultPrivi
     expect(&tokens, &mut pos, "PRIVILEGES")?;
 
     let mut target_role: Option<String> = None;
-    if tokens.get(pos).copied().unwrap_or("").eq_ignore_ascii_case("FOR") {
+    if tokens
+        .get(pos)
+        .copied()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("FOR")
+    {
         pos += 1;
         let kind = tokens.get(pos).copied().unwrap_or("");
         if !kind.eq_ignore_ascii_case("ROLE") && !kind.eq_ignore_ascii_case("USER") {
@@ -384,7 +396,11 @@ pub fn parse_alter_default_privileges_sql(sql: &str) -> Result<AlterDefaultPrivi
     }
 
     let mut schemas: Option<Vec<String>> = None;
-    if tokens.get(pos).copied().unwrap_or("").eq_ignore_ascii_case("IN")
+    if tokens
+        .get(pos)
+        .copied()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("IN")
         && tokens
             .get(pos + 1)
             .copied()
@@ -418,7 +434,12 @@ pub fn parse_alter_default_privileges_sql(sql: &str) -> Result<AlterDefaultPrivi
     pos += 1;
 
     let mut privileges: Vec<Privilege> = Vec::new();
-    if tokens.get(pos).copied().unwrap_or("").eq_ignore_ascii_case("ALL") {
+    if tokens
+        .get(pos)
+        .copied()
+        .unwrap_or("")
+        .eq_ignore_ascii_case("ALL")
+    {
         privileges.push(Privilege::All);
         pos += 1;
         if tokens
@@ -469,7 +490,12 @@ pub fn parse_alter_default_privileges_sql(sql: &str) -> Result<AlterDefaultPrivi
         }
 
         let mut with_grant_option = false;
-        if tokens.get(pos).copied().unwrap_or("").eq_ignore_ascii_case("WITH") {
+        if tokens
+            .get(pos)
+            .copied()
+            .unwrap_or("")
+            .eq_ignore_ascii_case("WITH")
+        {
             pos += 1;
             expect(&tokens, &mut pos, "GRANT")?;
             expect(&tokens, &mut pos, "OPTION")?;
@@ -557,7 +583,10 @@ mod tests {
         .unwrap();
         assert_eq!(cmd.schemas, None);
         match cmd.op {
-            AlterDefaultPrivilegesOp::Revoke { privileges, grantees } => {
+            AlterDefaultPrivilegesOp::Revoke {
+                privileges,
+                grantees,
+            } => {
                 assert_eq!(privileges, vec![Privilege::Select]);
                 assert_eq!(grantees, vec!["adp_grantee".to_string()]);
             }
