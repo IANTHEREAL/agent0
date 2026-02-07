@@ -21,9 +21,9 @@ This directory was refactored into submodules to keep responsibilities clearer:
 |------|----------|
 | Add SQL function | `src/sql/expr/functions/` + type inference in `src/sql/types/infer.rs` |
 | Add expression/operator eval | `src/sql/expr/evaluator.rs` + `src/sql/expr/operators.rs` |
-| Modify SELECT / JOIN behavior | `src/sql/executor/select.rs` + `src/sql/operators/` |
+| Modify SELECT / JOIN behavior | `src/sql/executor/select/` + `src/sql/operators/` |
 | Hash join planning/execution | `src/sql/planner.rs` + `src/sql/operators/hash_join.rs` |
-| USING/NATURAL `SELECT *` shaping | `src/sql/wildcard.rs` + `src/sql/executor/select.rs` |
+| USING/NATURAL `SELECT *` shaping | `src/sql/wildcard.rs` + `src/sql/executor/select/` |
 | DDL/DML behavior | `src/sql/ddl.rs` / `src/sql/dml.rs` (and `src/sql/executor/` wrappers) |
 
 ## Tests
