@@ -1,6 +1,8 @@
 //! Unit tests for SELECT executor
 
 use super::*;
+use super::join::JOIN_LOCKING_CLAUSE_UNSUPPORTED;
+use super::pushdown::GenerateSeriesOffsetLimitPushdownPlan;
 
 #[cfg(test)]
 mod join_locking_clause_tests {
