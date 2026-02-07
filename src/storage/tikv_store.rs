@@ -162,11 +162,19 @@ impl PerDatabaseSchemaCache {
 }
 
 pub struct TikvStore {
-    client: Arc<TransactionClient>,
+    client: Option<Arc<TransactionClient>>,
     cache: Arc<RwLock<SchemaCache>>,
 }
 
 impl TikvStore {
+    /// Returns a reference to the TiKV TransactionClient.
+    /// Panics if called on a test stub (client is None).
+    fn client(&self) -> &TransactionClient {
+        self.client
+            .as_ref()
+            .expect("TikvStore: no client (test stub used in production code path?)")
+    }
+
     #[allow(dead_code)]
     pub async fn new(pd_endpoints: Vec<String>) -> Result<Self> {
         Self::new_with_keyspace(pd_endpoints, None).await
@@ -189,7 +197,7 @@ impl TikvStore {
             .context("Failed to connect to TiKV")?;
         info!("Connected to TiKV. Keyspace: {:?}", keyspace);
         let store = Self {
-            client: Arc::new(client),
+            client: Some(Arc::new(client)),
             cache: Arc::new(RwLock::new(SchemaCache::new())),
         };
 
@@ -199,13 +207,26 @@ impl TikvStore {
         Ok(store)
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_stub() -> Arc<Self> {
+        use std::sync::OnceLock;
+        static STUB: OnceLock<Arc<TikvStore>> = OnceLock::new();
+        STUB.get_or_init(|| {
+            Arc::new(Self {
+                client: None,
+                cache: Arc::new(RwLock::new(SchemaCache::new())),
+            })
+        })
+        .clone()
+    }
+
     fn key(&self, key: &[u8]) -> Vec<u8> {
         key.to_vec()
     }
 
     pub async fn begin(&self) -> Result<Transaction> {
         let options = TransactionOptions::new_pessimistic().drop_check(CheckLevel::Warn);
-        self.client
+        self.client()
             .begin_with_options(options)
             .await
             .map_err(|e| anyhow!(e))
@@ -214,7 +235,7 @@ impl TikvStore {
     #[allow(dead_code)]
     pub async fn begin_optimistic(&self) -> Result<Transaction> {
         let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
-        self.client
+        self.client()
             .begin_with_options(options)
             .await
             .map_err(|e| anyhow!(e))
@@ -596,7 +617,7 @@ impl TikvStore {
     pub async fn unsafe_destroy_database_data(&self, db_id: u64) -> Result<()> {
         let (start, end) = encode_database_data_range(db_id);
         let range: BoundRange = (start..end).into();
-        self.client
+        self.client()
             .unsafe_destroy_range(range)
             .await
             .map_err(|e| anyhow!(e))

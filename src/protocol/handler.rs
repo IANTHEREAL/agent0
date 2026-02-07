@@ -1,6 +1,6 @@
 use crate::auth::AuthManager;
 use crate::observability;
-use crate::pool::TikvClientPool;
+use crate::pool::{TenantHandle, TikvClientPool};
 use crate::sql::expr::set_connection_id;
 use crate::sql::types::{TypeContext, TypeInferrer};
 use crate::sql::{ExecuteResult, Executor, InFailedSqlTransaction, Session};
@@ -2364,6 +2364,7 @@ pub struct DynamicPgHandler {
     executor: OnceCell<Arc<Executor>>,
     session: Mutex<Option<Session>>,
     connection_guard: OnceCell<observability::ConnectionGuard>,
+    tenant_handle: OnceCell<TenantHandle>,
     copy_context: Mutex<Option<CopyContext>>,
     suspended_portals: Mutex<HashMap<String, SuspendedPortalState>>,
     query_parser: Arc<TipgQueryParser>,
@@ -2380,6 +2381,7 @@ impl DynamicPgHandler {
             executor: OnceCell::new(),
             session: Mutex::new(None),
             connection_guard: OnceCell::new(),
+            tenant_handle: OnceCell::new(),
             copy_context: Mutex::new(None),
             suspended_portals: Mutex::new(HashMap::new()),
             query_parser: Arc::new(TipgQueryParser::new()),
@@ -2398,6 +2400,7 @@ impl DynamicPgHandler {
             executor: OnceCell::new(),
             session: Mutex::new(None),
             connection_guard: OnceCell::new(),
+            tenant_handle: OnceCell::new(),
             copy_context: Mutex::new(None),
             suspended_portals: Mutex::new(HashMap::new()),
             query_parser: Arc::new(TipgQueryParser::new()),
@@ -2738,9 +2741,13 @@ impl DynamicPgHandler {
         }
 
         let store = if let Some(pool) = &self.client_pool {
-            pool.get_client(Some(effective_keyspace.clone()))
+            let handle = pool
+                .acquire(Some(effective_keyspace.clone()))
                 .await
-                .map_err(|e| format!("Failed to get client from pool: {}", e))?
+                .map_err(|e| format!("Failed to get client from pool: {}", e))?;
+            let s = handle.store().clone();
+            let _ = self.tenant_handle.set(handle);
+            s
         } else {
             let s = TikvStore::new_with_keyspace(
                 self.pd_endpoints.clone(),
