@@ -24,11 +24,13 @@ modules:
     code_entrypoints:
       - path: src/main.rs
         symbols: [main]
-      - path: src/protocol/handler.rs
+      - path: src/protocol/handler/dynamic.rs
         symbols:
           - DynamicPgHandler
           - authenticate_user
-          - parse_tenant_username
+      - path: src/protocol/handler/tenant.rs
+        symbols: [parse_tenant_username]
+      - path: src/protocol/handler/portal.rs
       - path: src/protocol/copy_format.rs
       - path: crates/pgwire/src/api/auth/mod.rs
         symbols: [StartupHandler]
@@ -193,7 +195,7 @@ modules:
       - path: src/auth/rbac.rs
         symbols: [AuthManager]
       - path: src/sql/rbac.rs
-      - path: src/protocol/handler.rs
+      - path: src/protocol/handler/dynamic.rs
         symbols: [authenticate_user]
     gate_tests:
       - ci:.github/workflows/orm-tests.yml/test
@@ -309,7 +311,7 @@ modules:
       - path: src/observability.rs
       - path: src/extensions/http.rs
       - path: src/sql/trigger_worker.rs
-      - path: src/protocol/handler.rs
+      - path: src/protocol/handler/portal.rs
       - path: docs/configuration.md
     gate_tests:
       - ci:.github/workflows/orm-tests.yml/test

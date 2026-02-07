@@ -14,7 +14,7 @@
 ## External Contracts
 - **[Stable] Auth bootstrap: default admin user**
   - On first authentication attempt for a tenant/keyspace, the server MUST bootstrap a default superuser user `admin` with password `admin` if it does not already exist.
-  - Evidence: `src/auth/rbac.rs` (`AuthManager::bootstrap`, `DEFAULT_ADMIN_USER/PASSWORD`), `src/protocol/handler.rs` (`authenticate_user` calls `bootstrap`).
+  - Evidence: `src/auth/rbac.rs` (`AuthManager::bootstrap`, `DEFAULT_ADMIN_USER/PASSWORD`), `src/protocol/handler/dynamic.rs` (`authenticate_user` calls `bootstrap`).
   - Security note: this is a security-sensitive default; changes require DR/ADR per #368.
 
 - **[Stable] Password hashing/verification (persistent)**
@@ -24,7 +24,7 @@
 
 - **[Stable] Login eligibility**
   - Users with `can_login = false` MUST be denied authentication (current behavior: authentication fails with a fatal error).
-  - Evidence: `src/auth/rbac.rs` (`AuthManager::authenticate`), `src/protocol/handler.rs` (`authenticate_user` error path).
+  - Evidence: `src/auth/rbac.rs` (`AuthManager::authenticate`), `src/protocol/handler/dynamic.rs` (`authenticate_user` error path).
 
 - **[Stable] Role/user DDL surface (as implemented)**
   - `CREATE ROLE` MUST create a user record and accept at least: `LOGIN/NOLOGIN`, `PASSWORD`, `SUPERUSER`, `CREATEDB`, `CREATEROLE`, `CONNECTION LIMIT`.
@@ -53,7 +53,7 @@ If you need tenant selection or protocol/security-related env vars, they are def
 - `src/auth/password.rs`
 - `src/auth/rbac.rs` (`AuthManager`, `User`, `Role`, `_sys_user_` / `_sys_role_` prefixes)
 - `src/sql/rbac.rs`
-- `src/protocol/handler.rs` (`authenticate_user`)
+- `src/protocol/handler/dynamic.rs` (`authenticate_user`)
 
 ## Verification (Gates)
 Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
@@ -67,4 +67,3 @@ Gate IDs are defined in `./testing-gates.md` (do not restate semantics here).
 - Any change to password hashing format, auth bootstrap defaults, or superuser-only boundaries MUST update this document and the corresponding module entries in `docs/sot/modules.yaml`.
 - Breaking changes to security defaults require DR/ADR per #368 (impact surface + migration + rollback + verification updates).
 - Reference: https://github.com/c4pt0r/tipg/issues/368
-

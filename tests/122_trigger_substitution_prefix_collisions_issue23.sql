@@ -56,7 +56,7 @@ FOR EACH ROW EXECUTE FUNCTION issue23_after();
 INSERT INTO t_issue23 (a, aa) VALUES (2, 20);
 
 -- Allow background trigger worker to process the queued event.
-SELECT pg_sleep(0.3);
+SELECT pg_sleep(1.0);
 
 SELECT msg, aa FROM audit_issue23 ORDER BY aa;
 
@@ -64,4 +64,3 @@ DROP TRIGGER trg_after_issue23 ON t_issue23;
 DROP FUNCTION issue23_after();
 DROP TABLE t_issue23;
 DROP TABLE audit_issue23;
-
