@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use axum::Router;
+use clap::Parser;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
 
@@ -10,13 +11,39 @@ use pgtikv_admin::services::reconciler::Reconciler;
 use pgtikv_admin::session::SessionManager;
 use pgtikv_admin::{api, db, AppState};
 
+#[derive(Parser)]
+#[command(name = "pgtikv-admin", about = "pg-tikv Admin Portal Server", version)]
+struct Args {
+    /// Listen port
+    #[arg(short, long)]
+    port: Option<u16>,
+
+    /// Bind address
+    #[arg(long)]
+    host: Option<String>,
+
+    /// Database URL (sqlite:// or postgres://)
+    #[arg(short, long)]
+    database_url: Option<String>,
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
         .init();
 
-    let config = Config::from_env();
+    let args = Args::parse();
+    let mut config = Config::from_env();
+    if let Some(port) = args.port {
+        config.api_port = port;
+    }
+    if let Some(host) = args.host {
+        config.api_host = host;
+    }
+    if let Some(url) = args.database_url {
+        config.database_url = url;
+    }
     tracing::info!(
         "Starting pgtikv-admin v2.0.0 on {}:{}",
         config.api_host,
