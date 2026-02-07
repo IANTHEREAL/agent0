@@ -368,8 +368,8 @@ mod tests {
     fn test_abs() {
         assert_eq!(abs(vec![Value::Int32(-5)]).unwrap(), Value::Int32(5));
         assert_eq!(
-            abs(vec![Value::Float64(-3.14)]).unwrap(),
-            Value::Float64(3.14)
+            abs(vec![Value::Float64(-std::f64::consts::PI)]).unwrap(),
+            Value::Float64(std::f64::consts::PI)
         );
     }
 

@@ -1747,7 +1747,7 @@ fn test_l2_distance() {
     let v1 = vec![1.0, 0.0, 0.0];
     let v2 = vec![0.0, 1.0, 0.0];
     let dist = l2_distance(&v1, &v2).unwrap();
-    assert!((dist - 1.414213).abs() < 0.001);
+    assert!((dist - std::f64::consts::SQRT_2).abs() < 0.001);
 
     let v3 = vec![1.0, 2.0, 3.0];
     let v4 = vec![1.0, 2.0, 3.0];
