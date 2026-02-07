@@ -2966,6 +2966,10 @@ impl TikvStore {
 
         txn_put(txn, new_key, serialize_schema(&schema)?).await?;
         txn_delete(txn, old_key).await?;
+
+        self.invalidate_table_cache(db_id).await;
+        self.invalidate_trigger_cache(db_id, old_table).await;
+        self.invalidate_trigger_cache(db_id, new_table).await;
         Ok(())
     }
 

@@ -1,0 +1,6 @@
+phase|table_name
+warmup|t_cache
+(1 row)
+phase|table_name
+after|t_cache2
+(1 row)
