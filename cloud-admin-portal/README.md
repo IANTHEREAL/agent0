@@ -18,7 +18,7 @@ A modern web interface and CLI for managing pg-tikv multi-tenant database instan
 
 ```
 cloud-admin-portal/
-├── backend-rs/              # Rust backend (production)
+├── backend/                 # Rust backend (axum + sqlx)
 │   ├── src/
 │   │   ├── api/             # axum handlers (tenants, users, system, audit)
 │   │   ├── services/        # PD client, pg-tikv client, reconciler
@@ -29,13 +29,14 @@ cloud-admin-portal/
 │   │   ├── main.rs          # pgtikv-admin server binary
 │   │   └── cli.rs           # pgtikv-ctl CLI binary
 │   └── Cargo.toml
-├── backend/                 # Python backend (legacy, tests still valid)
-│   ├── app/
-│   └── tests/
 ├── frontend/                # React TypeScript frontend
 │   └── src/
 ├── deploy/                  # Docker Compose + nginx
-└── scripts/                 # dev.sh, build.sh
+│   ├── docker-compose.yml   # Production deployment
+│   ├── docker-compose.dev.yml # Development (backend in Docker)
+│   ├── nginx/nginx.conf     # Reverse proxy config
+│   └── .env.example         # Environment template
+└── scripts/                 # dev.sh, build.sh, deploy.sh
 ```
 
 ## Quick Start
@@ -43,7 +44,7 @@ cloud-admin-portal/
 ### Build
 
 ```bash
-cd backend-rs
+cd backend
 cargo build --release
 ```
 
@@ -202,28 +203,105 @@ Reconciler: DISABLING(>10min) → DISABLED
 
 ## Development
 
-### Python Backend (Legacy)
+### Backend (Rust)
 
 ```bash
 cd backend
-uv sync
-uv run pytest -v                    # 10 tests
+cargo check                         # Type check
+cargo build --release               # Build both binaries (pgtikv-admin + pgtikv-ctl)
 ```
 
 ### Frontend
 
 ```bash
 cd frontend
+npm install
 npx tsc --noEmit                    # Type check
+npm run dev                         # Development server (http://localhost:5173)
 npm run build                       # Production build
 ```
 
-### Rust Backend
+### Development Mode
+
+Start frontend dev server with API proxy to backend:
 
 ```bash
-cd backend-rs
-cargo check                         # Type check
-cargo build --release               # Build both binaries
+# Terminal 1: Start backend
+cd backend
+cargo run
+
+# Terminal 2: Start frontend (proxies /api to localhost:8090)
+cd frontend
+npm run dev
+```
+
+The Vite dev server proxies `/api` requests to the backend at `http://localhost:8090` (configurable via `VITE_BACKEND_URL`).
+
+## Deployment
+
+### Docker Compose (Production)
+
+The `deploy/` directory provides a production-ready Docker Compose setup with nginx as reverse proxy.
+
+```bash
+# 1. Configure environment
+cd deploy
+cp .env.example .env
+# Edit .env with your configuration (PD endpoints, pg-tikv host/port, etc.)
+
+# 2. Build and start services
+../scripts/build.sh                 # Build frontend + Docker images
+docker-compose up -d                # Start all services
+```
+
+**Services:**
+
+| Service | Description | Port |
+|---------|-------------|------|
+| `nginx` | Reverse proxy, serves frontend static files, proxies `/api` to backend | 80 (443 for HTTPS) |
+| `backend` | Rust API server (`pgtikv-admin`) | 8080 (internal) |
+| `frontend-builder` | Build stage that outputs static files to shared volume | - |
+
+**Architecture:**
+- nginx serves the pre-built React SPA from a shared Docker volume
+- API requests to `/api/*` are proxied to the backend container
+- SPA routing is handled via `try_files $uri $uri/ /index.html`
+- Static assets (JS, CSS, images, fonts) are cached for 1 year with immutable headers
+
+### Using deploy.sh
+
+The `scripts/deploy.sh` script provides common Docker Compose operations:
+
+```bash
+./scripts/deploy.sh start           # Start services (default)
+./scripts/deploy.sh stop            # Stop services
+./scripts/deploy.sh restart         # Restart services
+./scripts/deploy.sh status          # Show service status
+./scripts/deploy.sh logs            # Tail logs (all services)
+./scripts/deploy.sh logs backend    # Tail logs (specific service)
+./scripts/deploy.sh build           # Build + start
+```
+
+### HTTPS Configuration
+
+To enable HTTPS, uncomment the SSL server block in `deploy/nginx/nginx.conf` and mount your certificates:
+
+```yaml
+# In docker-compose.yml, uncomment:
+volumes:
+  - ./ssl:/etc/nginx/ssl:ro
+```
+
+Place `cert.pem` and `key.pem` in `deploy/ssl/`.
+
+### Environment Variables (.env.example)
+
+```bash
+PD_ENDPOINTS=127.0.0.1:2379          # TiKV PD addresses
+PG_HOST=127.0.0.1                    # pg-tikv host (internal backend connections)
+PG_PORT=5433                         # pg-tikv port (internal backend connections)
+PG_PUBLIC_ENDPOINTS=pg.example.com:5433  # Public endpoints for end-user connections
+API_PORT=8080                        # Backend API port
 ```
 
 ## License
