@@ -1,12 +1,9 @@
 use super::super::*;
 use super::table_factor::{
     collect_visible_aliases_in_table_with_joins, duplicate_column_names_lowercase,
-    TransparentNestedJoinInfo,
+    extract_virtual_table_filter, TransparentNestedJoinInfo,
 };
 use super::using_merge::{build_coalesce_for_merge, rewrite_for_using_join, UsingMergeColumn};
-use crate::sql::executor::table_utils::{
-    extract_virtual_table_filter, normalize_virtual_table_filter_for_pushdown,
-};
 
 mod projection;
 
@@ -33,7 +30,6 @@ impl Executor {
             .selection
             .as_ref()
             .map(extract_virtual_table_filter)
-            .map(normalize_virtual_table_filter_for_pushdown)
             .unwrap_or_default();
 
         let resolved_selection = if let Some(sel) = &select.selection {
