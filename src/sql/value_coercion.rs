@@ -1,14 +1,13 @@
-//! Type coercion and data type conversion utilities
+//! Value coercion and literal parsing utilities
 //!
-//! Functions for converting values between types, parsing PostgreSQL literals,
-//! and mapping SQL data types to internal representations.
+//! Functions for converting values between types and parsing PostgreSQL literals.
 
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 
-use sqlparser::ast::{DataType as SqlDataType, Expr};
+use sqlparser::ast::Expr;
 
 use crate::types::{ColumnDef, DataType, Value};
 
@@ -347,110 +346,6 @@ fn parse_array_element(s: &str) -> Value {
     }
 
     Value::Text(s.to_string())
-}
-
-/// Convert a SQL data type to our internal DataType
-pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
-    match sql_type {
-        SqlDataType::Boolean => Ok(DataType::Boolean),
-        SqlDataType::SmallInt(_) | SqlDataType::Int(_) | SqlDataType::Integer(_) => {
-            Ok(DataType::Int32)
-        }
-        SqlDataType::BigInt(_) => Ok(DataType::Int64),
-        SqlDataType::Float(_)
-        | SqlDataType::Double
-        | SqlDataType::DoublePrecision
-        | SqlDataType::Real => Ok(DataType::Float64),
-        SqlDataType::Numeric(info) | SqlDataType::Decimal(info) => {
-            let (precision, scale) = match info {
-                sqlparser::ast::ExactNumberInfo::None => (None, None),
-                // Postgres: NUMERIC(p) implies scale=0
-                sqlparser::ast::ExactNumberInfo::Precision(p) => (Some(*p as u32), Some(0)),
-                sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
-                    (Some(*p as u32), Some(*s as u32))
-                }
-            };
-            if let Some(p) = precision {
-                if p > 28 {
-                    return Err(anyhow!(
-                        "NUMERIC precision {} exceeds supported maximum 28",
-                        p
-                    ));
-                }
-            }
-            if let Some(s) = scale {
-                if s > 28 {
-                    return Err(anyhow!("NUMERIC scale {} exceeds supported maximum 28", s));
-                }
-            }
-            if let (Some(p), Some(s)) = (precision, scale) {
-                if s > p {
-                    return Err(anyhow!(
-                        "NUMERIC scale {} must be between 0 and precision {}",
-                        s,
-                        p
-                    ));
-                }
-            }
-            Ok(DataType::Numeric { precision, scale })
-        }
-        SqlDataType::Varchar(_)
-        | SqlDataType::Text
-        | SqlDataType::String(_)
-        | SqlDataType::Char(_)
-        | SqlDataType::Character(_)
-        | SqlDataType::CharacterVarying(_) => Ok(DataType::Text),
-        SqlDataType::Bytea => Ok(DataType::Bytes),
-        SqlDataType::Timestamp(_, tz) => match tz {
-            sqlparser::ast::TimezoneInfo::WithTimeZone | sqlparser::ast::TimezoneInfo::Tz => {
-                Ok(DataType::TimestampTz)
-            }
-            _ => Ok(DataType::Timestamp),
-        },
-        SqlDataType::Date => Ok(DataType::Date),
-        SqlDataType::Time(_, _) => Ok(DataType::Time),
-        SqlDataType::Interval => Ok(DataType::Interval),
-        SqlDataType::Uuid => Ok(DataType::Uuid),
-        SqlDataType::JSON => Ok(DataType::Json),
-        SqlDataType::Custom(name, modifiers) => {
-            if let Some(ident) = name.0.last() {
-                let type_name = ident.value.to_uppercase();
-                match type_name.as_str() {
-                    "SERIAL" => Ok(DataType::Int32),
-                    "BIGSERIAL" => Ok(DataType::Int64),
-                    "JSON" => Ok(DataType::Json),
-                    "JSONB" => Ok(DataType::Jsonb),
-                    "TIMESTAMPTZ" => Ok(DataType::TimestampTz),
-                    "VECTOR" => {
-                        // Extract dimension from type modifiers if available
-                        // sqlparser parses vector(3) as Custom type with Vec<String> modifiers
-                        let dim = if !modifiers.is_empty() {
-                            // Try to parse first modifier as dimension number
-                            modifiers[0].parse::<u32>().unwrap_or(1536)
-                        } else {
-                            1536 // Default dimension (OpenAI embedding size)
-                        };
-                        Ok(DataType::Vector(dim))
-                    }
-                    "TSVECTOR" => Ok(DataType::Tsvector),
-                    "TSQUERY" => Ok(DataType::Tsquery),
-                    _ => Ok(DataType::Text),
-                }
-            } else {
-                Ok(DataType::Text)
-            }
-        }
-        SqlDataType::Array(inner) => match inner {
-            sqlparser::ast::ArrayElemTypeDef::AngleBracket(inner_type) => {
-                Ok(DataType::Array(Box::new(convert_data_type(inner_type)?)))
-            }
-            sqlparser::ast::ArrayElemTypeDef::SquareBracket(inner_type) => {
-                Ok(DataType::Array(Box::new(convert_data_type(inner_type)?)))
-            }
-            _ => Ok(DataType::Array(Box::new(DataType::Text))),
-        },
-        _ => Err(SqlError::Unsupported(format!("Unsupported data type: {:?}", sql_type)).into()),
-    }
 }
 
 /// Infer the DataType from a Value

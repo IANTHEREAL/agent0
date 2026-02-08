@@ -9,7 +9,6 @@ use sqlparser::ast::{
 };
 use tikv_client::Transaction;
 
-use super::coercion::{coerce_value_for_column, convert_data_type, infer_data_type};
 use super::dml;
 use super::gin;
 use super::index_helpers;
@@ -17,6 +16,8 @@ use super::names;
 use super::names::normalize_ident;
 use super::projection::fill_row_defaults;
 use super::sequences;
+use super::types::try_sql_datatype_to_internal;
+use super::value_coercion::{coerce_value_for_column, infer_data_type};
 use super::{expr::eval_expr, ExecuteResult};
 use crate::storage::TikvStore;
 use crate::txn::{txn_delete, txn_put};
@@ -129,10 +130,6 @@ async fn resolve_column_data_type(
             match type_name.as_str() {
                 "SERIAL" => Ok((DataType::Int32, true)),
                 "BIGSERIAL" => Ok((DataType::Int64, true)),
-                // VECTOR/JSON/JSONB/TSVECTOR/TSQUERY are handled by existing conversion.
-                "VECTOR" | "JSON" | "JSONB" | "TSVECTOR" | "TSQUERY" => {
-                    Ok((convert_data_type(sql_type)?, false))
-                }
                 _ => {
                     let resolved_type = names::resolve_existing_type_name(
                         store.as_ref(),
@@ -143,7 +140,7 @@ async fn resolve_column_data_type(
                     )
                     .await?;
                     let Some(resolved_type) = resolved_type else {
-                        return Ok((convert_data_type(sql_type)?, false));
+                        return Ok((try_sql_datatype_to_internal(sql_type)?, false));
                     };
                     let full_name = resolved_type.full;
                     match store.get_type(txn, db_id, &full_name).await? {
@@ -156,12 +153,12 @@ async fn resolve_column_data_type(
                                 full_name
                             )),
                         },
-                        None => Ok((convert_data_type(sql_type)?, false)),
+                        None => Ok((try_sql_datatype_to_internal(sql_type)?, false)),
                     }
                 }
             }
         }
-        _ => Ok((convert_data_type(sql_type)?, false)),
+        _ => Ok((try_sql_datatype_to_internal(sql_type)?, false)),
     }
 }
 
@@ -907,7 +904,7 @@ pub async fn create_table_from_query_result(
         }));
     } else {
         col_defs.extend(explicit_columns.iter().map(|col| {
-            let data_type = convert_data_type(&col.data_type).unwrap_or(DataType::Text);
+            let data_type = try_sql_datatype_to_internal(&col.data_type).unwrap_or(DataType::Text);
             ColumnDef {
                 name: normalize_ident(&col.name),
                 data_type,

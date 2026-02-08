@@ -395,7 +395,7 @@ fn evaluate_index(
                 .iter()
                 .find(|c| c.name.eq_ignore_ascii_case(col))
             {
-                super::coercion::coerce_value_for_column(pred.value.clone(), col_def)
+                super::value_coercion::coerce_value_for_column(pred.value.clone(), col_def)
                     .unwrap_or_else(|_| pred.value.clone())
             } else {
                 pred.value.clone()

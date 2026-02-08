@@ -10,11 +10,14 @@ mod coercion;
 mod context;
 mod error;
 mod infer;
+mod mapping;
 mod registry;
 
 pub use context::TypeContext;
 pub use error::TypeError;
 pub use infer::TypeInferrer;
+
+pub(crate) use mapping::{sql_datatype_to_internal, try_sql_datatype_to_internal};
 
 // Re-exports for tests
 #[cfg(test)]

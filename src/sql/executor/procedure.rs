@@ -1,6 +1,6 @@
-use super::super::coercion::infer_data_type;
 use super::super::ddl;
 use super::super::names;
+use super::super::value_coercion::infer_data_type;
 use super::super::{parse_sql, ExecuteResult, Session};
 use super::core::Executor;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};

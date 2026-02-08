@@ -1229,7 +1229,7 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
             crate::types::date::date_days_to_timestamp_millis(days).map(Value::Timestamp)
         }
         (Value::Text(s), SqlType::Time(_, _)) => {
-            use crate::sql::coercion::parse_time_string;
+            use crate::sql::value_coercion::parse_time_string;
             parse_time_string(&s)
                 .map(Value::Time)
                 .ok_or_else(|| anyhow!("Invalid time format: {}", s))

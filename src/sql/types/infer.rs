@@ -2,10 +2,7 @@
 
 use std::collections::HashMap;
 
-use sqlparser::ast::{
-    DataType as SqlDataType, Expr, Function, FunctionArg, FunctionArgExpr, Query, SelectItem,
-    SetExpr,
-};
+use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr};
 
 use crate::types::DataType;
 
@@ -96,8 +93,8 @@ impl<'a> TypeInferrer<'a> {
 
             Expr::Value(val) => Ok(self.infer_value(val)),
 
-            Expr::Cast { data_type, .. } => Ok(sql_datatype_to_internal(data_type)),
-            Expr::TypedString { data_type, .. } => Ok(sql_datatype_to_internal(data_type)),
+            Expr::Cast { data_type, .. } => Ok(super::sql_datatype_to_internal(data_type)),
+            Expr::TypedString { data_type, .. } => Ok(super::sql_datatype_to_internal(data_type)),
 
             Expr::Function(f) => self.infer_function(f),
 
@@ -287,76 +284,5 @@ impl<'a> TypeInferrer<'a> {
             SelectItem::Wildcard(_) => Ok(DataType::Text),
             _ => Ok(DataType::Text),
         }
-    }
-}
-
-pub fn sql_datatype_to_internal(dt: &SqlDataType) -> DataType {
-    match dt {
-        SqlDataType::Boolean | SqlDataType::Bool => DataType::Boolean,
-        SqlDataType::SmallInt(_) | SqlDataType::Int2(_) => DataType::Int32,
-        SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => DataType::Int32,
-        SqlDataType::BigInt(_) | SqlDataType::Int8(_) => DataType::Int64,
-        SqlDataType::Real | SqlDataType::Float4 => DataType::Float64,
-        SqlDataType::Double
-        | SqlDataType::DoublePrecision
-        | SqlDataType::Float8
-        | SqlDataType::Float(_) => DataType::Float64,
-        SqlDataType::Numeric(info) | SqlDataType::Decimal(info) => {
-            use sqlparser::ast::ExactNumberInfo;
-            let (precision, scale) = match info {
-                ExactNumberInfo::None => (None, None),
-                ExactNumberInfo::Precision(p) => (Some(*p as u32), Some(0)),
-                ExactNumberInfo::PrecisionAndScale(p, s) => (Some(*p as u32), Some(*s as u32)),
-            };
-            DataType::Numeric { precision, scale }
-        }
-        SqlDataType::Varchar(_)
-        | SqlDataType::Char(_)
-        | SqlDataType::Text
-        | SqlDataType::String(_) => DataType::Text,
-        SqlDataType::Bytea => DataType::Bytes,
-        SqlDataType::Timestamp(_, tz) => match tz {
-            sqlparser::ast::TimezoneInfo::WithTimeZone | sqlparser::ast::TimezoneInfo::Tz => {
-                DataType::TimestampTz
-            }
-            _ => DataType::Timestamp,
-        },
-        SqlDataType::Date => DataType::Date,
-        SqlDataType::Time(_, _) => DataType::Time,
-        SqlDataType::Interval => DataType::Interval,
-        SqlDataType::Uuid => DataType::Uuid,
-        SqlDataType::JSON => DataType::Jsonb,
-        SqlDataType::Array(inner) => {
-            use sqlparser::ast::ArrayElemTypeDef;
-            match inner {
-                ArrayElemTypeDef::AngleBracket(inner_type) => {
-                    DataType::Array(Box::new(sql_datatype_to_internal(inner_type)))
-                }
-                ArrayElemTypeDef::SquareBracket(inner_type) => {
-                    DataType::Array(Box::new(sql_datatype_to_internal(inner_type)))
-                }
-                ArrayElemTypeDef::None => DataType::Array(Box::new(DataType::Text)),
-            }
-        }
-        SqlDataType::Custom(name, _) => {
-            let name_str = name
-                .0
-                .iter()
-                .map(|i| i.value.as_str())
-                .collect::<Vec<_>>()
-                .join(".");
-            match name_str.to_uppercase().as_str() {
-                "SERIAL" => DataType::Int32,
-                "BIGSERIAL" => DataType::Int64,
-                "TIMESTAMPTZ" => DataType::TimestampTz,
-                "JSONB" => DataType::Jsonb,
-                "JSON" => DataType::Json,
-                "TSVECTOR" => DataType::Tsvector,
-                "TSQUERY" => DataType::Tsquery,
-                _ if name_str.to_uppercase().starts_with("VECTOR") => DataType::Vector(0),
-                _ => DataType::UserDefined(name_str),
-            }
-        }
-        _ => DataType::Text,
     }
 }

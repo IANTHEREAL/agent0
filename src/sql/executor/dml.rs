@@ -361,7 +361,7 @@ impl Executor {
                         )?;
                         let col = &schema.columns[col_idx];
                         updated_vals[col_idx] =
-                            super::super::coercion::coerce_value_for_column(raw_val, col)?;
+                            super::super::value_coercion::coerce_value_for_column(raw_val, col)?;
                     }
                     let updated_row = Row::new(updated_vals);
 

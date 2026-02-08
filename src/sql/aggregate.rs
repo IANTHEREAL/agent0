@@ -418,7 +418,7 @@ pub fn eval_having_expr(
         } => {
             let inner_val = eval_having_expr(inner, row, schema, agg_funcs, aggs)?;
             let cast_expr = Expr::Cast {
-                expr: Box::new(super::coercion::value_to_sql_expr(&inner_val)),
+                expr: Box::new(super::value_coercion::value_to_sql_expr(&inner_val)),
                 data_type: data_type.clone(),
                 format: format.clone(),
             };

@@ -1,8 +1,8 @@
 //! Subquery resolution for the SQL executor
 
-use super::super::coercion::value_to_sql_expr;
 use super::super::expr::{coerce_text_literal_to_bool, eval_binary_op_public};
 use super::super::names::normalize_ident;
+use super::super::value_coercion::value_to_sql_expr;
 use super::super::ExecuteResult;
 use super::core::Executor;
 use crate::types::{Row, TableSchema, Value};

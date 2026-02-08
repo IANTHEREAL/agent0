@@ -8,12 +8,12 @@ use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
-use super::coercion::coerce_value_for_column;
 use super::expr::eval_expr;
 use super::gin;
 use super::index_helpers;
 use super::projection::{eval_default_expr, infer_expr_type};
 use super::sequences;
+use super::value_coercion::coerce_value_for_column;
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, IndexDef, Row, TableSchema, Value};
 

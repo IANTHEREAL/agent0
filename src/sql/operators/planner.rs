@@ -27,9 +27,9 @@ use super::{
     BoxedOperator, FilterOperator, IndexScanOperator, LimitOperator, ProjectOperator, SortOperator,
     TableScanOperator,
 };
-use crate::sql::coercion::coerce_value_for_column;
 use crate::sql::expr::eval_expr;
 use crate::sql::planner::{choose_best_access_path_for_filter, ScanType};
+use crate::sql::value_coercion::coerce_value_for_column;
 use crate::storage::TikvStore;
 use crate::types::{DataType, TableSchema, Value};
 

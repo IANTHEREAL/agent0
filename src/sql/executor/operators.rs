@@ -577,7 +577,7 @@ pub(crate) fn eval_having_expr_for_operators(
             let inner_val =
                 eval_having_expr_for_operators(inner, row, schema, agg_exprs, group_by_count)?;
             let cast_expr = Expr::Cast {
-                expr: Box::new(super::super::coercion::value_to_sql_expr(&inner_val)),
+                expr: Box::new(super::super::value_coercion::value_to_sql_expr(&inner_val)),
                 data_type: data_type.clone(),
                 format: format.clone(),
             };

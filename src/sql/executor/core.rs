@@ -2,7 +2,6 @@
 
 use super::super::alter_owner;
 use super::super::alter_sequence_owned_by;
-use super::super::coercion::parse_value_for_copy;
 use super::super::comment_on;
 use super::super::ddl;
 use super::super::dml;
@@ -15,6 +14,7 @@ use super::super::rbac;
 use super::super::sequences;
 use super::super::statement_time;
 use super::super::udt;
+use super::super::value_coercion::parse_value_for_copy;
 use super::super::{parse_sql, ExecuteResult, ExecuteResults, InFailedSqlTransaction, Session};
 use super::triggers::strip_leading_sql_comments;
 use crate::auth::AuthManager;
@@ -484,7 +484,7 @@ fn try_execute_current_setting_select(
 
     let mut output_type = DataType::Text;
     if let Some(cast_to) = cast_to {
-        if let Ok(t) = crate::sql::coercion::convert_data_type(cast_to) {
+        if let Ok(t) = crate::sql::types::try_sql_datatype_to_internal(cast_to) {
             output_type = t;
         } else {
             return Ok(None);

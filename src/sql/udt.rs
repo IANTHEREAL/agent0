@@ -4,9 +4,9 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::{ObjectName, UserDefinedTypeRepresentation};
 use tikv_client::Transaction;
 
-use super::coercion::convert_data_type;
 use super::names;
 use super::names::normalize_ident;
+use super::types::try_sql_datatype_to_internal;
 use super::ExecuteResult;
 use crate::storage::TikvStore;
 use crate::types::{UserTypeDef, UserTypeKind};
@@ -45,7 +45,7 @@ pub async fn execute_create_type(
                         field_name
                     ));
                 }
-                let field_type = convert_data_type(&attr.data_type)?;
+                let field_type = try_sql_datatype_to_internal(&attr.data_type)?;
                 fields.push((field_name, field_type));
             }
             UserTypeKind::Composite { fields }

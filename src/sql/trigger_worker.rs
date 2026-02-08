@@ -1146,7 +1146,7 @@ impl TriggerWorker {
                                         super::expr::eval_expr(&expr, None, None)?
                                     };
 
-                                    let coerced = super::coercion::coerce_value_for_column(
+                                    let coerced = super::value_coercion::coerce_value_for_column(
                                         value,
                                         &schema.columns[idx],
                                     )?;

@@ -12,11 +12,11 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 
 use super::catalog_oids;
-use super::coercion::value_to_sql_expr;
 use super::expr::{eval_expr, eval_join_expr, JoinEvalContext};
 use super::names;
 use super::names::normalize_ident;
 use super::plpgsql;
+use super::value_coercion::value_to_sql_expr;
 use super::ExecuteResult;
 
 pub(crate) fn expr_uses_sequence_functions(expr: &Expr) -> bool {
