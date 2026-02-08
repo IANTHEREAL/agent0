@@ -1,19 +1,23 @@
 -- TPC-C like functional test
 -- Tests: JOINs, AVG, IN, BETWEEN, IS NULL, complex queries
 
+-- Use a dedicated schema to isolate from other integration tests and keep this
+-- case portable to PostgreSQL (avoid non-standard `SHOW TABLES`).
+CREATE SCHEMA IF NOT EXISTS tpcc_basic;
+SET search_path TO tpcc_basic;
+
 -- ============================================================
 -- PART 1: Schema Creation (TPC-C simplified tables)
 -- ============================================================
 
-DROP TABLE IF EXISTS order_line CASCADE;
-DROP TABLE IF EXISTS orders CASCADE;
-DROP TABLE IF EXISTS new_orders CASCADE;
-DROP TABLE IF EXISTS history CASCADE;
-DROP TABLE IF EXISTS customer CASCADE;
-DROP TABLE IF EXISTS stock CASCADE;
-DROP TABLE IF EXISTS item CASCADE;
-DROP TABLE IF EXISTS district CASCADE;
-DROP TABLE IF EXISTS warehouse CASCADE;
+-- Cleanup from prior runs (do not rely on CASCADE).
+DROP TABLE IF EXISTS order_line;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS customer;
+DROP TABLE IF EXISTS stock;
+DROP TABLE IF EXISTS item;
+DROP TABLE IF EXISTS district;
+DROP TABLE IF EXISTS warehouse;
 
 CREATE TABLE warehouse (
     w_id INT PRIMARY KEY,
@@ -116,7 +120,10 @@ CREATE TABLE item (
     i_data TEXT
 );
 
-SHOW TABLES;
+SELECT table_name
+FROM information_schema.tables
+WHERE table_schema = 'tpcc_basic' AND table_type = 'BASE TABLE'
+ORDER BY table_name;
 
 -- ============================================================
 -- PART 2: Data Population
@@ -151,26 +158,26 @@ INSERT INTO stock VALUES (3, 1, 200, 'DIST01', 'DIST02', 800, 80, 8, 'Stock data
 INSERT INTO stock VALUES (1, 2, 75, 'DIST01', 'DIST02', 400, 40, 4, 'Stock data 4');
 
 -- Insert orders
-INSERT INTO orders VALUES (1, 1, 1, 1, 1704067200000, 1, 3, 1);
-INSERT INTO orders VALUES (2, 1, 1, 2, 1704153600000, 2, 2, 1);
-INSERT INTO orders VALUES (3, 1, 1, 1, 1704240000000, NULL, 1, 0);
-INSERT INTO orders VALUES (1, 2, 1, 1, 1704067200000, 1, 2, 1);
+INSERT INTO orders VALUES (1, 1, 1, 1, TIMESTAMP '2024-01-01 00:00:00', 1, 3, 1);
+INSERT INTO orders VALUES (2, 1, 1, 2, TIMESTAMP '2024-01-02 00:00:00', 2, 2, 1);
+INSERT INTO orders VALUES (3, 1, 1, 1, TIMESTAMP '2024-01-03 00:00:00', NULL, 1, 0);
+INSERT INTO orders VALUES (1, 2, 1, 1, TIMESTAMP '2024-01-01 00:00:00', 1, 2, 1);
 
 -- Insert order lines
-INSERT INTO order_line VALUES (1, 1, 1, 1, 1, 1, 1704067200000, 5, 52.50, 'D1INFO');
-INSERT INTO order_line VALUES (1, 1, 1, 2, 2, 1, 1704067200000, 3, 75.00, 'D1INFO');
-INSERT INTO order_line VALUES (1, 1, 1, 3, 3, 1, 1704067200000, 10, 57.50, 'D1INFO');
-INSERT INTO order_line VALUES (2, 1, 1, 1, 4, 1, 1704153600000, 1, 100.00, 'D1INFO');
-INSERT INTO order_line VALUES (2, 1, 1, 2, 5, 1, 1704153600000, 2, 30.50, 'D1INFO');
+INSERT INTO order_line VALUES (1, 1, 1, 1, 1, 1, TIMESTAMP '2024-01-01 00:00:00', 5, 52.50, 'D1INFO');
+INSERT INTO order_line VALUES (1, 1, 1, 2, 2, 1, TIMESTAMP '2024-01-01 00:00:00', 3, 75.00, 'D1INFO');
+INSERT INTO order_line VALUES (1, 1, 1, 3, 3, 1, TIMESTAMP '2024-01-01 00:00:00', 10, 57.50, 'D1INFO');
+INSERT INTO order_line VALUES (2, 1, 1, 1, 4, 1, TIMESTAMP '2024-01-02 00:00:00', 1, 100.00, 'D1INFO');
+INSERT INTO order_line VALUES (2, 1, 1, 2, 5, 1, TIMESTAMP '2024-01-02 00:00:00', 2, 30.50, 'D1INFO');
 
 -- ============================================================
 -- PART 3: Basic Queries (should already work)
 -- ============================================================
 
 -- Simple select
-SELECT * FROM warehouse;
-SELECT * FROM item WHERE i_price > 20.00;
-SELECT c_first, c_last, c_balance FROM customer WHERE c_w_id = 1 AND c_d_id = 1;
+SELECT * FROM warehouse ORDER BY w_id;
+SELECT * FROM item WHERE i_price > 20.00 ORDER BY i_id;
+SELECT c_first, c_last, c_balance FROM customer WHERE c_w_id = 1 AND c_d_id = 1 ORDER BY c_id;
 
 -- Aggregations
 SELECT COUNT(*) FROM customer;
@@ -186,23 +193,23 @@ SELECT AVG(i_price) FROM item;
 SELECT AVG(s_quantity) FROM stock WHERE s_w_id = 1;
 
 -- 4.2 IS NULL / IS NOT NULL  
-SELECT * FROM orders WHERE o_carrier_id IS NULL;
-SELECT * FROM orders WHERE o_carrier_id IS NOT NULL;
+SELECT * FROM orders WHERE o_carrier_id IS NULL ORDER BY o_w_id, o_d_id, o_id;
+SELECT * FROM orders WHERE o_carrier_id IS NOT NULL ORDER BY o_w_id, o_d_id, o_id;
 SELECT COUNT(*) FROM orders WHERE o_carrier_id IS NULL;
 
 -- 4.3 IN clause
-SELECT * FROM item WHERE i_id IN (1, 3, 5);
-SELECT c_first, c_last FROM customer WHERE c_credit IN ('GC', 'BC');
+SELECT * FROM item WHERE i_id IN (1, 3, 5) ORDER BY i_id;
+SELECT c_first, c_last FROM customer WHERE c_credit IN ('GC', 'BC') ORDER BY c_w_id, c_d_id, c_id;
 
 -- 4.4 BETWEEN clause
-SELECT * FROM item WHERE i_price BETWEEN 10.00 AND 30.00;
-SELECT * FROM stock WHERE s_quantity BETWEEN 50 AND 150;
+SELECT * FROM item WHERE i_price BETWEEN 10.00 AND 30.00 ORDER BY i_id;
+SELECT * FROM stock WHERE s_quantity BETWEEN 50 AND 150 ORDER BY s_w_id, s_i_id;
 
 -- 4.5 COALESCE
-SELECT o_id, COALESCE(o_carrier_id, 0) FROM orders;
+SELECT o_id, COALESCE(o_carrier_id, 0) FROM orders ORDER BY o_w_id, o_d_id, o_id;
 
 -- 4.6 Modulo operator
-SELECT i_id, i_id % 2 FROM item;
+SELECT i_id, i_id % 2 FROM item ORDER BY i_id;
 
 -- ============================================================
 -- PART 5: JOIN Queries (TPC-C style)
@@ -212,7 +219,8 @@ SELECT i_id, i_id % 2 FROM item;
 SELECT o.o_id, c.c_first, c.c_last
 FROM orders o
 INNER JOIN customer c ON o.o_c_id = c.c_id AND o.o_d_id = c.c_d_id AND o.o_w_id = c.c_w_id
-WHERE o.o_w_id = 1 AND o.o_d_id = 1;
+WHERE o.o_w_id = 1 AND o.o_d_id = 1
+ORDER BY o.o_id;
 
 -- 5.2 JOIN with aggregation - Total amount per order
 SELECT ol.ol_o_id, SUM(ol.ol_amount)
@@ -226,7 +234,8 @@ ORDER BY ol.ol_o_id;
 SELECT ol.ol_o_id, i.i_name, ol.ol_quantity, ol.ol_amount
 FROM order_line ol
 INNER JOIN item i ON ol.ol_i_id = i.i_id
-WHERE ol.ol_w_id = 1 AND ol.ol_d_id = 1 AND ol.ol_o_id = 1;
+WHERE ol.ol_w_id = 1 AND ol.ol_d_id = 1 AND ol.ol_o_id = 1
+ORDER BY ol.ol_number;
 
 -- 5.4 Stock level query (TPC-C Transaction 5 simplified)
 SELECT COUNT(*) FROM stock s
@@ -237,19 +246,25 @@ WHERE s.s_w_id = 1 AND s.s_quantity < 100;
 -- PART 6: DISTINCT
 -- ============================================================
 
-SELECT DISTINCT c_credit FROM customer;
-SELECT DISTINCT o_carrier_id FROM orders;
+SELECT DISTINCT c_credit FROM customer ORDER BY c_credit DESC;
+SELECT DISTINCT o_carrier_id FROM orders ORDER BY o_carrier_id NULLS LAST;
 
 -- ============================================================
 -- PART 7: Cleanup
 -- ============================================================
 
-DROP TABLE order_line;
-DROP TABLE orders;
-DROP TABLE stock;
-DROP TABLE customer;
-DROP TABLE district;
-DROP TABLE warehouse;
-DROP TABLE item;
+DROP TABLE IF EXISTS order_line;
+DROP TABLE IF EXISTS orders;
+DROP TABLE IF EXISTS stock;
+DROP TABLE IF EXISTS customer;
+DROP TABLE IF EXISTS district;
+DROP TABLE IF EXISTS warehouse;
+DROP TABLE IF EXISTS item;
 
-SHOW TABLES;
+SET search_path TO DEFAULT;
+DROP SCHEMA IF EXISTS tpcc_basic;
+
+SELECT table_name
+FROM information_schema.tables
+WHERE table_schema = 'tpcc_basic' AND table_type = 'BASE TABLE'
+ORDER BY table_name;
