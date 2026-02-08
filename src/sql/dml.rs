@@ -351,6 +351,10 @@ pub async fn execute_insert_row(
     on_conflict: &Option<OnInsert>,
     enum_cache: &EnumLabelCache,
 ) -> Result<InsertRowResult> {
+    let mut row_values = row.values;
+    coerce_row_values(schema, &mut row_values)?;
+    let row = Row::new(row_values);
+
     validate_enum_values(schema, &row, enum_cache)?;
 
     let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
@@ -641,6 +645,10 @@ pub async fn execute_update_row_by_pk(
     new_row: Row,
     enum_cache: &EnumLabelCache,
 ) -> Result<Row> {
+    let mut new_row_values = new_row.values;
+    coerce_row_values(schema, &mut new_row_values)?;
+    let new_row = Row::new(new_row_values);
+
     validate_enum_values(schema, &new_row, enum_cache)?;
     if !schema.foreign_keys.is_empty() {
         validate_foreign_keys(store, txn, db_id, schema, &new_row).await?;
@@ -1150,6 +1158,10 @@ pub async fn execute_update_row(
     new_row: Row,
     enum_cache: &EnumLabelCache,
 ) -> Result<Row> {
+    let mut new_row_values = new_row.values;
+    coerce_row_values(schema, &mut new_row_values)?;
+    let new_row = Row::new(new_row_values);
+
     validate_enum_values(schema, &new_row, enum_cache)?;
 
     let old_pks = schema.get_pk_values(old_row);

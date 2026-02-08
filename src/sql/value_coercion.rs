@@ -11,10 +11,36 @@ use sqlparser::ast::Expr;
 
 use crate::types::{ColumnDef, DataType, Value};
 
+fn value_is_compatible_with_column_type(value: &Value, column_type: &DataType) -> bool {
+    match (value, column_type) {
+        (Value::Null, _) => true,
+        (Value::Boolean(_), DataType::Boolean) => true,
+        (Value::Int32(_), DataType::Int32) => true,
+        (Value::Int64(_), DataType::Int64) => true,
+        (Value::Float64(_), DataType::Float64) => true,
+        (Value::Text(_), DataType::Text | DataType::Name | DataType::UserDefined(_)) => true,
+        (Value::Bytes(_), DataType::Bytes) => true,
+        (Value::Timestamp(_), DataType::Timestamp | DataType::TimestampTz) => true,
+        (Value::Interval(_), DataType::Interval) => true,
+        (Value::Uuid(_), DataType::Uuid) => true,
+        (Value::Array(_), DataType::Array(_)) => true,
+        (Value::Vector(vec), DataType::Vector(dim)) => vec.len() == *dim as usize,
+        (Value::Json(_), DataType::Json) => true,
+        (Value::Jsonb(_), DataType::Jsonb) => true,
+        (Value::Time(_), DataType::Time) => true,
+        (Value::Date(_), DataType::Date) => true,
+        (Value::Numeric(_), DataType::Numeric { .. }) => true,
+        (Value::Tsvector(_), DataType::Tsvector) => true,
+        (Value::Tsquery(_), DataType::Tsquery) => true,
+        _ => false,
+    }
+}
+
 /// Coerce a value to match the expected column type
 pub fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Value> {
     match (&val, &col.data_type) {
         (Value::Null, _) => Ok(Value::Null),
+        (_, DataType::Text | DataType::Name) => Ok(Value::Text(val.to_string())),
         (Value::Text(s), DataType::Date) => crate::types::date::parse_date_days(s).map(Value::Date),
         (Value::Timestamp(ts), DataType::Date) => {
             crate::types::date::timestamp_millis_to_date_days(*ts).map(Value::Date)
@@ -131,6 +157,15 @@ pub fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Value> {
         }
         (Value::Jsonb(s), DataType::Json) => Ok(Value::Json(s.clone())),
         (Value::Jsonb(s), DataType::Jsonb) => Ok(Value::Jsonb(s.clone())),
+        (Value::Text(s), DataType::Bytes) => {
+            if let Some(hex) = s.trim().strip_prefix("\\x") {
+                Ok(hex::decode(hex)
+                    .map(Value::Bytes)
+                    .unwrap_or_else(|_| Value::Bytes(s.as_bytes().to_vec())))
+            } else {
+                Ok(Value::Bytes(s.as_bytes().to_vec()))
+            }
+        }
         (Value::Text(s), DataType::Array(elem_type)) => {
             let arr = parse_pg_array(s).map_err(|_| {
                 anyhow::Error::from(SqlError::InvalidInputSyntax {
@@ -274,7 +309,26 @@ pub fn coerce_value_for_column(val: Value, col: &ColumnDef) -> Result<Value> {
                 .map(Value::Int64)
                 .ok_or_else(|| anyhow!("numeric value out of range for bigint"))
         }
-        _ => Ok(val),
+        (Value::Text(s), DataType::Interval) => {
+            super::expr::parse_interval_string(s).map_err(|_| {
+                SqlError::InvalidInputSyntax {
+                    type_name: "interval".into(),
+                    value: s.clone(),
+                }
+                .into()
+            })
+        }
+        _ => {
+            if value_is_compatible_with_column_type(&val, &col.data_type) {
+                Ok(val)
+            } else {
+                Err(SqlError::InvalidCast {
+                    from: val.data_type().unwrap_or(DataType::Text),
+                    to: col.data_type.clone(),
+                }
+                .into())
+            }
+        }
     }
 }
 

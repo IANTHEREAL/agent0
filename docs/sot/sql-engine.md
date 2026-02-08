@@ -39,6 +39,8 @@
 ## Data Model & Invariants
 - **Transaction state model**: statement execution is mediated by `Session` + an active TiKV transaction; savepoints and transaction boundaries are owned by the SQL engine layer, while TiKV transaction primitives are specified in `./storage-format.md`.
   - Evidence: `src/sql/session.rs`, `src/sql/executor/core.rs` (`session.begin/commit/rollback`, `with_savepoints` wrapper).
+- **[Stable] Stored values conform to schema types**: DML (INSERT/UPDATE/UPSERT) MUST NOT persist a `Value` variant that is incompatible with the declared column `DataType`. If an implicit DML cast/coercion is not supported, the statement MUST error and MUST be atomic (no partial row writes and no index corruption).
+  - Evidence: `src/sql/coercion.rs` (`coerce_value_for_column`), `src/sql/dml.rs` (`coerce_row_values`, DML write helpers), `tests/155_dml_type_coercion_invariant_issue407.sql`.
 - **Trigger execution model** (high level): BEFORE triggers execute in-statement; AFTER triggers are enqueued and processed asynchronously by a worker (exact queue/storage details are implementation-defined and may evolve).
   - Evidence: `src/sql/triggers.rs`, `src/sql/trigger_queue.rs`, `src/sql/trigger_worker.rs`, `src/sql/executor/triggers.rs`, `tests/53_trigger_execution.sql`.
 - **Index access paths are planner-driven**: plan selection (btree vs GIN-like) is chosen based on schema/index metadata + predicates; the index encoding itself is specified in `./storage-format.md`.

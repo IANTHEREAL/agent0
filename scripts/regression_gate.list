@@ -28,6 +28,7 @@ tests/139_nested_join_table_factor_issue427.sql
 tests/154_pg_catalog_type_reflection_issue417.sql
 tests/152_lateral_join_on_constraint.sql
 tests/153_rename_table_cache_invalidation.sql
+tests/155_dml_type_coercion_invariant_issue407.sql
 
 [orm]
 orm-tests/pg-client/
