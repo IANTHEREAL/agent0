@@ -15,6 +15,7 @@
 [sql]
 tests/96_dify_schema.sql
 tests/97_comment_on.sql
+tests/119_upsert_do_update_update_semantics_issue196.sql
 tests/125_pr285_compat_regressions.sql
 tests/126_timestamptz_offset_input_issue270.sql
 tests/128_hash_join_type_compat_issue426.sql

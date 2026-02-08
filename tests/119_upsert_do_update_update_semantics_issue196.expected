@@ -13,3 +13,11 @@ id|u
 id|u
 2|10
 (1 row)
+ERROR:  new row for relation "t_issue196_check" violates check constraint "t_issue196_check_check1"
+DETAIL:  Failing row contains (1, -1).
+id|i
+1|1
+(1 row)
+id|n
+1|2
+(1 row)

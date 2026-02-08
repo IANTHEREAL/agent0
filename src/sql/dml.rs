@@ -19,6 +19,16 @@ use crate::types::{ColumnDef, DataType, IndexDef, Row, TableSchema, Value};
 
 pub type EnumLabelCache = HashMap<String, HashSet<String>>;
 
+pub enum InsertRowResult {
+    Inserted(Row),
+    Skipped,
+    Conflicted {
+        existing_pk: Vec<Value>,
+        existing_row: Row,
+        excluded_row: Row,
+    },
+}
+
 pub async fn build_enum_label_cache(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -189,7 +199,7 @@ fn extract_gin_token_hashes_from_row(
     }
 }
 
-fn eval_upsert_expr(
+pub(crate) fn eval_upsert_expr(
     expr: &Expr,
     existing_row: &Row,
     excluded_row: &Row,
@@ -340,7 +350,7 @@ pub async fn execute_insert_row(
     row: Row,
     on_conflict: &Option<OnInsert>,
     enum_cache: &EnumLabelCache,
-) -> Result<Option<Row>> {
+) -> Result<InsertRowResult> {
     validate_enum_values(schema, &row, enum_cache)?;
 
     let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
@@ -403,7 +413,7 @@ pub async fn execute_insert_row(
                                         "Failed to find conflicting row in unique index"
                                     ));
                                 }
-                                let existing_pk = &pks[0];
+                                let existing_pk = pks.into_iter().next().unwrap();
 
                                 match &oc.action {
                                     OnConflictAction::DoNothing => {
@@ -419,9 +429,9 @@ pub async fn execute_insert_row(
                                         store
                                             .delete_by_pk(txn, db_id, table_name, &pk_values)
                                             .await?;
-                                        return Ok(None);
+                                        return Ok(InsertRowResult::Skipped);
                                     }
-                                    OnConflictAction::DoUpdate(do_update) => {
+                                    OnConflictAction::DoUpdate(_) => {
                                         let existing_rows = store
                                             .batch_get_rows(
                                                 txn,
@@ -431,34 +441,10 @@ pub async fn execute_insert_row(
                                                 schema,
                                             )
                                             .await?;
-                                        if existing_rows.is_empty() {
-                                            return Err(anyhow!(
-                                                "Failed to fetch existing row for upsert"
-                                            ));
-                                        }
-                                        let existing_row = &existing_rows[0];
-                                        let mut updated_vals = existing_row.values.clone();
-                                        for assignment in &do_update.assignments {
-                                            let col_name =
-                                                assignment.id.last().unwrap().value.clone();
-                                            let col_idx = schema
-                                                .column_index(&col_name)
-                                                .ok_or_else(|| {
-                                                    anyhow!(
-                                                        "Unknown column in DO UPDATE: {}",
-                                                        col_name
-                                                    )
-                                                })?;
-                                            updated_vals[col_idx] = eval_upsert_expr(
-                                                &assignment.value,
-                                                existing_row,
-                                                &row,
-                                                schema,
-                                                schema.columns.get(col_idx),
-                                            )?;
-                                        }
-                                        let updated_row = Row::new(updated_vals);
-                                        validate_enum_values(schema, &updated_row, enum_cache)?;
+                                        let existing_row =
+                                            existing_rows.into_iter().next().ok_or_else(|| {
+                                                anyhow!("Failed to fetch existing row for upsert")
+                                            })?;
 
                                         rollback_inserted_index_entries(
                                             store,
@@ -473,55 +459,15 @@ pub async fn execute_insert_row(
                                             .delete_by_pk(txn, db_id, table_name, &pk_values)
                                             .await?;
 
-                                        if schema.pk_indices.is_empty() {
-                                            if !schema.foreign_keys.is_empty() {
-                                                validate_foreign_keys(
-                                                    store,
-                                                    txn,
-                                                    db_id,
-                                                    schema,
-                                                    &updated_row,
-                                                )
-                                                .await?;
-                                            }
-                                            update_row_indexes(
-                                                store,
-                                                txn,
-                                                db_id,
-                                                schema,
-                                                existing_pk,
-                                                existing_row,
-                                                &updated_row,
-                                            )
-                                            .await?;
-                                            store
-                                                .upsert_by_pk(
-                                                    txn,
-                                                    db_id,
-                                                    table_name,
-                                                    existing_pk,
-                                                    updated_row.clone(),
-                                                )
-                                                .await?;
-                                            return Ok(Some(updated_row));
-                                        }
-
-                                        let updated_row = execute_update_row(
-                                            store,
-                                            txn,
-                                            db_id,
-                                            table_name,
-                                            schema,
+                                        return Ok(InsertRowResult::Conflicted {
+                                            existing_pk,
                                             existing_row,
-                                            updated_row,
-                                            enum_cache,
-                                        )
-                                        .await?;
-                                        return Ok(Some(updated_row));
+                                            excluded_row: row,
+                                        });
                                     }
                                 }
                             }
-                            Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
+                            Some(OnInsert::DuplicateKeyUpdate(_)) => {
                                 let pks = store
                                     .scan_index(
                                         txn,
@@ -539,7 +485,7 @@ pub async fn execute_insert_row(
                                         "Failed to find conflicting row in unique index"
                                     ));
                                 }
-                                let existing_pk = &pks[0];
+                                let existing_pk = pks.into_iter().next().unwrap();
 
                                 let existing_rows = store
                                     .batch_get_rows(
@@ -550,26 +496,10 @@ pub async fn execute_insert_row(
                                         schema,
                                     )
                                     .await?;
-                                if existing_rows.is_empty() {
-                                    return Err(anyhow!("Failed to fetch existing row for upsert"));
-                                }
-                                let existing_row = &existing_rows[0];
-                                let mut updated_vals = existing_row.values.clone();
-                                for assignment in assignments {
-                                    let col_name = assignment.id.last().unwrap().value.clone();
-                                    let col_idx = schema
-                                        .column_index(&col_name)
-                                        .ok_or_else(|| anyhow!("Unknown column: {}", col_name))?;
-                                    updated_vals[col_idx] = eval_upsert_expr(
-                                        &assignment.value,
-                                        existing_row,
-                                        &row,
-                                        schema,
-                                        schema.columns.get(col_idx),
-                                    )?;
-                                }
-                                let updated_row = Row::new(updated_vals);
-                                validate_enum_values(schema, &updated_row, enum_cache)?;
+                                let existing_row =
+                                    existing_rows.into_iter().next().ok_or_else(|| {
+                                        anyhow!("Failed to fetch existing row for upsert")
+                                    })?;
 
                                 rollback_inserted_index_entries(
                                     store,
@@ -583,52 +513,11 @@ pub async fn execute_insert_row(
                                 store
                                     .delete_by_pk(txn, db_id, table_name, &pk_values)
                                     .await?;
-
-                                if schema.pk_indices.is_empty() {
-                                    if !schema.foreign_keys.is_empty() {
-                                        validate_foreign_keys(
-                                            store,
-                                            txn,
-                                            db_id,
-                                            schema,
-                                            &updated_row,
-                                        )
-                                        .await?;
-                                    }
-                                    update_row_indexes(
-                                        store,
-                                        txn,
-                                        db_id,
-                                        schema,
-                                        existing_pk,
-                                        existing_row,
-                                        &updated_row,
-                                    )
-                                    .await?;
-                                    store
-                                        .upsert_by_pk(
-                                            txn,
-                                            db_id,
-                                            table_name,
-                                            existing_pk,
-                                            updated_row.clone(),
-                                        )
-                                        .await?;
-                                    return Ok(Some(updated_row));
-                                }
-
-                                let updated_row = execute_update_row(
-                                    store,
-                                    txn,
-                                    db_id,
-                                    table_name,
-                                    schema,
+                                return Ok(InsertRowResult::Conflicted {
+                                    existing_pk,
                                     existing_row,
-                                    updated_row,
-                                    enum_cache,
-                                )
-                                .await?;
-                                return Ok(Some(updated_row));
+                                    excluded_row: row,
+                                });
                             }
                             None => {
                                 // No ON CONFLICT specified, return error
@@ -679,7 +568,7 @@ pub async fn execute_insert_row(
                     )
                     .await?;
             }
-            Ok(Some(row))
+            Ok(InsertRowResult::Inserted(row))
         }
         Err(e)
             if e.to_string()
@@ -691,8 +580,8 @@ pub async fn execute_insert_row(
             let pk_values = schema.get_pk_values(&row);
             match on_conflict {
                 Some(OnInsert::OnConflict(oc)) => match &oc.action {
-                    OnConflictAction::DoNothing => Ok(None),
-                    OnConflictAction::DoUpdate(do_update) => {
+                    OnConflictAction::DoNothing => Ok(InsertRowResult::Skipped),
+                    OnConflictAction::DoUpdate(_) => {
                         let existing_rows = store
                             .batch_get_rows(
                                 txn,
@@ -702,41 +591,18 @@ pub async fn execute_insert_row(
                                 schema,
                             )
                             .await?;
-                        if existing_rows.is_empty() {
-                            return Err(anyhow!("Failed to fetch existing row for upsert"));
-                        }
-                        let existing_row = &existing_rows[0];
-                        let mut updated_vals = existing_row.values.clone();
-                        for assignment in &do_update.assignments {
-                            let col_name = assignment.id.last().unwrap().value.clone();
-                            let col_idx = schema.column_index(&col_name).ok_or_else(|| {
-                                anyhow!("Unknown column in DO UPDATE: {}", col_name)
-                            })?;
-                            updated_vals[col_idx] = eval_upsert_expr(
-                                &assignment.value,
-                                existing_row,
-                                &row,
-                                schema,
-                                schema.columns.get(col_idx),
-                            )?;
-                        }
-                        let updated_row = Row::new(updated_vals);
-                        validate_enum_values(schema, &updated_row, enum_cache)?;
-                        let updated_row = execute_update_row(
-                            store,
-                            txn,
-                            db_id,
-                            table_name,
-                            schema,
+                        let existing_row = existing_rows
+                            .into_iter()
+                            .next()
+                            .ok_or_else(|| anyhow!("Failed to fetch existing row for upsert"))?;
+                        Ok(InsertRowResult::Conflicted {
+                            existing_pk: pk_values,
                             existing_row,
-                            updated_row,
-                            enum_cache,
-                        )
-                        .await?;
-                        Ok(Some(updated_row))
+                            excluded_row: row,
+                        })
                     }
                 },
-                Some(OnInsert::DuplicateKeyUpdate(assignments)) => {
+                Some(OnInsert::DuplicateKeyUpdate(_)) => {
                     let existing_rows = store
                         .batch_get_rows(
                             txn,
@@ -746,38 +612,15 @@ pub async fn execute_insert_row(
                             schema,
                         )
                         .await?;
-                    if existing_rows.is_empty() {
-                        return Err(anyhow!("Failed to fetch existing row for upsert"));
-                    }
-                    let existing_row = &existing_rows[0];
-                    let mut updated_vals = existing_row.values.clone();
-                    for assignment in assignments {
-                        let col_name = assignment.id.last().unwrap().value.clone();
-                        let col_idx = schema
-                            .column_index(&col_name)
-                            .ok_or_else(|| anyhow!("Unknown column: {}", col_name))?;
-                        updated_vals[col_idx] = eval_upsert_expr(
-                            &assignment.value,
-                            existing_row,
-                            &row,
-                            schema,
-                            schema.columns.get(col_idx),
-                        )?;
-                    }
-                    let updated_row = Row::new(updated_vals);
-                    validate_enum_values(schema, &updated_row, enum_cache)?;
-                    let updated_row = execute_update_row(
-                        store,
-                        txn,
-                        db_id,
-                        table_name,
-                        schema,
+                    let existing_row = existing_rows
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow!("Failed to fetch existing row for upsert"))?;
+                    Ok(InsertRowResult::Conflicted {
+                        existing_pk: pk_values,
                         existing_row,
-                        updated_row,
-                        enum_cache,
-                    )
-                    .await?;
-                    Ok(Some(updated_row))
+                        excluded_row: row,
+                    })
                 }
                 None => Err(e),
                 _ => Err(e),
@@ -785,6 +628,29 @@ pub async fn execute_insert_row(
         }
         Err(e) => Err(e),
     }
+}
+
+pub async fn execute_update_row_by_pk(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    table_name: &str,
+    schema: &TableSchema,
+    pk_values: &[Value],
+    old_row: &Row,
+    new_row: Row,
+    enum_cache: &EnumLabelCache,
+) -> Result<Row> {
+    validate_enum_values(schema, &new_row, enum_cache)?;
+    if !schema.foreign_keys.is_empty() {
+        validate_foreign_keys(store, txn, db_id, schema, &new_row).await?;
+    }
+
+    update_row_indexes(store, txn, db_id, schema, pk_values, old_row, &new_row).await?;
+    store
+        .upsert_by_pk(txn, db_id, table_name, pk_values, new_row.clone())
+        .await?;
+    Ok(new_row)
 }
 
 async fn update_row_indexes(
@@ -1600,21 +1466,6 @@ pub async fn fill_missing_columns(
                 def,
             )
             .await?;
-        } else if !c.nullable {
-            let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-            let row_str = row_vals
-                .iter()
-                .map(|v| format!("{}", v))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(SqlError::NotNullViolation {
-                column: c.name.clone(),
-                relation: short_table.to_string(),
-                message: format!(
-                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint\nDETAIL:  Failing row contains ({}).",
-                    c.name, short_table, row_str
-                ),
-            }.into());
         }
     }
     Ok(())
@@ -1640,6 +1491,13 @@ pub fn coerce_row_values(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Res
             }.into());
         }
         row_vals[i] = coerced;
+    }
+    Ok(())
+}
+
+pub fn coerce_row_values_allow_null(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Result<()> {
+    for (i, c) in schema.columns.iter().enumerate() {
+        row_vals[i] = coerce_value_for_column(row_vals[i].clone(), c)?;
     }
     Ok(())
 }
@@ -1808,22 +1666,6 @@ pub async fn compute_update_values(
         };
         let col = &schema.columns[indices[i]];
         let coerced = coerce_value_for_column(raw_val, col)?;
-        if coerced == Value::Null && !col.nullable {
-            let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-            let row_str = vals
-                .iter()
-                .map(|v| format!("{}", v))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(SqlError::NotNullViolation {
-                column: col.name.clone(),
-                relation: short_table.to_string(),
-                message: format!(
-                    "null value in column \"{}\" of relation \"{}\" violates not-null constraint\nDETAIL:  Failing row contains ({}).",
-                    col.name, short_table, row_str
-                ),
-            }.into());
-        }
         vals[indices[i]] = coerced;
     }
     Ok(vals)

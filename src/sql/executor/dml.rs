@@ -157,12 +157,20 @@ impl Executor {
             .ok_or_else(|| anyhow!("Table '{}' does not exist", t))?;
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
         let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
-        let trigger_func_cache = triggers::prefetch_trigger_functions(
+        let trigger_func_cache_insert = triggers::prefetch_trigger_functions(
             &self.store(),
             txn,
             db_id,
             &trigger_defs,
             "INSERT",
+        )
+        .await?;
+        let trigger_func_cache_update = triggers::prefetch_trigger_functions(
+            &self.store(),
+            txn,
+            db_id,
+            &trigger_defs,
+            "UPDATE",
         )
         .await?;
 
@@ -246,9 +254,8 @@ impl Executor {
                 &indices,
             )
             .await?;
-            dml::coerce_row_values(&schema, &mut row_vals)?;
+            dml::coerce_row_values_allow_null(&schema, &mut row_vals)?;
             let row = Row::new(row_vals);
-            dml::validate_check_constraints(&schema, &row)?;
 
             let row = match triggers::apply_before_triggers_with_cache(
                 &self.store(),
@@ -257,7 +264,7 @@ impl Executor {
                 sequence_values,
                 search_path,
                 &trigger_defs,
-                &trigger_func_cache,
+                &trigger_func_cache_insert,
                 &schema,
                 "INSERT",
                 row,
@@ -268,6 +275,11 @@ impl Executor {
                 Some(r) => r,
                 None => continue,
             };
+
+            let mut final_vals = row.values;
+            dml::coerce_row_values(&schema, &mut final_vals)?;
+            let row = Row::new(final_vals);
+            dml::validate_check_constraints(&schema, &row)?;
 
             let result = dml::execute_insert_row(
                 &self.store(),
@@ -280,32 +292,157 @@ impl Executor {
                 &enum_cache,
             )
             .await?;
-            if let Some(final_row) = result {
-                trigger_worker::enqueue_after_triggers(
-                    txn,
-                    db_id,
-                    self.tenant_keyspace(),
-                    &t,
-                    TriggerOp::Insert,
-                    None,
-                    Some(&final_row),
-                    &trigger_defs,
-                )
-                .await?;
-                affected += 1;
-                if let Some(ret_row) = dml::eval_returning_row(
-                    &self.store(),
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    returning,
-                    &final_row,
-                    &schema,
-                )
-                .await?
-                {
-                    ret_rows.push(ret_row);
+            match result {
+                dml::InsertRowResult::Inserted(final_row) => {
+                    trigger_worker::enqueue_after_triggers(
+                        txn,
+                        db_id,
+                        self.tenant_keyspace(),
+                        &t,
+                        TriggerOp::Insert,
+                        None,
+                        Some(&final_row),
+                        &trigger_defs,
+                    )
+                    .await?;
+                    affected += 1;
+                    if let Some(ret_row) = dml::eval_returning_row(
+                        &self.store(),
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        returning,
+                        &final_row,
+                        &schema,
+                    )
+                    .await?
+                    {
+                        ret_rows.push(ret_row);
+                    }
+                }
+                dml::InsertRowResult::Skipped => continue,
+                dml::InsertRowResult::Conflicted {
+                    existing_pk,
+                    existing_row,
+                    excluded_row,
+                } => {
+                    let assignments = match on_conflict {
+                        Some(OnInsert::OnConflict(oc)) => match &oc.action {
+                            sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
+                                do_update.assignments.as_slice()
+                            }
+                            _ => {
+                                return Err(anyhow!(
+                                    "Conflicted insert returned from non-DO UPDATE ON CONFLICT"
+                                ));
+                            }
+                        },
+                        Some(OnInsert::DuplicateKeyUpdate(assignments)) => assignments.as_slice(),
+                        _ => {
+                            return Err(anyhow!(
+                                "Conflicted insert returned without ON CONFLICT DO UPDATE"
+                            ));
+                        }
+                    };
+
+                    let mut updated_vals = existing_row.values.clone();
+                    for assignment in assignments {
+                        let col_name = assignment.id.last().unwrap().value.clone();
+                        let col_idx = schema
+                            .column_index(&col_name)
+                            .ok_or_else(|| anyhow!("Unknown column in DO UPDATE: {}", col_name))?;
+                        let raw_val = dml::eval_upsert_expr(
+                            &assignment.value,
+                            &existing_row,
+                            &excluded_row,
+                            &schema,
+                            schema.columns.get(col_idx),
+                        )?;
+                        let col = &schema.columns[col_idx];
+                        updated_vals[col_idx] =
+                            super::super::coercion::coerce_value_for_column(raw_val, col)?;
+                    }
+                    let updated_row = Row::new(updated_vals);
+
+                    let updated_row = match triggers::apply_before_triggers_with_cache(
+                        &self.store(),
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        &trigger_defs,
+                        &trigger_func_cache_update,
+                        &schema,
+                        "UPDATE",
+                        updated_row,
+                        Some(&existing_row),
+                    )
+                    .await?
+                    {
+                        Some(row) => row,
+                        None => continue,
+                    };
+
+                    let mut final_vals = updated_row.values;
+                    dml::coerce_row_values(&schema, &mut final_vals)?;
+                    let updated_row = Row::new(final_vals);
+                    dml::validate_check_constraints(&schema, &updated_row)?;
+
+                    let updated_row = if schema.pk_indices.is_empty() {
+                        dml::execute_update_row_by_pk(
+                            &self.store(),
+                            txn,
+                            db_id,
+                            &t,
+                            &schema,
+                            &existing_pk,
+                            &existing_row,
+                            updated_row,
+                            &enum_cache,
+                        )
+                        .await?
+                    } else {
+                        dml::execute_update_row(
+                            &self.store(),
+                            txn,
+                            db_id,
+                            &t,
+                            &schema,
+                            &existing_row,
+                            updated_row,
+                            &enum_cache,
+                        )
+                        .await?
+                    };
+
+                    trigger_worker::enqueue_after_triggers(
+                        txn,
+                        db_id,
+                        self.tenant_keyspace(),
+                        &t,
+                        TriggerOp::Update,
+                        Some(&existing_row),
+                        Some(&updated_row),
+                        &trigger_defs,
+                    )
+                    .await?;
+
+                    affected += 1;
+                    if let Some(ret_row) = dml::eval_returning_row(
+                        &self.store(),
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        returning,
+                        &updated_row,
+                        &schema,
+                    )
+                    .await?
+                    {
+                        ret_rows.push(ret_row);
+                    }
                 }
             }
         }
@@ -783,8 +920,6 @@ impl Executor {
             };
 
             let new_row = Row::new(new_vals);
-            dml::validate_check_constraints(&schema, &new_row)?;
-
             let new_row = match triggers::apply_before_triggers_with_cache(
                 &self.store(),
                 txn,
@@ -803,6 +938,11 @@ impl Executor {
                 Some(row) => row,
                 None => continue,
             };
+
+            let mut final_vals = new_row.values;
+            dml::coerce_row_values(&schema, &mut final_vals)?;
+            let new_row = Row::new(final_vals);
+            dml::validate_check_constraints(&schema, &new_row)?;
 
             let updated_row = dml::execute_update_row(
                 &self.store(),
