@@ -49,7 +49,9 @@ use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::response::{CommandComplete, ErrorResponse, NoticeResponse};
 use pgwire::messages::startup::Authentication;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
-use sqlparser::ast::{Expr, Statement};
+use sqlparser::ast::{CopySource, CopyTarget, Expr, Ident, Statement};
+use sqlparser::dialect::PostgreSqlDialect;
+use sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::atomic::Ordering;
@@ -571,49 +573,129 @@ impl DynamicPgHandler {
         None
     }
 
-    pub(super) fn parse_copy_to_command(query: &str) -> Option<(String, Vec<String>)> {
-        let query = strip_leading_whitespace_and_comments(query)?;
-        let query_upper = query.to_uppercase();
-        // COPY TO STDOUT must start at statement start (after leading whitespace/comments).
-        if !query_upper.starts_with("COPY") || !query_upper.contains("TO") {
-            return None;
-        }
-        if !query_upper.contains("STDOUT") {
-            return None;
+    pub(super) fn parse_copy_to_command(
+        query: &str,
+    ) -> Result<Option<(String, Vec<String>)>, ErrorInfo> {
+        fn unsupported_copy_to_stdout_syntax() -> ErrorInfo {
+            ErrorInfo::new(
+                "ERROR".to_string(),
+                "0A000".to_string(),
+                "Unsupported COPY TO STDOUT syntax. Supported: COPY [schema.]table [(col1, col2, ...)] TO STDOUT".to_string(),
+            )
         }
 
-        // COPY [schema.]table (col1, col2) TO STDOUT
-        let re =
-            regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s*\(([^)]+)\)\s+TO\s+STDOUT").ok()?;
-        if let Some(caps) = re.captures(query) {
-            let schema = caps.get(1).map(|m| m.as_str().to_string());
-            let table = caps.get(2)?.as_str().to_string();
-            let table_name = match schema {
-                Some(s) => format!("{}.{}", s, table),
-                None => table,
+        fn is_valid_unquoted_ident(ident: &str) -> bool {
+            let mut chars = ident.chars();
+            let Some(first) = chars.next() else {
+                return false;
             };
-            let columns: Vec<String> = caps
-                .get(3)?
-                .as_str()
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect();
-            return Some((table_name, columns));
+            if first != '_' && !first.is_ascii_alphabetic() {
+                return false;
+            }
+            chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
         }
 
-        // COPY [schema.]table TO STDOUT (no columns)
-        let re2 = regex::Regex::new(r"(?i)^COPY\s+(?:(\w+)\.)?(\w+)\s+TO\s+STDOUT").ok()?;
-        if let Some(caps) = re2.captures(query) {
-            let schema = caps.get(1).map(|m| m.as_str().to_string());
-            let table = caps.get(2)?.as_str().to_string();
-            let table_name = match schema {
-                Some(s) => format!("{}.{}", s, table),
-                None => table,
-            };
-            return Some((table_name, vec![]));
+        let Some(query_trimmed) = strip_leading_whitespace_and_comments(query) else {
+            return Ok(None);
+        };
+
+        match query_trimmed.get(..4) {
+            Some(prefix) if prefix.eq_ignore_ascii_case("COPY") => {}
+            _ => return Ok(None),
         }
 
-        None
+        let dialect = PostgreSqlDialect {};
+        let Ok(stmts) = Parser::parse_sql(&dialect, query_trimmed) else {
+            return Ok(None);
+        };
+        let Some(stmt) = stmts.first() else {
+            return Ok(None);
+        };
+
+        let Statement::Copy {
+            source,
+            to,
+            target,
+            options,
+            legacy_options,
+            values,
+        } = stmt
+        else {
+            return Ok(None);
+        };
+
+        if !*to || !matches!(target, CopyTarget::Stdout) {
+            return Ok(None);
+        }
+
+        if stmts.len() != 1
+            || !options.is_empty()
+            || !legacy_options.is_empty()
+            || !values.is_empty()
+        {
+            return Err(unsupported_copy_to_stdout_syntax());
+        }
+
+        let CopySource::Table {
+            table_name,
+            columns,
+        } = source
+        else {
+            return Err(unsupported_copy_to_stdout_syntax());
+        };
+
+        let (schema_ident, table_ident) = match table_name.0.as_slice() {
+            [table] => (None, table),
+            [schema, table] => (Some(schema), table),
+            _ => return Err(unsupported_copy_to_stdout_syntax()),
+        };
+
+        let validate_ident = |ident: &Ident| -> Result<(), ErrorInfo> {
+            if ident.quote_style.is_some() {
+                return Err(unsupported_copy_to_stdout_syntax());
+            }
+            if !is_valid_unquoted_ident(&ident.value) {
+                return Err(ErrorInfo::new(
+                    "ERROR".to_string(),
+                    "42602".to_string(),
+                    format!("Invalid identifier in COPY TO STDOUT: \"{}\"", ident.value),
+                ));
+            }
+            Ok(())
+        };
+
+        if let Some(schema) = schema_ident {
+            validate_ident(schema)?;
+        }
+        validate_ident(table_ident)?;
+        for col in columns.iter() {
+            validate_ident(col)?;
+        }
+
+        let table_name = match schema_ident {
+            Some(schema) => format!("{}.{}", schema.value, table_ident.value),
+            None => table_ident.value.clone(),
+        };
+        let columns = columns.iter().map(|c| c.value.clone()).collect();
+
+        Ok(Some((table_name, columns)))
+    }
+
+    fn copy_out_response_from_select_result(
+        result: ExecuteResult,
+    ) -> Result<(CopyResponse, Vec<crate::types::Row>), ErrorInfo> {
+        match result {
+            ExecuteResult::Select { columns, rows, .. } => {
+                let col_count = columns.len();
+                let column_formats: Vec<i16> = vec![0; col_count];
+                Ok((CopyResponse::new(0, col_count, column_formats), rows))
+            }
+            _ => Err(ErrorInfo::new(
+                "ERROR".to_string(),
+                "0A000".to_string(),
+                "COPY TO STDOUT is only supported for tables".to_string(),
+            )),
+        }
     }
 
     async fn handle_copy_to_stdout<'a, C>(
@@ -656,26 +738,11 @@ impl DynamicPgHandler {
                 )))
             })?;
 
-        let rows = match result {
-            crate::sql::ExecuteResult::Select { rows, .. } => rows,
-            _ => {
-                return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
-                    "ERROR".to_string(),
-                    "XX000".to_string(),
-                    "COPY TO requires a table".to_string(),
-                ))));
-            }
-        };
+        let (copy_resp, rows) = Self::copy_out_response_from_select_result(result)
+            .map_err(|e| PgWireError::UserError(Box::new(e)))?;
 
         drop(session_guard);
 
-        let col_count = if let Some(first) = rows.first() {
-            first.values.len()
-        } else {
-            1
-        };
-        let column_formats: Vec<i16> = vec![0; col_count];
-        let copy_resp = CopyResponse::new(0, col_count, column_formats);
         pgwire::api::copy::send_copy_out_response(client, copy_resp).await?;
 
         let mut buf = Vec::with_capacity(4096);
@@ -964,14 +1031,18 @@ impl SimpleQueryHandler for DynamicPgHandler {
 
         let executor = self.get_executor()?;
 
-        if let Some((table_name, columns)) = Self::parse_copy_to_command(query) {
-            debug!(
-                "COPY TO STDOUT: table={}, columns={:?}",
-                table_name, columns
-            );
-            return self
-                .handle_copy_to_stdout(client, &table_name, &columns)
-                .await;
+        match Self::parse_copy_to_command(query) {
+            Ok(Some((table_name, columns))) => {
+                debug!(
+                    "COPY TO STDOUT: table={}, columns={:?}",
+                    table_name, columns
+                );
+                return self
+                    .handle_copy_to_stdout(client, &table_name, &columns)
+                    .await;
+            }
+            Ok(None) => {}
+            Err(e) => return Err(PgWireError::UserError(Box::new(e))),
         }
 
         if let Some((table_name, columns)) = Self::parse_copy_command(query) {
