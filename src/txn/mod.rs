@@ -38,15 +38,16 @@ pub(crate) async fn with_savepoints<R>(
 /// TiKV `put` wrapper that records undo information when SAVEPOINT is active.
 #[inline]
 pub(crate) async fn txn_put(txn: &mut Transaction, key: Vec<u8>, value: Vec<u8>) -> Result<()> {
-    let should_record = match SAVEPOINTS.try_with(|sp| sp.should_record_key(&key)) {
-        Ok(res) => res?,
-        Err(_) => false,
+    let savepoints = SAVEPOINTS.try_with(|sp| sp.clone()).ok();
+    let should_record = match savepoints.as_ref() {
+        Some(sp) => sp.should_record_key(&key).await?,
+        None => false,
     };
 
     if should_record {
         let prev = txn.get(key.clone()).await.map_err(|e| anyhow!(e))?;
-        if let Ok(res) = SAVEPOINTS.try_with(|sp| sp.record_prev_value(key.clone(), prev)) {
-            res?;
+        if let Some(sp) = savepoints {
+            sp.record_prev_value(key.clone(), prev).await?;
         }
     }
 
@@ -56,15 +57,16 @@ pub(crate) async fn txn_put(txn: &mut Transaction, key: Vec<u8>, value: Vec<u8>)
 /// TiKV `delete` wrapper that records undo information when SAVEPOINT is active.
 #[inline]
 pub(crate) async fn txn_delete(txn: &mut Transaction, key: Vec<u8>) -> Result<()> {
-    let should_record = match SAVEPOINTS.try_with(|sp| sp.should_record_key(&key)) {
-        Ok(res) => res?,
-        Err(_) => false,
+    let savepoints = SAVEPOINTS.try_with(|sp| sp.clone()).ok();
+    let should_record = match savepoints.as_ref() {
+        Some(sp) => sp.should_record_key(&key).await?,
+        None => false,
     };
 
     if should_record {
         let prev = txn.get(key.clone()).await.map_err(|e| anyhow!(e))?;
-        if let Ok(res) = SAVEPOINTS.try_with(|sp| sp.record_prev_value(key.clone(), prev)) {
-            res?;
+        if let Some(sp) = savepoints {
+            sp.record_prev_value(key.clone(), prev).await?;
         }
     }
 

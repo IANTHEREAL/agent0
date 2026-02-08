@@ -998,13 +998,13 @@ impl Executor {
                             continue;
                         }
                         Statement::Savepoint { name } => {
-                            session.create_savepoint(normalize_ident(name))?;
+                            session.create_savepoint(normalize_ident(name)).await?;
                             results.push(ExecuteResult::CommandComplete { tag: "SAVEPOINT" });
                             continue;
                         }
                         Statement::ReleaseSavepoint { name } => {
                             let sp = normalize_ident(name);
-                            session.release_savepoint(&sp)?;
+                            session.release_savepoint(&sp).await?;
                             results.push(ExecuteResult::CommandComplete { tag: "RELEASE" });
                             continue;
                         }
@@ -1114,12 +1114,12 @@ impl Executor {
                                 Ok(vec![ExecuteResult::TransactionEnd { tag }])
                             }
                             Statement::Savepoint { name } => {
-                                session.create_savepoint(normalize_ident(name))?;
+                                session.create_savepoint(normalize_ident(name)).await?;
                                 Ok(vec![ExecuteResult::CommandComplete { tag: "SAVEPOINT" }])
                             }
                             Statement::ReleaseSavepoint { name } => {
                                 let sp = normalize_ident(name);
-                                session.release_savepoint(&sp)?;
+                                session.release_savepoint(&sp).await?;
                                 Ok(vec![ExecuteResult::CommandComplete { tag: "RELEASE" }])
                             }
                             Statement::Rollback {

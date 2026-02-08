@@ -439,17 +439,17 @@ impl Session {
         self.settings.statement_timeout()
     }
 
-    pub fn create_savepoint(&mut self, name: String) -> Result<()> {
+    pub async fn create_savepoint(&mut self, name: String) -> Result<()> {
         if !self.is_in_transaction() {
             return Err(anyhow!("SAVEPOINT can only be used in transaction blocks"));
         }
         if self.is_transaction_failed() {
             return Err(anyhow::Error::new(InFailedSqlTransaction));
         }
-        self.savepoints.create(name)
+        self.savepoints.create(name).await
     }
 
-    pub fn release_savepoint(&mut self, name: &str) -> Result<()> {
+    pub async fn release_savepoint(&mut self, name: &str) -> Result<()> {
         if !self.is_in_transaction() {
             return Err(anyhow!(
                 "RELEASE SAVEPOINT can only be used in transaction blocks"
@@ -458,7 +458,7 @@ impl Session {
         if self.is_transaction_failed() {
             return Err(anyhow::Error::new(InFailedSqlTransaction));
         }
-        self.savepoints.release(name)
+        self.savepoints.release(name).await
     }
 
     pub async fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
@@ -468,7 +468,7 @@ impl Session {
             ));
         }
 
-        let mut prepared = self.savepoints.prepare_rollback_to(name)?;
+        let mut prepared = self.savepoints.prepare_rollback_to(name).await?;
         let res = {
             let txn = self.get_mut_txn().expect("transaction must be active");
 
@@ -510,7 +510,7 @@ impl Session {
         match self.state {
             TransactionState::Idle => {
                 let txn = self.store.begin().await?;
-                self.savepoints.reset()?;
+                self.savepoints.reset().await?;
                 self.state = TransactionState::Active(txn);
                 Ok(())
             }
@@ -525,7 +525,7 @@ impl Session {
     pub async fn commit(&mut self) -> Result<()> {
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
-                self.savepoints.reset()?;
+                self.savepoints.reset().await?;
                 match txn.commit().await {
                     Ok(_) => {
                         self.observability.record_commit();
@@ -538,7 +538,7 @@ impl Session {
                 }
             }
             TransactionState::Failed(mut txn) => {
-                self.savepoints.reset()?;
+                self.savepoints.reset().await?;
                 match txn.rollback().await {
                     Ok(_) => Ok(()),
                     Err(e) => {
@@ -555,7 +555,7 @@ impl Session {
     pub async fn rollback(&mut self) -> Result<()> {
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
-                self.savepoints.reset()?;
+                self.savepoints.reset().await?;
                 match txn.rollback().await {
                     Ok(_) => Ok(()),
                     Err(e) => {
@@ -565,7 +565,7 @@ impl Session {
                 }
             }
             TransactionState::Failed(mut txn) => {
-                self.savepoints.reset()?;
+                self.savepoints.reset().await?;
                 match txn.rollback().await {
                     Ok(_) => Ok(()),
                     Err(e) => {

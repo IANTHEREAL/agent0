@@ -1,7 +1,7 @@
 use super::savepoints::{PreparedRollback, SavepointManager};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use tokio::sync::Mutex;
 
 /// Session-scoped savepoint state.
 ///
@@ -27,42 +27,30 @@ impl SavepointState {
         self.active.load(Ordering::Acquire)
     }
 
-    pub(crate) fn reset(&self) -> Result<()> {
-        let mut manager = self
-            .manager
-            .lock()
-            .map_err(|_| anyhow!("savepoint manager mutex poisoned"))?;
+    pub(crate) async fn reset(&self) -> Result<()> {
+        let mut manager = self.manager.lock().await;
         manager.reset();
         self.active.store(false, Ordering::Release);
         Ok(())
     }
 
-    pub(crate) fn create(&self, name: String) -> Result<()> {
-        let mut manager = self
-            .manager
-            .lock()
-            .map_err(|_| anyhow!("savepoint manager mutex poisoned"))?;
+    pub(crate) async fn create(&self, name: String) -> Result<()> {
+        let mut manager = self.manager.lock().await;
         manager.create(name);
         self.active.store(true, Ordering::Release);
         Ok(())
     }
 
-    pub(crate) fn release(&self, name: &str) -> Result<()> {
-        let mut manager = self
-            .manager
-            .lock()
-            .map_err(|_| anyhow!("savepoint manager mutex poisoned"))?;
+    pub(crate) async fn release(&self, name: &str) -> Result<()> {
+        let mut manager = self.manager.lock().await;
         let res = manager.release(name);
         self.active
             .store(manager.has_savepoints(), Ordering::Release);
         res
     }
 
-    pub(crate) fn prepare_rollback_to(&self, name: &str) -> Result<PreparedRollback> {
-        let mut manager = self
-            .manager
-            .lock()
-            .map_err(|_| anyhow!("savepoint manager mutex poisoned"))?;
+    pub(crate) async fn prepare_rollback_to(&self, name: &str) -> Result<PreparedRollback> {
+        let mut manager = self.manager.lock().await;
         let prepared = manager.prepare_rollback_to(name)?;
         self.active
             .store(manager.has_savepoints(), Ordering::Release);
@@ -70,26 +58,24 @@ impl SavepointState {
     }
 
     #[inline]
-    pub(crate) fn should_record_key(&self, key: &[u8]) -> Result<bool> {
+    pub(crate) async fn should_record_key(&self, key: &[u8]) -> Result<bool> {
         if !self.is_active() {
             return Ok(false);
         }
-        let manager = self
-            .manager
-            .lock()
-            .map_err(|_| anyhow!("savepoint manager mutex poisoned"))?;
+        let manager = self.manager.lock().await;
         Ok(manager.should_record_key(key))
     }
 
     #[inline]
-    pub(crate) fn record_prev_value(&self, key: Vec<u8>, prev: Option<Vec<u8>>) -> Result<()> {
+    pub(crate) async fn record_prev_value(
+        &self,
+        key: Vec<u8>,
+        prev: Option<Vec<u8>>,
+    ) -> Result<()> {
         if !self.is_active() {
             return Ok(());
         }
-        let mut manager = self
-            .manager
-            .lock()
-            .map_err(|_| anyhow!("savepoint manager mutex poisoned"))?;
+        let mut manager = self.manager.lock().await;
         manager.record_prev_value(key, prev);
         Ok(())
     }
