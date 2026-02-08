@@ -14,6 +14,7 @@
 
 [sql]
 tests/96_dify_schema.sql
+tests/127_dify_lite_workload.sql
 tests/97_comment_on.sql
 tests/119_upsert_do_update_update_semantics_issue196.sql
 tests/125_pr285_compat_regressions.sql
