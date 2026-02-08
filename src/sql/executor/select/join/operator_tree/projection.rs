@@ -33,15 +33,24 @@ pub(super) fn project_join_output(
     let (columns, column_types, projected_rows) =
         if has_unqualified_wildcard && wildcard_plan.is_some() && !has_qualified_wildcard {
             let plan = wildcard_plan.as_ref().unwrap();
-            let cols: Vec<String> = plan.columns.iter().map(|c| c.name.clone()).collect();
-            let types: Vec<DataType> = plan.columns.iter().map(|c| c.data_type.clone()).collect();
-            let projected: Vec<Row> = rows
-                .iter()
-                .map(|row| {
-                    let values: Vec<Value> = plan
-                        .columns
-                        .iter()
-                        .map(|wc| {
+            let mut cols: Vec<String> = Vec::new();
+            let mut types: Vec<DataType> = Vec::new();
+            let mut sources: Vec<ProjectionSource> = Vec::new();
+
+            for item in resolved_projection {
+                match item {
+                    SelectItem::Wildcard(_) => {
+                        for wc in &plan.columns {
+                            // Guard-rail: wildcard expansion must never leak internal columns (#430),
+                            // even if they appear in the plan unexpectedly.
+                            let unqualified = wc.name.rsplit('.').next().unwrap_or(&wc.name);
+                            if unqualified.starts_with("__tipg_subquery_") {
+                                continue;
+                            }
+
+                            cols.push(wc.name.clone());
+                            types.push(wc.data_type.clone());
+
                             let mc = merge_columns
                                 .iter()
                                 .find(|mc| mc.col_name.eq_ignore_ascii_case(&wc.name));
@@ -54,7 +63,10 @@ pub(super) fn project_join_output(
                                     .iter()
                                     .any(|a| a.eq_ignore_ascii_case(wc_alias))
                             });
+
                             if let Some(mc) = mc.filter(|_| is_merge_source) {
+                                let mut indices: Vec<usize> =
+                                    Vec::with_capacity(mc.source_aliases.len());
                                 for sa in &mc.source_aliases {
                                     if let Some(ti) =
                                         tables.iter().position(|t| t.alias.eq_ignore_ascii_case(sa))
@@ -65,25 +77,67 @@ pub(super) fn project_join_output(
                                             .iter()
                                             .position(|c| c.name.eq_ignore_ascii_case(&wc.name))
                                         {
-                                            let idx = source_offsets[ti] + ci;
-                                            if let Some(val) = row.values.get(idx) {
-                                                if *val != Value::Null {
-                                                    return val.clone();
-                                                }
-                                            }
+                                            indices.push(source_offsets[ti] + ci);
                                         }
                                     }
                                 }
-                                Value::Null
+                                sources.push(ProjectionSource::CoalesceColumn(indices));
                             } else {
                                 let idx = source_offsets[wc.source_idx] + wc.col_idx;
-                                row.values.get(idx).cloned().unwrap_or(Value::Null)
+                                sources.push(ProjectionSource::ColumnIndex(idx));
                             }
-                        })
-                        .collect();
-                    Row::new(values)
-                })
-                .collect();
+                        }
+                    }
+                    SelectItem::QualifiedWildcard(_, _) => {
+                        return Err(anyhow!(
+                            "internal error: expected unqualified wildcard handling only"
+                        ));
+                    }
+                    SelectItem::UnnamedExpr(expr) => {
+                        let original_name = get_select_item_name(item);
+                        let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
+                        cols.push(original_name);
+                        types.push(infer_expr_type(&rewritten, final_schema));
+                        sources.push(ProjectionSource::Expr(rewritten));
+                    }
+                    SelectItem::ExprWithAlias { expr, alias } => {
+                        let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
+                        cols.push(alias.value.clone());
+                        types.push(infer_expr_type(&rewritten, final_schema));
+                        sources.push(ProjectionSource::Expr(rewritten));
+                    }
+                }
+            }
+
+            let mut projected: Vec<Row> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut values: Vec<Value> = Vec::with_capacity(sources.len());
+                for src in &sources {
+                    let val = match src {
+                        ProjectionSource::ColumnIndex(idx) => {
+                            row.values.get(*idx).cloned().unwrap_or(Value::Null)
+                        }
+                        ProjectionSource::Expr(expr) => {
+                            eval_expr(expr, Some(&row), Some(final_schema))?
+                        }
+                        ProjectionSource::CoalesceColumn(indices) => {
+                            let mut out = Value::Null;
+                            for idx in indices {
+                                if let Some(val) = row.values.get(*idx) {
+                                    if *val != Value::Null {
+                                        out = val.clone();
+                                        break;
+                                    }
+                                }
+                            }
+                            out
+                        }
+                    };
+                    values.push(val);
+                }
+                projected.push(Row::new(values));
+            }
+
             (cols, types, projected)
         } else if has_wildcard && merge_columns.is_empty() {
             let mut cols: Vec<String> = Vec::new();

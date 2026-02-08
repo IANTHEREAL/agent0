@@ -79,6 +79,11 @@ impl Executor {
         let is_implicit_join = select.from.len() > 1;
 
         let mut tables: Vec<TableInfo> = Vec::new();
+        // `build_join_wildcard_plan()` expects sources in `select.from` flattened order, which can
+        // differ from the physical `tables` order we build for correct JOIN binding precedence.
+        // Track the resolved alias for each flattened source so we can later remap wildcard plans
+        // back onto the executor's `tables` layout.
+        let mut from_source_aliases: Vec<Vec<String>> = vec![Vec::new(); select.from.len()];
         struct JoinStep {
             right_idx: usize,
             join_type: JoinType,
@@ -97,7 +102,7 @@ impl Executor {
         // JOINs first, then cross-join the standalone FROM items.
         // Phase 1: process FROM items that have explicit JOINs (they bind tighter)
         let mut transparent_nested_joins: Vec<TransparentNestedJoinInfo> = Vec::new();
-        for from_item in &select.from {
+        for (from_idx, from_item) in select.from.iter().enumerate() {
             if from_item.joins.is_empty() {
                 continue;
             }
@@ -116,6 +121,7 @@ impl Executor {
                 Some(t) => t,
                 None => return Ok(None),
             };
+            from_source_aliases[from_idx].push(alias.clone());
             if let TableFactor::NestedJoin {
                 table_with_joins,
                 alias: nested_alias,
@@ -155,6 +161,7 @@ impl Executor {
                     Some(t) => t,
                     None => return Ok(None),
                 };
+                from_source_aliases[from_idx].push(alias.clone());
                 if let TableFactor::NestedJoin {
                     table_with_joins,
                     alias: nested_alias,
@@ -330,7 +337,7 @@ impl Executor {
         }
 
         // Phase 2: add standalone FROM items (no explicit JOINs) as CROSS JOINs
-        for from_item in &select.from {
+        for (from_idx, from_item) in select.from.iter().enumerate() {
             if !from_item.joins.is_empty() {
                 continue;
             }
@@ -349,6 +356,7 @@ impl Executor {
                 Some(t) => t,
                 None => return Ok(None),
             };
+            from_source_aliases[from_idx].push(alias.clone());
             let idx = tables.len();
             let need_cross = idx > 0;
             if let TableFactor::NestedJoin {
@@ -1096,8 +1104,36 @@ impl Executor {
         let mut rewritten_order_by: Vec<sqlparser::ast::OrderByExpr> = Vec::new();
 
         let wildcard_plan = if !merge_columns.is_empty() {
-            let source_schemas: Vec<&TableSchema> = tables.iter().map(|t| &t.schema).collect();
-            build_join_wildcard_plan(select, &source_schemas)
+            let flattened_aliases: Vec<&str> = from_source_aliases
+                .iter()
+                .flatten()
+                .map(|a| a.as_str())
+                .collect();
+
+            let mut flattened_to_table_idx: Vec<usize> =
+                Vec::with_capacity(flattened_aliases.len());
+            let mut source_schemas: Vec<&TableSchema> = Vec::with_capacity(flattened_aliases.len());
+            for alias in &flattened_aliases {
+                let table_idx = tables
+                    .iter()
+                    .position(|t| t.alias.eq_ignore_ascii_case(alias))
+                    .ok_or_else(|| {
+                        anyhow!("internal error: wildcard source {} not found", alias)
+                    })?;
+                flattened_to_table_idx.push(table_idx);
+                source_schemas.push(&tables[table_idx].schema);
+            }
+
+            let mut plan = build_join_wildcard_plan(select, &source_schemas);
+            if let Some(ref mut plan) = plan {
+                for col in &mut plan.columns {
+                    col.source_idx = flattened_to_table_idx
+                        .get(col.source_idx)
+                        .copied()
+                        .unwrap_or(col.source_idx);
+                }
+            }
+            plan
         } else {
             None
         };
