@@ -154,6 +154,81 @@ fn extract_column_pair(
     None
 }
 
+/// Split a join condition into equi-join keys and residual filter.
+///
+/// This function separates the conjuncts of an AND expression into:
+/// 1. Equi-join predicates (e.g., `a.id = b.id`) that can be used for hash join
+/// 2. Residual predicates (e.g., `a.val > 10`) that must be applied as a filter
+///
+/// Returns `(left_key_indices, right_key_indices, residual_filter)`.
+/// If no equi-join keys are found, returns `None`.
+pub(crate) fn split_join_condition(
+    expr: &Expr,
+    left_schema: &TableSchema,
+    right_schema: &TableSchema,
+) -> Option<(Vec<usize>, Vec<usize>, Option<Expr>)> {
+    fn split_conjuncts(expr: &Expr, conjuncts: &mut Vec<Expr>) {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                split_conjuncts(left, conjuncts);
+                split_conjuncts(right, conjuncts);
+            }
+            Expr::Nested(inner) => split_conjuncts(inner, conjuncts),
+            other => conjuncts.push(other.clone()),
+        }
+    }
+
+    let mut conjuncts = Vec::new();
+    split_conjuncts(expr, &mut conjuncts);
+
+    let mut left_keys = Vec::new();
+    let mut right_keys = Vec::new();
+    let mut residual_conjuncts = Vec::new();
+
+    for conjunct in conjuncts {
+        if let Expr::BinaryOp {
+            left: left_expr,
+            op: BinaryOperator::Eq,
+            right: right_expr,
+        } = &conjunct
+        {
+            if let Some((lk, rk)) =
+                extract_column_pair(left_expr, right_expr, left_schema, right_schema)
+            {
+                left_keys.extend(lk);
+                right_keys.extend(rk);
+                continue;
+            }
+        }
+        residual_conjuncts.push(conjunct);
+    }
+
+    if left_keys.is_empty() {
+        return None;
+    }
+
+    let residual = if residual_conjuncts.is_empty() {
+        None
+    } else {
+        Some(
+            residual_conjuncts
+                .into_iter()
+                .reduce(|a, b| Expr::BinaryOp {
+                    left: Box::new(a),
+                    op: BinaryOperator::And,
+                    right: Box::new(b),
+                })
+                .unwrap(),
+        )
+    };
+
+    Some((left_keys, right_keys, residual))
+}
+
 #[derive(Debug, Clone)]
 pub enum ScanType {
     FullTableScan,
@@ -1340,5 +1415,159 @@ mod tests {
         };
         let path_no_pred = choose_best_access_path(&schema, &[], 10);
         assert!(matches!(path_no_pred.scan_type, ScanType::FullTableScan));
+    }
+
+    #[test]
+    fn test_multi_join_hash_join_selection_with_qualified_left_schema() {
+        // Simulate multi-join scenario: after first join (a JOIN b), the left schema
+        // has qualified columns like "a.id", "a.v", "b.id", "b.user_id".
+        // The second join (... JOIN c ON b.id = c.b_id) should still be able to
+        // extract equi-join keys and select hash join.
+        let left_after_first_join = schema_with_cols("join", &["a.id", "a.v", "b.id", "b.user_id"]);
+        let right_c = schema_with_cols("c", &["id", "b_id"]);
+
+        // Original condition: b.id = c.b_id
+        let original_condition = Expr::BinaryOp {
+            left: Box::new(Expr::CompoundIdentifier(vec![
+                Ident::new("b"),
+                Ident::new("id"),
+            ])),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::CompoundIdentifier(vec![
+                Ident::new("c"),
+                Ident::new("b_id"),
+            ])),
+        };
+
+        let cfg = HashJoinConfig {
+            max_memory_bytes: 1,
+            min_rows_threshold: 1,
+        };
+
+        // This should return HashJoin, not NestedLoop
+        match choose_join_algorithm(
+            Some(&original_condition),
+            &left_after_first_join,
+            &right_c,
+            1000,
+            1000,
+            &cfg,
+        ) {
+            JoinAlgorithmChoice::HashJoin {
+                left_key_indices,
+                right_key_indices,
+                ..
+            } => {
+                // b.id is at index 2 in the left schema
+                assert_eq!(left_key_indices, vec![2]);
+                // b_id is at index 1 in the right schema
+                assert_eq!(right_key_indices, vec![1]);
+            }
+            other => panic!(
+                "Expected HashJoin for multi-join with qualified left schema, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_split_join_condition_pure_equi_join() {
+        let left = schema_with_cols("l", &["id", "val"]);
+        let right = schema_with_cols("r", &["user_id"]);
+
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("id"))),
+            op: BinaryOperator::Eq,
+            right: Box::new(Expr::Identifier(Ident::new("user_id"))),
+        };
+
+        let (lk, rk, residual) = split_join_condition(&expr, &left, &right).unwrap();
+        assert_eq!(lk, vec![0]);
+        assert_eq!(rk, vec![0]);
+        assert!(residual.is_none());
+    }
+
+    #[test]
+    fn test_split_join_condition_with_residual() {
+        let left = schema_with_cols("l", &["id", "val"]);
+        let right = schema_with_cols("r", &["user_id", "amount"]);
+
+        // id = user_id AND val > 10
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new("id"))),
+                op: BinaryOperator::Eq,
+                right: Box::new(Expr::Identifier(Ident::new("user_id"))),
+            }),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new("val"))),
+                op: BinaryOperator::Gt,
+                right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
+                    "10".to_string(),
+                    false,
+                ))),
+            }),
+        };
+
+        let (lk, rk, residual) = split_join_condition(&expr, &left, &right).unwrap();
+        assert_eq!(lk, vec![0]);
+        assert_eq!(rk, vec![0]);
+        assert!(residual.is_some());
+    }
+
+    #[test]
+    fn test_split_join_condition_multi_key_with_residual() {
+        let left = schema_with_cols("l", &["id", "val", "category"]);
+        let right = schema_with_cols("r", &["user_id", "amount", "cat"]);
+
+        // id = user_id AND category = cat AND val > 10
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("id"))),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(Expr::Identifier(Ident::new("user_id"))),
+                }),
+                op: BinaryOperator::And,
+                right: Box::new(Expr::BinaryOp {
+                    left: Box::new(Expr::Identifier(Ident::new("category"))),
+                    op: BinaryOperator::Eq,
+                    right: Box::new(Expr::Identifier(Ident::new("cat"))),
+                }),
+            }),
+            op: BinaryOperator::And,
+            right: Box::new(Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(Ident::new("val"))),
+                op: BinaryOperator::Gt,
+                right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
+                    "10".to_string(),
+                    false,
+                ))),
+            }),
+        };
+
+        let (lk, rk, residual) = split_join_condition(&expr, &left, &right).unwrap();
+        assert_eq!(lk, vec![0, 2]);
+        assert_eq!(rk, vec![0, 2]);
+        assert!(residual.is_some());
+    }
+
+    #[test]
+    fn test_split_join_condition_no_equi_keys_returns_none() {
+        let left = schema_with_cols("l", &["id", "val"]);
+        let right = schema_with_cols("r", &["user_id"]);
+
+        // Only a non-equi predicate: val > 10
+        let expr = Expr::BinaryOp {
+            left: Box::new(Expr::Identifier(Ident::new("val"))),
+            op: BinaryOperator::Gt,
+            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
+                "10".to_string(),
+                false,
+            ))),
+        };
+
+        assert!(split_join_condition(&expr, &left, &right).is_none());
     }
 }

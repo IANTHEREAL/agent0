@@ -1161,9 +1161,13 @@ impl Executor {
                 None => None,
             };
 
-            // Try hash join for equi-join conditions
+            // Try hash join for equi-join conditions.
+            // IMPORTANT: Use the rewritten condition (with qualified column names) for join
+            // algorithm selection, not the original condition. After the first join, the left
+            // schema has qualified names like "a.id", "b.id", so we must use the rewritten
+            // condition that references these qualified names.
             let join_algo = choose_join_algorithm(
-                step.condition.as_ref(),
+                rewritten_condition.as_ref(),
                 running_op.schema(),
                 &right.schema,
                 1000,
@@ -1177,6 +1181,17 @@ impl Executor {
                     left_key_indices,
                     right_key_indices,
                 } => {
+                    // Split the rewritten condition into equi-join keys and residual filter.
+                    // The residual filter contains non-equi predicates that must be applied
+                    // after the hash join (e.g., a.val > 10 AND a.id = b.id => residual: a.val > 10).
+                    let residual_filter = if let Some(ref cond) = rewritten_condition {
+                        use crate::sql::planner::split_join_condition;
+                        split_join_condition(cond, running_op.schema(), &right.schema)
+                            .and_then(|(_, _, residual)| residual)
+                    } else {
+                        None
+                    };
+
                     let hash_join_type = match step.join_type {
                         JoinType::Inner => HashJoinType::Inner,
                         JoinType::Left => HashJoinType::Left,
@@ -1192,7 +1207,7 @@ impl Executor {
                             left_key_indices,
                             right_key_indices,
                             left_is_build,
-                            None,
+                            residual_filter,
                             HashJoinConfig::default(),
                         )
                         .with_output_schema(combined_schema),
