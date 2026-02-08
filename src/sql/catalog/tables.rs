@@ -49,16 +49,19 @@ impl VirtualTable for Tables {
         let mut rows = Vec::new();
 
         for full_table_name in ctx.user_tables {
-            let schema = match ctx
+            let (table_schema, table_name) = split_schema_and_name(full_table_name);
+            let Some(schema) = ctx
                 .store
                 .get_schema(ctx.txn, ctx.db_id, full_table_name)
                 .await?
-            {
-                Some(schema) => schema,
-                None => continue,
+            else {
+                continue;
             };
-            let (table_schema, table_name) = split_schema_and_name(full_table_name);
-            let owner = schema.owner;
+            let owner = if schema.owner.is_empty() {
+                "postgres".to_string()
+            } else {
+                schema.owner
+            };
             rows.push(Row::new(vec![
                 text_val(ctx.database_name),
                 text_val(&table_schema),
