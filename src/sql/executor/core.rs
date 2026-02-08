@@ -47,6 +47,282 @@ fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
 }
 
+fn is_ident_char_or_dollar(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'$' || b >= 0x80
+}
+
+/// Split a SQL string into top-level statements by semicolons.
+///
+/// Semicolons inside quoted strings, dollar-quoted strings, comments, or `CREATE PROCEDURE ... AS BEGIN ... END`
+/// bodies are ignored.
+fn split_sql_statements(sql: &str) -> Vec<&str> {
+    #[derive(Copy, Clone, PartialEq, Eq)]
+    enum CreateProcedureScanState {
+        Start,
+        SawCreate,
+        SawCreateOr,
+        SawCreateOrReplace,
+        SawCreateProcedure,
+        Other,
+    }
+
+    let bytes = sql.as_bytes();
+    let mut statements = Vec::new();
+
+    let mut in_single_quote = false;
+    let mut in_escape_single_quote = false;
+    let mut in_double_quote = false;
+    let mut dollar_delim: Option<Vec<u8>> = None;
+    let mut in_line_comment = false;
+    let mut block_comment_depth = 0usize;
+
+    let mut create_procedure_scan_state = CreateProcedureScanState::Start;
+    let mut create_procedure_saw_as = false;
+    let mut create_procedure_begin_depth = 0usize;
+    let mut create_procedure_case_depth = 0usize;
+
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if let Some(delim) = dollar_delim.as_ref() {
+            let delim_len = delim.len();
+            if i + delim_len <= bytes.len() && &bytes[i..i + delim_len] == delim.as_slice() {
+                dollar_delim = None;
+                i += delim_len;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+
+        if in_line_comment {
+            if bytes[i] == b'\n' {
+                in_line_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        if block_comment_depth > 0 {
+            if bytes[i] == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                block_comment_depth += 1;
+                i += 2;
+                continue;
+            }
+            if bytes[i] == b'*' && i + 1 < bytes.len() && bytes[i + 1] == b'/' {
+                block_comment_depth -= 1;
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        let b = bytes[i];
+
+        if b == b'\'' && !in_double_quote {
+            if in_single_quote {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                if in_escape_single_quote {
+                    let mut backslash_count = 0usize;
+                    let mut k = i;
+                    while k > 0 && bytes[k - 1] == b'\\' {
+                        backslash_count += 1;
+                        k -= 1;
+                    }
+                    if backslash_count % 2 == 1 {
+                        i += 1;
+                        continue;
+                    }
+                }
+                in_single_quote = false;
+                in_escape_single_quote = false;
+            } else {
+                in_single_quote = true;
+                in_escape_single_quote = i > 0
+                    && matches!(bytes[i - 1], b'e' | b'E')
+                    && (i == 1 || !is_ident_char_or_dollar(bytes[i - 2]));
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'"' && !in_single_quote {
+            if in_double_quote && i + 1 < bytes.len() && bytes[i + 1] == b'"' {
+                i += 2;
+                continue;
+            }
+            in_double_quote = !in_double_quote;
+            i += 1;
+            continue;
+        }
+
+        if !in_single_quote && !in_double_quote {
+            if b.is_ascii_alphabetic() {
+                let token_start = i;
+                let mut j = i + 1;
+                while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_') {
+                    j += 1;
+                }
+                let token = &bytes[token_start..j];
+
+                if create_procedure_begin_depth == 0 {
+                    match create_procedure_scan_state {
+                        CreateProcedureScanState::Start => {
+                            if token.eq_ignore_ascii_case(b"CREATE") {
+                                create_procedure_scan_state = CreateProcedureScanState::SawCreate;
+                            } else {
+                                create_procedure_scan_state = CreateProcedureScanState::Other;
+                            }
+                        }
+                        CreateProcedureScanState::SawCreate => {
+                            if token.eq_ignore_ascii_case(b"OR") {
+                                create_procedure_scan_state = CreateProcedureScanState::SawCreateOr;
+                            } else if token.eq_ignore_ascii_case(b"PROCEDURE") {
+                                create_procedure_scan_state =
+                                    CreateProcedureScanState::SawCreateProcedure;
+                            } else {
+                                create_procedure_scan_state = CreateProcedureScanState::Other;
+                            }
+                        }
+                        CreateProcedureScanState::SawCreateOr => {
+                            if token.eq_ignore_ascii_case(b"REPLACE") {
+                                create_procedure_scan_state =
+                                    CreateProcedureScanState::SawCreateOrReplace;
+                            } else {
+                                create_procedure_scan_state = CreateProcedureScanState::Other;
+                            }
+                        }
+                        CreateProcedureScanState::SawCreateOrReplace => {
+                            if token.eq_ignore_ascii_case(b"PROCEDURE") {
+                                create_procedure_scan_state =
+                                    CreateProcedureScanState::SawCreateProcedure;
+                            } else {
+                                create_procedure_scan_state = CreateProcedureScanState::Other;
+                            }
+                        }
+                        CreateProcedureScanState::SawCreateProcedure
+                        | CreateProcedureScanState::Other => {}
+                    }
+
+                    if create_procedure_scan_state == CreateProcedureScanState::SawCreateProcedure {
+                        if create_procedure_saw_as {
+                            if token.eq_ignore_ascii_case(b"BEGIN") {
+                                create_procedure_begin_depth = 1;
+                                create_procedure_case_depth = 0;
+                            }
+                            create_procedure_saw_as = false;
+                        } else if token.eq_ignore_ascii_case(b"AS") {
+                            create_procedure_saw_as = true;
+                        }
+                    }
+                } else {
+                    if token.eq_ignore_ascii_case(b"CASE") {
+                        create_procedure_case_depth += 1;
+                    } else if token.eq_ignore_ascii_case(b"BEGIN") {
+                        create_procedure_begin_depth += 1;
+                    } else if token.eq_ignore_ascii_case(b"END") {
+                        if create_procedure_case_depth > 0 {
+                            create_procedure_case_depth -= 1;
+                        } else {
+                            create_procedure_begin_depth =
+                                create_procedure_begin_depth.saturating_sub(1);
+                        }
+                    }
+                }
+
+                i = j;
+                continue;
+            }
+
+            if b == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+            if b == b'/' && i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                block_comment_depth = 1;
+                i += 2;
+                continue;
+            }
+
+            if b == b'$' {
+                let before_ok = i == 0 || !is_ident_char_or_dollar(bytes[i - 1]);
+
+                // Prepared-statement placeholder: $1, $2, ...
+                if before_ok {
+                    let mut j = i + 1;
+                    let mut saw_digit = false;
+                    while j < bytes.len() && bytes[j].is_ascii_digit() && j - i <= 10 {
+                        saw_digit = true;
+                        j += 1;
+                    }
+                    if saw_digit {
+                        let after_ok = j == bytes.len() || !is_ident_char_or_dollar(bytes[j]);
+                        if after_ok {
+                            i = j;
+                            continue;
+                        }
+                    }
+                }
+
+                // PostgreSQL dollar-quoted strings ($tag$...$tag$ or $$...$$)
+                if before_ok {
+                    let mut j = i + 1;
+                    if j < bytes.len() && bytes[j] == b'$' {
+                        dollar_delim = Some(b"$$".to_vec());
+                        i += 2;
+                        continue;
+                    }
+
+                    if j < bytes.len()
+                        && (bytes[j].is_ascii_alphabetic() || bytes[j] == b'_' || bytes[j] >= 0x80)
+                    {
+                        j += 1;
+                        while j < bytes.len() && bytes[j] != b'$' {
+                            if bytes[j].is_ascii_alphanumeric()
+                                || bytes[j] == b'_'
+                                || bytes[j] >= 0x80
+                            {
+                                j += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        if j < bytes.len() && bytes[j] == b'$' {
+                            dollar_delim = Some(bytes[i..=j].to_vec());
+                            i = j + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if b == b';' {
+                if create_procedure_begin_depth > 0 {
+                    i += 1;
+                    continue;
+                }
+                statements.push(&sql[start..i]);
+                start = i + 1;
+                create_procedure_scan_state = CreateProcedureScanState::Start;
+                create_procedure_saw_as = false;
+                create_procedure_begin_depth = 0;
+                create_procedure_case_depth = 0;
+                i += 1;
+                continue;
+            }
+        }
+
+        i += 1;
+    }
+
+    statements.push(&sql[start..]);
+    statements
+}
+
 #[derive(Debug)]
 struct StatementTimeoutError;
 
@@ -641,6 +917,30 @@ impl Executor {
     /// Supports multiple statements separated by semicolons (e.g., "BEGIN; UPDATE...; COMMIT;")
     /// Returns all results for proper PostgreSQL Simple Query Protocol compliance.
     pub async fn execute(&self, session: &mut Session, sql: &str) -> Result<ExecuteResults> {
+        let statements = split_sql_statements(sql)
+            .into_iter()
+            .filter(|stmt| !strip_leading_sql_comments(stmt).trim().is_empty())
+            .collect::<Vec<_>>();
+
+        if statements.is_empty() {
+            return Ok(ExecuteResults::single(ExecuteResult::Empty));
+        }
+
+        if statements.len() == 1 {
+            let statement = statements[0];
+            return self.execute_single(session, statement).await;
+        }
+
+        let mut results = Vec::new();
+        for statement in statements {
+            let ExecuteResults(mut statement_results) =
+                self.execute_single(session, statement).await?;
+            results.append(&mut statement_results);
+        }
+        Ok(ExecuteResults(results))
+    }
+
+    async fn execute_single(&self, session: &mut Session, sql: &str) -> Result<ExecuteResults> {
         let statement_ts = statement_time::now_timestamp_millis();
         let savepoints = session.savepoints();
         let connection_id = session.connection_id();
@@ -3601,8 +3901,8 @@ mod tests {
     use super::{
         cast_current_setting_value, get_skip_reason, get_unsupported_reason,
         is_current_setting_function, is_set_config_function, parse_search_path_guc_value,
-        set_variable_value_to_string, starts_with_ignore_ascii_case, try_parse_const_bool,
-        try_parse_const_text, unwrap_top_level_cast,
+        set_variable_value_to_string, split_sql_statements, starts_with_ignore_ascii_case,
+        try_parse_const_bool, try_parse_const_text, unwrap_top_level_cast,
     };
     use crate::types::Value;
     use sqlparser::ast::{
@@ -3613,6 +3913,123 @@ mod tests {
     fn test_starts_with_ignore_ascii_case_is_byte_safe() {
         assert!(starts_with_ignore_ascii_case("rollback;", "ROLLBACK"));
         assert!(!starts_with_ignore_ascii_case("é💩€ROLLBACK", "ROLLBACK"));
+    }
+
+    #[test]
+    fn test_split_sql_statements_basic() {
+        let sql = "CREATE EXTENSION http; SELECT 1;";
+        let statements: Vec<&str> = split_sql_statements(sql)
+            .into_iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(statements, vec!["CREATE EXTENSION http", "SELECT 1"]);
+    }
+
+    #[test]
+    fn test_split_sql_statements_ignores_semicolons_in_strings_and_comments() {
+        let sql = "SELECT ';' as s; /* ; */ SELECT 1; -- ;\nSELECT 2;";
+        let statements: Vec<&str> = split_sql_statements(sql)
+            .into_iter()
+            .map(|s| super::strip_leading_sql_comments(s).trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(statements, vec!["SELECT ';' as s", "SELECT 1", "SELECT 2"]);
+    }
+
+    #[test]
+    fn test_split_sql_statements_ignores_semicolons_in_dollar_quoted_strings() {
+        let sql = "CREATE FUNCTION f() RETURNS void AS $$ BEGIN RAISE NOTICE 'x; y'; END; $$ LANGUAGE plpgsql; SELECT 1;";
+        let statements: Vec<&str> = split_sql_statements(sql)
+            .into_iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].starts_with("CREATE FUNCTION"));
+        assert!(statements[0].contains("RAISE NOTICE 'x; y';"));
+        assert!(statements[0].contains("END; $$"));
+        assert_eq!(statements[1], "SELECT 1");
+    }
+
+    #[test]
+    fn test_split_sql_statements_ignores_semicolons_in_create_procedure_body() {
+        let sql = "CREATE PROCEDURE p() AS BEGIN\nSELECT 1;\nSELECT 2\nEND; SELECT 3;";
+        let statements: Vec<&str> = split_sql_statements(sql)
+            .into_iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].starts_with("CREATE PROCEDURE"));
+        assert!(statements[0].contains("SELECT 1;"));
+        assert!(statements[0].contains("SELECT 2"));
+        assert!(statements[0].contains("\nEND"));
+        assert_eq!(statements[1], "SELECT 3");
+    }
+
+    #[test]
+    fn test_split_sql_statements_create_procedure_does_not_break_on_case_end() {
+        let sql =
+            "CREATE PROCEDURE p() AS BEGIN\nSELECT CASE WHEN 1=1 THEN 1 ELSE 2 END;\nSELECT 2;\nEND; SELECT 3;";
+        let statements: Vec<&str> = split_sql_statements(sql)
+            .into_iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].starts_with("CREATE PROCEDURE"));
+        assert!(statements[0].contains("CASE WHEN"));
+        assert!(statements[0].contains("ELSE 2 END;"));
+        assert!(statements[0].contains("\nEND"));
+        assert_eq!(statements[1], "SELECT 3");
+    }
+
+    #[test]
+    fn test_split_sql_statements_ignores_semicolons_in_create_or_replace_procedure_body() {
+        let sql = "CREATE OR REPLACE PROCEDURE p() AS BEGIN\nSELECT 1;\nEND; SELECT 2;";
+        let statements: Vec<&str> = split_sql_statements(sql)
+            .into_iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].starts_with("CREATE OR REPLACE PROCEDURE"));
+        assert!(statements[0].contains("SELECT 1;"));
+        assert!(statements[0].contains("\nEND"));
+        assert_eq!(statements[1], "SELECT 2");
+    }
+
+    #[test]
+    fn test_split_sql_statements_does_not_treat_identifier_dollars_as_dollar_quotes() {
+        for sql in [
+            "COMMENT ON TABLE a$$ IS 'x'; SELECT 1;",
+            "COMMENT ON TABLE a$tag$ IS 'x'; SELECT 1;",
+            "COMMENT ON TABLE 租户$$ IS 'x'; SELECT 1;",
+        ] {
+            let statements: Vec<&str> = split_sql_statements(sql)
+                .into_iter()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            assert_eq!(
+                statements,
+                vec![sql.split(';').next().unwrap().trim(), "SELECT 1"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_split_sql_statements_ignores_semicolons_in_escape_string_literals() {
+        let sql = r"SELECT E'it\'s fine; really' AS semi; SELECT 1;";
+        let statements: Vec<&str> = split_sql_statements(sql)
+            .into_iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert_eq!(statements.len(), 2);
+        assert!(statements[0].contains("fine; really"));
+        assert_eq!(statements[1], "SELECT 1");
     }
 
     #[test]

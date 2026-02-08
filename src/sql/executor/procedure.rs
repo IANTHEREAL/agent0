@@ -687,13 +687,17 @@ impl Executor {
             .or_else(|| rest.split_once("as\nbegin"))
             .ok_or_else(|| anyhow!("CREATE PROCEDURE requires AS BEGIN ... END syntax"))?;
 
-        let body = body
-            .strip_suffix("END;")
-            .or_else(|| body.strip_suffix("END"))
-            .or_else(|| body.strip_suffix("end;"))
-            .or_else(|| body.strip_suffix("end"))
-            .unwrap_or(body)
-            .trim();
+        let body_trimmed = body.trim_end();
+        let body_trimmed = body_trimmed
+            .strip_suffix(';')
+            .unwrap_or(body_trimmed)
+            .trim_end();
+        if body_trimmed.len() < 3
+            || !body_trimmed.as_bytes()[body_trimmed.len() - 3..].eq_ignore_ascii_case(b"END")
+        {
+            return Err(anyhow!("CREATE PROCEDURE requires AS BEGIN ... END syntax"));
+        }
+        let body = body_trimmed[..body_trimmed.len() - 3].trim();
 
         let name_and_params = name_and_params.trim();
         let (proc_name, params_str) = if let Some(paren_pos) = name_and_params.find('(') {
