@@ -1,2 +1,1 @@
 ERROR:  Correlated subquery in JOIN context is not supported (outer refs: a)
-ERROR:  Correlated subquery in JOIN context is not supported (outer refs: a)

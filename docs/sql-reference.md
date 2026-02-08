@@ -269,6 +269,11 @@ SELECT * FROM users u WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = u.i
 SELECT name, (SELECT COUNT(*) FROM orders WHERE user_id = users.id) AS order_count FROM users;
 ```
 
+Notes:
+- Correlated subqueries are supported in single-table `SELECT` queries.
+- Correlated subqueries in `JOIN` queries (in `SELECT` list, `WHERE`, `HAVING`, or `JOIN ... ON`)
+  are not supported yet and will return an `Unsupported` error.
+
 ### Common Table Expressions (CTEs)
 
 ```sql

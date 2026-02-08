@@ -1,6 +1,6 @@
 -- Regression test for issue #430:
--- Internal `__tipg_subquery_*` computed columns must not leak into `SELECT *` output,
--- especially when USING/NATURAL join wildcard expansion is used.
+-- Correlated subqueries in JOIN-context clauses are explicitly unsupported.
+-- This test asserts we fail fast with a stable Unsupported error (fail-closed).
 
 DROP TABLE IF EXISTS ha_a;
 DROP TABLE IF EXISTS ha_b;

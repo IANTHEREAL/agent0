@@ -1,6 +1,6 @@
 -- Issue #420 regression:
--- Correlated scalar subqueries in JOIN ON conditions must remain correlated, and internal
--- `__tipg_subquery_*` computed columns must not leak into `SELECT *` output with USING/NATURAL joins.
+-- Correlated subqueries in JOIN-context clauses are explicitly unsupported.
+-- This test asserts we fail fast with a stable Unsupported error (fail-closed).
 
 DROP TABLE IF EXISTS i420_a;
 DROP TABLE IF EXISTS i420_b;
@@ -24,7 +24,7 @@ NATURAL JOIN i420_b b
 JOIN i420_d d ON d.v = (SELECT e.v FROM i420_e e WHERE e.id = a.id)
 ORDER BY a.id;
 
--- 2) `SELECT *` must not expose internal `__tipg_subquery_*` columns (even with LIMIT 0).
+-- 2) Same limitation in `SELECT *` queries.
 SELECT *
 FROM i420_a a
 NATURAL JOIN i420_b b

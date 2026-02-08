@@ -1,2 +1,1 @@
-id|a_val|b_val|v
-(0 rows)
+ERROR:  Correlated subquery in JOIN context is not supported (outer refs: ha_a)

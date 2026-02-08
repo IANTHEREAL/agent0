@@ -7,8 +7,31 @@ use super::using_merge::{build_coalesce_for_merge, rewrite_for_using_join, Using
 
 mod projection;
 
+const CORRELATED_SUBQUERY_JOIN_CONTEXT_UNSUPPORTED: &str =
+    "Correlated subquery in JOIN context is not supported";
+
+fn correlated_subquery_join_context_unsupported(mut outer_refs: Vec<String>) -> anyhow::Error {
+    outer_refs.sort_by(|a, b| {
+        a.to_lowercase()
+            .cmp(&b.to_lowercase())
+            .then_with(|| a.cmp(b))
+    });
+    outer_refs.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+
+    let msg = if outer_refs.is_empty() {
+        CORRELATED_SUBQUERY_JOIN_CONTEXT_UNSUPPORTED.to_string()
+    } else {
+        format!(
+            "{CORRELATED_SUBQUERY_JOIN_CONTEXT_UNSUPPORTED} (outer refs: {})",
+            outer_refs.join(", ")
+        )
+    };
+    SqlError::Unsupported(msg).into()
+}
+
 struct TableInfo {
     alias: String,
+    is_system_catalog: bool,
     schema: TableSchema,
     preloaded_rows: Option<Vec<Row>>,
 }
@@ -25,6 +48,86 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<Option<ExecuteResult>> {
         use crate::types::ColumnDef;
+
+        // Fail-closed semantics: JOIN-context correlated subqueries are not supported.
+        // If any scalar/EXISTS/IN subquery in SELECT/WHERE/HAVING references any JOIN-visible table
+        // alias, fail fast with an explicit Unsupported error.
+        //
+        // NOTE: JOIN ... ON scalar subqueries are handled later by join-condition rewriting, so we
+        // intentionally do not pre-check them here (required for ORM/system-catalog queries).
+        {
+            use core::ops::ControlFlow;
+            use sqlparser::ast::visit_expressions;
+
+            fn collect_correlated_outer_refs_in_expr(
+                expr: &Expr,
+                join_aliases: &[String],
+                out: &mut HashSet<String>,
+            ) {
+                let _ = visit_expressions(expr, |e| {
+                    let q = match e {
+                        Expr::Subquery(q) => Some(q.as_ref()),
+                        Expr::InSubquery { subquery, .. } => Some(subquery.as_ref()),
+                        Expr::Exists { subquery, .. } => Some(subquery.as_ref()),
+                        _ => None,
+                    };
+                    if let Some(q) = q {
+                        for alias in join_aliases {
+                            if crate::sql::executor::subquery::query_has_outer_reference(q, alias) {
+                                out.insert(alias.clone());
+                            }
+                        }
+                    }
+                    ControlFlow::<()>::Continue(())
+                });
+            }
+
+            let join_aliases: Vec<String> = {
+                let mut aliases: Vec<String> = Vec::new();
+                for twj in &select.from {
+                    aliases.extend(collect_visible_aliases_in_table_with_joins(twj));
+                }
+                let mut seen: HashSet<String> = HashSet::new();
+                aliases.retain(|a| seen.insert(a.to_lowercase()));
+                aliases
+            };
+
+            let mut correlated_outer_refs: HashSet<String> = HashSet::new();
+
+            for item in &select.projection {
+                match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                        collect_correlated_outer_refs_in_expr(
+                            expr,
+                            &join_aliases,
+                            &mut correlated_outer_refs,
+                        );
+                    }
+                    _ => {}
+                }
+            }
+
+            if let Some(sel) = select.selection.as_ref() {
+                collect_correlated_outer_refs_in_expr(
+                    sel,
+                    &join_aliases,
+                    &mut correlated_outer_refs,
+                );
+            }
+
+            if let Some(having) = select.having.as_ref() {
+                collect_correlated_outer_refs_in_expr(
+                    having,
+                    &join_aliases,
+                    &mut correlated_outer_refs,
+                );
+            }
+
+            if !correlated_outer_refs.is_empty() {
+                let outer_refs: Vec<String> = correlated_outer_refs.into_iter().collect();
+                return Err(correlated_subquery_join_context_unsupported(outer_refs));
+            }
+        }
 
         let virtual_filter = select
             .selection
@@ -78,6 +181,22 @@ impl Executor {
 
         let is_implicit_join = select.from.len() > 1;
 
+        fn table_factor_is_system_catalog(factor: &TableFactor) -> bool {
+            let schema_opt = match factor {
+                TableFactor::Table { name, .. } => match names::split_object_name(name) {
+                    Ok((schema_opt, _)) => schema_opt,
+                    Err(_) => return false,
+                },
+                _ => return false,
+            };
+
+            schema_opt.is_some_and(|schema| {
+                schema.eq_ignore_ascii_case("information_schema")
+                    || schema.eq_ignore_ascii_case("pg_catalog")
+                    || schema.eq_ignore_ascii_case("pg_toast")
+            })
+        }
+
         let mut tables: Vec<TableInfo> = Vec::new();
         // `build_join_wildcard_plan()` expects sources in `select.from` flattened order, which can
         // differ from the physical `tables` order we build for correct JOIN binding precedence.
@@ -121,6 +240,7 @@ impl Executor {
                 Some(t) => t,
                 None => return Ok(None),
             };
+            let is_system_catalog = table_factor_is_system_catalog(&from_item.relation);
             from_source_aliases[from_idx].push(alias.clone());
             if let TableFactor::NestedJoin {
                 table_with_joins,
@@ -141,6 +261,7 @@ impl Executor {
             }
             tables.push(TableInfo {
                 alias,
+                is_system_catalog,
                 schema,
                 preloaded_rows,
             });
@@ -161,6 +282,7 @@ impl Executor {
                     Some(t) => t,
                     None => return Ok(None),
                 };
+                let is_system_catalog = table_factor_is_system_catalog(&join.relation);
                 from_source_aliases[from_idx].push(alias.clone());
                 if let TableFactor::NestedJoin {
                     table_with_joins,
@@ -325,6 +447,7 @@ impl Executor {
                 let idx = tables.len();
                 tables.push(TableInfo {
                     alias,
+                    is_system_catalog,
                     schema: right_schema,
                     preloaded_rows: right_preloaded,
                 });
@@ -356,6 +479,7 @@ impl Executor {
                 Some(t) => t,
                 None => return Ok(None),
             };
+            let is_system_catalog = table_factor_is_system_catalog(&from_item.relation);
             from_source_aliases[from_idx].push(alias.clone());
             let idx = tables.len();
             let need_cross = idx > 0;
@@ -378,6 +502,7 @@ impl Executor {
             }
             tables.push(TableInfo {
                 alias,
+                is_system_catalog,
                 schema,
                 preloaded_rows,
             });
@@ -394,12 +519,6 @@ impl Executor {
             return Ok(None);
         }
 
-        // Resolve JOIN-condition scalar subqueries.
-        //
-        // - Uncorrelated subqueries are resolved eagerly to literals.
-        // - Correlated scalar subqueries are materialized as hidden computed columns on the
-        //   referenced outer table (preloading rows if needed), and the JOIN condition is
-        //   rewritten to reference that column instead of `Expr::Subquery`.
         let mut correlated_subquery_counter: usize = 0;
 
         fn rewrite_join_condition_subqueries<'a>(
@@ -439,15 +558,15 @@ impl Executor {
                                 .await;
                         }
 
-                        if referenced_aliases.len() > 1 {
-                            return Err(anyhow!(
-                                "Correlated scalar subquery in JOIN condition references multiple outer tables: {:?}",
-                                referenced_aliases
+                        if referenced_aliases.len() != 1 {
+                            return Err(correlated_subquery_join_context_unsupported(
+                                referenced_aliases,
                             ));
                         }
 
                         let outer_alias = referenced_aliases
-                            .pop()
+                            .first()
+                            .cloned()
                             .unwrap_or_else(|| "outer".to_string());
 
                         let table_idx = tables
@@ -459,6 +578,12 @@ impl Executor {
                                     outer_alias
                                 )
                             })?;
+
+                        if !tables[table_idx].is_system_catalog {
+                            return Err(correlated_subquery_join_context_unsupported(vec![
+                                outer_alias,
+                            ]));
+                        }
 
                         if tables[table_idx].preloaded_rows.is_none() {
                             let (schema, rows) = exec
@@ -523,6 +648,40 @@ impl Executor {
                             Ident::new(outer_alias),
                             Ident::new(computed_col),
                         ]))
+                    }
+                    Expr::Exists { subquery, .. } => {
+                        let mut referenced_aliases: Vec<String> = Vec::new();
+                        for t in tables.iter() {
+                            if crate::sql::executor::subquery::query_has_outer_reference(
+                                subquery, &t.alias,
+                            ) {
+                                referenced_aliases.push(t.alias.clone());
+                            }
+                        }
+                        if referenced_aliases.is_empty() {
+                            Ok(expr.clone())
+                        } else {
+                            Err(correlated_subquery_join_context_unsupported(
+                                referenced_aliases,
+                            ))
+                        }
+                    }
+                    Expr::InSubquery { subquery, .. } => {
+                        let mut referenced_aliases: Vec<String> = Vec::new();
+                        for t in tables.iter() {
+                            if crate::sql::executor::subquery::query_has_outer_reference(
+                                subquery, &t.alias,
+                            ) {
+                                referenced_aliases.push(t.alias.clone());
+                            }
+                        }
+                        if referenced_aliases.is_empty() {
+                            Ok(expr.clone())
+                        } else {
+                            Err(correlated_subquery_join_context_unsupported(
+                                referenced_aliases,
+                            ))
+                        }
                     }
                     Expr::BinaryOp { left, op, right } => {
                         let left = rewrite_join_condition_subqueries(
