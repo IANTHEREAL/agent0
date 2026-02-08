@@ -1,3 +1,4 @@
+use crate::sql::quoting;
 use crate::types::Value;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -448,14 +449,14 @@ pub fn quote_ident(args: Vec<Value>) -> Result<Value> {
         Some(v) => v.to_string(),
         None => return Ok(Value::Null),
     };
-    Ok(Value::Text(quote_ident_impl(&val)))
+    Ok(Value::Text(quoting::quote_ident(&val)))
 }
 
 pub fn quote_literal(args: Vec<Value>) -> Result<Value> {
     match args.into_iter().next() {
-        Some(Value::Text(s)) => Ok(Value::Text(quote_literal_impl(&s))),
+        Some(Value::Text(s)) => Ok(Value::Text(quoting::quote_literal(&s))),
         Some(Value::Null) => Ok(Value::Null),
-        Some(v) => Ok(Value::Text(quote_literal_impl(&v.to_string()))),
+        Some(v) => Ok(Value::Text(quoting::quote_literal(&v.to_string()))),
         None => Ok(Value::Null),
     }
 }
@@ -463,46 +464,10 @@ pub fn quote_literal(args: Vec<Value>) -> Result<Value> {
 pub fn quote_nullable(args: Vec<Value>) -> Result<Value> {
     match args.into_iter().next() {
         Some(Value::Null) => Ok(Value::Text("NULL".to_string())),
-        Some(Value::Text(s)) => Ok(Value::Text(quote_literal_impl(&s))),
-        Some(v) => Ok(Value::Text(quote_literal_impl(&v.to_string()))),
+        Some(Value::Text(s)) => Ok(Value::Text(quoting::quote_literal(&s))),
+        Some(v) => Ok(Value::Text(quoting::quote_literal(&v.to_string()))),
         None => Ok(Value::Text("NULL".to_string())),
     }
-}
-
-fn quote_literal_impl(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-fn quote_ident_impl(ident: &str) -> String {
-    let needs_quote = ident.is_empty() || !is_simple_unquoted_ident(ident) || is_sql_keyword(ident);
-    if needs_quote {
-        format!("\"{}\"", ident.replace('"', "\"\""))
-    } else {
-        ident.to_string()
-    }
-}
-
-fn is_simple_unquoted_ident(ident: &str) -> bool {
-    let mut chars = ident.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_lowercase() || first == '_') {
-        return false;
-    }
-    for ch in chars {
-        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '$') {
-            return false;
-        }
-    }
-    true
-}
-
-fn is_sql_keyword(ident: &str) -> bool {
-    let upper = ident.to_ascii_uppercase();
-    sqlparser::keywords::ALL_KEYWORDS
-        .binary_search(&upper.as_str())
-        .is_ok()
 }
 
 #[cfg(test)]

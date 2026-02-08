@@ -26,6 +26,7 @@ use std::future::Future;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use super::quoting;
 use super::timezone::parse_timezone_offset_seconds;
 
 // Thread-local storage for connection_id used by pg_backend_pid() as a fallback.
@@ -656,7 +657,7 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                             Value::Text(s) => s.clone(),
                             v => v.to_string(),
                         };
-                        quote_ident_impl(&s)
+                        quoting::quote_ident(&s)
                     }
                     'L' => {
                         if matches!(arg_val, Value::Null) {
@@ -666,7 +667,7 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                                 Value::Text(s) => s.clone(),
                                 v => v.to_string(),
                             };
-                            quote_literal_impl(&s)
+                            quoting::quote_literal(&s)
                         }
                     }
                     other => return Err(anyhow!(format_unrecognized_specifier_error(other))),
@@ -1725,42 +1726,6 @@ fn format_unrecognized_specifier_error(spec: char) -> String {
         "unrecognized format() type specifier \"{}\"\nHINT:  For a single \"%\" use \"%%\".",
         spec
     )
-}
-
-fn quote_literal_impl(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "''"))
-}
-
-fn quote_ident_impl(ident: &str) -> String {
-    let needs_quote = ident.is_empty() || !is_simple_unquoted_ident(ident) || is_sql_keyword(ident);
-    if needs_quote {
-        format!("\"{}\"", ident.replace('"', "\"\""))
-    } else {
-        ident.to_string()
-    }
-}
-
-fn is_simple_unquoted_ident(ident: &str) -> bool {
-    let mut chars = ident.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_lowercase() || first == '_') {
-        return false;
-    }
-    for ch in chars {
-        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '$') {
-            return false;
-        }
-    }
-    true
-}
-
-fn is_sql_keyword(ident: &str) -> bool {
-    let upper = ident.to_ascii_uppercase();
-    sqlparser::keywords::ALL_KEYWORDS
-        .binary_search(&upper.as_str())
-        .is_ok()
 }
 
 fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<Value> {

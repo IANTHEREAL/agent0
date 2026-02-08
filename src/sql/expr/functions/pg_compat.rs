@@ -1,4 +1,5 @@
 use crate::sql::pg_types;
+use crate::sql::quoting;
 use crate::types::Value;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -7,9 +8,6 @@ use super::SqlFn;
 
 pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("PG_TYPEOF", pg_typeof);
-    map.insert("QUOTE_IDENT", quote_ident);
-    map.insert("QUOTE_LITERAL", quote_literal);
-    map.insert("QUOTE_NULLABLE", quote_nullable);
     map.insert("PG_COLUMN_SIZE", pg_column_size);
     map.insert("FORMAT_TYPE", format_type);
     map.insert("PG_IS_IN_RECOVERY", pg_is_in_recovery);
@@ -64,65 +62,6 @@ fn pg_typeof_name(val: &Value) -> String {
 pub fn pg_typeof(args: Vec<Value>) -> Result<Value> {
     let val = args.into_iter().next().unwrap_or(Value::Null);
     Ok(Value::Text(pg_typeof_name(&val)))
-}
-
-fn is_simple_unquoted_ident(ident: &str) -> bool {
-    let mut chars = ident.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_lowercase() || first == '_') {
-        return false;
-    }
-    for ch in chars {
-        if !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' || ch == '$') {
-            return false;
-        }
-    }
-    true
-}
-
-fn is_sql_keyword(ident: &str) -> bool {
-    let upper = ident.to_ascii_uppercase();
-    sqlparser::keywords::ALL_KEYWORDS
-        .binary_search(&upper.as_str())
-        .is_ok()
-}
-
-pub fn quote_ident(args: Vec<Value>) -> Result<Value> {
-    let val = match args.into_iter().next() {
-        Some(Value::Text(s)) => s,
-        Some(Value::Null) => return Ok(Value::Null),
-        Some(v) => v.to_string(),
-        None => return Ok(Value::Null),
-    };
-    let needs_quote = val.is_empty() || !is_simple_unquoted_ident(&val) || is_sql_keyword(&val);
-    let result = if needs_quote {
-        format!("\"{}\"", val.replace('"', "\"\""))
-    } else {
-        val
-    };
-    Ok(Value::Text(result))
-}
-
-pub fn quote_literal(args: Vec<Value>) -> Result<Value> {
-    let val = match args.into_iter().next() {
-        Some(Value::Text(s)) => s,
-        Some(Value::Null) => return Ok(Value::Null),
-        Some(v) => v.to_string(),
-        None => return Ok(Value::Null),
-    };
-    Ok(Value::Text(format!("'{}'", val.replace('\'', "''"))))
-}
-
-pub fn quote_nullable(args: Vec<Value>) -> Result<Value> {
-    let val = match args.into_iter().next() {
-        Some(Value::Null) => return Ok(Value::Text("NULL".to_string())),
-        Some(Value::Text(s)) => s,
-        Some(v) => v.to_string(),
-        None => return Ok(Value::Text("NULL".to_string())),
-    };
-    Ok(Value::Text(format!("'{}'", val.replace('\'', "''"))))
 }
 
 pub fn pg_column_size(args: Vec<Value>) -> Result<Value> {
@@ -273,16 +212,6 @@ pub fn pg_get_serial_sequence(_args: Vec<Value>) -> Result<Value> {
         }
     }
 
-    fn quote_ident_str(ident: &str) -> String {
-        let needs_quote =
-            ident.is_empty() || !is_simple_unquoted_ident(ident) || is_sql_keyword(ident);
-        if needs_quote {
-            format!("\"{}\"", ident.replace('"', "\"\""))
-        } else {
-            ident.to_string()
-        }
-    }
-
     let mut iter = _args.into_iter();
     let table_name = match iter.next() {
         Some(Value::Text(s)) => s,
@@ -308,8 +237,8 @@ pub fn pg_get_serial_sequence(_args: Vec<Value>) -> Result<Value> {
     let seq_name = format!("{}_{}_seq", table, column);
     Ok(Value::Text(format!(
         "{}.{}",
-        quote_ident_str(&schema),
-        quote_ident_str(&seq_name)
+        quoting::quote_ident(&schema),
+        quoting::quote_ident(&seq_name)
     )))
 }
 
@@ -327,6 +256,8 @@ pub fn has_privilege(_args: Vec<Value>) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use crate::sql::expr::functions::string::{quote_ident, quote_literal, quote_nullable};
+
     use super::*;
 
     #[test]

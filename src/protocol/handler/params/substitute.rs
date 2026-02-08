@@ -1,4 +1,5 @@
 use super::scan::is_ident_char_or_dollar;
+use crate::sql::quoting;
 use pgwire::api::portal::Portal;
 use pgwire::api::Type;
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
@@ -176,10 +177,6 @@ pub(in crate::protocol::handler) fn substitute_parameters(
 ) -> PgWireResult<String> {
     let mut values: Vec<String> = Vec::with_capacity(portal.parameter_len());
 
-    fn quote_sql_string_literal(value: &str) -> String {
-        format!("'{}'", value.replace("'", "''"))
-    }
-
     for i in 0..portal.parameter_len() {
         let param_type = portal
             .statement
@@ -260,22 +257,22 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                 t if *t == Type::UUID => {
                     let uuid = uuid::Uuid::from_slice(param_bytes.as_ref())
                         .map_err(|e| invalid_param(e.to_string()))?;
-                    format!("{}::uuid", quote_sql_string_literal(&uuid.to_string()))
+                    format!("{}::uuid", quoting::quote_literal(&uuid.to_string()))
                 }
                 t if *t == Type::BYTEA => {
                     let hex = hex::encode(param_bytes.as_ref());
                     let repr = format!("\\x{}", hex);
-                    format!("{}::bytea", quote_sql_string_literal(&repr))
+                    format!("{}::bytea", quoting::quote_literal(&repr))
                 }
                 t if *t == Type::TEXT => {
                     let s = std::str::from_utf8(param_bytes.as_ref())
                         .map_err(|e| invalid_param(e.to_string()))?;
-                    quote_sql_string_literal(s)
+                    quoting::quote_literal(s)
                 }
                 t if *t == Type::JSON => {
                     let s = std::str::from_utf8(param_bytes.as_ref())
                         .map_err(|e| invalid_param(e.to_string()))?;
-                    quote_sql_string_literal(s)
+                    quoting::quote_literal(s)
                 }
                 // Type::UNKNOWN (OID 705) - pgx/GORM sends binary unknown when type is not inferred.
                 // Prefer fixed-width numeric decoding when payload contains NUL/control bytes
@@ -312,7 +309,7 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                         if let Ok(v) = s.trim().parse::<i64>() {
                             v.to_string()
                         } else {
-                            quote_sql_string_literal(s)
+                            quoting::quote_literal(s)
                         }
                     } else {
                         // Non-UTF8 and no obvious control bytes: best-effort numeric decode by size.
@@ -390,9 +387,9 @@ pub(in crate::protocol::handler) fn substitute_parameters(
                     }
                     v.to_string()
                 }
-                t if *t == Type::UUID => format!("{}::uuid", quote_sql_string_literal(raw)),
-                t if *t == Type::BYTEA => format!("{}::bytea", quote_sql_string_literal(raw)),
-                _ => quote_sql_string_literal(raw),
+                t if *t == Type::UUID => format!("{}::uuid", quoting::quote_literal(raw)),
+                t if *t == Type::BYTEA => format!("{}::bytea", quoting::quote_literal(raw)),
+                _ => quoting::quote_literal(raw),
             }
         };
 

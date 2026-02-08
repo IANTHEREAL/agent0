@@ -13,6 +13,7 @@ use tikv_client::Transaction;
 
 use super::names;
 use super::parse_sql;
+use super::quoting;
 use super::sequences;
 
 pub struct PlpgsqlContext {
@@ -689,7 +690,7 @@ fn substitute_variables(ctx: &PlpgsqlContext, s: &str) -> String {
     for (name, value) in &ctx.variables {
         let value_str = match value {
             Value::Null => "NULL".to_string(),
-            Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+            Value::Text(t) => quoting::quote_literal(t),
             v => v.to_string(),
         };
         result = replace_identifier(&result, name, &value_str);
@@ -915,7 +916,7 @@ async fn execute_sql_function(
     for (name, value) in &param_map {
         let value_str = match value {
             Value::Null => "NULL".to_string(),
-            Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+            Value::Text(t) => quoting::quote_literal(t),
             Value::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
             v => v.to_string(),
         };

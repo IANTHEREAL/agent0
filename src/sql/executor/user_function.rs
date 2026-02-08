@@ -1,6 +1,7 @@
 use crate::sql::error::SqlError;
 use crate::sql::names;
 use crate::sql::plpgsql;
+use crate::sql::quoting;
 use crate::sql::{parse_sql, ExecuteResult};
 use crate::types::{FunctionDef, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
@@ -214,23 +215,23 @@ fn value_to_sql_literal(value: &Value) -> String {
         Value::Int32(i) => i.to_string(),
         Value::Int64(i) => i.to_string(),
         Value::Float64(f) => f.to_string(),
-        Value::Text(t) => format!("'{}'", t.replace('\'', "''")),
+        Value::Text(t) => quoting::quote_literal(t),
         Value::Vector(_) => format!("'{}'", value),
         Value::Uuid(_) => format!("'{}'::uuid", value),
         Value::Timestamp(ts) => format!("'{}'::timestamp", ts),
         Value::Date(_) => format!("'{}'::date", value),
         Value::Time(_) => format!("'{}'::time", value),
         Value::Interval(iv) => format!("'{}'::interval", iv),
-        Value::Json(s) => format!("'{}'::json", s.replace('\'', "''")),
-        Value::Jsonb(s) => format!("'{}'::jsonb", s.replace('\'', "''")),
+        Value::Json(s) => format!("{}::json", quoting::quote_literal(s)),
+        Value::Jsonb(s) => format!("{}::jsonb", quoting::quote_literal(s)),
         Value::Bytes(b) => format!("'\\x{}'::bytea", hex::encode(b)),
         Value::Array(elems) => {
             let inner: Vec<String> = elems.iter().map(value_to_sql_literal).collect();
             format!("ARRAY[{}]", inner.join(", "))
         }
         Value::Numeric(d) => format!("{}::numeric", d),
-        Value::Tsvector(s) => format!("'{}'::tsvector", s.replace('\'', "''")),
-        Value::Tsquery(s) => format!("'{}'::tsquery", s.replace('\'', "''")),
+        Value::Tsvector(s) => format!("{}::tsvector", quoting::quote_literal(s)),
+        Value::Tsquery(s) => format!("{}::tsquery", quoting::quote_literal(s)),
     }
 }
 
