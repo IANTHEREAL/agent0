@@ -17,7 +17,7 @@ DETAIL:  Failing row contains (3, NULL, NULL).
 psql:/home/dongxu/lab/pg-tikv/tests/27_constraints.sql:15: ERROR:  null value in column "required_col" of relation "not_null_test" violates not-null constraint
 DETAIL:  Failing row contains (4, NULL, missing required).
 psql:/home/dongxu/lab/pg-tikv/tests/27_constraints.sql:17: ERROR:  null value in column "required_col" of relation "not_null_test" violates not-null constraint
-DETAIL:  Failing row contains (1, valid, NULL).
+DETAIL:  Failing row contains (1, NULL, NULL).
 psql:/home/dongxu/lab/pg-tikv/tests/27_constraints.sql:37: ERROR:  new row for relation "check_test" violates check constraint "check_test_check1"
 DETAIL:  Failing row contains (4, -1, 10, active).
 psql:/home/dongxu/lab/pg-tikv/tests/27_constraints.sql:38: ERROR:  new row for relation "check_test" violates check constraint "check_test_check2"
