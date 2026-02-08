@@ -151,6 +151,32 @@ impl StartupHandler for PgHandler {
     {
         if let PgWireFrontendMessage::Startup(ref startup) = message {
             pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
+            client.metadata_mut().insert(
+                super::METADATA_AUTH_IS_SUPERUSER.to_string(),
+                "off".to_string(),
+            );
+
+            {
+                let mut session = self.session.lock().await;
+                if let Some(user) = client.metadata().get(pgwire::api::METADATA_USER) {
+                    session.set_user(user.clone(), false);
+                }
+
+                if let Some(options) = client.metadata().get("options") {
+                    for (key, value) in super::parse_startup_options(options) {
+                        if let Err(e) = session.set_known_setting(&key.to_ascii_lowercase(), value)
+                        {
+                            warn!("Failed to apply startup option {}: {}", key, e);
+                        }
+                    }
+                }
+                if let Some(app_name) = client.metadata().get("application_name") {
+                    if let Err(e) = session.set_known_setting("application_name", app_name.clone())
+                    {
+                        warn!("Failed to apply application_name from startup: {}", e);
+                    }
+                }
+            }
             pgwire::api::auth::finish_authentication(client, &PgServerParameterProvider).await?;
         }
         Ok(())

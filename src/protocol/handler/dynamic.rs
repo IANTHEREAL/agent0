@@ -19,7 +19,7 @@ use super::{
     resolve_copy_columns, resolve_table_for_insert, rollback_autocommit_or_mark_failed,
     send_notices_and_get_last_response, stub_describe_field, CopyContext,
     PgServerParameterProvider, TipgQueryParser, CONNECTION_ID_COUNTER, METADATA_ACTUAL_USER,
-    METADATA_KEYSPACE,
+    METADATA_AUTH_IS_SUPERUSER, METADATA_KEYSPACE,
 };
 use crate::auth::AuthManager;
 use crate::observability;
@@ -886,6 +886,11 @@ impl StartupHandler for DynamicPgHandler {
                                     }
                                 }
                             }
+
+                            client.metadata_mut().insert(
+                                METADATA_AUTH_IS_SUPERUSER.to_string(),
+                                if is_superuser { "on" } else { "off" }.to_string(),
+                            );
 
                             pgwire::api::auth::finish_authentication(
                                 client,

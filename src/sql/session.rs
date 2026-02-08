@@ -133,7 +133,19 @@ impl SessionSettings {
                 self.timezone = Some(value);
             }
             "application_name" => self.application_name = Some(value),
-            "client_encoding" => self.client_encoding = Some(value),
+            "client_encoding" => {
+                let enc = value.trim();
+                if enc.eq_ignore_ascii_case("utf8") || enc.eq_ignore_ascii_case("utf-8") {
+                    // Server is UTF-8 only and does not support transcoding. Accept UTF-8 aliases
+                    // and store the canonical Postgres spelling.
+                    self.client_encoding = Some("UTF8".to_string());
+                } else {
+                    return Err(anyhow!(
+                        "unsupported client_encoding '{}'; only UTF8 is supported",
+                        value
+                    ));
+                }
+            }
             "standard_conforming_strings" => self.standard_conforming_strings = Some(value),
             "check_function_bodies" => self.check_function_bodies = Some(value),
             "xmloption" => self.xmloption = Some(value),
@@ -152,12 +164,17 @@ impl SessionSettings {
             // These are used heavily by drivers for feature detection.
             "server_version" => Some("16.0".to_string()),
             "server_version_num" => Some("160000".to_string()),
+            "server_encoding" => Some("UTF8".to_string()),
             "search_path" => Some(self.search_path.join(", ")),
             "statement_timeout" => Some(self.statement_timeout_ms.to_string()),
             "lock_timeout" => Some(self.lock_timeout_ms.to_string()),
             "idle_in_transaction_session_timeout" => {
                 Some(self.idle_in_transaction_session_timeout_ms.to_string())
             }
+            // Report canonical Postgres defaults for driver/tool compatibility.
+            "datestyle" => Some("ISO, MDY".to_string()),
+            "intervalstyle" => Some("postgres".to_string()),
+            "integer_datetimes" => Some("on".to_string()),
             "timezone" => Some(self.timezone.as_deref().unwrap_or("UTC").to_string()),
             "application_name" => Some(self.application_name.as_deref().unwrap_or("").to_string()),
             "client_encoding" => Some(
@@ -404,7 +421,18 @@ impl Session {
     }
 
     pub(crate) fn show_setting_value(&self, name: &str) -> Option<String> {
-        self.settings.show_value(name)
+        match name {
+            "is_superuser" => Some(if self.is_superuser { "on" } else { "off" }.to_string()),
+            // Session authorization is the authenticated session user (login role).
+            "session_authorization" => Some(
+                self.session_user
+                    .as_deref()
+                    .or(self.current_user.as_deref())
+                    .unwrap_or("postgres")
+                    .to_string(),
+            ),
+            _ => self.settings.show_value(name),
+        }
     }
 
     pub(crate) fn statement_timeout(&self) -> Option<Duration> {
@@ -567,6 +595,22 @@ mod tests {
             settings.show_value("server_version_num").as_deref(),
             Some("160000")
         );
+        assert_eq!(
+            settings.show_value("server_encoding").as_deref(),
+            Some("UTF8")
+        );
+        assert_eq!(
+            settings.show_value("datestyle").as_deref(),
+            Some("ISO, MDY")
+        );
+        assert_eq!(
+            settings.show_value("integer_datetimes").as_deref(),
+            Some("on")
+        );
+        assert_eq!(
+            settings.show_value("intervalstyle").as_deref(),
+            Some("postgres")
+        );
         assert_eq!(settings.show_value("timezone").as_deref(), Some("UTC"));
         assert_eq!(settings.show_value("application_name").as_deref(), Some(""));
         assert_eq!(
@@ -628,6 +672,27 @@ mod tests {
                 .show_value("transaction.isolation.level")
                 .as_deref(),
             Some("read committed")
+        );
+    }
+
+    #[test]
+    fn test_session_settings_client_encoding_utf8_only() {
+        let mut settings = SessionSettings::new();
+
+        assert!(settings
+            .set_known_setting("client_encoding", "LATIN1".to_string())
+            .is_err());
+        assert_eq!(
+            settings.show_value("client_encoding").as_deref(),
+            Some("UTF8")
+        );
+
+        assert!(settings
+            .set_known_setting("client_encoding", "UTF-8".to_string())
+            .unwrap());
+        assert_eq!(
+            settings.show_value("client_encoding").as_deref(),
+            Some("UTF8")
         );
     }
 

@@ -16,6 +16,42 @@ server_version_num
 timezone
 UTC
 (1 row)
+server_encoding
+UTF8
+(1 row)
+datestyle
+ISO, MDY
+(1 row)
+integer_datetimes
+on
+(1 row)
+intervalstyle
+postgres
+(1 row)
+is_superuser
+on
+(1 row)
+session_authorization
+admin
+(1 row)
+server_encoding
+UTF8
+(1 row)
+datestyle
+ISO, MDY
+(1 row)
+integer_datetimes
+on
+(1 row)
+intervalstyle
+postgres
+(1 row)
+is_superuser
+on
+(1 row)
+session_authorization
+admin
+(1 row)
 application_name
 pg-tikv-tests
 (1 row)
