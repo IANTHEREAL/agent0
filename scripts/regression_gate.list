@@ -29,6 +29,7 @@ tests/154_pg_catalog_type_reflection_issue417.sql
 tests/152_lateral_join_on_constraint.sql
 tests/153_rename_table_cache_invalidation.sql
 tests/155_dml_type_coercion_invariant_issue407.sql
+tests/156_join_on_correlated_scalar_subquery_issue420.sql
 
 [orm]
 orm-tests/pg-client/
