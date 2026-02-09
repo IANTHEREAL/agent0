@@ -11,6 +11,7 @@ pub(crate) enum Fs9Mode {
     Directory {
         path: String,
         recursive: bool,
+        exclude: Option<String>,
     },
     File {
         path: String,
@@ -23,6 +24,7 @@ pub(crate) enum Fs9Mode {
         format: Option<String>,
         delimiter: Option<char>,
         header: Option<bool>,
+        exclude: Option<String>,
     },
 }
 
@@ -94,9 +96,13 @@ pub(crate) async fn execute_table_function(
     let backend = backend::local_backend();
 
     match mode {
-        Fs9Mode::Directory { path, recursive } => {
-            let _ = recursive;
-            let entries = backend.readdir(&path).await?;
+        Fs9Mode::Directory {
+            path,
+            recursive,
+            exclude,
+        } => {
+            let exclude_set = glob::build_exclude_globset(exclude.as_deref())?;
+            let entries = list_directory_entries(backend, &path, recursive, exclude_set.as_ref()).await?;
             let decoded = decoders::decode_directory(entries);
             Ok((decoded.schema, decoded.rows))
         }
@@ -142,8 +148,15 @@ pub(crate) async fn execute_table_function(
             format,
             delimiter,
             header,
+            exclude,
         } => {
-            let matching_files = glob::expand_glob(backend, &pattern, MAX_FILES_PER_GLOB).await?;
+            let matching_files = glob::expand_glob(
+                backend,
+                &pattern,
+                MAX_FILES_PER_GLOB,
+                exclude.as_deref(),
+            )
+            .await?;
 
             if matching_files.is_empty() {
                 let decoded = decoders::decode_raw_text(&[], &pattern, 0);
@@ -188,4 +201,40 @@ pub(crate) async fn execute_table_function(
             Ok((schema, all_rows))
         }
     }
+}
+
+async fn list_directory_entries(
+    backend: &dyn backend::FsBackend,
+    path: &str,
+    recursive: bool,
+    exclude_set: Option<&globset::GlobSet>,
+) -> Result<Vec<backend::FsFileInfo>> {
+    if !recursive {
+        let mut entries = backend.readdir(path).await?;
+        if let Some(exclude_set) = exclude_set {
+            entries.retain(|entry| !glob::path_matches_exclude(&entry.path, exclude_set));
+        }
+        return Ok(entries);
+    }
+
+    let mut entries = Vec::new();
+    let mut stack = vec![path.to_string()];
+
+    while let Some(current_dir) = stack.pop() {
+        let dir_entries = backend.readdir(&current_dir).await?;
+        for entry in dir_entries {
+            if exclude_set.is_some_and(|set| glob::path_matches_exclude(&entry.path, set)) {
+                continue;
+            }
+
+            if entry.is_dir {
+                stack.push(entry.path.clone());
+            }
+
+            entries.push(entry);
+        }
+    }
+
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(entries)
 }

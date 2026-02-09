@@ -14,10 +14,12 @@ pub(crate) async fn expand_glob(
     backend: &dyn FsBackend,
     pattern: &str,
     max_files: usize,
+    exclude_pattern: Option<&str>,
 ) -> Result<Vec<String>> {
     let matcher = globset::Glob::new(pattern)
         .map_err(|err| anyhow!("fs9: invalid glob pattern '{pattern}': {err}"))?
         .compile_matcher();
+    let exclude_set = build_exclude_globset(exclude_pattern)?;
     let prefix = glob_prefix_dir(pattern);
     let include_dotfiles = pattern.starts_with('.') || pattern.contains("/.");
 
@@ -31,6 +33,7 @@ pub(crate) async fn expand_glob(
         0,
         10,
         include_dotfiles,
+        exclude_set.as_ref(),
     )
     .await?;
 
@@ -47,6 +50,7 @@ async fn walk_dir(
     depth: usize,
     max_depth: usize,
     include_dotfiles: bool,
+    exclude_set: Option<&globset::GlobSet>,
 ) -> Result<()> {
     if depth > max_depth {
         return Ok(());
@@ -64,6 +68,10 @@ async fn walk_dir(
         };
 
         for entry in entries {
+            if exclude_set.is_some_and(|set| path_matches_exclude(&entry.path, set)) {
+                continue;
+            }
+
             let filename = entry.path.rsplit('/').next().unwrap_or("");
             if filename.starts_with('.') && !include_dotfiles {
                 continue;
@@ -102,6 +110,46 @@ fn glob_prefix_dir(pattern: &str) -> &str {
         Some(pos) => &pattern[..=pos],
         None => "./",
     }
+}
+
+pub(crate) fn build_exclude_globset(exclude_pattern: Option<&str>) -> Result<Option<globset::GlobSet>> {
+    let Some(exclude_pattern) = exclude_pattern else {
+        return Ok(None);
+    };
+
+    let mut builder = globset::GlobSetBuilder::new();
+    let mut has_patterns = false;
+
+    for raw in exclude_pattern.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let glob = globset::Glob::new(trimmed)
+            .map_err(|err| anyhow!("fs9: invalid exclude pattern '{trimmed}': {err}"))?;
+        builder.add(glob);
+        has_patterns = true;
+    }
+
+    if !has_patterns {
+        return Ok(None);
+    }
+
+    let set = builder
+        .build()
+        .map_err(|err| anyhow!("fs9: invalid exclude pattern: {err}"))?;
+    Ok(Some(set))
+}
+
+pub(crate) fn path_matches_exclude(path: &str, exclude_set: &globset::GlobSet) -> bool {
+    exclude_set.is_match(path)
+        || path
+            .strip_prefix("./")
+            .is_some_and(|p| exclude_set.is_match(p))
+        || path
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| exclude_set.is_match(name))
 }
 
 #[cfg(test)]
@@ -161,7 +209,7 @@ mod tests {
 
         let backend = LocalFsBackend::new();
         let pattern = format!("{}/*.csv", dir.display());
-        let files = expand_glob(&backend, &pattern, 100)
+        let files = expand_glob(&backend, &pattern, 100, None)
             .await
             .expect("expand glob should succeed");
         assert_eq!(files.len(), 2);
@@ -181,7 +229,7 @@ mod tests {
 
         let backend = LocalFsBackend::new();
         let pattern = format!("{}/**/*.csv", dir.display());
-        let files = expand_glob(&backend, &pattern, 100)
+        let files = expand_glob(&backend, &pattern, 100, None)
             .await
             .expect("expand recursive glob should succeed");
         assert_eq!(files.len(), 2);
@@ -194,7 +242,7 @@ mod tests {
         let dir = unique_base("glob-empty");
         let backend = LocalFsBackend::new();
         let pattern = format!("{}/*.nonexistent", dir.display());
-        let files = expand_glob(&backend, &pattern, 100)
+        let files = expand_glob(&backend, &pattern, 100, None)
             .await
             .expect("expand empty glob should succeed");
         assert_eq!(files.len(), 0);
@@ -211,7 +259,7 @@ mod tests {
 
         let backend = LocalFsBackend::new();
         let pattern = format!("{}/*.csv", dir.display());
-        let files = expand_glob(&backend, &pattern, 3)
+        let files = expand_glob(&backend, &pattern, 3, None)
             .await
             .expect("glob should truncate, not error");
         assert_eq!(files.len(), 3);
@@ -227,11 +275,63 @@ mod tests {
 
         let backend = LocalFsBackend::new();
         let pattern = format!("{}/*.csv", dir.display());
-        let files = expand_glob(&backend, &pattern, 100)
+        let files = expand_glob(&backend, &pattern, 100, None)
             .await
             .expect("expand glob should succeed");
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("visible.csv"));
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_expand_glob_with_exclude() {
+        let dir = unique_base("glob-exclude-basic");
+        fs::write(dir.join("a.txt"), b"a").expect("write a.txt");
+        fs::write(dir.join("b.csv"), b"b").expect("write b.csv");
+
+        let backend = LocalFsBackend::new();
+        let pattern = format!("{}/*.*", dir.display());
+        let files = expand_glob(&backend, &pattern, 100, Some("*.txt"))
+            .await
+            .expect("expand glob with exclude should succeed");
+
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("b.csv"));
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_expand_glob_exclude_no_match() {
+        let dir = unique_base("glob-exclude-no-match");
+        fs::write(dir.join("a.txt"), b"a").expect("write a.txt");
+        fs::write(dir.join("b.csv"), b"b").expect("write b.csv");
+
+        let backend = LocalFsBackend::new();
+        let pattern = format!("{}/*.*", dir.display());
+        let files = expand_glob(&backend, &pattern, 100, Some("*.json"))
+            .await
+            .expect("expand glob with non-matching exclude should succeed");
+
+        assert_eq!(files.len(), 2);
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_expand_glob_exclude_all() {
+        let dir = unique_base("glob-exclude-all");
+        fs::write(dir.join("a.txt"), b"a").expect("write a.txt");
+        fs::write(dir.join("b.csv"), b"b").expect("write b.csv");
+
+        let backend = LocalFsBackend::new();
+        let pattern = format!("{}/*.*", dir.display());
+        let files = expand_glob(&backend, &pattern, 100, Some("*.*"))
+            .await
+            .expect("expand glob with full exclude should succeed");
+
+        assert_eq!(files.len(), 0);
 
         cleanup(&dir);
     }

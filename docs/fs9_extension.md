@@ -75,6 +75,20 @@ ORDER BY path;
 - `mode` (INT64): Unix permission mode (e.g., 33188 represents 0644).
 - `mtime` (TEXT): Last modification time in RFC 3339 format.
 
+**Example with exclude**:
+
+```sql
+-- Exclude hidden entries in directory listing
+SELECT path, type, size
+FROM extensions.fs9('/project/', recursive => true, exclude => '.*')
+ORDER BY path;
+
+-- Exclude multiple patterns (comma-separated)
+SELECT path, type
+FROM extensions.fs9('/data/', exclude => '*test*,*backup*')
+ORDER BY path;
+```
+
 ## 6. Reading Files
 
 ### CSV
@@ -139,6 +153,16 @@ ORDER BY _path, _line_number;
 
 -- Empty match returns 0 rows (no error)
 SELECT * FROM extensions.fs9('/data/nonexistent-*.csv');
+
+-- Exclude temp files from glob
+SELECT _path, level, message
+FROM extensions.fs9('/logs/*.jsonl', exclude => '*.tmp')
+ORDER BY _path;
+
+-- Exclude multiple patterns (comma-separated)
+SELECT _path, _line_number, line
+FROM extensions.fs9('/data/**/*.csv', exclude => '*test*,*backup*')
+ORDER BY _path, _line_number;
 ```
 - The `_path` column identifies which file each row came from.
 - Result schema is derived from the first matched file.
@@ -166,6 +190,7 @@ SELECT * FROM extensions.fs9('/data/', recursive => true);
 | `delimiter` | TEXT | CSV delimiter (single character) | `,` (TSV defaults to `\t`) |
 | `header` | BOOLEAN | Whether the CSV file has a header row | `true` |
 | `recursive` | BOOLEAN | Recursively list subdirectories (directory mode only) | `false` |
+| `exclude` | TEXT | Glob pattern(s) to exclude from results. Supports comma-separated patterns (e.g., `'*.tmp,*.bak'`). Works in glob and directory modes. | None |
 
 ## 9. Limits and Security
 

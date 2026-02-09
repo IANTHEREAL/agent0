@@ -253,6 +253,7 @@ impl Executor {
             let mut delimiter: Option<char> = None;
             let mut header: Option<bool> = None;
             let mut recursive: Option<bool> = None;
+            let mut exclude: Option<String> = None;
             
             for arg in &args[1..] {
                 match arg {
@@ -292,6 +293,12 @@ impl Executor {
                                     _ => return Err(anyhow!("fs9: 'recursive' must be BOOLEAN")),
                                 });
                             }
+                            "exclude" => {
+                                exclude = Some(match val {
+                                    Value::Text(s) => s,
+                                    _ => return Err(anyhow!("fs9: 'exclude' must be TEXT")),
+                                });
+                            }
                             _ => return Err(anyhow!("fs9: unknown parameter '{}'", param_name)),
                         }
                     }
@@ -307,13 +314,15 @@ impl Executor {
                 Fs9Mode::Directory {
                     path,
                     recursive: recursive.unwrap_or(false),
+                    exclude,
                 }
-            } else if path.contains('*') {
+            } else if fs::glob::is_glob_pattern(&path) {
                 Fs9Mode::Glob {
                     pattern: path,
                     format,
                     delimiter,
                     header,
+                    exclude,
                 }
             } else {
                 Fs9Mode::File {
