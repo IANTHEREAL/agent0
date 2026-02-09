@@ -426,6 +426,7 @@ mod tests {
             FsFileInfo {
                 path: "/tmp/a.txt".to_string(),
                 is_dir: false,
+                is_file: true,
                 size: 100,
                 mode: 0o644,
                 mtime: 1705312200,
@@ -433,6 +434,7 @@ mod tests {
             FsFileInfo {
                 path: "/tmp/subdir".to_string(),
                 is_dir: true,
+                is_file: false,
                 size: 0,
                 mode: 0o755,
                 mtime: 1705312200,

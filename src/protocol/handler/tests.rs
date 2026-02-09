@@ -37,7 +37,11 @@ use futures::StreamExt;
 use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, QueryResponse, Tag};
 use pgwire::messages::data::DataRow;
 use pgwire::messages::response::TransactionStatus;
+use std::fs;
 use tokio::sync::Mutex;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Default)]
 struct RecordingSink {
@@ -90,6 +94,43 @@ fn test_schema(name: &str, columns: Vec<ColumnDef>) -> TableSchema {
         foreign_keys: vec![],
         owner: String::new(),
     }
+}
+
+static FS9_INFER_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+fn unique_fs9_infer_base(name: &str) -> PathBuf {
+    let id = FS9_INFER_NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = PathBuf::from(format!(
+        "/tmp/pgtikv-fs9-infer-test-{name}-{}-{id}-{nanos}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).expect("create test dir");
+    dir
+}
+
+fn cleanup_dir(path: &PathBuf) {
+    let _ = fs::remove_dir_all(path);
+}
+
+fn extract_fs9_args(sql: &str) -> Vec<FunctionArg> {
+    let mut stmts = crate::sql::parse_sql(sql).expect("parse sql");
+    let stmt = stmts.pop().expect("expected statement");
+    let Statement::Query(q) = stmt else {
+        panic!("expected query statement");
+    };
+
+    let SetExpr::Select(select) = *q.body else {
+        panic!("expected SELECT");
+    };
+    let from = select.from.first().expect("expected FROM");
+    let TableFactor::Table { args, .. } = &from.relation else {
+        panic!("expected table factor");
+    };
+    args.as_ref().expect("expected function args").clone()
 }
 
 #[tokio::test]
@@ -929,7 +970,7 @@ fn test_parse_tenant_username_long_names() {
     let long_user = "b".repeat(100);
     let input = format!("{}.{}", long_tenant, long_user);
     let (ks, user) = parse_tenant_username(&input);
-    assert_eq!(ks, Some(format!("tipg_tenant_{}", long_tenant)));
+    assert_eq!(ks, Some(format!("tipg_tenant_{long_tenant}")));
     assert_eq!(user, long_user);
 }
 
@@ -1617,4 +1658,120 @@ fn test_encode_value_int64_as_timestamp_negative_millis() {
         encode_value_to_string(&Value::Int64(-1), Some(&col_type)),
         "1969-12-31 23:59:59.999000"
     );
+}
+
+#[tokio::test]
+async fn infer_fs9_schema_directory_mode() {
+    let dir = unique_fs9_infer_base("dir");
+    fs::write(dir.join("a.txt"), b"x").expect("write");
+
+    let path = format!("{}/", dir.display());
+    let sql = format!("SELECT * FROM extensions.fs9('{path}')");
+    let args = extract_fs9_args(&sql);
+
+    let schema = infer_fs9_table_function_schema(&args, true)
+        .await
+        .expect("schema");
+    let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(cols, vec!["path", "type", "size", "mode", "mtime"]);
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test]
+async fn infer_fs9_schema_directory_via_stat() {
+    let dir = unique_fs9_infer_base("dir-stat");
+    fs::create_dir_all(dir.join("nested")).expect("create nested dir");
+
+    let path = dir.to_string_lossy().to_string();
+    let sql = format!("SELECT * FROM extensions.fs9('{path}')");
+    let args = extract_fs9_args(&sql);
+
+    let schema = infer_fs9_table_function_schema(&args, true)
+        .await
+        .expect("schema");
+    let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(cols, vec!["path", "type", "size", "mode", "mtime"]);
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test]
+async fn infer_fs9_schema_csv_headers() {
+    let dir = unique_fs9_infer_base("csv");
+    let csv_path = dir.join("users.csv");
+    fs::write(&csv_path, b"name,age,city\nAlice,30,Beijing\n").expect("write csv");
+
+    let path = csv_path.to_string_lossy().to_string();
+    let sql = format!("SELECT * FROM extensions.fs9('{path}')");
+    let args = extract_fs9_args(&sql);
+
+    let schema = infer_fs9_table_function_schema(&args, true)
+        .await
+        .expect("schema");
+    let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(cols, vec!["_line_number", "name", "age", "city", "_path"]);
+    assert_eq!(schema.columns[0].data_type, DataType::Int64);
+    assert_eq!(schema.columns[1].data_type, DataType::Text);
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test]
+async fn infer_fs9_schema_jsonl_is_jsonb() {
+    let dir = unique_fs9_infer_base("jsonl");
+    let jsonl_path = dir.join("logs.jsonl");
+    fs::write(&jsonl_path, b"{\"a\":1}\n").expect("write jsonl");
+
+    let path = jsonl_path.to_string_lossy().to_string();
+    let sql = format!("SELECT * FROM extensions.fs9('{path}')");
+    let args = extract_fs9_args(&sql);
+
+    let schema = infer_fs9_table_function_schema(&args, true)
+        .await
+        .expect("schema");
+    let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(cols, vec!["_line_number", "line", "_path"]);
+    assert_eq!(schema.columns[1].data_type, DataType::Jsonb);
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test]
+async fn infer_fs9_schema_glob_uses_first_match() {
+    let dir = unique_fs9_infer_base("glob");
+    fs::write(dir.join("a.csv"), b"foo\n1\n").expect("write a.csv");
+    fs::write(dir.join("b.csv"), b"bar\n1\n").expect("write b.csv");
+
+    let pattern = format!("{}/*.csv", dir.display());
+    let sql = format!("SELECT * FROM extensions.fs9('{pattern}')");
+    let args = extract_fs9_args(&sql);
+
+    let schema = infer_fs9_table_function_schema(&args, true)
+        .await
+        .expect("schema");
+    let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(cols, vec!["_line_number", "foo", "_path"]);
+
+    cleanup_dir(&dir);
+}
+
+#[tokio::test]
+async fn infer_fs9_schema_non_superuser_is_fallback() {
+    let dir = unique_fs9_infer_base("nosu");
+    let csv_path = dir.join("users.csv");
+    fs::write(&csv_path, b"name\nAlice\n").expect("write csv");
+
+    let path = csv_path.to_string_lossy().to_string();
+    let sql = format!("SELECT * FROM extensions.fs9('{path}')");
+    let args = extract_fs9_args(&sql);
+
+    let schema = infer_fs9_table_function_schema(&args, false)
+        .await
+        .expect("schema");
+    let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
+    assert_eq!(cols, vec!["_line_number", "line", "_path"]);
+    assert_eq!(schema.columns[1].data_type, DataType::Text);
+
+    cleanup_dir(&dir);
 }

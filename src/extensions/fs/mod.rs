@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 
 use crate::extensions::context;
 use crate::types::{ColumnDef, DataType, Row, TableSchema};
+use std::collections::HashSet;
 
 pub(crate) mod backend;
 pub(crate) mod decoders;
@@ -87,7 +88,7 @@ pub(crate) async fn execute_table_function(
     _tenant: &str,
     mode: Fs9Mode,
 ) -> Result<(TableSchema, Vec<Row>)> {
-    if !context::is_superuser() {
+    if !context::allow_local_fs() {
         return Err(anyhow!("permission denied for extension \"fs9\""));
     }
 
@@ -217,24 +218,108 @@ async fn list_directory_entries(
         return Ok(entries);
     }
 
-    let mut entries = Vec::new();
-    let mut stack = vec![path.to_string()];
+    const MAX_RECURSIVE_DEPTH: usize = 10;
+    let max_entries = MAX_ROWS_PER_QUERY;
 
-    while let Some(current_dir) = stack.pop() {
+    let mut entries = Vec::new();
+    let mut stack = vec![(path.to_string(), 0usize)];
+    let mut visited: HashSet<String> = HashSet::new();
+
+    while let Some((current_dir, depth)) = stack.pop() {
+        if entries.len() >= max_entries {
+            break;
+        }
+        if depth > MAX_RECURSIVE_DEPTH {
+            continue;
+        }
+        if !visited.insert(current_dir.clone()) {
+            continue;
+        }
+
         let dir_entries = backend.readdir(&current_dir).await?;
         for entry in dir_entries {
             if exclude_set.is_some_and(|set| glob::path_matches_exclude(&entry.path, set)) {
                 continue;
             }
 
-            if entry.is_dir {
-                stack.push(entry.path.clone());
+            if entries.len() >= max_entries {
+                break;
+            }
+
+            if entry.is_dir && depth < MAX_RECURSIVE_DEPTH {
+                // Avoid following directory symlinks in recursive mode to prevent loops.
+                let is_symlink = tokio::fs::symlink_metadata(&entry.path)
+                    .await
+                    .map(|m| m.file_type().is_symlink())
+                    .unwrap_or(true);
+                if !is_symlink {
+                    stack.push((entry.path.clone(), depth + 1));
+                }
             }
 
             entries.push(entry);
+            if entries.len() >= max_entries {
+                break;
+            }
         }
     }
 
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use tokio::time::{timeout, Duration};
+
+    use super::{backend, list_directory_entries};
+
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn unique_base(name: &str) -> PathBuf {
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = PathBuf::from(format!(
+            "/tmp/pgtikv-fs9-listdir-test-{name}-{}-{id}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create test dir");
+        dir
+    }
+
+    fn cleanup(path: &PathBuf) {
+        let _ = fs::remove_dir_all(path);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recursive_directory_listing_skips_symlink_dirs() {
+        use std::os::unix::fs::symlink;
+
+        let dir = unique_base("symlink-loop");
+        fs::create_dir_all(dir.join("subdir")).expect("create subdir");
+        symlink(&dir, dir.join("loop")).expect("create symlink loop");
+
+        let backend = backend::LocalFsBackend::new();
+        let dir_str = dir.to_string_lossy().to_string();
+        let fut = list_directory_entries(&backend, &dir_str, true, None);
+        let entries = timeout(Duration::from_secs(1), fut)
+            .await
+            .expect("list_directory_entries should not hang")
+            .expect("list directory entries");
+
+        let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+        assert!(paths.iter().any(|p| p.ends_with("/loop")));
+        assert!(paths.iter().any(|p| p.ends_with("/subdir")));
+
+        cleanup(&dir);
+    }
 }

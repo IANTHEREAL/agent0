@@ -5,6 +5,7 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use tokio::io::AsyncReadExt;
 
 /// Metadata about a filesystem entry.
 #[derive(Debug, Clone)]
@@ -13,6 +14,8 @@ pub(crate) struct FsFileInfo {
     pub path: String,
     /// Whether this entry is a directory.
     pub is_dir: bool,
+    /// Whether this entry is a regular file.
+    pub is_file: bool,
     /// File size in bytes (0 for directories).
     pub size: u64,
     /// Unix permission mode (e.g., 0o644). 0 on non-Unix platforms.
@@ -68,6 +71,7 @@ fn metadata_mode(_metadata: &std::fs::Metadata, is_dir: bool) -> u32 {
 
 fn to_file_info(path: &str, metadata: std::fs::Metadata) -> Result<FsFileInfo> {
     let is_dir = metadata.is_dir();
+    let is_file = metadata.is_file();
     let mtime = metadata
         .modified()
         .map_err(|err| anyhow!("fs9: cannot stat '{path}': {err}"))?
@@ -78,6 +82,7 @@ fn to_file_info(path: &str, metadata: std::fs::Metadata) -> Result<FsFileInfo> {
     Ok(FsFileInfo {
         path: path.to_string(),
         is_dir,
+        is_file,
         size: metadata.len(),
         mode: metadata_mode(&metadata, is_dir),
         mtime,
@@ -125,15 +130,33 @@ impl FsBackend for LocalFsBackend {
         if info.is_dir {
             return Err(anyhow!("fs9: is a directory: {path}"));
         }
+        if !info.is_file {
+            return Err(anyhow!("fs9: not a regular file: {path}"));
+        }
         if info.size > max_bytes as u64 {
             return Err(anyhow!(
                 "fs9: file too large: {path} ({} bytes, max {max_bytes})",
                 info.size
             ));
         }
-        tokio::fs::read(path)
+        let file = tokio::fs::File::open(path)
             .await
-            .map_err(|err| anyhow!("fs9: cannot read file '{path}': {err}"))
+            .map_err(|err| anyhow!("fs9: cannot read file '{path}': {err}"))?;
+
+        let mut buf = Vec::new();
+        let mut limited = file.take(u64::try_from(max_bytes).unwrap_or(u64::MAX).saturating_add(1));
+        limited
+            .read_to_end(&mut buf)
+            .await
+            .map_err(|err| anyhow!("fs9: cannot read file '{path}': {err}"))?;
+
+        if buf.len() > max_bytes {
+            return Err(anyhow!(
+                "fs9: file too large: {path} (exceeded max {max_bytes} bytes)"
+            ));
+        }
+
+        Ok(buf)
     }
 
     async fn exists(&self, path: &str) -> Result<bool> {
@@ -319,6 +342,29 @@ mod tests {
         assert!(err.to_string().contains("fs9: is a directory"));
 
         cleanup(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_file_rejects_non_regular_files() {
+        let backend = LocalFsBackend::new();
+        let err = backend
+            .read_file("/dev/null", 1024)
+            .await
+            .expect_err("expected non-regular file error");
+        assert!(err.to_string().contains("fs9: not a regular file"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_read_file_enforces_max_bytes_when_metadata_len_is_zero() {
+        // procfs files can report len=0 but still produce content. Ensure we still enforce max_bytes.
+        let backend = LocalFsBackend::new();
+        let err = backend
+            .read_file("/proc/self/stat", 1)
+            .await
+            .expect_err("expected too large error");
+        assert!(err.to_string().contains("fs9: file too large"));
     }
 
     #[tokio::test]
