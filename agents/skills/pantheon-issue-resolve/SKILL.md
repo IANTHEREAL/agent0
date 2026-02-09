@@ -261,7 +261,7 @@ If this step fails, do NOT merge. Start another Fix exploration to address the f
 After each `parallel_explore`, wait via a sleep loop:
 1. Poll `functions.mcp__pantheon__get_branch(branch_id)` until `status` is terminal (case-insensitive match): `failed`, `succeed`, `finished`, `manifesting`, or `ready_for_manifest`.
 2. If `status` is terminal, Call `functions.mcp__pantheon__branch_output(branch_id, full_output=true)` to retrieve logs/results.
-3. Otherwise (not terminal), sleep 600s, then poll again
+3. Otherwise (not terminal), do **exactly one exclusive wait**: sleep 600s (treat runtime “Waiting for background terminal · sleep ...” as exclusive too). Do not start any other terminal/tool call and do not start another sleep until it finishes (no overlapping background waits; also avoid shell `sleep ... &`). After it completes, poll again.
 
 Pantheon note: `manifesting` and `ready_for_manifest` mean the branch run is already done; you can fetch `branch_output` and proceed to the next step (you do not need to wait for a later `succeed`/`finished` transition).
 
