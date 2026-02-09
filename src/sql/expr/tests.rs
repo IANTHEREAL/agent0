@@ -1036,6 +1036,31 @@ fn test_ilike_pattern() {
 }
 
 #[test]
+fn test_similar_to_trailing_escape() {
+    // Issue #545: Pattern ending with escape character should not match
+    assert_eq!(
+        eval_expr(
+            &parse_expr("'123A_' SIMILAR TO '%A_' ESCAPE '_'"),
+            None,
+            None
+        )
+        .unwrap(),
+        Value::Boolean(false)
+    );
+
+    // Escaped underscore followed by literal underscore should match
+    assert_eq!(
+        eval_expr(
+            &parse_expr("'123A_' SIMILAR TO '%A__' ESCAPE '_'"),
+            None,
+            None
+        )
+        .unwrap(),
+        Value::Boolean(true)
+    );
+}
+
+#[test]
 fn test_cast() {
     assert_eq!(
         eval_expr(&parse_expr("CAST(123 AS TEXT)"), None, None).unwrap(),

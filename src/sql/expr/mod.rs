@@ -1021,14 +1021,14 @@ fn like_match_impl(s: &str, pattern: &str, escape_char: Option<char>) -> bool {
 fn similar_to_match(s: &str, pattern: &str, escape_char: Option<char>) -> Result<bool> {
     let escape = escape_char.unwrap_or('\\');
     let mut regex_pattern = String::new();
-    let mut chars = pattern.chars().peekable();
+    let mut chars = pattern.chars();
     while let Some(ch) = chars.next() {
         if ch == escape {
             // Treat escaped character as a literal.
             if let Some(next) = chars.next() {
                 regex_pattern.push_str(&regex::escape(&next.to_string()));
             } else {
-                regex_pattern.push_str(&regex::escape(&escape.to_string()));
+                return Ok(false);
             }
             continue;
         }
@@ -1036,6 +1036,7 @@ fn similar_to_match(s: &str, pattern: &str, escape_char: Option<char>) -> Result
         match ch {
             '%' => regex_pattern.push_str(".*"),
             '_' => regex_pattern.push('.'),
+            '\\' => regex_pattern.push_str("\\\\"),
             other => regex_pattern.push(other),
         }
     }
