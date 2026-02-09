@@ -303,6 +303,10 @@ impl Executor {
                         None,
                         Some(&final_row),
                         &trigger_defs,
+                        &self.store(),
+                        self,
+                        sequence_values,
+                        search_path,
                     )
                     .await?;
                     affected += 1;
@@ -425,6 +429,10 @@ impl Executor {
                         Some(&existing_row),
                         Some(&updated_row),
                         &trigger_defs,
+                        &self.store(),
+                        self,
+                        sequence_values,
+                        search_path,
                     )
                     .await?;
 
@@ -659,6 +667,10 @@ impl Executor {
                 Some(&r),
                 None,
                 &trigger_defs,
+                &self.store(),
+                self,
+                sequence_values,
+                search_path,
             )
             .await?;
             cnt += 1;
@@ -965,6 +977,10 @@ impl Executor {
                 Some(r),
                 Some(&updated_row),
                 &trigger_defs,
+                &self.store(),
+                self,
+                sequence_values,
+                search_path,
             )
             .await?;
 

@@ -135,6 +135,7 @@ impl TikvClientPool {
         }
     }
 
+    #[allow(dead_code)]
     pub fn pd_endpoints(&self) -> &[String] {
         &self.pd_endpoints
     }

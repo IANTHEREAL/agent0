@@ -25,30 +25,32 @@ const DEFAULT_PG_PORT: u16 = 5433;
 const DEFAULT_PD_ENDPOINTS: &str = "127.0.0.1:2379";
 const DEFAULT_PG_LISTEN_ADDR: &str = "127.0.0.1";
 
-async fn create_keyspace(pd_endpoint: &str, keyspace_name: &str) -> Result<()> {
-    let url = format!("http://{}/pd/api/v2/keyspaces", pd_endpoint);
-    let body = serde_json::json!({ "name": keyspace_name });
+/// Lightweight PD health check — just verifies PD is reachable without
+/// creating any TiKV client or keyspace connection.
+async fn check_pd_health(pd_endpoint: &str) -> Result<()> {
+    let url = format!("http://{}/pd/api/v1/health", pd_endpoint);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| anyhow::anyhow!("HTTP client error: {}", e))?;
 
-    let client = reqwest::Client::new();
     let resp = client
-        .post(&url)
-        .json(&body)
+        .get(&url)
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("HTTP request failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("PD health check failed ({}): {}", url, e))?;
 
     if resp.status().is_success() {
-        info!("Successfully created keyspace '{}'", keyspace_name);
+        info!("PD health check passed ({})", pd_endpoint);
         Ok(())
     } else {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        if text.contains("already exists") {
-            info!("Keyspace '{}' already exists", keyspace_name);
-            Ok(())
-        } else {
-            Err(anyhow::anyhow!("PD returned {}: {}", status, text))
-        }
+        Err(anyhow::anyhow!(
+            "PD health check returned {}: {}",
+            status,
+            text
+        ))
     }
 }
 
@@ -130,50 +132,9 @@ async fn async_main() -> Result<()> {
 
     let client_pool = Arc::new(TikvClientPool::new(pd_addrs.clone()));
 
-    let startup_keyspace = default_keyspace
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
-    info!("Connecting to TiKV with keyspace '{}'...", startup_keyspace);
-
-    let connect_result = client_pool.get_client(Some(startup_keyspace.clone())).await;
-
-    if let Err(e) = connect_result {
-        let err_str = format!("{:?}", e);
-        if err_str.contains("does not exist") {
-            info!(
-                "Keyspace '{}' does not exist, attempting to create...",
-                startup_keyspace
-            );
-
-            if let Err(create_err) = create_keyspace(&pd_addrs[0], &startup_keyspace).await {
-                tracing::error!(
-                    "Failed to create keyspace '{}': {}",
-                    startup_keyspace,
-                    create_err
-                );
-                return Err(e);
-            }
-
-            info!(
-                "Keyspace '{}' created, retrying connection...",
-                startup_keyspace
-            );
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-
-            client_pool
-                .get_client(Some(startup_keyspace))
-                .await
-                .map_err(|e| {
-                    tracing::error!("Failed to connect to TiKV after creating keyspace: {}", e);
-                    e
-                })?;
-        } else {
-            tracing::error!("Failed to connect to TiKV: {}", e);
-            return Err(e);
-        }
-    }
-
-    info!("TiKV connection verified");
+    // Verify PD is reachable before accepting connections.
+    // TiKV client connections are created lazily per-keyspace on first client request.
+    check_pd_health(&pd_addrs[0]).await?;
 
     client_pool.spawn_reaper();
 

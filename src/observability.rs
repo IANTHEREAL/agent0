@@ -225,6 +225,7 @@ impl TenantObservability {
             if sql.is_empty() {
                 return;
             }
+            sql = redact_sensitive_sql(&sql);
             if sql.contains('|') {
                 sql = sql.replace('|', " ");
             }
@@ -569,6 +570,39 @@ fn parse_bool(v: &str) -> Option<bool> {
     }
 }
 
+fn redact_sensitive_sql(s: &str) -> String {
+    let upper = s.to_ascii_uppercase();
+    let bytes = s.as_bytes();
+    let ubytes = upper.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+
+    while i < bytes.len() {
+        if i + 8 <= ubytes.len() && &ubytes[i..i + 8] == b"PASSWORD" {
+            out.push_str(&s[i..i + 8]);
+            i += 8;
+            while i < bytes.len() && bytes[i] == b' ' {
+                out.push(' ');
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'\'' {
+                out.push_str("'***'");
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1; // skip closing quote
+                }
+            }
+        } else {
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    out
+}
+
 fn normalize_sql(s: &str, max_len: usize) -> String {
     let mut out = String::with_capacity(s.len().min(max_len));
     let mut prev_space = false;
@@ -691,5 +725,38 @@ mod tests {
     fn test_normalize_sql() {
         let s = "  SELECT   1 \n FROM  t ;  ";
         assert_eq!(normalize_sql(s, 512), "SELECT 1 FROM t");
+    }
+
+    #[test]
+    fn test_redact_create_role_password() {
+        let sql = "CREATE ROLE myuser WITH LOGIN PASSWORD 'secret123'";
+        assert_eq!(
+            redact_sensitive_sql(sql),
+            "CREATE ROLE myuser WITH LOGIN PASSWORD '***'"
+        );
+    }
+
+    #[test]
+    fn test_redact_alter_role_password() {
+        let sql = "ALTER ROLE admin WITH PASSWORD 'newpass!@#'";
+        assert_eq!(
+            redact_sensitive_sql(sql),
+            "ALTER ROLE admin WITH PASSWORD '***'"
+        );
+    }
+
+    #[test]
+    fn test_redact_no_password() {
+        let sql = "SELECT * FROM users";
+        assert_eq!(redact_sensitive_sql(sql), "SELECT * FROM users");
+    }
+
+    #[test]
+    fn test_redact_case_insensitive() {
+        let sql = "CREATE ROLE foo WITH LOGIN password 'hunter2' SUPERUSER";
+        assert_eq!(
+            redact_sensitive_sql(sql),
+            "CREATE ROLE foo WITH LOGIN password '***' SUPERUSER"
+        );
     }
 }

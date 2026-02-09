@@ -184,6 +184,7 @@ pub(crate) struct TriggerWorker {
     config: TriggerWorkerConfig,
     shutdown: AtomicBool,
     default_search_path: Vec<String>,
+    wake: tokio::sync::Notify,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -204,43 +205,7 @@ impl TriggerWorker {
             config: TriggerWorkerConfig::from_env(),
             shutdown: AtomicBool::new(false),
             default_search_path: vec!["public".to_string()],
-        }
-    }
-
-    async fn bootstrap_active_keyspaces(&self, pool: &TikvClientPool) {
-        let pd_endpoints = pool.pd_endpoints();
-        if pd_endpoints.is_empty() {
-            return;
-        }
-
-        let mut marked_any = false;
-        match list_keyspaces_from_pd(pd_endpoints).await {
-            Ok(keyspaces) => {
-                let mut discovered = 0usize;
-                for keyspace in keyspaces {
-                    self.mark_active(&keyspace);
-                    discovered += 1;
-                }
-                if discovered > 0 {
-                    marked_any = true;
-                    info!(
-                        "trigger worker bootstrap: discovered {} keyspaces",
-                        discovered
-                    );
-                }
-            }
-            Err(e) => {
-                warn!("trigger worker bootstrap failed to list keyspaces: {}", e);
-            }
-        }
-
-        if !marked_any {
-            let fallback = env::var("PG_KEYSPACE")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| "default".to_string());
-            self.mark_active(&normalize_pd_keyspace_name(&fallback));
+            wake: tokio::sync::Notify::new(),
         }
     }
 
@@ -257,6 +222,7 @@ impl TriggerWorker {
         self.active_keyspaces.insert(keyspace.to_string());
         self.active_keyspaces_marked_at
             .insert(keyspace.to_string(), Instant::now());
+        self.wake.notify_one();
     }
 
     pub(crate) fn take_active_keyspaces_snapshot(&self) -> Vec<String> {
@@ -319,20 +285,22 @@ impl TriggerWorker {
     }
 
     pub(crate) async fn run(&self, pool: Arc<TikvClientPool>) {
-        // After restart/failover, `active_keyspaces` starts empty. Bootstrap by discovering
-        // keyspaces from PD so any pre-existing `_sys_tq_` backlog can be recovered.
-        self.bootstrap_active_keyspaces(pool.as_ref()).await;
-
-        let poll_interval = Duration::from_millis(self.config.poll_interval_ms);
+        let safety_interval = Duration::from_secs(30);
 
         let gc_pool = pool.clone();
         let gc_handle = tokio::spawn(async move {
             trigger_worker().gc_loop(gc_pool).await;
         });
 
-        let mut interval = tokio::time::interval(poll_interval);
         while !self.shutdown.load(Ordering::Relaxed) {
-            interval.tick().await;
+            tokio::select! {
+                _ = self.wake.notified() => {}
+                _ = tokio::time::sleep(safety_interval) => {}
+            }
+
+            if self.shutdown.load(Ordering::Relaxed) {
+                break;
+            }
 
             let keyspaces = self.take_active_keyspaces_snapshot();
             if keyspaces.is_empty() {
@@ -431,76 +399,6 @@ impl TriggerWorker {
     }
 }
 
-fn normalize_pd_keyspace_name(name: &str) -> String {
-    if name == "DEFAULT" {
-        "default".to_string()
-    } else {
-        name.to_string()
-    }
-}
-
-fn parse_pd_keyspace_names(payload: &serde_json::Value) -> Vec<String> {
-    let keyspaces = payload
-        .get("keyspaces")
-        .and_then(|v| v.as_array())
-        .or_else(|| payload.as_array());
-
-    let Some(keyspaces) = keyspaces else {
-        return Vec::new();
-    };
-
-    let mut seen = std::collections::HashSet::new();
-    let mut out = Vec::new();
-    for item in keyspaces {
-        let Some(name) = item.get("name").and_then(|v| v.as_str()) else {
-            continue;
-        };
-        let normalized = normalize_pd_keyspace_name(name);
-        if normalized.is_empty() {
-            continue;
-        }
-        if seen.insert(normalized.clone()) {
-            out.push(normalized);
-        }
-    }
-    out
-}
-
-async fn list_keyspaces_from_pd(pd_endpoints: &[String]) -> Result<Vec<String>> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()?;
-
-    let mut last_err = None;
-    for endpoint in pd_endpoints {
-        let url = format!("http://{}/pd/api/v2/keyspaces", endpoint);
-        let resp = match client.get(&url).send().await {
-            Ok(resp) => resp,
-            Err(e) => {
-                last_err = Some(anyhow::anyhow!("PD request to {} failed: {}", endpoint, e));
-                continue;
-            }
-        };
-        if !resp.status().is_success() {
-            last_err = Some(anyhow::anyhow!(
-                "PD {} returned {} for {}",
-                endpoint,
-                resp.status(),
-                url
-            ));
-            continue;
-        }
-
-        let payload: serde_json::Value = resp.json().await?;
-        return Ok(parse_pd_keyspace_names(&payload));
-    }
-
-    if let Some(err) = last_err {
-        return Err(err);
-    }
-    Ok(Vec::new())
-}
-
 static TRIGGER_WORKER: OnceLock<TriggerWorker> = OnceLock::new();
 
 pub(crate) fn trigger_worker() -> &'static TriggerWorker {
@@ -525,10 +423,26 @@ pub(crate) fn spawn_trigger_worker(pool: Arc<TikvClientPool>) {
     });
 }
 
-/// Enqueue AFTER-row trigger events in the same transaction as the DML.
+const ASYNC_TRIGGER_KEYWORDS: &[&str] = &[
+    "http_get",
+    "http_post",
+    "http_put",
+    "http_delete",
+    "http_request",
+    "extensions.http",
+];
+
+fn trigger_body_needs_async(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    ASYNC_TRIGGER_KEYWORDS
+        .iter()
+        .any(|kw| lower.contains(kw))
+}
+
+/// Execute AFTER-row triggers, synchronously when possible.
 ///
-/// Queue backpressure is best-effort: when the in-memory depth estimate reaches
-/// the per-keyspace limit, enqueue is skipped to avoid blocking DML.
+/// Triggers whose function body contains HTTP/extension calls are enqueued
+/// for asynchronous processing. All others execute in the current transaction.
 pub(crate) async fn enqueue_after_triggers(
     txn: &mut Transaction,
     db_id: u64,
@@ -538,17 +452,13 @@ pub(crate) async fn enqueue_after_triggers(
     old_row: Option<&Row>,
     new_row: Option<&Row>,
     triggers: &[TriggerDef],
+    store: &Arc<TikvStore>,
+    executor: &Executor,
+    sequence_values: &mut HashMap<String, i64>,
+    search_path: &[String],
 ) -> Result<()> {
     let worker = trigger_worker();
     if !worker.config().enabled {
-        return Ok(());
-    }
-
-    let quota = worker.get_quota(keyspace);
-    let mut remaining = quota
-        .max_queue_depth
-        .saturating_sub(quota.current_depth.load(Ordering::Relaxed));
-    if remaining == 0 {
         return Ok(());
     }
 
@@ -558,31 +468,64 @@ pub(crate) async fn enqueue_after_triggers(
         TriggerOp::Delete => "DELETE",
     };
 
+    let after_triggers: Vec<&TriggerDef> = triggers
+        .iter()
+        .filter(|t| {
+            t.timing.eq_ignore_ascii_case("AFTER")
+                && t.events.iter().any(|e| e.eq_ignore_ascii_case(op_str))
+        })
+        .collect();
+
+    if after_triggers.is_empty() {
+        return Ok(());
+    }
+
+    let schema = store.get_schema(txn, db_id, table_full_name).await?;
+
+    let quota = worker.get_quota(keyspace);
     let mut queued_any = false;
-    for trigger in triggers.iter().filter(|t| {
-        t.timing.eq_ignore_ascii_case("AFTER")
-            && t.events.iter().any(|e| e.eq_ignore_ascii_case(op_str))
-    }) {
-        if remaining == 0 {
-            break;
+
+    for trigger in after_triggers {
+        let func = store.get_function(txn, db_id, &trigger.function).await?;
+        let Some(func) = func else {
+            continue;
+        };
+
+        if trigger_body_needs_async(&func.body) {
+            let remaining = quota
+                .max_queue_depth
+                .saturating_sub(quota.current_depth.load(Ordering::Relaxed));
+            if remaining == 0 {
+                continue;
+            }
+
+            let ev = TriggerEvent::new_pending(
+                trigger.name.clone(),
+                db_id,
+                table_full_name.to_string(),
+                op.clone(),
+                old_row.cloned(),
+                new_row.cloned(),
+            );
+            let key = encode_trigger_queue_key(ev.id);
+            let val = bincode::serialize(&ev)?;
+            crate::txn::txn_put(txn, key, val).await?;
+            quota.current_depth.fetch_add(1, Ordering::Relaxed);
+            queued_any = true;
+        } else if let Some(schema) = &schema {
+            Box::pin(worker.execute_trigger_body(
+                executor,
+                txn,
+                db_id,
+                sequence_values,
+                schema,
+                &func.body,
+                old_row,
+                new_row,
+                search_path,
+            ))
+            .await?;
         }
-
-        let ev = TriggerEvent::new_pending(
-            trigger.name.clone(),
-            db_id,
-            table_full_name.to_string(),
-            op.clone(),
-            old_row.cloned(),
-            new_row.cloned(),
-        );
-
-        let key = encode_trigger_queue_key(ev.id);
-        let val = bincode::serialize(&ev)?;
-        crate::txn::txn_put(txn, key, val).await?;
-
-        quota.current_depth.fetch_add(1, Ordering::Relaxed);
-        remaining -= 1;
-        queued_any = true;
     }
 
     if queued_any {
@@ -734,6 +677,7 @@ impl TriggerWorker {
                 &func.body,
                 event.old_row.as_ref(),
                 event.new_row.as_ref(),
+                &self.default_search_path,
             )
             .await
         })
@@ -818,15 +762,7 @@ impl TriggerWorker {
     }
 
     fn list_known_keyspaces(&self) -> Vec<String> {
-        use std::collections::HashSet;
-        let mut out = HashSet::new();
-        for entry in self.active_keyspaces.iter() {
-            out.insert(entry.clone());
-        }
-        for entry in self.quotas.iter() {
-            out.insert(entry.key().clone());
-        }
-        out.into_iter().collect()
+        self.active_keyspaces.iter().map(|r| r.clone()).collect()
     }
 
     async fn gc_keyspace(&self, pool: &Arc<TikvClientPool>, keyspace: &str) -> Result<()> {
@@ -1005,6 +941,7 @@ impl TriggerWorker {
         body: &str,
         old_row: Option<&Row>,
         new_row: Option<&Row>,
+        search_path: &[String],
     ) -> Result<()> {
         // This is intentionally a small subset of PL/pgSQL tailored for triggers:
         // - `NEW.col := <expr>` assignments
@@ -1057,6 +994,7 @@ impl TriggerWorker {
                         old_row,
                         &mut new_values,
                         stmt,
+                        search_path,
                     )
                     .await?
                 }
@@ -1079,6 +1017,7 @@ impl TriggerWorker {
                     old_row,
                     &mut new_values,
                     stmt,
+                    search_path,
                 )
                 .await?;
         }
@@ -1096,6 +1035,7 @@ impl TriggerWorker {
         old_row: Option<&Row>,
         new_values: &mut [crate::types::Value],
         stmt: &str,
+        search_path: &[String],
     ) -> Result<bool> {
         let stmt = stmt.trim().trim_end_matches(';').trim();
         let upper = stmt.to_uppercase();
@@ -1136,7 +1076,7 @@ impl TriggerWorker {
                                             txn,
                                             db_id,
                                             sequence_values,
-                                            &self.default_search_path,
+                                            search_path,
                                             &expr,
                                             None,
                                             None,
@@ -1170,7 +1110,7 @@ impl TriggerWorker {
                     txn,
                     db_id,
                     sequence_values,
-                    &self.default_search_path,
+                    search_path,
                     s,
                     None,
                 )
@@ -1422,10 +1362,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
-    use super::{
-        parse_new_assignment, parse_pd_keyspace_names, plpgsql_outer_block_range,
-        substitute_row_references,
-    };
+    use super::{parse_new_assignment, plpgsql_outer_block_range, substitute_row_references};
 
     #[test]
     fn parse_new_assignment_accepts_common_syntax() {
@@ -1703,35 +1640,4 @@ mod tests {
         assert!(!block.contains("-- end"));
     }
 
-    #[test]
-    fn parse_pd_keyspace_names_extracts_keyspaces() {
-        let payload = serde_json::json!({
-            "keyspaces": [
-                {"name": "DEFAULT"},
-                {"name": "tenant_a"},
-                {"name": "tenant_a"},
-                {"name": 123},
-                {}
-            ]
-        });
-
-        let mut keyspaces = parse_pd_keyspace_names(&payload);
-        keyspaces.sort();
-        assert_eq!(
-            keyspaces,
-            vec!["default".to_string(), "tenant_a".to_string()]
-        );
-    }
-
-    #[test]
-    fn parse_pd_keyspace_names_accepts_array_payload() {
-        let payload = serde_json::json!([{"name": "DEFAULT"}, {"name": "tenant_b"}]);
-
-        let mut keyspaces = parse_pd_keyspace_names(&payload);
-        keyspaces.sort();
-        assert_eq!(
-            keyspaces,
-            vec!["default".to_string(), "tenant_b".to_string()]
-        );
-    }
 }

@@ -964,9 +964,13 @@ impl StartupHandler for DynamicPgHandler {
                                 &PgServerParameterProvider,
                             )
                             .await?;
-                            debug!(
-                                "Authentication successful for user '{}' with keyspace {:?}",
-                                actual_user, keyspace
+                            let peer = client.socket_addr();
+                            info!(
+                                "New connection from {}:{} user='{}' keyspace='{}'",
+                                peer.ip(),
+                                peer.port(),
+                                actual_user,
+                                keyspace.as_deref().unwrap_or("default"),
                             );
                         } else {
                             let error_info = ErrorInfo::new(
