@@ -24,7 +24,7 @@ pub(in crate::protocol::handler) fn encode_value(
                 const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
                 const MAX_REASONABLE_UNIX_MS: i64 = 10_000_000_000_000;
 
-                let (seconds, micros) = if i.abs() > MAX_REASONABLE_UNIX_MS {
+                let (seconds, micros) = if *i > MAX_REASONABLE_UNIX_MS {
                     let pg_micros = i;
                     let unix_secs = pg_micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECS;
                     let micros = pg_micros.rem_euclid(1_000_000) as u32;
@@ -66,7 +66,9 @@ pub(in crate::protocol::handler) fn encode_value(
             const PG_EPOCH_UNIX_SECS: i64 = 946_684_800;
             const MAX_REASONABLE_UNIX_MS: i64 = 10_000_000_000_000; // year ~2286
 
-            let (seconds, micros) = if ts.abs() > MAX_REASONABLE_UNIX_MS {
+            // Only apply the legacy PG-epoch-micros heuristic for large *positive* values.
+            // Unix-epoch millis can be large in magnitude for pre-epoch timestamps (e.g. year 0001).
+            let (seconds, micros) = if *ts > MAX_REASONABLE_UNIX_MS {
                 // Likely PostgreSQL epoch microseconds - convert to Unix seconds
                 let pg_micros = ts;
                 let unix_secs = pg_micros.div_euclid(1_000_000) + PG_EPOCH_UNIX_SECS;

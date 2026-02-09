@@ -687,8 +687,37 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
             "\\x{}",
             hex::encode(b)
         ))),
-        Value::Timestamp(ts) => Expr::Value(SqlValue::Number(ts.to_string(), false)),
-        Value::Interval(iv) => Expr::Value(SqlValue::SingleQuotedString(iv.to_string())),
+        Value::Timestamp(ts) => {
+            let seconds = ts.div_euclid(1000);
+            let millis = ts.rem_euclid(1000) as u32;
+            let nanos = millis * 1_000_000;
+            if chrono::DateTime::<chrono::Utc>::from_timestamp(seconds, nanos).is_some() {
+                let formatted = crate::types::timestamp::format_timestamp_millis(*ts, false)
+                    .unwrap_or_else(|_| ts.to_string());
+                Expr::TypedString {
+                    data_type: sqlparser::ast::DataType::Timestamp(
+                        None,
+                        sqlparser::ast::TimezoneInfo::None,
+                    ),
+                    value: formatted,
+                }
+            } else {
+                Expr::Value(SqlValue::Number(ts.to_string(), false))
+            }
+        }
+        Value::Interval(iv) => {
+            let mut parts = Vec::new();
+            if iv.months != 0 {
+                parts.push(format!("{} month", iv.months));
+            }
+            if iv.millis != 0 || parts.is_empty() {
+                parts.push(format!("{} millisecond", iv.millis));
+            }
+            Expr::TypedString {
+                data_type: sqlparser::ast::DataType::Interval,
+                value: parts.join(" "),
+            }
+        }
         Value::Uuid(bytes) => {
             let uuid = uuid::Uuid::from_bytes(*bytes);
             Expr::Value(SqlValue::SingleQuotedString(uuid.to_string()))
@@ -712,11 +741,13 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
         }
         Value::Json(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
         Value::Jsonb(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
-        Value::Date(days) => {
-            let s =
-                crate::types::date::format_date_days(*days).unwrap_or_else(|_| days.to_string());
-            Expr::Value(SqlValue::SingleQuotedString(s))
-        }
+        Value::Date(days) => match crate::types::date::format_date_days(*days) {
+            Ok(s) => Expr::TypedString {
+                data_type: sqlparser::ast::DataType::Date,
+                value: s,
+            },
+            Err(_) => Expr::Value(SqlValue::SingleQuotedString(days.to_string())),
+        },
         Value::Time(micros) => {
             let total_secs = micros / 1_000_000;
             let hours = total_secs / 3600;
@@ -738,6 +769,7 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
 mod tests {
     use super::*;
     use crate::types::{ColumnDef, IntervalValue};
+    use sqlparser::ast::BinaryOperator;
 
     fn test_col(name: &str, data_type: DataType) -> ColumnDef {
         ColumnDef {
@@ -798,6 +830,37 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(vec_bad.contains("invalid input syntax for type vector"));
+    }
+
+    #[test]
+    fn test_value_to_sql_expr_timestamp_preserves_timestamp_semantics() {
+        use chrono::{TimeZone, Utc};
+
+        let ts1 = Utc
+            .with_ymd_and_hms(2000, 1, 1, 0, 0, 1)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+        let ts2 = Utc
+            .with_ymd_and_hms(2000, 1, 1, 0, 0, 2)
+            .single()
+            .unwrap()
+            .timestamp_millis();
+
+        let right_expr = value_to_sql_expr(&Value::Timestamp(ts1));
+        let right_val = crate::sql::expr::eval_expr(&right_expr, None, None).unwrap();
+
+        let diff = crate::sql::expr::eval_binary_op_public(
+            Value::Timestamp(ts2),
+            &BinaryOperator::Minus,
+            right_val,
+        )
+        .unwrap();
+
+        assert_eq!(
+            diff,
+            Value::Interval(crate::types::IntervalValue::from_millis(1_000))
+        );
     }
 
     #[test]

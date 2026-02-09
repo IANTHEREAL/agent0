@@ -1595,6 +1595,22 @@ fn test_encode_value_timestamp_negative_millis() {
 }
 
 #[test]
+fn test_encode_value_timestamp_year_0001() {
+    use chrono::{TimeZone, Utc};
+
+    let col_type = DataType::Timestamp;
+    let ts = Utc
+        .with_ymd_and_hms(1, 1, 1, 0, 0, 2)
+        .single()
+        .unwrap()
+        .timestamp_millis();
+    assert_eq!(
+        encode_value_to_string(&Value::Timestamp(ts), Some(&col_type)),
+        "0001-01-01 00:00:02"
+    );
+}
+
+#[test]
 fn test_encode_value_int64_as_timestamp_negative_millis() {
     let col_type = DataType::Timestamp;
     assert_eq!(

@@ -562,6 +562,103 @@ fn mul_values(left: Value, right: Value) -> Result<Value> {
         return Ok(numeric::numeric_mul(l, r)?.into_value());
     }
 
+    fn mul_interval_by_int(
+        iv: crate::types::IntervalValue,
+        factor: i64,
+    ) -> Result<crate::types::IntervalValue> {
+        let months_i64 = i64::from(iv.months)
+            .checked_mul(factor)
+            .ok_or_else(|| anyhow!("interval months out of range"))?;
+        let months =
+            i32::try_from(months_i64).map_err(|_| anyhow!("interval months out of range"))?;
+        let millis = iv
+            .millis
+            .checked_mul(factor)
+            .ok_or_else(|| anyhow!("interval out of range"))?;
+        Ok(crate::types::IntervalValue::new(months, millis))
+    }
+
+    match (left, right) {
+        (Value::Interval(iv), factor) | (factor, Value::Interval(iv)) => {
+            let Some(factor) = numeric::NumericValue::from_value(&factor) else {
+                return Err(
+                    SqlError::Unsupported("Unsupported types for multiplication".into()).into(),
+                );
+            };
+
+            return match factor {
+                numeric::NumericValue::Int32(n) => {
+                    Ok(Value::Interval(mul_interval_by_int(iv, i64::from(n))?))
+                }
+                numeric::NumericValue::Int64(n) => Ok(Value::Interval(mul_interval_by_int(iv, n)?)),
+                numeric::NumericValue::Decimal(d) => {
+                    use rust_decimal::prelude::ToPrimitive;
+
+                    if d.fract().is_zero() {
+                        let n = d
+                            .to_i64()
+                            .ok_or_else(|| anyhow!("interval multiplier out of range"))?;
+                        Ok(Value::Interval(mul_interval_by_int(iv, n)?))
+                    } else if iv.months == 0 {
+                        let f = d
+                            .to_f64()
+                            .ok_or_else(|| anyhow!("numeric value out of range"))?;
+                        if !f.is_finite() {
+                            return Err(anyhow!("interval multiplier out of range"));
+                        }
+                        let scaled = (iv.millis as f64) * f;
+                        if !scaled.is_finite() {
+                            return Err(anyhow!("interval out of range"));
+                        }
+                        let rounded = scaled.round();
+                        if rounded < (i64::MIN as f64) || rounded > (i64::MAX as f64) {
+                            return Err(anyhow!("interval out of range"));
+                        }
+                        Ok(Value::Interval(crate::types::IntervalValue::from_millis(
+                            rounded as i64,
+                        )))
+                    } else {
+                        Err(SqlError::Unsupported(
+                            "Unsupported interval multiplication with fractional months".into(),
+                        )
+                        .into())
+                    }
+                }
+                numeric::NumericValue::Float64(f) => {
+                    if f.fract() == 0.0 {
+                        // Range check before casting to avoid undefined behavior
+                        if !f.is_finite() || f < (i64::MIN as f64) || f > (i64::MAX as f64) {
+                            return Err(anyhow!("interval multiplier out of range"));
+                        }
+                        let n = f as i64;
+                        Ok(Value::Interval(mul_interval_by_int(iv, n)?))
+                    } else if iv.months == 0 {
+                        if !f.is_finite() {
+                            return Err(anyhow!("interval multiplier out of range"));
+                        }
+                        let scaled = (iv.millis as f64) * f;
+                        if !scaled.is_finite() {
+                            return Err(anyhow!("interval out of range"));
+                        }
+                        let rounded = scaled.round();
+                        if rounded < (i64::MIN as f64) || rounded > (i64::MAX as f64) {
+                            return Err(anyhow!("interval out of range"));
+                        }
+                        Ok(Value::Interval(crate::types::IntervalValue::from_millis(
+                            rounded as i64,
+                        )))
+                    } else {
+                        Err(SqlError::Unsupported(
+                            "Unsupported interval multiplication with fractional months".into(),
+                        )
+                        .into())
+                    }
+                }
+            };
+        }
+        _ => {}
+    }
+
     Err(SqlError::Unsupported("Unsupported types for multiplication".into()).into())
 }
 
@@ -927,5 +1024,59 @@ mod tests {
         let iv = crate::types::IntervalValue::from_months(i32::MIN);
         let err = add_interval_to_timestamp(ts_millis, &iv).unwrap_err();
         assert!(err.to_string().contains("Date out of range"));
+    }
+
+    #[test]
+    fn test_mul_values_interval_by_int() {
+        let iv = crate::types::IntervalValue::from_millis(1_000);
+
+        assert_eq!(
+            mul_values(Value::Int32(2), Value::Interval(iv)).unwrap(),
+            Value::Interval(crate::types::IntervalValue::from_millis(2_000))
+        );
+        assert_eq!(
+            mul_values(Value::Interval(iv), Value::Int64(3)).unwrap(),
+            Value::Interval(crate::types::IntervalValue::from_millis(3_000))
+        );
+
+        let iv_months = crate::types::IntervalValue::from_months(12);
+        assert_eq!(
+            mul_values(Value::Interval(iv_months), Value::Int32(2)).unwrap(),
+            Value::Interval(crate::types::IntervalValue::from_months(24))
+        );
+    }
+
+    #[test]
+    fn test_mul_values_interval_by_fractional_when_months_zero() {
+        let iv = crate::types::IntervalValue::from_millis(1_000);
+        assert_eq!(
+            mul_values(Value::Interval(iv), Value::Float64(0.5)).unwrap(),
+            Value::Interval(crate::types::IntervalValue::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn test_mul_values_interval_fractional_rejects_months_component() {
+        let iv = crate::types::IntervalValue::new(1, 0);
+        let err = mul_values(Value::Interval(iv), Value::Float64(0.5))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("fractional months"));
+    }
+
+    #[test]
+    fn test_mul_values_interval_by_large_whole_float_overflow() {
+        let iv = crate::types::IntervalValue::from_millis(1_000);
+        // Test with float that's whole but exceeds i64::MAX
+        let err = mul_values(Value::Interval(iv), Value::Float64(1e19))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("out of range"));
+
+        // Test with large negative float
+        let err = mul_values(Value::Interval(iv), Value::Float64(-1e19))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("out of range"));
     }
 }
