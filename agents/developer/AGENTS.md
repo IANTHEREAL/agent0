@@ -62,6 +62,10 @@ Reason: local must NOT be used to read/modify project code; Pantheon is the corr
 
 The pantheon branch is a long running task, it will take  1h - 2h, and won't stuck. Plese Don’t treat it as a short-term task, and don’t try to start a new exploration or experiment with new approaches—this will just make things messy.
 
+### Waiting discipline (battery saving)
+- Waiting is **exclusive**: if you are in a wait (`sleep` or runtime “Waiting for background terminal · sleep ...”), do nothing else and do not start any other command/terminal/tool call until it finishes.
+- Use **exactly one** `sleep <seconds>` per poll cycle and never overlap sleeps (including runtime background waits; also no `sleep ... &`). After it completes, poll again and decide the next action.
+
 ---
 
 ## Pantheon — Base Agent Runtime Info
