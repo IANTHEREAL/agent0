@@ -51,13 +51,7 @@ ORDER BY
     a;
 
 -- Test 7: query (line 57)
--- NOTE: tipg currently mis-evaluates NULLIF(col, const); use CASE equivalent.
-SELECT
-    a,
-    CASE WHEN a = 2 THEN NULL ELSE a END AS nullif_a_2,
-    CASE WHEN a = 2 THEN NULL ELSE a END AS case_a_2
-FROM t
-ORDER BY a;
+SELECT a, NULLIF(a, 2), CASE WHEN a = 2 THEN NULL ELSE a END FROM t ORDER BY 1;
 
 -- Test 8: query (line 64)
 SELECT
@@ -80,7 +74,6 @@ SELECT
     END;
 
 -- Test 9: query (line 86)
--- Removed CASE NULL::boolean WHEN NULL branch - nullable comparisons are indeterminate
 SELECT
     CASE
     WHEN 1 = 1 THEN 'one'
@@ -92,11 +85,22 @@ SELECT
     WHEN 2 THEN 'one'
     ELSE 'three'
     END,
+    CASE NULL::boolean
+    WHEN true THEN 'one'
+    WHEN false THEN 'two'
+    WHEN NULL THEN 'three'
+    ELSE 'four'
+    END,
     CASE
     WHEN false THEN 'one'
     WHEN true THEN 'two'
     END;
 
 -- Test 10: statement (line 116)
--- Keep COALESCE short-circuit edge case without tipg's COALESCE(col, ...) limitation.
-SELECT COALESCE(1, 1/0) AS coalesce;
+-- Keep COALESCE short-circuit edge case without correlated scalar subqueries (#548).
+CREATE TABLE t95560a (a INT);
+INSERT INTO t95560a VALUES (1);
+SELECT
+    COALESCE(a, 2) AS coalesce_col,
+    COALESCE(a, 1/0) AS coalesce_short_circuit
+FROM t95560a;
