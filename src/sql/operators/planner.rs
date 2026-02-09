@@ -15,7 +15,7 @@
 //!
 //! ```ignore
 //! let planner = PhysicalPlanner::new(store, search_path);
-//! let operator = planner.plan_simple_select(&schema, filter, order_by, limit, offset).await?;
+//! let operator = planner.plan_simple_select(db_id, schema, filter, order_by, limit, offset, 1000)?;
 //! ```
 
 use anyhow::Result;
@@ -175,6 +175,7 @@ impl PhysicalPlanner {
     /// A boxed operator that is the root of the execution tree.
     pub fn plan_simple_select(
         &self,
+        db_id: u64,
         schema: TableSchema,
         filter: Option<&Expr>,
         order_by: Vec<OrderByExpr>,
@@ -182,7 +183,8 @@ impl PhysicalPlanner {
         offset: usize,
         estimated_rows: usize,
     ) -> Result<BoxedOperator> {
-        let access_path = choose_best_access_path_for_filter(&schema, filter, estimated_rows);
+        let access_path =
+            choose_best_access_path_for_filter(db_id, &schema, filter, estimated_rows);
 
         let scan_upper_bound = match limit {
             Some(0) => Some(0),

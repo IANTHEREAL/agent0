@@ -554,6 +554,7 @@ impl Executor {
                 let planner = PhysicalPlanner::new(self.store(), search_path.to_vec());
                 let estimated_rows = 1000;
                 let mut lock_operator = planner.plan_simple_select(
+                    db_id,
                     schema.clone(),
                     resolved_selection.as_ref(),
                     Vec::new(),
@@ -716,6 +717,7 @@ impl Executor {
                 }
                 Some(sel) => {
                     let access_path = planner::choose_best_access_path_for_filter(
+                        db_id,
                         &schema,
                         Some(sel),
                         estimated_rows,

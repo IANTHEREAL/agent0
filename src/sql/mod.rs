@@ -36,6 +36,7 @@ mod result;
 mod role_settings;
 mod sequences;
 mod statement_time;
+pub mod stats;
 mod timezone;
 mod trigger_queue;
 mod trigger_rewrite;

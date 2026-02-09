@@ -340,7 +340,7 @@ fn generate_table_factor_plan(
 
             if let Some(schema) = schema_lookup(table_name) {
                 let access_path =
-                    choose_best_access_path_for_filter(&schema, filter_expr, estimated_rows);
+                    choose_best_access_path_for_filter(0, &schema, filter_expr, estimated_rows);
 
                 match access_path.scan_type {
                     ScanType::IndexScan {

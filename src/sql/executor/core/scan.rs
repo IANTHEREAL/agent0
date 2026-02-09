@@ -28,6 +28,9 @@ impl Executor {
             fill_row_defaults(&mut row, schema)?;
             filled_rows.push(row);
         }
+        if limit.is_none() {
+            crate::sql::stats::update_row_count_estimate(db_id, schema.table_id, filled_rows.len());
+        }
         Ok(filled_rows)
     }
 }

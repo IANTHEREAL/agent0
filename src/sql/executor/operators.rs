@@ -2418,6 +2418,7 @@ impl Executor {
                 op
             } else {
                 planner.plan_simple_select(
+                    db_id,
                     schema.clone(),
                     filter,
                     Vec::new(),
@@ -2523,6 +2524,7 @@ impl Executor {
             op
         } else {
             planner.plan_simple_select(
+                db_id,
                 schema.clone(),
                 filter,
                 rewrite_order_by_for_pre_projection_sort(order_by)?,
@@ -2613,6 +2615,7 @@ impl Executor {
             let planner = PhysicalPlanner::new(self.store(), search_path.to_vec());
             let estimated_rows = 1000;
             planner.plan_simple_select(
+                db_id,
                 schema.clone(),
                 filter,
                 Vec::new(),
