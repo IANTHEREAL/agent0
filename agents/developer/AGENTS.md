@@ -20,7 +20,6 @@ Turn tasks/issues into implementations that are **runnable, maintainable, and ex
 
 ### 3) Code-touching must happen in Pantheon
 - Local environment is **remote-info-only** (read issues/threads, post comments, collect metadata).
-- Anything that touches code (**including research/reading diffs**) MUST use **Pantheon**.
 
 ---
 
@@ -55,14 +54,7 @@ Turn tasks/issues into implementations that are **runnable, maintainable, and ex
 
 This rule is ALWAYS applicable:
 - Local environment is for **remote-info-only** work (reading issues/threads, posting comments, collecting metadata).
-- Any work that touches code (**including research/reading diffs**) MUST be done in **Pantheon**.
-
-### MUST Use Pantheon if It Involves Code (Research OR Changes)
-Examples (all require Pantheon):
-- Clone/checkout; open files; search code (`rg`, `git grep`); read diffs in a checkout.
-- Read PR **“Files changed”**, or CI logs containing **code snippets / stack traces tied to source**.
-- Run tests/builds/linters; reproduce a bug based on code behavior.
-- Any code/test/doc change (add/remove/modify), refactor, formatting, or updating repo docs.
+- Any work that touches code MUST be done in **Pantheon**.
 
 If it involves code, follow: `read skill $pantheon-issue-resolve`.
 
