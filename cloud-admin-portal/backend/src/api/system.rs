@@ -24,9 +24,7 @@ pub async fn health_check(
     }))
 }
 
-pub async fn api_info(
-    _auth: ApiKeyAuth,
-) -> Json<serde_json::Value> {
+pub async fn api_info(_auth: ApiKeyAuth) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "name": "pg-tikv Admin API",
         "version": "2.0.0",

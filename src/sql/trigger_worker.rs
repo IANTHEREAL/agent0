@@ -434,9 +434,7 @@ const ASYNC_TRIGGER_KEYWORDS: &[&str] = &[
 
 fn trigger_body_needs_async(body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
-    ASYNC_TRIGGER_KEYWORDS
-        .iter()
-        .any(|kw| lower.contains(kw))
+    ASYNC_TRIGGER_KEYWORDS.iter().any(|kw| lower.contains(kw))
 }
 
 /// Execute AFTER-row triggers, synchronously when possible.
@@ -1106,14 +1104,7 @@ impl TriggerWorker {
         for s in &statements {
             // Ignore result rows; errors propagate.
             let _ = executor
-                .execute_statement_on_txn(
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    s,
-                    None,
-                )
+                .execute_statement_on_txn(txn, db_id, sequence_values, search_path, s, None)
                 .await?;
         }
 
@@ -1639,5 +1630,4 @@ mod tests {
         assert!(block.contains("SELECT 2;"));
         assert!(!block.contains("-- end"));
     }
-
 }

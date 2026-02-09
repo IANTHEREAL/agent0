@@ -10,14 +10,19 @@ use crate::error::AppError;
 use crate::models::*;
 use crate::services::pd_client::PdClient;
 use crate::services::pg_client::PgClient;
-use crate::{tenant_state, AppState, DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USER, DEFAULT_PG_PORT, OBSERVABILITY_USER, TENANT_ID_LEN};
+use crate::{
+    tenant_state, AppState, DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USER, DEFAULT_PG_PORT,
+    OBSERVABILITY_USER, TENANT_ID_LEN,
+};
 
 fn encode_cursor(created_at: &str, id: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{created_at}|{id}"))
 }
 
 fn decode_cursor(cursor: &str) -> Option<(String, String)> {
-    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(cursor).ok()?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cursor)
+        .ok()?;
     let s = String::from_utf8(bytes).ok()?;
     let parts: Vec<&str> = s.splitn(2, '|').collect();
     if parts.len() == 2 {
@@ -58,7 +63,9 @@ pub async fn list_tenants(
     let size = params.size.unwrap_or(50);
 
     let cursor_pair = params.cursor.as_deref().and_then(decode_cursor);
-    let cursor_ref = cursor_pair.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str()));
+    let cursor_ref = cursor_pair
+        .as_ref()
+        .map(|(ts, id)| (ts.as_str(), id.as_str()));
 
     let opts = db::ListTenantsOpts {
         page,
@@ -91,7 +98,9 @@ pub async fn create_tenant(
 ) -> Result<(StatusCode, Json<CreateTenantResponse>), AppError> {
     let tenant_id = generate_tenant_id();
     let keyspace = make_keyspace(&tenant_id);
-    let admin_user = request.admin_user.unwrap_or_else(|| DEFAULT_ADMIN_USER.to_string());
+    let admin_user = request
+        .admin_user
+        .unwrap_or_else(|| DEFAULT_ADMIN_USER.to_string());
     let password = request.admin_password.unwrap_or_else(generate_password);
 
     // Check for ID collision
@@ -100,30 +109,65 @@ pub async fn create_tenant(
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    db::insert_tenant(&state.db, &tenant_id, &keyspace, tenant_state::CREATING, &now).await?;
+    db::insert_tenant(
+        &state.db,
+        &tenant_id,
+        &keyspace,
+        tenant_state::CREATING,
+        &now,
+    )
+    .await?;
 
     let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
     if !pd.create_keyspace(&keyspace).await {
-        db::update_tenant_state(&state.db, &tenant_id, tenant_state::CREATE_FAILED, Some("Failed to create keyspace in PD")).await?;
+        db::update_tenant_state(
+            &state.db,
+            &tenant_id,
+            tenant_state::CREATE_FAILED,
+            Some("Failed to create keyspace in PD"),
+        )
+        .await?;
         db::insert_audit_log(
-            &state.db, "CREATE", "TENANT", &tenant_id,
-            Some(&tenant_id), None, false,
-            Some("Failed to create keyspace in PD"), None,
-        ).await.ok();
+            &state.db,
+            "CREATE",
+            "TENANT",
+            &tenant_id,
+            Some(&tenant_id),
+            None,
+            false,
+            Some("Failed to create keyspace in PD"),
+            None,
+        )
+        .await
+        .ok();
         return Err(AppError::internal("Failed to create keyspace in TiKV"));
     }
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-    if !pg.bootstrap_admin_password(&tenant_id, &admin_user, DEFAULT_ADMIN_PASSWORD, &password).await {
+    if !pg
+        .bootstrap_admin_password(&tenant_id, &admin_user, DEFAULT_ADMIN_PASSWORD, &password)
+        .await
+    {
         db::update_tenant_state(
-            &state.db, &tenant_id, tenant_state::CREATE_FAILED,
+            &state.db,
+            &tenant_id,
+            tenant_state::CREATE_FAILED,
             Some("Keyspace created but password bootstrap failed"),
-        ).await?;
+        )
+        .await?;
         db::insert_audit_log(
-            &state.db, "CREATE", "TENANT", &tenant_id,
-            Some(&tenant_id), None, false,
-            Some("Password bootstrap failed"), None,
-        ).await.ok();
+            &state.db,
+            "CREATE",
+            "TENANT",
+            &tenant_id,
+            Some(&tenant_id),
+            None,
+            false,
+            Some("Password bootstrap failed"),
+            None,
+        )
+        .await
+        .ok();
         return Err(AppError::internal(
             "Failed to set admin password. Keyspace created but password unchanged.",
         ));
@@ -131,16 +175,27 @@ pub async fn create_tenant(
 
     db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None).await?;
     db::insert_audit_log(
-        &state.db, "CREATE", "TENANT", &tenant_id,
-        Some(&tenant_id), None, true, None, None,
-    ).await.ok();
+        &state.db,
+        "CREATE",
+        "TENANT",
+        &tenant_id,
+        Some(&tenant_id),
+        None,
+        true,
+        None,
+        None,
+    )
+    .await
+    .ok();
 
     let endpoints = state.config.parse_public_endpoints();
-    let (host, port) = endpoints.first().cloned().unwrap_or_else(|| ("127.0.0.1".into(), DEFAULT_PG_PORT));
+    let (host, port) = endpoints
+        .first()
+        .cloned()
+        .unwrap_or_else(|| ("127.0.0.1".into(), DEFAULT_PG_PORT));
 
-    let connection_string = format!(
-        "postgresql://{tenant_id}.{admin_user}:{password}@{host}:{port}/postgres"
-    );
+    let connection_string =
+        format!("postgresql://{tenant_id}.{admin_user}:{password}@{host}:{port}/postgres");
 
     Ok((
         StatusCode::CREATED,
@@ -209,22 +264,48 @@ pub async fn delete_tenant(
     let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
     if !pd.disable_keyspace(&tenant.keyspace).await {
         db::update_tenant_state(
-            &state.db, &tenant_id, tenant_state::ACTIVE,
+            &state.db,
+            &tenant_id,
+            tenant_state::ACTIVE,
             Some("Failed to disable keyspace in PD"),
-        ).await?;
+        )
+        .await?;
         db::insert_audit_log(
-            &state.db, "DELETE", "TENANT", &tenant_id,
-            Some(&tenant_id), None, false,
-            Some("Failed to disable keyspace"), None,
-        ).await.ok();
+            &state.db,
+            "DELETE",
+            "TENANT",
+            &tenant_id,
+            Some(&tenant_id),
+            None,
+            false,
+            Some("Failed to disable keyspace"),
+            None,
+        )
+        .await
+        .ok();
         return Err(AppError::internal("Failed to disable tenant"));
     }
 
-    db::update_tenant_state(&state.db, &tenant_id, tenant_state::DISABLED, Some("Deleted via API")).await?;
+    db::update_tenant_state(
+        &state.db,
+        &tenant_id,
+        tenant_state::DISABLED,
+        Some("Deleted via API"),
+    )
+    .await?;
     db::insert_audit_log(
-        &state.db, "DELETE", "TENANT", &tenant_id,
-        Some(&tenant_id), None, true, None, None,
-    ).await.ok();
+        &state.db,
+        "DELETE",
+        "TENANT",
+        &tenant_id,
+        Some(&tenant_id),
+        None,
+        true,
+        None,
+        None,
+    )
+    .await
+    .ok();
 
     Ok(Json(MessageResponse {
         message: format!("Tenant '{tenant_id}' disabled"),
@@ -247,22 +328,48 @@ pub async fn remove_tenant(
     let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
     if !pd.disable_keyspace(&tenant.keyspace).await {
         db::update_tenant_state(
-            &state.db, &tenant_id, tenant_state::ACTIVE,
+            &state.db,
+            &tenant_id,
+            tenant_state::ACTIVE,
             Some("Failed to disable keyspace in PD"),
-        ).await?;
+        )
+        .await?;
         db::insert_audit_log(
-            &state.db, "DELETE", "TENANT", &tenant_id,
-            Some(&tenant_id), None, false,
-            Some("Failed to disable keyspace"), None,
-        ).await.ok();
+            &state.db,
+            "DELETE",
+            "TENANT",
+            &tenant_id,
+            Some(&tenant_id),
+            None,
+            false,
+            Some("Failed to disable keyspace"),
+            None,
+        )
+        .await
+        .ok();
         return Err(AppError::internal("Failed to disable keyspace in TiKV"));
     }
 
-    db::update_tenant_state(&state.db, &tenant_id, tenant_state::DISABLED, Some("Removed via portal")).await?;
+    db::update_tenant_state(
+        &state.db,
+        &tenant_id,
+        tenant_state::DISABLED,
+        Some("Removed via portal"),
+    )
+    .await?;
     db::insert_audit_log(
-        &state.db, "DELETE", "TENANT", &tenant_id,
-        Some(&tenant_id), None, true, None, None,
-    ).await.ok();
+        &state.db,
+        "DELETE",
+        "TENANT",
+        &tenant_id,
+        Some(&tenant_id),
+        None,
+        true,
+        None,
+        None,
+    )
+    .await
+    .ok();
 
     Ok(Json(MessageResponse {
         message: format!("Tenant '{tenant_id}' removed from portal"),
@@ -295,9 +402,18 @@ pub async fn update_tenant(
     .await?;
 
     db::insert_audit_log(
-        &state.db, "UPDATE", "TENANT", &tenant_id,
-        Some(&tenant_id), None, true, None, None,
-    ).await.ok();
+        &state.db,
+        "UPDATE",
+        "TENANT",
+        &tenant_id,
+        Some(&tenant_id),
+        None,
+        true,
+        None,
+        None,
+    )
+    .await
+    .ok();
 
     let updated = db::get_tenant(&state.db, &tenant_id)
         .await?
@@ -323,15 +439,17 @@ pub async fn connect_tenant(
     }
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-    if !pg.test_connection(&tenant_id, &request.admin_user, &request.admin_password).await {
+    if !pg
+        .test_connection(&tenant_id, &request.admin_user, &request.admin_password)
+        .await
+    {
         return Err(AppError::unauthorized("Invalid tenant credentials"));
     }
 
-    let session = state.sessions.create_session(
-        &tenant_id,
-        &request.admin_user,
-        &request.admin_password,
-    );
+    let session =
+        state
+            .sessions
+            .create_session(&tenant_id, &request.admin_user, &request.admin_password);
 
     Ok(Json(TenantConnectResponse {
         session_id: session.session_id,
@@ -361,7 +479,12 @@ pub async fn execute_query(
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
     match pg
-        .run_sql(&session.tenant_id, &session.admin_user, &session.admin_password, &sql)
+        .run_sql(
+            &session.tenant_id,
+            &session.admin_user,
+            &session.admin_password,
+            &sql,
+        )
         .await
     {
         Ok(output) => Ok(Json(SqlQueryResponse {
@@ -388,14 +511,19 @@ pub async fn get_observability(
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
 
-    let cred = db::get_credential(&state.db, &tenant_id, "OBSERVABILITY", state.config.credential_key.as_deref())
-        .await?
-        .ok_or_else(|| {
-            AppError::new(
-                StatusCode::CONFLICT,
-                "Observability account not bootstrapped for this tenant",
-            )
-        })?;
+    let cred = db::get_credential(
+        &state.db,
+        &tenant_id,
+        "OBSERVABILITY",
+        state.config.credential_key.as_deref(),
+    )
+    .await?
+    .ok_or_else(|| {
+        AppError::new(
+            StatusCode::CONFLICT,
+            "Observability account not bootstrapped for this tenant",
+        )
+    })?;
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
 
@@ -456,7 +584,10 @@ pub async fn bootstrap_observability(
         .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-    if !pg.test_connection(&tenant_id, &request.admin_user, &request.admin_password).await {
+    if !pg
+        .test_connection(&tenant_id, &request.admin_user, &request.admin_password)
+        .await
+    {
         return Err(AppError::unauthorized("Invalid tenant credentials"));
     }
 
@@ -490,8 +621,15 @@ pub async fn bootstrap_observability(
         }
     }
 
-    db::upsert_credential(&state.db, &tenant_id, "OBSERVABILITY", OBSERVABILITY_USER, &obs_password, state.config.credential_key.as_deref())
-        .await?;
+    db::upsert_credential(
+        &state.db,
+        &tenant_id,
+        "OBSERVABILITY",
+        OBSERVABILITY_USER,
+        &obs_password,
+        state.config.credential_key.as_deref(),
+    )
+    .await?;
 
     Ok(Json(MessageResponse {
         message: format!(
@@ -514,7 +652,9 @@ pub async fn batch_create_tenants(
         ));
     }
 
-    let admin_user = request.admin_user.unwrap_or_else(|| DEFAULT_ADMIN_USER.to_string());
+    let admin_user = request
+        .admin_user
+        .unwrap_or_else(|| DEFAULT_ADMIN_USER.to_string());
     let mut created = Vec::new();
     let mut failed = Vec::new();
 
@@ -535,7 +675,15 @@ pub async fn batch_create_tenants(
         }
 
         let now = chrono::Utc::now().to_rfc3339();
-        if let Err(e) = db::insert_tenant(&state.db, &tenant_id, &keyspace, tenant_state::CREATING, &now).await {
+        if let Err(e) = db::insert_tenant(
+            &state.db,
+            &tenant_id,
+            &keyspace,
+            tenant_state::CREATING,
+            &now,
+        )
+        .await
+        {
             failed.push(BatchItemError {
                 id: tenant_id,
                 error: format!("DB insert failed: {e}"),
@@ -545,7 +693,14 @@ pub async fn batch_create_tenants(
 
         let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
         if !pd.create_keyspace(&keyspace).await {
-            db::update_tenant_state(&state.db, &tenant_id, tenant_state::CREATE_FAILED, Some("PD keyspace creation failed")).await.ok();
+            db::update_tenant_state(
+                &state.db,
+                &tenant_id,
+                tenant_state::CREATE_FAILED,
+                Some("PD keyspace creation failed"),
+            )
+            .await
+            .ok();
             failed.push(BatchItemError {
                 id: tenant_id,
                 error: "Failed to create keyspace in PD".into(),
@@ -554,8 +709,18 @@ pub async fn batch_create_tenants(
         }
 
         let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-        if !pg.bootstrap_admin_password(&tenant_id, &admin_user, DEFAULT_ADMIN_PASSWORD, &password).await {
-            db::update_tenant_state(&state.db, &tenant_id, tenant_state::CREATE_FAILED, Some("Password bootstrap failed")).await.ok();
+        if !pg
+            .bootstrap_admin_password(&tenant_id, &admin_user, DEFAULT_ADMIN_PASSWORD, &password)
+            .await
+        {
+            db::update_tenant_state(
+                &state.db,
+                &tenant_id,
+                tenant_state::CREATE_FAILED,
+                Some("Password bootstrap failed"),
+            )
+            .await
+            .ok();
             failed.push(BatchItemError {
                 id: tenant_id,
                 error: "Password bootstrap failed".into(),
@@ -563,15 +728,30 @@ pub async fn batch_create_tenants(
             continue;
         }
 
-        db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None).await.ok();
+        db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None)
+            .await
+            .ok();
         db::insert_audit_log(
-            &state.db, "CREATE", "TENANT", &tenant_id,
-            Some(&tenant_id), None, true, None, None,
-        ).await.ok();
+            &state.db,
+            "CREATE",
+            "TENANT",
+            &tenant_id,
+            Some(&tenant_id),
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
+        .ok();
 
         let endpoints = state.config.parse_public_endpoints();
-        let (host, port) = endpoints.first().cloned().unwrap_or_else(|| ("127.0.0.1".into(), DEFAULT_PG_PORT));
-        let connection_string = format!("postgresql://{tenant_id}.{admin_user}:{password}@{host}:{port}/postgres");
+        let (host, port) = endpoints
+            .first()
+            .cloned()
+            .unwrap_or_else(|| ("127.0.0.1".into(), DEFAULT_PG_PORT));
+        let connection_string =
+            format!("postgresql://{tenant_id}.{admin_user}:{password}@{host}:{port}/postgres");
 
         created.push(CreateTenantResponse {
             id: tenant_id,
@@ -630,11 +810,20 @@ pub async fn batch_delete_tenants(
             }
         };
 
-        db::update_tenant_state(&state.db, tenant_id, tenant_state::DISABLING, None).await.ok();
+        db::update_tenant_state(&state.db, tenant_id, tenant_state::DISABLING, None)
+            .await
+            .ok();
 
         let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
         if !pd.disable_keyspace(&tenant.keyspace).await {
-            db::update_tenant_state(&state.db, tenant_id, tenant_state::ACTIVE, Some("Failed to disable keyspace in PD")).await.ok();
+            db::update_tenant_state(
+                &state.db,
+                tenant_id,
+                tenant_state::ACTIVE,
+                Some("Failed to disable keyspace in PD"),
+            )
+            .await
+            .ok();
             failed.push(BatchItemError {
                 id: tenant_id.clone(),
                 error: "Failed to disable keyspace in PD".into(),
@@ -642,11 +831,27 @@ pub async fn batch_delete_tenants(
             continue;
         }
 
-        db::update_tenant_state(&state.db, tenant_id, tenant_state::DISABLED, Some("Batch delete")).await.ok();
+        db::update_tenant_state(
+            &state.db,
+            tenant_id,
+            tenant_state::DISABLED,
+            Some("Batch delete"),
+        )
+        .await
+        .ok();
         db::insert_audit_log(
-            &state.db, "DELETE", "TENANT", tenant_id,
-            Some(tenant_id), None, true, None, None,
-        ).await.ok();
+            &state.db,
+            "DELETE",
+            "TENANT",
+            tenant_id,
+            Some(tenant_id),
+            None,
+            true,
+            None,
+            None,
+        )
+        .await
+        .ok();
         deleted.push(tenant_id.clone());
     }
 
@@ -695,13 +900,23 @@ pub async fn batch_update_tenants(
             &updated,
             request.notes.as_deref(),
             tags_json.as_deref(),
-        ).await?;
+        )
+        .await?;
 
         for id in &updated {
             db::insert_audit_log(
-                &state.db, "UPDATE", "TENANT", id,
-                Some(id), None, true, None, None,
-            ).await.ok();
+                &state.db,
+                "UPDATE",
+                "TENANT",
+                id,
+                Some(id),
+                None,
+                true,
+                None,
+                None,
+            )
+            .await
+            .ok();
         }
     }
 

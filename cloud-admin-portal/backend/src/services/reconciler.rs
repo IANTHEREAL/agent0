@@ -69,7 +69,9 @@ impl Reconciler {
 
             // Batch-check which candidates already exist in DB
             let ids: Vec<&str> = candidates.iter().map(|(id, _)| id.as_str()).collect();
-            let existing = db::check_tenants_exist(&self.db, &ids).await.unwrap_or_default();
+            let existing = db::check_tenants_exist(&self.db, &ids)
+                .await
+                .unwrap_or_default();
 
             for (id, name) in &candidates {
                 if existing.contains(id.as_str()) {
@@ -111,9 +113,15 @@ impl Reconciler {
             for t in &stuck {
                 let exists = self.pd.get_keyspace(&t.keyspace).await.is_some();
                 let (new_state, reason) = if exists {
-                    (tenant_state::ACTIVE, "Recovered by reconciler: keyspace exists")
+                    (
+                        tenant_state::ACTIVE,
+                        "Recovered by reconciler: keyspace exists",
+                    )
                 } else {
-                    (tenant_state::CREATE_FAILED, "Recovered by reconciler: keyspace not found")
+                    (
+                        tenant_state::CREATE_FAILED,
+                        "Recovered by reconciler: keyspace not found",
+                    )
                 };
                 if let Err(e) =
                     db::update_tenant_state(&self.db, &t.id, new_state, Some(reason)).await
@@ -123,9 +131,7 @@ impl Reconciler {
             }
         }
 
-        if let Ok(stuck) =
-            db::get_stuck_tenants(&self.db, tenant_state::DISABLING, &cutoff).await
-        {
+        if let Ok(stuck) = db::get_stuck_tenants(&self.db, tenant_state::DISABLING, &cutoff).await {
             for t in &stuck {
                 if let Err(e) = db::update_tenant_state(
                     &self.db,

@@ -13,7 +13,9 @@ impl FromRequestParts<AppState> for ApiKeyAuth {
     fn from_request_parts<'life0, 'life1, 'async_trait>(
         parts: &'life0 mut Parts,
         state: &'life1 AppState,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Self, Self::Rejection>> + Send + 'async_trait>>
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self, Self::Rejection>> + Send + 'async_trait>,
+    >
     where
         'life0: 'async_trait,
         'life1: 'async_trait,
@@ -24,13 +26,12 @@ impl FromRequestParts<AppState> for ApiKeyAuth {
                 return Ok(Self);
             }
 
-            let key = parts
-                .headers
-                .get("X-API-Key")
-                .and_then(|v| v.to_str().ok());
+            let key = parts.headers.get("X-API-Key").and_then(|v| v.to_str().ok());
 
             match key {
-                None => Err(AppError::unauthorized("API key required. Pass X-API-Key header.")),
+                None => Err(AppError::unauthorized(
+                    "API key required. Pass X-API-Key header.",
+                )),
                 Some(k) => {
                     if state.config.api_keys.iter().any(|allowed| allowed == k) {
                         Ok(Self)
@@ -51,11 +52,19 @@ pub struct TenantSessionExtractor {
 }
 
 impl TenantSessionExtractor {
-    pub fn from_headers(headers: &HeaderMap, tenant_id: &str, state: &AppState) -> Result<Self, AppError> {
+    pub fn from_headers(
+        headers: &HeaderMap,
+        tenant_id: &str,
+        state: &AppState,
+    ) -> Result<Self, AppError> {
         let session_id = headers
             .get("X-Tenant-Session")
             .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| AppError::unauthorized("Tenant session required. Use POST /api/tenants/{id}/connect first."))?;
+            .ok_or_else(|| {
+                AppError::unauthorized(
+                    "Tenant session required. Use POST /api/tenants/{id}/connect first.",
+                )
+            })?;
 
         let session = state
             .sessions

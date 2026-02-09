@@ -127,9 +127,8 @@ async fn main() {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
-                let cutoff = (chrono::Utc::now()
-                    - chrono::Duration::days(retention_days as i64))
-                .to_rfc3339();
+                let cutoff = (chrono::Utc::now() - chrono::Duration::days(retention_days as i64))
+                    .to_rfc3339();
                 match db::delete_old_audit_logs(&db_ref, &cutoff).await {
                     Ok(n) if n > 0 => tracing::info!("Audit cleanup: removed {n} old entries"),
                     Err(e) => tracing::warn!("Audit cleanup failed: {e}"),

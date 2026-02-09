@@ -7,13 +7,20 @@ pub struct PdClient {
 
 impl PdClient {
     pub fn new(pd_endpoints: &str, client: &reqwest::Client) -> Self {
-        let first = pd_endpoints.split(',').next().unwrap_or("127.0.0.1:2379").trim();
+        let first = pd_endpoints
+            .split(',')
+            .next()
+            .unwrap_or("127.0.0.1:2379")
+            .trim();
         let base_url = if first.starts_with("http") {
             first.to_string()
         } else {
             format!("http://{first}")
         };
-        Self { base_url, client: client.clone() }
+        Self {
+            base_url,
+            client: client.clone(),
+        }
     }
 
     pub async fn create_keyspace(&self, name: &str) -> bool {
@@ -24,7 +31,10 @@ impl PdClient {
         });
         match self.client.post(&url).json(&body).send().await {
             Ok(resp) => resp.status().is_success(),
-            Err(e) => { tracing::warn!("PD create_keyspace failed: {e}"); false }
+            Err(e) => {
+                tracing::warn!("PD create_keyspace failed: {e}");
+                false
+            }
         }
     }
 
@@ -33,7 +43,10 @@ impl PdClient {
         match self.client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => resp.json().await.ok(),
             Ok(_) => None,
-            Err(e) => { tracing::warn!("PD get_keyspace failed: {e}"); None }
+            Err(e) => {
+                tracing::warn!("PD get_keyspace failed: {e}");
+                None
+            }
         }
     }
 
@@ -57,7 +70,10 @@ impl PdClient {
                 tracing::warn!("PD disable_keyspace {name} failed: {status} {body_text}");
                 false
             }
-            Err(e) => { tracing::warn!("PD disable_keyspace failed: {e}"); false }
+            Err(e) => {
+                tracing::warn!("PD disable_keyspace failed: {e}");
+                false
+            }
         }
     }
 
@@ -100,8 +116,9 @@ impl PdClient {
     {
         let mut page_token: Option<String> = None;
         loop {
-            let (keyspaces, next_token) =
-                self.list_keyspaces_page(page_size, page_token.as_deref()).await;
+            let (keyspaces, next_token) = self
+                .list_keyspaces_page(page_size, page_token.as_deref())
+                .await;
             if keyspaces.is_empty() {
                 break;
             }

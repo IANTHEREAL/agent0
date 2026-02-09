@@ -101,9 +101,7 @@ enum TenantAction {
         admin_password: Option<String>,
     },
     /// Batch delete tenants
-    BatchDelete {
-        ids: Vec<String>,
-    },
+    BatchDelete { ids: Vec<String> },
     /// Batch update tenant metadata
     BatchUpdate {
         ids: Vec<String>,
@@ -276,7 +274,11 @@ fn print_table(rows: &[Value], columns: &[(&str, &str, usize)]) {
     println!("{header}");
 
     // Separator
-    let sep: String = widths.iter().map(|w| "─".repeat(*w)).collect::<Vec<_>>().join("  ");
+    let sep: String = widths
+        .iter()
+        .map(|w| "─".repeat(*w))
+        .collect::<Vec<_>>()
+        .join("  ");
     println!("{sep}");
 
     // Rows
@@ -458,8 +460,14 @@ async fn main() {
                 }
 
                 println!("Tenant created: {}", data["id"].as_str().unwrap_or("-"));
-                println!("Admin user:     {}", data["admin_user"].as_str().unwrap_or("-"));
-                println!("Admin password: {}", data["admin_password"].as_str().unwrap_or("-"));
+                println!(
+                    "Admin user:     {}",
+                    data["admin_user"].as_str().unwrap_or("-")
+                );
+                println!(
+                    "Admin password: {}",
+                    data["admin_password"].as_str().unwrap_or("-")
+                );
                 println!(
                     "Connection:     {}",
                     data["connection_string"].as_str().unwrap_or("-")
@@ -531,7 +539,9 @@ async fn main() {
                 if let Some(pw) = &admin_password {
                     body["admin_password"] = Value::String(pw.clone());
                 }
-                let data = api.request("POST", "/tenants/batch", Some(&body), None).await;
+                let data = api
+                    .request("POST", "/tenants/batch", Some(&body), None)
+                    .await;
 
                 if cli.json {
                     print_json(&data);
@@ -564,7 +574,9 @@ async fn main() {
 
             TenantAction::BatchDelete { ids } => {
                 let body = serde_json::json!({ "ids": ids });
-                let data = api.request("POST", "/tenants/batch-delete", Some(&body), None).await;
+                let data = api
+                    .request("POST", "/tenants/batch-delete", Some(&body), None)
+                    .await;
 
                 if cli.json {
                     print_json(&data);
@@ -610,7 +622,9 @@ async fn main() {
                     }
                 }
 
-                let data = api.request("POST", "/tenants/batch-update", Some(&body), None).await;
+                let data = api
+                    .request("POST", "/tenants/batch-update", Some(&body), None)
+                    .await;
 
                 if cli.json {
                     print_json(&data);
@@ -674,7 +688,8 @@ async fn main() {
                             let tags = format_val(item.get("tags"));
                             writeln!(out, "{id},{st},{created},{notes},{tags}").ok();
                         } else {
-                            writeln!(out, "{}", serde_json::to_string(item).unwrap_or_default()).ok();
+                            writeln!(out, "{}", serde_json::to_string(item).unwrap_or_default())
+                                .ok();
                         }
                         total_exported += 1;
                     }
@@ -715,9 +730,14 @@ async fn main() {
                         body["admin_password"] = Value::String(pw.clone());
                     }
 
-                    let data = api.request("POST", "/tenants/batch", Some(&body), None).await;
+                    let data = api
+                        .request("POST", "/tenants/batch", Some(&body), None)
+                        .await;
                     let created = data["total_created"].as_u64().unwrap_or(0);
-                    let failed_items = data["failed"].as_array().map(|a| a.len() as u64).unwrap_or(0);
+                    let failed_items = data["failed"]
+                        .as_array()
+                        .map(|a| a.len() as u64)
+                        .unwrap_or(0);
                     total_created += created;
                     total_failed += failed_items;
 
@@ -738,7 +758,12 @@ async fn main() {
                 "admin_password": admin_password,
             });
             let data = api
-                .request("POST", &format!("/tenants/{tenant_id}/connect"), Some(&body), None)
+                .request(
+                    "POST",
+                    &format!("/tenants/{tenant_id}/connect"),
+                    Some(&body),
+                    None,
+                )
                 .await;
 
             if cli.json {
@@ -755,10 +780,7 @@ async fn main() {
         }
 
         Commands::Users { action } => match action {
-            UserAction::List {
-                tenant_id,
-                session,
-            } => {
+            UserAction::List { tenant_id, session } => {
                 let mut hdrs = HashMap::new();
                 hdrs.insert("X-Tenant-Session".into(), session);
 
@@ -821,7 +843,10 @@ async fn main() {
 
                 println!("User created: {}", data["username"].as_str().unwrap_or("-"));
                 println!("Password:     {}", data["password"].as_str().unwrap_or("-"));
-                println!("Connect:      {}", data["connection"].as_str().unwrap_or("-"));
+                println!(
+                    "Connect:      {}",
+                    data["connection"].as_str().unwrap_or("-")
+                );
             }
 
             UserAction::Delete {

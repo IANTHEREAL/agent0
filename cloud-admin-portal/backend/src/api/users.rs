@@ -77,17 +77,34 @@ pub async fn create_user(
 
     if !success {
         db::insert_audit_log(
-            &state.db, "CREATE", "USER", &request.username,
-            Some(&tenant_id), Some(&session.admin_user), false,
-            Some("PG client returned failure"), None,
-        ).await.ok();
+            &state.db,
+            "CREATE",
+            "USER",
+            &request.username,
+            Some(&tenant_id),
+            Some(&session.admin_user),
+            false,
+            Some("PG client returned failure"),
+            None,
+        )
+        .await
+        .ok();
         return Err(AppError::internal("Failed to create user"));
     }
 
     db::insert_audit_log(
-        &state.db, "CREATE", "USER", &request.username,
-        Some(&tenant_id), Some(&session.admin_user), true, None, None,
-    ).await.ok();
+        &state.db,
+        "CREATE",
+        "USER",
+        &request.username,
+        Some(&tenant_id),
+        Some(&session.admin_user),
+        true,
+        None,
+        None,
+    )
+    .await
+    .ok();
 
     Ok((
         StatusCode::CREATED,
@@ -111,7 +128,9 @@ pub async fn delete_user(
     let session = TenantSessionExtractor::from_headers(&headers, &tenant_id, &state)?;
 
     if is_protected_user(&username, &session.admin_user) {
-        return Err(AppError::forbidden(format!("Cannot delete protected user '{username}'")));
+        return Err(AppError::forbidden(format!(
+            "Cannot delete protected user '{username}'"
+        )));
     }
 
     let tenant = db::get_tenant(&state.db, &tenant_id)
@@ -120,22 +139,44 @@ pub async fn delete_user(
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
     let success = pg
-        .drop_user(&tenant.id, &session.admin_user, &session.admin_password, &username)
+        .drop_user(
+            &tenant.id,
+            &session.admin_user,
+            &session.admin_password,
+            &username,
+        )
         .await;
 
     if !success {
         db::insert_audit_log(
-            &state.db, "DELETE", "USER", &username,
-            Some(&tenant_id), Some(&session.admin_user), false,
-            Some("PG client returned failure"), None,
-        ).await.ok();
+            &state.db,
+            "DELETE",
+            "USER",
+            &username,
+            Some(&tenant_id),
+            Some(&session.admin_user),
+            false,
+            Some("PG client returned failure"),
+            None,
+        )
+        .await
+        .ok();
         return Err(AppError::internal("Failed to delete user"));
     }
 
     db::insert_audit_log(
-        &state.db, "DELETE", "USER", &username,
-        Some(&tenant_id), Some(&session.admin_user), true, None, None,
-    ).await.ok();
+        &state.db,
+        "DELETE",
+        "USER",
+        &username,
+        Some(&tenant_id),
+        Some(&session.admin_user),
+        true,
+        None,
+        None,
+    )
+    .await
+    .ok();
 
     Ok(Json(MessageResponse {
         message: format!("User '{username}' deleted"),
@@ -151,7 +192,9 @@ pub async fn reset_password(
     let session = TenantSessionExtractor::from_headers(&headers, &tenant_id, &state)?;
 
     if is_protected_user(&username, &session.admin_user) {
-        return Err(AppError::forbidden(format!("Cannot reset password for protected user '{username}'")));
+        return Err(AppError::forbidden(format!(
+            "Cannot reset password for protected user '{username}'"
+        )));
     }
 
     let tenant = db::get_tenant(&state.db, &tenant_id)
@@ -173,17 +216,34 @@ pub async fn reset_password(
 
     if !success {
         db::insert_audit_log(
-            &state.db, "RESET_PASSWORD", "USER", &username,
-            Some(&tenant_id), Some(&session.admin_user), false,
-            Some("PG client returned failure"), None,
-        ).await.ok();
+            &state.db,
+            "RESET_PASSWORD",
+            "USER",
+            &username,
+            Some(&tenant_id),
+            Some(&session.admin_user),
+            false,
+            Some("PG client returned failure"),
+            None,
+        )
+        .await
+        .ok();
         return Err(AppError::internal("Failed to reset password"));
     }
 
     db::insert_audit_log(
-        &state.db, "RESET_PASSWORD", "USER", &username,
-        Some(&tenant_id), Some(&session.admin_user), true, None, None,
-    ).await.ok();
+        &state.db,
+        "RESET_PASSWORD",
+        "USER",
+        &username,
+        Some(&tenant_id),
+        Some(&session.admin_user),
+        true,
+        None,
+        None,
+    )
+    .await
+    .ok();
 
     Ok(Json(PasswordResetResponse {
         username,

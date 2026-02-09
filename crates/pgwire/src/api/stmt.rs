@@ -153,10 +153,7 @@ fn is_multi_statement_prepared_query(sql: &str) -> bool {
             let prev_is_ident = i > 0 && is_ident_byte(bytes[i - 1]);
             if !prev_is_ident {
                 let mut j = i + 1;
-                while j < bytes.len()
-                    && bytes[j] != b'$'
-                    && is_dollar_quote_tag_byte(bytes[j])
-                {
+                while j < bytes.len() && bytes[j] != b'$' && is_dollar_quote_tag_byte(bytes[j]) {
                     j += 1;
                 }
                 if j < bytes.len() && bytes[j] == b'$' {

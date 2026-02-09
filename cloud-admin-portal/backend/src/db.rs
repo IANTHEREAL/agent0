@@ -46,9 +46,18 @@ pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
         .await?;
 
     if is_sqlite {
-        sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await.ok();
-        sqlx::query("PRAGMA busy_timeout=5000").execute(&pool).await.ok();
-        sqlx::query("PRAGMA synchronous=NORMAL").execute(&pool).await.ok();
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("PRAGMA busy_timeout=5000")
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query("PRAGMA synchronous=NORMAL")
+            .execute(&pool)
+            .await
+            .ok();
     }
 
     Ok(pool)
@@ -57,8 +66,7 @@ pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
 fn is_sqlite(pool: &AnyPool) -> bool {
     // Detect SQLite by checking the connection URL pattern
     // AnyPool doesn't expose the backend kind directly in newer sqlx
-    format!("{:?}", pool).contains("Sqlite")
-        || format!("{:?}", pool).contains("sqlite")
+    format!("{:?}", pool).contains("Sqlite") || format!("{:?}", pool).contains("sqlite")
 }
 
 pub fn adapt_sql(sql: &str, pool: &AnyPool) -> String {
@@ -274,7 +282,11 @@ pub async fn list_tenants(
 
     let (tenants, next_cursor) = if use_cursor {
         let has_more = rows.len() > opts.size as usize;
-        let tenants: Vec<TenantRow> = rows.iter().take(opts.size as usize).map(row_to_tenant).collect();
+        let tenants: Vec<TenantRow> = rows
+            .iter()
+            .take(opts.size as usize)
+            .map(row_to_tenant)
+            .collect();
         let nc = if has_more {
             tenants.last().map(|t| (t.created_at.clone(), t.id.clone()))
         } else {
@@ -293,7 +305,11 @@ pub async fn list_tenants(
         (tenants, nc)
     };
 
-    Ok(ListTenantsResult { tenants, total, next_cursor })
+    Ok(ListTenantsResult {
+        tenants,
+        total,
+        next_cursor,
+    })
 }
 
 pub async fn batch_update_metadata(
@@ -328,16 +344,29 @@ pub async fn batch_update_metadata(
 
 pub async fn get_tenant(pool: &AnyPool, tenant_id: &str) -> Result<Option<TenantRow>, sqlx::Error> {
     let sql = adapt_sql(
-        &format!("SELECT * FROM tenants WHERE id = $1 AND state NOT IN ('{}', '{}')", tenant_state::DISABLED, tenant_state::CREATE_FAILED),
+        &format!(
+            "SELECT * FROM tenants WHERE id = $1 AND state NOT IN ('{}', '{}')",
+            tenant_state::DISABLED,
+            tenant_state::CREATE_FAILED
+        ),
         pool,
     );
-    let row = sqlx::query(&sql).bind(tenant_id).fetch_optional(pool).await?;
+    let row = sqlx::query(&sql)
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.as_ref().map(row_to_tenant))
 }
 
-pub async fn get_tenant_by_id(pool: &AnyPool, tenant_id: &str) -> Result<Option<TenantRow>, sqlx::Error> {
+pub async fn get_tenant_by_id(
+    pool: &AnyPool,
+    tenant_id: &str,
+) -> Result<Option<TenantRow>, sqlx::Error> {
     let sql = adapt_sql("SELECT * FROM tenants WHERE id = $1", pool);
-    let row = sqlx::query(&sql).bind(tenant_id).fetch_optional(pool).await?;
+    let row = sqlx::query(&sql)
+        .bind(tenant_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.as_ref().map(row_to_tenant))
 }
 
@@ -394,7 +423,13 @@ pub async fn update_tenant_metadata(
         "UPDATE tenants SET notes = $1, tags = $2, updated_at = $3 WHERE id = $4",
         pool,
     );
-    sqlx::query(&sql).bind(notes).bind(tags).bind(&now).bind(id).execute(pool).await?;
+    sqlx::query(&sql)
+        .bind(notes)
+        .bind(tags)
+        .bind(&now)
+        .bind(id)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -444,7 +479,12 @@ pub async fn upsert_credential(
             "UPDATE tenant_credentials SET password_plain = $1, rotated_at = $2 WHERE id = $3",
             pool,
         );
-        sqlx::query(&sql).bind(&encrypted).bind(&now).bind(&cred.id).execute(pool).await?;
+        sqlx::query(&sql)
+            .bind(&encrypted)
+            .bind(&now)
+            .bind(&cred.id)
+            .execute(pool)
+            .await?;
     } else {
         let id = uuid::Uuid::new_v4().to_string();
         let sql = adapt_sql(
@@ -533,7 +573,10 @@ pub async fn query_audit_logs(
         idx += 1;
     }
 
-    sql.push_str(&format!(" ORDER BY timestamp DESC LIMIT ${idx} OFFSET ${}", idx + 1));
+    sql.push_str(&format!(
+        " ORDER BY timestamp DESC LIMIT ${idx} OFFSET ${}",
+        idx + 1
+    ));
 
     let adapted = adapt_sql(&sql, pool);
     let mut q = sqlx::query(&adapted);
@@ -565,16 +608,27 @@ pub async fn query_audit_logs(
 
 // ── Reconciler queries ──────────────────────────────────────────
 
-pub async fn get_stuck_tenants(pool: &AnyPool, state: &str, before: &str) -> Result<Vec<TenantRow>, sqlx::Error> {
+pub async fn get_stuck_tenants(
+    pool: &AnyPool,
+    state: &str,
+    before: &str,
+) -> Result<Vec<TenantRow>, sqlx::Error> {
     let sql = adapt_sql(
         "SELECT * FROM tenants WHERE state = $1 AND created_at < $2",
         pool,
     );
-    let rows = sqlx::query(&sql).bind(state).bind(before).fetch_all(pool).await?;
+    let rows = sqlx::query(&sql)
+        .bind(state)
+        .bind(before)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.iter().map(row_to_tenant).collect())
 }
 
-pub async fn check_tenants_exist(pool: &AnyPool, ids: &[&str]) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+pub async fn check_tenants_exist(
+    pool: &AnyPool,
+    ids: &[&str],
+) -> Result<std::collections::HashSet<String>, sqlx::Error> {
     if ids.is_empty() {
         return Ok(std::collections::HashSet::new());
     }
@@ -587,7 +641,10 @@ pub async fn check_tenants_exist(pool: &AnyPool, ids: &[&str]) -> Result<std::co
             .enumerate()
             .map(|(i, _)| format!("${}", i + 1))
             .collect();
-        let sql = format!("SELECT id FROM tenants WHERE id IN ({})", placeholders.join(","));
+        let sql = format!(
+            "SELECT id FROM tenants WHERE id IN ({})",
+            placeholders.join(",")
+        );
         let sql = adapt_sql(&sql, pool);
 
         let mut q = sqlx::query(&sql);

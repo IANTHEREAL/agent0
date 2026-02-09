@@ -1145,14 +1145,14 @@ pub async fn execute_create_index(
                     while let Some(batch) = scanner.next_batch(txn).await? {
                         for pair in batch {
                             let key: &[u8] = pair.key().as_ref().into();
-                            let pk_bytes =
-                                key.strip_prefix(data_key_prefix.as_slice())
-                                    .ok_or_else(|| {
-                                        anyhow!(
-                                            "corrupted row key while backfilling index '{}'",
-                                            idx_name_str
-                                        )
-                                    })?;
+                            let pk_bytes = key
+                                .strip_prefix(data_key_prefix.as_slice())
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "corrupted row key while backfilling index '{}'",
+                                        idx_name_str
+                                    )
+                                })?;
                             let pk_values =
                                 crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
 
@@ -1228,14 +1228,14 @@ pub async fn execute_create_index(
                     while let Some(batch) = scanner.next_batch(txn).await? {
                         for pair in batch {
                             let key: &[u8] = pair.key().as_ref().into();
-                            let pk_bytes =
-                                key.strip_prefix(data_key_prefix.as_slice())
-                                    .ok_or_else(|| {
-                                        anyhow!(
-                                            "corrupted row key while backfilling index '{}'",
-                                            idx_name_str
-                                        )
-                                    })?;
+                            let pk_bytes = key
+                                .strip_prefix(data_key_prefix.as_slice())
+                                .ok_or_else(|| {
+                                    anyhow!(
+                                        "corrupted row key while backfilling index '{}'",
+                                        idx_name_str
+                                    )
+                                })?;
                             let pk_values =
                                 crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
 

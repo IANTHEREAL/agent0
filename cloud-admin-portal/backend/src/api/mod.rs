@@ -11,7 +11,10 @@ use crate::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         // Tenants
-        .route("/tenants", get(tenants::list_tenants).post(tenants::create_tenant))
+        .route(
+            "/tenants",
+            get(tenants::list_tenants).post(tenants::create_tenant),
+        )
         .route("/tenants/batch", post(tenants::batch_create_tenants))
         .route("/tenants/batch-delete", post(tenants::batch_delete_tenants))
         .route("/tenants/batch-update", post(tenants::batch_update_tenants))

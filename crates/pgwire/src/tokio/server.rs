@@ -103,7 +103,11 @@ mod tests {
             _query: &'a str,
         ) -> PgWireResult<Vec<Response<'a>>>
         where
-            C: crate::api::ClientInfo + Sink<crate::messages::PgWireBackendMessage> + Unpin + Send + Sync,
+            C: crate::api::ClientInfo
+                + Sink<crate::messages::PgWireBackendMessage>
+                + Unpin
+                + Send
+                + Sync,
             C::Error: Debug,
             PgWireError: From<<C as Sink<crate::messages::PgWireBackendMessage>>::Error>,
         {

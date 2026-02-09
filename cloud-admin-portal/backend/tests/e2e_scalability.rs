@@ -81,12 +81,7 @@ async fn seed_tenant_full(
 
 async fn get_json(app: Router, uri: &str) -> (StatusCode, Value) {
     let resp = app
-        .oneshot(
-            Request::builder()
-                .uri(uri)
-                .body(Body::empty())
-                .unwrap(),
-        )
+        .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = resp.status();
@@ -159,7 +154,10 @@ async fn cursor_pagination_returns_next_cursor() {
     let (status, data) = get_json(app, "/tenants?size=5").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(data["items"].as_array().unwrap().len(), 5);
-    assert!(data["next_cursor"].is_string(), "should have next_cursor when more results");
+    assert!(
+        data["next_cursor"].is_string(),
+        "should have next_cursor when more results"
+    );
 }
 
 #[tokio::test]
@@ -221,7 +219,11 @@ async fn cursor_pagination_returns_negative_total() {
 
     let app2 = api::router().with_state(state.clone());
     let (_, second_page) = get_json(app2, &format!("/tenants?size=3&cursor={nc}")).await;
-    assert_eq!(second_page["total"].as_i64().unwrap(), -1, "cursor mode skips COUNT");
+    assert_eq!(
+        second_page["total"].as_i64().unwrap(),
+        -1,
+        "cursor mode skips COUNT"
+    );
 }
 
 // ── Full-text search ─────────────────────────────────────────────
@@ -358,9 +360,33 @@ async fn filter_by_tag_no_match() {
 #[tokio::test]
 async fn filter_by_state() {
     let (app, state) = setup().await;
-    seed_tenant_full(&state, "active_one_01", "ACTIVE", "2025-06-01T00:00:00+00:00", None, None).await;
-    seed_tenant_full(&state, "suspend_one1", "SUSPENDED", "2025-06-02T00:00:00+00:00", None, None).await;
-    seed_tenant_full(&state, "active_two_01", "ACTIVE", "2025-06-03T00:00:00+00:00", None, None).await;
+    seed_tenant_full(
+        &state,
+        "active_one_01",
+        "ACTIVE",
+        "2025-06-01T00:00:00+00:00",
+        None,
+        None,
+    )
+    .await;
+    seed_tenant_full(
+        &state,
+        "suspend_one1",
+        "SUSPENDED",
+        "2025-06-02T00:00:00+00:00",
+        None,
+        None,
+    )
+    .await;
+    seed_tenant_full(
+        &state,
+        "active_two_01",
+        "ACTIVE",
+        "2025-06-03T00:00:00+00:00",
+        None,
+        None,
+    )
+    .await;
 
     let (status, data) = get_json(app, "/tenants?state=SUSPENDED").await;
     assert_eq!(status, StatusCode::OK);
@@ -466,7 +492,10 @@ async fn batch_update_sets_notes_and_tags() {
 
     let app3 = api::router().with_state(state.clone());
     let (_, t2) = get_json(app3, "/tenants/tenant000002").await;
-    assert!(t2["notes"].is_null(), "unchanged tenant should not have notes");
+    assert!(
+        t2["notes"].is_null(),
+        "unchanged tenant should not have notes"
+    );
 }
 
 #[tokio::test]
@@ -486,10 +515,7 @@ async fn batch_update_partial_failure() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(data["updated"].as_array().unwrap().len(), 1);
     assert_eq!(data["failed"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        data["failed"][0]["id"].as_str().unwrap(),
-        "nonexistent1"
-    );
+    assert_eq!(data["failed"][0]["id"].as_str().unwrap(), "nonexistent1");
 }
 
 // ── Batch validation ─────────────────────────────────────────────
@@ -498,12 +524,7 @@ async fn batch_update_partial_failure() {
 async fn batch_create_rejects_zero_count() {
     let (app, _state) = setup().await;
 
-    let (status, data) = post_json(
-        app,
-        "/tenants/batch",
-        &json!({ "count": 0 }),
-    )
-    .await;
+    let (status, data) = post_json(app, "/tenants/batch", &json!({ "count": 0 })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(data["message"].as_str().unwrap().contains("count"));
 }
@@ -512,12 +533,7 @@ async fn batch_create_rejects_zero_count() {
 async fn batch_create_rejects_over_1000() {
     let (app, _state) = setup().await;
 
-    let (status, data) = post_json(
-        app,
-        "/tenants/batch",
-        &json!({ "count": 1001 }),
-    )
-    .await;
+    let (status, data) = post_json(app, "/tenants/batch", &json!({ "count": 1001 })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(data["message"].as_str().unwrap().contains("count"));
 }
@@ -526,12 +542,7 @@ async fn batch_create_rejects_over_1000() {
 async fn batch_delete_rejects_empty_ids() {
     let (app, _state) = setup().await;
 
-    let (status, _) = post_json(
-        app,
-        "/tenants/batch-delete",
-        &json!({ "ids": [] }),
-    )
-    .await;
+    let (status, _) = post_json(app, "/tenants/batch-delete", &json!({ "ids": [] })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -570,8 +581,24 @@ async fn batch_delete_nonexistent_returns_failures() {
 #[tokio::test]
 async fn list_excludes_create_failed() {
     let (app, state) = setup().await;
-    seed_tenant_full(&state, "good_tenant1", "ACTIVE", "2025-06-01T00:00:00+00:00", None, None).await;
-    seed_tenant_full(&state, "bad_tenant_1", "CREATE_FAILED", "2025-06-02T00:00:00+00:00", None, None).await;
+    seed_tenant_full(
+        &state,
+        "good_tenant1",
+        "ACTIVE",
+        "2025-06-01T00:00:00+00:00",
+        None,
+        None,
+    )
+    .await;
+    seed_tenant_full(
+        &state,
+        "bad_tenant_1",
+        "CREATE_FAILED",
+        "2025-06-02T00:00:00+00:00",
+        None,
+        None,
+    )
+    .await;
 
     let (status, data) = get_json(app, "/tenants?size=100").await;
     assert_eq!(status, StatusCode::OK);
@@ -585,9 +612,33 @@ async fn list_excludes_create_failed() {
 #[tokio::test]
 async fn list_returns_newest_first() {
     let (app, state) = setup().await;
-    seed_tenant_full(&state, "oldest_ten_1", "ACTIVE", "2025-01-01T00:00:00+00:00", None, None).await;
-    seed_tenant_full(&state, "newest_ten_1", "ACTIVE", "2025-12-31T00:00:00+00:00", None, None).await;
-    seed_tenant_full(&state, "middle_ten_1", "ACTIVE", "2025-06-15T00:00:00+00:00", None, None).await;
+    seed_tenant_full(
+        &state,
+        "oldest_ten_1",
+        "ACTIVE",
+        "2025-01-01T00:00:00+00:00",
+        None,
+        None,
+    )
+    .await;
+    seed_tenant_full(
+        &state,
+        "newest_ten_1",
+        "ACTIVE",
+        "2025-12-31T00:00:00+00:00",
+        None,
+        None,
+    )
+    .await;
+    seed_tenant_full(
+        &state,
+        "middle_ten_1",
+        "ACTIVE",
+        "2025-06-15T00:00:00+00:00",
+        None,
+        None,
+    )
+    .await;
 
     let (_, data) = get_json(app, "/tenants?size=10").await;
     let items = data["items"].as_array().unwrap();
