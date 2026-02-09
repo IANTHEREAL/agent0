@@ -1,0 +1,45 @@
+a|b|c
+1|1|2
+2|1|1
+2|2|NULL
+(3 rows)
+a|b|c
+2|1|1
+2|2|NULL
+(2 rows)
+a|b|c
+1|1|2
+2|1|1
+(2 rows)
+a|b|c
+1|1|2
+2|1|1
+2|2|NULL
+(3 rows)
+c
+1
+2
+NULL
+(3 rows)
+a|b|c
+(0 rows)
+c
+(0 rows)
+a|b|c
+1|1|1
+(1 row)
+c
+1
+(1 row)
+a|b|c
+(0 rows)
+c
+(0 rows)
+a|b|c
+1|1|1
+1|1|1
+(2 rows)
+c
+1
+1
+(2 rows)

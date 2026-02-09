@@ -1,0 +1,11 @@
+k|v|k|v
+0|1|0|1
+2|4|2|4
+(2 rows)
+k|v|k|v
+(0 rows)
+k|k
+(0 rows)
+pk|a|b
+0|1|2
+(1 row)
