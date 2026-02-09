@@ -1006,6 +1006,7 @@ async fn collect_sources_from_table_factor(
             return None;
         }
         crate::extensions::http::table_function_schema(func_name)
+            .or_else(|| crate::extensions::fs::table_function_schema(func_name))
     }
 
     match factor {
