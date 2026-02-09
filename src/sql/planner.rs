@@ -324,7 +324,12 @@ pub fn choose_best_access_path_for_filter(
     };
 
     let predicates = analyze_predicates(filter_expr);
-    let mut best = choose_best_access_path(schema, &predicates, estimated_table_rows);
+    let mut best = choose_best_access_path_with_filter(
+        schema,
+        &predicates,
+        Some(filter_expr),
+        estimated_table_rows,
+    );
 
     if let Some(gin_path) = choose_gin_access_path(schema, filter_expr, estimated_table_rows) {
         if gin_path.cost < best.cost {
@@ -494,6 +499,15 @@ pub fn choose_best_access_path(
     predicates: &[PredicateInfo],
     estimated_table_rows: usize,
 ) -> AccessPath {
+    choose_best_access_path_with_filter(schema, predicates, None, estimated_table_rows)
+}
+
+fn choose_best_access_path_with_filter(
+    schema: &TableSchema,
+    predicates: &[PredicateInfo],
+    filter: Option<&Expr>,
+    estimated_table_rows: usize,
+) -> AccessPath {
     let mut best_path = AccessPath {
         scan_type: ScanType::FullTableScan,
         cost: estimated_table_rows as f64,
@@ -503,9 +517,31 @@ pub fn choose_best_access_path(
         if !is_planner_usable_index(index) {
             continue;
         }
-        if index.predicate.is_some() {
-            continue;
+
+        if let Some(index_predicate) = index.predicate.as_deref() {
+            let Some(filter_expr) = filter else {
+                continue;
+            };
+            if !query_implies_index_predicate(filter_expr, index_predicate) {
+                continue;
+            }
         }
+
+        if !index.expressions.is_empty() {
+            if let Some(filter_expr) = filter {
+                if let Some((scan_type, cost)) =
+                    evaluate_expression_index(index, filter_expr, estimated_table_rows)
+                {
+                    if cost < best_path.cost {
+                        best_path = AccessPath { scan_type, cost };
+                    }
+                }
+            }
+            if index.columns.is_empty() {
+                continue;
+            }
+        }
+
         if let Some((scan_type, cost)) =
             evaluate_index(schema, index, predicates, estimated_table_rows)
         {
@@ -519,7 +555,7 @@ pub fn choose_best_access_path(
 }
 
 fn is_planner_usable_index(index: &IndexDef) -> bool {
-    if index.columns.is_empty() || !index.expressions.is_empty() {
+    if index.columns.is_empty() && index.expressions.is_empty() {
         return false;
     }
     index
@@ -527,6 +563,160 @@ fn is_planner_usable_index(index: &IndexDef) -> bool {
         .as_deref()
         .map(|m| m.eq_ignore_ascii_case("btree"))
         .unwrap_or(true)
+}
+
+fn evaluate_expression_index(
+    index: &IndexDef,
+    filter: &Expr,
+    estimated_table_rows: usize,
+) -> Option<(ScanType, f64)> {
+    let values = match_expression_predicates(index, filter)?;
+    let selectivity = estimate_selectivity(index, values.len(), true);
+    let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
+    let cost = 1.0 + estimated_rows as f64 * 0.5;
+
+    Some((
+        ScanType::IndexScan {
+            index_id: index.id,
+            index_name: index.name.clone(),
+            values,
+            estimated_rows,
+        },
+        cost,
+    ))
+}
+
+fn match_expression_predicates(index: &IndexDef, filter: &Expr) -> Option<Vec<Value>> {
+    if index.expressions.is_empty() {
+        return None;
+    }
+
+    let filter_conjuncts = extract_conjuncts(filter);
+    let mut values = Vec::with_capacity(index.expressions.len());
+
+    for expr_str in &index.expressions {
+        let expr_ast = parse_predicate_expr(expr_str)?;
+        let normalized_expr = normalize_expr_for_match(&expr_ast);
+        let mut matched_value = None;
+
+        for conjunct in &filter_conjuncts {
+            if let Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } = conjunct
+            {
+                let left_norm = normalize_expr_for_match(left);
+                let right_norm = normalize_expr_for_match(right);
+
+                if left_norm == normalized_expr {
+                    if let Ok(value) = eval_expr(right, None, None) {
+                        matched_value = Some(value);
+                        break;
+                    }
+                }
+                if right_norm == normalized_expr {
+                    if let Ok(value) = eval_expr(left, None, None) {
+                        matched_value = Some(value);
+                        break;
+                    }
+                }
+            }
+        }
+
+        values.push(matched_value?);
+    }
+
+    Some(values)
+}
+
+fn query_implies_index_predicate(filter: &Expr, index_predicate: &str) -> bool {
+    let Some(index_pred_expr) = parse_predicate_expr(index_predicate) else {
+        return false;
+    };
+
+    let query_conjuncts = extract_conjuncts(filter)
+        .iter()
+        .map(normalize_expr_for_match)
+        .collect::<Vec<_>>();
+
+    extract_conjuncts(&index_pred_expr)
+        .iter()
+        .map(normalize_expr_for_match)
+        .all(|idx_conj| query_conjuncts.iter().any(|q| q == &idx_conj))
+}
+
+fn parse_predicate_expr(expr_str: &str) -> Option<Expr> {
+    let sql = format!("SELECT {}", expr_str);
+    let stmts = super::parse_sql(&sql).ok()?;
+    let sqlparser::ast::Statement::Query(query) = stmts.into_iter().next()? else {
+        return None;
+    };
+    let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+        return None;
+    };
+    let sqlparser::ast::SelectItem::UnnamedExpr(expr) = select.projection.into_iter().next()?
+    else {
+        return None;
+    };
+    Some(expr)
+}
+
+fn extract_conjuncts(expr: &Expr) -> Vec<Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let mut result = extract_conjuncts(left);
+            result.extend(extract_conjuncts(right));
+            result
+        }
+        Expr::Nested(inner) => extract_conjuncts(inner),
+        other => vec![other.clone()],
+    }
+}
+
+fn normalize_expr_for_match(expr: &Expr) -> String {
+    normalize_expr_string(expr.to_string())
+}
+
+fn normalize_expr_string(mut input: String) -> String {
+    input = input.trim().to_string();
+    while has_wrapping_parentheses(&input) {
+        input = input[1..input.len().saturating_sub(1)].trim().to_string();
+    }
+    let without_quotes = input.replace('"', "").to_lowercase();
+    without_quotes
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn has_wrapping_parentheses(input: &str) -> bool {
+    if input.len() < 2 || !input.starts_with('(') || !input.ends_with(')') {
+        return false;
+    }
+
+    let mut depth = 0_i32;
+    for (idx, ch) in input.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 && idx + 1 < input.len() {
+                    return false;
+                }
+                if depth < 0 {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    depth == 0
 }
 
 fn evaluate_index(
@@ -1223,6 +1413,172 @@ mod tests {
         }];
         let path = choose_best_access_path(&schema, &predicates, 1000);
         assert!(matches!(path.scan_type, ScanType::FullTableScan));
+    }
+
+    fn schema_for_index_filter_tests(
+        columns: Vec<(&str, DataType)>,
+        indexes: Vec<IndexDef>,
+    ) -> TableSchema {
+        TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: columns
+                .into_iter()
+                .map(|(name, data_type)| crate::types::ColumnDef {
+                    name: name.to_string(),
+                    data_type,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                })
+                .collect(),
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes,
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_partial_index_exact_predicate_used() {
+        let schema = schema_for_index_filter_tests(
+            vec![("name", DataType::Text), ("status", DataType::Text)],
+            vec![IndexDef {
+                id: 1,
+                name: "idx_name_active".to_string(),
+                columns: vec!["name".to_string()],
+                unique: false,
+                method: None,
+                predicate: Some("status = 'active'".to_string()),
+                expressions: Vec::new(),
+            }],
+        );
+        let filter = parse_where_expr("SELECT * FROM t WHERE status = 'active' AND name = 'foo'");
+        let path = choose_best_access_path_for_filter(0, &schema, Some(&filter), 1000);
+        assert!(matches!(path.scan_type, ScanType::IndexScan { .. }));
+    }
+
+    #[test]
+    fn test_partial_index_missing_predicate_not_used() {
+        let schema = schema_for_index_filter_tests(
+            vec![("name", DataType::Text), ("status", DataType::Text)],
+            vec![IndexDef {
+                id: 1,
+                name: "idx_name_active".to_string(),
+                columns: vec!["name".to_string()],
+                unique: false,
+                method: None,
+                predicate: Some("status = 'active'".to_string()),
+                expressions: Vec::new(),
+            }],
+        );
+        let filter = parse_where_expr("SELECT * FROM t WHERE name = 'foo'");
+        let path = choose_best_access_path_for_filter(0, &schema, Some(&filter), 1000);
+        assert!(matches!(path.scan_type, ScanType::FullTableScan));
+    }
+
+    #[test]
+    fn test_partial_index_wrong_value_not_used() {
+        let schema = schema_for_index_filter_tests(
+            vec![("name", DataType::Text), ("status", DataType::Text)],
+            vec![IndexDef {
+                id: 1,
+                name: "idx_name_active".to_string(),
+                columns: vec!["name".to_string()],
+                unique: false,
+                method: None,
+                predicate: Some("status = 'active'".to_string()),
+                expressions: Vec::new(),
+            }],
+        );
+        let filter = parse_where_expr("SELECT * FROM t WHERE status = 'inactive' AND name = 'foo'");
+        let path = choose_best_access_path_for_filter(0, &schema, Some(&filter), 1000);
+        assert!(matches!(path.scan_type, ScanType::FullTableScan));
+    }
+
+    #[test]
+    fn test_partial_index_conjunct_subset_used() {
+        let schema = schema_for_index_filter_tests(
+            vec![
+                ("a", DataType::Int32),
+                ("b", DataType::Int32),
+                ("c", DataType::Int32),
+            ],
+            vec![IndexDef {
+                id: 1,
+                name: "idx_a_partial".to_string(),
+                columns: vec!["a".to_string()],
+                unique: false,
+                method: None,
+                predicate: Some("a = 1 AND b = 2".to_string()),
+                expressions: Vec::new(),
+            }],
+        );
+        let filter = parse_where_expr("SELECT * FROM t WHERE a = 1 AND b = 2 AND c = 3");
+        let path = choose_best_access_path_for_filter(0, &schema, Some(&filter), 1000);
+        assert!(matches!(path.scan_type, ScanType::IndexScan { .. }));
+    }
+
+    #[test]
+    fn test_partial_index_incomplete_conjunct_not_used() {
+        let schema = schema_for_index_filter_tests(
+            vec![("a", DataType::Int32), ("b", DataType::Int32)],
+            vec![IndexDef {
+                id: 1,
+                name: "idx_a_partial".to_string(),
+                columns: vec!["a".to_string()],
+                unique: false,
+                method: None,
+                predicate: Some("a = 1 AND b = 2".to_string()),
+                expressions: Vec::new(),
+            }],
+        );
+        let filter = parse_where_expr("SELECT * FROM t WHERE a = 1");
+        let path = choose_best_access_path_for_filter(0, &schema, Some(&filter), 1000);
+        assert!(matches!(path.scan_type, ScanType::FullTableScan));
+    }
+
+    #[test]
+    fn test_expression_index_lower_used() {
+        let schema = schema_for_index_filter_tests(
+            vec![("name", DataType::Text)],
+            vec![IndexDef {
+                id: 1,
+                name: "idx_lower_name".to_string(),
+                columns: vec![],
+                unique: false,
+                method: None,
+                predicate: None,
+                expressions: vec!["lower(name)".to_string()],
+            }],
+        );
+        let filter = parse_where_expr("SELECT * FROM t WHERE lower(name) = 'foo'");
+        let path = choose_best_access_path_for_filter(0, &schema, Some(&filter), 1000);
+        assert!(matches!(path.scan_type, ScanType::IndexScan { .. }));
+    }
+
+    #[test]
+    fn test_expression_index_case_insensitive_match() {
+        let schema = schema_for_index_filter_tests(
+            vec![("name", DataType::Text)],
+            vec![IndexDef {
+                id: 1,
+                name: "idx_lower_name".to_string(),
+                columns: vec![],
+                unique: false,
+                method: None,
+                predicate: None,
+                expressions: vec!["LOWER(name)".to_string()],
+            }],
+        );
+        let filter = parse_where_expr("SELECT * FROM t WHERE lower(name) = 'bar'");
+        let path = choose_best_access_path_for_filter(0, &schema, Some(&filter), 1000);
+        assert!(matches!(path.scan_type, ScanType::IndexScan { .. }));
     }
 
     #[test]
