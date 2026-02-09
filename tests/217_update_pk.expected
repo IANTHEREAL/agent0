@@ -1,0 +1,23 @@
+version_num
+abc123
+(1 row)
+version_num
+def456
+(1 row)
+version_num
+ghi789
+(1 row)
+a|b|c
+1|2|original
+(1 row)
+a|b|c
+10|2|original
+(1 row)
+a|b|c
+10|20|original
+(1 row)
+a|b|c
+100|200|original
+(1 row)
+psql:tests/217_update_pk.sql:41: ERROR:  duplicate key value violates unique constraint "alembic_version_pkey"
+DETAIL:  Key (version_num)=(existing) already exists.
