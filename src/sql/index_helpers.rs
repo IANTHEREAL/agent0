@@ -75,9 +75,62 @@ pub fn get_index_values_with_expressions(
     Ok(values)
 }
 
+/// Returns true if the index values are unchanged between old and new rows,
+/// meaning the index entry does not need to be deleted and recreated.
+pub fn index_values_unchanged(
+    index: &IndexDef,
+    schema: &TableSchema,
+    old_row: &Row,
+    new_row: &Row,
+) -> bool {
+    if is_index_materializable(index) {
+        let old_pred = eval_index_predicate(index, schema, old_row).unwrap_or(true);
+        let new_pred = eval_index_predicate(index, schema, new_row).unwrap_or(true);
+        if old_pred != new_pred {
+            return false;
+        }
+
+        let old_vals = get_index_values_with_expressions(index, schema, old_row);
+        let new_vals = get_index_values_with_expressions(index, schema, new_row);
+        match (old_vals, new_vals) {
+            (Ok(old_values), Ok(new_values)) => old_values == new_values,
+            _ => false,
+        }
+    } else {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_col(name: &str) -> crate::types::ColumnDef {
+        crate::types::ColumnDef {
+            name: name.to_string(),
+            data_type: crate::types::DataType::Text,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        }
+    }
+
+    fn test_schema(columns: Vec<crate::types::ColumnDef>) -> TableSchema {
+        TableSchema {
+            name: "public.t".to_string(),
+            table_id: 1,
+            columns,
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: "postgres".to_string(),
+        }
+    }
 
     #[test]
     fn test_is_index_materializable() {
@@ -124,5 +177,103 @@ mod tests {
             expressions: vec!["lower(a)".to_string()],
         };
         assert!(is_index_materializable(&expr_index));
+    }
+
+    #[test]
+    fn test_index_values_unchanged_simple_column() {
+        let index = IndexDef {
+            name: "idx_name".to_string(),
+            id: 1,
+            columns: vec!["name".to_string()],
+            unique: false,
+            method: None,
+            predicate: None,
+            expressions: vec![],
+        };
+        let schema = test_schema(vec![test_col("name")]);
+        let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
+        let new_row = Row::new(vec![Value::Text("Alice".to_string())]);
+
+        assert!(index_values_unchanged(&index, &schema, &old_row, &new_row));
+    }
+
+    #[test]
+    fn test_index_values_changed_simple_column() {
+        let index = IndexDef {
+            name: "idx_name".to_string(),
+            id: 1,
+            columns: vec!["name".to_string()],
+            unique: false,
+            method: None,
+            predicate: None,
+            expressions: vec![],
+        };
+        let schema = test_schema(vec![test_col("name")]);
+        let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
+        let new_row = Row::new(vec![Value::Text("Bob".to_string())]);
+
+        assert!(!index_values_unchanged(&index, &schema, &old_row, &new_row));
+    }
+
+    #[test]
+    fn test_index_values_unchanged_expression() {
+        let index = IndexDef {
+            name: "idx_lower_name".to_string(),
+            id: 1,
+            columns: vec![],
+            unique: false,
+            method: None,
+            predicate: None,
+            expressions: vec!["lower(name)".to_string()],
+        };
+        let schema = test_schema(vec![test_col("name")]);
+        let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
+        let new_row = Row::new(vec![Value::Text("Alice".to_string())]);
+
+        assert!(index_values_unchanged(&index, &schema, &old_row, &new_row));
+    }
+
+    #[test]
+    fn test_index_values_unchanged_non_indexed_column_changed() {
+        let index = IndexDef {
+            name: "idx_name".to_string(),
+            id: 1,
+            columns: vec!["name".to_string()],
+            unique: false,
+            method: None,
+            predicate: None,
+            expressions: vec![],
+        };
+        let schema = test_schema(vec![test_col("id"), test_col("name"), test_col("bio")]);
+        let old_row = Row::new(vec![
+            Value::Int32(1),
+            Value::Text("Alice".to_string()),
+            Value::Text("old bio".to_string()),
+        ]);
+        let new_row = Row::new(vec![
+            Value::Int32(1),
+            Value::Text("Alice".to_string()),
+            Value::Text("new bio".to_string()),
+        ]);
+
+        assert!(index_values_unchanged(&index, &schema, &old_row, &new_row));
+    }
+
+    #[test]
+    fn test_index_values_unchanged_unique_safe() {
+        let index = IndexDef {
+            name: "idx_email_key".to_string(),
+            id: 1,
+            columns: vec!["email".to_string()],
+            unique: true,
+            method: None,
+            predicate: None,
+            expressions: vec![],
+        };
+        let schema = test_schema(vec![test_col("email")]);
+        let old_row = Row::new(vec![Value::Text("a@b.com".to_string())]);
+        let new_row = Row::new(vec![Value::Text("a@b.com".to_string())]);
+
+        assert!(index_values_unchanged(&index, &schema, &old_row, &new_row));
     }
 }

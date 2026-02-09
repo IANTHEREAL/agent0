@@ -671,18 +671,37 @@ async fn update_row_indexes(
     new_row: &Row,
 ) -> Result<()> {
     for index in &schema.indexes {
-        let gin_hashes = extract_gin_token_hashes_from_row(schema, index, old_row)?;
-        if !gin_hashes.is_empty() {
-            store
-                .delete_gin_index_entries(
-                    txn,
-                    db_id,
-                    schema.table_id,
-                    index.id,
-                    &gin_hashes,
-                    &pk_values,
-                )
-                .await?;
+        if index_helpers::index_values_unchanged(index, schema, old_row, new_row) {
+            continue;
+        }
+
+        let old_gin_hashes = extract_gin_token_hashes_from_row(schema, index, old_row)?;
+        let new_gin_hashes = extract_gin_token_hashes_from_row(schema, index, new_row)?;
+        if !old_gin_hashes.is_empty() || !new_gin_hashes.is_empty() {
+            if !old_gin_hashes.is_empty() {
+                store
+                    .delete_gin_index_entries(
+                        txn,
+                        db_id,
+                        schema.table_id,
+                        index.id,
+                        &old_gin_hashes,
+                        &pk_values,
+                    )
+                    .await?;
+            }
+            if !new_gin_hashes.is_empty() {
+                store
+                    .create_gin_index_entries(
+                        txn,
+                        db_id,
+                        schema.table_id,
+                        index.id,
+                        &new_gin_hashes,
+                        &pk_values,
+                    )
+                    .await?;
+            }
             continue;
         }
 
@@ -704,27 +723,6 @@ async fn update_row_indexes(
                     index.unique,
                 )
                 .await?;
-        }
-    }
-
-    for index in &schema.indexes {
-        let gin_hashes = extract_gin_token_hashes_from_row(schema, index, new_row)?;
-        if !gin_hashes.is_empty() {
-            store
-                .create_gin_index_entries(
-                    txn,
-                    db_id,
-                    schema.table_id,
-                    index.id,
-                    &gin_hashes,
-                    &pk_values,
-                )
-                .await?;
-            continue;
-        }
-
-        if !index_helpers::is_index_materializable(index) {
-            continue;
         }
 
         let new_matches = index_helpers::eval_index_predicate(index, schema, new_row)?;
@@ -1199,6 +1197,10 @@ pub async fn execute_update_row(
     }
 
     for index in &schema.indexes {
+        if !pk_changed && index_helpers::index_values_unchanged(index, schema, old_row, &new_row) {
+            continue;
+        }
+
         let gin_hashes = extract_gin_token_hashes_from_row(schema, index, old_row)?;
         if !gin_hashes.is_empty() {
             store
@@ -1243,6 +1245,10 @@ pub async fn execute_update_row(
         .await?;
 
     for index in &schema.indexes {
+        if !pk_changed && index_helpers::index_values_unchanged(index, schema, old_row, &new_row) {
+            continue;
+        }
+
         let gin_hashes = extract_gin_token_hashes_from_row(schema, index, &new_row)?;
         if !gin_hashes.is_empty() {
             store
