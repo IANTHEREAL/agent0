@@ -739,6 +739,82 @@ pub fn encode_index_key_v2(
     key
 }
 
+fn encode_index_prefix_v2(
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    prefix_values: &[Value],
+) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(TABLE_INDEX_PREFIX);
+    key.extend_from_slice(&table_id.to_be_bytes());
+    key.push(b'_');
+    key.extend_from_slice(&index_id.to_be_bytes());
+    key.push(b'_');
+
+    for value in prefix_values {
+        encode_value_memcomparable(value, &mut key);
+    }
+
+    key
+}
+
+fn encode_prefix_end(prefix: &[u8]) -> Vec<u8> {
+    let mut end = prefix.to_vec();
+    for idx in (0..end.len()).rev() {
+        if end[idx] != 0xFF {
+            end[idx] = end[idx].wrapping_add(1);
+            end.truncate(idx + 1);
+            return end;
+        }
+    }
+
+    let mut end = prefix.to_vec();
+    end.push(0xFF);
+    end
+}
+
+pub fn encode_index_range_start_v2(
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    prefix_values: &[Value],
+    range_start: Option<&Value>,
+    start_inclusive: bool,
+) -> Vec<u8> {
+    let mut key = encode_index_prefix_v2(db_id, table_id, index_id, prefix_values);
+
+    if let Some(value) = range_start {
+        encode_value_memcomparable(value, &mut key);
+        if !start_inclusive {
+            key.push(0x00);
+        }
+    }
+
+    key
+}
+
+pub fn encode_index_range_end_v2(
+    db_id: u64,
+    table_id: u64,
+    index_id: u64,
+    prefix_values: &[Value],
+    range_end: Option<&Value>,
+    end_inclusive: bool,
+) -> Vec<u8> {
+    let mut key = encode_index_prefix_v2(db_id, table_id, index_id, prefix_values);
+
+    if let Some(value) = range_end {
+        encode_value_memcomparable(value, &mut key);
+        if end_inclusive {
+            key.push(0xFF);
+        }
+        return key;
+    }
+
+    encode_prefix_end(&key)
+}
+
 /// Encode the fixed prefix for a GIN-like inverted index entry.
 ///
 /// The returned key ends with a separator byte so callers can construct a range
@@ -1681,6 +1757,88 @@ mod tests {
         let key3 = encode_index_key(1, 1, &[Value::Int32(5)], None);
         assert!(key1 < key2);
         assert!(key2 < key3);
+    }
+
+    #[test]
+    fn test_encode_index_range_start_end_int32() {
+        let start = encode_index_range_start_v2(1, 10, 20, &[], Some(&Value::Int32(10)), true);
+        let end = encode_index_range_end_v2(1, 10, 20, &[], Some(&Value::Int32(20)), true);
+
+        let key_before = encode_index_key_v2(1, 10, 20, &[Value::Int32(9)], None);
+        let key_after = encode_index_key_v2(1, 10, 20, &[Value::Int32(21)], None);
+        assert!(key_before < start);
+        assert!(key_after >= end);
+
+        for i in 10..=20 {
+            let key = encode_index_key_v2(1, 10, 20, &[Value::Int32(i)], None);
+            assert!(key >= start, "key should be >= range start for {i}");
+            assert!(key < end, "key should be < range end for {i}");
+        }
+    }
+
+    #[test]
+    fn test_encode_index_range_exclusive_bounds() {
+        let start = encode_index_range_start_v2(1, 10, 20, &[], Some(&Value::Int32(10)), false);
+        let end = encode_index_range_end_v2(1, 10, 20, &[], Some(&Value::Int32(20)), false);
+
+        let key_10 = encode_index_key_v2(1, 10, 20, &[Value::Int32(10)], None);
+        let key_11 = encode_index_key_v2(1, 10, 20, &[Value::Int32(11)], None);
+        let key_19 = encode_index_key_v2(1, 10, 20, &[Value::Int32(19)], None);
+        let key_20 = encode_index_key_v2(1, 10, 20, &[Value::Int32(20)], None);
+
+        assert!(key_10 < start);
+        assert!(key_11 >= start);
+        assert!(key_19 < end);
+        assert!(key_20 >= end);
+    }
+
+    #[test]
+    fn test_encode_index_range_with_prefix() {
+        let start = encode_index_range_start_v2(
+            1,
+            10,
+            20,
+            &[Value::Int32(1)],
+            Some(&Value::Int32(5)),
+            true,
+        );
+
+        let key_14 = encode_index_key_v2(1, 10, 20, &[Value::Int32(1), Value::Int32(4)], None);
+        let key_15 = encode_index_key_v2(1, 10, 20, &[Value::Int32(1), Value::Int32(5)], None);
+        let key_16 = encode_index_key_v2(1, 10, 20, &[Value::Int32(1), Value::Int32(6)], None);
+
+        assert!(key_14 < start);
+        assert!(key_15 >= start);
+        assert!(start < key_16);
+    }
+
+    #[test]
+    fn test_encode_index_range_null_sorts_first() {
+        let start = encode_index_range_start_v2(1, 10, 20, &[], Some(&Value::Int32(5)), false);
+
+        let key_null = encode_index_key_v2(1, 10, 20, &[Value::Null], None);
+        let key_5 = encode_index_key_v2(1, 10, 20, &[Value::Int32(5)], None);
+        let key_6 = encode_index_key_v2(1, 10, 20, &[Value::Int32(6)], None);
+
+        assert!(key_null < start);
+        assert!(key_5 < start);
+        assert!(key_6 >= start);
+    }
+
+    #[test]
+    fn test_encode_index_range_unbounded() {
+        let start = encode_index_range_start_v2(1, 10, 20, &[Value::Int32(1)], None, true);
+        let end = encode_index_range_end_v2(1, 10, 20, &[Value::Int32(1)], None, true);
+
+        let key_low = encode_index_key_v2(1, 10, 20, &[Value::Int32(1), Value::Int32(-100)], None);
+        let key_high = encode_index_key_v2(1, 10, 20, &[Value::Int32(1), Value::Int32(999)], None);
+
+        assert_eq!(
+            start,
+            encode_index_key_v2(1, 10, 20, &[Value::Int32(1)], None)
+        );
+        assert!(start <= key_low);
+        assert!(key_high < end);
     }
 
     #[test]

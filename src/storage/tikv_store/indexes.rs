@@ -200,6 +200,95 @@ impl TikvStore {
         Ok(pks)
     }
 
+    /// Scan index by bounded range on the next index column after `prefix_values`.
+    pub async fn scan_index_range(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_id: u64,
+        index_id: u64,
+        prefix_values: &[Value],
+        range_start: Option<&Value>,
+        start_inclusive: bool,
+        range_end: Option<&Value>,
+        end_inclusive: bool,
+        unique: bool,
+        index_column_types: &[DataType],
+        pk_types: &[DataType],
+        limit: Option<usize>,
+    ) -> Result<Vec<Vec<Value>>> {
+        if pk_types.is_empty() {
+            return Err(anyhow!("PK types required for index scan"));
+        }
+
+        if matches!(limit, Some(0)) {
+            return Ok(Vec::new());
+        }
+
+        let start_raw = encode_index_range_start_v2(
+            db_id,
+            table_id,
+            index_id,
+            prefix_values,
+            range_start,
+            start_inclusive,
+        );
+        let end_raw = encode_index_range_end_v2(
+            db_id,
+            table_id,
+            index_id,
+            prefix_values,
+            range_end,
+            end_inclusive,
+        );
+        let start_key = self.key(&start_raw);
+        let end_key = self.key(&end_raw);
+
+        let range: BoundRange = (start_key..end_key).into();
+        let pairs = txn.scan(range, scan_limit_to_u32(limit)).await?;
+
+        let mut pks = Vec::new();
+        if unique {
+            let mut scanned_pairs = 0usize;
+            for pair in pairs {
+                scanned_pairs += 1;
+                let pk_bytes: &[u8] = pair.value().as_ref();
+                let pk = decode_pk_from_index_suffix(pk_bytes, pk_types)?;
+                pks.push(pk);
+            }
+            kv_stats::record_index_scan_pairs(scanned_pairs);
+            return Ok(pks);
+        }
+
+        let fixed_prefix_len = encode_index_key_v2(db_id, table_id, index_id, &[], None).len();
+        let mut scanned_pairs = 0usize;
+        for pair in pairs {
+            scanned_pairs += 1;
+            let full_key: &[u8] = pair.key().as_ref().into();
+            if full_key.len() <= fixed_prefix_len {
+                continue;
+            }
+
+            let mut offset = fixed_prefix_len;
+            for data_type in index_column_types {
+                let (_, consumed) = decode_value_memcomparable(&full_key[offset..], data_type)?;
+                offset += consumed;
+            }
+
+            if full_key.get(offset) != Some(&0x01) {
+                return Err(anyhow!("Non-unique index key missing PK separator"));
+            }
+            offset += 1;
+
+            let pk_bytes = &full_key[offset..];
+            let pk = decode_pk_from_index_suffix(pk_bytes, pk_types)?;
+            pks.push(pk);
+        }
+
+        kv_stats::record_index_scan_pairs(scanned_pairs);
+        Ok(pks)
+    }
+
     /// Create GIN-like inverted index entries for a row.
     ///
     /// Each `token_hash` is stored as a separate key that points to `pk_values` via the
