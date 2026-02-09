@@ -64,7 +64,7 @@ Examples (all require Pantheon):
 - Run tests/builds/linters; reproduce a bug based on code behavior.
 - Any code/test/doc change (add/remove/modify), refactor, formatting, or updating repo docs.
 
-If it involves code, follow: `read skill $pantheon-issue-resolve-loop`.
+If it involves code, follow: `read skill $pantheon-issue-resolve`.
 
 Reason: local must NOT be used to read/modify project code; Pantheon is the correct sandbox.
 
