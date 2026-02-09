@@ -205,7 +205,7 @@ Stop the loop when either:
 
 #### 2.5 Pre-merge build + smoke test (required)
 
-Before merging, run a quick local validation on the PR head branch:
+Before return, run a quick local validation on the PR head branch:
 1. `cargo build --release` succeeds
 2. tipg (pg-tikv) starts successfully against a local TiKV cluster
 3. `pg_isready` succeeds and `SELECT 1;` works
@@ -224,36 +224,6 @@ Then ensure CI is green (required). CI failures are merge blockers (treat as `ME
 
 If this step fails, do NOT merge. Start another Fix exploration to address the failure, then rerun Step 2.2 Review (and Step 2.3 Verify if needed), and repeat this Step 2.5 check before merging.
 
-#### 2.6 Merge PR
-
-When either:
-- the latest Review output is `NO_P0_P1`, OR
-- the latest Verify output is `NO_IN_SCOPE_P0_P1` (i.e., remaining findings were invalid or deferred into separate GitHub issues),
-and Step 2.5 passed (local validation + CI green), merge the PR using `gh` directly (this does NOT need to happen inside an exploration), or stop and report if merging is blocked by permissions/review policy.
-
-Preferred merge method: squash merge (if the repo allows it):
-- `HEAD_SHA=$(gh pr view {pr_number} --json headRefOid --jq .headRefOid)`
-- `gh pr merge {pr_number} --squash --match-head-commit $HEAD_SHA` (optionally add `--delete-branch`)
-
-If squash merge is not allowed by repo settings/policy, fall back to a normal merge:
-- `HEAD_SHA=$(gh pr view {pr_number} --json headRefOid --jq .headRefOid)`
-- `gh pr merge {pr_number} --merge --match-head-commit $HEAD_SHA` (optionally add `--delete-branch`)
-
-If the merge is blocked due to merge conflicts, start one more Fix exploration to resolve conflicts:
-- Call `functions.mcp__pantheon__parallel_explore` with `agent="codex"`, `num_branches=1`, `parent_branch_id=last_fix_branch_id`, and prompt:
-
-```
-resolve merge conflicts for PR {pr_number} (issue: {issue_link}).
-Important: do NOT create a new PR. checkout the existing PR head branch and push commits to it:
-- gh pr checkout {pr_number} (or git checkout {pr_head_branch})
-- bring the branch up-to-date with master (rebase or merge), resolve conflicts
-- run the smallest relevant tests/build
-- commit and push
-```
-
-After the conflict-resolution Fix finishes, run Step 2.2 Review again; if it finds any P0/P1, run Step 2.3 Verify and keep the Fix loop for any `IN_SCOPE_P0_P1`. Only merge after Review returns `NO_P0_P1` OR Verify returns `NO_IN_SCOPE_P0_P1`.
-
-After Review returns `NO_P0_P1` OR Verify returns `NO_IN_SCOPE_P0_P1`, rerun Step 2.5 (pre-merge build + smoke test + CI), then merge.
 
 ## Waiting / Polling (required between stages)
 
