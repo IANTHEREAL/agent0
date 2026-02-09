@@ -259,9 +259,8 @@ After Review returns `NO_P0_P1` OR Verify returns `NO_IN_SCOPE_P0_P1`, rerun Ste
 
 After each `parallel_explore`, wait via a sleep loop:
 1. Poll `functions.mcp__pantheon__get_branch(branch_id)` until `status` is terminal (case-insensitive match): `failed`, `succeed`, `finished`, `manifesting`, or `ready_for_manifest`.
-2. Call `functions.mcp__pantheon__branch_output(branch_id, full_output=true)` to retrieve logs/results.
-3. If terminal status is `failed`, stop the workflow and report the failing `branch_id` + the relevant output snippet.
-4. Otherwise (not terminal), sleep 600s, then poll again
+2. If `status` is terminal, Call `functions.mcp__pantheon__branch_output(branch_id, full_output=true)` to retrieve logs/results. 
+3. Otherwise (not terminal), sleep 600s, then poll again
 
 Pantheon note: `manifesting` and `ready_for_manifest` mean the branch run is already done; you can fetch `branch_output` and proceed to the next step (you do not need to wait for a later `succeed`/`finished` transition).
 
