@@ -29,6 +29,367 @@ fn correlated_subquery_join_context_unsupported(mut outer_refs: Vec<String>) -> 
     SqlError::Unsupported(msg).into()
 }
 
+fn rewrite_supported_correlated_exists_in_join_filter(
+    expr: &Expr,
+    join_aliases: &[String],
+) -> Expr {
+    use core::ops::ControlFlow;
+    use sqlparser::ast::{VisitMut, VisitorMut};
+
+    fn expr_contains_or(expr: &Expr) -> bool {
+        use core::ops::ControlFlow;
+        use sqlparser::ast::visit_expressions;
+
+        let mut found = false;
+        let _ = visit_expressions(expr, |e| match e {
+            Expr::BinaryOp {
+                op: BinaryOperator::Or,
+                ..
+            } => {
+                found = true;
+                ControlFlow::Break(())
+            }
+            _ => ControlFlow::Continue(()),
+        });
+        found
+    }
+
+    fn collect_and_conjuncts(expr: &Expr, out: &mut Vec<Expr>) {
+        match expr {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                collect_and_conjuncts(left, out);
+                collect_and_conjuncts(right, out);
+            }
+            Expr::Nested(inner) => collect_and_conjuncts(inner, out),
+            other => out.push(other.clone()),
+        }
+    }
+
+    fn combine_conjuncts(mut conjuncts: Vec<Expr>) -> Option<Expr> {
+        if conjuncts.is_empty() {
+            return None;
+        }
+        let first = conjuncts.remove(0);
+        Some(
+            conjuncts
+                .into_iter()
+                .fold(first, |acc, next| Expr::BinaryOp {
+                    left: Box::new(acc),
+                    op: BinaryOperator::And,
+                    right: Box::new(next),
+                }),
+        )
+    }
+
+    fn unqualified_table_part(expr: &Expr) -> Option<&sqlparser::ast::Ident> {
+        match expr {
+            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => parts.get(parts.len() - 2),
+            _ => None,
+        }
+    }
+
+    fn try_extract_outer_col(expr: &Expr, outer_alias: &str) -> Option<Expr> {
+        match expr {
+            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+                let table_part = names::normalize_ident(&parts[parts.len() - 2]);
+                table_part
+                    .eq_ignore_ascii_case(outer_alias)
+                    .then(|| expr.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn try_extract_inner_col(expr: &Expr, inner_exposed_name: &str) -> Option<Expr> {
+        match expr {
+            Expr::Identifier(_) => Some(expr.clone()),
+            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+                let table_part = names::normalize_ident(&parts[parts.len() - 2]);
+                table_part
+                    .eq_ignore_ascii_case(inner_exposed_name)
+                    .then(|| expr.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn try_decorrelate_exists_to_in(subquery: &Query, join_aliases: &[String]) -> Option<Expr> {
+        // Only support a single correlated outer alias (fail closed for multiple/zero).
+        let mut outer_refs: Vec<String> = Vec::new();
+        for alias in join_aliases {
+            if crate::sql::executor::subquery::query_has_outer_reference(subquery, alias) {
+                outer_refs.push(alias.clone());
+            }
+        }
+        if outer_refs.len() != 1 {
+            return None;
+        }
+        let outer_alias = outer_refs.swap_remove(0);
+
+        // Disallow complex query decorations (ORDER BY / LIMIT / OFFSET / WITH / etc).
+        if subquery.with.is_some()
+            || !subquery.order_by.is_empty()
+            || subquery.limit.is_some()
+            || !subquery.limit_by.is_empty()
+            || subquery.offset.is_some()
+            || subquery.fetch.is_some()
+            || !subquery.locks.is_empty()
+            || subquery.for_clause.is_some()
+        {
+            return None;
+        }
+
+        let select = match subquery.body.as_ref() {
+            SetExpr::Select(sel) => sel.as_ref(),
+            _ => return None,
+        };
+
+        if select.distinct.is_some()
+            || select.top.is_some()
+            || select.into.is_some()
+            || !select.lateral_views.is_empty()
+            || select.from.len() != 1
+            || !matches!(&select.group_by, GroupByExpr::Expressions(exprs) if exprs.is_empty())
+            || !select.cluster_by.is_empty()
+            || !select.distribute_by.is_empty()
+            || !select.sort_by.is_empty()
+            || select.having.is_some()
+            || !select.named_window.is_empty()
+            || select.qualify.is_some()
+        {
+            return None;
+        }
+
+        let twj = select.from.first()?;
+        if !twj.joins.is_empty() {
+            return None;
+        }
+
+        let inner_exposed_name: String = match &twj.relation {
+            TableFactor::Table { name, alias, .. } => alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| {
+                    names::split_object_name(name)
+                        .map(|(_, obj)| obj)
+                        .unwrap_or_else(|_| {
+                            name.0
+                                .last()
+                                .map(|ident| ident.value.clone())
+                                .unwrap_or_default()
+                        })
+                }),
+            _ => return None,
+        };
+
+        // If the inner FROM shadows the outer alias, we can't safely identify correlation via
+        // qualified names here.
+        if inner_exposed_name.eq_ignore_ascii_case(&outer_alias) {
+            return None;
+        }
+
+        let where_expr = select.selection.as_ref()?;
+
+        // Keep the supported shape tight: only AND conjunctions (no OR anywhere).
+        if expr_contains_or(where_expr) {
+            return None;
+        }
+
+        let mut conjuncts: Vec<Expr> = Vec::new();
+        collect_and_conjuncts(where_expr, &mut conjuncts);
+        if conjuncts.is_empty() {
+            return None;
+        }
+
+        let mut correlated_idx: Option<usize> = None;
+        for (idx, conj) in conjuncts.iter().enumerate() {
+            if crate::sql::executor::subquery::expr_has_outer_reference(conj, &outer_alias) {
+                if correlated_idx.is_some() {
+                    // Outer alias appears in more than one conjunct (unsupported).
+                    return None;
+                }
+                correlated_idx = Some(idx);
+            }
+        }
+        let correlated_idx = correlated_idx?;
+
+        // Correlated conjunct must be a simple inner_col = outer_alias.outer_col equality.
+        let correlated_conj = match &conjuncts[correlated_idx] {
+            Expr::Nested(inner) => inner.as_ref(),
+            other => other,
+        };
+        let (outer_col, inner_col) = match correlated_conj {
+            Expr::BinaryOp {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => {
+                if let Some(outer_col) = try_extract_outer_col(left, &outer_alias) {
+                    let inner_col = try_extract_inner_col(right, &inner_exposed_name)?;
+                    (outer_col, inner_col)
+                } else if let Some(outer_col) = try_extract_outer_col(right, &outer_alias) {
+                    let inner_col = try_extract_inner_col(left, &inner_exposed_name)?;
+                    (outer_col, inner_col)
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+
+        // Ensure the "inner col" side isn't accidentally another qualified outer ref.
+        if let Some(table_part) = unqualified_table_part(&inner_col) {
+            let table_part = names::normalize_ident(table_part);
+            if table_part.eq_ignore_ascii_case(&outer_alias) {
+                return None;
+            }
+        }
+
+        // Remaining conjuncts must be fully uncorrelated (no join-alias outer refs).
+        for (idx, conj) in conjuncts.iter().enumerate() {
+            if idx == correlated_idx {
+                continue;
+            }
+            for alias in join_aliases {
+                if crate::sql::executor::subquery::expr_has_outer_reference(conj, alias) {
+                    return None;
+                }
+            }
+        }
+
+        // Build the uncorrelated IN-subquery: SELECT inner_col FROM <table> WHERE <remaining>.
+        let mut remaining: Vec<Expr> = Vec::new();
+        for (idx, conj) in conjuncts.into_iter().enumerate() {
+            if idx != correlated_idx {
+                remaining.push(conj);
+            }
+        }
+        let new_selection = combine_conjuncts(remaining);
+
+        let mut new_select = select.clone();
+        new_select.projection = vec![SelectItem::UnnamedExpr(inner_col)];
+        new_select.selection = new_selection;
+
+        let new_query = Query {
+            with: None,
+            body: Box::new(SetExpr::Select(Box::new(new_select))),
+            order_by: Vec::new(),
+            limit: None,
+            limit_by: Vec::new(),
+            offset: None,
+            fetch: None,
+            locks: Vec::new(),
+            for_clause: None,
+        };
+
+        // Final safety check: rewritten subquery must not contain any outer refs.
+        for alias in join_aliases {
+            if crate::sql::executor::subquery::query_has_outer_reference(&new_query, alias) {
+                return None;
+            }
+        }
+
+        Some(Expr::InSubquery {
+            expr: Box::new(outer_col),
+            subquery: Box::new(new_query),
+            negated: false,
+        })
+    }
+
+    #[derive(Clone)]
+    struct SupportedExistsRewriter<'a> {
+        join_aliases: &'a [String],
+        query_depth: usize,
+        negation_depth: usize,
+    }
+
+    impl<'a> VisitorMut for SupportedExistsRewriter<'a> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+            self.query_depth = self.query_depth.saturating_add(1);
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+            self.query_depth = self.query_depth.saturating_sub(1);
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+            // Track when we enter a NOT context to avoid rewriting NOT (EXISTS ...) to NOT (IN ...)
+            // since IN can return NULL and get filtered incorrectly.
+            if matches!(
+                expr,
+                Expr::UnaryOp {
+                    op: sqlparser::ast::UnaryOperator::Not,
+                    ..
+                }
+            ) {
+                self.negation_depth = self.negation_depth.saturating_add(1);
+            }
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+            // Only rewrite at the current (outer) query block.
+            if self.query_depth > 0 {
+                // Track negation depth even in nested queries for correct unwinding
+                if matches!(
+                    expr,
+                    Expr::UnaryOp {
+                        op: sqlparser::ast::UnaryOperator::Not,
+                        ..
+                    }
+                ) {
+                    self.negation_depth = self.negation_depth.saturating_sub(1);
+                }
+                return ControlFlow::Continue(());
+            }
+
+            if let Expr::Exists { subquery, negated } = expr {
+                // Only rewrite EXISTS to IN if:
+                // 1. It's not negated in the Exists node itself
+                // 2. It's not wrapped in a NOT operator (negation_depth == 0)
+                // This prevents rewriting NOT (EXISTS ...) to NOT (IN ...), which has wrong NULL semantics.
+                if !*negated && self.negation_depth == 0 {
+                    if let Some(rewritten) =
+                        try_decorrelate_exists_to_in(subquery.as_ref(), self.join_aliases)
+                    {
+                        *expr = rewritten;
+                    }
+                }
+            }
+
+            // Unwind negation depth when exiting a NOT operator
+            if matches!(
+                expr,
+                Expr::UnaryOp {
+                    op: sqlparser::ast::UnaryOperator::Not,
+                    ..
+                }
+            ) {
+                self.negation_depth = self.negation_depth.saturating_sub(1);
+            }
+
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut out = expr.clone();
+    let mut visitor = SupportedExistsRewriter {
+        join_aliases,
+        query_depth: 0,
+        negation_depth: 0,
+    };
+    let _ = out.visit(&mut visitor);
+    out
+}
+
 struct TableInfo {
     alias: String,
     is_system_catalog: bool,
@@ -48,6 +409,24 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<Option<ExecuteResult>> {
         use crate::types::ColumnDef;
+
+        let join_aliases: Vec<String> = {
+            let mut aliases: Vec<String> = Vec::new();
+            for twj in &select.from {
+                aliases.extend(collect_visible_aliases_in_table_with_joins(twj));
+            }
+            let mut seen: HashSet<String> = HashSet::new();
+            aliases.retain(|a| seen.insert(a.to_lowercase()));
+            aliases
+        };
+
+        let mut select = select.clone();
+        if let Some(sel) = select.selection.as_mut() {
+            *sel = rewrite_supported_correlated_exists_in_join_filter(sel, &join_aliases);
+        }
+        if let Some(having) = select.having.as_mut() {
+            *having = rewrite_supported_correlated_exists_in_join_filter(having, &join_aliases);
+        }
 
         // Fail-closed semantics: JOIN-context correlated subqueries are not supported.
         // If any scalar/EXISTS/IN subquery in SELECT/WHERE/HAVING references any JOIN-visible table
@@ -81,16 +460,6 @@ impl Executor {
                     ControlFlow::<()>::Continue(())
                 });
             }
-
-            let join_aliases: Vec<String> = {
-                let mut aliases: Vec<String> = Vec::new();
-                for twj in &select.from {
-                    aliases.extend(collect_visible_aliases_in_table_with_joins(twj));
-                }
-                let mut seen: HashSet<String> = HashSet::new();
-                aliases.retain(|a| seen.insert(a.to_lowercase()));
-                aliases
-            };
 
             let mut correlated_outer_refs: HashSet<String> = HashSet::new();
 
@@ -170,7 +539,7 @@ impl Executor {
                     sequence_values,
                     search_path,
                     query,
-                    select,
+                    &select,
                     &resolved_projection,
                     resolved_selection.as_ref(),
                     ctes,
@@ -1237,7 +1606,7 @@ impl Executor {
                     search_path,
                     running_op,
                     query,
-                    select,
+                    &select,
                     &resolved_projection,
                     &table_aliases,
                     &merge_columns,
@@ -1298,7 +1667,7 @@ impl Executor {
                 source_schemas.push(&tables[table_idx].schema);
             }
 
-            let mut plan = build_join_wildcard_plan(select, &source_schemas);
+            let mut plan = build_join_wildcard_plan(&select, &source_schemas);
             if let Some(ref mut plan) = plan {
                 for col in &mut plan.columns {
                     col.source_idx = flattened_to_table_idx
@@ -1454,7 +1823,7 @@ impl Executor {
 
         let (columns, column_types, projected_rows) = projection::project_join_output(
             rows,
-            select,
+            &select,
             &resolved_projection,
             &final_schema,
             &table_aliases,
@@ -1470,5 +1839,135 @@ impl Executor {
             rows: projected_rows,
             timezone: crate::session_context::current_timezone(),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::ast::{
+        Ident, ObjectName, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
+    };
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    #[test]
+    fn test_not_exists_rewrite_is_not_decorrelated() {
+        // Test that NOT (EXISTS ...) is NOT rewritten to NOT (IN ...)
+        // because IN can return NULL and get filtered incorrectly.
+        let sql = "SELECT * FROM orders o WHERE NOT (EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id))";
+        let dialect = PostgreSqlDialect {};
+        let ast = Parser::parse_sql(&dialect, sql).expect("Failed to parse SQL");
+        let query = match &ast[0] {
+            sqlparser::ast::Statement::Query(q) => q.as_ref(),
+            _ => panic!("Expected Query statement"),
+        };
+        let select = match query.body.as_ref() {
+            SetExpr::Select(s) => s.as_ref(),
+            _ => panic!("Expected Select"),
+        };
+        let where_expr = select.selection.as_ref().expect("Expected WHERE clause");
+
+        let join_aliases = vec!["o".to_string()];
+        let rewritten =
+            rewrite_supported_correlated_exists_in_join_filter(where_expr, &join_aliases);
+
+        // The rewritten expression should still be NOT (EXISTS ...), not NOT (IN ...)
+        match &rewritten {
+            Expr::UnaryOp {
+                op: sqlparser::ast::UnaryOperator::Not,
+                expr,
+            } => {
+                match expr.as_ref() {
+                    Expr::Nested(inner) => {
+                        // It's ok if EXISTS is wrapped in Nested
+                        assert!(
+                            matches!(inner.as_ref(), Expr::Exists { .. }),
+                            "NOT (EXISTS ...) should not be rewritten to NOT (IN ...)"
+                        );
+                    }
+                    Expr::Exists { .. } => {
+                        // Good: NOT (EXISTS ...) was preserved
+                    }
+                    Expr::InSubquery { .. } => {
+                        panic!("NOT (EXISTS ...) should NOT be rewritten to NOT (IN ...) due to NULL handling issues");
+                    }
+                    other => {
+                        panic!("Unexpected expression inside NOT: {:?}", other);
+                    }
+                }
+            }
+            other => {
+                panic!("Expected NOT operator at top level, got: {:?}", other);
+            }
+        }
+    }
+
+    #[test]
+    fn test_plain_exists_rewrite_is_decorrelated() {
+        // Test that plain EXISTS (without NOT) IS rewritten to IN
+        let sql = "SELECT * FROM orders o WHERE EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id)";
+        let dialect = PostgreSqlDialect {};
+        let ast = Parser::parse_sql(&dialect, sql).expect("Failed to parse SQL");
+        let query = match &ast[0] {
+            sqlparser::ast::Statement::Query(q) => q.as_ref(),
+            _ => panic!("Expected Query statement"),
+        };
+        let select = match query.body.as_ref() {
+            SetExpr::Select(s) => s.as_ref(),
+            _ => panic!("Expected Select"),
+        };
+        let where_expr = select.selection.as_ref().expect("Expected WHERE clause");
+
+        let join_aliases = vec!["o".to_string()];
+        let rewritten =
+            rewrite_supported_correlated_exists_in_join_filter(where_expr, &join_aliases);
+
+        // The rewritten expression should be IN, not EXISTS
+        assert!(
+            matches!(rewritten, Expr::InSubquery { .. }),
+            "Plain EXISTS should be rewritten to IN, got: {:?}",
+            rewritten
+        );
+    }
+
+    #[test]
+    fn test_exists_negated_field_not_rewritten() {
+        // Test that EXISTS with negated=true in the node itself is not rewritten
+        let sql = "SELECT * FROM orders o WHERE NOT EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id)";
+        let dialect = PostgreSqlDialect {};
+        let ast = Parser::parse_sql(&dialect, sql).expect("Failed to parse SQL");
+        let query = match &ast[0] {
+            sqlparser::ast::Statement::Query(q) => q.as_ref(),
+            _ => panic!("Expected Query statement"),
+        };
+        let select = match query.body.as_ref() {
+            SetExpr::Select(s) => s.as_ref(),
+            _ => panic!("Expected Select"),
+        };
+        let where_expr = select.selection.as_ref().expect("Expected WHERE clause");
+
+        let join_aliases = vec!["o".to_string()];
+        let rewritten =
+            rewrite_supported_correlated_exists_in_join_filter(where_expr, &join_aliases);
+
+        // Should not be rewritten to IN
+        fn contains_in_subquery(expr: &Expr) -> bool {
+            match expr {
+                Expr::InSubquery { .. } => true,
+                Expr::BinaryOp { left, right, .. } => {
+                    contains_in_subquery(left) || contains_in_subquery(right)
+                }
+                Expr::UnaryOp { expr: inner, .. } | Expr::Nested(inner) => {
+                    contains_in_subquery(inner)
+                }
+                _ => false,
+            }
+        }
+
+        assert!(
+            !contains_in_subquery(&rewritten),
+            "NOT EXISTS should not be rewritten to IN"
+        );
     }
 }
