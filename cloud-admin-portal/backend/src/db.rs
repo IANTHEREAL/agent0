@@ -135,6 +135,7 @@ pub async fn create_tables(pool: &AnyPool) -> Result<(), sqlx::Error> {
         "CREATE INDEX IF NOT EXISTS idx_tenants_state ON tenants(state)",
         "CREATE INDEX IF NOT EXISTS idx_tenants_created ON tenants(created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_tenants_state_created ON tenants(state, created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_tenants_cursor ON tenants(created_at DESC, id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_creds_tenant ON tenant_credentials(tenant_id)",
         "CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_logs(tenant_id)",
@@ -163,54 +164,166 @@ fn row_to_tenant(row: &sqlx::any::AnyRow) -> TenantRow {
     }
 }
 
+pub struct ListTenantsOpts<'a> {
+    pub page: u32,
+    pub size: u32,
+    pub state_filter: Option<&'a str>,
+    pub q: Option<&'a str>,
+    pub tag: Option<&'a str>,
+    pub cursor: Option<(&'a str, &'a str)>,
+}
+
+pub struct ListTenantsResult {
+    pub tenants: Vec<TenantRow>,
+    pub total: i64,
+    pub next_cursor: Option<(String, String)>,
+}
+
 pub async fn list_tenants(
     pool: &AnyPool,
-    page: u32,
-    size: u32,
-    state_filter: Option<&str>,
-    q: Option<&str>,
-) -> Result<(Vec<TenantRow>, i64), sqlx::Error> {
-    let offset = (page - 1) * size;
-
-    let mut count_sql = format!("SELECT COUNT(*) as cnt FROM tenants WHERE state != '{}'", tenant_state::CREATE_FAILED);
-    let mut list_sql = format!("SELECT * FROM tenants WHERE state != '{}'", tenant_state::CREATE_FAILED);
+    opts: &ListTenantsOpts<'_>,
+) -> Result<ListTenantsResult, sqlx::Error> {
+    let base_where = format!("state != '{}'", tenant_state::CREATE_FAILED);
+    let mut filters = Vec::new();
     let mut binds: Vec<String> = Vec::new();
     let mut param_idx = 1;
 
-    if let Some(st) = state_filter {
-        count_sql.push_str(&format!(" AND state = ${param_idx}"));
-        list_sql.push_str(&format!(" AND state = ${param_idx}"));
+    if let Some(st) = opts.state_filter {
+        filters.push(format!("state = ${param_idx}"));
         binds.push(st.to_string());
         param_idx += 1;
     }
-    if let Some(query) = q {
-        count_sql.push_str(&format!(" AND id LIKE ${param_idx}"));
-        list_sql.push_str(&format!(" AND id LIKE ${param_idx}"));
-        binds.push(format!("%{query}%"));
+    if let Some(query) = opts.q {
+        let pattern = format!("%{query}%");
+        filters.push(format!(
+            "(id LIKE ${p} OR COALESCE(notes,'') LIKE ${p} OR COALESCE(tags,'') LIKE ${p})",
+            p = param_idx
+        ));
+        binds.push(pattern);
+        param_idx += 1;
+    }
+    if let Some(tag) = opts.tag {
+        filters.push(format!("COALESCE(tags,'') LIKE ${param_idx}"));
+        binds.push(format!("%\"{tag}\"%"));
         param_idx += 1;
     }
 
-    list_sql.push_str(&format!(" ORDER BY created_at DESC LIMIT ${param_idx} OFFSET ${}", param_idx + 1));
-    let _ = param_idx;
+    let where_clause = if filters.is_empty() {
+        base_where
+    } else {
+        format!("{base_where} AND {}", filters.join(" AND "))
+    };
 
-    let count_sql = adapt_sql(&count_sql, pool);
-    let list_sql = adapt_sql(&list_sql, pool);
+    let use_cursor = opts.cursor.is_some();
 
-    let mut count_q = sqlx::query(&count_sql);
-    for b in &binds {
-        count_q = count_q.bind(b);
+    let total = if use_cursor {
+        -1
+    } else {
+        let count_sql = adapt_sql(
+            &format!("SELECT COUNT(*) as cnt FROM tenants WHERE {where_clause}"),
+            pool,
+        );
+        let mut count_q = sqlx::query(&count_sql);
+        for b in &binds {
+            count_q = count_q.bind(b);
+        }
+        count_q.fetch_one(pool).await?.get("cnt")
+    };
+
+    let mut list_where = where_clause.clone();
+    if let Some((cursor_ts, cursor_id)) = opts.cursor {
+        list_where.push_str(&format!(
+            " AND (created_at < ${p1} OR (created_at = ${p1} AND id < ${p2}))",
+            p1 = param_idx,
+            p2 = param_idx + 1
+        ));
+        binds.push(cursor_ts.to_string());
+        binds.push(cursor_id.to_string());
+        param_idx = param_idx + 2;
     }
-    let total: i64 = count_q.fetch_one(pool).await?.get("cnt");
+
+    let mut extra_binds: Vec<i64> = Vec::new();
+
+    let list_sql = if use_cursor {
+        let sql = format!(
+            "SELECT * FROM tenants WHERE {list_where} ORDER BY created_at DESC, id DESC LIMIT ${param_idx}"
+        );
+        extra_binds.push((opts.size + 1) as i64);
+        adapt_sql(&sql, pool)
+    } else {
+        let offset = ((opts.page.max(1)) - 1) * opts.size;
+        let sql = format!(
+            "SELECT * FROM tenants WHERE {list_where} ORDER BY created_at DESC, id DESC LIMIT ${} OFFSET ${}",
+            param_idx,
+            param_idx + 1
+        );
+        extra_binds.push(opts.size as i64);
+        extra_binds.push(offset as i64);
+        adapt_sql(&sql, pool)
+    };
 
     let mut list_q = sqlx::query(&list_sql);
     for b in &binds {
         list_q = list_q.bind(b);
     }
-    list_q = list_q.bind(size as i64).bind(offset as i64);
+    for b in &extra_binds {
+        list_q = list_q.bind(*b);
+    }
 
     let rows = list_q.fetch_all(pool).await?;
-    let tenants: Vec<TenantRow> = rows.iter().map(row_to_tenant).collect();
-    Ok((tenants, total))
+
+    let (tenants, next_cursor) = if use_cursor {
+        let has_more = rows.len() > opts.size as usize;
+        let tenants: Vec<TenantRow> = rows.iter().take(opts.size as usize).map(row_to_tenant).collect();
+        let nc = if has_more {
+            tenants.last().map(|t| (t.created_at.clone(), t.id.clone()))
+        } else {
+            None
+        };
+        (tenants, nc)
+    } else {
+        let tenants: Vec<TenantRow> = rows.iter().map(row_to_tenant).collect();
+        let offset = ((opts.page.max(1)) - 1) * opts.size;
+        let has_more_offset = (offset as i64 + tenants.len() as i64) < total;
+        let nc = if has_more_offset {
+            tenants.last().map(|t| (t.created_at.clone(), t.id.clone()))
+        } else {
+            None
+        };
+        (tenants, nc)
+    };
+
+    Ok(ListTenantsResult { tenants, total, next_cursor })
+}
+
+pub async fn batch_update_metadata(
+    pool: &AnyPool,
+    ids: &[String],
+    notes: Option<&str>,
+    tags: Option<&str>,
+) -> Result<u64, sqlx::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let mut affected = 0u64;
+    for chunk in ids.chunks(100) {
+        let placeholders: Vec<String> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("${}", i + 4))
+            .collect();
+        let sql = format!(
+            "UPDATE tenants SET notes = $1, tags = $2, updated_at = $3 WHERE id IN ({})",
+            placeholders.join(",")
+        );
+        let sql = adapt_sql(&sql, pool);
+        let mut q = sqlx::query(&sql);
+        q = q.bind(notes).bind(tags).bind(&now);
+        for id in chunk {
+            q = q.bind(id);
+        }
+        let result = q.execute(pool).await?;
+        affected += result.rows_affected();
+    }
+    Ok(affected)
 }
 
 pub async fn get_tenant(pool: &AnyPool, tenant_id: &str) -> Result<Option<TenantRow>, sqlx::Error> {

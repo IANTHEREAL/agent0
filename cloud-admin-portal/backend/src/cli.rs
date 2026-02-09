@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -64,6 +65,10 @@ enum TenantAction {
         state: Option<String>,
         #[arg(short, long)]
         query: Option<String>,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
     },
     /// Get tenant details
     Get { tenant_id: String },
@@ -85,6 +90,51 @@ enum TenantAction {
         notes: Option<String>,
         #[arg(long)]
         tags: Option<String>,
+    },
+    /// Batch create tenants
+    BatchCreate {
+        #[arg(long)]
+        count: u32,
+        #[arg(long, default_value = DEFAULT_ADMIN_USER)]
+        admin_user: String,
+        #[arg(long)]
+        admin_password: Option<String>,
+    },
+    /// Batch delete tenants
+    BatchDelete {
+        ids: Vec<String>,
+    },
+    /// Batch update tenant metadata
+    BatchUpdate {
+        ids: Vec<String>,
+        #[arg(long)]
+        notes: Option<String>,
+        #[arg(long)]
+        tags: Option<String>,
+    },
+    /// Export tenants to stdout (JSONL or CSV)
+    Export {
+        #[arg(long, default_value = "jsonl")]
+        format: String,
+        #[arg(long)]
+        state: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long, default_value_t = 500)]
+        batch_size: u32,
+    },
+    /// Import tenants from JSONL file (one tenant per line)
+    Import {
+        #[arg(long)]
+        file: String,
+        #[arg(long, default_value = DEFAULT_ADMIN_USER)]
+        admin_user: String,
+        #[arg(long)]
+        admin_password: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        batch_size: u32,
+        #[arg(long, default_value_t = 4)]
+        parallel: u32,
     },
 }
 
@@ -295,6 +345,8 @@ async fn main() {
                 size,
                 state,
                 query,
+                cursor,
+                tag,
             } => {
                 let mut path = format!("/tenants?page={page}&size={size}");
                 if let Some(st) = &state {
@@ -302,6 +354,12 @@ async fn main() {
                 }
                 if let Some(q) = &query {
                     path.push_str(&format!("&q={q}"));
+                }
+                if let Some(c) = &cursor {
+                    path.push_str(&format!("&cursor={c}"));
+                }
+                if let Some(t) = &tag {
+                    path.push_str(&format!("&tag={t}"));
                 }
                 let data = api.request("GET", &path, None, None).await;
 
@@ -331,8 +389,16 @@ async fn main() {
                     ],
                 );
 
-                let pages = ((total as f64) / (size as f64)).ceil().max(1.0) as i64;
-                println!("\n{total} tenant(s), page {page}/{pages}");
+                if total >= 0 {
+                    let pages = ((total as f64) / (size as f64)).ceil().max(1.0) as i64;
+                    println!("\n{total} tenant(s), page {page}/{pages}");
+                } else {
+                    println!("\n{} tenant(s) returned", items.len());
+                }
+
+                if let Some(nc) = data["next_cursor"].as_str() {
+                    println!("Next cursor: {nc}");
+                }
             }
 
             TenantAction::Get { tenant_id } => {
@@ -454,6 +520,211 @@ async fn main() {
                     data["id"].as_str().unwrap_or("-"),
                     data["state"].as_str().unwrap_or("-")
                 );
+            }
+
+            TenantAction::BatchCreate {
+                count,
+                admin_user,
+                admin_password,
+            } => {
+                let mut body = serde_json::json!({ "count": count, "admin_user": admin_user });
+                if let Some(pw) = &admin_password {
+                    body["admin_password"] = Value::String(pw.clone());
+                }
+                let data = api.request("POST", "/tenants/batch", Some(&body), None).await;
+
+                if cli.json {
+                    print_json(&data);
+                    return;
+                }
+
+                let created = data["total_created"].as_u64().unwrap_or(0);
+                let requested = data["total_requested"].as_u64().unwrap_or(0);
+                println!("Created {created}/{requested} tenant(s)");
+
+                if let Some(items) = data["created"].as_array() {
+                    for item in items {
+                        println!(
+                            "  {} (password: {})",
+                            item["id"].as_str().unwrap_or("-"),
+                            item["admin_password"].as_str().unwrap_or("-")
+                        );
+                    }
+                }
+                if let Some(items) = data["failed"].as_array() {
+                    for item in items {
+                        eprintln!(
+                            "  FAILED {}: {}",
+                            item["id"].as_str().unwrap_or("-"),
+                            item["error"].as_str().unwrap_or("-")
+                        );
+                    }
+                }
+            }
+
+            TenantAction::BatchDelete { ids } => {
+                let body = serde_json::json!({ "ids": ids });
+                let data = api.request("POST", "/tenants/batch-delete", Some(&body), None).await;
+
+                if cli.json {
+                    print_json(&data);
+                    return;
+                }
+
+                if let Some(items) = data["deleted"].as_array() {
+                    println!("Deleted {} tenant(s)", items.len());
+                    for id in items {
+                        println!("  {}", id.as_str().unwrap_or("-"));
+                    }
+                }
+                if let Some(items) = data["failed"].as_array() {
+                    for item in items {
+                        eprintln!(
+                            "  FAILED {}: {}",
+                            item["id"].as_str().unwrap_or("-"),
+                            item["error"].as_str().unwrap_or("-")
+                        );
+                    }
+                }
+            }
+
+            TenantAction::BatchUpdate { ids, notes, tags } => {
+                let mut body = serde_json::json!({ "ids": ids });
+                if let Some(n) = &notes {
+                    if n.is_empty() {
+                        body["notes"] = Value::Null;
+                    } else {
+                        body["notes"] = Value::String(n.clone());
+                    }
+                }
+                if let Some(t) = &tags {
+                    if t.is_empty() {
+                        body["tags"] = Value::Null;
+                    } else {
+                        let tag_list: Vec<Value> = t
+                            .split(',')
+                            .map(|s| Value::String(s.trim().to_string()))
+                            .filter(|v| v.as_str().map(|s| !s.is_empty()).unwrap_or(false))
+                            .collect();
+                        body["tags"] = Value::Array(tag_list);
+                    }
+                }
+
+                let data = api.request("POST", "/tenants/batch-update", Some(&body), None).await;
+
+                if cli.json {
+                    print_json(&data);
+                    return;
+                }
+
+                if let Some(items) = data["updated"].as_array() {
+                    println!("Updated {} tenant(s)", items.len());
+                }
+                if let Some(items) = data["failed"].as_array() {
+                    for item in items {
+                        eprintln!(
+                            "  FAILED {}: {}",
+                            item["id"].as_str().unwrap_or("-"),
+                            item["error"].as_str().unwrap_or("-")
+                        );
+                    }
+                }
+            }
+
+            TenantAction::Export {
+                format,
+                state,
+                tag,
+                batch_size,
+            } => {
+                let stdout = io::stdout();
+                let mut out = stdout.lock();
+                let mut cursor: Option<String> = None;
+                let mut total_exported = 0u64;
+
+                if format == "csv" {
+                    writeln!(out, "id,state,created_at,notes,tags").ok();
+                }
+
+                loop {
+                    let mut path = format!("/tenants?size={batch_size}");
+                    if let Some(st) = &state {
+                        path.push_str(&format!("&state={st}"));
+                    }
+                    if let Some(t) = &tag {
+                        path.push_str(&format!("&tag={t}"));
+                    }
+                    if let Some(c) = &cursor {
+                        path.push_str(&format!("&cursor={c}"));
+                    }
+
+                    let data = api.request("GET", &path, None, None).await;
+                    let items = data["items"].as_array().cloned().unwrap_or_default();
+
+                    if items.is_empty() {
+                        break;
+                    }
+
+                    for item in &items {
+                        if format == "csv" {
+                            let id = item["id"].as_str().unwrap_or("");
+                            let st = item["state"].as_str().unwrap_or("");
+                            let created = item["created_at"].as_str().unwrap_or("");
+                            let notes = item["notes"].as_str().unwrap_or("");
+                            let tags = format_val(item.get("tags"));
+                            writeln!(out, "{id},{st},{created},{notes},{tags}").ok();
+                        } else {
+                            writeln!(out, "{}", serde_json::to_string(item).unwrap_or_default()).ok();
+                        }
+                        total_exported += 1;
+                    }
+
+                    match data["next_cursor"].as_str() {
+                        Some(nc) => cursor = Some(nc.to_string()),
+                        None => break,
+                    }
+                }
+
+                eprintln!("Exported {total_exported} tenant(s)");
+            }
+
+            TenantAction::Import {
+                file,
+                admin_user,
+                admin_password,
+                batch_size,
+                parallel: _parallel,
+            } => {
+                let content = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+                    eprintln!("Failed to read {file}: {e}");
+                    process::exit(1);
+                });
+
+                let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+                let total_lines = lines.len();
+                let mut total_created = 0u64;
+                let mut total_failed = 0u64;
+
+                for chunk in lines.chunks(batch_size as usize) {
+                    let count = chunk.len() as u32;
+                    let mut body = serde_json::json!({
+                        "count": count,
+                        "admin_user": admin_user,
+                    });
+                    if let Some(pw) = &admin_password {
+                        body["admin_password"] = Value::String(pw.clone());
+                    }
+
+                    let data = api.request("POST", "/tenants/batch", Some(&body), None).await;
+                    let created = data["total_created"].as_u64().unwrap_or(0);
+                    let failed_items = data["failed"].as_array().map(|a| a.len() as u64).unwrap_or(0);
+                    total_created += created;
+                    total_failed += failed_items;
+
+                    eprint!("\rImported {total_created}/{total_lines}...");
+                }
+
+                eprintln!("\nImport complete: {total_created} created, {total_failed} failed");
             }
         },
 

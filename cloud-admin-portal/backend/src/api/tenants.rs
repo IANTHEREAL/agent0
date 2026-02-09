@@ -1,6 +1,7 @@
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
+use base64::Engine;
 use rand::Rng;
 
 use crate::auth::{ApiKeyAuth, TenantSessionExtractor};
@@ -10,6 +11,21 @@ use crate::models::*;
 use crate::services::pd_client::PdClient;
 use crate::services::pg_client::PgClient;
 use crate::{tenant_state, AppState, DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USER, DEFAULT_PG_PORT, OBSERVABILITY_USER, TENANT_ID_LEN};
+
+fn encode_cursor(created_at: &str, id: &str) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("{created_at}|{id}"))
+}
+
+fn decode_cursor(cursor: &str) -> Option<(String, String)> {
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(cursor).ok()?;
+    let s = String::from_utf8(bytes).ok()?;
+    let parts: Vec<&str> = s.splitn(2, '|').collect();
+    if parts.len() == 2 {
+        Some((parts[0].to_string(), parts[1].to_string()))
+    } else {
+        None
+    }
+}
 
 fn generate_tenant_id() -> String {
     let mut rng = rand::thread_rng();
@@ -41,16 +57,28 @@ pub async fn list_tenants(
     let page = params.page.unwrap_or(1);
     let size = params.size.unwrap_or(50);
 
-    let (tenants, total) =
-        db::list_tenants(&state.db, page, size, params.state.as_deref(), params.q.as_deref()).await?;
+    let cursor_pair = params.cursor.as_deref().and_then(decode_cursor);
+    let cursor_ref = cursor_pair.as_ref().map(|(ts, id)| (ts.as_str(), id.as_str()));
 
-    let items: Vec<TenantResponse> = tenants.iter().map(|t| t.to_response()).collect();
+    let opts = db::ListTenantsOpts {
+        page,
+        size,
+        state_filter: params.state.as_deref(),
+        q: params.q.as_deref(),
+        tag: params.tag.as_deref(),
+        cursor: cursor_ref,
+    };
+
+    let result = db::list_tenants(&state.db, &opts).await?;
+    let items: Vec<TenantResponse> = result.tenants.iter().map(|t| t.to_response()).collect();
+    let next_cursor = result.next_cursor.map(|(ts, id)| encode_cursor(&ts, &id));
 
     Ok(Json(TenantListResponse {
         items,
-        total,
+        total: result.total,
         page,
         size,
+        next_cursor,
     }))
 }
 
@@ -470,4 +498,212 @@ pub async fn bootstrap_observability(
             "Observability account '{OBSERVABILITY_USER}' bootstrapped for tenant '{tenant_id}'"
         ),
     }))
+}
+
+// ── Batch create tenants ─────────────────────────────────────────
+
+pub async fn batch_create_tenants(
+    State(state): State<AppState>,
+    _auth: ApiKeyAuth,
+    Json(request): Json<BatchCreateRequest>,
+) -> Result<(StatusCode, Json<BatchCreateResponse>), AppError> {
+    if request.count == 0 || request.count > 1000 {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "count must be between 1 and 1000",
+        ));
+    }
+
+    let admin_user = request.admin_user.unwrap_or_else(|| DEFAULT_ADMIN_USER.to_string());
+    let mut created = Vec::new();
+    let mut failed = Vec::new();
+
+    for _ in 0..request.count {
+        let tenant_id = generate_tenant_id();
+        let keyspace = make_keyspace(&tenant_id);
+        let password = request
+            .admin_password
+            .clone()
+            .unwrap_or_else(generate_password);
+
+        if db::get_tenant_by_id(&state.db, &tenant_id).await?.is_some() {
+            failed.push(BatchItemError {
+                id: tenant_id,
+                error: "ID collision".into(),
+            });
+            continue;
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        if let Err(e) = db::insert_tenant(&state.db, &tenant_id, &keyspace, tenant_state::CREATING, &now).await {
+            failed.push(BatchItemError {
+                id: tenant_id,
+                error: format!("DB insert failed: {e}"),
+            });
+            continue;
+        }
+
+        let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
+        if !pd.create_keyspace(&keyspace).await {
+            db::update_tenant_state(&state.db, &tenant_id, tenant_state::CREATE_FAILED, Some("PD keyspace creation failed")).await.ok();
+            failed.push(BatchItemError {
+                id: tenant_id,
+                error: "Failed to create keyspace in PD".into(),
+            });
+            continue;
+        }
+
+        let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+        if !pg.bootstrap_admin_password(&tenant_id, &admin_user, DEFAULT_ADMIN_PASSWORD, &password).await {
+            db::update_tenant_state(&state.db, &tenant_id, tenant_state::CREATE_FAILED, Some("Password bootstrap failed")).await.ok();
+            failed.push(BatchItemError {
+                id: tenant_id,
+                error: "Password bootstrap failed".into(),
+            });
+            continue;
+        }
+
+        db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None).await.ok();
+        db::insert_audit_log(
+            &state.db, "CREATE", "TENANT", &tenant_id,
+            Some(&tenant_id), None, true, None, None,
+        ).await.ok();
+
+        let endpoints = state.config.parse_public_endpoints();
+        let (host, port) = endpoints.first().cloned().unwrap_or_else(|| ("127.0.0.1".into(), DEFAULT_PG_PORT));
+        let connection_string = format!("postgresql://{tenant_id}.{admin_user}:{password}@{host}:{port}/postgres");
+
+        created.push(CreateTenantResponse {
+            id: tenant_id,
+            admin_user: admin_user.clone(),
+            admin_password: password,
+            connection_string,
+            created_at: now,
+        });
+    }
+
+    let total_created = created.len() as u32;
+    Ok((
+        StatusCode::CREATED,
+        Json(BatchCreateResponse {
+            created,
+            failed,
+            total_requested: request.count,
+            total_created,
+        }),
+    ))
+}
+
+// ── Batch delete tenants ─────────────────────────────────────────
+
+pub async fn batch_delete_tenants(
+    State(state): State<AppState>,
+    _auth: ApiKeyAuth,
+    Json(request): Json<BatchDeleteRequest>,
+) -> Result<Json<BatchDeleteResponse>, AppError> {
+    if request.ids.is_empty() || request.ids.len() > 1000 {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "ids must contain 1 to 1000 entries",
+        ));
+    }
+
+    let mut deleted = Vec::new();
+    let mut failed = Vec::new();
+
+    for tenant_id in &request.ids {
+        let tenant = match db::get_tenant(&state.db, tenant_id).await {
+            Ok(Some(t)) => t,
+            Ok(None) => {
+                failed.push(BatchItemError {
+                    id: tenant_id.clone(),
+                    error: "Tenant not found".into(),
+                });
+                continue;
+            }
+            Err(e) => {
+                failed.push(BatchItemError {
+                    id: tenant_id.clone(),
+                    error: format!("DB error: {e}"),
+                });
+                continue;
+            }
+        };
+
+        db::update_tenant_state(&state.db, tenant_id, tenant_state::DISABLING, None).await.ok();
+
+        let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
+        if !pd.disable_keyspace(&tenant.keyspace).await {
+            db::update_tenant_state(&state.db, tenant_id, tenant_state::ACTIVE, Some("Failed to disable keyspace in PD")).await.ok();
+            failed.push(BatchItemError {
+                id: tenant_id.clone(),
+                error: "Failed to disable keyspace in PD".into(),
+            });
+            continue;
+        }
+
+        db::update_tenant_state(&state.db, tenant_id, tenant_state::DISABLED, Some("Batch delete")).await.ok();
+        db::insert_audit_log(
+            &state.db, "DELETE", "TENANT", tenant_id,
+            Some(tenant_id), None, true, None, None,
+        ).await.ok();
+        deleted.push(tenant_id.clone());
+    }
+
+    Ok(Json(BatchDeleteResponse { deleted, failed }))
+}
+
+// ── Batch update tenants ─────────────────────────────────────────
+
+pub async fn batch_update_tenants(
+    State(state): State<AppState>,
+    _auth: ApiKeyAuth,
+    Json(request): Json<BatchUpdateRequest>,
+) -> Result<Json<BatchUpdateResponse>, AppError> {
+    if request.ids.is_empty() || request.ids.len() > 1000 {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "ids must contain 1 to 1000 entries",
+        ));
+    }
+
+    let tags_json = request
+        .tags
+        .as_ref()
+        .map(|t| serde_json::to_string(t).unwrap_or_else(|_| "[]".into()));
+
+    let existing_refs: Vec<&str> = request.ids.iter().map(|s| s.as_str()).collect();
+    let existing = db::check_tenants_exist(&state.db, &existing_refs).await?;
+
+    let mut updated = Vec::new();
+    let mut failed = Vec::new();
+
+    for id in &request.ids {
+        if !existing.contains(id) {
+            failed.push(BatchItemError {
+                id: id.clone(),
+                error: "Tenant not found".into(),
+            });
+        } else {
+            updated.push(id.clone());
+        }
+    }
+
+    if !updated.is_empty() {
+        db::batch_update_metadata(
+            &state.db,
+            &updated,
+            request.notes.as_deref(),
+            tags_json.as_deref(),
+        ).await?;
+
+        for id in &updated {
+            db::insert_audit_log(
+                &state.db, "UPDATE", "TENANT", id,
+                Some(id), None, true, None, None,
+            ).await.ok();
+        }
+    }
+
+    Ok(Json(BatchUpdateResponse { updated, failed }))
 }

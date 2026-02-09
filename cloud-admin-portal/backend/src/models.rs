@@ -38,6 +38,27 @@ pub struct ListTenantsParams {
     pub size: Option<u32>,
     pub state: Option<String>,
     pub q: Option<String>,
+    pub cursor: Option<String>,
+    pub tag: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct BatchCreateRequest {
+    pub count: u32,
+    pub admin_user: Option<String>,
+    pub admin_password: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct BatchDeleteRequest {
+    pub ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct BatchUpdateRequest {
+    pub ids: Vec<String>,
+    pub notes: Option<String>,
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +99,34 @@ pub struct TenantListResponse {
     pub total: i64,
     pub page: u32,
     pub size: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct BatchCreateResponse {
+    pub created: Vec<CreateTenantResponse>,
+    pub failed: Vec<BatchItemError>,
+    pub total_requested: u32,
+    pub total_created: u32,
+}
+
+#[derive(Serialize)]
+pub struct BatchDeleteResponse {
+    pub deleted: Vec<String>,
+    pub failed: Vec<BatchItemError>,
+}
+
+#[derive(Serialize)]
+pub struct BatchUpdateResponse {
+    pub updated: Vec<String>,
+    pub failed: Vec<BatchItemError>,
+}
+
+#[derive(Serialize)]
+pub struct BatchItemError {
+    pub id: String,
+    pub error: String,
 }
 
 #[derive(Serialize)]
