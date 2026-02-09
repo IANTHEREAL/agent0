@@ -24,8 +24,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::{
-    BoxedOperator, FilterOperator, IndexScanOperator, LimitOperator, ProjectOperator, SortOperator,
-    TableScanOperator,
+    BoxedOperator, FilterOperator, InListScanOperator, IndexScanOperator, LimitOperator,
+    ProjectOperator, RangeIndexScanOperator, SortOperator, TableScanOperator,
 };
 use crate::sql::expr::eval_expr;
 use crate::sql::planner::{choose_best_access_path_for_filter, ScanType};
@@ -250,11 +250,36 @@ impl PhysicalPlanner {
                     scan_limit,
                 ))
             }
-            ScanType::IndexBoundedRangeScan { .. } | ScanType::InListScan { .. } => {
-                // TODO: Task 3 will implement proper scan execution
-                // For now, fall back to full table scan
-                Box::new(TableScanOperator::new(schema.clone()))
-            }
+            ScanType::IndexBoundedRangeScan {
+                index_id,
+                index_name,
+                prefix_values,
+                range_start,
+                start_inclusive,
+                range_end,
+                end_inclusive,
+                ..
+            } => Box::new(RangeIndexScanOperator::new(
+                schema.clone(),
+                index_id,
+                index_name,
+                prefix_values,
+                range_start,
+                start_inclusive,
+                range_end,
+                end_inclusive,
+            )),
+            ScanType::InListScan {
+                index_id,
+                index_name,
+                column_values,
+                ..
+            } => Box::new(InListScanOperator::new(
+                schema.clone(),
+                index_id,
+                index_name,
+                column_values,
+            )),
             ScanType::GinIndexScan { .. } => Box::new(TableScanOperator::new(schema.clone())),
         };
 

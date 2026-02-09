@@ -918,10 +918,137 @@ impl Executor {
                             }
                             rows
                         }
-                        ScanType::IndexBoundedRangeScan { .. } | ScanType::InListScan { .. } => {
-                            // TODO: Task 3 will implement proper scan execution
-                            // For now, fall back to full table scan
-                            self.scan_and_fill(txn, db_id, &t, &schema).await?
+                        ScanType::IndexBoundedRangeScan {
+                            index_id,
+                            ref index_name,
+                            ref prefix_values,
+                            ref range_start,
+                            start_inclusive,
+                            ref range_end,
+                            end_inclusive,
+                            ..
+                        } => {
+                            let index = schema.indexes.iter().find(|i| i.id == index_id);
+                            let Some(idx) = index else {
+                                return Err(anyhow!("Index not found"));
+                            };
+
+                            let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
+                                vec![DataType::Uuid]
+                            } else {
+                                schema
+                                    .pk_indices
+                                    .iter()
+                                    .map(|&i| schema.columns[i].data_type.clone())
+                                    .collect()
+                            };
+
+                            let index_column_types: Vec<_> = idx
+                                .columns
+                                .iter()
+                                .map(|col| {
+                                    schema
+                                        .columns
+                                        .iter()
+                                        .find(|c| c.name.eq_ignore_ascii_case(col))
+                                        .map(|c| c.data_type.clone())
+                                        .ok_or_else(|| anyhow!("Index column '{}' not found", col))
+                                })
+                                .collect::<Result<Vec<_>>>()?;
+
+                            debug!(
+                                "Using Index Bounded Range Scan on {} (cost: {:.2})",
+                                index_name, access_path.cost
+                            );
+
+                            let pks = self
+                                .store()
+                                .scan_index_range(
+                                    txn,
+                                    db_id,
+                                    schema.table_id,
+                                    idx.id,
+                                    prefix_values,
+                                    range_start.as_ref(),
+                                    start_inclusive,
+                                    range_end.as_ref(),
+                                    end_inclusive,
+                                    idx.unique,
+                                    &index_column_types,
+                                    &pk_types,
+                                    None,
+                                )
+                                .await?;
+                            let mut rows = self
+                                .store()
+                                .batch_get_rows(txn, db_id, schema.table_id, pks, &schema)
+                                .await?;
+                            for r in &mut rows {
+                                fill_row_defaults(r, &schema)?;
+                            }
+                            rows
+                        }
+                        ScanType::InListScan {
+                            index_id,
+                            ref index_name,
+                            ref column_values,
+                            ..
+                        } => {
+                            let index = schema.indexes.iter().find(|i| i.id == index_id);
+                            let Some(idx) = index else {
+                                return Err(anyhow!("Index not found"));
+                            };
+
+                            let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
+                                vec![DataType::Uuid]
+                            } else {
+                                schema
+                                    .pk_indices
+                                    .iter()
+                                    .map(|&i| schema.columns[i].data_type.clone())
+                                    .collect()
+                            };
+
+                            debug!(
+                                "Using In-List Scan on {} ({} values, cost: {:.2})",
+                                index_name,
+                                column_values.len(),
+                                access_path.cost
+                            );
+
+                            let mut all_pks = Vec::new();
+                            for values in column_values {
+                                let pks = self
+                                    .store()
+                                    .scan_index(
+                                        txn,
+                                        db_id,
+                                        schema.table_id,
+                                        idx.id,
+                                        values,
+                                        idx.unique,
+                                        &pk_types,
+                                        None,
+                                    )
+                                    .await?;
+                                all_pks.extend(pks);
+                            }
+
+                            let mut deduped_pks = Vec::with_capacity(all_pks.len());
+                            for pk in all_pks {
+                                if !deduped_pks.contains(&pk) {
+                                    deduped_pks.push(pk);
+                                }
+                            }
+
+                            let mut rows = self
+                                .store()
+                                .batch_get_rows(txn, db_id, schema.table_id, deduped_pks, &schema)
+                                .await?;
+                            for r in &mut rows {
+                                fill_row_defaults(r, &schema)?;
+                            }
+                            rows
                         }
                         ScanType::FullTableScan => {
                             debug!("Using Full Table Scan (cost: {:.2})", access_path.cost);
