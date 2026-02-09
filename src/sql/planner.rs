@@ -244,6 +244,22 @@ pub enum ScanType {
         prefix_values: Vec<Value>,
         estimated_rows: usize,
     },
+    IndexBoundedRangeScan {
+        index_id: u64,
+        index_name: String,
+        prefix_values: Vec<Value>,
+        range_start: Option<Value>,
+        start_inclusive: bool,
+        range_end: Option<Value>,
+        end_inclusive: bool,
+        estimated_rows: usize,
+    },
+    InListScan {
+        index_id: u64,
+        index_name: String,
+        column_values: Vec<Vec<Value>>,
+        estimated_rows: usize,
+    },
     GinIndexScan {
         index_id: u64,
         index_name: String,
@@ -264,6 +280,7 @@ pub struct PredicateInfo {
     pub column: String,
     pub op: PredicateOp,
     pub value: Value,
+    pub in_values: Vec<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -274,9 +291,7 @@ pub enum PredicateOp {
     Le,
     Gt,
     Ge,
-    #[allow(dead_code)] // planner predicate type, not yet used in index selection
     Like,
-    #[allow(dead_code)] // planner predicate type, not yet used in index selection
     In,
     IsNull,
     IsNotNull,
@@ -366,6 +381,7 @@ fn collect_predicates(expr: &Expr, predicates: &mut Vec<PredicateInfo>) {
                     column: normalize_ident(ident),
                     op: PredicateOp::IsNull,
                     value: Value::Null,
+                    in_values: Vec::new(),
                 });
             }
         }
@@ -375,7 +391,66 @@ fn collect_predicates(expr: &Expr, predicates: &mut Vec<PredicateInfo>) {
                     column: normalize_ident(ident),
                     op: PredicateOp::IsNotNull,
                     value: Value::Null,
+                    in_values: Vec::new(),
                 });
+            }
+        }
+        Expr::Between {
+            expr,
+            negated,
+            low,
+            high,
+        } => {
+            if *negated {
+                return;
+            }
+            if let Expr::Identifier(ident) = &**expr {
+                let column = normalize_ident(ident);
+                let Ok(low_value) = eval_expr(low, None, None) else {
+                    return;
+                };
+                let Ok(high_value) = eval_expr(high, None, None) else {
+                    return;
+                };
+                predicates.push(PredicateInfo {
+                    column: column.clone(),
+                    op: PredicateOp::Ge,
+                    value: low_value,
+                    in_values: Vec::new(),
+                });
+                predicates.push(PredicateInfo {
+                    column,
+                    op: PredicateOp::Le,
+                    value: high_value,
+                    in_values: Vec::new(),
+                });
+            }
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            if *negated {
+                return;
+            }
+            if let Expr::Identifier(ident) = &**expr {
+                let mut values = Vec::with_capacity(list.len());
+                for item in list {
+                    let Ok(v) = eval_expr(item, None, None) else {
+                        return;
+                    };
+                    values.push(v);
+                }
+
+                if !values.is_empty() {
+                    predicates.push(PredicateInfo {
+                        column: normalize_ident(ident),
+                        op: PredicateOp::In,
+                        value: values[0].clone(),
+                        in_values: values,
+                    });
+                }
             }
         }
         Expr::Nested(e) => collect_predicates(e, predicates),
@@ -390,6 +465,7 @@ fn extract_simple_predicate(left: &Expr, right: &Expr, op: PredicateOp) -> Optio
                 column: normalize_ident(ident),
                 op,
                 value: val,
+                in_values: Vec::new(),
             });
         }
     }
@@ -406,6 +482,7 @@ fn extract_simple_predicate(left: &Expr, right: &Expr, op: PredicateOp) -> Optio
                 column: normalize_ident(ident),
                 op: reversed_op,
                 value: val,
+                in_values: Vec::new(),
             });
         }
     }
@@ -422,12 +499,6 @@ pub fn choose_best_access_path(
         cost: estimated_table_rows as f64,
     };
 
-    let predicate_map: HashMap<&str, &PredicateInfo> = predicates
-        .iter()
-        .filter(|p| p.op == PredicateOp::Eq)
-        .map(|p| (p.column.as_str(), p))
-        .collect();
-
     for index in &schema.indexes {
         if !is_planner_usable_index(index) {
             continue;
@@ -436,7 +507,7 @@ pub fn choose_best_access_path(
             continue;
         }
         if let Some((scan_type, cost)) =
-            evaluate_index(schema, index, &predicate_map, estimated_table_rows)
+            evaluate_index(schema, index, predicates, estimated_table_rows)
         {
             if cost < best_path.cost {
                 best_path = AccessPath { scan_type, cost };
@@ -461,62 +532,164 @@ fn is_planner_usable_index(index: &IndexDef) -> bool {
 fn evaluate_index(
     schema: &TableSchema,
     index: &IndexDef,
-    predicate_map: &HashMap<&str, &PredicateInfo>,
+    predicates: &[PredicateInfo],
     estimated_table_rows: usize,
 ) -> Option<(ScanType, f64)> {
-    let mut matched_values = Vec::new();
-    let mut all_matched = true;
+    let eq_predicate_map: HashMap<&str, &PredicateInfo> = predicates
+        .iter()
+        .filter(|p| p.op == PredicateOp::Eq)
+        .map(|p| (p.column.as_str(), p))
+        .collect();
+
+    let mut prefix_values = Vec::new();
 
     for col in &index.columns {
-        if let Some(pred) = predicate_map.get(col.as_str()) {
-            let coerced = if let Some(col_def) = schema
-                .columns
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(col))
-            {
-                super::value_coercion::coerce_value_for_column(pred.value.clone(), col_def)
-                    .unwrap_or_else(|_| pred.value.clone())
-            } else {
-                pred.value.clone()
-            };
-            matched_values.push(coerced);
+        if let Some(pred) = eq_predicate_map.get(col.as_str()) {
+            prefix_values.push(coerce_index_predicate_value(schema, col, &pred.value));
         } else {
-            all_matched = false;
             break;
         }
     }
 
-    if matched_values.is_empty() {
-        return None;
-    }
+    if prefix_values.len() == index.columns.len() {
+        let selectivity = estimate_selectivity(index, prefix_values.len(), true);
+        let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
+        let cost = 1.0 + estimated_rows as f64 * 0.5;
 
-    let selectivity = estimate_selectivity(index, matched_values.len(), all_matched);
-    let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
-
-    let index_lookup_cost = 1.0;
-    let row_fetch_cost = estimated_rows as f64 * 0.5;
-    let cost = index_lookup_cost + row_fetch_cost;
-
-    if all_matched {
-        Some((
+        return Some((
             ScanType::IndexScan {
                 index_id: index.id,
                 index_name: index.name.clone(),
-                values: matched_values,
+                values: prefix_values,
                 estimated_rows,
             },
             cost,
-        ))
-    } else {
-        Some((
-            ScanType::IndexRangeScan {
+        ));
+    }
+
+    let Some(next_col) = index.columns.get(prefix_values.len()) else {
+        return None;
+    };
+
+    if let Some(in_pred) = predicates.iter().find(|p| {
+        p.op == PredicateOp::In
+            && p.column.eq_ignore_ascii_case(next_col)
+            && !p.in_values.is_empty()
+    }) {
+        let mut column_values = Vec::with_capacity(in_pred.in_values.len());
+        for in_value in &in_pred.in_values {
+            let mut lookup = prefix_values.clone();
+            lookup.push(coerce_index_predicate_value(schema, next_col, in_value));
+            column_values.push(lookup);
+        }
+
+        let table_rows = estimated_table_rows.max(1);
+        let selectivity = ((in_pred.in_values.len() as f64) * (1.0 / table_rows as f64)).min(0.5);
+        let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
+        let cost = 1.0 + estimated_rows as f64 * 0.5;
+
+        return Some((
+            ScanType::InListScan {
                 index_id: index.id,
                 index_name: index.name.clone(),
-                prefix_values: matched_values,
+                column_values,
                 estimated_rows,
             },
             cost,
-        ))
+        ));
+    }
+
+    let lower_inclusive = predicates
+        .iter()
+        .find(|p| p.column.eq_ignore_ascii_case(next_col) && p.op == PredicateOp::Ge);
+    let lower_exclusive = predicates
+        .iter()
+        .find(|p| p.column.eq_ignore_ascii_case(next_col) && p.op == PredicateOp::Gt);
+    let upper_inclusive = predicates
+        .iter()
+        .find(|p| p.column.eq_ignore_ascii_case(next_col) && p.op == PredicateOp::Le);
+    let upper_exclusive = predicates
+        .iter()
+        .find(|p| p.column.eq_ignore_ascii_case(next_col) && p.op == PredicateOp::Lt);
+
+    let (range_start, start_inclusive) = if let Some(pred) = lower_inclusive {
+        (
+            Some(coerce_index_predicate_value(schema, next_col, &pred.value)),
+            true,
+        )
+    } else if let Some(pred) = lower_exclusive {
+        (
+            Some(coerce_index_predicate_value(schema, next_col, &pred.value)),
+            false,
+        )
+    } else {
+        (None, true)
+    };
+
+    let (range_end, end_inclusive) = if let Some(pred) = upper_inclusive {
+        (
+            Some(coerce_index_predicate_value(schema, next_col, &pred.value)),
+            true,
+        )
+    } else if let Some(pred) = upper_exclusive {
+        (
+            Some(coerce_index_predicate_value(schema, next_col, &pred.value)),
+            false,
+        )
+    } else {
+        (None, true)
+    };
+
+    if range_start.is_some() || range_end.is_some() {
+        let two_sided = range_start.is_some() && range_end.is_some();
+        let selectivity = if two_sided { 0.1 } else { 0.3 };
+        let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
+        let cost = 1.0 + estimated_rows as f64 * 0.5;
+
+        return Some((
+            ScanType::IndexBoundedRangeScan {
+                index_id: index.id,
+                index_name: index.name.clone(),
+                prefix_values,
+                range_start,
+                start_inclusive,
+                range_end,
+                end_inclusive,
+                estimated_rows,
+            },
+            cost,
+        ));
+    }
+
+    if prefix_values.is_empty() {
+        return None;
+    }
+
+    let selectivity = estimate_selectivity(index, prefix_values.len(), false);
+    let estimated_rows = ((estimated_table_rows as f64) * selectivity).max(1.0) as usize;
+    let cost = 1.0 + estimated_rows as f64 * 0.5;
+
+    Some((
+        ScanType::IndexRangeScan {
+            index_id: index.id,
+            index_name: index.name.clone(),
+            prefix_values,
+            estimated_rows,
+        },
+        cost,
+    ))
+}
+
+fn coerce_index_predicate_value(schema: &TableSchema, col: &str, value: &Value) -> Value {
+    if let Some(col_def) = schema
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(col))
+    {
+        super::value_coercion::coerce_value_for_column(value.clone(), col_def)
+            .unwrap_or_else(|_| value.clone())
+    } else {
+        value.clone()
     }
 }
 
@@ -1014,6 +1187,7 @@ mod tests {
             column: "a".to_string(),
             op: PredicateOp::Eq,
             value: Value::Int32(1),
+            in_values: Vec::new(),
         }];
         let path = choose_best_access_path(&schema, &predicates, 1000);
         assert!(matches!(path.scan_type, ScanType::IndexScan { .. }));
@@ -1045,6 +1219,7 @@ mod tests {
             column: "a".to_string(),
             op: PredicateOp::Eq,
             value: Value::Int32(1),
+            in_values: Vec::new(),
         }];
         let path = choose_best_access_path(&schema, &predicates, 1000);
         assert!(matches!(path.scan_type, ScanType::FullTableScan));
@@ -1130,6 +1305,58 @@ mod tests {
         assert_eq!(predicates[0].op, PredicateOp::Gt);
     }
 
+    fn parse_where_expr(sql: &str) -> Expr {
+        let dialect = PostgreSqlDialect {};
+        let statements = Parser::parse_sql(&dialect, sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
+            panic!("expected query");
+        };
+        let sqlparser::ast::SetExpr::Select(select) = *query.body else {
+            panic!("expected select");
+        };
+        select.selection.expect("WHERE exists")
+    }
+
+    fn is_int_value(v: &Value, expected: i64) -> bool {
+        matches!(v, Value::Int32(n) if i64::from(*n) == expected)
+            || matches!(v, Value::Int64(n) if *n == expected)
+    }
+
+    #[test]
+    fn test_analyze_predicates_between() {
+        let expr = parse_where_expr("SELECT * FROM t WHERE x BETWEEN 5 AND 10");
+        let mut predicates = Vec::new();
+        collect_predicates(&expr, &mut predicates);
+
+        let ge = predicates
+            .iter()
+            .find(|p| p.column == "x" && p.op == PredicateOp::Ge)
+            .expect("missing x >= 5");
+        assert!(is_int_value(&ge.value, 5));
+
+        let le = predicates
+            .iter()
+            .find(|p| p.column == "x" && p.op == PredicateOp::Le)
+            .expect("missing x <= 10");
+        assert!(is_int_value(&le.value, 10));
+    }
+
+    #[test]
+    fn test_analyze_predicates_in_list() {
+        let expr = parse_where_expr("SELECT * FROM t WHERE x IN (1, 2, 3)");
+        let mut predicates = Vec::new();
+        collect_predicates(&expr, &mut predicates);
+
+        let in_pred = predicates
+            .iter()
+            .find(|p| p.column == "x" && p.op == PredicateOp::In)
+            .expect("missing x IN predicate");
+        assert_eq!(in_pred.in_values.len(), 3);
+        assert!(is_int_value(&in_pred.in_values[0], 1));
+        assert!(is_int_value(&in_pred.in_values[1], 2));
+        assert!(is_int_value(&in_pred.in_values[2], 3));
+    }
+
     #[test]
     fn test_analyze_predicates_nested() {
         let nested = Expr::Nested(Box::new(make_eq_expr("id", 1)));
@@ -1191,6 +1418,7 @@ mod tests {
             column: "a".to_string(),
             op: PredicateOp::Eq,
             value: Value::Int32(1),
+            in_values: Vec::new(),
         }];
         let path = choose_best_access_path(&schema, &predicates, 10000);
         if let ScanType::IndexScan { index_name, .. } = path.scan_type {
@@ -1238,11 +1466,13 @@ mod tests {
                 column: "a".to_string(),
                 op: PredicateOp::Eq,
                 value: Value::Int32(1),
+                in_values: Vec::new(),
             },
             PredicateInfo {
                 column: "b".to_string(),
                 op: PredicateOp::Eq,
                 value: Value::Int32(2),
+                in_values: Vec::new(),
             },
         ];
         let path = choose_best_access_path(&schema, &predicates, 10000);
@@ -1283,6 +1513,7 @@ mod tests {
             column: "a".to_string(),
             op: PredicateOp::Eq,
             value: Value::Int32(1),
+            in_values: Vec::new(),
         }];
         let path = choose_best_access_path(&schema, &predicates, 10000);
         match path.scan_type {
@@ -1291,6 +1522,276 @@ mod tests {
             }
             _ => panic!("Expected IndexRangeScan for partial match"),
         }
+    }
+
+    #[test]
+    fn test_choose_range_scan_gt() {
+        let schema = TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![crate::types::ColumnDef {
+                name: "val".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![IndexDef {
+                id: 1,
+                name: "idx_val".to_string(),
+                columns: vec!["val".to_string()],
+                unique: false,
+                method: None,
+                predicate: None,
+                expressions: Vec::new(),
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+        let predicates = vec![PredicateInfo {
+            column: "val".to_string(),
+            op: PredicateOp::Gt,
+            value: Value::Int32(5),
+            in_values: Vec::new(),
+        }];
+
+        let path = choose_best_access_path(&schema, &predicates, 100000);
+        assert!(matches!(
+            path.scan_type,
+            ScanType::IndexBoundedRangeScan { .. }
+        ));
+    }
+
+    #[test]
+    fn test_choose_range_scan_between() {
+        let schema = TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![crate::types::ColumnDef {
+                name: "val".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![IndexDef {
+                id: 1,
+                name: "idx_val".to_string(),
+                columns: vec!["val".to_string()],
+                unique: false,
+                method: None,
+                predicate: None,
+                expressions: Vec::new(),
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+        let predicates = vec![
+            PredicateInfo {
+                column: "val".to_string(),
+                op: PredicateOp::Ge,
+                value: Value::Int32(5),
+                in_values: Vec::new(),
+            },
+            PredicateInfo {
+                column: "val".to_string(),
+                op: PredicateOp::Le,
+                value: Value::Int32(10),
+                in_values: Vec::new(),
+            },
+        ];
+
+        let path = choose_best_access_path(&schema, &predicates, 100000);
+        match path.scan_type {
+            ScanType::IndexBoundedRangeScan {
+                range_start,
+                range_end,
+                ..
+            } => {
+                assert!(matches!(range_start, Some(Value::Int32(5))));
+                assert!(matches!(range_end, Some(Value::Int32(10))));
+            }
+            other => panic!("expected IndexBoundedRangeScan, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_choose_range_scan_composite_prefix_plus_range() {
+        let schema = TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![
+                crate::types::ColumnDef {
+                    name: "a".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                crate::types::ColumnDef {
+                    name: "b".to_string(),
+                    data_type: DataType::Int32,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![IndexDef {
+                id: 1,
+                name: "idx_ab".to_string(),
+                columns: vec!["a".to_string(), "b".to_string()],
+                unique: false,
+                method: None,
+                predicate: None,
+                expressions: Vec::new(),
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+        let predicates = vec![
+            PredicateInfo {
+                column: "a".to_string(),
+                op: PredicateOp::Eq,
+                value: Value::Int32(1),
+                in_values: Vec::new(),
+            },
+            PredicateInfo {
+                column: "b".to_string(),
+                op: PredicateOp::Gt,
+                value: Value::Int32(5),
+                in_values: Vec::new(),
+            },
+        ];
+
+        let path = choose_best_access_path(&schema, &predicates, 100000);
+        match path.scan_type {
+            ScanType::IndexBoundedRangeScan {
+                prefix_values,
+                range_start,
+                range_end,
+                ..
+            } => {
+                assert_eq!(prefix_values.len(), 1);
+                assert!(matches!(prefix_values[0], Value::Int32(1)));
+                assert!(matches!(range_start, Some(Value::Int32(5))));
+                assert!(range_end.is_none());
+            }
+            other => panic!("expected IndexBoundedRangeScan, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_choose_in_list_scan() {
+        let schema = TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![crate::types::ColumnDef {
+                name: "val".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![IndexDef {
+                id: 1,
+                name: "idx_val".to_string(),
+                columns: vec!["val".to_string()],
+                unique: false,
+                method: None,
+                predicate: None,
+                expressions: Vec::new(),
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+        let predicates = vec![PredicateInfo {
+            column: "val".to_string(),
+            op: PredicateOp::In,
+            value: Value::Null,
+            in_values: vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)],
+        }];
+
+        let path = choose_best_access_path(&schema, &predicates, 100000);
+        match path.scan_type {
+            ScanType::InListScan { column_values, .. } => {
+                assert_eq!(column_values.len(), 3);
+                assert!(matches!(column_values[0][0], Value::Int32(1)));
+                assert!(matches!(column_values[1][0], Value::Int32(2)));
+                assert!(matches!(column_values[2][0], Value::Int32(3)));
+            }
+            other => panic!("expected InListScan, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_range_scan_cost_less_than_full_scan() {
+        let schema = TableSchema {
+            name: "test".to_string(),
+            table_id: 1,
+            columns: vec![crate::types::ColumnDef {
+                name: "val".to_string(),
+                data_type: DataType::Int32,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![IndexDef {
+                id: 1,
+                name: "idx_val".to_string(),
+                columns: vec!["val".to_string()],
+                unique: false,
+                method: None,
+                predicate: None,
+                expressions: Vec::new(),
+            }],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+        let predicates = vec![PredicateInfo {
+            column: "val".to_string(),
+            op: PredicateOp::Gt,
+            value: Value::Int32(5),
+            in_values: Vec::new(),
+        }];
+
+        let path = choose_best_access_path(&schema, &predicates, 100000);
+        assert!(matches!(
+            path.scan_type,
+            ScanType::IndexBoundedRangeScan { .. }
+        ));
+        assert!(path.cost < 100000_f64);
     }
 
     #[test]

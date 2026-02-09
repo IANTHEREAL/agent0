@@ -399,6 +399,62 @@ fn generate_table_factor_plan(
                             },
                         }
                     }
+                    ScanType::IndexBoundedRangeScan {
+                        index_name,
+                        estimated_rows: est_rows,
+                        ..
+                    } => {
+                        let index_cond = predicates
+                            .iter()
+                            .map(|p| format_predicate(p))
+                            .collect::<Vec<_>>()
+                            .join(" AND ");
+                        PlanNode::IndexScan {
+                            table_name: table_name.to_string(),
+                            alias: alias_name,
+                            index_name,
+                            index_cond: if index_cond.is_empty() {
+                                None
+                            } else {
+                                Some(index_cond)
+                            },
+                            filter: None,
+                            cost: PlanCost {
+                                startup: 0.15,
+                                total: 0.15 + (est_rows as f64 * 0.01),
+                                rows: est_rows.max(1),
+                                width: estimate_row_width(&schema),
+                            },
+                        }
+                    }
+                    ScanType::InListScan {
+                        index_name,
+                        estimated_rows: est_rows,
+                        ..
+                    } => {
+                        let index_cond = predicates
+                            .iter()
+                            .map(|p| format_predicate(p))
+                            .collect::<Vec<_>>()
+                            .join(" AND ");
+                        PlanNode::IndexScan {
+                            table_name: table_name.to_string(),
+                            alias: alias_name,
+                            index_name,
+                            index_cond: if index_cond.is_empty() {
+                                None
+                            } else {
+                                Some(index_cond)
+                            },
+                            filter: None,
+                            cost: PlanCost {
+                                startup: 0.15,
+                                total: 0.15 + (est_rows as f64 * 0.01),
+                                rows: est_rows.max(1),
+                                width: estimate_row_width(&schema),
+                            },
+                        }
+                    }
                     ScanType::GinIndexScan {
                         index_name,
                         estimated_rows: est_rows,

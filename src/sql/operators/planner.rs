@@ -250,6 +250,11 @@ impl PhysicalPlanner {
                     scan_limit,
                 ))
             }
+            ScanType::IndexBoundedRangeScan { .. } | ScanType::InListScan { .. } => {
+                // TODO: Task 3 will implement proper scan execution
+                // For now, fall back to full table scan
+                Box::new(TableScanOperator::new(schema.clone()))
+            }
             ScanType::GinIndexScan { .. } => Box::new(TableScanOperator::new(schema.clone())),
         };
 

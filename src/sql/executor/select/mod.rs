@@ -918,6 +918,11 @@ impl Executor {
                             }
                             rows
                         }
+                        ScanType::IndexBoundedRangeScan { .. } | ScanType::InListScan { .. } => {
+                            // TODO: Task 3 will implement proper scan execution
+                            // For now, fall back to full table scan
+                            self.scan_and_fill(txn, db_id, &t, &schema).await?
+                        }
                         ScanType::FullTableScan => {
                             debug!("Using Full Table Scan (cost: {:.2})", access_path.cost);
                             self.scan_and_fill(txn, db_id, &t, &schema).await?
