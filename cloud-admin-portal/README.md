@@ -65,32 +65,146 @@ PGTIKV_API_KEYS=my-secret-key \
 ./target/release/pgtikv-admin
 ```
 
-### CLI Usage
+### CLI Tool (`pgtikv-ctl`)
+
+#### Global Options
+
+| Option | Env Var | Default | Description |
+|--------|---------|---------|-------------|
+| `--api-url <URL>` | `PGTIKV_API_URL` | `http://localhost:8090/api` | Admin API address |
+| `--api-key <KEY>` | `PGTIKV_API_KEY` | (empty) | API authentication key |
+| `--json` | — | `false` | Output as JSON (for scripting) |
 
 ```bash
-# List tenants
+# Configure via environment (recommended)
+export PGTIKV_API_URL=http://admin.example.com/api
+export PGTIKV_API_KEY=my-secret-key
+```
+
+#### Command Overview
+
+```
+pgtikv-ctl
+├── tenants                # Tenant management
+│   ├── list               # List tenants
+│   ├── get <id>           # Get tenant details
+│   ├── create             # Create tenant
+│   ├── update <id>        # Update tenant metadata
+│   ├── remove <id>        # Remove tenant (ACTIVE → DISABLED)
+│   └── delete <id>        # Delete tenant (alias for remove)
+├── connect <id>           # Get tenant session (for user management)
+├── users                  # User management (requires --session)
+│   ├── list <id>          # List users
+│   ├── create <id>        # Create user
+│   ├── delete <id> <user> # Delete user
+│   └── reset-password <id> <user>  # Reset password
+├── health                 # Health check
+└── info                   # API version info
+```
+
+#### Tenant Management
+
+```bash
+# List all tenants
 pgtikv-ctl tenants list
 
-# Create tenant
-pgtikv-ctl tenants create --admin-user admin
+# Filter by state, search, paginate
+pgtikv-ctl tenants list --state ACTIVE -q "production" --page 1 --size 20
 
-# Get tenant details
+# Get tenant details (shows endpoints, tags, notes)
 pgtikv-ctl tenants get <tenant_id>
 
-# Connect to tenant (get session for user management)
-pgtikv-ctl connect <tenant_id> --admin-user admin --admin-password secret
+# Create tenant (auto-generates password if omitted)
+pgtikv-ctl tenants create
+pgtikv-ctl tenants create --admin-user dbadmin --admin-password mypass123
 
-# List users (requires session)
-pgtikv-ctl users list <tenant_id> --session <session_id>
+# Update metadata
+pgtikv-ctl tenants update <tenant_id> --notes "Production DB" --tags "prod,cn-east"
+pgtikv-ctl tenants update <tenant_id> --tags ""   # clear tags
 
-# Create user
-pgtikv-ctl users create <tenant_id> --username myuser --session <session_id>
+# Remove tenant (ACTIVE → DISABLING → DISABLED)
+pgtikv-ctl tenants remove <tenant_id>
+```
 
-# Health check
+> **Note**: TiKV keyspaces can only be disabled, not physically deleted. Data is retained.
+
+#### Session & User Management
+
+User management requires a tenant session obtained via `connect`:
+
+```bash
+# 1. Get session
+pgtikv-ctl connect <tenant_id> --admin-user admin --admin-password <password>
+# → Session:  e3f4a5b6c7d8...
+# → Expires:  2026-02-08 23:25
+
+# Tip: capture session in a variable
+SESSION=$(pgtikv-ctl --json connect <tenant_id> \
+  --admin-user admin --admin-password <password> \
+  | jq -r .session_id)
+
+# 2. List users
+pgtikv-ctl users list <tenant_id> --session $SESSION
+
+# 3. Create user (auto-generates password if omitted)
+pgtikv-ctl users create <tenant_id> --username appuser --session $SESSION
+pgtikv-ctl users create <tenant_id> --username dbadmin --password secret --superuser --session $SESSION
+
+# 4. Reset password
+pgtikv-ctl users reset-password <tenant_id> appuser --session $SESSION
+
+# 5. Delete user
+pgtikv-ctl users delete <tenant_id> appuser --session $SESSION
+```
+
+Sessions expire after 1 hour by default (configured by `PGTIKV_SESSION_TTL_HOURS`).
+
+#### System Commands
+
+```bash
+pgtikv-ctl health          # Status: ok  PD: ✓
+pgtikv-ctl info            # pg-tikv Admin API v2.0.0
+```
+
+#### End-to-End Example
+
+```bash
+export PGTIKV_API_URL=http://localhost:8090/api
+
+# Check service health
 pgtikv-ctl health
 
-# JSON output
-pgtikv-ctl --json tenants list
+# Create a tenant
+pgtikv-ctl tenants create --admin-user admin
+# → Tenant created: x9y8z7w6v5u4
+# → Admin password: aB3$kL9mP2xQ
+# → Connection:     psql -h pg.example.com -p 5433 -U x9y8z7w6v5u4.admin
+
+# Get session
+SESSION=$(pgtikv-ctl --json connect x9y8z7w6v5u4 \
+  --admin-user admin --admin-password 'aB3$kL9mP2xQ' \
+  | jq -r .session_id)
+
+# Create an application user
+pgtikv-ctl users create x9y8z7w6v5u4 --username appuser --session $SESSION
+
+# Verify
+pgtikv-ctl users list x9y8z7w6v5u4 --session $SESSION
+
+# Connect to the database
+psql -h pg.example.com -p 5433 -U x9y8z7w6v5u4.appuser
+```
+
+#### Error Handling
+
+The CLI exits with code 1 on any API or connection error:
+
+```bash
+$ pgtikv-ctl tenants get nonexistent
+Error 404: Tenant not found
+
+$ pgtikv-ctl --api-url http://unreachable:8090/api health
+Connection failed: error sending request for url (http://unreachable:8090/api/health)
 ```
 
 ### Frontend
