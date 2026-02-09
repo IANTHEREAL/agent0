@@ -32,7 +32,7 @@ pub async fn list_users(
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
     let users = pg
-        .list_users(&tenant.keyspace, &session.admin_user, &session.admin_password)
+        .list_users(&tenant.id, &session.admin_user, &session.admin_password)
         .await;
 
     Ok(Json(users))
@@ -57,7 +57,7 @@ pub async fn create_user(
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
     let success = pg
         .create_user(
-            &tenant.keyspace,
+            &tenant.id,
             &session.admin_user,
             &session.admin_password,
             &request.username,
@@ -87,7 +87,7 @@ pub async fn create_user(
             password,
             connection: format!(
                 "psql -h {} -p {} -U {}.{}",
-                state.config.pg_host, state.config.pg_port, tenant.keyspace, request.username
+                state.config.pg_host, state.config.pg_port, tenant.id, request.username
             ),
         }),
     ))
@@ -107,7 +107,7 @@ pub async fn delete_user(
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
     let success = pg
-        .drop_user(&tenant.keyspace, &session.admin_user, &session.admin_password, &username)
+        .drop_user(&tenant.id, &session.admin_user, &session.admin_password, &username)
         .await;
 
     if !success {
@@ -146,7 +146,7 @@ pub async fn reset_password(
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
     let success = pg
         .reset_password(
-            &tenant.keyspace,
+            &tenant.id,
             &session.admin_user,
             &session.admin_password,
             &username,

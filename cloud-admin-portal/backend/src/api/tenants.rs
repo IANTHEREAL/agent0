@@ -86,7 +86,7 @@ pub async fn create_tenant(
     }
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-    if !pg.bootstrap_admin_password(&keyspace, &admin_user, &password).await {
+    if !pg.bootstrap_admin_password(&tenant_id, &admin_user, &password).await {
         db::update_tenant_state(
             &state.db, &tenant_id, tenant_state::CREATE_FAILED,
             Some("Keyspace created but password bootstrap failed"),
@@ -136,13 +136,6 @@ pub async fn get_tenant(
     let tenant = db::get_tenant(&state.db, &tenant_id)
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
-
-    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
-    if pd.get_keyspace(&tenant.keyspace).await.is_none() {
-        return Err(AppError::not_found(format!(
-            "Tenant '{tenant_id}' keyspace not found in TiKV"
-        )));
-    }
 
     let endpoint_tuples = state.config.parse_public_endpoints();
     let endpoints: Vec<Endpoint> = endpoint_tuples
@@ -309,13 +302,13 @@ pub async fn connect_tenant(
     }
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-    if !pg.test_connection(&tenant.keyspace, &request.admin_user, &request.admin_password).await {
+    if !pg.test_connection(&tenant_id, &request.admin_user, &request.admin_password).await {
         return Err(AppError::unauthorized("Invalid tenant credentials"));
     }
 
     let session = state.sessions.create_session(
         &tenant_id,
-        &tenant.keyspace,
+        &tenant_id,
         &request.admin_user,
         &request.admin_password,
     );
@@ -348,7 +341,7 @@ pub async fn execute_query(
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
     match pg
-        .run_sql(&session.keyspace, &session.admin_user, &session.admin_password, &sql)
+        .run_sql(&session.tenant_id, &session.admin_user, &session.admin_password, &sql)
         .await
     {
         Ok(output) => Ok(Json(SqlQueryResponse {
@@ -371,7 +364,7 @@ pub async fn get_observability(
     _auth: ApiKeyAuth,
     Path(tenant_id): Path<String>,
 ) -> Result<Json<TenantObservabilityResponse>, AppError> {
-    let tenant = db::get_tenant(&state.db, &tenant_id)
+    db::get_tenant(&state.db, &tenant_id)
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
 
@@ -387,7 +380,7 @@ pub async fn get_observability(
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
 
     let summary_val = pg
-        .get_observability_summary(&tenant.keyspace, &cred.username, &cred.password_enc)
+        .get_observability_summary(&tenant_id, &cred.username, &cred.password_enc)
         .await
         .map_err(|e| AppError::bad_gateway(e))?
         .ok_or_else(|| AppError::bad_gateway("Failed to fetch observability summary"))?;
@@ -405,7 +398,7 @@ pub async fn get_observability(
     };
 
     let samples_val = pg
-        .get_observability_samples(&tenant.keyspace, &cred.username, &cred.password_enc)
+        .get_observability_samples(&tenant_id, &cred.username, &cred.password_enc)
         .await;
 
     let samples: Vec<QuerySample> = samples_val
@@ -444,7 +437,7 @@ pub async fn bootstrap_observability(
     }
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-    if !pg.test_connection(&tenant.keyspace, &request.admin_user, &request.admin_password).await {
+    if !pg.test_connection(&tenant_id, &request.admin_user, &request.admin_password).await {
         return Err(AppError::unauthorized("Invalid tenant credentials"));
     }
 
@@ -452,7 +445,7 @@ pub async fn bootstrap_observability(
 
     let created = pg
         .create_user(
-            &tenant.keyspace,
+            &tenant_id,
             &request.admin_user,
             &request.admin_password,
             OBSERVABILITY_USER,
@@ -464,7 +457,7 @@ pub async fn bootstrap_observability(
     if !created {
         let rotated = pg
             .reset_password(
-                &tenant.keyspace,
+                &tenant_id,
                 &request.admin_user,
                 &request.admin_password,
                 OBSERVABILITY_USER,

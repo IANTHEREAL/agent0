@@ -51,19 +51,25 @@ export function TenantLayout() {
             <ArrowLeft className="w-3 h-3" />
             Back to Tenants
           </Link>
-          <h2 className="text-base font-semibold font-mono">t{tenantId}</h2>
+          <h2 className="text-base font-semibold font-mono">{tenantId}</h2>
           <span
             className={cn(
               "inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full text-[10px] mt-1 w-fit",
-              tenant.state === "ENABLED"
+              tenant.state === "ACTIVE"
                 ? "bg-green-500/10 text-green-600"
-                : "bg-red-500/10 text-red-600"
+                : tenant.state === "CREATING" || tenant.state === "DISABLING"
+                  ? "bg-amber-500/10 text-amber-600"
+                  : "bg-red-500/10 text-red-600"
             )}
           >
             <span
               className={cn(
                 "w-1 h-1 rounded-full",
-                tenant.state === "ENABLED" ? "bg-green-500" : "bg-red-500"
+                tenant.state === "ACTIVE"
+                  ? "bg-green-500"
+                  : tenant.state === "CREATING" || tenant.state === "DISABLING"
+                    ? "bg-amber-500"
+                    : "bg-red-500"
               )}
             />
             {tenant.state}

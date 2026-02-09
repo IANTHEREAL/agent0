@@ -1,14 +1,19 @@
-import { Activity, AlertTriangle, Clock, Gauge, Users } from "lucide-react"
-import { useTenantObservability } from "@/api/tenants"
+import { useState } from "react"
+import { Activity, AlertTriangle, Clock, Gauge, Loader2, Users, Zap } from "lucide-react"
+import { useTenantObservability, bootstrapTenantObservabilityUser } from "@/api/tenants"
 import { ApiError } from "@/api/client"
 import { useSortableData } from "@/hooks/useSortableData"
+import { useQueryClient } from "@tanstack/react-query"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Button } from "@/components/ui/button"
 import { SortableHeader } from "@/components/ui/sortable-header"
 import { cn } from "@/lib/utils"
 import type { QuerySample } from "@/types"
 
 type Props = {
   tenantId: string
+  adminUser?: string
+  adminPassword?: string
 }
 
 type SampleSortKey = "query" | "sample_count" | "latency_p99_ms" | "latency_avg_ms" | "last_seen_ms_ago"
@@ -47,9 +52,11 @@ function formatAge(ms: number) {
   return `${Math.round(ms / (60 * 60_000))}h`
 }
 
-export function TenantObservabilityCard({ tenantId }: Props) {
+export function TenantObservabilityCard({ tenantId, adminUser, adminPassword }: Props) {
   const { data, isLoading, error } = useTenantObservability(tenantId)
   const apiError = error instanceof ApiError ? error : null
+  const queryClient = useQueryClient()
+  const [bootstrapping, setBootstrapping] = useState(false)
 
   const { sortedData: sortedSamples, requestSort, getSortDirection } = useSortableData<QuerySample, SampleSortKey>(
     data?.samples,
@@ -73,11 +80,34 @@ export function TenantObservabilityCard({ tenantId }: Props) {
             Loading metrics...
           </div>
         ) : error || !data ? (
-          <div className="flex items-center gap-2 text-xs text-muted-foreground rounded-lg border border-border/50 bg-muted/20 px-3 py-2">
-            <AlertTriangle className="h-4 w-4" />
-            {apiError?.status === 409
-              ? "Observability account is not bootstrapped for this tenant"
-              : "Failed to load metrics"}
+          <div className="flex items-center justify-between text-xs text-muted-foreground rounded-lg border border-border/50 bg-muted/20 px-3 py-2">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4" />
+              {apiError?.status === 409
+                ? "Observability account is not bootstrapped for this tenant"
+                : "Failed to load metrics"}
+            </div>
+            {apiError?.status === 409 && adminUser && adminPassword && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="h-7 text-xs gap-1.5"
+                disabled={bootstrapping}
+                onClick={async () => {
+                  setBootstrapping(true)
+                  try {
+                    await bootstrapTenantObservabilityUser(tenantId, adminUser, adminPassword)
+                    queryClient.invalidateQueries({ queryKey: ["tenant-observability", tenantId] })
+                  } catch {
+                  } finally {
+                    setBootstrapping(false)
+                  }
+                }}
+              >
+                {bootstrapping ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
+                Bootstrap
+              </Button>
+            )}
           </div>
         ) : (
           <>

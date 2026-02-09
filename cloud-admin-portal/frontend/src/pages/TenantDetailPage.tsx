@@ -496,7 +496,11 @@ export function TenantDetailPage() {
         </CardContent>
       </Card>
 
-      <TenantObservabilityCard tenantId={tenantId!} />
+      <TenantObservabilityCard
+        tenantId={tenantId!}
+        adminUser={isConnected ? adminUser : undefined}
+        adminPassword={isConnected ? adminPassword : undefined}
+      />
 
       <CreateUserDialog
         tenantId={tenantId!}

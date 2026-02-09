@@ -11,10 +11,10 @@ impl PgClient {
         Self { host: host.to_string(), port }
     }
 
-    async fn connect(&self, keyspace: &str, user: &str, password: &str) -> Result<tokio_postgres::Client, String> {
+    async fn connect(&self, tenant_id: &str, user: &str, password: &str) -> Result<tokio_postgres::Client, String> {
         let connstr = format!(
             "host={} port={} user={}.{} password={} dbname=postgres",
-            self.host, self.port, keyspace, user, password
+            self.host, self.port, tenant_id, user, password
         );
         let (client, conn) = tokio_postgres::connect(&connstr, NoTls)
             .await
@@ -42,12 +42,15 @@ impl PgClient {
         false
     }
 
-    pub async fn list_users(&self, keyspace: &str, admin_user: &str, admin_password: &str) -> Vec<UserResponse> {
-        let client = match self.connect(keyspace, admin_user, admin_password).await {
+    pub async fn list_users(&self, tenant_id: &str, admin_user: &str, admin_password: &str) -> Vec<UserResponse> {
+        let client = match self.connect(tenant_id, admin_user, admin_password).await {
             Ok(c) => c,
             Err(e) => { tracing::warn!("list_users connect failed: {e}"); return Vec::new(); }
         };
-        match client.query("SELECT * FROM _pgtikv_sys_users()", &[]).await {
+        match client.query(
+            "SELECT rolname, rolsuper, rolcanlogin, rolcreatedb, rolcreaterole FROM pg_roles",
+            &[],
+        ).await {
             Ok(rows) => rows.iter().map(|r| {
                 UserResponse {
                     name: r.get::<_, String>(0),
@@ -70,7 +73,7 @@ impl PgClient {
             Err(_) => return false,
         };
         let su = if superuser { " SUPERUSER" } else { "" };
-        let sql = format!("CREATE USER {new_user} WITH PASSWORD '{new_password}'{su}");
+        let sql = format!("CREATE ROLE {new_user} WITH LOGIN PASSWORD '{new_password}'{su}");
         client.simple_query(&sql).await.is_ok()
     }
 
@@ -79,7 +82,7 @@ impl PgClient {
             Ok(c) => c,
             Err(_) => return false,
         };
-        client.simple_query(&format!("DROP USER {username}")).await.is_ok()
+        client.simple_query(&format!("DROP ROLE {username}")).await.is_ok()
     }
 
     pub async fn reset_password(
@@ -90,7 +93,7 @@ impl PgClient {
             Ok(c) => c,
             Err(_) => return false,
         };
-        client.simple_query(&format!("ALTER USER {target_user} WITH PASSWORD '{new_password}'")).await.is_ok()
+        client.simple_query(&format!("ALTER ROLE {target_user} WITH PASSWORD '{new_password}'")).await.is_ok()
     }
 
     pub async fn run_sql(&self, keyspace: &str, user: &str, password: &str, sql: &str) -> Result<String, String> {
