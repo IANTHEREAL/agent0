@@ -73,7 +73,7 @@ modules:
         symbols: [parse_sql]
       - path: src/sql/planner.rs
         symbols: [choose_join_algorithm]
-      - path: src/sql/executor/core.rs
+      - path: src/sql/executor/core/mod.rs
         symbols: [Executor]
       - path: src/sql/expr/mod.rs
         symbols: [eval_expr, eval_join_expr]
