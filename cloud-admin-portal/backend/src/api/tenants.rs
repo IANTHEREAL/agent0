@@ -9,7 +9,7 @@ use crate::error::AppError;
 use crate::models::*;
 use crate::services::pd_client::PdClient;
 use crate::services::pg_client::PgClient;
-use crate::{tenant_state, AppState, DEFAULT_ADMIN_USER, DEFAULT_PG_PORT, OBSERVABILITY_USER, TENANT_ID_LEN};
+use crate::{tenant_state, AppState, DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USER, DEFAULT_PG_PORT, OBSERVABILITY_USER, TENANT_ID_LEN};
 
 fn generate_tenant_id() -> String {
     let mut rng = rand::thread_rng();
@@ -86,7 +86,7 @@ pub async fn create_tenant(
     }
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-    if !pg.bootstrap_admin_password(&tenant_id, &admin_user, &password).await {
+    if !pg.bootstrap_admin_password(&tenant_id, &admin_user, DEFAULT_ADMIN_PASSWORD, &password).await {
         db::update_tenant_state(
             &state.db, &tenant_id, tenant_state::CREATE_FAILED,
             Some("Keyspace created but password bootstrap failed"),
@@ -294,20 +294,12 @@ pub async fn connect_tenant(
         return Err(AppError::forbidden("Tenant is suspended"));
     }
 
-    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
-    if pd.get_keyspace(&tenant.keyspace).await.is_none() {
-        return Err(AppError::not_found(format!(
-            "Tenant '{tenant_id}' keyspace not found"
-        )));
-    }
-
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
     if !pg.test_connection(&tenant_id, &request.admin_user, &request.admin_password).await {
         return Err(AppError::unauthorized("Invalid tenant credentials"));
     }
 
     let session = state.sessions.create_session(
-        &tenant_id,
         &tenant_id,
         &request.admin_user,
         &request.admin_password,
@@ -368,7 +360,7 @@ pub async fn get_observability(
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
 
-    let cred = db::get_credential(&state.db, &tenant_id, "OBSERVABILITY")
+    let cred = db::get_credential(&state.db, &tenant_id, "OBSERVABILITY", state.config.credential_key.as_deref())
         .await?
         .ok_or_else(|| {
             AppError::new(
@@ -380,9 +372,15 @@ pub async fn get_observability(
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
 
     let summary_val = pg
-        .get_observability_summary(&tenant_id, &cred.username, &cred.password_enc)
+        .get_observability_summary(&tenant_id, &cred.username, &cred.password_plain)
         .await
-        .map_err(|e| AppError::bad_gateway(e))?
+        .map_err(|e| {
+            tracing::warn!("observability query failed for tenant {tenant_id}: {e}");
+            AppError::new(
+                StatusCode::CONFLICT,
+                "Observer credential may be stale. Please re-bootstrap observability.",
+            )
+        })?
         .ok_or_else(|| AppError::bad_gateway("Failed to fetch observability summary"))?;
 
     let summary = ObservabilitySummary {
@@ -398,7 +396,7 @@ pub async fn get_observability(
     };
 
     let samples_val = pg
-        .get_observability_samples(&tenant_id, &cred.username, &cred.password_enc)
+        .get_observability_samples(&tenant_id, &cred.username, &cred.password_plain)
         .await;
 
     let samples: Vec<QuerySample> = samples_val
@@ -425,16 +423,9 @@ pub async fn bootstrap_observability(
     Path(tenant_id): Path<String>,
     Json(request): Json<TenantConnectRequest>,
 ) -> Result<Json<MessageResponse>, AppError> {
-    let tenant = db::get_tenant(&state.db, &tenant_id)
+    db::get_tenant(&state.db, &tenant_id)
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
-
-    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
-    if pd.get_keyspace(&tenant.keyspace).await.is_none() {
-        return Err(AppError::not_found(format!(
-            "Tenant '{tenant_id}' keyspace not found"
-        )));
-    }
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
     if !pg.test_connection(&tenant_id, &request.admin_user, &request.admin_password).await {
@@ -471,7 +462,7 @@ pub async fn bootstrap_observability(
         }
     }
 
-    db::upsert_credential(&state.db, &tenant_id, "OBSERVABILITY", OBSERVABILITY_USER, &obs_password)
+    db::upsert_credential(&state.db, &tenant_id, "OBSERVABILITY", OBSERVABILITY_USER, &obs_password, state.config.credential_key.as_deref())
         .await?;
 
     Ok(Json(MessageResponse {

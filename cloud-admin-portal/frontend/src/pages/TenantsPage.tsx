@@ -6,7 +6,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { useToast } from "@/components/ui/use-toast"
-import { cn } from "@/lib/utils"
+import { cn, formatDate } from "@/lib/utils"
 import { CreateTenantDialog } from "@/components/tenants/CreateTenantDialog"
 import { EditTenantMetadataDialog } from "@/components/tenants/EditTenantMetadataDialog"
 import { ConfirmDialog } from "@/components/common/ConfirmDialog"
@@ -174,9 +174,7 @@ export function TenantsPage() {
                         </td>
                         <td className="px-3 py-2.5">
                           <span className="text-xs text-muted-foreground">
-                            {tenant.created_at
-                              ? new Date(tenant.created_at.endsWith("Z") ? tenant.created_at : tenant.created_at + "Z").toLocaleString()
-                              : "-"}
+                            {formatDate(tenant.created_at)}
                           </span>
                         </td>
                         <td className="px-3 py-2.5">

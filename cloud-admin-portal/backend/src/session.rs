@@ -8,7 +8,6 @@ use rand::Rng;
 pub struct TenantSession {
     pub session_id: String,
     pub tenant_id: String,
-    pub keyspace: String,
     pub admin_user: String,
     pub admin_password: String,
     pub expires_at: String,
@@ -30,7 +29,6 @@ impl SessionManager {
     pub fn create_session(
         &self,
         tenant_id: &str,
-        keyspace: &str,
         admin_user: &str,
         admin_password: &str,
     ) -> TenantSession {
@@ -40,7 +38,6 @@ impl SessionManager {
         let session = TenantSession {
             session_id: session_id.clone(),
             tenant_id: tenant_id.to_string(),
-            keyspace: keyspace.to_string(),
             admin_user: admin_user.to_string(),
             admin_password: admin_password.to_string(),
             expires_at,
@@ -77,8 +74,7 @@ impl SessionManager {
 }
 
 fn generate_session_id() -> String {
-    let mut rng = rand::thread_rng();
-    (0..32)
-        .map(|_| format!("{:x}", rng.gen::<u8>() % 16))
-        .collect()
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

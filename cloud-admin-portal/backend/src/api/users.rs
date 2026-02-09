@@ -10,6 +10,12 @@ use crate::models::*;
 use crate::services::pg_client::PgClient;
 use crate::AppState;
 
+const SYSTEM_USER_PREFIX: &str = "_pgtikv_sys_";
+
+fn is_protected_user(username: &str, session_admin_user: &str) -> bool {
+    username.starts_with(SYSTEM_USER_PREFIX) || username == session_admin_user
+}
+
 fn generate_password() -> String {
     let mut rng = rand::thread_rng();
     let charset = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";
@@ -31,9 +37,12 @@ pub async fn list_users(
         .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-    let users = pg
+    let users: Vec<UserResponse> = pg
         .list_users(&tenant.id, &session.admin_user, &session.admin_password)
-        .await;
+        .await
+        .into_iter()
+        .filter(|u| !u.name.starts_with(SYSTEM_USER_PREFIX))
+        .collect();
 
     Ok(Json(users))
 }
@@ -101,6 +110,10 @@ pub async fn delete_user(
 ) -> Result<Json<MessageResponse>, AppError> {
     let session = TenantSessionExtractor::from_headers(&headers, &tenant_id, &state)?;
 
+    if is_protected_user(&username, &session.admin_user) {
+        return Err(AppError::forbidden(format!("Cannot delete protected user '{username}'")));
+    }
+
     let tenant = db::get_tenant(&state.db, &tenant_id)
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
@@ -136,6 +149,10 @@ pub async fn reset_password(
     headers: HeaderMap,
 ) -> Result<Json<PasswordResetResponse>, AppError> {
     let session = TenantSessionExtractor::from_headers(&headers, &tenant_id, &state)?;
+
+    if is_protected_user(&username, &session.admin_user) {
+        return Err(AppError::forbidden(format!("Cannot reset password for protected user '{username}'")));
+    }
 
     let tenant = db::get_tenant(&state.db, &tenant_id)
         .await?

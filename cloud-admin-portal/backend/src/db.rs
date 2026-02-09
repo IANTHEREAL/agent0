@@ -1,8 +1,29 @@
 use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
 
+use crate::crypto;
 use crate::models::{CredentialRow, TenantRow};
 use crate::tenant_state;
+
+fn encrypt_password(password: &str, key: Option<&str>) -> String {
+    match key {
+        Some(k) => crypto::encrypt(password, k).unwrap_or_else(|e| {
+            tracing::error!("credential encryption failed: {e}");
+            password.to_string()
+        }),
+        None => password.to_string(),
+    }
+}
+
+fn decrypt_password(stored: &str, key: Option<&str>) -> String {
+    match key {
+        Some(k) => crypto::decrypt(stored, k).unwrap_or_else(|e| {
+            tracing::warn!("credential decryption failed (might be plaintext): {e}");
+            stored.to_string()
+        }),
+        None => stored.to_string(),
+    }
+}
 
 pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
     sqlx::any::install_default_drivers();
@@ -76,7 +97,7 @@ pub async fn create_tables(pool: &AnyPool) -> Result<(), sqlx::Error> {
         tenant_id TEXT NOT NULL,
         credential_type TEXT NOT NULL,
         username TEXT NOT NULL,
-        password_enc TEXT NOT NULL,
+        password_plain TEXT NOT NULL,
         key_version INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL,
         rotated_at TEXT,
@@ -258,9 +279,10 @@ pub async fn get_credential(
     pool: &AnyPool,
     tenant_id: &str,
     cred_type: &str,
+    credential_key: Option<&str>,
 ) -> Result<Option<CredentialRow>, sqlx::Error> {
     let sql = adapt_sql(
-        "SELECT id, tenant_id, credential_type, username, password_enc FROM tenant_credentials WHERE tenant_id = $1 AND credential_type = $2",
+        "SELECT id, tenant_id, credential_type, username, password_plain FROM tenant_credentials WHERE tenant_id = $1 AND credential_type = $2",
         pool,
     );
     let row = sqlx::query(&sql)
@@ -268,12 +290,15 @@ pub async fn get_credential(
         .bind(cred_type)
         .fetch_optional(pool)
         .await?;
-    Ok(row.map(|r| CredentialRow {
-        id: r.get("id"),
-        tenant_id: r.get("tenant_id"),
-        credential_type: r.get("credential_type"),
-        username: r.get("username"),
-        password_enc: r.get("password_enc"),
+    Ok(row.map(|r| {
+        let stored: String = r.get("password_plain");
+        CredentialRow {
+            id: r.get("id"),
+            tenant_id: r.get("tenant_id"),
+            credential_type: r.get("credential_type"),
+            username: r.get("username"),
+            password_plain: decrypt_password(&stored, credential_key),
+        }
     }))
 }
 
@@ -283,20 +308,22 @@ pub async fn upsert_credential(
     cred_type: &str,
     username: &str,
     password: &str,
+    credential_key: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    let existing = get_credential(pool, tenant_id, cred_type).await?;
+    let encrypted = encrypt_password(password, credential_key);
+    let existing = get_credential(pool, tenant_id, cred_type, credential_key).await?;
     let now = chrono::Utc::now().to_rfc3339();
 
     if let Some(cred) = existing {
         let sql = adapt_sql(
-            "UPDATE tenant_credentials SET password_enc = $1, rotated_at = $2 WHERE id = $3",
+            "UPDATE tenant_credentials SET password_plain = $1, rotated_at = $2 WHERE id = $3",
             pool,
         );
-        sqlx::query(&sql).bind(password).bind(&now).bind(&cred.id).execute(pool).await?;
+        sqlx::query(&sql).bind(&encrypted).bind(&now).bind(&cred.id).execute(pool).await?;
     } else {
         let id = uuid::Uuid::new_v4().to_string();
         let sql = adapt_sql(
-            "INSERT INTO tenant_credentials (id, tenant_id, credential_type, username, password_enc, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+            "INSERT INTO tenant_credentials (id, tenant_id, credential_type, username, password_plain, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
             pool,
         );
         sqlx::query(&sql)
@@ -304,7 +331,7 @@ pub async fn upsert_credential(
             .bind(tenant_id)
             .bind(cred_type)
             .bind(username)
-            .bind(password)
+            .bind(&encrypted)
             .bind(&now)
             .execute(pool)
             .await?;

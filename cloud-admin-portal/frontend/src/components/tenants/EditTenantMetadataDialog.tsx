@@ -17,6 +17,7 @@ import {
 } from "@/components/ui/dialog"
 import { useToast } from "@/components/ui/use-toast"
 import { ApiError } from "@/api/client"
+import { formatDate } from "@/lib/utils"
 import type { Tenant } from "@/types"
 
 interface EditTenantMetadataDialogProps {
@@ -122,10 +123,10 @@ export function EditTenantMetadataDialog({
 
           {tenant.created_at && (
             <div className="text-xs text-muted-foreground pt-2 border-t">
-              <p>Created: {new Date(tenant.created_at).toLocaleString()}</p>
+              <p>Created: {formatDate(tenant.created_at)}</p>
               {tenant.created_by && <p>Created by: {tenant.created_by}</p>}
               {tenant.updated_at && (
-                <p>Last updated: {new Date(tenant.updated_at).toLocaleString()}</p>
+                <p>Last updated: {formatDate(tenant.updated_at)}</p>
               )}
             </div>
           )}

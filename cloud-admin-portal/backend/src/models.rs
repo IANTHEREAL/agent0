@@ -234,5 +234,5 @@ pub struct CredentialRow {
     pub tenant_id: String,
     pub credential_type: String,
     pub username: String,
-    pub password_enc: String,
+    pub password_plain: String,
 }

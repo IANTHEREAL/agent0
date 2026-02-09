@@ -6,6 +6,33 @@ pub struct PgClient {
     port: u16,
 }
 
+/// Validate a SQL identifier (username/role name).
+/// Only allows alphanumeric + underscore, must be non-empty, max 63 chars.
+fn validate_identifier(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("Identifier cannot be empty".into());
+    }
+    if name.len() > 63 {
+        return Err("Identifier too long (max 63 chars)".into());
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(format!("Invalid identifier '{}': only [a-zA-Z0-9_] allowed", name));
+    }
+    Ok(())
+}
+
+/// Escape a value for use inside a SQL single-quoted string literal.
+/// Doubles any single-quote characters.
+fn escape_sql_string(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Escape a value for use in a libpq connection string.
+/// Wraps in single quotes, escaping backslashes and single quotes.
+fn escape_connstr_value(s: &str) -> String {
+    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
 impl PgClient {
     pub fn new(host: &str, port: u16) -> Self {
         Self { host: host.to_string(), port }
@@ -13,8 +40,11 @@ impl PgClient {
 
     async fn connect(&self, tenant_id: &str, user: &str, password: &str) -> Result<tokio_postgres::Client, String> {
         let connstr = format!(
-            "host={} port={} user={}.{} password={} dbname=postgres",
-            self.host, self.port, tenant_id, user, password
+            "host={} port={} user={} password={} dbname=postgres",
+            escape_connstr_value(&self.host),
+            self.port,
+            escape_connstr_value(&format!("{}.{}", tenant_id, user)),
+            escape_connstr_value(password),
         );
         let (client, conn) = tokio_postgres::connect(&connstr, NoTls)
             .await
@@ -30,13 +60,25 @@ impl PgClient {
         }
     }
 
-    pub async fn bootstrap_admin_password(&self, keyspace: &str, user: &str, password: &str) -> bool {
-        for attempt in 0..3 {
+    pub async fn bootstrap_admin_password(
+        &self, keyspace: &str, user: &str,
+        default_password: &str, desired_password: &str,
+    ) -> bool {
+        // If desired password already works, nothing to do
+        if self.test_connection(keyspace, user, desired_password).await {
+            return true;
+        }
+
+        // Wait for keyspace to become available, then connect with default password
+        for attempt in 0..5 {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
-            if self.test_connection(keyspace, user, password).await {
-                return true;
+            if self.test_connection(keyspace, user, default_password).await {
+                // Change password to desired one
+                return self
+                    .reset_password(keyspace, user, default_password, user, desired_password)
+                    .await;
             }
         }
         false
@@ -68,16 +110,27 @@ impl PgClient {
         &self, keyspace: &str, admin_user: &str, admin_password: &str,
         new_user: &str, new_password: &str, superuser: bool,
     ) -> bool {
+        if let Err(e) = validate_identifier(new_user) {
+            tracing::warn!("create_user rejected: {e}");
+            return false;
+        }
         let client = match self.connect(keyspace, admin_user, admin_password).await {
             Ok(c) => c,
             Err(_) => return false,
         };
         let su = if superuser { " SUPERUSER" } else { "" };
-        let sql = format!("CREATE ROLE {new_user} WITH LOGIN PASSWORD '{new_password}'{su}");
+        let sql = format!(
+            "CREATE ROLE {new_user} WITH LOGIN PASSWORD '{}'{su}",
+            escape_sql_string(new_password),
+        );
         client.simple_query(&sql).await.is_ok()
     }
 
     pub async fn drop_user(&self, keyspace: &str, admin_user: &str, admin_password: &str, username: &str) -> bool {
+        if let Err(e) = validate_identifier(username) {
+            tracing::warn!("drop_user rejected: {e}");
+            return false;
+        }
         let client = match self.connect(keyspace, admin_user, admin_password).await {
             Ok(c) => c,
             Err(_) => return false,
@@ -89,11 +142,19 @@ impl PgClient {
         &self, keyspace: &str, admin_user: &str, admin_password: &str,
         target_user: &str, new_password: &str,
     ) -> bool {
+        if let Err(e) = validate_identifier(target_user) {
+            tracing::warn!("reset_password rejected: {e}");
+            return false;
+        }
         let client = match self.connect(keyspace, admin_user, admin_password).await {
             Ok(c) => c,
             Err(_) => return false,
         };
-        client.simple_query(&format!("ALTER ROLE {target_user} WITH PASSWORD '{new_password}'")).await.is_ok()
+        let sql = format!(
+            "ALTER ROLE {target_user} WITH PASSWORD '{}'",
+            escape_sql_string(new_password),
+        );
+        client.simple_query(&sql).await.is_ok()
     }
 
     pub async fn run_sql(&self, keyspace: &str, user: &str, password: &str, sql: &str) -> Result<String, String> {

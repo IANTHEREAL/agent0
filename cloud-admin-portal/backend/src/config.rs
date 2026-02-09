@@ -16,6 +16,7 @@ pub struct Config {
     pub reconciler_enabled: bool,
     pub reconciler_interval_secs: u64,
     pub session_ttl_hours: u64,
+    pub credential_key: Option<String>,
 }
 
 impl Config {
@@ -66,6 +67,9 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
+            credential_key: env::var("PGTIKV_CREDENTIAL_KEY")
+                .ok()
+                .filter(|k| !k.is_empty()),
         }
     }
 

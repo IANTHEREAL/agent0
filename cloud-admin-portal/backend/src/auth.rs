@@ -46,7 +46,6 @@ impl FromRequestParts<AppState> for ApiKeyAuth {
 pub struct TenantSessionExtractor {
     pub session_id: String,
     pub tenant_id: String,
-    pub keyspace: String,
     pub admin_user: String,
     pub admin_password: String,
 }
@@ -66,7 +65,6 @@ impl TenantSessionExtractor {
         Ok(Self {
             session_id: session.session_id.clone(),
             tenant_id: session.tenant_id.clone(),
-            keyspace: session.keyspace.clone(),
             admin_user: session.admin_user.clone(),
             admin_password: session.admin_password.clone(),
         })

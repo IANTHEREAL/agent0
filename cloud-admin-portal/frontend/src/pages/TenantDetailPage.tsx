@@ -459,25 +459,31 @@ export function TenantDetailPage() {
                         )}
                       </td>
                       <td className="px-4 py-3">
-                        <div className="flex justify-end gap-1">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 text-xs gap-1 text-muted-foreground hover:text-foreground"
-                            onClick={() => handleResetPassword(user.name)}
-                          >
-                            <Key className="w-3.5 h-3.5" />
-                            Reset
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
-                            onClick={() => setConfirmDeleteUser(user.name)}
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </Button>
-                        </div>
+                        {user.name === adminUser ? (
+                          <div className="flex justify-end">
+                            <span className="text-[10px] text-muted-foreground/60 italic">protected</span>
+                          </div>
+                        ) : (
+                          <div className="flex justify-end gap-1">
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 text-xs gap-1 text-muted-foreground hover:text-foreground"
+                              onClick={() => handleResetPassword(user.name)}
+                            >
+                              <Key className="w-3.5 h-3.5" />
+                              Reset
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 w-7 p-0 text-muted-foreground hover:text-destructive hover:bg-destructive/10"
+                              onClick={() => setConfirmDeleteUser(user.name)}
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </Button>
+                          </div>
+                        )}
                       </td>
                     </tr>
                   ))}

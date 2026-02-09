@@ -1,6 +1,7 @@
 pub const KEYSPACE_PREFIX: &str = "tipg_tenant_";
 pub const TENANT_ID_LEN: usize = 12;
 pub const DEFAULT_ADMIN_USER: &str = "admin";
+pub const DEFAULT_ADMIN_PASSWORD: &str = "admin";
 pub const DEFAULT_PG_PORT: u16 = 5433;
 pub const OBSERVABILITY_USER: &str = "_pgtikv_sys_observer";
 
@@ -16,6 +17,7 @@ pub mod tenant_state {
 pub mod api;
 pub mod auth;
 pub mod config;
+pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod models;

@@ -41,7 +41,22 @@ impl PdClient {
         let url = format!("{}/pd/api/v2/keyspaces/{name}/state", self.base_url);
         let body = json!({ "action": "DISABLE" });
         match self.client.put(&url).json(&body).send().await {
-            Ok(resp) => resp.status().is_success(),
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return true;
+                }
+                // Already disabled or not found — treat as success for idempotent removal
+                if status == reqwest::StatusCode::NOT_FOUND
+                    || status == reqwest::StatusCode::CONFLICT
+                {
+                    tracing::info!("PD disable_keyspace {name}: {status} (treating as success)");
+                    return true;
+                }
+                let body_text = resp.text().await.unwrap_or_default();
+                tracing::warn!("PD disable_keyspace {name} failed: {status} {body_text}");
+                false
+            }
             Err(e) => { tracing::warn!("PD disable_keyspace failed: {e}"); false }
         }
     }

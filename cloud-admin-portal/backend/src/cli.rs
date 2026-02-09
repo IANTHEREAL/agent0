@@ -180,8 +180,8 @@ impl ApiClient {
                 } else {
                     let err: Value = serde_json::from_str(&text).unwrap_or_default();
                     let detail = err
-                        .get("detail")
-                        .or_else(|| err.get("message"))
+                        .get("message")
+                        .or_else(|| err.get("detail"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("Unknown error");
                     eprintln!("Error {}: {detail}", status.as_u16());
