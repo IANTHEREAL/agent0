@@ -1,14 +1,11 @@
 # pg-tikv Cloud Admin Portal - Production Docker Compose
-# Usage: docker-compose up -d
-
-version: "3.8"
+# Usage: docker compose up -d
 
 services:
-  # Nginx reverse proxy - serves frontend static files and proxies API
   nginx:
     image: nginx:alpine
     ports:
-      - "80:80"
+      - "${NGINX_PORT:-80}:80"
       - "443:443"
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
@@ -19,27 +16,33 @@ services:
       - backend
     restart: unless-stopped
 
-  # FastAPI backend
   backend:
     build:
       context: ../backend
       dockerfile: Dockerfile
     environment:
-      - PGTIKV_PD_ENDPOINTS=${PD_ENDPOINTS:-127.0.0.1:2379}
-      - PGTIKV_PG_HOST=${PG_HOST:-pg-tikv}
+      - PGTIKV_PD_ENDPOINTS=${PD_ENDPOINTS:-localhost:2379}
+      - PGTIKV_PG_HOST=${PG_HOST:-host.docker.internal}
       - PGTIKV_PG_PORT=${PG_PORT:-5433}
-      - PGTIKV_CORS_ORIGINS=["http://localhost", "https://admin.example.com"]
+      - PGTIKV_PG_PUBLIC_ENDPOINTS=${PG_PUBLIC_ENDPOINTS:-127.0.0.1:5433}
+      - PGTIKV_API_PORT=8090
+      - PGTIKV_API_HOST=0.0.0.0
+      - PGTIKV_DATABASE_URL=${DATABASE_URL:-sqlite://data/portal.db?mode=rwc}
+      - PGTIKV_API_KEYS=${API_KEYS:-}
+      - PGTIKV_CORS_ORIGINS=${CORS_ORIGINS:-http://localhost,https://admin.example.com}
+      - RUST_LOG=${RUST_LOG:-info}
     expose:
-      - "8080"
+      - "8090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8090/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 10s
 
-  # Frontend build stage (for building static files)
   frontend-builder:
     build:
       context: ../frontend

@@ -1,27 +1,22 @@
 # pg-tikv Cloud Admin Portal - Development Docker Compose
-# Usage: docker-compose -f docker-compose.dev.yml up
-
-version: "3.8"
+# Usage: docker compose -f docker-compose.dev.yml up
 
 services:
-  # FastAPI backend with hot reload
   backend:
     build:
       context: ../backend
       dockerfile: Dockerfile
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8080 --reload
     ports:
-      - "8080:8080"
+      - "${PGTIKV_API_PORT:-8090}:8090"
     environment:
-      - PGTIKV_PD_ENDPOINTS=${PD_ENDPOINTS:-127.0.0.1:2379}
+      - PGTIKV_PD_ENDPOINTS=${PD_ENDPOINTS:-localhost:2379}
       - PGTIKV_PG_HOST=${PG_HOST:-host.docker.internal}
       - PGTIKV_PG_PORT=${PG_PORT:-5433}
-      - PGTIKV_CORS_ORIGINS=["http://localhost:5173", "http://127.0.0.1:5173"]
-      - PGTIKV_DEBUG=true
-    volumes:
-      - ../backend/app:/app/app:ro
+      - PGTIKV_API_PORT=8090
+      - PGTIKV_API_HOST=0.0.0.0
+      - PGTIKV_CORS_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
+      - RUST_LOG=debug
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-  # Note: For development, run the frontend separately with `npm run dev`
-  # It will proxy API requests to the backend on port 8080
+  # Run frontend separately: cd frontend && npm run dev

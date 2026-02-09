@@ -30,33 +30,33 @@ cd "$PROJECT_DIR/deploy"
 case "${1:-start}" in
     start)
         echo -e "${GREEN}Starting services...${NC}"
-        docker-compose up -d
+        docker compose up -d
         echo -e "${GREEN}Services started${NC}"
-        docker-compose ps
+        docker compose ps
         ;;
     stop)
         echo -e "${YELLOW}Stopping services...${NC}"
-        docker-compose down
+        docker compose down
         echo -e "${GREEN}Services stopped${NC}"
         ;;
     restart)
         echo -e "${YELLOW}Restarting services...${NC}"
-        docker-compose restart
+        docker compose restart
         echo -e "${GREEN}Services restarted${NC}"
-        docker-compose ps
+        docker compose ps
         ;;
     status)
-        docker-compose ps
+        docker compose ps
         ;;
     logs)
-        docker-compose logs -f "${2:-}"
+        docker compose logs -f "${2:-}"
         ;;
     build)
         echo -e "${YELLOW}Building and starting services...${NC}"
         "$SCRIPT_DIR/build.sh"
-        docker-compose up -d
+        docker compose up -d
         echo -e "${GREEN}Services started${NC}"
-        docker-compose ps
+        docker compose ps
         ;;
     *)
         usage
