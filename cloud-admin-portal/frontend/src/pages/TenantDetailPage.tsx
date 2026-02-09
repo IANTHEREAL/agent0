@@ -254,14 +254,14 @@ export function TenantDetailPage() {
                       <div className="flex items-center gap-2">
                         <span className="text-[10px] text-muted-foreground uppercase tracking-wide font-medium min-w-[36px]">psql</span>
                         <code className="flex-1 bg-background/60 border border-border/30 px-3 py-2 rounded-md text-xs font-mono text-muted-foreground">
-                          psql -h {endpoint.host} -p {endpoint.port} -U t{tenantId}.admin -d postgres
+                          psql -h {endpoint.host} -p {endpoint.port} -U {tenantId}.admin -d postgres
                         </code>
                         <Button
                           variant="ghost"
                           size="sm"
                           className="h-8 w-8 p-0 hover:bg-primary/10"
                           onClick={() => copyConnectionString(
-                            `psql -h ${endpoint.host} -p ${endpoint.port} -U t${tenantId}.admin -d postgres`,
+                            `psql -h ${endpoint.host} -p ${endpoint.port} -U ${tenantId}.admin -d postgres`,
                             "psql"
                           )}
                         >
@@ -275,14 +275,14 @@ export function TenantDetailPage() {
                       <div className="flex items-center gap-2">
                         <span className="text-[10px] text-muted-foreground uppercase tracking-wide font-medium min-w-[36px]">DSN</span>
                         <code className="flex-1 bg-background/60 border border-border/30 px-3 py-2 rounded-md text-xs font-mono text-muted-foreground">
-                          postgresql://t{tenantId}.admin@{endpoint.host}:{endpoint.port}/postgres
+                          postgresql://{tenantId}.admin@{endpoint.host}:{endpoint.port}/postgres
                         </code>
                         <Button
                           variant="ghost"
                           size="sm"
                           className="h-8 w-8 p-0 hover:bg-primary/10"
                           onClick={() => copyConnectionString(
-                            `postgresql://t${tenantId}.admin@${endpoint.host}:${endpoint.port}/postgres`,
+                            `postgresql://${tenantId}.admin@${endpoint.host}:${endpoint.port}/postgres`,
                             "DSN"
                           )}
                         >

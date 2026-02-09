@@ -12,11 +12,25 @@ import type {
   TenantObservabilityResponse,
 } from "@/types"
 
-export function useTenants() {
+export interface TenantsQueryParams {
+  page?: number
+  size?: number
+  state?: string
+  q?: string
+}
+
+export function useTenants(params: TenantsQueryParams = {}) {
+  const searchParams = new URLSearchParams()
+  if (params.page) searchParams.set("page", String(params.page))
+  if (params.size) searchParams.set("size", String(params.size))
+  if (params.state) searchParams.set("state", params.state)
+  if (params.q) searchParams.set("q", params.q)
+  const qs = searchParams.toString()
+
   return useQuery({
-    queryKey: ["tenants"],
-    queryFn: () => apiRequest<TenantListResponse>("/tenants"),
-    select: (data) => data.items,
+    queryKey: ["tenants", params],
+    queryFn: () => apiRequest<TenantListResponse>(`/tenants${qs ? `?${qs}` : ""}`),
+    placeholderData: (prev) => prev,
   })
 }
 

@@ -9,20 +9,18 @@ use crate::error::AppError;
 use crate::models::*;
 use crate::services::pd_client::PdClient;
 use crate::services::pg_client::PgClient;
-use crate::AppState;
-
-const OBSERVABILITY_USER: &str = "_pgtikv_sys_observer";
+use crate::{tenant_state, AppState, DEFAULT_ADMIN_USER, DEFAULT_PG_PORT, OBSERVABILITY_USER, TENANT_ID_LEN};
 
 fn generate_tenant_id() -> String {
     let mut rng = rand::thread_rng();
     let charset = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    (0..12)
+    (0..TENANT_ID_LEN)
         .map(|_| charset[rng.gen_range(0..charset.len())] as char)
         .collect()
 }
 
 fn make_keyspace(id: &str) -> String {
-    format!("ks_{id}")
+    format!("{}{id}", crate::KEYSPACE_PREFIX)
 }
 
 fn generate_password() -> String {
@@ -65,7 +63,7 @@ pub async fn create_tenant(
 ) -> Result<(StatusCode, Json<CreateTenantResponse>), AppError> {
     let tenant_id = generate_tenant_id();
     let keyspace = make_keyspace(&tenant_id);
-    let admin_user = request.admin_user.unwrap_or_else(|| "admin".to_string());
+    let admin_user = request.admin_user.unwrap_or_else(|| DEFAULT_ADMIN_USER.to_string());
     let password = request.admin_password.unwrap_or_else(generate_password);
 
     // Check for ID collision
@@ -74,11 +72,11 @@ pub async fn create_tenant(
     }
 
     let now = chrono::Utc::now().to_rfc3339();
-    db::insert_tenant(&state.db, &tenant_id, &keyspace, "CREATING", &now).await?;
+    db::insert_tenant(&state.db, &tenant_id, &keyspace, tenant_state::CREATING, &now).await?;
 
     let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
     if !pd.create_keyspace(&keyspace).await {
-        db::update_tenant_state(&state.db, &tenant_id, "CREATE_FAILED", Some("Failed to create keyspace in PD")).await?;
+        db::update_tenant_state(&state.db, &tenant_id, tenant_state::CREATE_FAILED, Some("Failed to create keyspace in PD")).await?;
         db::insert_audit_log(
             &state.db, "CREATE", "TENANT", &tenant_id,
             Some(&tenant_id), None, false,
@@ -90,7 +88,7 @@ pub async fn create_tenant(
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
     if !pg.bootstrap_admin_password(&keyspace, &admin_user, &password).await {
         db::update_tenant_state(
-            &state.db, &tenant_id, "CREATE_FAILED",
+            &state.db, &tenant_id, tenant_state::CREATE_FAILED,
             Some("Keyspace created but password bootstrap failed"),
         ).await?;
         db::insert_audit_log(
@@ -103,14 +101,18 @@ pub async fn create_tenant(
         ));
     }
 
-    db::update_tenant_state(&state.db, &tenant_id, "ACTIVE", None).await?;
+    db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None).await?;
     db::insert_audit_log(
         &state.db, "CREATE", "TENANT", &tenant_id,
         Some(&tenant_id), None, true, None, None,
     ).await.ok();
 
     let endpoints = state.config.parse_public_endpoints();
-    let (host, port) = endpoints.first().cloned().unwrap_or_else(|| ("127.0.0.1".into(), 5433));
+    let (host, port) = endpoints.first().cloned().unwrap_or_else(|| ("127.0.0.1".into(), DEFAULT_PG_PORT));
+
+    let connection_string = format!(
+        "postgresql://{tenant_id}.{admin_user}:{password}@{host}:{port}/postgres"
+    );
 
     Ok((
         StatusCode::CREATED,
@@ -118,9 +120,7 @@ pub async fn create_tenant(
             id: tenant_id,
             admin_user: admin_user.clone(),
             admin_password: password.clone(),
-            connection_string: format!(
-                "postgresql://{keyspace}.{admin_user}:{password}@{host}:{port}/postgres"
-            ),
+            connection_string,
             created_at: now,
         }),
     ))
@@ -156,12 +156,14 @@ pub async fn get_tenant(
             } else {
                 "primary".into()
             },
+            region: None,
             priority: 100 - (i as i32) * 10,
             description: if endpoint_tuples.len() > 1 {
                 Some(format!("pg-tikv endpoint {}", i + 1))
             } else {
                 Some("pg-tikv primary endpoint".into())
             },
+            enabled: true,
         })
         .collect();
 
@@ -181,12 +183,12 @@ pub async fn delete_tenant(
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
 
-    db::update_tenant_state(&state.db, &tenant_id, "DISABLING", None).await?;
+    db::update_tenant_state(&state.db, &tenant_id, tenant_state::DISABLING, None).await?;
 
     let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
     if !pd.disable_keyspace(&tenant.keyspace).await {
         db::update_tenant_state(
-            &state.db, &tenant_id, "ACTIVE",
+            &state.db, &tenant_id, tenant_state::ACTIVE,
             Some("Failed to disable keyspace in PD"),
         ).await?;
         db::insert_audit_log(
@@ -197,7 +199,7 @@ pub async fn delete_tenant(
         return Err(AppError::internal("Failed to disable tenant"));
     }
 
-    db::update_tenant_state(&state.db, &tenant_id, "DISABLED", Some("Deleted via API")).await?;
+    db::update_tenant_state(&state.db, &tenant_id, tenant_state::DISABLED, Some("Deleted via API")).await?;
     db::insert_audit_log(
         &state.db, "DELETE", "TENANT", &tenant_id,
         Some(&tenant_id), None, true, None, None,
@@ -219,12 +221,12 @@ pub async fn remove_tenant(
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
 
-    db::update_tenant_state(&state.db, &tenant_id, "DISABLING", None).await?;
+    db::update_tenant_state(&state.db, &tenant_id, tenant_state::DISABLING, None).await?;
 
     let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
     if !pd.disable_keyspace(&tenant.keyspace).await {
         db::update_tenant_state(
-            &state.db, &tenant_id, "ACTIVE",
+            &state.db, &tenant_id, tenant_state::ACTIVE,
             Some("Failed to disable keyspace in PD"),
         ).await?;
         db::insert_audit_log(
@@ -235,7 +237,7 @@ pub async fn remove_tenant(
         return Err(AppError::internal("Failed to disable keyspace in TiKV"));
     }
 
-    db::update_tenant_state(&state.db, &tenant_id, "DISABLED", Some("Removed via portal")).await?;
+    db::update_tenant_state(&state.db, &tenant_id, tenant_state::DISABLED, Some("Removed via portal")).await?;
     db::insert_audit_log(
         &state.db, "DELETE", "TENANT", &tenant_id,
         Some(&tenant_id), None, true, None, None,
@@ -295,7 +297,7 @@ pub async fn connect_tenant(
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant '{tenant_id}' not found")))?;
 
-    if tenant.state == "SUSPENDED" {
+    if tenant.state == tenant_state::SUSPENDED {
         return Err(AppError::forbidden("Tenant is suspended"));
     }
 

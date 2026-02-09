@@ -1,5 +1,7 @@
 use std::env;
 
+use crate::DEFAULT_PG_PORT;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub pd_endpoints: String,
@@ -41,9 +43,9 @@ impl Config {
             pg_port: env::var("PGTIKV_PG_PORT")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(5433),
+                .unwrap_or(DEFAULT_PG_PORT),
             pg_public_endpoints: env::var("PGTIKV_PG_PUBLIC_ENDPOINTS")
-                .unwrap_or_else(|_| "127.0.0.1:5433".into()),
+                .unwrap_or_else(|_| format!("127.0.0.1:{DEFAULT_PG_PORT}")),
             api_port: env::var("PGTIKV_API_PORT")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -78,7 +80,7 @@ impl Config {
                 if let Some((host, port_str)) = ep.rsplit_once(':') {
                     port_str.parse().ok().map(|port| (host.to_string(), port))
                 } else {
-                    Some((ep.to_string(), 5433))
+                    Some((ep.to_string(), DEFAULT_PG_PORT))
                 }
             })
             .collect()

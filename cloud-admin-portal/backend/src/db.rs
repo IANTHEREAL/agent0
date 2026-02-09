@@ -2,6 +2,7 @@ use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
 
 use crate::models::{CredentialRow, TenantRow};
+use crate::tenant_state;
 
 pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
     sqlx::any::install_default_drivers();
@@ -138,8 +139,8 @@ pub async fn list_tenants(
 ) -> Result<(Vec<TenantRow>, i64), sqlx::Error> {
     let offset = (page - 1) * size;
 
-    let mut count_sql = String::from("SELECT COUNT(*) as cnt FROM tenants WHERE state != 'CREATE_FAILED'");
-    let mut list_sql = String::from("SELECT * FROM tenants WHERE state != 'CREATE_FAILED'");
+    let mut count_sql = format!("SELECT COUNT(*) as cnt FROM tenants WHERE state != '{}'", tenant_state::CREATE_FAILED);
+    let mut list_sql = format!("SELECT * FROM tenants WHERE state != '{}'", tenant_state::CREATE_FAILED);
     let mut binds: Vec<String> = Vec::new();
     let mut param_idx = 1;
 
@@ -181,7 +182,7 @@ pub async fn list_tenants(
 
 pub async fn get_tenant(pool: &AnyPool, tenant_id: &str) -> Result<Option<TenantRow>, sqlx::Error> {
     let sql = adapt_sql(
-        "SELECT * FROM tenants WHERE id = $1 AND state NOT IN ('DISABLED', 'CREATE_FAILED')",
+        &format!("SELECT * FROM tenants WHERE id = $1 AND state NOT IN ('{}', '{}')", tenant_state::DISABLED, tenant_state::CREATE_FAILED),
         pool,
     );
     let row = sqlx::query(&sql).bind(tenant_id).fetch_optional(pool).await?;
@@ -422,7 +423,8 @@ pub async fn get_stuck_tenants(pool: &AnyPool, state: &str, before: &str) -> Res
 }
 
 pub async fn get_all_keyspaces_from_db(pool: &AnyPool) -> Result<Vec<(String, String)>, sqlx::Error> {
-    let rows = sqlx::query("SELECT id, keyspace FROM tenants WHERE state NOT IN ('DISABLED', 'CREATE_FAILED')")
+    let sql = format!("SELECT id, keyspace FROM tenants WHERE state NOT IN ('{}', '{}')", tenant_state::DISABLED, tenant_state::CREATE_FAILED);
+    let rows = sqlx::query(&sql)
         .fetch_all(pool)
         .await?;
     Ok(rows.iter().map(|r| (r.get::<String, _>("id"), r.get::<String, _>("keyspace"))).collect())

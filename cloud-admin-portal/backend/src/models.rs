@@ -57,8 +57,6 @@ pub struct TenantResponse {
     pub id: String,
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub is_deleted: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
@@ -103,9 +101,12 @@ pub struct Endpoint {
     pub port: u16,
     #[serde(rename = "type")]
     pub ep_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     pub priority: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    pub enabled: bool,
 }
 
 #[derive(Serialize)]
@@ -209,10 +210,6 @@ pub struct TenantRow {
 }
 
 impl TenantRow {
-    pub fn is_deleted(&self) -> bool {
-        self.state == "DISABLED" || self.state == "CREATE_FAILED"
-    }
-
     pub fn to_response(&self) -> TenantResponse {
         let tags: Option<Vec<String>> = self
             .tags
@@ -221,7 +218,6 @@ impl TenantRow {
         TenantResponse {
             id: self.id.clone(),
             state: self.state.clone(),
-            is_deleted: Some(self.is_deleted()),
             created_at: Some(self.created_at.clone()),
             created_by: self.created_by.clone(),
             notes: self.notes.clone(),

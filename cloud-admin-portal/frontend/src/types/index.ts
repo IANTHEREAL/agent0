@@ -10,14 +10,12 @@ export interface Endpoint {
   priority: number
   description?: string | null
   enabled: boolean
-  connection_string: string
 }
 
 export interface Tenant {
   id: string
   state: string
   endpoints: Endpoint[]
-  is_deleted?: boolean
   created_at?: string
   created_by?: string | null
   notes?: string | null
@@ -110,7 +108,6 @@ export interface SqlQueryResponse {
   success: boolean
   result?: string | null
   error?: string | null
-  rows_affected?: number | null
 }
 
 export interface ObservabilitySummary {

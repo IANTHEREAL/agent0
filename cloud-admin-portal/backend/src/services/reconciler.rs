@@ -6,6 +6,7 @@ use sqlx::AnyPool;
 
 use crate::db;
 use crate::services::pd_client::PdClient;
+use crate::{tenant_state, TENANT_ID_LEN};
 
 pub struct Reconciler {
     pd: PdClient,
@@ -46,9 +47,12 @@ impl Reconciler {
             if name == "DEFAULT" || name == "default" || existing_ks.contains(name) {
                 continue;
             }
-            let id = name.strip_prefix("ks_").unwrap_or(name);
+            let id = match name.strip_prefix(crate::KEYSPACE_PREFIX) {
+                Some(stripped) if stripped.len() == TENANT_ID_LEN && stripped.chars().all(|c| c.is_ascii_alphanumeric()) => stripped,
+                _ => continue,
+            };
             let now = chrono::Utc::now().to_rfc3339();
-            if db::insert_tenant(&self.db, id, name, "ACTIVE", &now).await.is_ok() {
+            if db::insert_tenant(&self.db, id, name, tenant_state::ACTIVE, &now).await.is_ok() {
                 tracing::info!("Synced keyspace from PD: {name} -> tenant {id}");
                 count += 1;
             }
@@ -69,13 +73,13 @@ impl Reconciler {
     async fn run_cycle(&self) {
         let cutoff = (chrono::Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
 
-        if let Ok(stuck) = db::get_stuck_tenants(&self.db, "CREATING", &cutoff).await {
+        if let Ok(stuck) = db::get_stuck_tenants(&self.db, tenant_state::CREATING, &cutoff).await {
             for t in &stuck {
                 let exists = self.pd.get_keyspace(&t.keyspace).await.is_some();
                 let (new_state, reason) = if exists {
-                    ("ACTIVE", "Recovered by reconciler: keyspace exists")
+                    (tenant_state::ACTIVE, "Recovered by reconciler: keyspace exists")
                 } else {
-                    ("CREATE_FAILED", "Recovered by reconciler: keyspace not found")
+                    (tenant_state::CREATE_FAILED, "Recovered by reconciler: keyspace not found")
                 };
                 if let Err(e) = db::update_tenant_state(&self.db, &t.id, new_state, Some(reason)).await {
                     tracing::warn!("Failed to recover tenant {}: {e}", t.id);
@@ -83,9 +87,9 @@ impl Reconciler {
             }
         }
 
-        if let Ok(stuck) = db::get_stuck_tenants(&self.db, "DISABLING", &cutoff).await {
+        if let Ok(stuck) = db::get_stuck_tenants(&self.db, tenant_state::DISABLING, &cutoff).await {
             for t in &stuck {
-                if let Err(e) = db::update_tenant_state(&self.db, &t.id, "DISABLED", Some("Recovered by reconciler")).await {
+                if let Err(e) = db::update_tenant_state(&self.db, &t.id, tenant_state::DISABLED, Some("Recovered by reconciler")).await {
                     tracing::warn!("Failed to recover tenant {}: {e}", t.id);
                 }
             }

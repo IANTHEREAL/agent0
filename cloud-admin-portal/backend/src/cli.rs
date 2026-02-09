@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::process;
 
 use clap::{Parser, Subcommand};
+use pgtikv_admin::{DEFAULT_ADMIN_USER, TENANT_ID_LEN};
 use serde_json::Value;
 
 const DEFAULT_API_URL: &str = "http://localhost:8090/api";
@@ -68,7 +69,7 @@ enum TenantAction {
     Get { tenant_id: String },
     /// Create tenant
     Create {
-        #[arg(long, default_value = "admin")]
+        #[arg(long, default_value = DEFAULT_ADMIN_USER)]
         admin_user: String,
         #[arg(long)]
         admin_password: Option<String>,
@@ -323,7 +324,7 @@ async fn main() {
                 print_table(
                     &display_items,
                     &[
-                        ("ID", "id", 12),
+                        ("ID", "id", TENANT_ID_LEN),
                         ("STATE", "state", 8),
                         ("CREATED", "created_at", 16),
                         ("TAGS", "tags", 10),
