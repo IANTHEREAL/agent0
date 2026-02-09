@@ -38,7 +38,7 @@ Before doing anything else, sync the code to the latest master, then do not prop
 Call `functions.mcp__pantheon__parallel_explore` with `agent="codex"`, `num_branches=1`, `parent_branch_id=parent_branch_id`, and prompt:
 
 ```
-pull the latest code from master branch or Existing PR: {existing_pr_link} (if having), then validate the target:
+pull the latest code from master branch or Existing PR: {existing_pr_link} (if having), then analyze the target deeply:
 - Issue: {issue_link}
 - Existing PR: {existing_pr_link} if having
 
@@ -46,17 +46,23 @@ pull the latest code from master branch or Existing PR: {existing_pr_link} (if h
 1) Restate the issue claim precisely (expected vs actual, triggering inputs/config).
 2) Locate the relevant code path(s) and identify the exact conditions required to reach them.
 3) Determine reachability under default production configuration (or clearly-common configs).
-4) Assess concrete impact and blast radius (unavailability, correctness, data safety, security, severe perf).
-5) Actively search for counter-evidence (feature gates, existing guards, fallbacks, isolation boundaries, test-only behavior, unreachable branches).
+4) Identify the likely root cause and present evidence that leads to that root cause (code-causal chain, repro evidence, and why alternatives are less likely).
+5) Analyze whether there is a broader systemic issue beyond this report (same pattern in adjacent code paths, shared abstractions, or config combinations).
+6) Assess concrete impact and blast radius (unavailability, correctness, data safety, security, severe perf).
+7) Actively search for counter-evidence (feature gates, existing guards, fallbacks, isolation boundaries, test-only behavior, unreachable branches).
 
-Output exactly one of:
-VERDICT=INVALID
+Output:
+- If invalid, output exactly: VERDICT=INVALID
+- If valid, output exactly:
 VERDICT=VALID
+BEGIN_SOLUTION_SUGGESTION
+<concise, actionable solution proposal using KISS; include scope, risk, and why it addresses the evidenced root cause>
+END_SOLUTION_SUGGESTION
 ```
 
 Wait for the branch to finish (see “Waiting / Polling”), then parse the output.
 If the verdict is `VERDICT=INVALID`, stop.
-If the verdict is `VERDICT=VALID`, set `synced_master_branch_id = validity_branch_id` and proceed to Step 2.
+If the verdict is `VERDICT=VALID`, parse `BEGIN_SOLUTION_SUGGESTION ... END_SOLUTION_SUGGESTION`, set `synced_master_branch_id = validity_branch_id`, and proceed to Step 2.
 
 ### Step 2 — Fix/Review/Verify Iteration Loop (Pantheon branches)
 
