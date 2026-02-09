@@ -579,7 +579,7 @@ fn format_predicate(pred: &PredicateInfo) -> String {
         super::planner::PredicateOp::Gt => ">",
         super::planner::PredicateOp::Ge => ">=",
         super::planner::PredicateOp::Like => "~~",
-        super::planner::PredicateOp::In => "= ANY",
+        super::planner::PredicateOp::In => "IN",
         super::planner::PredicateOp::IsNull => "IS NULL",
         super::planner::PredicateOp::IsNotNull => "IS NOT NULL",
     };
@@ -587,6 +587,19 @@ fn format_predicate(pred: &PredicateInfo) -> String {
     match pred.op {
         super::planner::PredicateOp::IsNull | super::planner::PredicateOp::IsNotNull => {
             format!("({} {})", pred.column, op_str)
+        }
+        super::planner::PredicateOp::In => {
+            let values = if pred.in_values.is_empty() {
+                vec![pred.value.clone()]
+            } else {
+                pred.in_values.clone()
+            };
+            let list = values
+                .iter()
+                .map(format_value)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("({} IN ({}))", pred.column, list)
         }
         _ => format!("({} {} {})", pred.column, op_str, format_value(&pred.value)),
     }

@@ -87,12 +87,12 @@ Hash Join Left  (cost=0.00..10022.00 rows=1000000 width=40)
   ->  Seq Scan on explain_join t2  (cost=0.00..11.00 rows=1000 width=40)
 (4 rows)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
-  Filter: a IN (10, 20)
+Index Scan using idx_a on explain_test  (cost=0.15..0.17 rows=2 width=44)
+  Index Cond: (a IN (10, 20))
 (2 rows)
 QUERY PLAN
-Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)
-  Filter: a BETWEEN 10 AND 20
+Index Scan using idx_a on explain_test  (cost=0.15..1.15 rows=100 width=44)
+  Index Cond: (a >= 10) AND (a <= 20)
 (2 rows)
 QUERY PLAN
 Seq Scan on explain_test  (cost=0.00..11.00 rows=1000 width=44)

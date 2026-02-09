@@ -175,6 +175,7 @@ impl Executor {
         .await?;
 
         let mut affected = 0;
+        let mut inserted = 0usize;
         let mut ret_rows = Vec::new();
         let ret_cols = dml::build_returning_columns(returning, &schema)?;
 
@@ -310,6 +311,7 @@ impl Executor {
                     )
                     .await?;
                     affected += 1;
+                    inserted += 1;
                     if let Some(ret_row) = dml::eval_returning_row(
                         &self.store(),
                         txn,
@@ -453,6 +455,10 @@ impl Executor {
                     }
                 }
             }
+        }
+
+        if inserted > 0 {
+            crate::sql::stats::bump_row_count_estimate(db_id, schema.table_id, inserted as isize);
         }
 
         if returning.is_some() {

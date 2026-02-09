@@ -1,5 +1,6 @@
 use super::super::*;
 use super::using_merge::{rewrite_for_using_join, UsingMergeColumn};
+use sqlparser::ast::OrderByExpr;
 
 impl Executor {
     pub(super) async fn execute_join_aggregate_path(
@@ -126,6 +127,57 @@ impl Executor {
         let group_by_count = group_by_names.len();
 
         let group_by_exprs_clone = group_by_exprs.clone();
+
+        let ordered_array_agg_order_by: Option<Vec<OrderByExpr>> = {
+            let mut ordered: Vec<Vec<OrderByExpr>> = Vec::new();
+            for item in &rewritten_projection {
+                let expr = match item {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+                    _ => continue,
+                };
+                if let Expr::ArrayAgg(arr) = expr {
+                    if let Some(order_by) = arr.order_by.as_ref() {
+                        if !order_by.is_empty() {
+                            ordered.push(order_by.clone());
+                        }
+                    }
+                }
+            }
+
+            if ordered.is_empty() {
+                None
+            } else {
+                let canonical = |obs: &[OrderByExpr]| -> String {
+                    obs.iter()
+                        .map(|o| format!("{}|{:?}|{:?}", o.expr, o.asc, o.nulls_first))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                let first_key = canonical(&ordered[0]);
+                if ordered.iter().any(|o| canonical(o) != first_key) {
+                    return Err(SqlError::Unsupported(
+                        "Multiple ordered aggregates with different ORDER BY are not supported"
+                            .into(),
+                    )
+                    .into());
+                }
+                Some(ordered.remove(0))
+            }
+        };
+
+        if let Some(order_by) = ordered_array_agg_order_by {
+            let mut sort_keys: Vec<OrderByExpr> = group_by_exprs_clone
+                .iter()
+                .map(|e| OrderByExpr {
+                    expr: e.clone(),
+                    asc: Some(true),
+                    nulls_first: None,
+                })
+                .collect();
+            sort_keys.extend(order_by);
+            running_op = Box::new(SortOperator::new(running_op, sort_keys));
+        }
+
         running_op = Box::new(HashAggregateOperator::new(
             running_op,
             group_by_exprs,

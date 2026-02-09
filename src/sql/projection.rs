@@ -34,6 +34,7 @@ pub fn get_expr_name(expr: &Expr) -> String {
                 "?column?".to_string()
             }
         }
+        Expr::ArrayAgg(_) => "array_agg".to_string(),
         Expr::Case { .. } => "case".to_string(),
         Expr::Cast { data_type, .. } => {
             use sqlparser::ast::DataType;

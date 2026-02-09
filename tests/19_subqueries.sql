@@ -80,7 +80,8 @@ SELECT c.name, COUNT(o.id) as order_count
 FROM customers c
 LEFT JOIN orders o ON c.id = o.customer_id
 WHERE EXISTS (SELECT 1 FROM orders WHERE customer_id = c.id)
-GROUP BY c.name;
+GROUP BY c.name
+ORDER BY c.name;
 
 DROP TABLE orders;
 DROP TABLE customers;

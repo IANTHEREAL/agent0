@@ -46,6 +46,7 @@ mod order;
 mod pushdown;
 
 use analysis::{expr_has_subquery, projection_has_non_window_aggregate};
+use analysis::projection_has_window_function;
 use join::ensure_no_locking_clauses_for_join;
 use order::{
     expand_projection_exprs_for_positional_order_by, expr_matches, extract_grouping_sets,
@@ -576,9 +577,7 @@ impl Executor {
                 }
             }
 
-            let has_window = extract_window_functions(&resolved_projection)
-                .iter()
-                .any(|_| true);
+            let has_window = projection_has_window_function(&resolved_projection);
             let has_agg_or_group_by = projection_has_non_window_aggregate(&resolved_projection)
                 || !matches!(
                     &select.group_by,
@@ -704,7 +703,7 @@ impl Executor {
                         && select.having.is_none()
                         && select.from.len() == 1
                         && select.from[0].joins.is_empty()
-                        && extract_window_functions(&select.projection).is_empty();
+                        && !projection_has_window_function(&select.projection);
 
                     let scan_upper_bound = if can_pushdown_scan_limit {
                         scan_upper_bound
