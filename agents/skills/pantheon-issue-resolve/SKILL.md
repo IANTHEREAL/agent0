@@ -1,9 +1,9 @@
 ---
-name: pantheon-issue-resolve-loop
+name: pantheon-issue-resolve
 description: "Resolve an issue (create a new PR or reuse an existing PR) with evidence-first validation, then run a strict Pantheon parallel_explore fix+review+verify loop (codex) until no in-scope P0/P1 remain; finish with required local build+smoke test before merging."
 ---
 
-# Pantheon Issue Resolve Loop
+# Pantheon Issue Resolve
 
 ## Overview
 
