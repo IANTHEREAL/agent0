@@ -120,7 +120,7 @@ modules:
       - 'auth/RBAC semantics (authoritative: `auth-rbac`)'
     code_entrypoints:
       - path: src/storage/encoding.rs
-      - path: src/storage/tikv_store.rs
+      - path: src/storage/tikv_store/mod.rs
         symbols: [TikvStore]
       - path: src/pool.rs
         symbols: [TikvClientPool]
