@@ -15,7 +15,9 @@ pub struct Config {
     pub api_keys: Vec<String>,
     pub reconciler_enabled: bool,
     pub reconciler_interval_secs: u64,
+    pub reconciler_sync_keyspaces: bool,
     pub session_ttl_hours: u64,
+    pub audit_retention_days: u64,
     pub credential_key: Option<String>,
 }
 
@@ -63,10 +65,17 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(300),
+            reconciler_sync_keyspaces: env::var("PGTIKV_RECONCILER_SYNC_KEYSPACES")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
             session_ttl_hours: env::var("PGTIKV_SESSION_TTL_HOURS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(1),
+            audit_retention_days: env::var("PGTIKV_AUDIT_RETENTION_DAYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(90),
             credential_key: env::var("PGTIKV_CREDENTIAL_KEY")
                 .ok()
                 .filter(|k| !k.is_empty()),

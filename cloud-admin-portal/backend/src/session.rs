@@ -66,10 +66,32 @@ impl SessionManager {
         Some(session.clone())
     }
 
+    pub fn sweep_expired(&self) -> usize {
+        if let Ok(mut map) = self.sessions.write() {
+            return self.evict_expired_from_map(&mut map);
+        }
+        0
+    }
+
+    pub fn session_count(&self) -> usize {
+        self.sessions.read().map(|m| m.len()).unwrap_or(0)
+    }
+
     pub fn clear_all(&self) {
         if let Ok(mut map) = self.sessions.write() {
             map.clear();
         }
+    }
+
+    fn evict_expired_from_map(&self, map: &mut HashMap<String, TenantSession>) -> usize {
+        let now = Utc::now();
+        let before = map.len();
+        map.retain(|_, s| {
+            chrono::DateTime::parse_from_rfc3339(&s.expires_at)
+                .map(|exp| now < exp)
+                .unwrap_or(false)
+        });
+        before - map.len()
     }
 }
 

@@ -28,7 +28,9 @@ fn decrypt_password(stored: &str, key: Option<&str>) -> String {
 pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
     sqlx::any::install_default_drivers();
 
-    if url.starts_with("sqlite") {
+    let is_sqlite = url.starts_with("sqlite");
+
+    if is_sqlite {
         if let Some(path) = url.strip_prefix("sqlite://") {
             let path = path.split('?').next().unwrap_or(path);
             if let Some(parent) = std::path::Path::new(path).parent() {
@@ -37,10 +39,18 @@ pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
         }
     }
 
+    let max_conns = if is_sqlite { 5 } else { 20 };
     let pool = AnyPoolOptions::new()
-        .max_connections(10)
+        .max_connections(max_conns)
         .connect(url)
         .await?;
+
+    if is_sqlite {
+        sqlx::query("PRAGMA journal_mode=WAL").execute(&pool).await.ok();
+        sqlx::query("PRAGMA busy_timeout=5000").execute(&pool).await.ok();
+        sqlx::query("PRAGMA synchronous=NORMAL").execute(&pool).await.ok();
+    }
+
     Ok(pool)
 }
 
@@ -123,6 +133,8 @@ pub async fn create_tables(pool: &AnyPool) -> Result<(), sqlx::Error> {
 
     let indexes = [
         "CREATE INDEX IF NOT EXISTS idx_tenants_state ON tenants(state)",
+        "CREATE INDEX IF NOT EXISTS idx_tenants_created ON tenants(created_at DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_tenants_state_created ON tenants(state, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_creds_tenant ON tenant_credentials(tenant_id)",
         "CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_logs(tenant_id)",
@@ -449,10 +461,37 @@ pub async fn get_stuck_tenants(pool: &AnyPool, state: &str, before: &str) -> Res
     Ok(rows.iter().map(row_to_tenant).collect())
 }
 
-pub async fn get_all_keyspaces_from_db(pool: &AnyPool) -> Result<Vec<(String, String)>, sqlx::Error> {
-    let sql = format!("SELECT id, keyspace FROM tenants WHERE state NOT IN ('{}', '{}')", tenant_state::DISABLED, tenant_state::CREATE_FAILED);
-    let rows = sqlx::query(&sql)
-        .fetch_all(pool)
-        .await?;
-    Ok(rows.iter().map(|r| (r.get::<String, _>("id"), r.get::<String, _>("keyspace"))).collect())
+pub async fn check_tenants_exist(pool: &AnyPool, ids: &[&str]) -> Result<std::collections::HashSet<String>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+
+    let mut result = std::collections::HashSet::new();
+
+    for chunk in ids.chunks(100) {
+        let placeholders: Vec<String> = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("${}", i + 1))
+            .collect();
+        let sql = format!("SELECT id FROM tenants WHERE id IN ({})", placeholders.join(","));
+        let sql = adapt_sql(&sql, pool);
+
+        let mut q = sqlx::query(&sql);
+        for id in chunk {
+            q = q.bind(*id);
+        }
+        let rows = q.fetch_all(pool).await?;
+        for r in &rows {
+            result.insert(r.get::<String, _>("id"));
+        }
+    }
+
+    Ok(result)
+}
+
+pub async fn delete_old_audit_logs(pool: &AnyPool, before: &str) -> Result<u64, sqlx::Error> {
+    let sql = adapt_sql("DELETE FROM audit_logs WHERE timestamp < $1", pool);
+    let result = sqlx::query(&sql).bind(before).execute(pool).await?;
+    Ok(result.rows_affected())
 }

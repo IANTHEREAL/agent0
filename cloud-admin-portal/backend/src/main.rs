@@ -76,13 +76,19 @@ async fn main() {
     // ── Reconciler ───────────────────────────────────────────────
     let reconciler_stop = if config.reconciler_enabled {
         let pd = PdClient::new(&config.pd_endpoints, &http_client);
-        let reconciler = Reconciler::new(pd, pool.clone(), config.reconciler_interval_secs);
+        let reconciler = Reconciler::new(
+            pd,
+            pool.clone(),
+            config.reconciler_interval_secs,
+            config.reconciler_sync_keyspaces,
+        );
         let stop = reconciler.stop_handle();
 
-        // Sync existing keyspaces on startup
-        let synced = reconciler.sync_new_keyspaces().await;
-        if synced > 0 {
-            tracing::info!("Synced {synced} keyspace(s) from PD on startup");
+        if config.reconciler_sync_keyspaces {
+            let synced = reconciler.sync_new_keyspaces().await;
+            if synced > 0 {
+                tracing::info!("Synced {synced} keyspace(s) from PD on startup");
+            }
         }
 
         tokio::spawn(async move {
@@ -90,14 +96,48 @@ async fn main() {
         });
 
         tracing::info!(
-            "Reconciler started (interval={}s)",
-            config.reconciler_interval_secs
+            "Reconciler started (interval={}s, sync_keyspaces={})",
+            config.reconciler_interval_secs,
+            config.reconciler_sync_keyspaces,
         );
         Some(stop)
     } else {
         tracing::info!("Reconciler disabled");
         None
     };
+
+    // ── Background: session sweep + audit cleanup ─────────────
+    {
+        let sessions_ref = state.sessions.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                let swept = sessions_ref.sweep_expired();
+                if swept > 0 {
+                    tracing::debug!("Session sweep: removed {swept} expired sessions");
+                }
+            }
+        });
+    }
+    {
+        let db_ref = pool.clone();
+        let retention_days = config.audit_retention_days;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            loop {
+                interval.tick().await;
+                let cutoff = (chrono::Utc::now()
+                    - chrono::Duration::days(retention_days as i64))
+                .to_rfc3339();
+                match db::delete_old_audit_logs(&db_ref, &cutoff).await {
+                    Ok(n) if n > 0 => tracing::info!("Audit cleanup: removed {n} old entries"),
+                    Err(e) => tracing::warn!("Audit cleanup failed: {e}"),
+                    _ => {}
+                }
+            }
+        });
+    }
 
     // ── CORS ─────────────────────────────────────────────────────
     let origins: Vec<_> = config

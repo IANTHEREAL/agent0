@@ -61,17 +61,57 @@ impl PdClient {
         }
     }
 
-    pub async fn list_keyspaces(&self) -> Vec<serde_json::Value> {
-        let url = format!("{}/pd/api/v2/keyspaces", self.base_url);
+    /// Fetch one page of keyspaces from PD.
+    /// Returns `(keyspaces, next_page_token)`. `next_page_token` is `None` when
+    /// there are no more pages.
+    pub async fn list_keyspaces_page(
+        &self,
+        limit: u32,
+        page_token: Option<&str>,
+    ) -> (Vec<serde_json::Value>, Option<String>) {
+        let mut url = format!("{}/pd/api/v2/keyspaces?limit={limit}", self.base_url);
+        if let Some(token) = page_token {
+            url.push_str(&format!("&page_token={token}"));
+        }
         match self.client.get(&url).send().await {
             Ok(resp) if resp.status().is_success() => {
                 let body: serde_json::Value = resp.json().await.unwrap_or_default();
-                body.get("keyspaces")
+                let keyspaces = body
+                    .get("keyspaces")
                     .and_then(|v| v.as_array())
                     .cloned()
-                    .unwrap_or_default()
+                    .unwrap_or_default();
+                let next_token = body
+                    .get("next_page_token")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                (keyspaces, next_token)
             }
-            _ => Vec::new(),
+            _ => (Vec::new(), None),
+        }
+    }
+
+    /// Iterate ALL keyspaces from PD using pagination.
+    /// Calls `callback` for each page. If the callback returns `false`, stops early.
+    pub async fn for_each_keyspace_page<F>(&self, page_size: u32, mut callback: F)
+    where
+        F: FnMut(&[serde_json::Value]) -> bool,
+    {
+        let mut page_token: Option<String> = None;
+        loop {
+            let (keyspaces, next_token) =
+                self.list_keyspaces_page(page_size, page_token.as_deref()).await;
+            if keyspaces.is_empty() {
+                break;
+            }
+            if !callback(&keyspaces) {
+                break;
+            }
+            match next_token {
+                Some(token) => page_token = Some(token),
+                None => break,
+            }
         }
     }
 
