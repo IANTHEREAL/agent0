@@ -35,6 +35,12 @@ export async function apiRequest<T>(
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({ message: "Unknown error" }))
+
+    if (response.status === 401 && tenantName) {
+      sessionStorage.removeItem(`tenant_session:${tenantName}`)
+      window.dispatchEvent(new CustomEvent("session-expired", { detail: { tenantId: tenantName } }))
+    }
+
     throw new ApiError(response.status, error.message || error.detail, error.details)
   }
 

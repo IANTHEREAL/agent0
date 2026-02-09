@@ -1,19 +1,21 @@
 import { useState } from "react"
-import { Activity, AlertTriangle, Clock, Gauge, Loader2, Users, Zap } from "lucide-react"
+import { Activity, AlertTriangle, Clock, Gauge, Loader2, Users, Zap, Lock, LogIn } from "lucide-react"
 import { useTenantObservability, bootstrapTenantObservabilityUser } from "@/api/tenants"
 import { ApiError } from "@/api/client"
+import { useTenantSessionContext } from "@/contexts/TenantSessionContext"
 import { useSortableData } from "@/hooks/useSortableData"
 import { useQueryClient } from "@tanstack/react-query"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { SortableHeader } from "@/components/ui/sortable-header"
+import { useToast } from "@/components/ui/use-toast"
 import { cn } from "@/lib/utils"
 import type { QuerySample } from "@/types"
 
 type Props = {
   tenantId: string
-  adminUser?: string
-  adminPassword?: string
 }
 
 type SampleSortKey = "query" | "sample_count" | "latency_p99_ms" | "latency_avg_ms" | "last_seen_ms_ago"
@@ -52,11 +54,14 @@ function formatAge(ms: number) {
   return `${Math.round(ms / (60 * 60_000))}h`
 }
 
-export function TenantObservabilityCard({ tenantId, adminUser, adminPassword }: Props) {
+export function TenantObservabilityCard({ tenantId }: Props) {
+  const { isConnected, adminUser, adminPassword, connect, isConnecting, setAdminUser, setAdminPassword } = useTenantSessionContext()
+  const { toast } = useToast()
   const { data, isLoading, error } = useTenantObservability(tenantId)
   const apiError = error instanceof ApiError ? error : null
   const queryClient = useQueryClient()
   const [bootstrapping, setBootstrapping] = useState(false)
+  const [showBootstrapLogin, setShowBootstrapLogin] = useState(false)
 
   const { sortedData: sortedSamples, requestSort, getSortDirection } = useSortableData<QuerySample, SampleSortKey>(
     data?.samples,
@@ -80,33 +85,79 @@ export function TenantObservabilityCard({ tenantId, adminUser, adminPassword }: 
             Loading metrics...
           </div>
         ) : error || !data ? (
-          <div className="flex items-center justify-between text-xs text-muted-foreground rounded-lg border border-border/50 bg-muted/20 px-3 py-2">
-            <div className="flex items-center gap-2">
-              <AlertTriangle className="h-4 w-4" />
-              {apiError?.status === 409
-                ? "Observability account is not bootstrapped for this tenant"
-                : "Failed to load metrics"}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between text-xs text-muted-foreground rounded-lg border border-border/50 bg-muted/20 px-3 py-2">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4" />
+                {apiError?.status === 409
+                  ? "Observability account is not bootstrapped for this tenant"
+                  : "Failed to load metrics"}
+              </div>
+              {apiError?.status === 409 && isConnected && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs gap-1.5"
+                  disabled={bootstrapping}
+                  onClick={async () => {
+                    setBootstrapping(true)
+                    try {
+                      await bootstrapTenantObservabilityUser(tenantId, adminUser, adminPassword)
+                      queryClient.invalidateQueries({ queryKey: ["tenants", tenantId, "observability"] })
+                    } catch {
+                      toast({ title: "Bootstrap failed", description: "Could not bootstrap observability account", variant: "destructive" })
+                    } finally {
+                      setBootstrapping(false)
+                    }
+                  }}
+                >
+                  {bootstrapping ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
+                  Bootstrap
+                </Button>
+              )}
+              {apiError?.status === 409 && !isConnected && !showBootstrapLogin && (
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-7 text-xs gap-1.5"
+                  onClick={() => setShowBootstrapLogin(true)}
+                >
+                  <LogIn className="w-3.5 h-3.5" />
+                  Connect to Bootstrap
+                </Button>
+              )}
             </div>
-            {apiError?.status === 409 && adminUser && adminPassword && (
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-7 text-xs gap-1.5"
-                disabled={bootstrapping}
-                onClick={async () => {
-                  setBootstrapping(true)
+            {apiError?.status === 409 && !isConnected && showBootstrapLogin && (
+              <form
+                className="rounded-lg border border-border/50 bg-muted/10 p-4 space-y-3"
+                onSubmit={async (e) => {
+                  e.preventDefault()
                   try {
-                    await bootstrapTenantObservabilityUser(tenantId, adminUser, adminPassword)
-                    queryClient.invalidateQueries({ queryKey: ["tenant-observability", tenantId] })
+                    await connect(adminUser, adminPassword)
+                    toast({ title: "Connected", description: "Now click Bootstrap to set up observability" })
                   } catch {
-                  } finally {
-                    setBootstrapping(false)
+                    toast({ title: "Connection Failed", description: "Invalid credentials", variant: "destructive" })
                   }
                 }}
               >
-                {bootstrapping ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Zap className="w-3.5 h-3.5" />}
-                Bootstrap
-              </Button>
+                <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                  <Lock className="w-3.5 h-3.5" />
+                  Connect with admin credentials to bootstrap observability
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <Label htmlFor="obs_user" className="text-xs">Username</Label>
+                    <Input id="obs_user" className="h-8 text-sm" value={adminUser} onChange={(e) => setAdminUser(e.target.value)} placeholder="admin" />
+                  </div>
+                  <div className="space-y-1">
+                    <Label htmlFor="obs_pass" className="text-xs">Password</Label>
+                    <Input id="obs_pass" type="password" className="h-8 text-sm" value={adminPassword} onChange={(e) => setAdminPassword(e.target.value)} placeholder="••••••••" />
+                  </div>
+                </div>
+                <Button type="submit" size="sm" className="h-8 w-full gap-2" disabled={isConnecting}>
+                  {isConnecting ? <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Connecting...</> : <><LogIn className="w-3.5 h-3.5" /> Connect</>}
+                </Button>
+              </form>
             )}
           </div>
         ) : (

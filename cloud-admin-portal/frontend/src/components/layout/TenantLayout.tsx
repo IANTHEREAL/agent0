@@ -2,6 +2,7 @@ import { Outlet, Link, useParams, useLocation } from "react-router-dom"
 import { ArrowLeft, LayoutDashboard, Terminal } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useTenant } from "@/api/tenants"
+import { TenantSessionProvider } from "@/contexts/TenantSessionContext"
 
 export function TenantLayout() {
   const { id: tenantId } = useParams<{ id: string }>()
@@ -41,6 +42,7 @@ export function TenantLayout() {
   }
 
   return (
+    <TenantSessionProvider tenantId={tenantId!}>
     <div className="flex h-full -m-5">
       <aside className="w-48 border-r border-border flex flex-col bg-muted/20">
         <div className="p-3 border-b border-border">
@@ -102,5 +104,6 @@ export function TenantLayout() {
         <Outlet />
       </main>
     </div>
+    </TenantSessionProvider>
   )
 }

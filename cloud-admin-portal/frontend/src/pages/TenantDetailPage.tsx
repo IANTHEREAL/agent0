@@ -1,13 +1,9 @@
-/**
- * Tenant detail page with user management
- */
-
 import { useState } from "react"
 import { useParams } from "react-router-dom"
-import { Key, Trash2, Copy, Check, Plus, Network, Users, Shield, LogIn, Lock, Loader2, Tag } from "lucide-react"
+import { Key, Trash2, Copy, Check, Plus, Network, Users, Shield, LogIn, Lock, Loader2, Tag, Info, Clock, FileText } from "lucide-react"
 import { useTenant } from "@/api/tenants"
 import { useUsers, useDeleteUser, useResetPassword } from "@/api/users"
-import { useTenantSession } from "@/hooks/useTenantSession"
+import { useTenantSessionContext } from "@/contexts/TenantSessionContext"
 import { useSortableData } from "@/hooks/useSortableData"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -15,7 +11,7 @@ import { Label } from "@/components/ui/label"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { SortableHeader } from "@/components/ui/sortable-header"
 import { useToast } from "@/components/ui/use-toast"
-import { cn } from "@/lib/utils"
+import { cn, formatDate } from "@/lib/utils"
 import { CreateUserDialog } from "@/components/users/CreateUserDialog"
 import { CredentialsModal } from "@/components/common/CredentialsModal"
 import { ConfirmDialog } from "@/components/common/ConfirmDialog"
@@ -35,17 +31,17 @@ export function TenantDetailPage() {
   const { data: tenant, isLoading: tenantLoading } = useTenant(tenantId!)
   const { toast } = useToast()
 
-  // Connection state
-  const [adminUser, setAdminUser] = useState("admin")
-  const [adminPassword, setAdminPassword] = useState("")
   const {
     isConnected,
+    adminUser,
+    adminPassword,
     connect,
     disconnect,
     isConnecting,
-  } = useTenantSession(tenantId!)
+    setAdminUser,
+    setAdminPassword,
+  } = useTenantSessionContext()
 
-  // User management
   const { data: users, isLoading: usersLoading } = useUsers(tenantId!, isConnected)
   const deleteUserMutation = useDeleteUser(tenantId!)
   const resetPasswordMutation = useResetPassword(tenantId!)
@@ -55,7 +51,7 @@ export function TenantDetailPage() {
     userSortColumns
   )
 
-  const [copied, setCopied] = useState(false)
+  const [copiedKey, setCopiedKey] = useState<string | null>(null)
   const [showCreateUser, setShowCreateUser] = useState(false)
   const [showPasswordModal, setShowPasswordModal] = useState(false)
   const [resetPasswordResult, setResetPasswordResult] = useState<{
@@ -122,17 +118,13 @@ export function TenantDetailPage() {
     }
   }
 
-  const copyConnectionString = async (text: string, type: string) => {
+  const copyToClipboard = async (text: string, key: string, label: string) => {
     try {
       await navigator.clipboard.writeText(text)
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-      toast({
-        title: "Copied",
-        description: `${type} connection string copied to clipboard`,
-      })
+      setCopiedKey(key)
+      setTimeout(() => setCopiedKey(null), 2000)
+      toast({ title: "Copied", description: `${label} copied to clipboard` })
     } catch {
-      // Fallback for non-secure contexts or when clipboard API fails
       const textArea = document.createElement('textarea')
       textArea.value = text
       textArea.style.position = 'fixed'
@@ -141,18 +133,11 @@ export function TenantDetailPage() {
       textArea.select()
       try {
         document.execCommand('copy')
-        setCopied(true)
-        setTimeout(() => setCopied(false), 2000)
-        toast({
-          title: "Copied",
-          description: `${type} connection string copied to clipboard`,
-        })
+        setCopiedKey(key)
+        setTimeout(() => setCopiedKey(null), 2000)
+        toast({ title: "Copied", description: `${label} copied to clipboard` })
       } catch {
-        toast({
-          title: "Copy failed",
-          description: "Please manually copy the connection string",
-          variant: "destructive",
-        })
+        toast({ title: "Copy failed", description: "Please copy manually", variant: "destructive" })
       } finally {
         document.body.removeChild(textArea)
       }
@@ -174,29 +159,77 @@ export function TenantDetailPage() {
   return (
     <div className="space-y-4">
 
-      {/* Tags */}
-      {tenant.tags && tenant.tags.length > 0 && (
-        <Card>
-          <CardHeader className="pb-3">
-            <div className="flex items-center gap-2">
-              <Tag className="h-4 w-4 text-muted-foreground" />
-              <CardTitle className="text-base">Tags</CardTitle>
+      {/* Basic Info */}
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex items-center gap-2">
+            <Info className="h-4 w-4 text-muted-foreground" />
+            <CardTitle className="text-base">Tenant Info</CardTitle>
+          </div>
+        </CardHeader>
+        <CardContent>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div>
+              <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-1">Tenant ID</div>
+              <div className="text-sm font-mono font-medium">{tenant.id}</div>
             </div>
-          </CardHeader>
-          <CardContent>
-            <div className="flex flex-wrap gap-1.5">
-              {tenant.tags.map((tag) => (
-                <span
-                  key={tag}
-                  className="inline-flex items-center px-2 py-0.5 rounded-md text-xs bg-blue-500/10 text-blue-600 ring-1 ring-blue-500/20"
-                >
-                  {tag}
-                </span>
-              ))}
+            <div>
+              <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-1">Status</div>
+              <span className={cn(
+                "inline-flex items-center gap-1.5 text-xs font-medium",
+                tenant.state === "ACTIVE" ? "text-green-600"
+                  : tenant.state === "CREATING" || tenant.state === "DISABLING" ? "text-yellow-600"
+                  : "text-red-600"
+              )}>
+                <span className={cn(
+                  "w-1.5 h-1.5 rounded-full",
+                  tenant.state === "ACTIVE" ? "bg-green-500"
+                    : tenant.state === "CREATING" || tenant.state === "DISABLING" ? "bg-yellow-500"
+                    : "bg-red-500"
+                )} />
+                {tenant.state}
+              </span>
             </div>
-          </CardContent>
-        </Card>
-      )}
+            <div>
+              <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-1 flex items-center gap-1">
+                <Clock className="w-3 h-3" /> Created
+              </div>
+              <div className="text-sm">{formatDate(tenant.created_at)}</div>
+            </div>
+            {tenant.created_by && (
+              <div>
+                <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-1">Created By</div>
+                <div className="text-sm">{tenant.created_by}</div>
+              </div>
+            )}
+          </div>
+          {tenant.notes && (
+            <div className="mt-4 pt-3 border-t">
+              <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-1 flex items-center gap-1">
+                <FileText className="w-3 h-3" /> Notes
+              </div>
+              <p className="text-sm text-muted-foreground whitespace-pre-wrap">{tenant.notes}</p>
+            </div>
+          )}
+          {tenant.tags && tenant.tags.length > 0 && (
+            <div className="mt-3 pt-3 border-t">
+              <div className="text-[11px] text-muted-foreground uppercase tracking-wide mb-2 flex items-center gap-1">
+                <Tag className="w-3 h-3" /> Tags
+              </div>
+              <div className="flex flex-wrap gap-1.5">
+                {tenant.tags.map((tag) => (
+                  <span
+                    key={tag}
+                    className="inline-flex items-center px-2 py-0.5 rounded-md text-xs bg-blue-500/10 text-blue-600 ring-1 ring-blue-500/20"
+                  >
+                    {tag}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
 
       {/* Connection Endpoints */}
       <Card>
@@ -214,89 +247,87 @@ export function TenantDetailPage() {
         <CardContent>
           {tenant.endpoints && tenant.endpoints.length > 0 ? (
             <div className="space-y-3">
-              {tenant.endpoints.map((endpoint, idx) => (
+              {tenant.endpoints.map((endpoint, idx) => {
+                const psqlCmd = `psql -h ${endpoint.host} -p ${endpoint.port} -U ${tenantId}.admin -d postgres`
+                const dsnCmd = `postgresql://${tenantId}.admin@${endpoint.host}:${endpoint.port}/postgres`
+                return (
                 <div key={idx} className="group rounded-lg border border-border/50 bg-muted/20 hover:bg-muted/40 transition-colors overflow-hidden">
-                  <div className="flex items-center justify-between px-4 py-2.5 border-b border-border/30 bg-muted/30">
-                    <div className="flex items-center gap-2.5">
-                      <span className="text-sm font-medium">
-                        {endpoint.description || `Endpoint ${idx + 1}`}
-                      </span>
-                      <span className={cn(
-                        "inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium uppercase tracking-wide",
-                        endpoint.type === "primary" && "bg-blue-500/10 text-blue-600 ring-1 ring-blue-500/20",
-                        endpoint.type === "replica" && "bg-emerald-500/10 text-emerald-600 ring-1 ring-emerald-500/20",
-                        endpoint.type === "load_balancer" && "bg-violet-500/10 text-violet-600 ring-1 ring-violet-500/20"
-                      )}>
-                        {endpoint.type.replace('_', ' ')}
-                      </span>
-                      {endpoint.region && (
-                        <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
-                          {endpoint.region}
+                    <div className="flex items-center justify-between px-4 py-2.5 border-b border-border/30 bg-muted/30">
+                      <div className="flex items-center gap-2.5">
+                        <span className="text-sm font-medium">
+                          {endpoint.description || `Endpoint ${idx + 1}`}
                         </span>
+                        <span className={cn(
+                          "inline-flex items-center px-2 py-0.5 rounded-full text-[10px] font-medium uppercase tracking-wide",
+                          endpoint.type === "primary" && "bg-blue-500/10 text-blue-600 ring-1 ring-blue-500/20",
+                          endpoint.type === "replica" && "bg-emerald-500/10 text-emerald-600 ring-1 ring-emerald-500/20",
+                          endpoint.type === "load_balancer" && "bg-violet-500/10 text-violet-600 ring-1 ring-violet-500/20"
+                        )}>
+                          {endpoint.type.replace('_', ' ')}
+                        </span>
+                        {endpoint.region && (
+                          <span className="text-[10px] text-muted-foreground bg-muted px-1.5 py-0.5 rounded">
+                            {endpoint.region}
+                          </span>
+                        )}
+                      </div>
+                      {!endpoint.enabled && (
+                        <span className="text-[10px] font-medium text-red-500 bg-red-500/10 px-2 py-0.5 rounded-full">Offline</span>
                       )}
                     </div>
-                    {!endpoint.enabled && (
-                      <span className="text-[10px] font-medium text-red-500 bg-red-500/10 px-2 py-0.5 rounded-full">Offline</span>
-                    )}
-                  </div>
-                  <div className="px-4 py-3 space-y-2.5">
-                    <div className="flex items-center gap-6 text-xs">
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-muted-foreground">Host</span>
-                        <span className="font-mono font-medium bg-background/50 px-1.5 py-0.5 rounded">{endpoint.host}</span>
+                    <div className="px-4 py-3 space-y-2.5">
+                      <div className="flex items-center gap-6 text-xs">
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-muted-foreground">Host</span>
+                          <span className="font-mono font-medium bg-background/50 px-1.5 py-0.5 rounded">{endpoint.host}</span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <span className="text-muted-foreground">Port</span>
+                          <span className="font-mono font-medium bg-background/50 px-1.5 py-0.5 rounded">{endpoint.port}</span>
+                        </div>
                       </div>
-                      <div className="flex items-center gap-1.5">
-                        <span className="text-muted-foreground">Port</span>
-                        <span className="font-mono font-medium bg-background/50 px-1.5 py-0.5 rounded">{endpoint.port}</span>
-                      </div>
-                    </div>
-                    <div className="space-y-2">
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] text-muted-foreground uppercase tracking-wide font-medium min-w-[36px]">psql</span>
-                        <code className="flex-1 bg-background/60 border border-border/30 px-3 py-2 rounded-md text-xs font-mono text-muted-foreground">
-                          psql -h {endpoint.host} -p {endpoint.port} -U {tenantId}.admin -d postgres
-                        </code>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-8 w-8 p-0 hover:bg-primary/10"
-                          onClick={() => copyConnectionString(
-                            `psql -h ${endpoint.host} -p ${endpoint.port} -U ${tenantId}.admin -d postgres`,
-                            "psql"
-                          )}
-                        >
-                          {copied ? (
-                            <Check className="w-4 h-4 text-green-500" />
-                          ) : (
-                            <Copy className="w-4 h-4 text-muted-foreground" />
-                          )}
-                        </Button>
-                      </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-[10px] text-muted-foreground uppercase tracking-wide font-medium min-w-[36px]">DSN</span>
-                        <code className="flex-1 bg-background/60 border border-border/30 px-3 py-2 rounded-md text-xs font-mono text-muted-foreground">
-                          postgresql://{tenantId}.admin@{endpoint.host}:{endpoint.port}/postgres
-                        </code>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          className="h-8 w-8 p-0 hover:bg-primary/10"
-                          onClick={() => copyConnectionString(
-                            `postgresql://${tenantId}.admin@${endpoint.host}:${endpoint.port}/postgres`,
-                            "DSN"
-                          )}
-                        >
-                          {copied ? (
-                            <Check className="w-4 h-4 text-green-500" />
-                          ) : (
-                            <Copy className="w-4 h-4 text-muted-foreground" />
-                          )}
-                        </Button>
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] text-muted-foreground uppercase tracking-wide font-medium min-w-[36px]">psql</span>
+                          <code className="flex-1 bg-background/60 border border-border/30 px-3 py-2 rounded-md text-xs font-mono text-muted-foreground">
+                            {psqlCmd}
+                          </code>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 w-8 p-0 hover:bg-primary/10"
+                            onClick={() => copyToClipboard(psqlCmd, `psql-${idx}`, "psql")}
+                          >
+                            {copiedKey === `psql-${idx}` ? (
+                              <Check className="w-4 h-4 text-green-500" />
+                            ) : (
+                              <Copy className="w-4 h-4 text-muted-foreground" />
+                            )}
+                          </Button>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="text-[10px] text-muted-foreground uppercase tracking-wide font-medium min-w-[36px]">DSN</span>
+                          <code className="flex-1 bg-background/60 border border-border/30 px-3 py-2 rounded-md text-xs font-mono text-muted-foreground">
+                            {dsnCmd}
+                          </code>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-8 w-8 p-0 hover:bg-primary/10"
+                            onClick={() => copyToClipboard(dsnCmd, `dsn-${idx}`, "DSN")}
+                          >
+                            {copiedKey === `dsn-${idx}` ? (
+                              <Check className="w-4 h-4 text-green-500" />
+                            ) : (
+                              <Copy className="w-4 h-4 text-muted-foreground" />
+                            )}
+                          </Button>
+                        </div>
                       </div>
                     </div>
                   </div>
-                </div>
-              ))}
+                )
+              })}
             </div>
           ) : (
             <div className="flex flex-col items-center justify-center py-8 text-muted-foreground border border-dashed rounded-lg bg-muted/10">
@@ -502,11 +533,7 @@ export function TenantDetailPage() {
         </CardContent>
       </Card>
 
-      <TenantObservabilityCard
-        tenantId={tenantId!}
-        adminUser={isConnected ? adminUser : undefined}
-        adminPassword={isConnected ? adminPassword : undefined}
-      />
+      <TenantObservabilityCard tenantId={tenantId!} />
 
       <CreateUserDialog
         tenantId={tenantId!}

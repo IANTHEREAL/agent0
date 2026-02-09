@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react"
 import { Link, useSearchParams } from "react-router-dom"
-import { Plus, Ban, Users, Edit, Search, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from "lucide-react"
-import { useTenants, useRemoveTenant } from "@/api/tenants"
+import { Plus, Power, Users, Edit, Search, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight } from "lucide-react"
+import { useTenants, useDeleteTenant } from "@/api/tenants"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -21,7 +21,7 @@ export function TenantsPage() {
 
   const [searchInput, setSearchInput] = useState(search)
   const [showCreateDialog, setShowCreateDialog] = useState(false)
-  const [confirmRemove, setConfirmRemove] = useState<string | null>(null)
+  const [confirmDisable, setConfirmDisable] = useState<string | null>(null)
   const [editingTenant, setEditingTenant] = useState<Tenant | null>(null)
 
   const { data, isLoading, isFetching } = useTenants({
@@ -34,7 +34,7 @@ export function TenantsPage() {
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
 
-  const removeMutation = useRemoveTenant()
+  const disableMutation = useDeleteTenant()
   const { toast } = useToast()
 
   const setPage = useCallback((p: number) => {
@@ -63,17 +63,17 @@ export function TenantsPage() {
     return () => clearTimeout(timer)
   }, [searchInput, search, setSearch])
 
-  const handleRemove = async (tenantId: string) => {
+  const handleDisable = async (tenantId: string) => {
     try {
-      await removeMutation.mutateAsync(tenantId)
+      await disableMutation.mutateAsync(tenantId)
       toast({
-        title: "Tenant Removed",
-        description: `Tenant "${tenantId}" has been removed from the portal.`,
+        title: "Tenant Disabled",
+        description: `Tenant "${tenantId}" has been disabled.`,
       })
     } catch {
       toast({
         title: "Error",
-        description: "Failed to remove tenant",
+        description: "Failed to disable tenant",
         variant: "destructive",
       })
     }
@@ -213,9 +213,10 @@ export function TenantsPage() {
                               variant="ghost"
                               size="sm"
                               className="h-7 w-7 p-0 text-destructive hover:text-destructive"
-                              onClick={() => setConfirmRemove(tenant.id)}
+                              onClick={() => setConfirmDisable(tenant.id)}
+                              disabled={tenant.state !== "ACTIVE"}
                             >
-                              <Ban className="w-3.5 h-3.5" />
+                              <Power className="w-3.5 h-3.5" />
                             </Button>
                           </div>
                         </td>
@@ -290,23 +291,23 @@ export function TenantsPage() {
       />
 
       <ConfirmDialog
-        open={confirmRemove !== null}
-        onOpenChange={(open) => !open && setConfirmRemove(null)}
-        title="Remove Tenant?"
+        open={confirmDisable !== null}
+        onOpenChange={(open) => !open && setConfirmDisable(null)}
+        title="Disable Tenant?"
         description={
           <div className="space-y-2">
             <p>
-              This will remove tenant <strong>{confirmRemove}</strong> from the portal interface.
+              This will disable tenant <strong>{confirmDisable}</strong> and its TiKV keyspace.
             </p>
             <p className="text-sm text-muted-foreground">
-              The tenant's keyspace will be disabled in TiKV and hidden from this portal.
-              Data remains in storage but becomes inaccessible. This action cannot be undone.
+              The keyspace will be disabled and the tenant will no longer accept connections.
+              Data remains in TiKV storage but becomes inaccessible. This action cannot be undone.
             </p>
           </div>
         }
-        confirmLabel="Remove Tenant"
+        confirmLabel="Disable Tenant"
         variant="destructive"
-        onConfirm={() => handleRemove(confirmRemove!)}
+        onConfirm={() => handleDisable(confirmDisable!)}
       />
     </div>
   )
