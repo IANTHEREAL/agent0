@@ -82,12 +82,34 @@ Initialize at the start of Step 2:
 Call `functions.mcp__pantheon__parallel_explore` with `agent="codex"`, `num_branches=1`, `parent_branch_id=last_fix_branch_id`, and prompt:
 
 ```
-1) fix this issue ({issue_link}) using Linus KISS principle with an accurate, rigorous, and concise solut
-ion and don't introduce other issue and regression issue.
+1) fix this issue ({issue_link}) using Linus KISS principle with an accurate, rigorous, and concise solution and don't introduce other issue and regression issue.
 2) self-review your own diff (correctness, edge cases, compatibility, and obvious regressions).
 3) run the smallest relevant tests/build.
-4) create a PR using `gh` (MUST be created in this exploration; do NOT delegate PR creation to the user o
-r to later steps).
+4) create a PR using `gh` (MUST be created in this exploration; do NOT delegate PR creation to the user or to later steps).
+5) If `gh` is unauthorized (token expired/invalid), retry once after checking auth status.
+6) If still unauthorized, do NOT discard code: commit local changes, keep the current fixing branch, and stop this run.
+
+Output exactly one mode:
+
+Success mode:
+PR_URL=<url>
+PR_NUMBER=<number>
+PR_HEAD_BRANCH=<branch>
+
+GH auth expired mode:
+GH_AUTH_EXPIRED
+LOCAL_COMMIT=<sha>
+RETRY_PUSH_BRANCH=<branch>
+```
+
+Wait for the branch to finish (see “Waiting / Polling”), then parse output and set `last_fix_branch_id = fix_branch_id`.
+- If Success mode: extract and store `PR_URL/PR_NUMBER/PR_HEAD_BRANCH`.
+- If `GH_AUTH_EXPIRED`: store `retry_push_branch`, then immediately start ONE recovery Fix exploration from `last_fix_branch_id` with this prompt:
+
+```
+Do NOT change code. Use existing local commits only.
+Push branch `{retry_push_branch}` and create/reuse PR using `gh`.
+- If a PR for this head branch already exists, reuse it; otherwise create it.
 
 Output exactly:
 PR_URL=<url>
@@ -95,8 +117,7 @@ PR_NUMBER=<number>
 PR_HEAD_BRANCH=<branch>
 ```
 
-Wait for the branch to finish (see “Waiting / Polling”), then extract and store `PR_URL/PR_NUMBER/PR_HEAD_BRANCH`.
-Set `last_fix_branch_id = fix_branch_id`.
+Wait for recovery branch completion, then store `PR_URL/PR_NUMBER/PR_HEAD_BRANCH`.
 
 #### 2.2 Review (codex) — P0/P1 bug hunt
 
@@ -192,12 +213,22 @@ Important: do NOT create a new PR. checkout the existing PR head branch and push
 - commit
 - push
 run the smallest relevant tests/build.
+
+If `gh` is unauthorized (token expired/invalid):
+- retry auth-sensitive operation once
+- if still unauthorized, keep code and local commit, then stop this run
+
+If auth expires and push cannot finish, output exactly:
+GH_AUTH_EXPIRED
+LOCAL_COMMIT=<sha>
+RETRY_PUSH_BRANCH={pr_head_branch}
 ```
 
 2. Wait for the branch to finish (see “Waiting / Polling”); set `last_fix_branch_id = fix_branch_id`.
-3. Review again using Step 2.2 (which uses `parent_branch_id=last_fix_branch_id`); wait and parse.
-4. If Review output is `NO_P0_P1`, stop the loop.
-5. Otherwise Verify again using Step 2.3; wait and parse.
+3. If output is `GH_AUTH_EXPIRED`, start ONE recovery Fix exploration from `last_fix_branch_id` with prompt: "Do NOT change code; only push `{pr_head_branch}` and sync PR using `gh` (reuse existing PR)." Wait for completion.
+4. Review again using Step 2.2 (which uses `parent_branch_id=last_fix_branch_id`); wait and parse.
+5. If Review output is `NO_P0_P1`, stop the loop.
+6. Otherwise Verify again using Step 2.3; wait and parse.
 
 Stop the loop when either:
 - Review outputs `NO_P0_P1`, or
@@ -229,11 +260,11 @@ If this step fails, do NOT merge. Start another Fix exploration to address the f
 
 After each `parallel_explore`, wait via a sleep loop:
 1. Poll `functions.mcp__pantheon__get_branch(branch_id)` until `status` is terminal (case-insensitive match): `failed`, `succeed`, `finished`, `manifesting`, or `ready_for_manifest`.
-2. If `status` is terminal, Call `functions.mcp__pantheon__branch_output(branch_id, full_output=true)` to retrieve logs/results. 
+2. If `status` is terminal, Call `functions.mcp__pantheon__branch_output(branch_id, full_output=true)` to retrieve logs/results.
 3. Otherwise (not terminal), sleep 600s, then poll again
 
 Pantheon note: `manifesting` and `ready_for_manifest` mean the branch run is already done; you can fetch `branch_output` and proceed to the next step (you do not need to wait for a later `succeed`/`finished` transition).
 
 Hard rule:
 - `functions.mcp__pantheon__parallel_explore` must be with `num_branches=1`
-- The pantheon branch is a long running task, it will take  1h - 2h, and won't stuck. Plese Don’t treat it as a short-term task, and don’t try to start a new exploration or experiment with new approaches—this will just make things messy.
+- The pantheon branch is a long running task, it will take hours, and won't stuck. Plese Don’t treat it as a short-term task, and don’t try to start a new exploration or experiment with new approaches—this will just make things messy.
