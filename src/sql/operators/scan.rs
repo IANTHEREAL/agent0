@@ -5,6 +5,8 @@ use super::{ExecutionContext, PhysicalOperator};
 use crate::sql::projection::fill_row_defaults;
 use crate::types::{Row, TableSchema, Value};
 
+const OPERATOR_BATCH_FETCH_SIZE: usize = 256;
+
 #[derive(Debug)]
 pub struct TableScanOperator {
     schema: TableSchema,
@@ -129,7 +131,8 @@ pub struct IndexScanOperator {
     index_name: String,
     lookup_values: Vec<Value>,
     scan_limit: Option<usize>,
-    buffer: Vec<Row>,
+    pk_queue: Vec<Vec<Value>>,
+    row_buffer: Vec<Row>,
     position: usize,
     opened: bool,
 }
@@ -148,7 +151,8 @@ impl IndexScanOperator {
             index_name,
             lookup_values,
             scan_limit: None,
-            buffer: Vec::new(),
+            pk_queue: Vec::new(),
+            row_buffer: Vec::new(),
             position: 0,
             opened: false,
         }
@@ -168,10 +172,38 @@ impl IndexScanOperator {
             index_name,
             lookup_values,
             scan_limit,
-            buffer: Vec::new(),
+            pk_queue: Vec::new(),
+            row_buffer: Vec::new(),
             position: 0,
             opened: false,
         }
+    }
+
+    async fn load_next_batch(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        self.row_buffer.clear();
+        self.position = 0;
+
+        while self.row_buffer.is_empty() && !self.pk_queue.is_empty() {
+            let batch_size = OPERATOR_BATCH_FETCH_SIZE.min(self.pk_queue.len());
+            let batch_pks: Vec<Vec<Value>> = self.pk_queue.drain(..batch_size).collect();
+            let rows = ctx
+                .store
+                .batch_get_rows(
+                    ctx.txn,
+                    ctx.db_id,
+                    self.schema.table_id,
+                    batch_pks,
+                    &self.schema,
+                )
+                .await?;
+
+            self.row_buffer = rows
+                .into_iter()
+                .map(|r| fill_row_defaults_scan(r, &self.schema))
+                .collect::<Result<Vec<_>>>()?;
+        }
+
+        Ok(())
     }
 }
 
@@ -182,7 +214,8 @@ impl PhysicalOperator for IndexScanOperator {
     }
 
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.buffer.clear();
+        self.pk_queue.clear();
+        self.row_buffer.clear();
         self.position = 0;
         self.opened = true;
 
@@ -245,35 +278,36 @@ impl PhysicalOperator for IndexScanOperator {
                 .await?
         };
 
-        let rows = ctx
-            .store
-            .batch_get_rows(ctx.txn, ctx.db_id, self.schema.table_id, pks, &self.schema)
-            .await?;
-
-        self.buffer = rows
-            .into_iter()
-            .map(|r| fill_row_defaults_scan(r, &self.schema))
-            .collect::<Result<Vec<_>>>()?;
+        self.pk_queue = pks;
+        self.load_next_batch(ctx).await?;
 
         Ok(())
     }
 
-    async fn next(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
+    async fn next(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
         if !self.opened {
             return Err(anyhow!("Operator not opened"));
         }
 
-        if self.position < self.buffer.len() {
-            let row = self.buffer[self.position].clone();
+        if self.position < self.row_buffer.len() {
+            let row = self.row_buffer[self.position].clone();
             self.position += 1;
             Ok(Some(row))
         } else {
-            Ok(None)
+            self.load_next_batch(ctx).await?;
+            if self.position < self.row_buffer.len() {
+                let row = self.row_buffer[self.position].clone();
+                self.position += 1;
+                Ok(Some(row))
+            } else {
+                Ok(None)
+            }
         }
     }
 
     async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.buffer.clear();
+        self.pk_queue.clear();
+        self.row_buffer.clear();
         self.opened = false;
         Ok(())
     }
@@ -301,7 +335,8 @@ pub struct RangeIndexScanOperator {
     range_end: Option<Value>,
     end_inclusive: bool,
     scan_limit: Option<usize>,
-    buffer: Vec<Row>,
+    pk_queue: Vec<Vec<Value>>,
+    row_buffer: Vec<Row>,
     position: usize,
     opened: bool,
 }
@@ -327,7 +362,8 @@ impl RangeIndexScanOperator {
             range_end,
             end_inclusive,
             scan_limit: None,
-            buffer: Vec::new(),
+            pk_queue: Vec::new(),
+            row_buffer: Vec::new(),
             position: 0,
             opened: false,
         }
@@ -355,10 +391,38 @@ impl RangeIndexScanOperator {
             range_end,
             end_inclusive,
             scan_limit,
-            buffer: Vec::new(),
+            pk_queue: Vec::new(),
+            row_buffer: Vec::new(),
             position: 0,
             opened: false,
         }
+    }
+
+    async fn load_next_batch(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        self.row_buffer.clear();
+        self.position = 0;
+
+        while self.row_buffer.is_empty() && !self.pk_queue.is_empty() {
+            let batch_size = OPERATOR_BATCH_FETCH_SIZE.min(self.pk_queue.len());
+            let batch_pks: Vec<Vec<Value>> = self.pk_queue.drain(..batch_size).collect();
+            let rows = ctx
+                .store
+                .batch_get_rows(
+                    ctx.txn,
+                    ctx.db_id,
+                    self.schema.table_id,
+                    batch_pks,
+                    &self.schema,
+                )
+                .await?;
+
+            self.row_buffer = rows
+                .into_iter()
+                .map(|r| fill_row_defaults_scan(r, &self.schema))
+                .collect::<Result<Vec<_>>>()?;
+        }
+
+        Ok(())
     }
 }
 
@@ -369,7 +433,8 @@ impl PhysicalOperator for RangeIndexScanOperator {
     }
 
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.buffer.clear();
+        self.pk_queue.clear();
+        self.row_buffer.clear();
         self.position = 0;
         self.opened = true;
 
@@ -422,35 +487,36 @@ impl PhysicalOperator for RangeIndexScanOperator {
             )
             .await?;
 
-        let rows = ctx
-            .store
-            .batch_get_rows(ctx.txn, ctx.db_id, self.schema.table_id, pks, &self.schema)
-            .await?;
-
-        self.buffer = rows
-            .into_iter()
-            .map(|r| fill_row_defaults_scan(r, &self.schema))
-            .collect::<Result<Vec<_>>>()?;
+        self.pk_queue = pks;
+        self.load_next_batch(ctx).await?;
 
         Ok(())
     }
 
-    async fn next(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
+    async fn next(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
         if !self.opened {
             return Err(anyhow!("Operator not opened"));
         }
 
-        if self.position < self.buffer.len() {
-            let row = self.buffer[self.position].clone();
+        if self.position < self.row_buffer.len() {
+            let row = self.row_buffer[self.position].clone();
             self.position += 1;
             Ok(Some(row))
         } else {
-            Ok(None)
+            self.load_next_batch(ctx).await?;
+            if self.position < self.row_buffer.len() {
+                let row = self.row_buffer[self.position].clone();
+                self.position += 1;
+                Ok(Some(row))
+            } else {
+                Ok(None)
+            }
         }
     }
 
     async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.buffer.clear();
+        self.pk_queue.clear();
+        self.row_buffer.clear();
         self.opened = false;
         Ok(())
     }
@@ -474,7 +540,8 @@ pub struct InListScanOperator {
     index_name: String,
     column_values: Vec<Vec<Value>>,
     scan_limit: Option<usize>,
-    buffer: Vec<Row>,
+    pk_queue: Vec<Vec<Value>>,
+    row_buffer: Vec<Row>,
     position: usize,
     opened: bool,
 }
@@ -492,7 +559,8 @@ impl InListScanOperator {
             index_name,
             column_values,
             scan_limit: None,
-            buffer: Vec::new(),
+            pk_queue: Vec::new(),
+            row_buffer: Vec::new(),
             position: 0,
             opened: false,
         }
@@ -512,10 +580,38 @@ impl InListScanOperator {
             index_name,
             column_values,
             scan_limit,
-            buffer: Vec::new(),
+            pk_queue: Vec::new(),
+            row_buffer: Vec::new(),
             position: 0,
             opened: false,
         }
+    }
+
+    async fn load_next_batch(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
+        self.row_buffer.clear();
+        self.position = 0;
+
+        while self.row_buffer.is_empty() && !self.pk_queue.is_empty() {
+            let batch_size = OPERATOR_BATCH_FETCH_SIZE.min(self.pk_queue.len());
+            let batch_pks: Vec<Vec<Value>> = self.pk_queue.drain(..batch_size).collect();
+            let rows = ctx
+                .store
+                .batch_get_rows(
+                    ctx.txn,
+                    ctx.db_id,
+                    self.schema.table_id,
+                    batch_pks,
+                    &self.schema,
+                )
+                .await?;
+
+            self.row_buffer = rows
+                .into_iter()
+                .map(|r| fill_row_defaults_scan(r, &self.schema))
+                .collect::<Result<Vec<_>>>()?;
+        }
+
+        Ok(())
     }
 }
 
@@ -526,7 +622,8 @@ impl PhysicalOperator for InListScanOperator {
     }
 
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.buffer.clear();
+        self.pk_queue.clear();
+        self.row_buffer.clear();
         self.position = 0;
         self.opened = true;
 
@@ -575,41 +672,36 @@ impl PhysicalOperator for InListScanOperator {
             deduped_pks.truncate(limit);
         }
 
-        let rows = ctx
-            .store
-            .batch_get_rows(
-                ctx.txn,
-                ctx.db_id,
-                self.schema.table_id,
-                deduped_pks,
-                &self.schema,
-            )
-            .await?;
-
-        self.buffer = rows
-            .into_iter()
-            .map(|r| fill_row_defaults_scan(r, &self.schema))
-            .collect::<Result<Vec<_>>>()?;
+        self.pk_queue = deduped_pks;
+        self.load_next_batch(ctx).await?;
 
         Ok(())
     }
 
-    async fn next(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
+    async fn next(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
         if !self.opened {
             return Err(anyhow!("Operator not opened"));
         }
 
-        if self.position < self.buffer.len() {
-            let row = self.buffer[self.position].clone();
+        if self.position < self.row_buffer.len() {
+            let row = self.row_buffer[self.position].clone();
             self.position += 1;
             Ok(Some(row))
         } else {
-            Ok(None)
+            self.load_next_batch(ctx).await?;
+            if self.position < self.row_buffer.len() {
+                let row = self.row_buffer[self.position].clone();
+                self.position += 1;
+                Ok(Some(row))
+            } else {
+                Ok(None)
+            }
         }
     }
 
     async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.buffer.clear();
+        self.pk_queue.clear();
+        self.row_buffer.clear();
         self.opened = false;
         Ok(())
     }
