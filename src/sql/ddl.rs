@@ -27,6 +27,7 @@ use crate::types::{
 };
 
 const DDL_SCAN_BATCH_SIZE: u32 = 1024;
+const DDL_BACKFILL_COMMIT_SIZE: usize = 5000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GinColumnType {
@@ -479,6 +480,23 @@ async fn delete_range(txn: &mut Transaction, start: Vec<u8>, end: Vec<u8>) -> Re
             txn_delete(txn, pair.into_key().into()).await?;
         }
     }
+    Ok(())
+}
+
+async fn maybe_rotate_backfill_txn(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    current_batch_writes: &mut usize,
+    has_committed_batches: &mut bool,
+) -> Result<()> {
+    if *current_batch_writes < DDL_BACKFILL_COMMIT_SIZE {
+        return Ok(());
+    }
+
+    txn.commit().await?;
+    *txn = store.begin().await?;
+    *current_batch_writes = 0;
+    *has_committed_batches = true;
     Ok(())
 }
 
@@ -1112,37 +1130,71 @@ pub async fn execute_create_index(
         expressions: idx_exprs,
     };
 
-    if index_helpers::is_index_materializable(&new_index) {
-        if !rows.is_empty() {
-            if schema.pk_indices.is_empty() {
-                let pk_types: Vec<DataType> = vec![DataType::Uuid];
-                let (start, end) =
-                    crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
-                let data_key_prefix = start.clone();
-                let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
-                while let Some(batch) = scanner.next_batch(txn).await? {
-                    for pair in batch {
-                        let key: &[u8] = pair.key().as_ref().into();
-                        let pk_bytes =
-                            key.strip_prefix(data_key_prefix.as_slice())
-                                .ok_or_else(|| {
-                                    anyhow!(
-                                        "corrupted row key while backfilling index '{}'",
-                                        idx_name_str
-                                    )
-                                })?;
-                        let pk_values =
-                            crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
+    let mut current_batch_writes = 0usize;
+    let mut has_committed_batches = false;
 
-                        let mut row = crate::storage::deserialize_row(pair.value())?;
-                        fill_row_defaults(&mut row, &schema)?;
+    let create_result: Result<()> = async {
+        if index_helpers::is_index_materializable(&new_index) {
+            if !rows.is_empty() {
+                if schema.pk_indices.is_empty() {
+                    let pk_types: Vec<DataType> = vec![DataType::Uuid];
+                    let (start, end) =
+                        crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                    let data_key_prefix = start.clone();
+                    let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+                    while let Some(batch) = scanner.next_batch(txn).await? {
+                        for pair in batch {
+                            let key: &[u8] = pair.key().as_ref().into();
+                            let pk_bytes =
+                                key.strip_prefix(data_key_prefix.as_slice())
+                                    .ok_or_else(|| {
+                                        anyhow!(
+                                            "corrupted row key while backfilling index '{}'",
+                                            idx_name_str
+                                        )
+                                    })?;
+                            let pk_values =
+                                crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
 
+                            let mut row = crate::storage::deserialize_row(pair.value())?;
+                            fill_row_defaults(&mut row, &schema)?;
+
+                            if !index_helpers::eval_index_predicate(&new_index, &schema, &row)? {
+                                continue;
+                            }
+                            let idx_values = index_helpers::get_index_values_with_expressions(
+                                &new_index, &schema, &row,
+                            )?;
+                            store
+                                .create_index_entry(
+                                    txn,
+                                    db_id,
+                                    schema.table_id,
+                                    index_id,
+                                    &idx_values,
+                                    &pk_values,
+                                    unique,
+                                )
+                                .await?;
+                            current_batch_writes += 1;
+                            maybe_rotate_backfill_txn(
+                                store,
+                                txn,
+                                &mut current_batch_writes,
+                                &mut has_committed_batches,
+                            )
+                            .await?;
+                        }
+                    }
+                } else {
+                    for row in rows {
                         if !index_helpers::eval_index_predicate(&new_index, &schema, &row)? {
                             continue;
                         }
                         let idx_values = index_helpers::get_index_values_with_expressions(
                             &new_index, &schema, &row,
                         )?;
+                        let pk_values = schema.get_pk_values(&row);
                         store
                             .create_index_entry(
                                 txn,
@@ -1154,60 +1206,74 @@ pub async fn execute_create_index(
                                 unique,
                             )
                             .await?;
-                    }
-                }
-            } else {
-                for row in rows {
-                    if !index_helpers::eval_index_predicate(&new_index, &schema, &row)? {
-                        continue;
-                    }
-                    let idx_values = index_helpers::get_index_values_with_expressions(
-                        &new_index, &schema, &row,
-                    )?;
-                    let pk_values = schema.get_pk_values(&row);
-                    store
-                        .create_index_entry(
+                        current_batch_writes += 1;
+                        maybe_rotate_backfill_txn(
+                            store,
                             txn,
-                            db_id,
-                            schema.table_id,
-                            index_id,
-                            &idx_values,
-                            &pk_values,
-                            unique,
+                            &mut current_batch_writes,
+                            &mut has_committed_batches,
                         )
                         .await?;
+                    }
                 }
             }
-        }
-    } else if supported_gin_index_column(&schema, &new_index).is_some() {
-        if !rows.is_empty() {
-            if schema.pk_indices.is_empty() {
-                let pk_types: Vec<DataType> = vec![DataType::Uuid];
-                let (start, end) =
-                    crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
-                let data_key_prefix = start.clone();
-                let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
-                while let Some(batch) = scanner.next_batch(txn).await? {
-                    for pair in batch {
-                        let key: &[u8] = pair.key().as_ref().into();
-                        let pk_bytes =
-                            key.strip_prefix(data_key_prefix.as_slice())
-                                .ok_or_else(|| {
-                                    anyhow!(
-                                        "corrupted row key while backfilling index '{}'",
-                                        idx_name_str
-                                    )
-                                })?;
-                        let pk_values =
-                            crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
+        } else if supported_gin_index_column(&schema, &new_index).is_some() {
+            if !rows.is_empty() {
+                if schema.pk_indices.is_empty() {
+                    let pk_types: Vec<DataType> = vec![DataType::Uuid];
+                    let (start, end) =
+                        crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
+                    let data_key_prefix = start.clone();
+                    let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
+                    while let Some(batch) = scanner.next_batch(txn).await? {
+                        for pair in batch {
+                            let key: &[u8] = pair.key().as_ref().into();
+                            let pk_bytes =
+                                key.strip_prefix(data_key_prefix.as_slice())
+                                    .ok_or_else(|| {
+                                        anyhow!(
+                                            "corrupted row key while backfilling index '{}'",
+                                            idx_name_str
+                                        )
+                                    })?;
+                            let pk_values =
+                                crate::storage::decode_pk_from_index_suffix(pk_bytes, &pk_types)?;
 
-                        let mut row = crate::storage::deserialize_row(pair.value())?;
-                        fill_row_defaults(&mut row, &schema)?;
+                            let mut row = crate::storage::deserialize_row(pair.value())?;
+                            fill_row_defaults(&mut row, &schema)?;
 
+                            let hashes =
+                                extract_gin_token_hashes_from_row(&schema, &new_index, &row)?;
+                            if hashes.is_empty() {
+                                continue;
+                            }
+                            store
+                                .create_gin_index_entries(
+                                    txn,
+                                    db_id,
+                                    schema.table_id,
+                                    index_id,
+                                    &hashes,
+                                    &pk_values,
+                                )
+                                .await?;
+                            current_batch_writes += 1;
+                            maybe_rotate_backfill_txn(
+                                store,
+                                txn,
+                                &mut current_batch_writes,
+                                &mut has_committed_batches,
+                            )
+                            .await?;
+                        }
+                    }
+                } else {
+                    for row in rows {
                         let hashes = extract_gin_token_hashes_from_row(&schema, &new_index, &row)?;
                         if hashes.is_empty() {
                             continue;
                         }
+                        let pk_values = schema.get_pk_values(&row);
                         store
                             .create_gin_index_entries(
                                 txn,
@@ -1218,32 +1284,50 @@ pub async fn execute_create_index(
                                 &pk_values,
                             )
                             .await?;
-                    }
-                }
-            } else {
-                for row in rows {
-                    let hashes = extract_gin_token_hashes_from_row(&schema, &new_index, &row)?;
-                    if hashes.is_empty() {
-                        continue;
-                    }
-                    let pk_values = schema.get_pk_values(&row);
-                    store
-                        .create_gin_index_entries(
+                        current_batch_writes += 1;
+                        maybe_rotate_backfill_txn(
+                            store,
                             txn,
-                            db_id,
-                            schema.table_id,
-                            index_id,
-                            &hashes,
-                            &pk_values,
+                            &mut current_batch_writes,
+                            &mut has_committed_batches,
                         )
                         .await?;
+                    }
                 }
             }
         }
-    }
 
-    schema.indexes.push(new_index);
-    store.update_schema(txn, db_id, schema).await?;
+        schema.indexes.push(new_index.clone());
+        store.update_schema(txn, db_id, schema.clone()).await?;
+        Ok(())
+    }
+    .await;
+
+    if let Err(err) = create_result {
+        if has_committed_batches {
+            // Backfill commits can succeed before schema update. On failure after that point,
+            // remove committed entries so CREATE INDEX does not leave orphaned index KV data.
+            let _ = txn.rollback().await;
+            let (start, end) = index_prefix_range(db_id, schema.table_id, index_id);
+            let cleanup_result: Result<()> = async {
+                let mut cleanup_txn = store.begin().await?;
+                delete_range(&mut cleanup_txn, start, end).await?;
+                cleanup_txn.commit().await?;
+                Ok(())
+            }
+            .await;
+
+            *txn = store.begin().await?;
+
+            if let Err(cleanup_err) = cleanup_result {
+                return Err(err.context(format!(
+                    "failed to cleanup partially backfilled index '{}': {}",
+                    idx_name_str, cleanup_err
+                )));
+            }
+        }
+        return Err(err);
+    }
 
     Ok(ExecuteResult::CreateIndex {
         index_name: idx_name_str,
