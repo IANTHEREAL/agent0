@@ -25,6 +25,8 @@ const (
 type ControllerConfig struct {
 	// MCPBaseURL is the Pantheon MCP SSE endpoint, e.g. http://host:8000/mcp/sse.
 	MCPBaseURL string
+	// MCPBearerToken is an optional bearer token for MCP requests.
+	MCPBearerToken string
 
 	ProjectName string
 	Agent       string
@@ -100,7 +102,7 @@ func runControllerWithClient(ctx context.Context, cfg ControllerConfig, client a
 	normalizeControllerDefaults(&state)
 
 	if client == nil {
-		client = NewMCPClient(state.MCPBaseURL)
+		client = NewMCPClient(state.MCPBaseURL, cfg.MCPBearerToken)
 	}
 
 	if cfg.Rebootstrap && strings.TrimSpace(state.ActiveBranch) != "" {

@@ -14,6 +14,7 @@ First run (needs a baseline parent branch):
 ```bash
 go run ./cmd/agent0 \
   --mcp-base-url http://localhost:8000/mcp/sse \
+  --mcp-bearer-token <token> \
   --pantheon-project-name agent0 \
   --pantheon-parent-branch-id <baseline_parent_branch_id> \
   --task "..."
@@ -32,3 +33,7 @@ Optional initialization hints:
 - `--project-collaboration-md-url <url>`
 - `--minibook-account <account>`
 - `--rebootstrap`
+
+Optional MCP auth:
+
+- `--mcp-bearer-token <token>` (or `MCP_BEARER_TOKEN` / `PANTHEON_BEARER_TOKEN`)
