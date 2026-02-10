@@ -307,16 +307,25 @@ fn hash_array_element(val: &Value) -> u64 {
         Value::Null => fnv1a_u64(h, b"n"),
         Value::Boolean(b) => fnv1a_u64(h, if *b { b"t" } else { b"f" }),
         Value::Int32(i) => {
-            h = fnv1a_u64(h, b"i4");
-            fnv1a_u64(h, &i.to_be_bytes())
+            h = fnv1a_u64(h, b"i");
+            fnv1a_u64(h, &(*i as i64).to_be_bytes())
         }
         Value::Int64(i) => {
-            h = fnv1a_u64(h, b"i8");
+            h = fnv1a_u64(h, b"i");
             fnv1a_u64(h, &i.to_be_bytes())
         }
         Value::Float64(f) => {
-            h = fnv1a_u64(h, b"f8");
-            fnv1a_u64(h, &f.to_bits().to_be_bytes())
+            if f.is_finite()
+                && f.fract() == 0.0
+                && *f >= (i64::MIN as f64)
+                && *f <= (i64::MAX as f64)
+            {
+                h = fnv1a_u64(h, b"i");
+                fnv1a_u64(h, &(*f as i64).to_be_bytes())
+            } else {
+                h = fnv1a_u64(h, b"f");
+                fnv1a_u64(h, &f.to_bits().to_be_bytes())
+            }
         }
         Value::Text(s) => {
             h = fnv1a_u64(h, b"s");
@@ -501,5 +510,53 @@ mod tests {
         for t in contained_tokens {
             assert!(container_tokens.contains(&t));
         }
+    }
+
+    #[test]
+    fn hash_array_element_int32_equals_int64() {
+        assert_eq!(
+            hash_array_element(&Value::Int32(42)),
+            hash_array_element(&Value::Int64(42))
+        );
+    }
+
+    #[test]
+    fn hash_array_element_int32_equals_int64_negative() {
+        assert_eq!(
+            hash_array_element(&Value::Int32(-1)),
+            hash_array_element(&Value::Int64(-1))
+        );
+    }
+
+    #[test]
+    fn hash_array_element_int32_equals_int64_zero() {
+        assert_eq!(
+            hash_array_element(&Value::Int32(0)),
+            hash_array_element(&Value::Int64(0))
+        );
+    }
+
+    #[test]
+    fn hash_array_element_float64_integer_equals_int64() {
+        assert_eq!(
+            hash_array_element(&Value::Float64(42.0)),
+            hash_array_element(&Value::Int64(42))
+        );
+    }
+
+    #[test]
+    fn hash_array_element_float64_fractional_differs_from_int() {
+        assert_ne!(
+            hash_array_element(&Value::Float64(42.5)),
+            hash_array_element(&Value::Int64(42))
+        );
+    }
+
+    #[test]
+    fn hash_array_element_int32_int64_different_values_differ() {
+        assert_ne!(
+            hash_array_element(&Value::Int32(1)),
+            hash_array_element(&Value::Int64(2))
+        );
     }
 }
