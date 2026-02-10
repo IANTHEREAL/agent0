@@ -1,5 +1,6 @@
 use anyhow::Result;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt};
+use tokio::sync::mpsc;
 
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
@@ -157,30 +158,133 @@ impl StreamingJsonlDecoder {
 }
 
 pub(crate) struct StreamingCsvDecoder {
-    _private: (),
+    schema: TableSchema,
+    rows_rx: mpsc::Receiver<Result<Row>>,
+    total_bytes: usize,
 }
 
 impl StreamingCsvDecoder {
     pub(crate) async fn new(
-        _reader: Box<dyn AsyncBufRead + Unpin + Send>,
-        _path: String,
-        _delimiter: Option<char>,
-        _has_headers: bool,
+        mut reader: Box<dyn AsyncBufRead + Unpin + Send>,
+        path: String,
+        delimiter: Option<char>,
+        has_headers: bool,
     ) -> Result<Self> {
-        todo!("StreamingCsvDecoder::new")
+        let delimiter = delimiter.unwrap_or(',');
+        let delimiter = u8::try_from(delimiter as u32)
+            .map_err(|_| anyhow::anyhow!("delimiter must be a single-byte character"))?;
+
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data).await?;
+        let total_bytes = data.len();
+
+        let (schema, col_count) = csv_schema_from_data(&data, delimiter, has_headers)?;
+
+        let (rows_tx, rows_rx) = mpsc::channel(256);
+        tokio::task::spawn_blocking(move || {
+            let mut csv_reader = csv::ReaderBuilder::new()
+                .delimiter(delimiter)
+                .flexible(true)
+                .has_headers(has_headers)
+                .from_reader(data.as_slice());
+
+            if has_headers {
+                if let Err(err) = csv_reader.headers() {
+                    let _ = rows_tx.blocking_send(Err(err.into()));
+                    return;
+                }
+            }
+
+            let path_value = Value::Text(path);
+            for (idx, record) in csv_reader.records().enumerate() {
+                let record = match record {
+                    Ok(record) => record,
+                    Err(err) => {
+                        let _ = rows_tx.blocking_send(Err(err.into()));
+                        return;
+                    }
+                };
+
+                let mut values = Vec::with_capacity(col_count + 2);
+                values.push(Value::Int64((idx + 1) as i64));
+                for col_idx in 0..col_count {
+                    match record.get(col_idx) {
+                        Some(v) => values.push(Value::Text(v.to_string())),
+                        None => values.push(Value::Null),
+                    }
+                }
+                values.push(path_value.clone());
+
+                if rows_tx.blocking_send(Ok(Row::new(values))).is_err() {
+                    return;
+                }
+            }
+        });
+
+        Ok(Self {
+            schema,
+            rows_rx,
+            total_bytes,
+        })
     }
 
     pub(crate) fn schema(&self) -> &TableSchema {
-        todo!("StreamingCsvDecoder::schema")
+        &self.schema
     }
 
     pub(crate) async fn next_row(&mut self) -> Result<Option<Row>> {
-        todo!("StreamingCsvDecoder::next_row")
+        match self.rows_rx.recv().await {
+            Some(row) => row.map(Some),
+            None => Ok(None),
+        }
     }
 
     pub(crate) fn bytes_read(&self) -> usize {
-        todo!("StreamingCsvDecoder::bytes_read")
+        self.total_bytes
     }
+}
+
+fn csv_schema_from_data(data: &[u8], delimiter: u8, has_headers: bool) -> Result<(TableSchema, usize)> {
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .flexible(true)
+        .has_headers(has_headers)
+        .from_reader(data);
+
+    if has_headers {
+        let headers = reader.headers()?.clone();
+        let col_count = headers.len();
+
+        let mut columns = vec![make_column("_line_number", DataType::Int64, false)];
+        for name in headers.iter() {
+            columns.push(make_column(name, DataType::Text, true));
+        }
+        columns.push(make_column("_path", DataType::Text, false));
+        let schema = make_schema("fs9", columns);
+        return Ok((schema, col_count));
+    }
+
+    let mut records = reader.records();
+    let Some(first) = records.next() else {
+        let schema = make_schema(
+            "fs9",
+            vec![
+                make_column("_line_number", DataType::Int64, false),
+                make_column("_path", DataType::Text, false),
+            ],
+        );
+        return Ok((schema, 0));
+    };
+
+    let first = first?;
+    let col_count = first.len();
+    let mut columns = vec![make_column("_line_number", DataType::Int64, false)];
+    for idx in 0..col_count {
+        columns.push(make_column(&format!("col_{idx}"), DataType::Text, true));
+    }
+    columns.push(make_column("_path", DataType::Text, false));
+    let schema = make_schema("fs9", columns);
+    Ok((schema, col_count))
 }
 
 #[cfg(test)]
