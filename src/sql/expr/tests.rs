@@ -2053,3 +2053,17 @@ fn test_eval_expr_without_query_context_falls_back() {
     let val = eval_expr_with_query_ctx(&expr, None, None, None).unwrap();
     assert_eq!(val, Value::Int32(42));
 }
+
+
+#[test]
+fn test_like_single_byte_escape_accepted() {
+    // ASCII (1 byte) should work fine
+    assert_eq!(
+        eval_expr(&parse_expr("'a_b' LIKE 'a\\_b' ESCAPE '\\'"), None, None).unwrap(),
+        Value::Boolean(true)
+    );
+    assert_eq!(
+        eval_expr(&parse_expr("'a%b' LIKE 'a\\%b' ESCAPE '\\'"), None, None).unwrap(),
+        Value::Boolean(true)
+    );
+}
