@@ -1,0 +1,545 @@
+use std::collections::HashMap;
+use std::io::{self, Write};
+use std::process;
+
+use clap::{Parser, Subcommand};
+use pgtikv_admin::cli_common::{format_time, format_val, print_json, print_table, ApiClient};
+use serde_json::Value;
+
+const DEFAULT_API_URL: &str = "http://localhost:8090/api";
+
+// ── CLI definition ──────────────────────────────────────────────
+
+#[derive(Parser)]
+#[command(
+    name = "db9",
+    about = "db9 — Customer CLI for pg-tikv database service",
+    version
+)]
+struct Cli {
+    /// API base URL (env: DB9_API_URL)
+    #[arg(long, env = "DB9_API_URL", default_value = DEFAULT_API_URL)]
+    api_url: String,
+
+    /// Output as JSON
+    #[arg(long, global = true)]
+    json: bool,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Register a new account
+    Register,
+    /// Login to your account
+    Login,
+    /// Logout (remove stored credentials)
+    Logout,
+    /// Database management
+    Db {
+        #[command(subcommand)]
+        action: DbAction,
+    },
+    /// Token management
+    Token {
+        #[command(subcommand)]
+        action: TokenAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbAction {
+    /// Create a new database
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        region: Option<String>,
+    },
+    /// List your databases
+    List,
+    /// Get database status and details
+    Status { id: String },
+    /// Delete a database
+    Delete { id: String },
+    /// Show connection info for a database
+    Connect { id: String },
+}
+
+#[derive(Subcommand)]
+enum TokenAction {
+    /// List your API tokens
+    List,
+    /// Revoke a token
+    Revoke { token_id: String },
+}
+
+// ── Config helpers ──────────────────────────────────────────────
+
+fn config_dir() -> std::path::PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| {
+            eprintln!("Cannot determine home directory");
+            process::exit(1);
+        })
+        .join(".db9")
+}
+
+fn ensure_config_dir() -> std::path::PathBuf {
+    let dir = config_dir();
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+            eprintln!("Failed to create config directory: {e}");
+            process::exit(1);
+        });
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            std::fs::set_permissions(&dir, perms).ok();
+        }
+    }
+    dir
+}
+
+fn load_token() -> Result<String, String> {
+    let cred_path = config_dir().join("credentials");
+    let content = std::fs::read_to_string(&cred_path)
+        .map_err(|_| "Not logged in. Run 'db9 login' first.".to_string())?;
+    let parsed: toml::Table = content
+        .parse()
+        .map_err(|_| "Not logged in. Run 'db9 login' first.".to_string())?;
+    parsed
+        .get("token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "Not logged in. Run 'db9 login' first.".to_string())
+}
+
+fn save_token(token: &str) -> Result<(), String> {
+    let dir = ensure_config_dir();
+    let cred_path = dir.join("credentials");
+    let content = format!("token = \"{token}\"\n");
+    std::fs::write(&cred_path, content)
+        .map_err(|e| format!("Failed to save credentials: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&cred_path, perms)
+            .map_err(|e| format!("Failed to set file permissions: {e}"))?;
+    }
+    Ok(())
+}
+
+fn require_token() -> String {
+    match load_token() {
+        Ok(t) => t,
+        Err(msg) => {
+            eprintln!("{msg}");
+            process::exit(1);
+        }
+    }
+}
+
+fn make_auth_headers(token: &str) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "Authorization".to_string(),
+        format!("Bearer {token}"),
+    );
+    headers
+}
+
+fn prompt_email() -> String {
+    print!("Email: ");
+    io::stdout().flush().ok();
+    let mut email = String::new();
+    io::stdin().read_line(&mut email).unwrap_or_else(|e| {
+        eprintln!("Failed to read email: {e}");
+        process::exit(1);
+    });
+    email.trim().to_string()
+}
+
+fn prompt_password(prompt: &str) -> String {
+    rpassword::prompt_password(prompt).unwrap_or_else(|e| {
+        eprintln!("Failed to read password: {e}");
+        process::exit(1);
+    })
+}
+
+// ── Main ────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() {
+    let cli = Cli::parse();
+    let api = ApiClient::new(&cli.api_url, None);
+
+    match cli.command {
+        Commands::Register => cmd_register(&api, cli.json).await,
+        Commands::Login => cmd_login(&api, cli.json).await,
+        Commands::Logout => cmd_logout(),
+        Commands::Db { action } => match action {
+            DbAction::Create { name, region } => {
+                cmd_db_create(&api, cli.json, &name, region.as_deref()).await
+            }
+            DbAction::List => cmd_db_list(&api, cli.json).await,
+            DbAction::Status { id } => cmd_db_status(&api, cli.json, &id).await,
+            DbAction::Delete { id } => cmd_db_delete(&api, cli.json, &id).await,
+            DbAction::Connect { id } => cmd_db_connect(&api, cli.json, &id).await,
+        },
+        Commands::Token { action } => match action {
+            TokenAction::List => cmd_token_list(&api, cli.json).await,
+            TokenAction::Revoke { token_id } => {
+                cmd_token_revoke(&api, cli.json, &token_id).await
+            }
+        },
+    }
+}
+
+// ── Command implementations ─────────────────────────────────────
+
+async fn cmd_register(api: &ApiClient, json: bool) {
+    let email = prompt_email();
+    let password = prompt_password("Password: ");
+    let confirm = prompt_password("Confirm password: ");
+
+    if password != confirm {
+        eprintln!("Passwords do not match.");
+        process::exit(1);
+    }
+
+    let body = serde_json::json!({
+        "email": email,
+        "password": password,
+    });
+    let data = api
+        .request("POST", "/customer/register", Some(&body), None)
+        .await;
+
+    if json {
+        print_json(&data);
+        return;
+    }
+
+    println!("Account created successfully! Run 'db9 login' to get started.");
+}
+
+async fn cmd_login(api: &ApiClient, json: bool) {
+    let email = prompt_email();
+    let password = prompt_password("Password: ");
+
+    let body = serde_json::json!({
+        "email": email,
+        "password": password,
+    });
+    let data = api
+        .request("POST", "/customer/login", Some(&body), None)
+        .await;
+
+    let token = data["token"]
+        .as_str()
+        .unwrap_or_else(|| {
+            eprintln!("Login failed: no token in response");
+            process::exit(1);
+        });
+
+    if let Err(e) = save_token(token) {
+        eprintln!("{e}");
+        process::exit(1);
+    }
+
+    if json {
+        // NEVER include the token in JSON output for security
+        let safe = serde_json::json!({
+            "expires_at": data["expires_at"],
+        });
+        print_json(&safe);
+        return;
+    }
+
+    println!(
+        "Login successful! Token expires: {}",
+        format_time(data.get("expires_at"))
+    );
+}
+
+fn cmd_logout() {
+    let cred_path = config_dir().join("credentials");
+    if cred_path.exists() {
+        std::fs::remove_file(&cred_path).unwrap_or_else(|e| {
+            eprintln!("Failed to remove credentials: {e}");
+            process::exit(1);
+        });
+    }
+    println!("Logged out successfully.");
+}
+
+async fn cmd_db_create(api: &ApiClient, json: bool, name: &str, region: Option<&str>) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let mut body = serde_json::json!({ "name": name });
+    if let Some(r) = region {
+        body["region"] = Value::String(r.to_string());
+    }
+
+    let data = api
+        .request("POST", "/customer/databases", Some(&body), Some(&headers))
+        .await;
+
+    if json {
+        print_json(&data);
+        return;
+    }
+
+    println!("Database created successfully!\n");
+    println!(
+        "ID:          {}",
+        format_val(data.get("id"))
+    );
+    println!(
+        "Name:        {}",
+        format_val(data.get("name"))
+    );
+    println!(
+        "State:       {}",
+        format_val(data.get("state"))
+    );
+    if let Some(r) = data.get("region").and_then(|v| v.as_str()) {
+        println!("Region:      {r}");
+    }
+    if let Some(user) = data.get("admin_user").and_then(|v| v.as_str()) {
+        println!("Admin User:  {user}");
+    }
+    if let Some(pass) = data.get("admin_password").and_then(|v| v.as_str()) {
+        println!("Admin Pass:  {pass}");
+    }
+
+    if let Some(conn) = data.get("connection_string").and_then(|v| v.as_str()) {
+        println!("\nConnection String:");
+        println!("  {conn}");
+        println!("\npsql Command:");
+        println!("  psql \"{conn}\"");
+    }
+}
+
+async fn cmd_db_list(api: &ApiClient, json: bool) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let data = api
+        .request("GET", "/customer/databases", None, Some(&headers))
+        .await;
+
+    if json {
+        print_json(&data);
+        return;
+    }
+
+    let mut items = data.as_array().cloned().unwrap_or_default();
+    for item in &mut items {
+        if let Some(obj) = item.as_object_mut() {
+            let formatted = format_time(obj.get("created_at").map(|v| v));
+            obj.insert("created_at".into(), Value::String(formatted));
+        }
+    }
+
+    print_table(
+        &items,
+        &[
+            ("ID", "id", 12),
+            ("NAME", "name", 15),
+            ("STATE", "state", 8),
+            ("REGION", "region", 10),
+            ("CREATED", "created_at", 16),
+        ],
+    );
+}
+
+async fn cmd_db_status(api: &ApiClient, json: bool, id: &str) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let data = api
+        .request(
+            "GET",
+            &format!("/customer/databases/{id}"),
+            None,
+            Some(&headers),
+        )
+        .await;
+
+    if json {
+        print_json(&data);
+        return;
+    }
+
+    println!(
+        "Database: {}",
+        format_val(data.get("name"))
+    );
+    println!(
+        "ID:       {}",
+        format_val(data.get("id"))
+    );
+    println!(
+        "State:    {}",
+        format_val(data.get("state"))
+    );
+    if let Some(r) = data.get("region").and_then(|v| v.as_str()) {
+        println!("Region:   {r}");
+    }
+    println!(
+        "Created:  {}",
+        format_time(data.get("created_at"))
+    );
+
+    if let Some(eps) = data["endpoints"].as_array() {
+        if !eps.is_empty() {
+            println!("\nEndpoints:");
+            for ep in eps {
+                println!(
+                    "  Host: {}  Port: {}  Type: {}",
+                    ep["host"].as_str().unwrap_or("?"),
+                    ep["port"].as_u64().unwrap_or(0),
+                    ep["type"].as_str().unwrap_or("-"),
+                );
+            }
+        }
+    }
+
+    if let Some(conn) = data.get("connection_string").and_then(|v| v.as_str()) {
+        println!("\nConnection:");
+        println!("  {conn}");
+    }
+}
+
+async fn cmd_db_delete(api: &ApiClient, json: bool, id: &str) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    if !json {
+        print!(
+            "Are you sure you want to delete database {id}? This cannot be undone. [y/N] "
+        );
+        io::stdout().flush().ok();
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).unwrap_or_else(|e| {
+            eprintln!("Failed to read input: {e}");
+            process::exit(1);
+        });
+        let answer = answer.trim();
+        if answer != "y" && answer != "Y" {
+            println!("Cancelled.");
+            return;
+        }
+    }
+
+    let data = api
+        .request(
+            "DELETE",
+            &format!("/customer/databases/{id}"),
+            None,
+            Some(&headers),
+        )
+        .await;
+
+    if json {
+        print_json(&data);
+        return;
+    }
+
+    println!("Database {id} has been disabled.");
+}
+
+async fn cmd_db_connect(api: &ApiClient, json: bool, id: &str) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let data = api
+        .request(
+            "GET",
+            &format!("/customer/databases/{id}"),
+            None,
+            Some(&headers),
+        )
+        .await;
+
+    if json {
+        let mut result = serde_json::json!({});
+        if let Some(conn) = data.get("connection_string") {
+            result["connection_string"] = conn.clone();
+        }
+        if let Some(eps) = data.get("endpoints") {
+            result["endpoints"] = eps.clone();
+        }
+        print_json(&result);
+        return;
+    }
+
+    if let Some(conn) = data.get("connection_string").and_then(|v| v.as_str()) {
+        println!("Connection String:");
+        println!("  {conn}");
+        println!("\npsql Command:");
+        println!("  psql \"{conn}\"");
+    }
+}
+
+async fn cmd_token_list(api: &ApiClient, json: bool) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let data = api
+        .request("GET", "/customer/tokens", None, Some(&headers))
+        .await;
+
+    if json {
+        print_json(&data);
+        return;
+    }
+
+    let mut items = data.as_array().cloned().unwrap_or_default();
+    for item in &mut items {
+        if let Some(obj) = item.as_object_mut() {
+            let created = format_time(obj.get("created_at").map(|v| v));
+            obj.insert("created_at".into(), Value::String(created));
+            let expires = format_time(obj.get("expires_at").map(|v| v));
+            obj.insert("expires_at".into(), Value::String(expires));
+        }
+    }
+
+    print_table(
+        &items,
+        &[
+            ("ID", "id", 36),
+            ("NAME", "name", 10),
+            ("CREATED", "created_at", 16),
+            ("EXPIRES", "expires_at", 16),
+        ],
+    );
+}
+
+async fn cmd_token_revoke(api: &ApiClient, json: bool, token_id: &str) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let data = api
+        .request(
+            "DELETE",
+            &format!("/customer/tokens/{token_id}"),
+            None,
+            Some(&headers),
+        )
+        .await;
+
+    if json {
+        print_json(&data);
+        return;
+    }
+
+    println!("Token revoked.");
+}

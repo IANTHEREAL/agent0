@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "pgtikv-ctl"
 path = "src/cli.rs"
 
+[[bin]]
+name = "db9"
+path = "src/db9.rs"
+
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
@@ -30,6 +34,9 @@ aes-gcm = "0.10"
 base64 = "0.22"
 argon2 = "0.5"
 sha2 = "0.10"
+toml = "0.8"
+rpassword = "7"
+dirs = "5"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }
