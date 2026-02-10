@@ -34,6 +34,7 @@ tests/156_join_on_correlated_scalar_subquery_issue420.sql
 tests/155_correlated_subquery_join_on_issue446.sql
 tests/157_join_select_correlated_scalar_subquery_issue428.sql
 tests/158_join_on_correlated_subquery_right_alias_issue87.sql
+tests/218_gin_correctness.sql
 
 [orm]
 orm-tests/pg-client/
