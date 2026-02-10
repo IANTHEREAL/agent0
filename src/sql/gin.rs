@@ -279,6 +279,8 @@ pub(crate) fn extract_gin_token_hashes_from_row(
             let mut hashes = tokens.key_values;
             hashes.reserve(tokens.key_exists.len());
             hashes.extend(tokens.key_exists);
+            hashes.sort_unstable();
+            hashes.dedup();
             Ok(hashes)
         }
     }
@@ -482,6 +484,38 @@ mod tests {
             v
         };
         assert_eq!(&scan[..2], key_values_sorted.as_slice());
+    }
+
+    #[test]
+    fn jsonb_write_path_tokens_are_deduped() {
+        let schema = TableSchema::new(
+            "public.docs".to_string(),
+            1,
+            vec![crate::types::ColumnDef {
+                name: "payload".to_string(),
+                data_type: DataType::Jsonb,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            vec![],
+        );
+        let index = IndexDef {
+            name: "docs_payload_gin".to_string(),
+            id: 1,
+            columns: vec!["payload".to_string()],
+            unique: false,
+            method: Some("gin".to_string()),
+            predicate: None,
+            expressions: vec![],
+        };
+        let row = Row::new(vec![Value::Jsonb(r#"{"a":1,"b":2}"#.to_string())]);
+
+        let hashes = extract_gin_token_hashes_from_row(&schema, &index, &row).unwrap();
+        assert!(hashes.windows(2).all(|w| w[0] <= w[1]));
+        assert!(hashes.windows(2).all(|w| w[0] != w[1]));
     }
 
     #[test]
