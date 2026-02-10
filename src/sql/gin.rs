@@ -390,9 +390,21 @@ pub(crate) fn extract_tsvector_gin_tokens(tsvector: &str) -> Vec<u64> {
 ///
 /// Parses query terms from tsquery format: "'hello' & 'world'" => ["hello", "world"]
 pub(crate) fn extract_tsquery_gin_tokens(tsquery: &str) -> Vec<u64> {
+    if tsquery.contains('|') {
+        return Vec::new();
+    }
+
     let mut tokens = Vec::new();
-    for term in tsquery.split(|c: char| matches!(c, '&' | '|' | '!' | '(' | ')')) {
-        let word = term.trim().trim_matches('\'').to_lowercase();
+    for segment in tsquery.split('&') {
+        let term = segment
+            .trim()
+            .trim_matches(|c| matches!(c, '(' | ')'))
+            .trim();
+        if term.starts_with('!') {
+            continue;
+        }
+
+        let word = term.trim_matches('\'').trim().to_lowercase();
         if !word.is_empty() {
             tokens.push(hash_tsvector_lexeme(&word));
         }
@@ -558,5 +570,52 @@ mod tests {
             hash_array_element(&Value::Int32(1)),
             hash_array_element(&Value::Int64(2))
         );
+    }
+
+    #[test]
+    fn tsquery_tokens_pure_and() {
+        let tokens = extract_tsquery_gin_tokens("'hello' & 'world'");
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.contains(&hash_tsvector_lexeme("hello")));
+        assert!(tokens.contains(&hash_tsvector_lexeme("world")));
+    }
+
+    #[test]
+    fn tsquery_tokens_not_excluded() {
+        let tokens = extract_tsquery_gin_tokens("'hello' & !'world'");
+        assert_eq!(tokens.len(), 1);
+        assert!(tokens.contains(&hash_tsvector_lexeme("hello")));
+    }
+
+    #[test]
+    fn tsquery_tokens_only_not() {
+        let tokens = extract_tsquery_gin_tokens("!'hello'");
+        assert_eq!(tokens.len(), 0);
+    }
+
+    #[test]
+    fn tsquery_tokens_or_returns_empty() {
+        let tokens = extract_tsquery_gin_tokens("'hello' | 'world'");
+        assert_eq!(tokens.len(), 0);
+    }
+
+    #[test]
+    fn tsquery_tokens_complex_or() {
+        let tokens = extract_tsquery_gin_tokens("'hello' & 'world' | 'rust'");
+        assert_eq!(tokens.len(), 0);
+    }
+
+    #[test]
+    fn tsquery_tokens_empty_string() {
+        let tokens = extract_tsquery_gin_tokens("");
+        assert_eq!(tokens.len(), 0);
+    }
+
+    #[test]
+    fn tsquery_tokens_parenthesized() {
+        let tokens = extract_tsquery_gin_tokens("('hello' & 'world')");
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.contains(&hash_tsvector_lexeme("hello")));
+        assert!(tokens.contains(&hash_tsvector_lexeme("world")));
     }
 }
