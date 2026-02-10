@@ -3,6 +3,7 @@ use anyhow::{anyhow, Result};
 use crate::extensions::context;
 use crate::types::{ColumnDef, DataType, Row, TableSchema};
 use std::collections::HashSet;
+use tracing::warn;
 
 pub(crate) mod backend;
 pub(crate) mod decoders;
@@ -29,9 +30,9 @@ pub(crate) enum Fs9Mode {
     },
 }
 
-pub(crate) const MAX_ROWS_PER_QUERY: usize = 10_000;
 pub(crate) const MAX_BYTES_PER_FILE: usize = 10 * 1024 * 1024;
 pub(crate) const MAX_FILES_PER_GLOB: usize = 10_000;
+pub(crate) const MAX_TOTAL_BYTES: usize = 100 * 1024 * 1024;
 
 fn fs9_file_schema(name: &str) -> TableSchema {
     TableSchema {
@@ -131,17 +132,16 @@ pub(crate) async fn execute_table_function(
                     } else {
                         delimiter
                     };
-                    let decoded =
-                        decoders::decode_csv(&data, &path, delim, header, MAX_ROWS_PER_QUERY)
-                            .map_err(|e| anyhow!("fs9: CSV decode error: {e}"))?;
+                    let decoded = decoders::decode_csv(&data, &path, delim, header, usize::MAX)
+                        .map_err(|e| anyhow!("fs9: CSV decode error: {e}"))?;
                     Ok((decoded.schema, decoded.rows))
                 }
                 "jsonl" | "ndjson" => {
-                    let decoded = decoders::decode_jsonl(&data, &path, MAX_ROWS_PER_QUERY);
+                    let decoded = decoders::decode_jsonl(&data, &path, usize::MAX);
                     Ok((decoded.schema, decoded.rows))
                 }
                 _ => {
-                    let decoded = decoders::decode_raw_text(&data, &path, MAX_ROWS_PER_QUERY);
+                    let decoded = decoders::decode_raw_text(&data, &path, usize::MAX);
                     Ok((decoded.schema, decoded.rows))
                 }
             }
@@ -164,15 +164,25 @@ pub(crate) async fn execute_table_function(
 
             let mut all_rows: Vec<Row> = Vec::new();
             let mut result_schema: Option<TableSchema> = None;
+            let mut total_bytes_read: usize = 0;
+            let mut files_read_count: usize = 0;
 
             for file_path in &matching_files {
-                if all_rows.len() >= MAX_ROWS_PER_QUERY {
+                if total_bytes_read >= MAX_TOTAL_BYTES {
+                    warn!(
+                        "fs9: bytes budget exhausted ({} MB), {} of {} matched files were scanned",
+                        total_bytes_read / (1024 * 1024),
+                        files_read_count,
+                        matching_files.len()
+                    );
                     break;
                 }
 
                 let data = backend.read_file(file_path, MAX_BYTES_PER_FILE).await?;
+                total_bytes_read = total_bytes_read.saturating_add(data.len());
+                files_read_count += 1;
+
                 let fmt = decoders::detect_format(file_path, format.as_deref());
-                let remaining = MAX_ROWS_PER_QUERY - all_rows.len();
 
                 let decoded = match fmt {
                     "csv" | "tsv" => {
@@ -181,11 +191,11 @@ pub(crate) async fn execute_table_function(
                         } else {
                             delimiter
                         };
-                        decoders::decode_csv(&data, file_path, delim, header, remaining)
+                        decoders::decode_csv(&data, file_path, delim, header, usize::MAX)
                             .map_err(|e| anyhow!("fs9: CSV decode error in {}: {e}", file_path))?
                     }
-                    "jsonl" | "ndjson" => decoders::decode_jsonl(&data, file_path, remaining),
-                    _ => decoders::decode_raw_text(&data, file_path, remaining),
+                    "jsonl" | "ndjson" => decoders::decode_jsonl(&data, file_path, usize::MAX),
+                    _ => decoders::decode_raw_text(&data, file_path, usize::MAX),
                 };
 
                 if result_schema.is_none() {
@@ -218,7 +228,8 @@ async fn list_directory_entries(
     }
 
     const MAX_RECURSIVE_DEPTH: usize = 10;
-    let max_entries = MAX_ROWS_PER_QUERY;
+    const MAX_DIR_ENTRIES: usize = 100_000;
+    let max_entries = MAX_DIR_ENTRIES;
 
     let mut entries = Vec::new();
     let mut stack = vec![(path.to_string(), 0usize)];
@@ -226,6 +237,7 @@ async fn list_directory_entries(
 
     while let Some((current_dir, depth)) = stack.pop() {
         if entries.len() >= max_entries {
+            warn!("fs9: directory listing capped at {} entries", max_entries);
             break;
         }
         if depth > MAX_RECURSIVE_DEPTH {
