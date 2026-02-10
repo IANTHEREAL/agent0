@@ -9,13 +9,13 @@ use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
 use super::expr::eval_expr;
-use super::gin;
+use super::gin::extract_gin_token_hashes_from_row;
 use super::index_helpers;
 use super::projection::{eval_default_expr, infer_expr_type};
 use super::sequences;
 use super::value_coercion::coerce_value_for_column;
 use crate::storage::TikvStore;
-use crate::types::{ColumnDef, DataType, IndexDef, Row, TableSchema, Value};
+use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
 pub type EnumLabelCache = HashMap<String, HashSet<String>>;
 
@@ -110,93 +110,6 @@ fn validate_enum_values(schema: &TableSchema, row: &Row, cache: &EnumLabelCache)
     }
 
     Ok(())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GinColumnType {
-    Jsonb,
-    Array,
-    Tsvector,
-}
-
-fn supported_gin_index_column(
-    schema: &TableSchema,
-    index: &IndexDef,
-) -> Option<(usize, GinColumnType)> {
-    if !index
-        .method
-        .as_deref()
-        .map(|m| m.eq_ignore_ascii_case("gin"))
-        .unwrap_or(false)
-    {
-        return None;
-    }
-
-    if index.columns.len() != 1 || !index.expressions.is_empty() || index.predicate.is_some() {
-        return None;
-    }
-
-    let col_idx = schema.column_index(&index.columns[0])?;
-    match &schema.columns.get(col_idx)?.data_type {
-        DataType::Json | DataType::Jsonb => Some((col_idx, GinColumnType::Jsonb)),
-        DataType::Array(_) => Some((col_idx, GinColumnType::Array)),
-        DataType::Tsvector => Some((col_idx, GinColumnType::Tsvector)),
-        _ => None,
-    }
-}
-
-fn extract_gin_token_hashes_from_row(
-    schema: &TableSchema,
-    index: &IndexDef,
-    row: &Row,
-) -> Result<Vec<u64>> {
-    let Some((col_idx, col_type)) = supported_gin_index_column(schema, index) else {
-        return Ok(Vec::new());
-    };
-
-    match col_type {
-        GinColumnType::Array => match row.values.get(col_idx) {
-            Some(Value::Null) | None => Ok(Vec::new()),
-            Some(Value::Array(arr)) => Ok(gin::extract_array_gin_tokens(arr)),
-            Some(other) => Err(anyhow!(
-                "GIN index '{}' requires ARRAY value, got {}",
-                index.name,
-                other.data_type().unwrap_or(DataType::Text)
-            )),
-        },
-        GinColumnType::Tsvector => match row.values.get(col_idx) {
-            Some(Value::Null) | None => Ok(Vec::new()),
-            Some(Value::Tsvector(s)) => Ok(gin::extract_tsvector_gin_tokens(s)),
-            Some(Value::Text(s)) => Ok(gin::extract_tsvector_gin_tokens(s)),
-            Some(other) => Err(anyhow!(
-                "GIN index '{}' requires TSVECTOR value, got {}",
-                index.name,
-                other.data_type().unwrap_or(DataType::Text)
-            )),
-        },
-        GinColumnType::Jsonb => {
-            let json_text = match row.values.get(col_idx) {
-                Some(Value::Null) | None => return Ok(Vec::new()),
-                Some(Value::Json(s) | Value::Jsonb(s) | Value::Text(s)) => s.as_str(),
-                Some(other) => {
-                    return Err(anyhow!(
-                        "GIN index '{}' requires JSON/JSONB value, got {}",
-                        index.name,
-                        other.data_type().unwrap_or(DataType::Text)
-                    ));
-                }
-            };
-
-            let json: serde_json::Value = serde_json::from_str(json_text).map_err(|e| {
-                anyhow!("Invalid JSONB value for GIN index '{}': {}", index.name, e)
-            })?;
-            let tokens = gin::extract_gin_tokens(&json);
-            let mut hashes = tokens.key_values;
-            hashes.reserve(tokens.key_exists.len());
-            hashes.extend(tokens.key_exists);
-            Ok(hashes)
-        }
-    }
 }
 
 pub(crate) fn eval_upsert_expr(

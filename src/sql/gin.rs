@@ -9,6 +9,8 @@
 
 use serde_json::{Number as JsonNumber, Value as JsonValue};
 
+use anyhow::{anyhow, Result};
+
 /// Maximum recursion depth when extracting GIN tokens.
 ///
 /// This is a guardrail against pathological JSON that would otherwise create enormous
@@ -193,7 +195,96 @@ fn hash_json_number(mut h: u64, n: &JsonNumber) -> u64 {
 // ARRAY GIN Token Extraction
 // ----------------------------
 
-use crate::types::Value;
+use crate::types::{DataType, IndexDef, Row, TableSchema, Value};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GinColumnType {
+    Jsonb,
+    Array,
+    Tsvector,
+}
+
+pub(crate) fn supported_gin_index_column(
+    schema: &TableSchema,
+    index: &IndexDef,
+) -> Option<(usize, GinColumnType)> {
+    if !index
+        .method
+        .as_deref()
+        .map(|m| m.eq_ignore_ascii_case("gin"))
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    if index.columns.len() != 1 || !index.expressions.is_empty() || index.predicate.is_some() {
+        return None;
+    }
+
+    let col_idx = schema.column_index(&index.columns[0])?;
+    match &schema.columns.get(col_idx)?.data_type {
+        DataType::Json | DataType::Jsonb => Some((col_idx, GinColumnType::Jsonb)),
+        DataType::Array(_) => Some((col_idx, GinColumnType::Array)),
+        DataType::Tsvector => Some((col_idx, GinColumnType::Tsvector)),
+        _ => None,
+    }
+}
+
+pub(crate) fn extract_gin_token_hashes_from_row(
+    schema: &TableSchema,
+    index: &IndexDef,
+    row: &Row,
+) -> Result<Vec<u64>> {
+    let Some((col_idx, col_type)) = supported_gin_index_column(schema, index) else {
+        return Ok(Vec::new());
+    };
+
+    match col_type {
+        GinColumnType::Array => match row.values.get(col_idx) {
+            Some(Value::Null) | None => Ok(Vec::new()),
+            Some(Value::Array(arr)) => Ok(extract_array_gin_tokens(arr)),
+            Some(other) => Err(anyhow!(
+                "GIN index '{}' requires ARRAY value, got {}",
+                index.name,
+                other.data_type().unwrap_or(DataType::Text)
+            )),
+        },
+        GinColumnType::Tsvector => match row.values.get(col_idx) {
+            Some(Value::Null) | None => Ok(Vec::new()),
+            Some(Value::Tsvector(s)) => Ok(extract_tsvector_gin_tokens(s)),
+            Some(Value::Text(s)) => Ok(extract_tsvector_gin_tokens(s)),
+            Some(other) => Err(anyhow!(
+                "GIN index '{}' requires TSVECTOR value, got {}",
+                index.name,
+                other.data_type().unwrap_or(DataType::Text)
+            )),
+        },
+        GinColumnType::Jsonb => {
+            let json_text = match row.values.get(col_idx) {
+                Some(Value::Null) | None => return Ok(Vec::new()),
+                Some(Value::Json(s) | Value::Jsonb(s) | Value::Text(s)) => s.as_str(),
+                Some(other) => {
+                    return Err(anyhow!(
+                        "GIN index '{}' requires JSON/JSONB value, got {}",
+                        index.name,
+                        other.data_type().unwrap_or(DataType::Text)
+                    ));
+                }
+            };
+
+            let json: JsonValue = serde_json::from_str(json_text).map_err(|e| {
+                anyhow!("Invalid JSONB value for GIN index '{}': {}", index.name, e)
+            })?;
+            let tokens = extract_gin_tokens(&json);
+            let mut hashes = tokens.key_values;
+            hashes.reserve(tokens.key_exists.len());
+            hashes.extend(tokens.key_exists);
+            hashes.sort_unstable();
+            hashes.dedup();
+            Ok(hashes)
+        }
+    }
+}
 
 /// Extract hashed GIN tokens from an ARRAY value.
 ///
@@ -218,16 +309,25 @@ fn hash_array_element(val: &Value) -> u64 {
         Value::Null => fnv1a_u64(h, b"n"),
         Value::Boolean(b) => fnv1a_u64(h, if *b { b"t" } else { b"f" }),
         Value::Int32(i) => {
-            h = fnv1a_u64(h, b"i4");
-            fnv1a_u64(h, &i.to_be_bytes())
+            h = fnv1a_u64(h, b"i");
+            fnv1a_u64(h, &(*i as i64).to_be_bytes())
         }
         Value::Int64(i) => {
-            h = fnv1a_u64(h, b"i8");
+            h = fnv1a_u64(h, b"i");
             fnv1a_u64(h, &i.to_be_bytes())
         }
         Value::Float64(f) => {
-            h = fnv1a_u64(h, b"f8");
-            fnv1a_u64(h, &f.to_bits().to_be_bytes())
+            if f.is_finite()
+                && f.fract() == 0.0
+                && *f >= (i64::MIN as f64)
+                && *f <= (i64::MAX as f64)
+            {
+                h = fnv1a_u64(h, b"i");
+                fnv1a_u64(h, &(*f as i64).to_be_bytes())
+            } else {
+                h = fnv1a_u64(h, b"f");
+                fnv1a_u64(h, &f.to_bits().to_be_bytes())
+            }
         }
         Value::Text(s) => {
             h = fnv1a_u64(h, b"s");
@@ -292,9 +392,21 @@ pub(crate) fn extract_tsvector_gin_tokens(tsvector: &str) -> Vec<u64> {
 ///
 /// Parses query terms from tsquery format: "'hello' & 'world'" => ["hello", "world"]
 pub(crate) fn extract_tsquery_gin_tokens(tsquery: &str) -> Vec<u64> {
+    if tsquery.contains('|') {
+        return Vec::new();
+    }
+
     let mut tokens = Vec::new();
-    for term in tsquery.split(|c: char| matches!(c, '&' | '|' | '!' | '(' | ')')) {
-        let word = term.trim().trim_matches('\'').to_lowercase();
+    for segment in tsquery.split('&') {
+        let term = segment
+            .trim()
+            .trim_matches(|c| matches!(c, '(' | ')'))
+            .trim();
+        if term.starts_with('!') {
+            continue;
+        }
+
+        let word = term.trim_matches('\'').trim().to_lowercase();
         if !word.is_empty() {
             tokens.push(hash_tsvector_lexeme(&word));
         }
@@ -375,6 +487,38 @@ mod tests {
     }
 
     #[test]
+    fn jsonb_write_path_tokens_are_deduped() {
+        let schema = TableSchema::new(
+            "public.docs".to_string(),
+            1,
+            vec![crate::types::ColumnDef {
+                name: "payload".to_string(),
+                data_type: DataType::Jsonb,
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            }],
+            vec![],
+        );
+        let index = IndexDef {
+            name: "docs_payload_gin".to_string(),
+            id: 1,
+            columns: vec!["payload".to_string()],
+            unique: false,
+            method: Some("gin".to_string()),
+            predicate: None,
+            expressions: vec![],
+        };
+        let row = Row::new(vec![Value::Jsonb(r#"{"a":1,"b":2}"#.to_string())]);
+
+        let hashes = extract_gin_token_hashes_from_row(&schema, &index, &row).unwrap();
+        assert!(hashes.windows(2).all(|w| w[0] <= w[1]));
+        assert!(hashes.windows(2).all(|w| w[0] != w[1]));
+    }
+
+    #[test]
     fn array_tokens_basic() {
         let arr = vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)];
         let tokens = extract_array_gin_tokens(&arr);
@@ -412,5 +556,100 @@ mod tests {
         for t in contained_tokens {
             assert!(container_tokens.contains(&t));
         }
+    }
+
+    #[test]
+    fn hash_array_element_int32_equals_int64() {
+        assert_eq!(
+            hash_array_element(&Value::Int32(42)),
+            hash_array_element(&Value::Int64(42))
+        );
+    }
+
+    #[test]
+    fn hash_array_element_int32_equals_int64_negative() {
+        assert_eq!(
+            hash_array_element(&Value::Int32(-1)),
+            hash_array_element(&Value::Int64(-1))
+        );
+    }
+
+    #[test]
+    fn hash_array_element_int32_equals_int64_zero() {
+        assert_eq!(
+            hash_array_element(&Value::Int32(0)),
+            hash_array_element(&Value::Int64(0))
+        );
+    }
+
+    #[test]
+    fn hash_array_element_float64_integer_equals_int64() {
+        assert_eq!(
+            hash_array_element(&Value::Float64(42.0)),
+            hash_array_element(&Value::Int64(42))
+        );
+    }
+
+    #[test]
+    fn hash_array_element_float64_fractional_differs_from_int() {
+        assert_ne!(
+            hash_array_element(&Value::Float64(42.5)),
+            hash_array_element(&Value::Int64(42))
+        );
+    }
+
+    #[test]
+    fn hash_array_element_int32_int64_different_values_differ() {
+        assert_ne!(
+            hash_array_element(&Value::Int32(1)),
+            hash_array_element(&Value::Int64(2))
+        );
+    }
+
+    #[test]
+    fn tsquery_tokens_pure_and() {
+        let tokens = extract_tsquery_gin_tokens("'hello' & 'world'");
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.contains(&hash_tsvector_lexeme("hello")));
+        assert!(tokens.contains(&hash_tsvector_lexeme("world")));
+    }
+
+    #[test]
+    fn tsquery_tokens_not_excluded() {
+        let tokens = extract_tsquery_gin_tokens("'hello' & !'world'");
+        assert_eq!(tokens.len(), 1);
+        assert!(tokens.contains(&hash_tsvector_lexeme("hello")));
+    }
+
+    #[test]
+    fn tsquery_tokens_only_not() {
+        let tokens = extract_tsquery_gin_tokens("!'hello'");
+        assert_eq!(tokens.len(), 0);
+    }
+
+    #[test]
+    fn tsquery_tokens_or_returns_empty() {
+        let tokens = extract_tsquery_gin_tokens("'hello' | 'world'");
+        assert_eq!(tokens.len(), 0);
+    }
+
+    #[test]
+    fn tsquery_tokens_complex_or() {
+        let tokens = extract_tsquery_gin_tokens("'hello' & 'world' | 'rust'");
+        assert_eq!(tokens.len(), 0);
+    }
+
+    #[test]
+    fn tsquery_tokens_empty_string() {
+        let tokens = extract_tsquery_gin_tokens("");
+        assert_eq!(tokens.len(), 0);
+    }
+
+    #[test]
+    fn tsquery_tokens_parenthesized() {
+        let tokens = extract_tsquery_gin_tokens("('hello' & 'world')");
+        assert_eq!(tokens.len(), 2);
+        assert!(tokens.contains(&hash_tsvector_lexeme("hello")));
+        assert!(tokens.contains(&hash_tsvector_lexeme("world")));
     }
 }

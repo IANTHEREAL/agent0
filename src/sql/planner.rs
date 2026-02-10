@@ -939,36 +939,85 @@ fn choose_gin_access_path(
 }
 
 fn extract_gin_contains_predicate(expr: &Expr) -> Option<(String, Value)> {
+    let predicates = collect_gin_predicates(expr);
+    if predicates.is_empty() {
+        return None;
+    }
+
+    predicates
+        .into_iter()
+        .min_by_key(|(_, value)| gin_predicate_priority(value))
+}
+
+fn collect_gin_predicates(expr: &Expr) -> Vec<(String, Value)> {
     match expr {
-        Expr::Nested(inner) => extract_gin_contains_predicate(inner),
+        Expr::Nested(inner) => collect_gin_predicates(inner),
         Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::And) => {
-            extract_gin_contains_predicate(left).or_else(|| extract_gin_contains_predicate(right))
+            let mut predicates = collect_gin_predicates(left);
+            predicates.extend(collect_gin_predicates(right));
+            predicates
         }
-        Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::PGCustomBinaryOperator(ops) if ops.len() == 1 && ops[0] == "@@") =>
+        Expr::BinaryOp { left, op, right }
+            if is_gin_binary_operator(op, "@@") || is_gin_binary_operator(op, "@>") =>
         {
-            let column = extract_column_ref(left)?.name;
-            let pattern = eval_expr(right, None, None).ok()?;
-            Some((column, pattern))
+            match (extract_column_ref(left), eval_expr(right, None, None).ok()) {
+                (Some(column), Some(pattern)) => vec![(column.name, pattern)],
+                _ => Vec::new(),
+            }
         }
         Expr::JsonAccess {
             left,
             operator,
             right,
         } if matches!(operator, JsonOperator::AtArrow) => {
-            let column = extract_column_ref(left)?.name;
-            let pattern = eval_expr(right, None, None).ok()?;
-            Some((column, pattern))
+            collect_json_access_gin_predicates(left, right)
         }
         Expr::JsonAccess {
             left,
             operator,
             right,
         } if matches!(operator, JsonOperator::AtAt) => {
-            let column = extract_column_ref(left)?.name;
-            let pattern = eval_expr(right, None, None).ok()?;
-            Some((column, pattern))
+            collect_json_access_gin_predicates(left, right)
         }
-        _ => None,
+        _ => Vec::new(),
+    }
+}
+
+fn is_gin_binary_operator(op: &BinaryOperator, expected: &str) -> bool {
+    matches!(op, BinaryOperator::PGCustomBinaryOperator(parts) if parts.join("") == expected)
+}
+
+fn collect_json_access_gin_predicates(left: &Expr, right: &Expr) -> Vec<(String, Value)> {
+    let Some(column) = extract_column_ref(left).map(|col| col.name) else {
+        return Vec::new();
+    };
+
+    match right {
+        Expr::BinaryOp {
+            left: rhs_left,
+            op,
+            right: rhs_right,
+        } if matches!(op, BinaryOperator::And) => {
+            let mut predicates = Vec::new();
+            if let Ok(pattern) = eval_expr(rhs_left, None, None) {
+                predicates.push((column, pattern));
+            }
+            predicates.extend(collect_gin_predicates(rhs_right));
+            predicates
+        }
+        _ => match eval_expr(right, None, None).ok() {
+            Some(pattern) => vec![(column, pattern)],
+            None => Vec::new(),
+        },
+    }
+}
+
+fn gin_predicate_priority(value: &Value) -> u8 {
+    match value {
+        Value::Tsquery(_) => 0,
+        Value::Array(_) => 1,
+        Value::Json(_) | Value::Jsonb(_) => 2,
+        _ => 3,
     }
 }
 
@@ -1638,6 +1687,24 @@ mod tests {
             ScanType::GinIndexScan { index_id, .. } => assert_eq!(index_id, 7),
             other => panic!("expected GinIndexScan, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_gin_predicate_selection_single() {
+        let filter = parse_where_expr("SELECT * FROM t WHERE metadata @> '{\"type\":\"pdf\"}'");
+        let (column, _) = extract_gin_contains_predicate(&filter).expect("expected GIN predicate");
+        assert_eq!(column, "metadata");
+    }
+
+    #[test]
+    fn test_gin_predicate_selection_prefers_fts() {
+        let filter = parse_where_expr(
+            "SELECT * FROM t WHERE metadata @> '{\"type\":\"pdf\"}' AND document @@ to_tsquery('invoice')",
+        );
+        let (column, pattern) =
+            extract_gin_contains_predicate(&filter).expect("expected GIN predicate");
+        assert_eq!(column, "document");
+        assert!(matches!(pattern, Value::Tsquery(_)));
     }
 
     #[test]
