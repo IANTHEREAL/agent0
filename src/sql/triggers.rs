@@ -478,6 +478,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
 
         let new_values = vec![Value::Int32(1), Value::Null];
@@ -521,6 +522,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
 
         let new_values = vec![Value::Int32(7), Value::Int32(3)];
@@ -569,6 +571,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
 
         let new_values = vec![Value::Int32(1), Value::Int32(9)];
@@ -608,6 +611,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
 
         let new_values = vec![Value::Int32(1), Value::Int32(9)];

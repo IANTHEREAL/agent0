@@ -850,16 +850,46 @@ pub(crate) fn projection_may_have_udf(projection: &[SelectItem]) -> bool {
     })
 }
 
-pub(crate) fn collect_nested_aggregates(expr: &Expr) -> Vec<&Function> {
+/// A reference to an aggregate expression found nested inside an expression tree.
+/// This can be either a regular `Function` aggregate (COUNT, SUM, etc.) or an `ArrayAgg`.
+#[derive(Debug)]
+pub(crate) enum NestedAggregateRef<'a> {
+    Function(&'a Function),
+    ArrayAgg(&'a sqlparser::ast::ArrayAgg),
+}
+
+pub(crate) fn collect_nested_aggregates(expr: &Expr) -> Vec<NestedAggregateRef<'_>> {
     let mut result = Vec::new();
     collect_nested_aggregates_inner(expr, &mut result);
     result
 }
 
-fn collect_nested_aggregates_inner<'a>(expr: &'a Expr, out: &mut Vec<&'a Function>) {
+pub(crate) fn array_agg_signature_for_map(
+    distinct: bool,
+    arg: &Expr,
+    order_by: &[OrderByExpr],
+) -> String {
+    let arr = sqlparser::ast::ArrayAgg {
+        distinct,
+        expr: Box::new(arg.clone()),
+        order_by: if order_by.is_empty() {
+            None
+        } else {
+            Some(order_by.to_vec())
+        },
+        limit: None,
+        within_group: false,
+    };
+    format!("{}", arr).to_lowercase()
+}
+
+fn collect_nested_aggregates_inner<'a>(expr: &'a Expr, out: &mut Vec<NestedAggregateRef<'a>>) {
     match expr {
         Expr::Function(f) if is_aggregate_func(f) => {
-            out.push(f);
+            out.push(NestedAggregateRef::Function(f));
+        }
+        Expr::ArrayAgg(arr) => {
+            out.push(NestedAggregateRef::ArrayAgg(arr));
         }
         Expr::BinaryOp { left, right, .. } => {
             collect_nested_aggregates_inner(left, out);
@@ -1202,9 +1232,13 @@ impl Executor {
                 }
 
                 // Whole-row reference: `SELECT t_alias` (composite value), only if it doesn't
-                // resolve to a column name.
+                // resolve to a column name. Check FROM alias first, then schema name.
+                let alias_match = schema
+                    .from_alias
+                    .as_ref()
+                    .map_or(false, |a| a.eq_ignore_ascii_case(col_name));
                 let schema_short_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-                if schema_short_name.eq_ignore_ascii_case(col_name) {
+                if alias_match || schema_short_name.eq_ignore_ascii_case(col_name) {
                     return Ok(());
                 }
                 let prefix = format!("{}.", col_name.to_lowercase());
@@ -1457,16 +1491,40 @@ impl Executor {
             }
 
             let nested = collect_nested_aggregates(expr);
-            for f in nested {
-                Self::add_aggregate_from_function(
-                    f,
-                    None,
-                    schema,
-                    &mut agg_exprs,
-                    &mut agg_names,
-                    &mut agg_types,
-                    &mut seen_sigs,
-                );
+            for agg_ref in nested {
+                match agg_ref {
+                    NestedAggregateRef::Function(f) => {
+                        Self::add_aggregate_from_function(
+                            f,
+                            None,
+                            schema,
+                            &mut agg_exprs,
+                            &mut agg_names,
+                            &mut agg_types,
+                            &mut seen_sigs,
+                        );
+                    }
+                    NestedAggregateRef::ArrayAgg(arr) => {
+                        let sig = format!("{}", arr).to_lowercase();
+                        if !seen_sigs.contains(&sig) {
+                            seen_sigs.insert(sig);
+                            let arg = Some((*arr.expr).clone());
+                            agg_exprs.push(AggregateExpr {
+                                func_name: "ARRAY_AGG".to_string(),
+                                arg: arg.clone(),
+                                distinct: arr.distinct,
+                                delimiter: None,
+                                filter: None,
+                                order_by: arr.order_by.clone().unwrap_or_default(),
+                            });
+                            agg_names.push("array_agg".to_string());
+                            agg_types.push(DataType::Array(Box::new(infer_expr_type(
+                                arr.expr.as_ref(),
+                                schema,
+                            ))));
+                        }
+                    }
+                }
             }
         }
 
@@ -1539,6 +1597,11 @@ impl Executor {
             let mut seen_sigs: std::collections::HashSet<String> = agg_exprs
                 .iter()
                 .map(|a| {
+                    if a.func_name.eq_ignore_ascii_case("ARRAY_AGG") {
+                        if let Some(arg) = a.arg.as_ref() {
+                            return array_agg_signature_for_map(a.distinct, arg, &a.order_by);
+                        }
+                    }
                     let distinct_prefix = if a.distinct { "DISTINCT " } else { "" };
                     let arg_str = a.arg.as_ref().map_or("*".to_string(), |e| format!("{}", e));
                     let filter_suffix = a
@@ -1561,16 +1624,40 @@ impl Executor {
                 })
                 .collect();
             let having_aggs = collect_nested_aggregates(having_expr);
-            for f in having_aggs {
-                Self::add_aggregate_from_function(
-                    f,
-                    None,
-                    &schema,
-                    &mut agg_exprs,
-                    &mut agg_names,
-                    &mut agg_types,
-                    &mut seen_sigs,
-                );
+            for agg_ref in having_aggs {
+                match agg_ref {
+                    NestedAggregateRef::Function(f) => {
+                        Self::add_aggregate_from_function(
+                            f,
+                            None,
+                            &schema,
+                            &mut agg_exprs,
+                            &mut agg_names,
+                            &mut agg_types,
+                            &mut seen_sigs,
+                        );
+                    }
+                    NestedAggregateRef::ArrayAgg(arr) => {
+                        let sig = format!("{}", arr).to_lowercase();
+                        if !seen_sigs.contains(&sig) {
+                            seen_sigs.insert(sig);
+                            let arg = Some((*arr.expr).clone());
+                            agg_exprs.push(AggregateExpr {
+                                func_name: "ARRAY_AGG".to_string(),
+                                arg: arg.clone(),
+                                distinct: arr.distinct,
+                                delimiter: None,
+                                filter: None,
+                                order_by: arr.order_by.clone().unwrap_or_default(),
+                            });
+                            agg_names.push("array_agg".to_string());
+                            agg_types.push(DataType::Array(Box::new(infer_expr_type(
+                                arr.expr.as_ref(),
+                                &schema,
+                            ))));
+                        }
+                    }
+                }
             }
         }
 
@@ -1703,6 +1790,13 @@ impl Executor {
         let agg_column_map: HashMap<String, String> = {
             let mut map = HashMap::new();
             for (i, agg) in agg_exprs.iter().enumerate() {
+                if agg.func_name.eq_ignore_ascii_case("ARRAY_AGG") {
+                    if let Some(arg) = agg.arg.as_ref() {
+                        let sig = array_agg_signature_for_map(agg.distinct, arg, &agg.order_by);
+                        map.insert(sig, agg_names[i].clone());
+                    }
+                    continue;
+                }
                 let distinct_prefix = if agg.distinct { "DISTINCT " } else { "" };
                 let arg_str = agg
                     .arg
@@ -1875,6 +1969,7 @@ impl Executor {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
 
         let left_estimate = left_preloaded.as_ref().map_or(1000, |r| r.len());
@@ -3141,6 +3236,7 @@ impl Executor {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
 
         let mut columns: Vec<String> = Vec::new();
@@ -3223,6 +3319,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         }
     }
 
@@ -3329,6 +3426,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         }
     }
 
@@ -3470,12 +3568,20 @@ mod tests {
         }
     }
 
+    /// Helper to extract the function signature from a NestedAggregateRef.
+    fn nested_agg_sig(agg: &NestedAggregateRef<'_>) -> String {
+        match agg {
+            NestedAggregateRef::Function(f) => agg_func_signature(f),
+            NestedAggregateRef::ArrayAgg(arr) => format!("{}", arr).to_lowercase(),
+        }
+    }
+
     #[test]
     fn test_collect_nested_aggregates_bare_count() {
         let expr = parse_expr("COUNT(*)");
         let aggs = collect_nested_aggregates(&expr);
         assert_eq!(aggs.len(), 1);
-        assert_eq!(agg_func_signature(aggs[0]), "count(*)");
+        assert_eq!(nested_agg_sig(&aggs[0]), "count(*)");
     }
 
     #[test]
@@ -3484,7 +3590,7 @@ mod tests {
         let expr = parse_expr("'count=' || COUNT(*)");
         let aggs = collect_nested_aggregates(&expr);
         assert_eq!(aggs.len(), 1);
-        assert_eq!(agg_func_signature(aggs[0]), "count(*)");
+        assert_eq!(nested_agg_sig(&aggs[0]), "count(*)");
     }
 
     #[test]
@@ -3493,7 +3599,7 @@ mod tests {
         let expr = parse_expr("CAST(AVG(salary) AS INT)");
         let aggs = collect_nested_aggregates(&expr);
         assert_eq!(aggs.len(), 1);
-        assert_eq!(agg_func_signature(aggs[0]), "avg(salary)");
+        assert_eq!(nested_agg_sig(&aggs[0]), "avg(salary)");
     }
 
     #[test]
@@ -3502,7 +3608,7 @@ mod tests {
         let expr = parse_expr("CASE WHEN COUNT(*) > 5 THEN 'many' ELSE 'few' END");
         let aggs = collect_nested_aggregates(&expr);
         assert_eq!(aggs.len(), 1);
-        assert_eq!(agg_func_signature(aggs[0]), "count(*)");
+        assert_eq!(nested_agg_sig(&aggs[0]), "count(*)");
     }
 
     #[test]
@@ -3511,7 +3617,7 @@ mod tests {
         let expr = parse_expr("ROUND(AVG(salary), 2)");
         let aggs = collect_nested_aggregates(&expr);
         assert_eq!(aggs.len(), 1);
-        assert_eq!(agg_func_signature(aggs[0]), "avg(salary)");
+        assert_eq!(nested_agg_sig(&aggs[0]), "avg(salary)");
     }
 
     #[test]
@@ -3519,6 +3625,32 @@ mod tests {
         let expr = parse_expr("1 + 2");
         let aggs = collect_nested_aggregates(&expr);
         assert!(aggs.is_empty());
+    }
+
+    #[test]
+    fn test_collect_nested_aggregates_array_agg_in_is_null() {
+        // ARRAY_AGG(x) IS NULL — the ArrayAgg should be collected
+        let expr = parse_expr("ARRAY_AGG(x) IS NULL");
+        let aggs = collect_nested_aggregates(&expr);
+        assert_eq!(aggs.len(), 1);
+        assert!(matches!(aggs[0], NestedAggregateRef::ArrayAgg(_)));
+    }
+
+    #[test]
+    fn test_collect_nested_aggregates_array_agg_order_by_in_is_null() {
+        let expr = parse_expr("ARRAY_AGG(x ORDER BY y) IS NULL");
+        let aggs = collect_nested_aggregates(&expr);
+        assert_eq!(aggs.len(), 1);
+        assert_eq!(nested_agg_sig(&aggs[0]), "array_agg(x order by y)");
+    }
+
+    #[test]
+    fn test_collect_nested_aggregates_array_agg_in_case() {
+        // CASE WHEN true THEN ARRAY_AGG(x) ELSE NULL END
+        let expr = parse_expr("CASE WHEN true THEN ARRAY_AGG(x) ELSE NULL END");
+        let aggs = collect_nested_aggregates(&expr);
+        assert_eq!(aggs.len(), 1);
+        assert!(matches!(aggs[0], NestedAggregateRef::ArrayAgg(_)));
     }
 
     #[test]

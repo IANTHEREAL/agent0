@@ -927,6 +927,14 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                 Ok(Value::Boolean(true))
             }
         }
+        // ArrayAgg should normally be rewritten to a column reference by the aggregate
+        // extraction/rewriting pass. If it reaches here, it means we're evaluating it in a
+        // scalar context (e.g., in a non-aggregate query). Provide a clear error message.
+        Expr::ArrayAgg(_) => Err(SqlError::Unsupported(
+            "ARRAY_AGG is an aggregate function and cannot be used in a non-aggregate context"
+                .to_string(),
+        )
+        .into()),
         _ => Err(SqlError::Unsupported(format!("Unsupported expression: {:?}", expr)).into()),
     }
 }

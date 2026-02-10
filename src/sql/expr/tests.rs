@@ -2054,7 +2054,6 @@ fn test_eval_expr_without_query_context_falls_back() {
     assert_eq!(val, Value::Int32(42));
 }
 
-
 #[test]
 fn test_like_single_byte_escape_accepted() {
     // ASCII (1 byte) should work fine

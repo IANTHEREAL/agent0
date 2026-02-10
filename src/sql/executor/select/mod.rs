@@ -460,6 +460,15 @@ impl Executor {
             _ => return Err(SqlError::Unsupported("Unsupported table".into()).into()),
         };
 
+        // Propagate FROM alias into the schema so that expression evaluation
+        // can resolve whole-row references like `SELECT bar FROM foo_tbl AS bar`
+        // and qualified column references like `SELECT bar.col`.
+        let mut schema = schema;
+        let schema_short_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+        if !schema_short_name.eq_ignore_ascii_case(&outer_alias) {
+            schema.from_alias = Some(outer_alias.clone());
+        }
+
         let is_from_cte = ctes.contains_key(&t.to_lowercase());
         let (is_virtual, rows_loaded) = if is_from_cte && use_operator_execution() {
             (false, false)

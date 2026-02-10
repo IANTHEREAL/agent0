@@ -867,6 +867,7 @@ pub async fn execute_create_table(
         check_constraints,
         foreign_keys,
         owner: "postgres".to_string(),
+        from_alias: None,
     };
     store.create_table(txn, db_id, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
@@ -951,6 +952,7 @@ pub async fn create_table_from_query_result(
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: "postgres".to_string(),
+        from_alias: None,
     };
     store.create_table(txn, db_id, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
@@ -1027,6 +1029,7 @@ pub async fn create_table_from_select_into(
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: "postgres".to_string(),
+        from_alias: None,
     };
     store.create_table(txn, db_id, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;

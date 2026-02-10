@@ -1,0 +1,36 @@
+category|has_names
+fruit|t
+veggie|t
+(2 rows)
+category|has_names
+fruit|yes
+veggie|yes
+(2 rows)
+names
+{none}
+(1 row)
+bar
+(1,fruit,banana,30)
+(1 row)
+name
+banana
+(1 row)
+category|cnt
+fruit|3
+veggie|2
+(2 rows)
+category|sorted_names
+fruit|{apple,banana,cherry}
+veggie|{bean,carrot}
+(2 rows)
+category|names_by_score_desc
+fruit|{banana,cherry,apple}
+veggie|{carrot,bean}
+(2 rows)
+category|names_by_score
+fruit|{apple,cherry,banana}
+veggie|{bean,carrot}
+(2 rows)
+all_sorted
+{apple,banana,bean,carrot,cherry}
+(1 row)

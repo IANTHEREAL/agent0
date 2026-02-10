@@ -1322,6 +1322,7 @@ async fn collect_sources_from_table_factor(
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         })
     }
 

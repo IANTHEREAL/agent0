@@ -87,6 +87,15 @@ impl Executor {
             let mut seen_sigs: std::collections::HashSet<String> = agg_exprs
                 .iter()
                 .map(|a| {
+                    if a.func_name.eq_ignore_ascii_case("ARRAY_AGG") {
+                        if let Some(arg) = a.arg.as_ref() {
+                            return crate::sql::executor::operators::array_agg_signature_for_map(
+                                a.distinct,
+                                arg,
+                                &a.order_by,
+                            );
+                        }
+                    }
                     let distinct_prefix = if a.distinct { "DISTINCT " } else { "" };
                     let arg_str = a.arg.as_ref().map_or("*".to_string(), |e| format!("{}", e));
                     let filter_suffix = a
@@ -111,16 +120,43 @@ impl Executor {
             let having_aggs = crate::sql::executor::operators::collect_nested_aggregates(
                 &rewritten_having_for_agg,
             );
-            for f in having_aggs {
-                Executor::add_aggregate_from_function(
-                    f,
-                    None,
-                    &join_schema,
-                    &mut agg_exprs,
-                    &mut agg_names,
-                    &mut agg_types,
-                    &mut seen_sigs,
-                );
+            for agg_ref in having_aggs {
+                use crate::sql::executor::operators::NestedAggregateRef;
+                match agg_ref {
+                    NestedAggregateRef::Function(f) => {
+                        Executor::add_aggregate_from_function(
+                            f,
+                            None,
+                            &join_schema,
+                            &mut agg_exprs,
+                            &mut agg_names,
+                            &mut agg_types,
+                            &mut seen_sigs,
+                        );
+                    }
+                    NestedAggregateRef::ArrayAgg(arr) => {
+                        let sig = format!("{}", arr).to_lowercase();
+                        if !seen_sigs.contains(&sig) {
+                            seen_sigs.insert(sig);
+                            let arg = Some((*arr.expr).clone());
+                            agg_exprs.push(crate::sql::operators::AggregateExpr {
+                                func_name: "ARRAY_AGG".to_string(),
+                                arg: arg.clone(),
+                                distinct: arr.distinct,
+                                delimiter: None,
+                                filter: None,
+                                order_by: arr.order_by.clone().unwrap_or_default(),
+                            });
+                            agg_names.push("array_agg".to_string());
+                            agg_types.push(DataType::Array(Box::new(
+                                crate::sql::projection::infer_expr_type(
+                                    arr.expr.as_ref(),
+                                    &join_schema,
+                                ),
+                            )));
+                        }
+                    }
+                }
             }
         }
 
@@ -232,6 +268,17 @@ impl Executor {
         let agg_column_map: HashMap<String, String> = {
             let mut map = HashMap::new();
             for (i, agg) in agg_exprs.iter().enumerate() {
+                if agg.func_name.eq_ignore_ascii_case("ARRAY_AGG") {
+                    if let Some(arg) = agg.arg.as_ref() {
+                        let sig = crate::sql::executor::operators::array_agg_signature_for_map(
+                            agg.distinct,
+                            arg,
+                            &agg.order_by,
+                        );
+                        map.insert(sig, agg_names[i].clone());
+                    }
+                    continue;
+                }
                 let distinct_prefix = if agg.distinct { "DISTINCT " } else { "" };
                 let arg_str = agg
                     .arg

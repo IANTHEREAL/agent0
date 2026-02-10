@@ -205,6 +205,11 @@ impl<'a> TypeInferrer<'a> {
 
             Expr::Nested(inner) => self.infer(inner),
 
+            Expr::ArrayAgg(arr) => {
+                let inner_type = self.infer(&arr.expr)?;
+                Ok(DataType::Array(Box::new(inner_type)))
+            }
+
             _ => Ok(DataType::Text),
         }
     }

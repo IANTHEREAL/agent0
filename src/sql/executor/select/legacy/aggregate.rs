@@ -20,6 +20,10 @@ impl Executor {
         let mut group_rows: HashMap<Vec<u8>, Row> = HashMap::new();
         // Track seen values for DISTINCT aggregates: group_key -> (agg_idx -> seen_values)
         let mut seen_distinct: HashMap<Vec<u8>, Vec<HashSet<Vec<u8>>>> = HashMap::new();
+        // Buffers for ARRAY_AGG with ORDER BY: group_key -> (agg_idx -> Option<buffer>)
+        // Each buffer entry holds (sort_keys, value) pairs to be sorted before producing result.
+        let mut ordered_agg_buffers: HashMap<Vec<u8>, Vec<Option<Vec<(Vec<Value>, Value)>>>> =
+            HashMap::new();
 
         for row in filtered_rows {
             let mut key = Vec::new();
@@ -82,6 +86,18 @@ impl Executor {
                 }
                 let distinct_sets: Vec<HashSet<Vec<u8>>> =
                     agg_funcs.iter().map(|_| HashSet::new()).collect();
+                let ord_buffers: Vec<Option<Vec<(Vec<Value>, Value)>>> = agg_funcs
+                    .iter()
+                    .map(|(_, agg_expr)| {
+                        if let AggExpr::ArrayAgg(arr) = agg_expr {
+                            if arr.order_by.as_ref().map_or(false, |ob| !ob.is_empty()) {
+                                return Some(Vec::new());
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+                ordered_agg_buffers.insert(key_bytes.clone(), ord_buffers);
                 seen_distinct.insert(key_bytes.clone(), distinct_sets);
                 groups.insert(key_bytes.clone(), aggs);
                 group_rows.insert(key_bytes.clone(), row.clone());
@@ -159,7 +175,63 @@ impl Executor {
                     }
                 }
 
-                aggs[agg_idx].update(&val)?;
+                // Buffer ordered ARRAY_AGG values instead of updating directly
+                let bufs = ordered_agg_buffers.get_mut(&key_bytes).unwrap();
+                if let Some(buf) = bufs[agg_idx].as_mut() {
+                    if let AggExpr::ArrayAgg(arr) = &agg_funcs[agg_idx].1 {
+                        let order_by = arr.order_by.as_ref().unwrap();
+                        let mut keys = Vec::with_capacity(order_by.len());
+                        for o in order_by {
+                            let key = self
+                                .eval_expr_maybe_sequence(
+                                    txn,
+                                    db_id,
+                                    sequence_values,
+                                    search_path,
+                                    &o.expr,
+                                    Some(&row),
+                                    Some(schema),
+                                )
+                                .await?;
+                            keys.push(key);
+                        }
+                        buf.push((keys, val));
+                    }
+                } else {
+                    aggs[agg_idx].update(&val)?;
+                }
+            }
+        }
+
+        // Flush ordered ARRAY_AGG buffers: sort and feed into aggregators
+        for (key_bytes, aggs) in groups.iter_mut() {
+            if let Some(bufs) = ordered_agg_buffers.get_mut(key_bytes) {
+                for (agg_idx, (_, agg_expr)) in agg_funcs.iter().enumerate() {
+                    if let Some(mut buf) = bufs[agg_idx].take() {
+                        if let AggExpr::ArrayAgg(arr) = agg_expr {
+                            let order_by = arr.order_by.as_ref().unwrap();
+                            buf.sort_by(|(keys_a, _), (keys_b, _)| {
+                                for (key_idx, order_expr) in order_by.iter().enumerate() {
+                                    let asc = order_expr.asc.unwrap_or(true);
+                                    let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+                                    let ord = crate::sql::expr::compare_order_by_values(
+                                        &keys_a[key_idx],
+                                        &keys_b[key_idx],
+                                        asc,
+                                        nulls_first,
+                                    );
+                                    if ord != std::cmp::Ordering::Equal {
+                                        return ord;
+                                    }
+                                }
+                                std::cmp::Ordering::Equal
+                            });
+                            for (_, val) in buf {
+                                aggs[agg_idx].update(&val)?;
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -346,6 +418,8 @@ impl Executor {
         for grouping_set in &grouping_sets {
             let mut groups: HashMap<Vec<u8>, Vec<Aggregator>> = HashMap::new();
             let mut group_rows: HashMap<Vec<u8>, Row> = HashMap::new();
+            let mut ordered_agg_buffers: HashMap<Vec<u8>, Vec<Option<Vec<(Vec<Value>, Value)>>>> =
+                HashMap::new();
 
             for row in &filtered_rows {
                 let mut key = Vec::new();
@@ -406,6 +480,18 @@ impl Executor {
                             }
                         }
                     }
+                    let ord_buffers: Vec<Option<Vec<(Vec<Value>, Value)>>> = agg_funcs
+                        .iter()
+                        .map(|(_, agg_expr)| {
+                            if let AggExpr::ArrayAgg(arr) = agg_expr {
+                                if arr.order_by.as_ref().map_or(false, |ob| !ob.is_empty()) {
+                                    return Some(Vec::new());
+                                }
+                            }
+                            None
+                        })
+                        .collect();
+                    ordered_agg_buffers.insert(key_bytes.clone(), ord_buffers);
                     groups.insert(key_bytes.clone(), aggs);
                     group_rows.insert(key_bytes.clone(), row.clone());
                 }
@@ -472,7 +558,63 @@ impl Executor {
                     } else {
                         Value::Int32(1)
                     };
-                    aggs[agg_idx].update(&val)?;
+                    // Buffer ordered ARRAY_AGG values instead of updating directly
+                    let bufs = ordered_agg_buffers.get_mut(&key_bytes).unwrap();
+                    if let Some(buf) = bufs[agg_idx].as_mut() {
+                        if let AggExpr::ArrayAgg(arr) = &agg_funcs[agg_idx].1 {
+                            let order_by = arr.order_by.as_ref().unwrap();
+                            let mut keys = Vec::with_capacity(order_by.len());
+                            for o in order_by {
+                                let key = self
+                                    .eval_expr_maybe_sequence(
+                                        txn,
+                                        db_id,
+                                        sequence_values,
+                                        search_path,
+                                        &o.expr,
+                                        Some(row),
+                                        Some(schema),
+                                    )
+                                    .await?;
+                                keys.push(key);
+                            }
+                            buf.push((keys, val));
+                        }
+                    } else {
+                        aggs[agg_idx].update(&val)?;
+                    }
+                }
+            }
+
+            // Flush ordered ARRAY_AGG buffers: sort and feed into aggregators
+            for (key_bytes, aggs) in groups.iter_mut() {
+                if let Some(bufs) = ordered_agg_buffers.get_mut(key_bytes) {
+                    for (agg_idx, (_, agg_expr)) in agg_funcs.iter().enumerate() {
+                        if let Some(mut buf) = bufs[agg_idx].take() {
+                            if let AggExpr::ArrayAgg(arr) = agg_expr {
+                                let order_by = arr.order_by.as_ref().unwrap();
+                                buf.sort_by(|(keys_a, _), (keys_b, _)| {
+                                    for (key_idx, order_expr) in order_by.iter().enumerate() {
+                                        let asc = order_expr.asc.unwrap_or(true);
+                                        let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+                                        let ord = crate::sql::expr::compare_order_by_values(
+                                            &keys_a[key_idx],
+                                            &keys_b[key_idx],
+                                            asc,
+                                            nulls_first,
+                                        );
+                                        if ord != std::cmp::Ordering::Equal {
+                                            return ord;
+                                        }
+                                    }
+                                    std::cmp::Ordering::Equal
+                                });
+                                for (_, val) in buf {
+                                    aggs[agg_idx].update(&val)?;
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

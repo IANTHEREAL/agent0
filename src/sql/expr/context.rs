@@ -158,12 +158,17 @@ impl EvalContext for SingleTableContext<'_> {
                     return Ok(format_composite_value(values));
                 }
 
+                // Whole-row reference: check FROM alias first, then schema name
+                let is_alias_match = schema
+                    .from_alias
+                    .as_ref()
+                    .map_or(false, |a| a.eq_ignore_ascii_case(name));
                 let short_name_matches = schema
                     .name
                     .rsplit('.')
                     .next()
                     .is_some_and(|short| short.eq_ignore_ascii_case(name));
-                if schema.name.eq_ignore_ascii_case(name) || short_name_matches {
+                if is_alias_match || short_name_matches {
                     let values = schema
                         .columns
                         .iter()
@@ -195,10 +200,26 @@ impl EvalContext for SingleTableContext<'_> {
 
             match (self.row, self.schema) {
                 (Some(row), Some(schema)) => {
+                    // Try exact qualified name first (e.g., "t.id" column in schema)
                     let qualified_name = format!("{}.{}", table_part, col_name);
+                    if let Some(idx) = schema.column_index(&qualified_name) {
+                        return Ok(row.values[idx].clone());
+                    }
+                    // If the table_part matches our FROM alias or the schema name,
+                    // resolve the unqualified column name
+                    let alias_match = schema
+                        .from_alias
+                        .as_ref()
+                        .map_or(false, |a| a.eq_ignore_ascii_case(table_part));
+                    let schema_short = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                    if alias_match || schema_short.eq_ignore_ascii_case(table_part) {
+                        if let Some(idx) = schema.column_index(col_name) {
+                            return Ok(row.values[idx].clone());
+                        }
+                    }
+                    // Fallback: try unqualified column name regardless
                     let idx = schema
-                        .column_index(&qualified_name)
-                        .or_else(|| schema.column_index(col_name))
+                        .column_index(col_name)
                         .ok_or_else(|| anyhow!("Column '{}' not found", col_name))?;
                     Ok(row.values[idx].clone())
                 }
@@ -542,6 +563,49 @@ mod tests {
         assert_eq!(
             ctx.resolve_column("foo").unwrap(),
             Value::Text("(1)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_column_whole_row_reference_by_from_alias() {
+        let schema = TableSchema {
+            name: "public.foo_tbl".to_string(),
+            columns: vec![int_col("i"), int_col("mod2")],
+            from_alias: Some("bar".to_string()),
+            ..Default::default()
+        };
+        let row = Row::new(vec![Value::Int32(1), Value::Int32(2)]);
+        let ctx = SingleTableContext::new(Some(&row), Some(&schema));
+        // Resolving by alias should work
+        assert_eq!(
+            ctx.resolve_column("bar").unwrap(),
+            Value::Text("(1,2)".to_string())
+        );
+        // Resolving by original table name should also still work
+        assert_eq!(
+            ctx.resolve_column("foo_tbl").unwrap(),
+            Value::Text("(1,2)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_compound_identifier_by_from_alias() {
+        let schema = TableSchema {
+            name: "public.foo_tbl".to_string(),
+            columns: vec![int_col("i"), int_col("mod2")],
+            from_alias: Some("bar".to_string()),
+            ..Default::default()
+        };
+        let row = Row::new(vec![Value::Int32(1), Value::Int32(2)]);
+        let ctx = SingleTableContext::new(Some(&row), Some(&schema));
+        let parts = vec![
+            sqlparser::ast::Ident::new("bar"),
+            sqlparser::ast::Ident::new("i"),
+        ];
+        // bar.i should resolve to the i column value
+        assert_eq!(
+            ctx.resolve_compound_identifier(&parts).unwrap(),
+            Value::Int32(1)
         );
     }
 }

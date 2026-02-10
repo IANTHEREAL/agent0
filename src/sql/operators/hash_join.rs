@@ -458,6 +458,7 @@ impl HashJoinOperator {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
 
         let (build_child, probe_child, build_key_indices, probe_key_indices) = if left_is_build {
@@ -897,6 +898,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         }
     }
 
@@ -931,6 +933,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         }
     }
 

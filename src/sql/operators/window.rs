@@ -122,6 +122,7 @@ impl WindowOperator {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
 
         Self {
@@ -786,6 +787,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         }
     }
 
@@ -884,6 +886,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         }
     }
 
@@ -921,6 +924,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         }
     }
 
@@ -1097,6 +1101,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
 
         let child = Box::new(TableScanOperator::new(schema.clone()));

@@ -203,6 +203,7 @@ impl Executor {
                 check_constraints: vec![],
                 foreign_keys: vec![],
                 owner: String::new(),
+                from_alias: None,
             };
 
             let row = Row::new(vec![
@@ -296,6 +297,7 @@ impl Executor {
                 check_constraints: vec![],
                 foreign_keys: vec![],
                 owner: String::new(),
+                from_alias: None,
             };
 
             let rows = groups
@@ -504,6 +506,7 @@ impl Executor {
                 check_constraints: vec![],
                 foreign_keys: vec![],
                 owner: String::new(),
+                from_alias: None,
             };
 
             let row = Row::new(vec![
@@ -652,6 +655,7 @@ impl Executor {
                 check_constraints: vec![],
                 foreign_keys: vec![],
                 owner: String::new(),
+                from_alias: None,
             };
 
             return Ok((schema, rows));
@@ -688,6 +692,7 @@ impl Executor {
                 check_constraints: vec![],
                 foreign_keys: vec![],
                 owner: String::new(),
+                from_alias: None,
             };
             let rows = vec![Row::new(vec![result])];
             return Ok((schema, rows));
@@ -779,6 +784,7 @@ impl Executor {
                                 check_constraints: vec![],
                                 foreign_keys: vec![],
                                 owner: String::new(),
+                                from_alias: None,
                             };
                             Ok((schema, rows))
                         }
@@ -826,6 +832,7 @@ impl Executor {
                 check_constraints: vec![],
                 foreign_keys: vec![],
                 owner: String::new(),
+                from_alias: None,
             };
             let rows = vec![Row::new(vec![result])];
             return Ok((schema, rows));
@@ -896,6 +903,7 @@ impl Executor {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
 
         let rows: Vec<Row> = values.into_iter().map(|v| Row::new(vec![v])).collect();
@@ -1008,6 +1016,7 @@ impl Executor {
                         check_constraints: vec![],
                         foreign_keys: vec![],
                         owner: String::new(),
+                        from_alias: None,
                     };
                     Ok((schema, rows))
                 }

@@ -1711,6 +1711,7 @@ pub fn build_update_join_context<'a>(
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        from_alias: None,
     };
 
     let mut column_offsets: HashMap<String, usize> = HashMap::new();
@@ -1773,6 +1774,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         }
     }
 

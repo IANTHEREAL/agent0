@@ -1081,6 +1081,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         }
     }
 
@@ -1346,6 +1347,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
         let path = choose_best_access_path(&schema, &[], 1000);
         assert!(matches!(path.scan_type, ScanType::FullTableScan));
@@ -1372,6 +1374,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
         let predicates = vec![PredicateInfo {
             column: "a".to_string(),
@@ -1404,6 +1407,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
         let predicates = vec![PredicateInfo {
             column: "a".to_string(),
@@ -1441,6 +1445,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         }
     }
 
@@ -1611,6 +1616,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
 
         let dialect = PostgreSqlDialect {};
@@ -1769,6 +1775,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
         let predicates = vec![PredicateInfo {
             column: "a".to_string(),
@@ -1816,6 +1823,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
         let predicates = vec![
             PredicateInfo {
@@ -1864,6 +1872,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
         let predicates = vec![PredicateInfo {
             column: "a".to_string(),
@@ -1909,6 +1918,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
         let predicates = vec![PredicateInfo {
             column: "val".to_string(),
@@ -1953,6 +1963,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
         let predicates = vec![
             PredicateInfo {
@@ -2023,6 +2034,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
         let predicates = vec![
             PredicateInfo {
@@ -2085,6 +2097,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
         let predicates = vec![PredicateInfo {
             column: "val".to_string(),
@@ -2134,6 +2147,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
         let predicates = vec![PredicateInfo {
             column: "val".to_string(),
@@ -2273,6 +2287,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
         let path_no_pred = choose_best_access_path(&schema, &[], 10);
         assert!(matches!(path_no_pred.scan_type, ScanType::FullTableScan));

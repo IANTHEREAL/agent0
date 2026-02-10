@@ -56,6 +56,7 @@ fn build_type_infer_schema_for_two_table_join(
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        from_alias: None,
     }
 }
 

@@ -129,6 +129,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: "postgres".to_string(),
+            from_alias: None,
         }
     }
 

@@ -1423,6 +1423,7 @@ impl Executor {
                             check_constraints: Vec::new(),
                             foreign_keys: Vec::new(),
                             owner: String::new(),
+                            from_alias: None,
                         },
                     ));
                 }
@@ -1517,6 +1518,7 @@ impl Executor {
                 check_constraints: vec![],
                 foreign_keys: vec![],
                 owner: String::new(),
+                from_alias: None,
             };
 
             let right_op: BoxedOperator = if let Some(rows) = right_preloaded_rows {

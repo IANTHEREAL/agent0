@@ -221,6 +221,7 @@ impl Executor {
                             check_constraints: vec![],
                             foreign_keys: vec![],
                             owner: String::new(),
+                            from_alias: None,
                         });
 
                         if let Some(cond) = join_on_constraint.as_ref() {
@@ -256,6 +257,7 @@ impl Executor {
                             check_constraints: vec![],
                             foreign_keys: vec![],
                             owner: String::new(),
+                            from_alias: None,
                         });
                     }
 
@@ -319,6 +321,7 @@ impl Executor {
                     check_constraints: vec![],
                     foreign_keys: vec![],
                     owner: String::new(),
+                    from_alias: None,
                 });
 
                 for col in &lat_schema.columns {
@@ -394,6 +397,7 @@ impl Executor {
                     check_constraints: vec![],
                     foreign_keys: vec![],
                     owner: String::new(),
+                    from_alias: None,
                 };
 
                 let mut temp_table_aliases = table_aliases.clone();
@@ -456,6 +460,7 @@ impl Executor {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
 
         let merge_columns: Vec<UsingMergeColumn> = Vec::new();

@@ -141,6 +141,7 @@ fn http_response_schema(name: &str) -> TableSchema {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        from_alias: None,
     }
 }
 

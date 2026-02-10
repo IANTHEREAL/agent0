@@ -1332,6 +1332,7 @@ pub fn deserialize_schema(data: &[u8]) -> Result<TableSchema> {
         check_constraints: legacy.check_constraints,
         foreign_keys: legacy.foreign_keys,
         owner: DEFAULT_OWNER.to_string(),
+        from_alias: None,
     })
 }
 
@@ -1567,6 +1568,7 @@ mod tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: "postgres".to_string(),
+            from_alias: None,
         };
         let serialized = serialize_schema(&schema).unwrap();
         let deserialized = deserialize_schema(&serialized).unwrap();

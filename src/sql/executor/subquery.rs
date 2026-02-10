@@ -2253,6 +2253,7 @@ mod subquery_tests {
             check_constraints: vec![],
             foreign_keys: vec![],
             owner: String::new(),
+            from_alias: None,
         };
         let outer_row = Row::new(vec![Value::Int32(9)]);
 

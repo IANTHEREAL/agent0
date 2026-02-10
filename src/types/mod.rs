@@ -508,6 +508,11 @@ pub struct TableSchema {
     /// Owner role/user name for this table (metadata only; no permission enforcement yet).
     #[serde(default = "default_owner")]
     pub owner: String,
+    /// Runtime-only FROM alias (e.g., `FROM foo_tbl AS bar` → alias = "bar").
+    /// Not serialized; used only during query evaluation for whole-row references
+    /// and qualified column resolution.
+    #[serde(skip)]
+    pub from_alias: Option<String>,
 }
 
 impl TableSchema {
@@ -535,6 +540,7 @@ impl TableSchema {
             check_constraints: Vec::new(),
             foreign_keys: Vec::new(),
             owner: default_owner(),
+            from_alias: None,
         }
     }
 }
