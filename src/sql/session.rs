@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tikv_client::Transaction;
 
+pub(crate) const DEFAULT_MAX_SORT_BYTES: usize = 256 * 1024 * 1024;
+
 #[derive(Debug)]
 pub struct InFailedSqlTransaction;
 
@@ -37,6 +39,10 @@ pub enum TransactionState {
 pub(crate) struct SessionSettings {
     search_path: Vec<String>,
 
+    /// Maximum bytes allowed for in-memory sort (ORDER BY).
+    /// Default: 256 MB. 0 = unlimited.
+    max_sort_bytes: usize,
+
     // pg_dump startup variables we keep for readback (`SHOW`) and later timeout enforcement.
     statement_timeout_ms: u64,
     lock_timeout_ms: u64,
@@ -57,6 +63,7 @@ impl SessionSettings {
     pub(crate) fn new() -> Self {
         Self {
             search_path: vec!["public".to_string()],
+            max_sort_bytes: DEFAULT_MAX_SORT_BYTES,
             ..Default::default()
         }
     }
@@ -120,6 +127,50 @@ impl SessionSettings {
         Ok(ms as u64)
     }
 
+    fn parse_byte_size(value: &str) -> Result<usize> {
+        let s = value.trim();
+        if s.is_empty() {
+            return Err(anyhow!("invalid byte size value '{}'", value));
+        }
+
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+
+        if i == 0 {
+            return Err(anyhow!("invalid byte size value '{}'", value));
+        }
+
+        let (num_part, unit_part) = s.split_at(i);
+        let num: u128 = num_part
+            .parse()
+            .map_err(|_| anyhow!("invalid byte size value '{}'", value))?;
+        let unit = unit_part.trim();
+
+        let multiplier: u128 = if unit.is_empty() {
+            1
+        } else if unit.eq_ignore_ascii_case("kb") {
+            1024
+        } else if unit.eq_ignore_ascii_case("mb") {
+            1024 * 1024
+        } else if unit.eq_ignore_ascii_case("gb") {
+            1024 * 1024 * 1024
+        } else {
+            return Err(anyhow!("invalid byte size unit '{}'", unit));
+        };
+
+        let total = num
+            .checked_mul(multiplier)
+            .ok_or_else(|| anyhow!("byte size value out of range '{}'", value))?;
+        if total > usize::MAX as u128 {
+            return Err(anyhow!("byte size value out of range '{}'", value));
+        }
+
+        Ok(total as usize)
+    }
+
     /// Set a known session setting. Returns `true` if the setting name is recognized.
     pub(crate) fn set_known_setting(&mut self, name: &str, value: String) -> Result<bool> {
         match name {
@@ -127,6 +178,9 @@ impl SessionSettings {
             "lock_timeout" => self.lock_timeout_ms = Self::parse_timeout_millis(&value)?,
             "idle_in_transaction_session_timeout" => {
                 self.idle_in_transaction_session_timeout_ms = Self::parse_timeout_millis(&value)?
+            }
+            "pgtikv.max_sort_bytes" => {
+                self.max_sort_bytes = Self::parse_byte_size(&value)?;
             }
             "timezone" => {
                 crate::types::timestamp::TimeZoneSpec::try_parse(&value)?;
@@ -171,6 +225,7 @@ impl SessionSettings {
             "idle_in_transaction_session_timeout" => {
                 Some(self.idle_in_transaction_session_timeout_ms.to_string())
             }
+            "pgtikv.max_sort_bytes" => Some(self.max_sort_bytes.to_string()),
             // Report canonical Postgres defaults for driver/tool compatibility.
             "datestyle" => Some("ISO, MDY".to_string()),
             "intervalstyle" => Some("postgres".to_string()),
@@ -229,6 +284,10 @@ impl SessionSettings {
         } else {
             Some(Duration::from_millis(self.statement_timeout_ms))
         }
+    }
+
+    pub(crate) fn max_sort_bytes(&self) -> usize {
+        self.max_sort_bytes
     }
 }
 
@@ -439,6 +498,10 @@ impl Session {
         self.settings.statement_timeout()
     }
 
+    pub(crate) fn max_sort_bytes(&self) -> usize {
+        self.settings.max_sort_bytes()
+    }
+
     pub async fn create_savepoint(&mut self, name: String) -> Result<()> {
         if !self.is_in_transaction() {
             return Err(anyhow!("SAVEPOINT can only be used in transaction blocks"));
@@ -622,6 +685,10 @@ mod tests {
             Some("0")
         );
         assert_eq!(
+            settings.show_value("pgtikv.max_sort_bytes").as_deref(),
+            Some("268435456")
+        );
+        assert_eq!(
             settings.show_value("client_encoding").as_deref(),
             Some("UTF8")
         );
@@ -724,6 +791,53 @@ mod tests {
             .is_err());
         assert!(settings
             .set_known_setting("statement_timeout", "1unknown".to_string())
+            .is_err());
+    }
+
+    #[test]
+    fn test_session_settings_max_sort_bytes_parsing() {
+        let mut settings = SessionSettings::new();
+
+        settings
+            .set_known_setting("pgtikv.max_sort_bytes", "268435456".to_string())
+            .unwrap();
+        assert_eq!(
+            settings.show_value("pgtikv.max_sort_bytes").as_deref(),
+            Some("268435456")
+        );
+
+        settings
+            .set_known_setting("pgtikv.max_sort_bytes", "256MB".to_string())
+            .unwrap();
+        assert_eq!(
+            settings.show_value("pgtikv.max_sort_bytes").as_deref(),
+            Some("268435456")
+        );
+
+        settings
+            .set_known_setting("pgtikv.max_sort_bytes", "1gb".to_string())
+            .unwrap();
+        assert_eq!(
+            settings.show_value("pgtikv.max_sort_bytes").as_deref(),
+            Some("1073741824")
+        );
+
+        settings
+            .set_known_setting("pgtikv.max_sort_bytes", "0".to_string())
+            .unwrap();
+        assert_eq!(
+            settings.show_value("pgtikv.max_sort_bytes").as_deref(),
+            Some("0")
+        );
+
+        assert!(settings
+            .set_known_setting("pgtikv.max_sort_bytes", "-1".to_string())
+            .is_err());
+        assert!(settings
+            .set_known_setting("pgtikv.max_sort_bytes", "1TB".to_string())
+            .is_err());
+        assert!(settings
+            .set_known_setting("pgtikv.max_sort_bytes", "abc".to_string())
             .is_err());
     }
 

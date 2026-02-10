@@ -485,9 +485,12 @@ impl Executor {
                         .show_setting_value("timezone")
                         .unwrap_or_else(|| "UTC".to_string()),
                 );
+                let max_sort_bytes = session.max_sort_bytes();
                 let stmt_exec: Result<Vec<ExecuteResult>> = session_context::with_timezone(
                     timezone,
-                    crate::extensions::context::with_context(is_superuser, async {
+                    session_context::with_max_sort_bytes(
+                        max_sort_bytes,
+                        crate::extensions::context::with_context(is_superuser, async {
                         match stmt {
                             // Transaction Control
                             Statement::StartTransaction { .. } => {
@@ -653,6 +656,7 @@ impl Executor {
                                     "statement_timeout"
                                         | "lock_timeout"
                                         | "idle_in_transaction_session_timeout"
+                                        | "pgtikv.max_sort_bytes"
                                         | "timezone"
                                         | "application_name"
                                         | "client_encoding"
@@ -809,6 +813,7 @@ impl Executor {
                             }
                         }
                     }),
+                    ),
                 )
                 .await;
 
