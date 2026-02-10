@@ -5,7 +5,7 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufRead, AsyncReadExt, BufReader};
 
 /// Metadata about a filesystem entry.
 #[derive(Debug, Clone)]
@@ -38,6 +38,17 @@ pub(crate) trait FsBackend: Send + Sync {
     async fn read_file(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>>;
     /// Check if a path exists.
     async fn exists(&self, path: &str) -> Result<bool>;
+
+    /// Open a file for streaming line-by-line reads.
+    ///
+    /// Returns a buffered async reader limited to `max_bytes`.
+    /// The caller is responsible for reading lines from it.
+    /// The path must be a regular file (not a directory or special file).
+    async fn read_file_stream(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>>;
 }
 
 pub(crate) struct LocalFsBackend;
@@ -180,6 +191,25 @@ impl FsBackend for LocalFsBackend {
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
             Err(err) => Err(anyhow!("fs9: cannot stat '{path}': {err}")),
         }
+    }
+
+    async fn read_file_stream(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
+        let info = self.stat(path).await?;
+        if info.is_dir {
+            return Err(anyhow!("fs9: is a directory: {path}"));
+        }
+        if !info.is_file {
+            return Err(anyhow!("fs9: not a regular file: {path}"));
+        }
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|err| anyhow!("fs9: cannot read file '{path}': {err}"))?;
+        let limited = file.take(max_bytes as u64);
+        Ok(Box::new(BufReader::new(limited)))
     }
 }
 
@@ -399,5 +429,124 @@ mod tests {
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         );
         assert!(!backend.exists(&path).await.expect("exists missing"));
+    }
+
+    #[tokio::test]
+    async fn test_read_file_stream_basic() {
+        use tokio::io::AsyncBufReadExt;
+
+        let backend = LocalFsBackend::new();
+        let dir = unique_base("stream-basic");
+        let file = dir.join("lines.txt");
+        fs::write(&file, b"line1\nline2\nline3\n").expect("write");
+
+        let mut reader = backend
+            .read_file_stream(&file.to_string_lossy(), 1024)
+            .await
+            .expect("stream file");
+
+        let mut lines = Vec::new();
+        let mut buf = String::new();
+        while reader.read_line(&mut buf).await.expect("read") > 0 {
+            lines.push(buf.trim_end_matches('\n').to_string());
+            buf.clear();
+        }
+        assert_eq!(lines, vec!["line1", "line2", "line3"]);
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_stream_matches_batch() {
+        use tokio::io::AsyncReadExt;
+
+        let backend = LocalFsBackend::new();
+        let dir = unique_base("stream-vs-batch");
+        let file = dir.join("data.txt");
+        let content = b"hello world\nfoo bar\n";
+        fs::write(&file, content).expect("write");
+
+        let batch = backend
+            .read_file(&file.to_string_lossy(), 1024)
+            .await
+            .expect("batch read");
+
+        let mut stream = backend
+            .read_file_stream(&file.to_string_lossy(), 1024)
+            .await
+            .expect("stream read");
+        let mut stream_buf = Vec::new();
+        stream
+            .read_to_end(&mut stream_buf)
+            .await
+            .expect("stream to end");
+
+        assert_eq!(batch, stream_buf);
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_stream_respects_max_bytes() {
+        use tokio::io::AsyncReadExt;
+
+        let backend = LocalFsBackend::new();
+        let dir = unique_base("stream-max-bytes");
+        let file = dir.join("big.txt");
+        fs::write(&file, b"abcdefghijklmnop").expect("write 16 bytes");
+
+        let mut reader = backend
+            .read_file_stream(&file.to_string_lossy(), 5)
+            .await
+            .expect("stream with limit");
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.expect("read");
+        assert_eq!(buf.len(), 5);
+        assert_eq!(&buf, b"abcde");
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_read_file_stream_rejects_directory() {
+        let backend = LocalFsBackend::new();
+        let dir = unique_base("stream-dir");
+
+        match backend.read_file_stream(&dir.to_string_lossy(), 1024).await {
+            Err(e) => assert!(e.to_string().contains("fs9: is a directory")),
+            Ok(_) => panic!("expected error for directory"),
+        }
+
+        cleanup(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_file_stream_rejects_non_regular_files() {
+        let backend = LocalFsBackend::new();
+        match backend.read_file_stream("/dev/null", 1024).await {
+            Err(e) => assert!(e.to_string().contains("fs9: not a regular file")),
+            Ok(_) => panic!("expected error for non-regular file"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_file_stream_empty_file() {
+        use tokio::io::AsyncReadExt;
+
+        let backend = LocalFsBackend::new();
+        let dir = unique_base("stream-empty");
+        let file = dir.join("empty.txt");
+        fs::write(&file, b"").expect("write empty");
+
+        let mut reader = backend
+            .read_file_stream(&file.to_string_lossy(), 1024)
+            .await
+            .expect("stream empty");
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).await.expect("read");
+        assert!(buf.is_empty());
+
+        cleanup(&dir);
     }
 }
