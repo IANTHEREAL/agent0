@@ -28,3 +28,18 @@ SELECT 'nope'::BOOLEAN;
 
 -- Invalid text-to-boolean: another bad value
 SELECT 'maybe'::BOOLEAN;
+
+-- Narrowing cast overflow: bigint out of i32 range must error (previously wrapped)
+SELECT 2147483648::BIGINT::INT4;
+
+-- Narrowing cast overflow: large float to int must error (previously saturated)
+SELECT 1e20::FLOAT8::INT4;
+
+-- NaN to int must error (previously returned 0)
+SELECT 'NaN'::FLOAT8::INT4;
+
+-- Float to bigint overflow must error
+SELECT 1e19::FLOAT8::BIGINT;
+
+-- NaN to bigint must error
+SELECT 'NaN'::FLOAT8::BIGINT;

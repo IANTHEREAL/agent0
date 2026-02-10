@@ -1178,9 +1178,15 @@ fn cast_value_to_type(val: Value, target: &DataType) -> Result<Value> {
                 .into()
             })
         }
-        (Value::Int64(n), DataType::Int32) => Ok(Value::Int32(n as i32)),
+        (Value::Int64(n), DataType::Int32) => i32::try_from(n)
+            .map(Value::Int32)
+            .map_err(|_| anyhow!("integer out of range")),
         (Value::Float64(n), DataType::Int32) => {
-            Ok(Value::Int32(round_half_away_from_zero(n) as i32))
+            let rounded = round_half_away_from_zero(n);
+            if n.is_nan() || rounded < (i32::MIN as f64) || rounded > (i32::MAX as f64) {
+                return Err(anyhow!("integer out of range"));
+            }
+            Ok(Value::Int32(rounded as i32))
         }
         (Value::Numeric(d), DataType::Int32) => {
             use rust_decimal::prelude::ToPrimitive;
@@ -1204,7 +1210,11 @@ fn cast_value_to_type(val: Value, target: &DataType) -> Result<Value> {
         }
         (Value::Int32(n), DataType::Int64) => Ok(Value::Int64(n as i64)),
         (Value::Float64(n), DataType::Int64) => {
-            Ok(Value::Int64(round_half_away_from_zero(n) as i64))
+            let rounded = round_half_away_from_zero(n);
+            if n.is_nan() || rounded < (i64::MIN as f64) || rounded > (i64::MAX as f64) {
+                return Err(anyhow!("bigint out of range"));
+            }
+            Ok(Value::Int64(rounded as i64))
         }
         (Value::Numeric(d), DataType::Int64) => {
             use rust_decimal::prelude::ToPrimitive;

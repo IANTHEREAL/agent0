@@ -28,3 +28,8 @@ ERROR:  invalid input syntax for type bigint: "xyz"
 ERROR:  invalid input syntax for type double precision: "not_a_float"
 ERROR:  invalid input syntax for type boolean: "nope"
 ERROR:  invalid input syntax for type boolean: "maybe"
+ERROR:  integer out of range
+ERROR:  integer out of range
+ERROR:  integer out of range
+ERROR:  bigint out of range
+ERROR:  bigint out of range
