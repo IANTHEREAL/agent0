@@ -57,6 +57,11 @@ pub enum PlanNode {
         cost: PlanCost,
         child: Box<PlanNode>,
     },
+    TableFunctionScan {
+        function_name: String,
+        alias: Option<String>,
+        cost: PlanCost,
+    },
     Result {
         cost: PlanCost,
     },
@@ -333,9 +338,25 @@ fn generate_table_factor_plan(
     row_count_lookup: &impl Fn(&str) -> usize,
 ) -> PlanNode {
     match table_factor {
-        TableFactor::Table { name, alias, .. } => {
+        TableFactor::Table {
+            name, alias, args, ..
+        } => {
             let table_name = name.0.last().map(|i| i.value.as_str()).unwrap_or("");
             let alias_name = alias.as_ref().map(|a| a.name.value.clone());
+
+            if args.is_some() {
+                return PlanNode::TableFunctionScan {
+                    function_name: table_name.to_string(),
+                    alias: alias_name,
+                    cost: PlanCost {
+                        startup: 0.0,
+                        total: 11.0,
+                        rows: 1000,
+                        width: DEFAULT_ROW_WIDTH,
+                    },
+                };
+            }
+
             let estimated_rows = row_count_lookup(table_name);
 
             if let Some(schema) = schema_lookup(table_name) {
@@ -535,6 +556,7 @@ fn get_plan_cost(plan: &PlanNode) -> PlanCost {
         PlanNode::Sort { cost, .. } => cost.clone(),
         PlanNode::Limit { cost, .. } => cost.clone(),
         PlanNode::Aggregate { cost, .. } => cost.clone(),
+        PlanNode::TableFunctionScan { cost, .. } => cost.clone(),
         PlanNode::Result { cost } => cost.clone(),
     }
 }
@@ -797,6 +819,23 @@ fn format_plan_node(output: &mut String, plan: &PlanNode, indent: usize, is_firs
             }
             format_plan_node(output, child, indent + 6, false);
         }
+        PlanNode::TableFunctionScan {
+            function_name,
+            alias,
+            cost,
+        } => {
+            let display = if let Some(a) = alias {
+                format!("{} {}", function_name, a)
+            } else {
+                function_name.clone()
+            };
+            writeln!(
+                output,
+                "{}Function Scan on {}  (cost={:.2}..{:.2} rows={} width={})",
+                prefix, display, cost.startup, cost.total, cost.rows, cost.width
+            )
+            .unwrap();
+        }
         PlanNode::Result { cost } => {
             writeln!(
                 output,
@@ -888,6 +927,22 @@ mod tests {
 
         assert!(output.contains("Index Scan using users_pkey on users"));
         assert!(output.contains("Index Cond:"));
+    }
+
+    #[test]
+    fn test_table_function_plan() {
+        let sql = "SELECT * FROM extensions.fs9('./*.rs')";
+        let dialect = sqlparser::dialect::PostgreSqlDialect {};
+        let ast = sqlparser::parser::Parser::parse_sql(&dialect, sql).unwrap();
+
+        let plan = generate_plan(&ast[0], dummy_schema_lookup, dummy_row_count);
+        let output = format_plan_text(&plan, 0);
+
+        assert!(
+            output.contains("Function Scan on fs9"),
+            "EXPLAIN should show Function Scan for table functions, got: {}",
+            output
+        );
     }
 
     #[test]

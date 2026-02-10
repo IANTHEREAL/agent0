@@ -346,13 +346,12 @@ async fn start_glob_stream_with_budget(
     use backend::FsBackend;
 
     let backend = backend::local_backend();
-    let matching_files = glob::expand_glob(backend, pattern, MAX_FILES_PER_GLOB, exclude).await?;
 
-    if matching_files.is_empty() {
-        return Ok(None);
-    }
+    let first_path = match glob::find_first_match(backend, pattern, exclude).await? {
+        Some(p) => p,
+        None => return Ok(None),
+    };
 
-    let first_path = matching_files[0].clone();
     let fmt = decoders::detect_format(&first_path, format);
 
     let schema = match fmt {
@@ -384,7 +383,23 @@ async fn start_glob_stream_with_budget(
     let (tx, rx) = mpsc::channel(256);
     let fmt_owned = fmt.to_string();
     let pattern_owned = pattern.to_string();
+    let exclude_owned = exclude.map(|s| s.to_string());
     tokio::spawn(async move {
+        let matching_files = match glob::expand_glob(
+            backend,
+            &pattern_owned,
+            MAX_FILES_PER_GLOB,
+            exclude_owned.as_deref(),
+        )
+        .await
+        {
+            Ok(files) => files,
+            Err(err) => {
+                warn!("fs9: glob expansion error for {}: {}", pattern_owned, err);
+                return;
+            }
+        };
+
         let mut total_bytes: usize = 0;
         let mut files_read_count: usize = 0;
 

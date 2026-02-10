@@ -9,6 +9,25 @@ pub(crate) fn is_glob_pattern(path: &str) -> bool {
     path.contains('*') || path.contains('?') || path.contains('[')
 }
 
+/// Infer the maximum directory walk depth from a glob pattern.
+///
+/// - `./*.rs`        → 0 (only scan prefix directory)
+/// - `./src/*/*.rs`  → 1 (one level of subdirectories)
+/// - `./**/*.rs`     → 20 (effectively unlimited)
+fn infer_glob_max_depth(pattern: &str) -> usize {
+    let prefix = glob_prefix_dir(pattern);
+    let suffix = pattern[prefix.len()..].trim_start_matches('/');
+
+    if suffix.contains("**") {
+        return 20; // effectively unlimited
+    }
+
+    // Count directory separators in the glob suffix.
+    // "./*.rs"       → suffix="*.rs"   → 0 separators → depth 0
+    // "./src/*/*.rs" → suffix="*/*.rs"  → 1 separator  → depth 1
+    suffix.matches('/').count()
+}
+
 /// Expand a glob pattern into matching file paths.
 /// Returns sorted list of matching file paths (directories excluded).
 pub(crate) async fn expand_glob(
@@ -23,6 +42,7 @@ pub(crate) async fn expand_glob(
     let exclude_set = build_exclude_globset(exclude_pattern)?;
     let prefix = glob_prefix_dir(pattern);
     let include_dotfiles = pattern.starts_with('.') || pattern.contains("/.");
+    let max_depth = infer_glob_max_depth(pattern);
 
     let mut results = Vec::new();
     walk_dir(
@@ -32,7 +52,7 @@ pub(crate) async fn expand_glob(
         &mut results,
         max_files,
         0,
-        10,
+        max_depth,
         include_dotfiles,
         exclude_set.as_ref(),
     )
@@ -40,6 +60,38 @@ pub(crate) async fn expand_glob(
 
     results.sort();
     Ok(results)
+}
+
+/// Find the first file matching a glob pattern (for fast schema detection).
+/// Does not sort — returns as soon as one match is found.
+pub(crate) async fn find_first_match(
+    backend: &dyn FsBackend,
+    pattern: &str,
+    exclude_pattern: Option<&str>,
+) -> Result<Option<String>> {
+    let matcher = globset::Glob::new(pattern)
+        .map_err(|err| anyhow!("fs9: invalid glob pattern '{pattern}': {err}"))?
+        .compile_matcher();
+    let exclude_set = build_exclude_globset(exclude_pattern)?;
+    let prefix = glob_prefix_dir(pattern);
+    let include_dotfiles = pattern.starts_with('.') || pattern.contains("/.");
+    let max_depth = infer_glob_max_depth(pattern);
+
+    let mut results = Vec::new();
+    walk_dir(
+        backend,
+        prefix,
+        &matcher,
+        &mut results,
+        1,
+        0,
+        max_depth,
+        include_dotfiles,
+        exclude_set.as_ref(),
+    )
+    .await?;
+
+    Ok(results.into_iter().next())
 }
 
 async fn walk_dir(
@@ -187,6 +239,71 @@ mod tests {
 
     fn cleanup(path: &PathBuf) {
         let _ = fs::remove_dir_all(path);
+    }
+
+    #[test]
+    fn test_infer_glob_max_depth() {
+        assert_eq!(infer_glob_max_depth("./*.rs"), 0);
+        assert_eq!(infer_glob_max_depth("/tmp/data/*.csv"), 0);
+        assert_eq!(infer_glob_max_depth("*.csv"), 0);
+        assert_eq!(infer_glob_max_depth("./src/*/*.rs"), 1);
+        assert_eq!(infer_glob_max_depth("/a/b/*/*/*"), 2);
+        assert_eq!(infer_glob_max_depth("./**/*.rs"), 20);
+        assert_eq!(infer_glob_max_depth("/tmp/**/*.jsonl"), 20);
+    }
+
+    #[tokio::test]
+    async fn test_find_first_match() {
+        let dir = unique_base("find-first");
+        fs::write(dir.join("a.csv"), b"h\n1").expect("write a.csv");
+        fs::write(dir.join("b.csv"), b"h\n2").expect("write b.csv");
+        fs::write(dir.join("c.txt"), b"text").expect("write c.txt");
+
+        let backend = LocalFsBackend::new();
+        let pattern = format!("{}/*.csv", dir.display());
+        let first = find_first_match(&backend, &pattern, None)
+            .await
+            .expect("find_first_match should succeed");
+        assert!(first.is_some());
+        assert!(first.unwrap().ends_with(".csv"));
+
+        let pattern2 = format!("{}/*.nonexistent", dir.display());
+        let none = find_first_match(&backend, &pattern2, None)
+            .await
+            .expect("find_first_match should succeed for no matches");
+        assert!(none.is_none());
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_depth_limits_recursion() {
+        let dir = unique_base("depth-limit");
+        fs::write(dir.join("top.csv"), b"h\n1").expect("write top.csv");
+        let sub = dir.join("sub");
+        fs::create_dir_all(&sub).expect("create subdir");
+        fs::write(sub.join("nested.csv"), b"h\n2").expect("write nested.csv");
+
+        let backend = LocalFsBackend::new();
+
+        let shallow = format!("{}/*.csv", dir.display());
+        let files = expand_glob(&backend, &shallow, 100, None)
+            .await
+            .expect("shallow glob");
+        assert_eq!(
+            files.len(),
+            1,
+            "shallow glob should not recurse into subdirs"
+        );
+        assert!(files[0].ends_with("top.csv"));
+
+        let deep = format!("{}/**/*.csv", dir.display());
+        let files = expand_glob(&backend, &deep, 100, None)
+            .await
+            .expect("deep glob");
+        assert_eq!(files.len(), 2, "deep glob should find files in subdirs");
+
+        cleanup(&dir);
     }
 
     #[test]

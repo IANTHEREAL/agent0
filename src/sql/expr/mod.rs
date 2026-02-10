@@ -1337,12 +1337,10 @@ fn cast_to_numeric(val: Value, info: &sqlparser::ast::ExactNumberInfo) -> Result
         Value::Numeric(d) => d,
         Value::Int32(i) => Decimal::from(i),
         Value::Int64(i) => Decimal::from(i),
-        Value::Float64(f) => {
-            Decimal::try_from(f).map_err(|_| SqlError::InvalidInputSyntax {
-                type_name: "numeric".into(),
-                value: f.to_string(),
-            })?
-        }
+        Value::Float64(f) => Decimal::try_from(f).map_err(|_| SqlError::InvalidInputSyntax {
+            type_name: "numeric".into(),
+            value: f.to_string(),
+        })?,
         Value::Text(s) => {
             Decimal::from_str(s.trim()).map_err(|_| SqlError::InvalidInputSyntax {
                 type_name: "numeric".into(),

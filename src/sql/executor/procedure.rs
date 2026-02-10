@@ -498,13 +498,14 @@ mod tests {
     #[test]
     fn substitute_parameters_preserves_quoted_identifiers() {
         let mut param_map = HashMap::new();
-        param_map.insert("name".to_string(), ("'test'".to_string(), "text".to_string()));
+        param_map.insert(
+            "name".to_string(),
+            ("'test'".to_string(), "text".to_string()),
+        );
 
-        let result = substitute_parameters_in_statement(
-            r#"SELECT "name", name FROM users"#,
-            &param_map,
-        )
-        .unwrap();
+        let result =
+            substitute_parameters_in_statement(r#"SELECT "name", name FROM users"#, &param_map)
+                .unwrap();
 
         // Should not replace quoted identifier "name" but should replace unquoted name
         assert!(result.contains(r#""name""#));
@@ -555,7 +556,8 @@ mod tests {
     #[test]
     fn substitute_parameters_handles_escaped_string_literals_with_backslashes() {
         let param_map = HashMap::new();
-        let result = substitute_parameters_in_statement(r"SELECT E'\\n' FROM t", &param_map).unwrap();
+        let result =
+            substitute_parameters_in_statement(r"SELECT E'\\n' FROM t", &param_map).unwrap();
         assert!(result.contains(r"E'\\n'"));
     }
 
