@@ -814,6 +814,27 @@ pub async fn list_customer_tenants(
     Ok(rows.iter().map(row_to_tenant).collect())
 }
 
+pub async fn get_tenant_for_customer(
+    pool: &AnyPool,
+    tenant_id: &str,
+    customer_id: &str,
+) -> Result<Option<TenantRow>, sqlx::Error> {
+    let sql = adapt_sql(
+        &format!(
+            "SELECT * FROM tenants WHERE id = $1 AND customer_id = $2 AND state NOT IN ('{}', '{}')",
+            tenant_state::DISABLED,
+            tenant_state::CREATE_FAILED
+        ),
+        pool,
+    );
+    let row = sqlx::query(&sql)
+        .bind(tenant_id)
+        .bind(customer_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_tenant))
+}
+
 pub async fn set_tenant_customer_id(
     pool: &AnyPool,
     tenant_id: &str,

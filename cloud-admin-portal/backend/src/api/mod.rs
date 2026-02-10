@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod customer;
 pub mod system;
 pub mod tenants;
 pub mod users;
@@ -53,4 +54,5 @@ pub fn router() -> Router<AppState> {
         .route("/info", get(system::api_info))
         // Audit
         .route("/audit-logs", get(audit::query_audit_logs))
+        .nest("/customer", customer::router())
 }
