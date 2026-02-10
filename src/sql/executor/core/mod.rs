@@ -27,10 +27,12 @@ use observability::{
     is_observability_system_query, is_observability_tableless_query, OBSERVABILITY_USER,
 };
 use retry::is_retryable_tikv_error;
+#[cfg(test)]
 use settings_tableless::{
     cast_current_setting_value, is_current_setting_function, is_set_config_function,
-    try_execute_current_setting_select, try_execute_set_config_select, unwrap_top_level_cast,
+    unwrap_top_level_cast,
 };
+use settings_tableless::{try_execute_current_setting_select, try_execute_set_config_select};
 use timeout::StatementTimeoutError;
 
 use super::super::alter_owner;

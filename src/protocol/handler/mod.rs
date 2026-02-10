@@ -25,7 +25,6 @@ mod copy;
 mod dynamic;
 mod encode;
 mod errors;
-mod legacy;
 mod params;
 mod portal;
 mod query_parser;
@@ -34,15 +33,11 @@ mod tenant;
 
 use encode::{datatype_to_pgtype, result_to_response};
 
-pub use query_parser::TipgQueryParser;
-pub use server_params::PgServerParameterProvider;
-#[allow(dead_code)]
-pub type HandlerFactory = legacy::HandlerFactory;
-#[allow(dead_code)]
-pub type PgHandler = legacy::PgHandler;
 pub use dynamic::DynamicHandlerFactory;
 #[allow(unused_imports)]
 pub use dynamic::DynamicPgHandler;
+pub use query_parser::TipgQueryParser;
+pub use server_params::PgServerParameterProvider;
 
 /// Custom metadata key for storing the extracted keyspace
 const METADATA_KEYSPACE: &str = "keyspace";

@@ -61,7 +61,6 @@ pub fn get_expr_name(expr: &Expr) -> String {
         Expr::Extract { .. } => "extract".to_string(),
         Expr::Subquery(_) => "subquery".to_string(),
         Expr::Nested(inner) => get_expr_name(inner),
-        Expr::ArrayAgg(_) => "array_agg".to_string(),
         _ => "?column?".to_string(),
     }
 }

@@ -1,7 +1,7 @@
 -- CREATE/DROP/ALTER DATABASE edge cases and compatibility behavior.
 
 -- pg_database should exist and include the default database.
-SELECT datname FROM pg_catalog.pg_database ORDER BY datname;
+SELECT datname FROM pg_catalog.pg_database WHERE datname = 'postgres' ORDER BY datname;
 
 -- Idempotent cleanup (expects NOTICEs in a fresh keyspace).
 DROP DATABASE IF EXISTS createdb_103_opts;

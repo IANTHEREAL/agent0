@@ -5,12 +5,17 @@
 
 use std::collections::HashSet;
 
+#[cfg(test)]
 use anyhow::Result;
-use sqlparser::ast::{Expr, Query};
+#[cfg(test)]
+use sqlparser::ast::Expr;
+use sqlparser::ast::Query;
 
 use super::expr::eval_expr;
 use super::value_key::serialize_values_for_key;
-use crate::types::{Row, TableSchema, Value};
+#[cfg(test)]
+use crate::types::TableSchema;
+use crate::types::{Row, Value};
 
 /// Deduplicate rows based on their serialized values
 pub fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
@@ -23,29 +28,6 @@ pub fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
         }
     }
     result
-}
-
-pub fn distinct_on_rows_with_indices(
-    rows: Vec<Row>,
-    on_exprs: &[Expr],
-    row_context: Option<&TableSchema>,
-) -> Result<(Vec<Row>, Vec<usize>)> {
-    let mut seen: HashSet<Vec<u8>> = HashSet::new();
-    let mut result = Vec::new();
-    let mut indices = Vec::new();
-
-    for (idx, row) in rows.into_iter().enumerate() {
-        let key_values: Vec<Value> = on_exprs
-            .iter()
-            .map(|expr| eval_expr(expr, Some(&row), row_context))
-            .collect::<Result<Vec<_>>>()?;
-        let key = serialize_values_for_key(&key_values)?;
-        if seen.insert(key) {
-            indices.push(idx);
-            result.push(row);
-        }
-    }
-    Ok((result, indices))
 }
 
 #[cfg(test)]
@@ -154,79 +136,6 @@ mod tests {
         ];
         let result = dedup_rows(rows);
         assert_eq!(result.len(), 4);
-    }
-
-    #[test]
-    fn test_distinct_on_rows_with_indices() {
-        let schema = TableSchema::new(
-            "t".to_string(),
-            1,
-            vec![
-                ColumnDef {
-                    name: "a".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                },
-                ColumnDef {
-                    name: "b".to_string(),
-                    data_type: DataType::Text,
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                },
-            ],
-            vec![],
-        );
-        let rows = vec![
-            Row::new(vec![Value::Int32(1), Value::Text("x".to_string())]),
-            Row::new(vec![Value::Int32(1), Value::Text("y".to_string())]),
-            Row::new(vec![Value::Int32(2), Value::Text("z".to_string())]),
-        ];
-
-        let on_exprs = vec![sqlparser::ast::Expr::Identifier(
-            sqlparser::ast::Ident::new("a"),
-        )];
-        let (result, indices) =
-            distinct_on_rows_with_indices(rows, &on_exprs, Some(&schema)).unwrap();
-        assert_eq!(indices, vec![0, 2]);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0].values[1], Value::Text("x".to_string()));
-        assert_eq!(result[1].values[1], Value::Text("z".to_string()));
-    }
-
-    #[test]
-    fn test_distinct_on_rows_with_indices_propagates_eval_error() {
-        let schema = TableSchema::new(
-            "t".to_string(),
-            1,
-            vec![ColumnDef {
-                name: "a".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-            }],
-            vec![],
-        );
-
-        let rows = vec![
-            Row::new(vec![Value::Int32(1)]),
-            Row::new(vec![Value::Int32(2)]),
-        ];
-        let on_exprs = vec![sqlparser::ast::Expr::Identifier(
-            sqlparser::ast::Ident::new("missing_col"),
-        )];
-
-        let result = distinct_on_rows_with_indices(rows, &on_exprs, Some(&schema));
-        assert!(result.is_err());
     }
 
     #[test]

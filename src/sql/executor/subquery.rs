@@ -1,6 +1,5 @@
 //! Subquery resolution for the SQL executor
 
-use super::super::expr::{coerce_text_literal_to_bool, eval_binary_op_public};
 use super::super::names::normalize_ident;
 use super::super::value_coercion::value_to_sql_expr;
 use super::super::ExecuteResult;
@@ -8,13 +7,12 @@ use super::core::Executor;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    BinaryOperator, Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr,
-    Value as SqlValue,
+    Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, Value as SqlValue,
 };
 use std::collections::HashMap;
 use tikv_client::Transaction;
 
-fn expr_contains_subquery(expr: &Expr) -> bool {
+pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
     use core::ops::ControlFlow;
     use sqlparser::ast::visit_expressions;
 
@@ -43,6 +41,7 @@ impl Executor {
         search_path: &'a [String],
         expr: &'a Expr,
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+        from_aliases: &'a [String],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Expr>> + Send + 'a>> {
         Box::pin(async move {
             if !expr_contains_subquery(expr) {
@@ -54,6 +53,14 @@ impl Executor {
                     subquery,
                     negated,
                 } => {
+                    // If the subquery references any FROM-clause alias, it's correlated.
+                    // Leave it unresolved for per-row evaluation.
+                    if from_aliases
+                        .iter()
+                        .any(|alias| query_has_outer_reference(subquery, alias))
+                    {
+                        return Ok(expr.clone());
+                    }
                     let result = self
                         .execute_query_with_outer_ctes(
                             txn,
@@ -80,6 +87,7 @@ impl Executor {
                             search_path,
                             inner_expr,
                             ctes,
+                            from_aliases,
                         )
                         .await?,
                     );
@@ -98,6 +106,7 @@ impl Executor {
                             search_path,
                             left,
                             ctes,
+                            from_aliases,
                         )
                         .await?,
                     );
@@ -109,6 +118,7 @@ impl Executor {
                             search_path,
                             right,
                             ctes,
+                            from_aliases,
                         )
                         .await?,
                     );
@@ -127,6 +137,7 @@ impl Executor {
                             search_path,
                             inner,
                             ctes,
+                            from_aliases,
                         )
                         .await?,
                     );
@@ -144,6 +155,7 @@ impl Executor {
                             search_path,
                             inner,
                             ctes,
+                            from_aliases,
                         )
                         .await?,
                     );
@@ -162,6 +174,7 @@ impl Executor {
                             search_path,
                             inner,
                             ctes,
+                            from_aliases,
                         )
                         .await?,
                     );
@@ -172,6 +185,12 @@ impl Executor {
                     })
                 }
                 Expr::Subquery(subquery) => {
+                    if from_aliases
+                        .iter()
+                        .any(|alias| query_has_outer_reference(subquery, alias))
+                    {
+                        return Ok(expr.clone());
+                    }
                     let result = self
                         .execute_query_with_outer_ctes(
                             txn,
@@ -197,6 +216,12 @@ impl Executor {
                     }
                 }
                 Expr::Exists { subquery, negated } => {
+                    if from_aliases
+                        .iter()
+                        .any(|alias| query_has_outer_reference(subquery, alias))
+                    {
+                        return Ok(expr.clone());
+                    }
                     let result = self
                         .execute_query_with_outer_ctes(
                             txn,
@@ -229,6 +254,7 @@ impl Executor {
                                 search_path,
                                 op,
                                 ctes,
+                                from_aliases,
                             )
                             .await?,
                         ))
@@ -245,6 +271,7 @@ impl Executor {
                                 search_path,
                                 cond,
                                 ctes,
+                                from_aliases,
                             )
                             .await?,
                         );
@@ -259,6 +286,7 @@ impl Executor {
                                 search_path,
                                 res,
                                 ctes,
+                                from_aliases,
                             )
                             .await?,
                         );
@@ -272,6 +300,7 @@ impl Executor {
                                 search_path,
                                 else_expr,
                                 ctes,
+                                from_aliases,
                             )
                             .await?,
                         ))
@@ -300,6 +329,7 @@ impl Executor {
                                         search_path,
                                         e,
                                         ctes,
+                                        from_aliases,
                                     )
                                     .await?,
                                 ),
@@ -337,12 +367,20 @@ impl Executor {
         for item in projection {
             let resolved_item = match item {
                 SelectItem::UnnamedExpr(e) => SelectItem::UnnamedExpr(
-                    self.resolve_subqueries(txn, db_id, sequence_values, search_path, e, ctes)
+                    self.resolve_subqueries(txn, db_id, sequence_values, search_path, e, ctes, &[])
                         .await?,
                 ),
                 SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias {
                     expr: self
-                        .resolve_subqueries(txn, db_id, sequence_values, search_path, expr, ctes)
+                        .resolve_subqueries(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            expr,
+                            ctes,
+                            &[],
+                        )
                         .await?,
                     alias: alias.clone(),
                 },
@@ -378,6 +416,7 @@ impl Executor {
                                 search_path,
                                 e,
                                 ctes,
+                                &[],
                             )
                             .await?,
                         )
@@ -399,6 +438,7 @@ impl Executor {
                                     search_path,
                                     expr,
                                     ctes,
+                                    &[],
                                 )
                                 .await?,
                             alias: alias.clone(),
@@ -417,184 +457,6 @@ impl Executor {
             Expr::Subquery(q) => query_has_outer_reference(q, outer_alias),
             _ => false,
         }
-    }
-
-    pub(crate) fn expr_has_correlated_exists(&self, expr: &Expr, outer_alias: &str) -> bool {
-        match expr {
-            Expr::Exists { subquery, .. } => query_has_outer_reference(subquery, outer_alias),
-            Expr::BinaryOp { left, right, .. } => {
-                self.expr_has_correlated_exists(left, outer_alias)
-                    || self.expr_has_correlated_exists(right, outer_alias)
-            }
-            Expr::UnaryOp { expr: inner, .. } => {
-                self.expr_has_correlated_exists(inner, outer_alias)
-            }
-            Expr::Nested(inner) => self.expr_has_correlated_exists(inner, outer_alias),
-            _ => false,
-        }
-    }
-
-    pub(crate) fn eval_correlated_exists<'a>(
-        &'a self,
-        txn: &'a mut Transaction,
-        db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
-        search_path: &'a [String],
-        subquery: &'a Query,
-        negated: bool,
-        outer_alias: &'a str,
-        outer_schema: &'a TableSchema,
-        outer_row: &'a Row,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
-        Box::pin(async move {
-            let substituted_query =
-                substitute_outer_values_in_query(subquery, outer_alias, outer_schema, outer_row);
-            let result = self
-                .execute_query(txn, db_id, sequence_values, search_path, &substituted_query)
-                .await?;
-            let exists = match result {
-                ExecuteResult::Select { rows, .. } => !rows.is_empty(),
-                _ => false,
-            };
-            let result_bool = if negated { !exists } else { exists };
-            Ok(Value::Boolean(result_bool))
-        })
-    }
-
-    pub(crate) fn eval_selection_with_correlated_exists<'a>(
-        &'a self,
-        txn: &'a mut Transaction,
-        db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
-        expr: &'a Expr,
-        search_path: &'a [String],
-        outer_alias: &'a str,
-        outer_schema: &'a TableSchema,
-        outer_row: &'a Row,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
-        Box::pin(async move {
-            match expr {
-                Expr::Exists { subquery, negated } => {
-                    if query_has_outer_reference(subquery, outer_alias) {
-                        self.eval_correlated_exists(
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            subquery,
-                            *negated,
-                            outer_alias,
-                            outer_schema,
-                            outer_row,
-                        )
-                        .await
-                    } else {
-                        let result = self
-                            .execute_query(txn, db_id, sequence_values, search_path, subquery)
-                            .await?;
-                        let exists = match result {
-                            ExecuteResult::Select { rows, .. } => !rows.is_empty(),
-                            _ => false,
-                        };
-                        let result_bool = if *negated { !exists } else { exists };
-                        Ok(Value::Boolean(result_bool))
-                    }
-                }
-                Expr::BinaryOp { left, op, right } => {
-                    let left_val = self
-                        .eval_selection_with_correlated_exists(
-                            txn,
-                            db_id,
-                            sequence_values,
-                            left,
-                            search_path,
-                            outer_alias,
-                            outer_schema,
-                            outer_row,
-                        )
-                        .await?;
-                    let right_val = self
-                        .eval_selection_with_correlated_exists(
-                            txn,
-                            db_id,
-                            sequence_values,
-                            right,
-                            search_path,
-                            outer_alias,
-                            outer_schema,
-                            outer_row,
-                        )
-                        .await?;
-                    match op {
-                        BinaryOperator::And | BinaryOperator::Or => {
-                            let left_val = coerce_text_literal_to_bool(left, left_val)?;
-                            let right_val = coerce_text_literal_to_bool(right, right_val)?;
-                            eval_binary_op_public(left_val, op, right_val)
-                        }
-                        _ => {
-                            self.eval_expr_maybe_sequence(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                expr,
-                                Some(outer_row),
-                                Some(outer_schema),
-                            )
-                            .await
-                        }
-                    }
-                }
-                Expr::UnaryOp {
-                    op: sqlparser::ast::UnaryOperator::Not,
-                    expr: inner,
-                } => {
-                    let inner_val = self
-                        .eval_selection_with_correlated_exists(
-                            txn,
-                            db_id,
-                            sequence_values,
-                            inner,
-                            search_path,
-                            outer_alias,
-                            outer_schema,
-                            outer_row,
-                        )
-                        .await?;
-                    let inner_val = coerce_text_literal_to_bool(inner, inner_val)?;
-                    match inner_val {
-                        Value::Boolean(b) => Ok(Value::Boolean(!b)),
-                        Value::Null => Ok(Value::Null),
-                        other => Err(anyhow!("NOT requires boolean, got {:?}", other)),
-                    }
-                }
-                Expr::Nested(inner) => {
-                    self.eval_selection_with_correlated_exists(
-                        txn,
-                        db_id,
-                        sequence_values,
-                        inner,
-                        search_path,
-                        outer_alias,
-                        outer_schema,
-                        outer_row,
-                    )
-                    .await
-                }
-                _ => {
-                    self.eval_expr_maybe_sequence(
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        expr,
-                        Some(outer_row),
-                        Some(outer_schema),
-                    )
-                    .await
-                }
-            }
-        })
     }
 
     pub(crate) fn eval_correlated_subquery<'a>(

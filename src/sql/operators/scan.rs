@@ -138,7 +138,6 @@ pub struct IndexScanOperator {
 }
 
 impl IndexScanOperator {
-    #[allow(dead_code)] // Operator framework
     pub fn new(
         schema: TableSchema,
         index_id: u64,

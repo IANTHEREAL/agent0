@@ -45,7 +45,6 @@ mod triggers;
 pub mod types;
 mod udt;
 pub(crate) mod wildcard;
-mod window;
 
 pub use executor::*;
 pub use parser::*;

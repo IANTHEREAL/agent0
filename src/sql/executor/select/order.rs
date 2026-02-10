@@ -23,40 +23,6 @@ pub(super) fn expand_projection_exprs_for_positional_order_by(
     exprs
 }
 
-pub(super) fn resolve_order_by_exprs_for_non_agg(
-    order_by: &[sqlparser::ast::OrderByExpr],
-    resolved_projection: &[SelectItem],
-    schema: &TableSchema,
-) -> Result<Vec<Expr>> {
-    let output_exprs = expand_projection_exprs_for_positional_order_by(resolved_projection, schema);
-
-    order_by
-        .iter()
-        .map(|order_expr| {
-            if let Expr::Identifier(ref ident) = order_expr.expr {
-                for item in resolved_projection {
-                    if let SelectItem::ExprWithAlias { expr, alias } = item {
-                        if alias.value.eq_ignore_ascii_case(&ident.value) {
-                            return Ok(expr.clone());
-                        }
-                    }
-                }
-            }
-
-            if let Expr::Value(SqlValue::Number(n, _)) = &order_expr.expr {
-                if let Ok(pos) = n.parse::<usize>() {
-                    if pos == 0 || pos > output_exprs.len() {
-                        return Err(anyhow!("ORDER BY position {} is not in select list", pos));
-                    }
-                    return Ok(output_exprs[pos - 1].clone());
-                }
-            }
-
-            Ok(order_expr.expr.clone())
-        })
-        .collect()
-}
-
 pub(super) fn resolve_group_by_exprs(
     group_by: &[Expr],
     resolved_projection: &[SelectItem],
@@ -138,7 +104,7 @@ pub(super) fn extract_grouping_sets(exprs: &[Expr]) -> Option<Vec<Vec<Expr>>> {
     None
 }
 
-pub(super) fn expr_matches(pattern: &Expr, target: &Expr) -> bool {
+pub(crate) fn expr_matches(pattern: &Expr, target: &Expr) -> bool {
     match (pattern, target) {
         (Expr::Identifier(a), Expr::Identifier(b)) => a.value.eq_ignore_ascii_case(&b.value),
         (Expr::CompoundIdentifier(a), Expr::CompoundIdentifier(b)) => {

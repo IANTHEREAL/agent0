@@ -29,6 +29,13 @@ impl TikvStore {
         txn.lock_keys(keys).await.map_err(|e| anyhow!(e))
     }
 
+    /// Lock rows with SKIP LOCKED semantics.  Returns the indices (into `rows`)
+    /// that were successfully locked in `txn`.
+    ///
+    /// Uses a NOWAIT pessimistic lock per row (`wait_timeout = -1` on the TiKV
+    /// PessimisticLockRequest).  When TiKV encounters a key already held by
+    /// another transaction it returns an error immediately instead of blocking,
+    /// so we can skip that row and move on.
     pub async fn lock_rows_skip_locked(
         &self,
         txn: &mut Transaction,
@@ -37,22 +44,6 @@ impl TikvStore {
         rows: &[Row],
         max_locks: Option<usize>,
     ) -> Result<Vec<usize>> {
-        fn is_key_locked_error(err: &tikv_client::Error) -> bool {
-            match err {
-                tikv_client::Error::PessimisticLockError { inner, .. } => {
-                    is_key_locked_error(inner.as_ref())
-                }
-                tikv_client::Error::ExtractedErrors(errors)
-                | tikv_client::Error::MultipleKeyErrors(errors) => {
-                    errors.iter().any(is_key_locked_error)
-                }
-                tikv_client::Error::KeyError(key_error) => {
-                    key_error.locked.is_some() || key_error.conflict.is_some()
-                }
-                _ => false,
-            }
-        }
-
         if rows.is_empty() {
             return Ok(Vec::new());
         }
@@ -69,29 +60,62 @@ impl TikvStore {
         }
 
         let max_locks = max_locks.unwrap_or(usize::MAX);
-        let mut locked_indices = Vec::new();
 
-        for (idx, row) in rows.iter().enumerate() {
-            if locked_indices.len() >= max_locks {
+        // Build keys for all candidate rows.
+        let keys: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|row| {
+                let pk_values = schema.get_pk_values(row);
+                let row_key = encode_pk_values(&pk_values);
+                self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key))
+            })
+            .collect();
+
+        // Use a NOWAIT transaction to attempt locking one key at a time.
+        // `pessimistic_lock_wait_timeout = Some(-1)` sets `wait_timeout = -1`
+        // on the PessimisticLockRequest, which tells TiKV to return an error
+        // immediately if the key is locked instead of blocking.
+        let nowait_options = TransactionOptions::new_pessimistic()
+            .drop_check(CheckLevel::Warn)
+            .no_resolve_locks();
+        let mut nowait_options = nowait_options;
+        nowait_options.pessimistic_lock_wait_timeout = Some(-1);
+
+        let mut nowait_txn = self
+            .client()
+            .begin_with_options(nowait_options)
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+        let mut available_indices = Vec::new();
+        for (idx, key) in keys.iter().enumerate() {
+            if available_indices.len() >= max_locks {
                 break;
             }
-
-            let pk_values = schema.get_pk_values(row);
-            let row_key = encode_pk_values(&pk_values);
-            let key = self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key));
-
-            match txn.lock_keys(vec![key]).await {
-                Ok(()) => locked_indices.push(idx),
-                Err(err) => {
-                    if is_key_locked_error(&err) {
-                        continue;
-                    }
-                    return Err(anyhow!(err));
-                }
+            match nowait_txn.lock_keys(vec![key.clone()]).await {
+                Ok(()) => available_indices.push(idx),
+                Err(_) => continue, // Key is locked by another txn — skip
             }
         }
 
-        Ok(locked_indices)
+        // Rollback the NOWAIT transaction — it was only used to discover which
+        // keys are available.
+        let _ = nowait_txn.rollback().await;
+
+        if available_indices.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Now acquire the real locks in the caller's transaction.
+        let available_keys: Vec<Vec<u8>> = available_indices
+            .iter()
+            .map(|&idx| keys[idx].clone())
+            .collect();
+        txn.lock_keys(available_keys)
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+        Ok(available_indices)
     }
 
     /// Check if a table exists (using txn)
@@ -142,141 +166,6 @@ impl TikvStore {
         }
     }
 
-    pub async fn get_table_privileges(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        table_full_name: &str,
-    ) -> Result<Vec<TablePrivilegeGrant>> {
-        let key = self.key(&encode_table_privileges_key_v2(db_id, table_full_name));
-        match txn.get(key).await? {
-            Some(data) => Ok(bincode::deserialize(&data)?),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    pub async fn grant_table_privilege(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        table_full_name: &str,
-        grant: TablePrivilegeGrant,
-    ) -> Result<()> {
-        let key = self.key(&encode_table_privileges_key_v2(db_id, table_full_name));
-        let mut grants: Vec<TablePrivilegeGrant> = match txn.get(key.clone()).await? {
-            Some(data) => bincode::deserialize(&data)?,
-            None => Vec::new(),
-        };
-        grants
-            .retain(|g| !(g.grantee == grant.grantee && g.privilege_type == grant.privilege_type));
-        grants.push(grant);
-        let data = bincode::serialize(&grants)?;
-        txn_put(txn, key, data).await?;
-        Ok(())
-    }
-
-    pub async fn revoke_table_privilege(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        table_full_name: &str,
-        grantee: &str,
-        privilege_type: &str,
-    ) -> Result<()> {
-        let key = self.key(&encode_table_privileges_key_v2(db_id, table_full_name));
-        let Some(data) = txn.get(key.clone()).await? else {
-            return Ok(());
-        };
-        let mut grants: Vec<TablePrivilegeGrant> = bincode::deserialize(&data)?;
-        grants.retain(|g| !(g.grantee == grantee && g.privilege_type == privilege_type));
-        if grants.is_empty() {
-            txn_delete(txn, key).await?;
-        } else {
-            txn_put(txn, key, bincode::serialize(&grants)?).await?;
-        }
-        Ok(())
-    }
-
-    pub async fn get_default_table_privileges(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        owner: &str,
-        schema: Option<&str>,
-    ) -> Result<Vec<DefaultTablePrivilegeGrant>> {
-        let key = self.key(&encode_default_table_privileges_key_v2(
-            db_id, owner, schema,
-        ));
-        match txn.get(key).await? {
-            Some(data) => Ok(bincode::deserialize(&data)?),
-            None => Ok(Vec::new()),
-        }
-    }
-
-    pub async fn grant_default_table_privilege(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        owner: &str,
-        schema: Option<&str>,
-        grant: DefaultTablePrivilegeGrant,
-    ) -> Result<()> {
-        let key = self.key(&encode_default_table_privileges_key_v2(
-            db_id, owner, schema,
-        ));
-        let mut grants: Vec<DefaultTablePrivilegeGrant> = match txn.get(key.clone()).await? {
-            Some(data) => bincode::deserialize(&data)?,
-            None => Vec::new(),
-        };
-        grants
-            .retain(|g| !(g.grantee == grant.grantee && g.privilege_type == grant.privilege_type));
-        grants.push(grant);
-        txn_put(txn, key, bincode::serialize(&grants)?).await?;
-        Ok(())
-    }
-
-    pub async fn revoke_default_table_privilege(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        owner: &str,
-        schema: Option<&str>,
-        grantee: &str,
-        privilege_type: &str,
-    ) -> Result<()> {
-        let key = self.key(&encode_default_table_privileges_key_v2(
-            db_id, owner, schema,
-        ));
-        let Some(data) = txn.get(key.clone()).await? else {
-            return Ok(());
-        };
-        let mut grants: Vec<DefaultTablePrivilegeGrant> = bincode::deserialize(&data)?;
-        grants.retain(|g| !(g.grantee == grantee && g.privilege_type == privilege_type));
-        if grants.is_empty() {
-            txn_delete(txn, key).await?;
-        } else {
-            txn_put(txn, key, bincode::serialize(&grants)?).await?;
-        }
-        Ok(())
-    }
-
-    pub async fn delete_default_table_privileges_for_owner(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        owner: &str,
-    ) -> Result<()> {
-        let prefix = encode_default_table_privileges_key_v2(db_id, owner, None);
-        let mut end = prefix.clone();
-        end.push(0xFF);
-        let range: BoundRange = (self.key(&prefix)..self.key(&end)).into();
-        let pairs = txn.scan(range, SCAN_LIMIT).await?;
-        for pair in pairs {
-            txn_delete(txn, pair.into_key().into()).await?;
-        }
-        Ok(())
-    }
-
     pub async fn drop_table(
         &self,
         txn: &mut Transaction,
@@ -325,13 +214,6 @@ impl TikvStore {
             .await?;
             self.delete_column_comments_for_table(txn, db_id, table_name)
                 .await?;
-
-            // Table privileges are stored under a dedicated key to support `information_schema.table_privileges`.
-            txn_delete(
-                txn,
-                self.key(&encode_table_privileges_key_v2(db_id, table_name)),
-            )
-            .await?;
 
             info!("Dropped table '{}'", table_name);
             self.invalidate_table_cache(db_id).await;
@@ -440,29 +322,6 @@ impl TikvStore {
         txn_put(txn, data_key, row_data).await?;
         debug!("Upserted row into '{}' (explicit PK)", table_name);
         Ok(())
-    }
-
-    /// Scan all rows from a table, returning both the row key and row value.
-    pub async fn scan_with_keys(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        table_name: &str,
-    ) -> Result<Vec<(Vec<u8>, Row)>> {
-        let schema = self
-            .get_schema(txn, db_id, table_name)
-            .await?
-            .ok_or_else(|| anyhow!("Table not found"))?;
-        let (raw_start, raw_end) = encode_table_data_range_v2(db_id, schema.table_id);
-        let range: BoundRange = (self.key(&raw_start)..self.key(&raw_end)).into();
-        let pairs: Vec<_> = txn.scan(range, SCAN_LIMIT).await?.collect();
-        let mut rows = Vec::with_capacity(pairs.len());
-        for pair in pairs {
-            let key: &[u8] = pair.key().as_ref().into();
-            let row = deserialize_row(pair.value())?;
-            rows.push((key.to_vec(), row));
-        }
-        Ok(rows)
     }
 
     /// Scan all rows from a table

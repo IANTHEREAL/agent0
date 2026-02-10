@@ -507,7 +507,7 @@ impl Executor {
 
         let resolved_selection = if let Some(sel) = &select.selection {
             Some(
-                self.resolve_subqueries(txn, db_id, sequence_values, search_path, sel, ctes)
+                self.resolve_subqueries(txn, db_id, sequence_values, search_path, sel, ctes, &[])
                     .await?,
             )
         } else {
@@ -924,6 +924,7 @@ impl Executor {
                                     search_path,
                                     expr,
                                     ctes,
+                                    &[],
                                 )
                                 .await;
                         }
@@ -1837,9 +1838,7 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlparser::ast::{
-        Ident, ObjectName, Select, SelectItem, SetExpr, TableFactor, TableWithJoins,
-    };
+    use sqlparser::ast::SetExpr;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 

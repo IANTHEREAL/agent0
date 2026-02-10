@@ -600,7 +600,6 @@ fn format_predicate(pred: &PredicateInfo) -> String {
         super::planner::PredicateOp::Le => "<=",
         super::planner::PredicateOp::Gt => ">",
         super::planner::PredicateOp::Ge => ">=",
-        super::planner::PredicateOp::Like => "~~",
         super::planner::PredicateOp::In => "IN",
         super::planner::PredicateOp::IsNull => "IS NULL",
         super::planner::PredicateOp::IsNotNull => "IS NOT NULL",

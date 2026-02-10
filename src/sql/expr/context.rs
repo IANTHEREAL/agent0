@@ -259,42 +259,6 @@ impl EvalContext for SingleTableContext<'_> {
     }
 }
 
-fn format_composite_row_value(schema: &TableSchema, row: &Row) -> String {
-    fn format_field_value(value: &Value) -> String {
-        match value {
-            Value::Null => String::new(),
-            Value::Text(s) => {
-                let needs_quotes =
-                    s.contains([',', '(', ')', '"', '\\']) || s.chars().any(|c| c.is_whitespace());
-                if !needs_quotes {
-                    return s.clone();
-                }
-                let mut escaped = String::with_capacity(s.len() + 2);
-                escaped.push('"');
-                for ch in s.chars() {
-                    match ch {
-                        '"' | '\\' => {
-                            escaped.push('\\');
-                            escaped.push(ch);
-                        }
-                        _ => escaped.push(ch),
-                    }
-                }
-                escaped.push('"');
-                escaped
-            }
-            other => other.to_string(),
-        }
-    }
-
-    let mut parts = Vec::with_capacity(schema.columns.len());
-    for idx in 0..schema.columns.len() {
-        let value = row.values.get(idx).unwrap_or(&Value::Null);
-        parts.push(format_field_value(value));
-    }
-    format!("({})", parts.join(","))
-}
-
 pub struct JoinEvalContext<'a> {
     pub column_offsets: &'a HashMap<String, usize>,
     pub merged_column_offsets: Option<&'a HashMap<String, Vec<usize>>>,

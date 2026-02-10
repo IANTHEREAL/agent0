@@ -260,6 +260,7 @@ pub enum ScanType {
         column_values: Vec<Vec<Value>>,
         estimated_rows: usize,
     },
+    #[allow(dead_code)] // Planned GIN index scan feature
     GinIndexScan {
         index_id: u64,
         index_name: String,
@@ -291,7 +292,6 @@ pub enum PredicateOp {
     Le,
     Gt,
     Ge,
-    Like,
     In,
     IsNull,
     IsNotNull,
@@ -494,6 +494,7 @@ fn extract_simple_predicate(left: &Expr, right: &Expr, op: PredicateOp) -> Optio
     None
 }
 
+#[cfg(test)]
 pub fn choose_best_access_path(
     schema: &TableSchema,
     predicates: &[PredicateInfo],

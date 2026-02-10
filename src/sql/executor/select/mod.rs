@@ -1,34 +1,32 @@
 //! SELECT query execution
 
-use super::super::aggregate::{collect_having_agg_funcs, eval_having_expr, AggExpr};
-use super::super::distinct::{apply_offset_limit_fetch, dedup_rows, distinct_on_rows_with_indices};
-use super::super::gin;
+use super::super::aggregate::{collect_having_agg_funcs, AggExpr};
+use super::super::distinct::{apply_offset_limit_fetch, dedup_rows};
 use super::super::names;
-use super::super::operators::WindowFunctionExpr;
 use super::super::operators::{
-    execute_operator_tree, BoxedOperator, FilterOperator, HashAggregateOperator, HashJoinConfig,
-    HashJoinOperator, HashJoinType, JoinType, LimitOperator, NestedLoopJoinOperator,
-    PhysicalPlanner, SortOperator, TableScanOperator, WindowOperator,
+    execute_operator_tree, execute_operator_tree_with_ctes, BoxedOperator, FilterOperator,
+    HashAggregateOperator, HashJoinConfig, HashJoinOperator, HashJoinType, JoinType, LimitOperator,
+    NestedLoopJoinOperator, PhysicalPlanner, SortOperator, TableScanOperator, WindowOperator,
 };
-use super::super::planner::{self, choose_join_algorithm, JoinAlgorithmChoice, ScanType};
-use super::super::projection::{fill_row_defaults, get_select_item_name, infer_expr_type};
+use super::super::planner::{choose_join_algorithm, JoinAlgorithmChoice};
+use super::super::projection::{get_select_item_name, infer_expr_type};
 use super::super::sequences;
-use super::super::value_key::{serialize_value_for_key, serialize_values_for_key};
 use super::super::wildcard::build_join_wildcard_plan;
-use super::super::window::{compute_window_functions, WindowFuncInfo};
 use super::super::{
     expr::{coerce_text_literal_to_bool, eval_expr, validate_bool_expr_in_boolean_context},
-    Aggregator, ExecuteResult,
+    ExecuteResult,
 };
 use super::core::Executor;
 use super::extensions::ExtensionTableFunctionResult;
 use super::operators::rewrite_expr_for_multi_join;
 use super::operators::{
     eval_having_expr_for_operators, extract_limit, extract_offset, is_aggregate_func,
-    projection_may_have_udf, rewrite_agg_refs_to_columns, use_operator_execution,
+    rewrite_agg_refs_to_columns,
 };
+use super::subquery::{expr_contains_subquery, substitute_outer_values};
 use crate::sql::error::SqlError;
 use crate::sql::information_schema::VirtualTableFilter;
+#[allow(unused_imports)] // Re-exported for join sub-modules via glob import
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
@@ -43,17 +41,13 @@ use tracing::debug;
 
 mod analysis;
 mod join;
-mod legacy;
-mod order;
+pub(crate) mod order;
 mod pushdown;
 
+use analysis::projection_has_non_window_aggregate;
 use analysis::projection_has_window_function;
-use analysis::{expr_has_subquery, projection_has_non_window_aggregate};
 use join::ensure_no_locking_clauses_for_join;
-use order::{
-    expand_projection_exprs_for_positional_order_by, expr_matches, extract_grouping_sets,
-    resolve_group_by_exprs, resolve_order_by_exprs_for_non_agg,
-};
+use order::{extract_grouping_sets, resolve_group_by_exprs};
 use pushdown::{
     generate_series_offset_limit_pushdown_eligible, normalize_query_offset_limit_fetch_expressions,
     plan_generate_series_offset_limit_pushdown,
@@ -177,7 +171,15 @@ impl Executor {
                 let mut row_values = Vec::with_capacity(expr_len);
                 for expr in expr_row {
                     let resolved = self
-                        .resolve_subqueries(txn, db_id, sequence_values, search_path, expr, ctes)
+                        .resolve_subqueries(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            expr,
+                            ctes,
+                            &[],
+                        )
                         .await?;
                     let value = sequences::eval_expr_with_sequences(
                         &store,
@@ -265,9 +267,7 @@ impl Executor {
             ));
         }
 
-        let mut generate_series_offset_limit_pushed_down = false;
         let mut streaming_scan_operator: Option<BoxedOperator> = None;
-        let mut query_with_evaluated_offset_limit_fetch: Option<Query> = None;
         let (t, outer_alias, schema, all_rows_base, is_virtual, rows_loaded) = match &select.from[0]
             .relation
         {
@@ -286,9 +286,7 @@ impl Executor {
                             .unwrap_or_else(|| obj_name.clone());
                         let query_for_pushdown =
                             if generate_series_offset_limit_pushdown_eligible(query, select) {
-                                query_with_evaluated_offset_limit_fetch =
-                                    Some(normalize_query_offset_limit_fetch_expressions(query));
-                                query_with_evaluated_offset_limit_fetch.as_ref().unwrap()
+                                &normalize_query_offset_limit_fetch_expressions(query)
                             } else {
                                 query
                             };
@@ -296,8 +294,6 @@ impl Executor {
                             plan_generate_series_offset_limit_pushdown(query_for_pushdown, select);
                         let offset = pushdown.offset;
                         let limit = pushdown.limit;
-                        generate_series_offset_limit_pushed_down =
-                            pushdown.clear_query_offset_limit_fetch;
 
                         let (schema, rows) = self
                             .execute_generate_series(func_args, &als, alias.as_ref(), offset, limit)
@@ -488,37 +484,40 @@ impl Executor {
         }
 
         let is_from_cte = ctes.contains_key(&t.to_lowercase());
-        let (is_virtual, rows_loaded) = if is_from_cte && use_operator_execution() {
+        let (is_virtual, rows_loaded) = if is_from_cte {
             (false, false)
         } else {
             (is_virtual, rows_loaded)
         };
 
-        let has_correlated_exists = select
-            .selection
-            .as_ref()
-            .map(|sel| self.expr_has_correlated_exists(sel, &outer_alias))
-            .unwrap_or(false);
-
+        let from_aliases = vec![outer_alias.clone()];
         let resolved_selection = if let Some(sel) = &select.selection {
-            if has_correlated_exists {
-                Some(sel.clone())
-            } else {
-                Some(
-                    self.resolve_subqueries(txn, db_id, sequence_values, search_path, sel, ctes)
-                        .await?,
+            Some(
+                self.resolve_subqueries(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    sel,
+                    ctes,
+                    &from_aliases,
                 )
-            }
+                .await?,
+            )
         } else {
             None
         };
 
         if let Some(sel) = resolved_selection.as_ref() {
-            validate_bool_expr_in_boolean_context(
-                sel,
-                &schema,
-                "Filter predicate must evaluate to boolean",
-            )?;
+            // Skip validation if the selection still contains correlated subqueries
+            // (they'll be resolved per-row later).
+            if !expr_contains_subquery(sel) {
+                validate_bool_expr_in_boolean_context(
+                    sel,
+                    &schema,
+                    "Filter predicate must evaluate to boolean",
+                )?;
+            }
         }
 
         let resolved_projection = self
@@ -533,67 +532,204 @@ impl Executor {
             )
             .await?;
 
+        // Preloaded rows: virtual tables, materialized views, CTEs, derived tables,
+        // generate_series results already have all rows in memory.
+        // Also check for streaming scan operators from extension table functions.
+        let preloaded_rows: Option<Vec<Row>> = if streaming_scan_operator.is_some() {
+            // Streaming scan operator will be used directly; no preloaded rows.
+            None
+        } else if is_virtual || rows_loaded {
+            Some(all_rows_base)
+        } else {
+            None
+        };
+
+        // If the resolved selection contains correlated subqueries or UDF/sequence
+        // calls, the sync FilterOperator can't handle them.  Split into
+        // operator-safe (pushdown) and async (per-row) parts.
+        let needs_async_filter = resolved_selection.as_ref().is_some_and(|sel| {
+            expr_contains_subquery(sel) || sequences::expr_needs_async_eval(sel)
+        });
+        let (resolved_selection, mut preloaded_rows) = if needs_async_filter {
+            let sel = resolved_selection.unwrap();
+            let (safe_parts, async_parts) = split_async_conjuncts(&sel);
+
+            // Load all rows using only the operator-safe filter.
+            let base_rows = if let Some(rows) = preloaded_rows {
+                // Already have rows; apply the safe filter manually.
+                if let Some(ref safe) = safe_parts {
+                    let mut filtered = Vec::new();
+                    for row in rows {
+                        let val = eval_expr(safe, Some(&row), Some(&schema))?;
+                        let val = coerce_text_literal_to_bool(safe, val)?;
+                        if matches!(val, Value::Boolean(true)) {
+                            filtered.push(row);
+                        }
+                    }
+                    filtered
+                } else {
+                    rows
+                }
+            } else {
+                let mut scan_op: BoxedOperator = if let Some(op) = streaming_scan_operator.take() {
+                    op
+                } else {
+                    Box::new(TableScanOperator::new(schema.clone()))
+                };
+                if let Some(ref safe) = safe_parts {
+                    scan_op = Box::new(FilterOperator::new(scan_op, safe.clone()));
+                }
+                if ctes.is_empty() {
+                    execute_operator_tree(
+                        &mut scan_op,
+                        txn,
+                        self.store(),
+                        db_id,
+                        search_path,
+                        sequence_values,
+                    )
+                    .await?
+                } else {
+                    execute_operator_tree_with_ctes(
+                        &mut scan_op,
+                        txn,
+                        self.store(),
+                        db_id,
+                        search_path,
+                        sequence_values,
+                        ctes,
+                    )
+                    .await?
+                }
+            };
+
+            // Apply async filter per-row (handles correlated subqueries, UDFs, sequences).
+            let filtered_rows = if let Some(ref async_filter) = async_parts {
+                let has_subqueries = expr_contains_subquery(async_filter);
+                let mut out = Vec::new();
+                for row in base_rows {
+                    let eval_expr_input = if has_subqueries {
+                        // Substitute outer values and resolve any remaining subqueries.
+                        let substituted =
+                            substitute_outer_values(async_filter, &outer_alias, &schema, &row);
+                        self.resolve_subqueries(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            &substituted,
+                            ctes,
+                            &[],
+                        )
+                        .await?
+                    } else {
+                        async_filter.clone()
+                    };
+                    let val = self
+                        .eval_expr_maybe_sequence(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            &eval_expr_input,
+                            Some(&row),
+                            Some(&schema),
+                        )
+                        .await?;
+                    let val = coerce_text_literal_to_bool(&eval_expr_input, val)?;
+                    if matches!(val, Value::Boolean(true)) {
+                        out.push(row);
+                    }
+                }
+                out
+            } else {
+                base_rows
+            };
+
+            // Pass filtered rows as preloaded; no further WHERE filtering needed.
+            (None, Some(filtered_rows))
+        } else {
+            (resolved_selection, preloaded_rows)
+        };
+
+        // FOR UPDATE / FOR SHARE: lock matching rows.
         let has_for_update = query
             .locks
             .iter()
             .any(|l| matches!(l.lock_type, LockType::Update));
+        let has_for_share = query
+            .locks
+            .iter()
+            .any(|l| matches!(l.lock_type, LockType::Share));
+        let has_skip_locked = query
+            .locks
+            .iter()
+            .any(|l| matches!(l.nonblock, Some(NonBlock::SkipLocked)));
+        let has_nowait = query
+            .locks
+            .iter()
+            .any(|l| matches!(l.nonblock, Some(NonBlock::Nowait)));
 
-        // Detect grouping sets (CUBE/ROLLUP/GROUPING SETS) early — not yet supported by operators.
-        let group_by_exprs_for_grouping_sets_check = match &select.group_by {
-            GroupByExpr::Expressions(exprs) => exprs.as_slice(),
-            GroupByExpr::All => &[][..],
-        };
-        let has_grouping_sets =
-            extract_grouping_sets(group_by_exprs_for_grouping_sets_check).is_some();
+        if (has_for_update || has_for_share) && schema.pk_indices.is_empty() {
+            return Err(anyhow!("FOR UPDATE/SHARE requires primary key"));
+        }
 
-        let has_udf = projection_may_have_udf(&resolved_projection)
-            || resolved_selection
-                .as_ref()
-                .map_or(false, |sel| super::operators::expr_may_have_udf_pub(sel));
+        if has_for_update || has_for_share {
+            let planner = PhysicalPlanner::new(self.store(), search_path.to_vec());
+            let estimated_rows = 1000;
 
-        let has_scalar_subquery = resolved_projection.iter().any(|item| match item {
-            SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                expr_has_subquery(e)
-            }
-            _ => false,
-        }) || resolved_selection
-            .as_ref()
-            .map_or(false, |sel| expr_has_subquery(sel));
-
-        if use_operator_execution()
-            && !has_correlated_exists
-            && !has_scalar_subquery
-            && !has_udf
-            && query.locks.is_empty()
-            && !(has_for_update && schema.pk_indices.is_empty())
-            && select_into_target.is_none()
-            && !has_grouping_sets
-            && matches!(&*query.body, SetExpr::Select(_))
-        {
-            // Preloaded rows: virtual tables, materialized views, CTEs, derived tables,
-            // generate_series results already have all rows in memory.
-            let preloaded_source: Option<BoxedOperator> =
-                if let Some(op) = streaming_scan_operator.take() {
-                    Some(op)
-                } else if is_virtual || rows_loaded {
-                    Some(Box::new(TableScanOperator::new_with_rows(
-                        schema.clone(),
-                        all_rows_base,
-                    )))
-                } else {
-                    None
-                };
-
-            if has_for_update {
-                let planner = PhysicalPlanner::new(self.store(), search_path.to_vec());
-                let estimated_rows = 1000;
+            if has_skip_locked {
+                // SKIP LOCKED: scan all matching rows in ORDER BY order (no
+                // LIMIT/OFFSET) so we can try-lock each row with NOWAIT and
+                // skip rows held by other transactions.
                 let mut lock_operator = planner.plan_simple_select(
                     db_id,
                     schema.clone(),
                     resolved_selection.as_ref(),
-                    Vec::new(),
+                    query.order_by.clone(),
                     None,
                     0,
+                    estimated_rows,
+                )?;
+                let candidate_rows = execute_operator_tree(
+                    &mut lock_operator,
+                    txn,
+                    self.store(),
+                    db_id,
+                    search_path,
+                    sequence_values,
+                )
+                .await?;
+
+                // Try-lock rows one-by-one (NOWAIT); collect at most
+                // offset + limit successfully-locked rows.
+                let offset = extract_offset(query);
+                let limit = extract_limit(query);
+                let max_locks = limit.map(|l| offset + l);
+
+                let locked_indices = self
+                    .store()
+                    .lock_rows_skip_locked(txn, db_id, &t, &candidate_rows, max_locks)
+                    .await?;
+
+                // Feed all locked rows into preloaded_rows (preserving order).
+                // The main query will apply ORDER BY + OFFSET + LIMIT on top.
+                let locked_rows: Vec<Row> = locked_indices
+                    .iter()
+                    .map(|&i| candidate_rows[i].clone())
+                    .collect();
+                preloaded_rows = Some(locked_rows);
+            } else {
+                // Regular FOR UPDATE/SHARE (including NOWAIT):
+                // Lock only the rows that appear in the final result by
+                // respecting ORDER BY + LIMIT + OFFSET in the lock scan.
+                let mut lock_operator = planner.plan_simple_select(
+                    db_id,
+                    schema.clone(),
+                    resolved_selection.as_ref(),
+                    query.order_by.clone(),
+                    extract_limit(query),
+                    extract_offset(query),
                     estimated_rows,
                 )?;
                 let lock_rows = execute_operator_tree(
@@ -608,943 +744,121 @@ impl Executor {
                 if !lock_rows.is_empty() {
                     self.store().lock_rows(txn, db_id, &t, &lock_rows).await?;
                 }
-            }
-
-            let has_window = projection_has_window_function(&resolved_projection);
-            let has_agg_or_group_by = projection_has_non_window_aggregate(&resolved_projection)
-                || !matches!(
-                    &select.group_by,
-                    GroupByExpr::Expressions(exprs) if exprs.is_empty()
-                )
-                || select.having.is_some();
-
-            if has_window && !has_agg_or_group_by {
-                return self
-                    .execute_window_with_operators(
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        schema,
-                        resolved_selection.as_ref(),
-                        &query.order_by,
-                        super::operators::extract_limit(query),
-                        super::operators::extract_offset(query),
-                        &resolved_projection,
-                        ctes,
-                        preloaded_source,
-                    )
-                    .await;
-            } else if has_agg_or_group_by {
-                let resolved_group_by = match &select.group_by {
-                    GroupByExpr::Expressions(exprs) => GroupByExpr::Expressions(
-                        resolve_group_by_exprs(exprs, &resolved_projection, &schema)?,
-                    ),
-                    GroupByExpr::All => GroupByExpr::All,
-                };
-                return self
-                    .execute_aggregate_with_operators(
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        schema,
-                        resolved_selection.as_ref(),
-                        &resolved_group_by,
-                        select.having.as_ref(),
-                        &query.order_by,
-                        super::operators::extract_limit(query),
-                        super::operators::extract_offset(query),
-                        &resolved_projection,
-                        ctes,
-                        preloaded_source,
-                    )
-                    .await;
-            } else {
-                return self
-                    .execute_with_operators(
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        schema,
-                        resolved_selection.as_ref(),
-                        &query.order_by,
-                        super::operators::extract_limit(query),
-                        super::operators::extract_offset(query),
-                        &resolved_projection,
-                        select.distinct.as_ref(),
-                        ctes,
-                        preloaded_source,
-                    )
-                    .await;
+                // Do not set preloaded_rows: the main query independently scans
+                // and applies WHERE/ORDER BY/LIMIT, preserving correct behavior
+                // when async WHERE conjuncts have already pre-filtered rows.
             }
         }
+        let _ = has_nowait; // TODO: implement NOWAIT semantics
 
-        let pkless_for_update = has_for_update && schema.pk_indices.is_empty();
-        if pkless_for_update && (is_virtual || rows_loaded) {
-            return Err(anyhow!(
-                "FOR UPDATE not supported for '{}': table has no primary key",
-                t
-            ));
-        }
-
-        let mut pkless_row_keys: Option<Vec<Vec<u8>>> = None;
-
-        let all_rows = if is_virtual {
-            all_rows_base
-        } else if rows_loaded {
-            // Rows are already materialized (CTE, derived table, view, etc). Index scans
-            // are only applicable to base tables.
-            all_rows_base
-        } else if pkless_for_update {
-            let mut rows_with_keys = self.store().scan_with_keys(txn, db_id, &t).await?;
-            for (_, row) in &mut rows_with_keys {
-                fill_row_defaults(row, &schema)?;
-            }
-            let (keys, rows) = rows_with_keys.into_iter().unzip();
-            pkless_row_keys = Some(keys);
-            rows
-        } else {
-            let estimated_rows = 1000;
-
-            match &resolved_selection {
-                None => {
-                    let scan_upper_bound = {
-                        let limit = super::operators::extract_limit(query);
-                        let offset = super::operators::extract_offset(query);
-                        match limit {
-                            Some(0) => Some(0),
-                            Some(n) => Some(offset.saturating_add(n)),
-                            None => None,
-                        }
-                    };
-
-                    let has_for_update = query
-                        .locks
-                        .iter()
-                        .any(|l| matches!(l.lock_type, LockType::Update));
-
-                    let can_pushdown_scan_limit = scan_upper_bound.is_some()
-                        && !has_for_update
-                        && select.distinct.is_none()
-                        && query.order_by.is_empty()
-                        && matches!(
-                            &select.group_by,
-                            GroupByExpr::Expressions(exprs) if exprs.is_empty()
-                        )
-                        && select.having.is_none()
-                        && select.from.len() == 1
-                        && select.from[0].joins.is_empty()
-                        && !projection_has_window_function(&select.projection);
-
-                    let scan_upper_bound = if can_pushdown_scan_limit {
-                        scan_upper_bound
-                    } else {
-                        None
-                    };
-
-                    self.scan_and_fill_with_limit(txn, db_id, &t, &schema, scan_upper_bound)
-                        .await?
-                }
-                Some(sel) => {
-                    let access_path = planner::choose_best_access_path_for_filter(
-                        db_id,
-                        &schema,
-                        Some(sel),
-                        estimated_rows,
-                    );
-
-                    match access_path.scan_type {
-                        ScanType::GinIndexScan {
-                            index_id,
-                            ref index_name,
-                            ref column,
-                            ref pattern,
-                            ..
-                        } => {
-                            let index = schema.indexes.iter().find(|i| i.id == index_id);
-                            let Some(idx) = index else {
-                                return Err(anyhow!("GIN index not found"));
-                            };
-
-                            let gin_col_type = schema
-                                .columns
-                                .iter()
-                                .find(|c| c.name.eq_ignore_ascii_case(column))
-                                .map(|c| &c.data_type);
-
-                            let token_hashes = match &pattern {
-                                Value::Null => Vec::new(),
-                                Value::Array(arr) => gin::extract_array_gin_tokens(arr),
-                                Value::Tsquery(s) => gin::extract_tsquery_gin_tokens(s),
-                                Value::Tsvector(s) => gin::extract_tsvector_gin_tokens(s),
-                                Value::Json(s) | Value::Jsonb(s) => {
-                                    let pattern_json: serde_json::Value = serde_json::from_str(s)
-                                        .map_err(|e| {
-                                        anyhow!("Invalid JSONB pattern for @>: {}", e)
-                                    })?;
-                                    gin::extract_gin_tokens(&pattern_json).into_scan_hashes()
-                                }
-                                Value::Text(s) => match gin_col_type {
-                                    Some(DataType::Tsvector) => gin::extract_tsquery_gin_tokens(s),
-                                    Some(DataType::Array(_)) => {
-                                        let parsed: Vec<Value> =
-                                            serde_json::from_str(s).unwrap_or_default();
-                                        gin::extract_array_gin_tokens(&parsed)
-                                    }
-                                    _ => {
-                                        let pattern_json: serde_json::Value =
-                                            serde_json::from_str(s).map_err(|e| {
-                                                anyhow!("Invalid JSONB pattern for @>: {}", e)
-                                            })?;
-                                        gin::extract_gin_tokens(&pattern_json).into_scan_hashes()
-                                    }
-                                },
-                                other => {
-                                    return Err(anyhow!(
-                                        "GIN pattern must be array, json/jsonb, or tsquery, got {}",
-                                        other.data_type().unwrap_or(DataType::Text)
-                                    ));
-                                }
-                            };
-
-                            if token_hashes.is_empty() {
-                                debug!(
-                                    "GIN predicate yields no tokens; falling back to full scan (index: {})",
-                                    index_name
-                                );
-                                self.scan_and_fill(txn, db_id, &t, &schema).await?
-                            } else {
-                                debug!(
-                                    "Using GIN Index Scan on {} (cost: {:.2})",
-                                    index_name, access_path.cost
-                                );
-                                let pk_keys = self
-                                    .store()
-                                    .scan_gin_index_intersection(
-                                        txn,
-                                        db_id,
-                                        schema.table_id,
-                                        idx.id,
-                                        &token_hashes,
-                                    )
-                                    .await?;
-                                let mut rows = self
-                                    .store()
-                                    .batch_get_rows_by_pk_keys(txn, db_id, schema.table_id, pk_keys)
-                                    .await?;
-                                for r in &mut rows {
-                                    fill_row_defaults(r, &schema)?;
-                                }
-                                rows
-                            }
-                        }
-                        ScanType::IndexScan {
-                            index_id,
-                            ref index_name,
-                            ref values,
-                            ..
-                        } => {
-                            let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
-                                vec![DataType::Uuid]
-                            } else {
-                                schema
-                                    .pk_indices
-                                    .iter()
-                                    .map(|&idx| schema.columns[idx].data_type.clone())
-                                    .collect()
-                            };
-
-                            let index = schema.indexes.iter().find(|i| i.id == index_id);
-                            let Some(idx) = index else {
-                                return Err(anyhow!("Index not found"));
-                            };
-
-                            debug!(
-                                "Using Index Scan on {} (cost: {:.2})",
-                                index_name, access_path.cost
-                            );
-
-                            let pks = self
-                                .store()
-                                .scan_index(
-                                    txn,
-                                    db_id,
-                                    schema.table_id,
-                                    idx.id,
-                                    values,
-                                    idx.unique,
-                                    &pk_types,
-                                    None,
-                                )
-                                .await?;
-                            let mut rows = self
-                                .store()
-                                .batch_get_rows(txn, db_id, schema.table_id, pks, &schema)
-                                .await?;
-                            for r in &mut rows {
-                                fill_row_defaults(r, &schema)?;
-                            }
-                            rows
-                        }
-                        ScanType::IndexRangeScan {
-                            index_id,
-                            ref index_name,
-                            ref prefix_values,
-                            ..
-                        } => {
-                            let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
-                                vec![DataType::Uuid]
-                            } else {
-                                schema
-                                    .pk_indices
-                                    .iter()
-                                    .map(|&idx| schema.columns[idx].data_type.clone())
-                                    .collect()
-                            };
-
-                            let index = schema.indexes.iter().find(|i| i.id == index_id);
-                            let Some(idx) = index else {
-                                return Err(anyhow!("Index not found"));
-                            };
-
-                            let index_column_types: Vec<_> = idx
-                                .columns
-                                .iter()
-                                .map(|col| {
-                                    schema
-                                        .columns
-                                        .iter()
-                                        .find(|c| c.name.eq_ignore_ascii_case(col))
-                                        .map(|c| c.data_type.clone())
-                                        .ok_or_else(|| anyhow!("Index column '{}' not found", col))
-                                })
-                                .collect::<Result<Vec<_>>>()?;
-
-                            debug!(
-                                "Using Index Range Scan on {} (cost: {:.2})",
-                                index_name, access_path.cost
-                            );
-
-                            let pks = self
-                                .store()
-                                .scan_index_prefix(
-                                    txn,
-                                    db_id,
-                                    schema.table_id,
-                                    idx.id,
-                                    prefix_values,
-                                    idx.unique,
-                                    &index_column_types,
-                                    &pk_types,
-                                    None,
-                                )
-                                .await?;
-                            let mut rows = self
-                                .store()
-                                .batch_get_rows(txn, db_id, schema.table_id, pks, &schema)
-                                .await?;
-                            for r in &mut rows {
-                                fill_row_defaults(r, &schema)?;
-                            }
-                            rows
-                        }
-                        ScanType::IndexBoundedRangeScan {
-                            index_id,
-                            ref index_name,
-                            ref prefix_values,
-                            ref range_start,
-                            start_inclusive,
-                            ref range_end,
-                            end_inclusive,
-                            ..
-                        } => {
-                            let index = schema.indexes.iter().find(|i| i.id == index_id);
-                            let Some(idx) = index else {
-                                return Err(anyhow!("Index not found"));
-                            };
-
-                            let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
-                                vec![DataType::Uuid]
-                            } else {
-                                schema
-                                    .pk_indices
-                                    .iter()
-                                    .map(|&i| schema.columns[i].data_type.clone())
-                                    .collect()
-                            };
-
-                            let index_column_types: Vec<_> = idx
-                                .columns
-                                .iter()
-                                .map(|col| {
-                                    schema
-                                        .columns
-                                        .iter()
-                                        .find(|c| c.name.eq_ignore_ascii_case(col))
-                                        .map(|c| c.data_type.clone())
-                                        .ok_or_else(|| anyhow!("Index column '{}' not found", col))
-                                })
-                                .collect::<Result<Vec<_>>>()?;
-
-                            debug!(
-                                "Using Index Bounded Range Scan on {} (cost: {:.2})",
-                                index_name, access_path.cost
-                            );
-
-                            let pks = self
-                                .store()
-                                .scan_index_range(
-                                    txn,
-                                    db_id,
-                                    schema.table_id,
-                                    idx.id,
-                                    prefix_values,
-                                    range_start.as_ref(),
-                                    start_inclusive,
-                                    range_end.as_ref(),
-                                    end_inclusive,
-                                    idx.unique,
-                                    &index_column_types,
-                                    &pk_types,
-                                    None,
-                                )
-                                .await?;
-                            let mut rows = self
-                                .store()
-                                .batch_get_rows(txn, db_id, schema.table_id, pks, &schema)
-                                .await?;
-                            for r in &mut rows {
-                                fill_row_defaults(r, &schema)?;
-                            }
-                            rows
-                        }
-                        ScanType::InListScan {
-                            index_id,
-                            ref index_name,
-                            ref column_values,
-                            ..
-                        } => {
-                            let index = schema.indexes.iter().find(|i| i.id == index_id);
-                            let Some(idx) = index else {
-                                return Err(anyhow!("Index not found"));
-                            };
-
-                            let pk_types: Vec<DataType> = if schema.pk_indices.is_empty() {
-                                vec![DataType::Uuid]
-                            } else {
-                                schema
-                                    .pk_indices
-                                    .iter()
-                                    .map(|&i| schema.columns[i].data_type.clone())
-                                    .collect()
-                            };
-
-                            debug!(
-                                "Using In-List Scan on {} ({} values, cost: {:.2})",
-                                index_name,
-                                column_values.len(),
-                                access_path.cost
-                            );
-
-                            let mut all_pks = Vec::new();
-                            for values in column_values {
-                                let pks = self
-                                    .store()
-                                    .scan_index(
-                                        txn,
-                                        db_id,
-                                        schema.table_id,
-                                        idx.id,
-                                        values,
-                                        idx.unique,
-                                        &pk_types,
-                                        None,
-                                    )
-                                    .await?;
-                                all_pks.extend(pks);
-                            }
-
-                            let mut deduped_pks = Vec::with_capacity(all_pks.len());
-                            for pk in all_pks {
-                                if !deduped_pks.contains(&pk) {
-                                    deduped_pks.push(pk);
-                                }
-                            }
-
-                            let mut rows = self
-                                .store()
-                                .batch_get_rows(txn, db_id, schema.table_id, deduped_pks, &schema)
-                                .await?;
-                            for r in &mut rows {
-                                fill_row_defaults(r, &schema)?;
-                            }
-                            rows
-                        }
-                        ScanType::FullTableScan => {
-                            debug!("Using Full Table Scan (cost: {:.2})", access_path.cost);
-                            self.scan_and_fill(txn, db_id, &t, &schema).await?
-                        }
-                    }
-                }
-            }
+        // Detect grouping sets (CUBE/ROLLUP/GROUPING SETS).
+        let group_by_exprs_for_grouping_sets_check = match &select.group_by {
+            GroupByExpr::Expressions(exprs) => exprs.as_slice(),
+            GroupByExpr::All => &[][..],
         };
+        let grouping_sets = extract_grouping_sets(group_by_exprs_for_grouping_sets_check);
 
-        let (filtered_rows, lock_keys) = if pkless_for_update {
-            let all_keys = pkless_row_keys
-                .take()
-                .ok_or_else(|| anyhow!("missing row keys for FOR UPDATE"))?;
+        let has_window = projection_has_window_function(&resolved_projection);
+        let has_agg_or_group_by = projection_has_non_window_aggregate(&resolved_projection)
+            || !matches!(
+                &select.group_by,
+                GroupByExpr::Expressions(exprs) if exprs.is_empty()
+            )
+            || select.having.is_some();
 
-            if let Some(ref sel) = resolved_selection {
-                let mut rows = Vec::new();
-                let mut keys = Vec::new();
-                if has_correlated_exists {
-                    for (key, r) in all_keys.into_iter().zip(all_rows.into_iter()) {
-                        let result = self
-                            .eval_selection_with_correlated_exists(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                sel,
-                                search_path,
-                                &outer_alias,
-                                &schema,
-                                &r,
-                            )
-                            .await?;
-                        let result = coerce_text_literal_to_bool(sel, result)?;
-                        match result {
-                            Value::Boolean(true) => {
-                                rows.push(r);
-                                keys.push(key);
-                            }
-                            Value::Boolean(false) | Value::Null => {}
-                            other => {
-                                return Err(anyhow!(
-                                    "Filter predicate must evaluate to boolean, got {:?}",
-                                    other
-                                ));
-                            }
-                        }
-                    }
-                } else {
-                    for (key, r) in all_keys.into_iter().zip(all_rows.into_iter()) {
-                        let result = self
-                            .eval_expr_maybe_sequence(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                sel,
-                                Some(&r),
-                                Some(&schema),
-                            )
-                            .await?;
-                        let result = coerce_text_literal_to_bool(sel, result)?;
-                        match result {
-                            Value::Boolean(true) => {
-                                rows.push(r);
-                                keys.push(key);
-                            }
-                            Value::Boolean(false) | Value::Null => {}
-                            other => {
-                                return Err(anyhow!(
-                                    "Filter predicate must evaluate to boolean, got {:?}",
-                                    other
-                                ));
-                            }
-                        }
-                    }
-                }
-                (rows, keys)
+        // Convert preloaded_rows (Option<Vec<Row>>) to preloaded_source (Option<BoxedOperator>)
+        // for operator functions that expect BoxedOperator. Also consider streaming_scan_operator.
+        let preloaded_source: Option<BoxedOperator> =
+            if let Some(op) = streaming_scan_operator.take() {
+                Some(op)
+            } else if let Some(rows) = &preloaded_rows {
+                Some(Box::new(TableScanOperator::new_with_rows(
+                    schema.clone(),
+                    rows.clone(),
+                )))
             } else {
-                (all_rows, all_keys)
-            }
-        } else if let Some(ref sel) = resolved_selection {
-            let mut v = Vec::new();
-            if has_correlated_exists {
-                for r in all_rows {
-                    let result = self
-                        .eval_selection_with_correlated_exists(
-                            txn,
-                            db_id,
-                            sequence_values,
-                            sel,
-                            search_path,
-                            &outer_alias,
-                            &schema,
-                            &r,
-                        )
-                        .await?;
-                    let result = coerce_text_literal_to_bool(sel, result)?;
-                    match result {
-                        Value::Boolean(true) => v.push(r),
-                        Value::Boolean(false) | Value::Null => {}
-                        other => {
-                            return Err(anyhow!(
-                                "Filter predicate must evaluate to boolean, got {:?}",
-                                other
-                            ));
-                        }
-                    }
-                }
-            } else {
-                for r in all_rows {
-                    let result = self
-                        .eval_expr_maybe_sequence(
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            sel,
-                            Some(&r),
-                            Some(&schema),
-                        )
-                        .await?;
-                    let result = coerce_text_literal_to_bool(sel, result)?;
-                    match result {
-                        Value::Boolean(true) => v.push(r),
-                        Value::Boolean(false) | Value::Null => {}
-                        other => {
-                            return Err(anyhow!(
-                                "Filter predicate must evaluate to boolean, got {:?}",
-                                other
-                            ));
-                        }
-                    }
-                }
-            }
-            (v, Vec::new())
-        } else {
-            (all_rows, Vec::new())
-        };
-
-        if has_for_update && pkless_for_update && !filtered_rows.is_empty() {
-            txn.lock_keys(lock_keys).await.map_err(|e| anyhow!(e))?;
-        }
-
-        let group_keys_exprs = match &select.group_by {
-            GroupByExpr::Expressions(exprs) => exprs,
-            GroupByExpr::All => {
-                return Err(SqlError::Unsupported("GROUP BY ALL not supported".into()).into())
-            }
-        };
-
-        let resolved_group_keys_exprs =
-            resolve_group_by_exprs(group_keys_exprs, &resolved_projection, &schema)?;
-        let group_keys_exprs = resolved_group_keys_exprs.as_slice();
-
-        let grouping_sets = extract_grouping_sets(group_keys_exprs);
-        let has_grouping_sets = grouping_sets.is_some();
-
-        let (all_wf_exprs, window_sig_to_col) =
-            Executor::extract_window_function_exprs(&resolved_projection, &schema);
-        let has_window_funcs_flag = !all_wf_exprs.is_empty();
-
-        // Convert WindowFunctionExpr → WindowFuncInfo for compute_window_functions
-        let window_funcs: Vec<WindowFuncInfo> = all_wf_exprs
-            .iter()
-            .map(|wf| WindowFuncInfo {
-                proj_idx: usize::MAX, // sentinel — not used for matching
-                func_name: wf.func_name.clone(),
-                arg_expr: wf.arg_expr.clone(),
-                partition_by: wf.partition_by.clone(),
-                order_by: wf.order_by.clone(),
-                offset_expr: wf.offset_expr.clone(),
-                default_value_expr: wf.default_value_expr.clone(),
-                window_frame: wf.window_frame.clone(),
-            })
-            .collect();
-
-        let mut agg_funcs: Vec<(usize, AggExpr)> = Vec::new();
-        let extra_start = select.projection.len();
-        for (i, item) in select.projection.iter().enumerate() {
-            match item {
-                SelectItem::UnnamedExpr(Expr::Function(f))
-                | SelectItem::ExprWithAlias {
-                    expr: Expr::Function(f),
-                    ..
-                } => {
-                    if f.over.is_none() {
-                        let func_name = f
-                            .name
-                            .0
-                            .last()
-                            .map(|n| n.value.to_uppercase())
-                            .unwrap_or_default();
-                        if matches!(
-                            func_name.as_str(),
-                            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" | "STRING_AGG" | "ARRAY_AGG"
-                        ) {
-                            agg_funcs.push((i, AggExpr::Function(f.clone())));
-                        } else {
-                            collect_having_agg_funcs(
-                                &Expr::Function(f.clone()),
-                                &mut agg_funcs,
-                                extra_start,
-                            );
-                        }
-                    }
-                }
-                SelectItem::UnnamedExpr(Expr::ArrayAgg(arr))
-                | SelectItem::ExprWithAlias {
-                    expr: Expr::ArrayAgg(arr),
-                    ..
-                } => {
-                    agg_funcs.push((i, AggExpr::ArrayAgg(arr.clone())));
-                }
-                // Handle expressions containing nested aggregates (e.g., 'X=' || count(*))
-                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                    collect_having_agg_funcs(expr, &mut agg_funcs, extra_start);
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(having_expr) = &select.having {
-            collect_having_agg_funcs(having_expr, &mut agg_funcs, extra_start);
-        }
-
-        let is_agg = !group_keys_exprs.is_empty() || !agg_funcs.is_empty();
-
-        if is_agg {
-            if has_grouping_sets {
-                return self
-                    .execute_grouping_sets_query(
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        query,
-                        select,
-                        &schema,
-                        filtered_rows,
-                        grouping_sets.unwrap(),
-                        agg_funcs,
-                        &resolved_projection,
-                        select_into_target,
-                    )
-                    .await;
-            }
-            return self
-                .execute_aggregate_query(
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    query,
-                    select,
-                    &schema,
-                    filtered_rows,
-                    group_keys_exprs,
-                    agg_funcs,
-                    &resolved_projection,
-                    select_into_target,
-                )
-                .await;
-        }
-
-        let window_results = if !window_funcs.is_empty() {
-            Some(compute_window_functions(
-                &filtered_rows,
-                &schema,
-                &window_funcs,
-            )?)
-        } else {
-            None
-        };
-
-        let output_exprs_for_order_by =
-            expand_projection_exprs_for_positional_order_by(&resolved_projection, &schema);
-
-        let order_by_references_correlated_subquery = query.order_by.iter().any(|order_expr| {
-            if let Expr::Identifier(ref ident) = order_expr.expr {
-                for item in &resolved_projection {
-                    if let SelectItem::ExprWithAlias { expr, alias } = item {
-                        if alias.value.eq_ignore_ascii_case(&ident.value) {
-                            if let Expr::Subquery(_) = expr {
-                                return true;
-                            }
-                        }
-                    }
-                }
-                return false;
-            }
-
-            if let Expr::Value(SqlValue::Number(n, _)) = &order_expr.expr {
-                if let Ok(pos) = n.parse::<usize>() {
-                    if pos > 0 {
-                        if let Some(expr) = output_exprs_for_order_by.get(pos - 1) {
-                            return matches!(expr, Expr::Subquery(_));
-                        }
-                    }
-                }
-                return false;
-            }
-
-            false
-        });
-
-        let (filtered_rows, window_results) =
-            if !query.order_by.is_empty() && !order_by_references_correlated_subquery {
-                self.apply_order_by(
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    filtered_rows,
-                    window_results,
-                    &query.order_by,
-                    &resolved_projection,
-                    &schema,
-                )
-                .await?
-            } else {
-                (filtered_rows, window_results)
+                None
             };
 
-        let has_window_funcs = has_window_funcs_flag;
-        let wildcard = select
-            .projection
-            .iter()
-            .any(|p| matches!(p, SelectItem::Wildcard(_)));
-        let pure_wildcard = wildcard && select.projection.len() == 1;
-
-        let (mut rows_for_projection, mut window_results) = match &select.distinct {
-            Some(Distinct::On(on_exprs)) => {
-                let (rows, indices) =
-                    distinct_on_rows_with_indices(filtered_rows, on_exprs, Some(&schema))?;
-                let window_results =
-                    window_results.map(|wr| super::super::query::reorder_by_indices(&wr, &indices));
-                (rows, window_results)
-            }
-            _ => (filtered_rows, window_results),
-        };
-
-        if has_for_update && !pkless_for_update && !rows_for_projection.is_empty() {
-            let for_update_nonblock = query
-                .locks
-                .iter()
-                .find(|l| matches!(l.lock_type, LockType::Update))
-                .and_then(|l| l.nonblock);
-
-            let query_base_for_offset_limit_fetch = query_with_evaluated_offset_limit_fetch
-                .as_ref()
-                .unwrap_or(query);
-            let query_for_offset_limit_fetch = if generate_series_offset_limit_pushed_down {
-                let mut q = query_base_for_offset_limit_fetch.clone();
-                q.offset = None;
-                q.limit = None;
-                q.fetch = None;
-                q
-            } else {
-                query_base_for_offset_limit_fetch.clone()
-            };
-
-            let offset = extract_offset(&query_for_offset_limit_fetch);
-            let max_lock = match extract_limit(&query_for_offset_limit_fetch) {
-                Some(0) => Some(0),
-                Some(n) => Some(offset.saturating_add(n)),
-                None => None,
-            };
-
-            match for_update_nonblock {
-                Some(NonBlock::SkipLocked) => {
-                    let locked_indices = self
-                        .store()
-                        .lock_rows_skip_locked(txn, db_id, &t, &rows_for_projection, max_lock)
-                        .await?;
-                    rows_for_projection = locked_indices
-                        .iter()
-                        .map(|&idx| rows_for_projection[idx].clone())
-                        .collect();
-                    window_results = window_results
-                        .map(|wr| super::super::query::reorder_by_indices(&wr, &locked_indices));
-                }
-                _ => {
-                    let lock_count = max_lock.unwrap_or(rows_for_projection.len());
-                    let lock_count = lock_count.min(rows_for_projection.len());
-                    if lock_count > 0 {
-                        self.store()
-                            .lock_rows(txn, db_id, &t, &rows_for_projection[..lock_count])
-                            .await?;
-                    }
-                }
-            }
-        }
-
-        let (cols, result_rows) = if pure_wildcard && !has_window_funcs {
-            let cols: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-            (cols, rows_for_projection)
-        } else {
-            self.project_rows(
+        let result = if let Some(grouping_sets) = grouping_sets {
+            // GROUPING SETS / CUBE / ROLLUP
+            self.execute_grouping_sets_with_operators(
                 txn,
                 db_id,
                 sequence_values,
                 search_path,
-                select,
-                &schema,
-                &outer_alias,
-                rows_for_projection,
+                schema.clone(),
+                resolved_selection.as_ref(),
+                &grouping_sets,
+                select.having.as_ref(),
+                &query.order_by,
+                extract_limit(query),
+                extract_offset(query),
                 &resolved_projection,
-                window_results.as_ref(),
-                &all_wf_exprs,
-                &window_sig_to_col,
+                ctes,
+                preloaded_rows,
+            )
+            .await?
+        } else if has_window && !has_agg_or_group_by {
+            self.execute_window_with_operators(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                schema.clone(),
+                resolved_selection.as_ref(),
+                &query.order_by,
+                extract_limit(query),
+                extract_offset(query),
+                &resolved_projection,
+                ctes,
+                preloaded_source,
+            )
+            .await?
+        } else if has_agg_or_group_by {
+            let resolved_group_by = match &select.group_by {
+                GroupByExpr::Expressions(exprs) => GroupByExpr::Expressions(
+                    resolve_group_by_exprs(exprs, &resolved_projection, &schema)?,
+                ),
+                GroupByExpr::All => GroupByExpr::All,
+            };
+            self.execute_aggregate_with_operators(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                schema.clone(),
+                resolved_selection.as_ref(),
+                &resolved_group_by,
+                select.having.as_ref(),
+                &query.order_by,
+                extract_limit(query),
+                extract_offset(query),
+                &resolved_projection,
+                ctes,
+                preloaded_source,
+            )
+            .await?
+        } else {
+            self.execute_with_operators(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                schema.clone(),
+                resolved_selection.as_ref(),
+                &query.order_by,
+                extract_limit(query),
+                extract_offset(query),
+                &resolved_projection,
+                select.distinct.as_ref(),
+                ctes,
+                preloaded_source,
             )
             .await?
         };
 
-        let mut result_rows = result_rows;
-        if order_by_references_correlated_subquery && !query.order_by.is_empty() {
-            self.sort_by_correlated_subquery(&mut result_rows, &cols, &query.order_by);
-        }
-
-        if matches!(&select.distinct, Some(Distinct::Distinct)) {
-            result_rows = dedup_rows(result_rows);
-        }
-
-        let query_base_for_offset_limit_fetch = query_with_evaluated_offset_limit_fetch
-            .as_ref()
-            .unwrap_or(query);
-        let query_no_offset_limit = if generate_series_offset_limit_pushed_down {
-            let mut q = query_base_for_offset_limit_fetch.clone();
-            q.offset = None;
-            q.limit = None;
-            q.fetch = None;
-            Some(q)
-        } else {
-            None
-        };
-        let query_for_offset_limit_fetch = query_no_offset_limit
-            .as_ref()
-            .unwrap_or(query_base_for_offset_limit_fetch);
-        result_rows = apply_offset_limit_fetch(result_rows, query_for_offset_limit_fetch);
-
-        let column_types = Some(
-            select
-                .projection
-                .iter()
-                .flat_map(|item| match item {
-                    SelectItem::Wildcard(_) => schema
-                        .columns
-                        .iter()
-                        .map(|c| c.data_type.clone())
-                        .collect::<Vec<_>>(),
-                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        vec![infer_expr_type(expr, &schema)]
-                    }
-                    _ => vec![DataType::Text],
-                })
-                .collect(),
-        );
-
-        let result = ExecuteResult::Select {
-            column_types,
-            columns: cols,
-            rows: result_rows,
-            timezone: crate::session_context::current_timezone(),
-        };
+        // SELECT INTO post-processing: create table from result.
         if let Some((target_name, _temp)) = select_into_target {
             return self
                 .create_table_from_result(txn, db_id, search_path, &target_name, result)
@@ -1552,6 +866,59 @@ impl Executor {
         }
         Ok(result)
     }
+}
+
+/// Split an AND-connected expression into parts that are safe for the sync operator
+/// path vs parts that need async per-row evaluation (subqueries, UDFs, sequences).
+/// Returns (operator_safe, async_parts). Either may be None.
+fn split_async_conjuncts(expr: &Expr) -> (Option<Expr>, Option<Expr>) {
+    let conjuncts = flatten_and_conjuncts(expr);
+    let mut safe = Vec::new();
+    let mut needs_async = Vec::new();
+    for c in conjuncts {
+        if expr_contains_subquery(c) || sequences::expr_needs_async_eval(c) {
+            needs_async.push(c.clone());
+        } else {
+            safe.push(c.clone());
+        }
+    }
+    (
+        if safe.is_empty() {
+            None
+        } else {
+            Some(and_conjuncts(safe))
+        },
+        if needs_async.is_empty() {
+            None
+        } else {
+            Some(and_conjuncts(needs_async))
+        },
+    )
+}
+
+fn flatten_and_conjuncts(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            let mut parts = flatten_and_conjuncts(left);
+            parts.extend(flatten_and_conjuncts(right));
+            parts
+        }
+        Expr::Nested(inner) => flatten_and_conjuncts(inner),
+        _ => vec![expr],
+    }
+}
+
+fn and_conjuncts(mut exprs: Vec<Expr>) -> Expr {
+    let first = exprs.remove(0);
+    exprs.into_iter().fold(first, |acc, e| Expr::BinaryOp {
+        left: Box::new(acc),
+        op: BinaryOperator::And,
+        right: Box::new(e),
+    })
 }
 
 #[cfg(test)]

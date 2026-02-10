@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
@@ -9,7 +8,7 @@ use sqlparser::ast::{
 };
 use tikv_client::Transaction;
 
-use super::super::expr::{coerce_text_literal_to_bool, eval_expr};
+use super::super::expr::{coerce_text_literal_to_bool, compare_values, eval_expr};
 use super::super::operators::{
     execute_operator_tree, execute_operator_tree_with_ctes, AggregateExpr, BoxedOperator,
     DistinctOnOperator, DistinctOperator, FilterOperator, HashAggregateOperator, HashJoinConfig,
@@ -19,8 +18,10 @@ use super::super::operators::{
 };
 use super::super::planner::{choose_join_algorithm, JoinAlgorithmChoice};
 use super::super::projection::{get_expr_name, get_select_item_name, infer_expr_type};
+use super::super::sequences;
 use super::super::ExecuteResult;
 use super::core::Executor;
+use super::subquery::expr_contains_subquery;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use sqlparser::ast::Ident;
 
@@ -627,15 +628,6 @@ pub(crate) fn find_matching_aggregate(f: &Function, agg_exprs: &[AggregateExpr])
     None
 }
 
-pub fn use_operator_execution() -> bool {
-    static USE_OPERATORS: OnceLock<bool> = OnceLock::new();
-    *USE_OPERATORS.get_or_init(|| {
-        std::env::var("PGTIKV_USE_OPERATORS")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(true)
-    })
-}
-
 pub fn extract_limit(query: &Query) -> Option<usize> {
     if let Some(limit_expr) = &query.limit {
         if let Ok(v) = eval_expr(limit_expr, None, None) {
@@ -715,139 +707,6 @@ pub(crate) fn is_aggregate_func(f: &Function) -> bool {
         .map(|n| n.value.to_uppercase())
         .unwrap_or_default();
     AGGREGATE_FUNC_NAMES.contains(&name.as_str())
-}
-
-static EVAL_FUNCTION_MATCH_NAMES: &[&str] = &[
-    "NULLIF",
-    "GREATEST",
-    "LEAST",
-    "GET_BIT",
-    "SET_BIT",
-    "INT8SEND",
-    "INT4SEND",
-    "UUID_SEND",
-    "SUBSTR",
-    "FORMAT",
-    "NOW",
-    "CURRENT_TIMESTAMP",
-    "CURRENT_DATE",
-    "DATE_TRUNC",
-    "DATE",
-    "TO_CHAR",
-    "AGE",
-    "GENERATE_SERIES",
-    "NEXTVAL",
-    "CURRVAL",
-    "SETVAL",
-    "SET_CONFIG",
-    "PG_BACKEND_PID",
-    "VERSION",
-    "CURRENT_DATABASE",
-    "CURRENT_SCHEMA",
-    "CURRENT_USER",
-    "SESSION_USER",
-    "USER",
-    "PG_GET_USERBYID",
-    "PG_GET_INDEXDEF",
-    "PG_GET_CONSTRAINTDEF",
-    "PG_GET_EXPR",
-    "FORMAT_TYPE",
-    "PG_CATALOG.SET_CONFIG",
-    "L2_DISTANCE",
-    "COSINE_DISTANCE",
-    "INNER_PRODUCT",
-    "VECTOR_DIMS",
-    "VECTOR_NORM",
-    "SUBSTRING",
-    "POSITION",
-    "OVERLAY",
-    "COALESCE",
-    "ROW_NUMBER",
-    "RANK",
-    "DENSE_RANK",
-    "LAG",
-    "LEAD",
-    "FIRST_VALUE",
-    "LAST_VALUE",
-    "NTH_VALUE",
-    "NTILE",
-    "CUME_DIST",
-    "PERCENT_RANK",
-    "CURRENT_SETTING",
-];
-
-fn is_known_builtin_function(name: &str) -> bool {
-    let upper = name.to_uppercase();
-    if AGGREGATE_FUNC_NAMES.contains(&upper.as_str()) {
-        return true;
-    }
-    if EVAL_FUNCTION_MATCH_NAMES.contains(&upper.as_str()) {
-        return true;
-    }
-    crate::sql::expr::functions::get_registry().contains_key(upper.as_str())
-}
-
-fn expr_may_have_udf(expr: &Expr) -> bool {
-    match expr {
-        Expr::Function(f) => {
-            let name = f.name.0.last().map(|n| n.value.clone()).unwrap_or_default();
-            if !is_known_builtin_function(&name) {
-                return true;
-            }
-            for arg in &f.args {
-                if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
-                | FunctionArg::Named {
-                    arg: FunctionArgExpr::Expr(e),
-                    ..
-                } = arg
-                {
-                    if expr_may_have_udf(e) {
-                        return true;
-                    }
-                }
-            }
-            false
-        }
-        Expr::BinaryOp { left, right, .. } => expr_may_have_udf(left) || expr_may_have_udf(right),
-        Expr::UnaryOp { expr: inner, .. } | Expr::Nested(inner) => expr_may_have_udf(inner),
-        Expr::Cast { expr: inner, .. } | Expr::TryCast { expr: inner, .. } => {
-            expr_may_have_udf(inner)
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            results,
-            else_result,
-        } => {
-            operand.as_ref().map_or(false, |o| expr_may_have_udf(o))
-                || conditions.iter().any(expr_may_have_udf)
-                || results.iter().any(expr_may_have_udf)
-                || else_result.as_ref().map_or(false, |e| expr_may_have_udf(e))
-        }
-        Expr::InList { expr: e, list, .. } => {
-            expr_may_have_udf(e) || list.iter().any(expr_may_have_udf)
-        }
-        Expr::Between {
-            expr, low, high, ..
-        } => expr_may_have_udf(expr) || expr_may_have_udf(low) || expr_may_have_udf(high),
-        Expr::IsNull(e) | Expr::IsNotNull(e) | Expr::IsTrue(e) | Expr::IsFalse(e) => {
-            expr_may_have_udf(e)
-        }
-        _ => false,
-    }
-}
-
-pub(crate) fn expr_may_have_udf_pub(expr: &Expr) -> bool {
-    expr_may_have_udf(expr)
-}
-
-pub(crate) fn projection_may_have_udf(projection: &[SelectItem]) -> bool {
-    projection.iter().any(|item| match item {
-        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-            expr_may_have_udf(e)
-        }
-        _ => false,
-    })
 }
 
 /// A reference to an aggregate expression found nested inside an expression tree.
@@ -1884,14 +1743,40 @@ impl Executor {
             }
         }
 
+        let needs_async_agg_proj = projection_exprs
+            .iter()
+            .any(|e| expr_contains_subquery(e) || sequences::expr_needs_async_eval(e));
+
         let mut projected_rows: Vec<Row> = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
-            for expr in &projection_exprs {
-                let val = eval_expr(expr, Some(row), Some(&agg_output_schema))?;
-                values.push(val);
+        if needs_async_agg_proj {
+            for row in &rows {
+                let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
+                for expr in &projection_exprs {
+                    values.push(
+                        self.eval_projection_expr(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            expr,
+                            row,
+                            &agg_output_schema,
+                            ctes,
+                        )
+                        .await?,
+                    );
+                }
+                projected_rows.push(Row::new(values));
             }
-            projected_rows.push(Row::new(values));
+        } else {
+            for row in &rows {
+                let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
+                for expr in &projection_exprs {
+                    let val = eval_expr(expr, Some(row), Some(&agg_output_schema))?;
+                    values.push(val);
+                }
+                projected_rows.push(Row::new(values));
+            }
         }
 
         if !order_by.is_empty() {
@@ -1910,6 +1795,428 @@ impl Executor {
             columns,
             column_types: Some(column_types),
             rows: projected_rows,
+            timezone: crate::session_context::current_timezone(),
+        })
+    }
+
+    /// Execute GROUPING SETS / CUBE / ROLLUP queries via the operator path.
+    ///
+    /// For each grouping set we run a separate `HashAggregateOperator` pass
+    /// (re-scanning the same preloaded rows), then union all results.
+    /// Columns that are not part of the current grouping set are set to NULL.
+    /// The `GROUPING()` introspection function is resolved during projection.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn execute_grouping_sets_with_operators(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        schema: TableSchema,
+        filter: Option<&Expr>,
+        grouping_sets: &[Vec<Expr>],
+        having: Option<&Expr>,
+        order_by: &[OrderByExpr],
+        limit: Option<usize>,
+        offset: usize,
+        projection: &[SelectItem],
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+        preloaded_rows: Option<Vec<Row>>,
+    ) -> Result<ExecuteResult> {
+        use super::select::order::expr_matches;
+
+        // Collect the union of all group-by columns across all grouping sets.
+        let all_group_cols: Vec<Expr> = {
+            let mut seen = std::collections::HashSet::new();
+            let mut all = Vec::new();
+            for set in grouping_sets {
+                for expr in set {
+                    let key = format!("{}", expr).to_lowercase();
+                    if seen.insert(key) {
+                        all.push(expr.clone());
+                    }
+                }
+            }
+            all
+        };
+
+        let (agg_exprs, agg_names, agg_types) = Self::extract_aggregate_info(projection, &schema);
+
+        // Pre-load rows once so we can reuse them across grouping sets.
+        let was_preloaded = preloaded_rows.is_some();
+        let base_rows: Vec<Row> = if let Some(rows) = preloaded_rows {
+            rows
+        } else {
+            let mut root: BoxedOperator = Box::new(TableScanOperator::new(schema.clone()));
+            if let Some(filter_expr) = filter {
+                root = Box::new(FilterOperator::new(root, filter_expr.clone()));
+            }
+            if ctes.is_empty() {
+                execute_operator_tree(
+                    &mut root,
+                    txn,
+                    self.store(),
+                    db_id,
+                    search_path,
+                    sequence_values,
+                )
+                .await?
+            } else {
+                execute_operator_tree_with_ctes(
+                    &mut root,
+                    txn,
+                    self.store(),
+                    db_id,
+                    search_path,
+                    sequence_values,
+                    ctes,
+                )
+                .await?
+            }
+        };
+
+        // Apply filter to pre-loaded rows if needed.
+        let filtered_rows: Vec<Row> = if !was_preloaded {
+            // Already filtered through the operator tree above.
+            base_rows
+        } else if let Some(filter_expr) = filter {
+            let mut out = Vec::new();
+            for row in base_rows {
+                let val = eval_expr(filter_expr, Some(&row), Some(&schema))?;
+                let val = coerce_text_literal_to_bool(filter_expr, val)?;
+                match val {
+                    Value::Boolean(true) => out.push(row),
+                    Value::Boolean(false) | Value::Null => {}
+                    _ => return Err(anyhow!("Filter must evaluate to boolean")),
+                }
+            }
+            out
+        } else {
+            base_rows
+        };
+
+        let mut all_result_rows: Vec<Row> = Vec::new();
+
+        for grouping_set in grouping_sets {
+            // Build group-by info for this particular set.
+            let mut gb_exprs = Vec::new();
+            let mut gb_names = Vec::new();
+            let mut gb_types = Vec::new();
+            for expr in grouping_set {
+                let name = match expr {
+                    Expr::Identifier(id) => id.value.clone(),
+                    Expr::CompoundIdentifier(parts) => parts
+                        .last()
+                        .map(|p| p.value.clone())
+                        .unwrap_or_else(|| format!("{}", expr)),
+                    _ => format!("{}", expr),
+                };
+                let data_type = infer_expr_type(expr, &schema);
+                gb_exprs.push(expr.clone());
+                gb_names.push(name);
+                gb_types.push(data_type);
+            }
+
+            let gb_count = gb_names.len();
+
+            // Build operator tree: preloaded scan → aggregate
+            let mut root: BoxedOperator = Box::new(TableScanOperator::new_with_rows(
+                schema.clone(),
+                filtered_rows.clone(),
+            ));
+
+            root = Box::new(HashAggregateOperator::new(
+                root,
+                gb_exprs.clone(),
+                agg_exprs.clone(),
+                gb_names.clone(),
+                gb_types.clone(),
+                agg_names.clone(),
+                agg_types.clone(),
+            ));
+
+            let rows = if ctes.is_empty() {
+                execute_operator_tree(
+                    &mut root,
+                    txn,
+                    self.store(),
+                    db_id,
+                    search_path,
+                    sequence_values,
+                )
+                .await?
+            } else {
+                execute_operator_tree_with_ctes(
+                    &mut root,
+                    txn,
+                    self.store(),
+                    db_id,
+                    search_path,
+                    sequence_values,
+                    ctes,
+                )
+                .await?
+            };
+
+            let agg_output_schema = root.schema().clone();
+
+            // Extend schema and rows with all group-by columns from all sets,
+            // so HAVING can reference columns absent from the current grouping set
+            // (they resolve to NULL, matching PostgreSQL GROUPING SETS semantics).
+            let (having_schema, rows) = if having.is_some() {
+                let existing_cols: std::collections::HashSet<String> = agg_output_schema
+                    .columns
+                    .iter()
+                    .map(|c| c.name.to_lowercase())
+                    .collect();
+                let mut extra_cols: Vec<(String, DataType)> = Vec::new();
+                for gc_expr in &all_group_cols {
+                    let name = match gc_expr {
+                        Expr::Identifier(id) => id.value.clone(),
+                        Expr::CompoundIdentifier(parts) => parts
+                            .last()
+                            .map(|p| p.value.clone())
+                            .unwrap_or_else(|| format!("{}", gc_expr)),
+                        _ => format!("{}", gc_expr),
+                    };
+                    if !existing_cols.contains(&name.to_lowercase()) {
+                        let dt = infer_expr_type(gc_expr, &schema);
+                        extra_cols.push((name, dt));
+                    }
+                }
+                if extra_cols.is_empty() {
+                    (agg_output_schema.clone(), rows)
+                } else {
+                    let mut extended_schema = agg_output_schema.clone();
+                    for (name, dt) in &extra_cols {
+                        extended_schema.columns.push(ColumnDef {
+                            name: name.clone(),
+                            data_type: dt.clone(),
+                            nullable: true,
+                            primary_key: false,
+                            unique: false,
+                            is_serial: false,
+                            default_expr: None,
+                        });
+                    }
+                    let extended_rows: Vec<Row> = rows
+                        .into_iter()
+                        .map(|mut row| {
+                            row.values
+                                .extend(std::iter::repeat(Value::Null).take(extra_cols.len()));
+                            row
+                        })
+                        .collect();
+                    (extended_schema, extended_rows)
+                }
+            } else {
+                (agg_output_schema.clone(), rows)
+            };
+
+            // Apply HAVING
+            let rows = if let Some(having_expr) = having {
+                let mut filtered = Vec::new();
+                for row in rows {
+                    let having_val = eval_having_expr_for_operators(
+                        having_expr,
+                        &row,
+                        &having_schema,
+                        &agg_exprs,
+                        gb_count,
+                    )?;
+                    let having_val = coerce_text_literal_to_bool(having_expr, having_val)?;
+                    match having_val {
+                        Value::Boolean(true) => filtered.push(row),
+                        Value::Boolean(false) | Value::Null => {}
+                        other => {
+                            return Err(anyhow!(
+                                "HAVING clause must evaluate to boolean, got {:?}",
+                                other
+                            ));
+                        }
+                    }
+                }
+                filtered
+            } else {
+                rows
+            };
+
+            // Build column maps for projection rewriting.
+            let agg_column_map: HashMap<String, String> = {
+                let mut map = HashMap::new();
+                for (i, agg) in agg_exprs.iter().enumerate() {
+                    if agg.func_name.eq_ignore_ascii_case("ARRAY_AGG") {
+                        if let Some(arg) = agg.arg.as_ref() {
+                            let sig = array_agg_signature_for_map(agg.distinct, arg, &agg.order_by);
+                            map.insert(sig, agg_names[i].clone());
+                        }
+                        continue;
+                    }
+                    let distinct_prefix = if agg.distinct { "DISTINCT " } else { "" };
+                    let arg_str = agg
+                        .arg
+                        .as_ref()
+                        .map_or("*".to_string(), |e| format!("{}", e));
+                    let filter_suffix = agg
+                        .filter
+                        .as_ref()
+                        .map_or(String::new(), |flt| format!(" filter(where {})", flt));
+                    let mut sig = format!(
+                        "{}({}{}){}",
+                        agg.func_name, distinct_prefix, arg_str, filter_suffix
+                    )
+                    .to_lowercase();
+                    if let Some(ref delim) = agg.delimiter {
+                        sig = format!(
+                            "{}({}{}, '{}'){}",
+                            agg.func_name, distinct_prefix, arg_str, delim, filter_suffix
+                        )
+                        .to_lowercase();
+                    }
+                    map.insert(sig, agg_names[i].clone());
+                }
+                for item in projection {
+                    let expr = match item {
+                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+                        _ => continue,
+                    };
+                    if let Expr::Function(f) = expr {
+                        if is_aggregate_func(f) {
+                            let sig = agg_func_signature(f);
+                            let name = get_select_item_name(item);
+                            if !map.contains_key(&sig) {
+                                map.insert(sig, name);
+                            }
+                        }
+                    }
+                    if let Expr::ArrayAgg(_) = expr {
+                        let sig = format!("{}", expr).to_lowercase();
+                        let name = get_select_item_name(item);
+                        if !map.contains_key(&sig) {
+                            map.insert(sig, name);
+                        }
+                    }
+                }
+                map
+            };
+
+            let group_by_expr_map: HashMap<String, String> = gb_exprs
+                .iter()
+                .zip(gb_names.iter())
+                .map(|(expr, name)| (format!("{}", expr).to_lowercase(), name.clone()))
+                .collect();
+
+            // Project each row, applying grouping-set NULL logic and GROUPING().
+            for row in &rows {
+                let mut values: Vec<Value> = Vec::new();
+
+                for item in projection {
+                    let col_expr = match item {
+                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+                        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                            for col in &agg_output_schema.columns {
+                                let val = eval_expr(
+                                    &Expr::Identifier(Ident::new(col.name.clone())),
+                                    Some(row),
+                                    Some(&agg_output_schema),
+                                )?;
+                                values.push(val);
+                            }
+                            continue;
+                        }
+                    };
+
+                    // Handle GROUPING() introspection function
+                    if let Expr::Function(func) = col_expr {
+                        let func_name = func
+                            .name
+                            .0
+                            .last()
+                            .map(|i| i.value.to_uppercase())
+                            .unwrap_or_default();
+                        if func_name == "GROUPING" && func.args.len() == 1 {
+                            let arg_expr = match &func.args[0] {
+                                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                                _ => None,
+                            };
+                            if let Some(arg_expr) = arg_expr {
+                                let is_in_set = grouping_set
+                                    .iter()
+                                    .any(|gs_expr| expr_matches(gs_expr, arg_expr));
+                                values.push(Value::Int32(if is_in_set { 0 } else { 1 }));
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Check if this expression is a group-by column that's NOT
+                    // in the current grouping set → emit NULL.
+                    let is_group_col = all_group_cols.iter().any(|gc| expr_matches(gc, col_expr));
+                    if is_group_col {
+                        let is_in_current_set = grouping_set
+                            .iter()
+                            .any(|gs_expr| expr_matches(gs_expr, col_expr));
+                        if !is_in_current_set {
+                            values.push(Value::Null);
+                            continue;
+                        }
+                    }
+
+                    // Normal projection: rewrite aggregate/group-by refs.
+                    let expr_str = format!("{}", col_expr).to_lowercase();
+                    let rewritten = if let Some(gb_col) = group_by_expr_map.get(&expr_str) {
+                        Expr::Identifier(Ident::new(gb_col.clone()))
+                    } else {
+                        rewrite_agg_refs_to_columns(col_expr, &agg_column_map, &gb_names)
+                    };
+                    let val = eval_expr(&rewritten, Some(row), Some(&agg_output_schema))?;
+                    values.push(val);
+                }
+
+                all_result_rows.push(Row::new(values));
+            }
+        }
+
+        // Build output column names and types.
+        let mut columns: Vec<String> = Vec::new();
+        let mut column_types: Vec<DataType> = Vec::new();
+        for item in projection {
+            match item {
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                    for col in &schema.columns {
+                        columns.push(col.name.clone());
+                        column_types.push(col.data_type.clone());
+                    }
+                }
+                _ => {
+                    columns.push(get_select_item_name(item));
+                    let dt = match item {
+                        SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                            infer_expr_type(expr, &schema)
+                        }
+                        _ => DataType::Text,
+                    };
+                    column_types.push(dt);
+                }
+            }
+        }
+
+        // ORDER BY, OFFSET, LIMIT
+        if !order_by.is_empty() {
+            all_result_rows =
+                self.apply_order_by_for_aggregate(all_result_rows, order_by, &columns);
+        }
+        if offset > 0 {
+            all_result_rows = all_result_rows.into_iter().skip(offset).collect();
+        }
+        if let Some(limit) = limit {
+            all_result_rows.truncate(limit);
+        }
+
+        Ok(ExecuteResult::Select {
+            columns,
+            column_types: Some(column_types),
+            rows: all_result_rows,
             timezone: crate::session_context::current_timezone(),
         })
     }
@@ -2670,15 +2977,27 @@ impl Executor {
             });
         }
 
+        // Check if ORDER BY expressions (after alias resolution) need async evaluation.
+        // If so, skip pre-projection sort; we'll sort after projection instead.
+        let pre_proj_order_by = rewrite_order_by_for_pre_projection_sort(order_by)?;
+        let order_by_needs_async = pre_proj_order_by
+            .iter()
+            .any(|o| expr_contains_subquery(&o.expr) || sequences::expr_needs_async_eval(&o.expr));
+        let effective_pre_proj_order = if order_by_needs_async {
+            Vec::new()
+        } else {
+            pre_proj_order_by
+        };
+
+        let mut preloaded_source = preloaded_source;
         let base_operator = if let Some(mut op) = preloaded_source.take() {
             if let Some(filter_expr) = filter {
                 op = Box::new(FilterOperator::new(op, filter_expr.clone()));
             }
-            let rewritten_order_by = rewrite_order_by_for_pre_projection_sort(order_by)?;
-            if !rewritten_order_by.is_empty() {
-                op = Box::new(SortOperator::new(op, rewritten_order_by));
+            if !effective_pre_proj_order.is_empty() {
+                op = Box::new(SortOperator::new(op, effective_pre_proj_order));
             }
-            if limit.is_some() || offset > 0 {
+            if !order_by_needs_async && (limit.is_some() || offset > 0) {
                 op = Box::new(LimitOperator::new(op, limit, offset));
             }
             op
@@ -2687,9 +3006,9 @@ impl Executor {
                 db_id,
                 schema.clone(),
                 filter,
-                rewrite_order_by_for_pre_projection_sort(order_by)?,
-                limit,
-                offset,
+                effective_pre_proj_order,
+                if order_by_needs_async { None } else { limit },
+                if order_by_needs_async { 0 } else { offset },
                 estimated_rows,
             )?
         };
@@ -2732,14 +3051,106 @@ impl Executor {
             });
         }
 
-        let mut rows: Vec<Row> = Vec::with_capacity(raw_rows.len());
-        for row in raw_rows {
-            let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
-            for expr in &projection_exprs {
-                values.push(eval_expr(expr, Some(&row), Some(&schema))?);
+        let needs_async_proj = projection_exprs
+            .iter()
+            .any(|e| expr_contains_subquery(e) || sequences::expr_needs_async_eval(e));
+
+        // If ORDER BY was deferred (has UDFs or subqueries), compute sort keys
+        // from pre-projection rows BEFORE projection consumes them.
+        let pre_proj_order = if order_by_needs_async && !order_by.is_empty() {
+            Some(rewrite_order_by_for_pre_projection_sort(order_by)?)
+        } else {
+            None
+        };
+        let sort_keys: Option<Vec<Vec<Value>>> = if let Some(ref ppo) = pre_proj_order {
+            let mut all_keys = Vec::with_capacity(raw_rows.len());
+            for row in &raw_rows {
+                let mut keys = Vec::with_capacity(ppo.len());
+                for o in ppo {
+                    let val = self
+                        .eval_projection_expr(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            &o.expr,
+                            row,
+                            &schema,
+                            ctes,
+                        )
+                        .await?;
+                    keys.push(val);
+                }
+                all_keys.push(keys);
             }
-            rows.push(Row::new(values));
+            Some(all_keys)
+        } else {
+            None
+        };
+
+        let mut rows: Vec<Row> = Vec::with_capacity(raw_rows.len());
+        if needs_async_proj {
+            for row in raw_rows {
+                let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
+                for expr in &projection_exprs {
+                    values.push(
+                        self.eval_projection_expr(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            expr,
+                            &row,
+                            &schema,
+                            ctes,
+                        )
+                        .await?,
+                    );
+                }
+                rows.push(Row::new(values));
+            }
+        } else {
+            for row in raw_rows {
+                let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
+                for expr in &projection_exprs {
+                    values.push(eval_expr(expr, Some(&row), Some(&schema))?);
+                }
+                rows.push(Row::new(values));
+            }
         }
+
+        // Sort using precomputed keys from pre-projection rows.
+        let rows = if let (Some(keys), Some(ref ppo)) = (sort_keys, &pre_proj_order) {
+            let mut keyed: Vec<(Vec<Value>, Row)> = keys.into_iter().zip(rows).collect();
+            keyed.sort_by(|(ka, _), (kb, _)| {
+                for (idx, o) in ppo.iter().enumerate() {
+                    let asc = o.asc.unwrap_or(true);
+                    let va = &ka[idx];
+                    let vb = &kb[idx];
+                    let cmp_val = compare_values(va, vb).unwrap_or(0);
+                    let ord = match cmp_val {
+                        x if x < 0 => std::cmp::Ordering::Less,
+                        x if x > 0 => std::cmp::Ordering::Greater,
+                        _ => std::cmp::Ordering::Equal,
+                    };
+                    let ord = if asc { ord } else { ord.reverse() };
+                    if ord != std::cmp::Ordering::Equal {
+                        return ord;
+                    }
+                }
+                std::cmp::Ordering::Equal
+            });
+            let mut sorted: Vec<Row> = keyed.into_iter().map(|(_, row)| row).collect();
+            if offset > 0 {
+                sorted = sorted.into_iter().skip(offset).collect();
+            }
+            if let Some(lim) = limit {
+                sorted.truncate(lim);
+            }
+            sorted
+        } else {
+            rows
+        };
 
         Ok(ExecuteResult::Select {
             columns,
@@ -2810,6 +3221,17 @@ impl Executor {
                     output_exprs_for_positional_order_by
                         .push(Self::rewrite_window_refs(expr, &window_sig_to_column));
                 }
+            }
+        }
+
+        // Register implicit window aliases (window_0, window_1, ...) for ORDER BY resolution
+        for (_sig, internal_name) in &window_sig_to_column {
+            if let Some(public_alias) = internal_name.strip_prefix("__") {
+                alias_exprs_for_order_by
+                    .entry(public_alias.to_string())
+                    .or_insert_with(|| {
+                        Expr::Identifier(sqlparser::ast::Ident::new(internal_name.clone()))
+                    });
             }
         }
 
@@ -3255,7 +3677,24 @@ impl Executor {
                         projection_exprs.push(Expr::Identifier(Ident::new(col.name.clone())));
                     }
                 }
-                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                SelectItem::UnnamedExpr(expr) => {
+                    // Use implicit window alias (window_0, etc.) for bare window functions
+                    let col_name = if matches!(expr, Expr::Function(f) if f.over.is_some()) {
+                        let sig = format!("{}", expr).to_lowercase();
+                        window_sig_to_column
+                            .get(&sig)
+                            .and_then(|internal| internal.strip_prefix("__"))
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| get_select_item_name(item))
+                    } else {
+                        get_select_item_name(item)
+                    };
+                    columns.push(col_name);
+                    let rewritten = Self::rewrite_window_refs(expr, window_sig_to_column);
+                    column_types.push(infer_expr_type(&rewritten, &window_schema));
+                    projection_exprs.push(rewritten);
+                }
+                SelectItem::ExprWithAlias { expr, .. } => {
                     columns.push(get_select_item_name(item));
                     let rewritten = Self::rewrite_window_refs(expr, window_sig_to_column);
                     column_types.push(infer_expr_type(&rewritten, &window_schema));

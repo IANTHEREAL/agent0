@@ -156,6 +156,8 @@ fn is_known_builtin_function(name: &str) -> bool {
         | "CURRENT_SCHEMA" | "NEXTVAL" | "CURRVAL" | "SETVAL"
         // Vector functions (if supported)
         | "VECTOR_DIMS" | "VECTOR_NORM"
+        // Vector distance functions (rewritten from <->, <#>, <=> operators by parser)
+        | "L2_DISTANCE" | "INNER_PRODUCT" | "COSINE_DISTANCE"
     )
 }
 

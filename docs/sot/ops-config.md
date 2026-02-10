@@ -38,7 +38,6 @@
 | `PGTIKV_OBS_MAX_SAMPLE_GROUPS` | env | `50` | `src/observability.rs` (`ObservabilityConfig::from_env`) | Cap for distinct query sample groups; must be `> 0`. |
 | `PGTIKV_OBS_MAX_SQL_LEN` | env | `512` | `src/observability.rs` (`ObservabilityConfig::from_env`) | Max SQL length stored for sampled queries; must be `> 0`. |
 | `PGTIKV_HTTP_ALLOW_INSECURE` | env | `false` | `src/extensions/http.rs` (`allow_insecure_http`) | When true, allows non-HTTPS HTTP extension requests; accepts `"1"` or case-insensitive `"true"`. |
-| `PGTIKV_USE_OPERATORS` | env | `true` | `src/sql/executor/operators.rs` (`use_operator_execution`) | Toggle operator-based execution; accepts `"1"` or case-insensitive `"true"`. |
 | `PGTIKV_MAX_GENERATE_SERIES_ROWS` | env | `1000000` | `src/sql/executor/table_utils.rs` (`max_generate_series_rows`) | Guardrail for `generate_series`; must parse as `usize` and be `> 0`. |
 | `PGTIKV_MAX_SUSPENDED_PORTALS` | env | `32` | `src/protocol/handler/portal.rs` (`max_suspended_portals`) | Upper bound for suspended portals kept in memory; must parse as `usize` and be `> 0`. |
 | `PGTIKV_MAX_SUSPENDED_PORTAL_BUFFER_ROWS` | env | `10000` | `src/protocol/handler/portal.rs` (`max_suspended_portal_buffer_rows`) | Row count cap for buffered suspended-portal rows; must parse as `usize` and be `> 0`. |

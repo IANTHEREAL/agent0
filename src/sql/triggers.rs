@@ -1,7 +1,7 @@
 //! BEFORE trigger execution for INSERT/UPDATE DML operations.
 
 use crate::storage::TikvStore;
-use crate::types::{FunctionDef, Row, TableSchema, TriggerDef, Value};
+use crate::types::{FunctionDef, Row, TableSchema, TriggerDef};
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -445,6 +445,7 @@ async fn execute_trigger_body_cached(
 mod tests {
     use super::*;
     use crate::sql::trigger_rewrite::value_to_sql_literal;
+    use crate::types::Value;
 
     #[test]
     fn test_substitute_row_references() {

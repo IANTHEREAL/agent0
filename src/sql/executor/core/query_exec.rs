@@ -55,6 +55,62 @@ impl Executor {
         }
     }
 
+    /// Evaluate a projection expression that may contain correlated subqueries or UDFs.
+    /// Falls back to sync eval_expr for simple expressions.
+    pub(crate) async fn eval_projection_expr(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        expr: &Expr,
+        row: &Row,
+        schema: &TableSchema,
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Result<Value> {
+        use super::super::subquery::{expr_contains_subquery, substitute_outer_values};
+
+        if expr_contains_subquery(expr) {
+            let outer_alias = schema
+                .from_alias
+                .as_deref()
+                .unwrap_or(schema.name.rsplit('.').next().unwrap_or(&schema.name));
+            let substituted = substitute_outer_values(expr, outer_alias, schema, row);
+            let resolved = self
+                .resolve_subqueries(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    &substituted,
+                    ctes,
+                    &[],
+                )
+                .await?;
+            self.eval_expr_maybe_sequence(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                &resolved,
+                Some(row),
+                Some(schema),
+            )
+            .await
+        } else {
+            self.eval_expr_maybe_sequence(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                expr,
+                Some(row),
+                Some(schema),
+            )
+            .await
+        }
+    }
+
     pub(crate) async fn execute_query(
         &self,
         txn: &mut Transaction,

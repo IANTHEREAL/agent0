@@ -637,14 +637,12 @@ impl Executor {
             table_scan_pairs,
             index_scan_pairs,
             batch_get_keys,
-            gin_scan_keys,
         }) = kv_stats
         {
             use std::fmt::Write;
             writeln!(&mut plan_text, "KV Table Scan Pairs: {}", table_scan_pairs).unwrap();
             writeln!(&mut plan_text, "KV Index Scan Pairs: {}", index_scan_pairs).unwrap();
             writeln!(&mut plan_text, "KV Batch Get Keys: {}", batch_get_keys).unwrap();
-            writeln!(&mut plan_text, "KV GIN Scan Keys: {}", gin_scan_keys).unwrap();
         }
 
         let lines: Vec<Row> = plan_text

@@ -684,21 +684,6 @@ impl ViewDef {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TablePrivilegeGrant {
-    pub grantor: String,
-    pub grantee: String,
-    pub privilege_type: String,
-    pub is_grantable: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DefaultTablePrivilegeGrant {
-    pub grantee: String,
-    pub privilege_type: String,
-    pub is_grantable: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

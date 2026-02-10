@@ -48,7 +48,6 @@
 
 ## Configuration
 This module MUST NOT redefine config keys. Relevant keys are defined exactly once in `./ops-config.md`:
-- `PGTIKV_USE_OPERATORS`
 - `PGTIKV_MAX_GENERATE_SERIES_ROWS`
 - `PGTIKV_TRIGGER_ENABLED`, `PGTIKV_TRIGGER_*`
 - `PGTIKV_OBS_ENABLED`, `PGTIKV_OBS_*`

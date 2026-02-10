@@ -55,33 +55,6 @@ mod tests {
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 
-    fn make_schema(col_names: &[&str]) -> TableSchema {
-        TableSchema {
-            name: "t".to_string(),
-            table_id: 0,
-            columns: col_names
-                .iter()
-                .map(|name| crate::types::ColumnDef {
-                    name: (*name).to_string(),
-                    data_type: DataType::Int32,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                })
-                .collect(),
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![],
-            indexes: vec![],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            from_alias: None,
-        }
-    }
-
     fn ident(name: &str) -> Expr {
         Expr::Identifier(sqlparser::ast::Ident::new(name))
     }
@@ -93,59 +66,6 @@ mod tests {
             sqlparser::ast::Statement::Query(q) => q,
             other => panic!("expected query, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn resolves_order_by_positional_for_select_projection() {
-        let query = parse_query("SELECT a, b FROM t ORDER BY 2");
-        let SetExpr::Select(select) = &*query.body else {
-            panic!("Expected SELECT");
-        };
-
-        let schema = make_schema(&["a", "b"]);
-        let resolved =
-            resolve_order_by_exprs_for_non_agg(&query.order_by, &select.projection, &schema)
-                .unwrap();
-
-        assert_eq!(resolved.len(), 1);
-        assert!(
-            matches!(&resolved[0], Expr::Identifier(id) if id.value == "b"),
-            "unexpected resolved expr: {:?}",
-            resolved[0]
-        );
-    }
-
-    #[test]
-    fn resolves_order_by_positional_for_select_wildcard() {
-        let query = parse_query("SELECT * FROM t ORDER BY 2");
-        let SetExpr::Select(select) = &*query.body else {
-            panic!("Expected SELECT");
-        };
-
-        let schema = make_schema(&["a", "b", "c"]);
-        let resolved =
-            resolve_order_by_exprs_for_non_agg(&query.order_by, &select.projection, &schema)
-                .unwrap();
-
-        assert_eq!(resolved.len(), 1);
-        assert!(
-            matches!(&resolved[0], Expr::Identifier(id) if id.value == "b"),
-            "unexpected resolved expr: {:?}",
-            resolved[0]
-        );
-    }
-
-    #[test]
-    fn rejects_out_of_range_order_by_position() {
-        let query = parse_query("SELECT a FROM t ORDER BY 2");
-        let SetExpr::Select(select) = &*query.body else {
-            panic!("Expected SELECT");
-        };
-
-        let schema = make_schema(&["a"]);
-        let err = resolve_order_by_exprs_for_non_agg(&query.order_by, &select.projection, &schema)
-            .unwrap_err();
-        assert!(err.to_string().contains("ORDER BY position 2"));
     }
 
     #[test]

@@ -1784,10 +1784,6 @@ fn eval_date_trunc_from_args(args: Vec<Value>) -> Result<Value> {
     Ok(Value::Timestamp(truncated.timestamp_millis()))
 }
 
-pub fn eval_value_public(v: &SqlValue) -> Result<Value> {
-    eval_value(v)
-}
-
 pub fn eval_binary_op_public(left: Value, op: &BinaryOperator, right: Value) -> Result<Value> {
     eval_binary_op(left, op, right)
 }

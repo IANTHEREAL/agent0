@@ -1,11 +1,224 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use sqlparser::ast::Expr;
+use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr};
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::expr::eval_expr_with_query_ctx;
 use crate::sql::query_context::QueryContext;
-use crate::types::{ColumnDef, DataType, Row, TableSchema};
+use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+
+/// Identifies set-returning function kinds that expand one input row to many.
+#[derive(Copy, Clone, Debug)]
+enum SrfKind {
+    Unnest,
+    RegexpSplitToTable,
+    RegexpMatches,
+    EvalFunctionArray,
+}
+
+fn detect_srf(expr: &Expr) -> Option<SrfKind> {
+    let Expr::Function(f) = expr else {
+        return None;
+    };
+    let Some(name) = f.name.0.last() else {
+        return None;
+    };
+    match name.value.to_ascii_uppercase().as_str() {
+        "UNNEST" => Some(SrfKind::Unnest),
+        "REGEXP_SPLIT_TO_TABLE" => Some(SrfKind::RegexpSplitToTable),
+        "REGEXP_MATCHES" => Some(SrfKind::RegexpMatches),
+        "JSONB_OBJECT_KEYS"
+        | "JSONB_ARRAY_ELEMENTS"
+        | "JSONB_ARRAY_ELEMENTS_TEXT"
+        | "JSONB_EACH"
+        | "JSONB_EACH_TEXT" => Some(SrfKind::EvalFunctionArray),
+        _ => None,
+    }
+}
+
+fn regexp_captures_to_values(caps: &regex::Captures<'_>) -> Vec<Value> {
+    if caps.len() > 1 {
+        (1..caps.len())
+            .map(|idx| match caps.get(idx) {
+                Some(m) => Value::Text(m.as_str().to_string()),
+                None => Value::Null,
+            })
+            .collect()
+    } else {
+        caps.get(0)
+            .map(|m| vec![Value::Text(m.as_str().to_string())])
+            .unwrap_or_default()
+    }
+}
+
+/// Evaluate a set-returning function and return the expanded values.
+fn eval_srf(
+    kind: SrfKind,
+    f: &Function,
+    input: &Row,
+    schema: &TableSchema,
+    query_ctx: Option<&QueryContext>,
+) -> Result<Vec<Value>> {
+    match kind {
+        SrfKind::Unnest => {
+            let arg_expr = f.args.first().and_then(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                _ => None,
+            });
+            if let Some(arg_expr) = arg_expr {
+                match eval_expr_with_query_ctx(arg_expr, Some(input), Some(schema), query_ctx)? {
+                    Value::Array(arr) => Ok(arr),
+                    Value::Null => Ok(Vec::new()),
+                    other => Ok(vec![other]),
+                }
+            } else {
+                Ok(Vec::new())
+            }
+        }
+        SrfKind::RegexpSplitToTable => {
+            let arg0 = f.args.get(0).and_then(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                _ => None,
+            });
+            let arg1 = f.args.get(1).and_then(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                _ => None,
+            });
+            let arg2 = f.args.get(2).and_then(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                _ => None,
+            });
+            let (Some(arg0), Some(arg1)) = (arg0, arg1) else {
+                return Err(anyhow!(
+                    "regexp_split_to_table requires at least 2 arguments"
+                ));
+            };
+
+            let source_val = eval_expr_with_query_ctx(arg0, Some(input), Some(schema), query_ctx)?;
+            let source = match source_val {
+                Value::Text(s) => Some(s),
+                Value::Null => None,
+                v => Some(v.to_string()),
+            };
+
+            let pattern_val = eval_expr_with_query_ctx(arg1, Some(input), Some(schema), query_ctx)?;
+            let pattern = match pattern_val {
+                Value::Text(s) => Some(s),
+                Value::Null => None,
+                v => Some(v.to_string()),
+            };
+
+            match (source, pattern) {
+                (Some(source), Some(pattern)) => {
+                    let flags = if let Some(arg2) = arg2 {
+                        match eval_expr_with_query_ctx(arg2, Some(input), Some(schema), query_ctx)?
+                        {
+                            Value::Text(s) => s,
+                            Value::Null => String::new(),
+                            v => v.to_string(),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let case_insensitive = flags.to_ascii_lowercase().contains('i');
+                    let regex_pattern = if case_insensitive {
+                        format!("(?i){}", pattern)
+                    } else {
+                        pattern
+                    };
+                    let re = regex::Regex::new(&regex_pattern)
+                        .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+
+                    let mut parts = Vec::new();
+                    let mut last_end = 0usize;
+                    for m in re.find_iter(&source) {
+                        parts.push(Value::Text(source[last_end..m.start()].to_string()));
+                        last_end = m.end();
+                    }
+                    parts.push(Value::Text(source[last_end..].to_string()));
+                    Ok(parts)
+                }
+                _ => Ok(Vec::new()),
+            }
+        }
+        SrfKind::RegexpMatches => {
+            let arg0 = f.args.get(0).and_then(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                _ => None,
+            });
+            let arg1 = f.args.get(1).and_then(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                _ => None,
+            });
+            let arg2 = f.args.get(2).and_then(|arg| match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
+                _ => None,
+            });
+            let (Some(arg0), Some(arg1)) = (arg0, arg1) else {
+                return Err(anyhow!("regexp_matches requires at least 2 arguments"));
+            };
+
+            let source_val = eval_expr_with_query_ctx(arg0, Some(input), Some(schema), query_ctx)?;
+            let source = match source_val {
+                Value::Text(s) => Some(s),
+                Value::Null => None,
+                v => Some(v.to_string()),
+            };
+
+            let pattern_val = eval_expr_with_query_ctx(arg1, Some(input), Some(schema), query_ctx)?;
+            let pattern = match pattern_val {
+                Value::Text(s) => Some(s),
+                Value::Null => None,
+                v => Some(v.to_string()),
+            };
+
+            match (source, pattern) {
+                (Some(source), Some(pattern)) => {
+                    let flags = if let Some(arg2) = arg2 {
+                        match eval_expr_with_query_ctx(arg2, Some(input), Some(schema), query_ctx)?
+                        {
+                            Value::Text(s) => s,
+                            Value::Null => String::new(),
+                            v => v.to_string(),
+                        }
+                    } else {
+                        String::new()
+                    };
+                    let global = flags.to_ascii_lowercase().contains('g');
+                    let case_insensitive = flags.to_ascii_lowercase().contains('i');
+                    let regex_pattern = if case_insensitive {
+                        format!("(?i){}", pattern)
+                    } else {
+                        pattern
+                    };
+                    let re = regex::Regex::new(&regex_pattern)
+                        .map_err(|e| anyhow!("Invalid regex pattern: {}", e))?;
+
+                    let mut out = Vec::new();
+                    if global {
+                        for caps in re.captures_iter(&source) {
+                            out.push(Value::Array(regexp_captures_to_values(&caps)));
+                        }
+                    } else if let Some(caps) = re.captures(&source) {
+                        out.push(Value::Array(regexp_captures_to_values(&caps)));
+                    }
+                    Ok(out)
+                }
+                _ => Ok(Vec::new()),
+            }
+        }
+        SrfKind::EvalFunctionArray => {
+            // JSONB_OBJECT_KEYS, JSONB_ARRAY_ELEMENTS, etc. — eval_expr already
+            // returns the array; we just need to unpack it.
+            let func_expr = Expr::Function(f.clone());
+            match eval_expr_with_query_ctx(&func_expr, Some(input), Some(schema), query_ctx)? {
+                Value::Array(arr) => Ok(arr),
+                Value::Null => Ok(Vec::new()),
+                other => Ok(vec![other]),
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct ProjectOperator {
@@ -15,6 +228,10 @@ pub struct ProjectOperator {
     output_names: Vec<String>,
     output_schema: TableSchema,
     opened: bool,
+    /// Pre-computed SRF info: (expression_index, SrfKind) for each SRF in the projection.
+    srf_indices: Vec<(usize, SrfKind)>,
+    /// Buffer for SRF-expanded rows waiting to be yielded.
+    srf_buffer: Vec<Row>,
 }
 
 impl ProjectOperator {
@@ -50,12 +267,20 @@ impl ProjectOperator {
             from_alias: None,
         };
 
+        let srf_indices: Vec<(usize, SrfKind)> = expressions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, expr)| detect_srf(expr).map(|kind| (i, kind)))
+            .collect();
+
         Self {
             child,
             expressions,
             output_names,
             output_schema,
             opened: false,
+            srf_indices,
+            srf_buffer: Vec::new(),
         }
     }
 
@@ -70,6 +295,62 @@ impl ProjectOperator {
 
         Ok(Row::new(values))
     }
+
+    /// Project a row that contains SRFs, returning a vector of expanded rows.
+    fn project_row_with_srf(
+        &self,
+        input: &Row,
+        query_ctx: Option<&QueryContext>,
+    ) -> Result<Vec<Row>> {
+        let child_schema = self.child.schema();
+
+        // First, evaluate all expressions and collect SRF outputs.
+        let mut base_values = Vec::with_capacity(self.expressions.len());
+        let mut srf_outputs: Vec<(usize, Vec<Value>)> = Vec::new();
+
+        for (i, expr) in self.expressions.iter().enumerate() {
+            if let Some(&(_, kind)) = self.srf_indices.iter().find(|(idx, _)| *idx == i) {
+                let Expr::Function(f) = expr else {
+                    base_values.push(Value::Null);
+                    continue;
+                };
+                let outputs = eval_srf(kind, f, input, child_schema, query_ctx)?;
+                srf_outputs.push((i, outputs));
+                base_values.push(Value::Null); // placeholder
+            } else {
+                let value =
+                    eval_expr_with_query_ctx(expr, Some(input), Some(child_schema), query_ctx)?;
+                base_values.push(value);
+            }
+        }
+
+        if srf_outputs.is_empty() {
+            return Ok(vec![Row::new(base_values)]);
+        }
+
+        // Expand: find max SRF length, create one row per position.
+        let max_len = srf_outputs
+            .iter()
+            .map(|(_, out)| out.len())
+            .max()
+            .unwrap_or(0);
+
+        if max_len == 0 {
+            // All SRFs returned empty → produce no rows (like PostgreSQL).
+            return Ok(Vec::new());
+        }
+
+        let mut expanded = Vec::with_capacity(max_len);
+        for i in 0..max_len {
+            let mut row_values = base_values.clone();
+            for (col_idx, out) in &srf_outputs {
+                row_values[*col_idx] = out.get(i).cloned().unwrap_or(Value::Null);
+            }
+            expanded.push(Row::new(row_values));
+        }
+
+        Ok(expanded)
+    }
 }
 
 #[async_trait]
@@ -81,6 +362,7 @@ impl PhysicalOperator for ProjectOperator {
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
         self.opened = true;
+        self.srf_buffer.clear();
         Ok(())
     }
 
@@ -89,17 +371,44 @@ impl PhysicalOperator for ProjectOperator {
             return Err(anyhow!("Operator not opened"));
         }
 
-        if let Some(row) = self.child.next(ctx).await? {
-            let projected = self.project_row(&row, ctx.query_ctx)?;
-            Ok(Some(projected))
+        // If we have buffered SRF-expanded rows, yield from buffer first.
+        if !self.srf_buffer.is_empty() {
+            return Ok(Some(self.srf_buffer.remove(0)));
+        }
+
+        if self.srf_indices.is_empty() {
+            // No SRFs — fast path, same as before.
+            if let Some(row) = self.child.next(ctx).await? {
+                let projected = self.project_row(&row, ctx.query_ctx)?;
+                Ok(Some(projected))
+            } else {
+                Ok(None)
+            }
         } else {
-            Ok(None)
+            // SRF path: keep fetching child rows until we get at least one expanded row.
+            loop {
+                let Some(row) = self.child.next(ctx).await? else {
+                    return Ok(None);
+                };
+                let mut expanded = self.project_row_with_srf(&row, ctx.query_ctx)?;
+                if expanded.is_empty() {
+                    continue; // SRFs returned empty, skip this input row.
+                }
+                if expanded.len() == 1 {
+                    return Ok(Some(expanded.remove(0)));
+                }
+                // Buffer remaining rows, return first.
+                let first = expanded.remove(0);
+                self.srf_buffer = expanded;
+                return Ok(Some(first));
+            }
         }
     }
 
     async fn close(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         self.child.close(ctx).await?;
         self.opened = false;
+        self.srf_buffer.clear();
         Ok(())
     }
 

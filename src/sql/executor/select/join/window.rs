@@ -102,6 +102,15 @@ impl Executor {
             }
         }
 
+        // Register implicit window aliases (window_0, window_1, ...) for ORDER BY resolution
+        for (_sig, internal_name) in &window_sig_to_column {
+            if let Some(public_alias) = internal_name.strip_prefix("__") {
+                alias_exprs
+                    .entry(public_alias.to_string())
+                    .or_insert_with(|| Expr::Identifier(Ident::new(internal_name.clone())));
+            }
+        }
+
         for o in &query.order_by {
             let expr = if let Expr::Identifier(ident) = &o.expr {
                 if let Some(e) = alias_exprs.get(&ident.value.to_lowercase()) {

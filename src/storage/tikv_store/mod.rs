@@ -3,9 +3,8 @@ use super::kv_stats;
 use crate::extensions::InstalledExtension;
 use crate::txn::{txn_delete, txn_put};
 use crate::types::{
-    DataType, DatabaseDef, DefaultTablePrivilegeGrant, FunctionDef, Row, SequenceBacking,
-    SequenceDef, SequenceState, TablePrivilegeGrant, TableSchema, TriggerDef, UserTypeDef, Value,
-    ViewDef,
+    DataType, DatabaseDef, FunctionDef, Row, SequenceBacking, SequenceDef, SequenceState,
+    TableSchema, TriggerDef, UserTypeDef, Value, ViewDef,
 };
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -127,11 +126,6 @@ impl TikvStore {
             .expect("TikvStore: no client (test stub used in production code path?)")
     }
 
-    #[allow(dead_code)]
-    pub async fn new(pd_endpoints: Vec<String>) -> Result<Self> {
-        Self::new_with_keyspace(pd_endpoints, None).await
-    }
-
     pub async fn new_with_keyspace(
         pd_endpoints: Vec<String>,
         keyspace: Option<String>,
@@ -184,7 +178,6 @@ impl TikvStore {
             .map_err(|e| anyhow!(e))
     }
 
-    #[allow(dead_code)]
     pub async fn begin_optimistic(&self) -> Result<Transaction> {
         let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::Warn);
         self.client()

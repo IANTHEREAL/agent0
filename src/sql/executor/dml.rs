@@ -520,8 +520,16 @@ impl Executor {
         }
         let resolved_selection = if let Some(sel) = selection {
             Some(
-                self.resolve_subqueries(txn, db_id, sequence_values, search_path, sel, &ctes_ctx)
-                    .await?,
+                self.resolve_subqueries(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    sel,
+                    &ctes_ctx,
+                    &[],
+                )
+                .await?,
             )
         } else {
             None
@@ -749,8 +757,16 @@ impl Executor {
         }
         let resolved_selection = if let Some(sel) = selection {
             Some(
-                self.resolve_subqueries(txn, db_id, sequence_values, search_path, sel, &ctes_ctx)
-                    .await?,
+                self.resolve_subqueries(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    sel,
+                    &ctes_ctx,
+                    &[],
+                )
+                .await?,
             )
         } else {
             None

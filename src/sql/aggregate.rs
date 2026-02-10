@@ -4,19 +4,16 @@ use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
-use sqlparser::ast::{ArrayAgg, Expr, Function, FunctionArg, FunctionArgExpr};
+use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr};
 
-use crate::sql::expr::{
-    coerce_text_literal_to_bool, compare_values, eval_binary_op_public, eval_expr,
-    eval_value_public,
-};
+use crate::sql::expr::compare_values;
 use crate::sql::pg_numeric::pg_numeric_div;
-use crate::types::{Row, TableSchema, Value};
+use crate::types::Value;
 
 #[derive(Debug, Clone)]
 pub enum AggExpr {
     Function(Function),
-    ArrayAgg(ArrayAgg),
+    ArrayAgg,
 }
 
 #[derive(Debug)]
@@ -71,10 +68,6 @@ impl Aggregator {
             values: Vec::new(),
             delimiter,
         }
-    }
-
-    pub fn new_array_agg() -> Self {
-        Aggregator::ArrayAgg { values: Vec::new() }
     }
 
     pub fn update(&mut self, val: &Value) -> Result<()> {
@@ -354,10 +347,10 @@ pub fn collect_having_agg_funcs(
                 }
             }
         }
-        Expr::ArrayAgg(arr) => {
+        Expr::ArrayAgg(_) => {
             let already_exists = agg_funcs
                 .iter()
-                .any(|(_, existing)| matches!(existing, AggExpr::ArrayAgg(_)));
+                .any(|(_, existing)| matches!(existing, AggExpr::ArrayAgg));
             if !already_exists {
                 let new_idx = extra_start
                     + (agg_funcs.len()
@@ -365,7 +358,7 @@ pub fn collect_having_agg_funcs(
                             .iter()
                             .filter(|(idx, _)| *idx < extra_start)
                             .count());
-                agg_funcs.push((new_idx, AggExpr::ArrayAgg(arr.clone())));
+                agg_funcs.push((new_idx, AggExpr::ArrayAgg));
             }
         }
         Expr::BinaryOp { left, right, .. } => {
@@ -394,179 +387,6 @@ pub fn collect_having_agg_funcs(
         Expr::Nested(e) => collect_having_agg_funcs(e, agg_funcs, extra_start),
         Expr::Cast { expr, .. } => collect_having_agg_funcs(expr, agg_funcs, extra_start),
         _ => {}
-    }
-}
-
-/// Evaluate HAVING clause expression with aggregated values
-pub fn eval_having_expr(
-    expr: &Expr,
-    row: &Row,
-    schema: &TableSchema,
-    agg_funcs: &[(usize, AggExpr)],
-    aggs: &[Aggregator],
-) -> Result<Value> {
-    match expr {
-        Expr::BinaryOp { left, op, right } => {
-            let left_val = eval_having_expr(left, row, schema, agg_funcs, aggs)?;
-            let right_val = eval_having_expr(right, row, schema, agg_funcs, aggs)?;
-            eval_binary_op_public(left_val, op, right_val)
-        }
-        Expr::Cast {
-            expr: inner,
-            data_type,
-            format,
-        } => {
-            let inner_val = eval_having_expr(inner, row, schema, agg_funcs, aggs)?;
-            let cast_expr = Expr::Cast {
-                expr: Box::new(super::value_coercion::value_to_sql_expr(&inner_val)),
-                data_type: data_type.clone(),
-                format: format.clone(),
-            };
-            eval_expr(&cast_expr, Some(row), Some(schema))
-        }
-        Expr::Function(f) => {
-            let func_name = f
-                .name
-                .0
-                .last()
-                .map(|i| i.value.to_uppercase())
-                .unwrap_or_default();
-            for (i, (_, agg_expr)) in agg_funcs.iter().enumerate() {
-                if let AggExpr::Function(agg_f) = agg_expr {
-                    let agg_name = agg_f
-                        .name
-                        .0
-                        .last()
-                        .map(|n| n.value.to_uppercase())
-                        .unwrap_or_default();
-                    if agg_name == func_name && args_match(f, agg_f) {
-                        return Ok(aggs[i].result());
-                    }
-                }
-            }
-            if matches!(
-                func_name.as_str(),
-                "COUNT"
-                    | "SUM"
-                    | "AVG"
-                    | "MIN"
-                    | "MAX"
-                    | "STRING_AGG"
-                    | "ARRAY_AGG"
-                    | "BOOL_AND"
-                    | "BOOL_OR"
-                    | "EVERY"
-            ) {
-                let mut temp_agg = Aggregator::new(&func_name)?;
-                let arg_expr = if f.args.is_empty() {
-                    None
-                } else {
-                    match &f.args[0] {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                        _ => None,
-                    }
-                };
-                if let Some(e) = arg_expr {
-                    let val = eval_expr(e, Some(row), Some(schema))?;
-                    temp_agg.update(&val)?;
-                } else {
-                    temp_agg.update(&Value::Int32(1))?;
-                }
-                Ok(temp_agg.result())
-            } else {
-                let args: Vec<Value> = f
-                    .args
-                    .iter()
-                    .filter_map(|arg| {
-                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) = arg {
-                            eval_having_expr(e, row, schema, agg_funcs, aggs).ok()
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                match func_name.as_str() {
-                    "COALESCE" => {
-                        for val in args {
-                            if !matches!(val, Value::Null) {
-                                return Ok(val);
-                            }
-                        }
-                        Ok(Value::Null)
-                    }
-                    "NULLIF" => {
-                        if args.len() >= 2 && compare_values(&args[0], &args[1]).unwrap_or(1) == 0 {
-                            Ok(Value::Null)
-                        } else {
-                            Ok(args.into_iter().next().unwrap_or(Value::Null))
-                        }
-                    }
-                    _ => eval_expr(expr, Some(row), Some(schema)),
-                }
-            }
-        }
-        Expr::Case {
-            operand,
-            conditions,
-            results,
-            else_result,
-        } => {
-            if let Some(op) = operand.as_deref() {
-                let operand_val = eval_having_expr(op, row, schema, agg_funcs, aggs)?;
-                if matches!(operand_val, Value::Null) {
-                    return else_result
-                        .as_deref()
-                        .map(|e| eval_having_expr(e, row, schema, agg_funcs, aggs))
-                        .unwrap_or(Ok(Value::Null));
-                }
-                for (cond, res) in conditions.iter().zip(results.iter()) {
-                    let cond_val = eval_having_expr(cond, row, schema, agg_funcs, aggs)?;
-                    if matches!(cond_val, Value::Null) {
-                        continue;
-                    }
-                    if compare_values(&operand_val, &cond_val).unwrap_or(1) == 0 {
-                        return eval_having_expr(res, row, schema, agg_funcs, aggs);
-                    }
-                }
-            } else {
-                for (cond, res) in conditions.iter().zip(results.iter()) {
-                    let cond_val = eval_having_expr(cond, row, schema, agg_funcs, aggs)?;
-                    let cond_val = coerce_text_literal_to_bool(cond, cond_val)?;
-                    let cond_true = match cond_val {
-                        Value::Boolean(b) => b,
-                        Value::Null => false,
-                        other => {
-                            return Err(anyhow!(
-                                "CASE WHEN requires boolean condition, got {:?}",
-                                other
-                            ));
-                        }
-                    };
-                    if cond_true {
-                        return eval_having_expr(res, row, schema, agg_funcs, aggs);
-                    }
-                }
-            }
-
-            else_result
-                .as_deref()
-                .map(|e| eval_having_expr(e, row, schema, agg_funcs, aggs))
-                .unwrap_or(Ok(Value::Null))
-        }
-        Expr::ArrayAgg(arr) => {
-            for (i, (_, agg_expr)) in agg_funcs.iter().enumerate() {
-                if matches!(agg_expr, AggExpr::ArrayAgg(_)) {
-                    return Ok(aggs[i].result());
-                }
-            }
-            let mut temp_agg = Aggregator::new_array_agg();
-            let val = eval_expr(&arr.expr, Some(row), Some(schema))?;
-            temp_agg.update(&val)?;
-            Ok(temp_agg.result())
-        }
-        Expr::Nested(e) => eval_having_expr(e, row, schema, agg_funcs, aggs),
-        Expr::Value(v) => eval_value_public(v),
-        _ => eval_expr(expr, Some(row), Some(schema)),
     }
 }
 
@@ -778,7 +598,7 @@ mod tests {
 
     #[test]
     fn test_array_agg() {
-        let mut agg = Aggregator::new_array_agg();
+        let mut agg = Aggregator::new("ARRAY_AGG").unwrap();
         agg.update(&Value::Int32(1)).unwrap();
         agg.update(&Value::Int32(2)).unwrap();
         agg.update(&Value::Int32(3)).unwrap();
@@ -790,7 +610,7 @@ mod tests {
 
     #[test]
     fn test_array_agg_with_null() {
-        let mut agg = Aggregator::new_array_agg();
+        let mut agg = Aggregator::new("ARRAY_AGG").unwrap();
         agg.update(&Value::Int32(1)).unwrap();
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Int32(2)).unwrap();
@@ -802,7 +622,7 @@ mod tests {
 
     #[test]
     fn test_array_agg_empty() {
-        let agg = Aggregator::new_array_agg();
+        let agg = Aggregator::new("ARRAY_AGG").unwrap();
         assert_eq!(agg.result(), Value::Null);
     }
 
@@ -882,38 +702,5 @@ mod tests {
             parse_first_projection_expr("SELECT COUNT(*) FILTER (WHERE x > 0) > 0");
         collect_having_agg_funcs(&count_star_filter_expr, &mut agg_funcs, 1);
         assert_eq!(agg_funcs.len(), 2);
-    }
-
-    #[test]
-    fn test_eval_having_expr_matches_filtered_aggregate_call() {
-        let count_star = parse_first_projection_function("SELECT COUNT(*)");
-        let count_star_filter =
-            parse_first_projection_function("SELECT COUNT(*) FILTER (WHERE x > 0)");
-
-        let agg_funcs = vec![
-            (0, AggExpr::Function(count_star)),
-            (1, AggExpr::Function(count_star_filter.clone())),
-        ];
-
-        let mut count_all = Aggregator::new("COUNT").unwrap();
-        for _ in 0..10 {
-            count_all.update(&Value::Int32(1)).unwrap();
-        }
-
-        let mut count_filtered = Aggregator::new("COUNT").unwrap();
-        count_filtered.update(&Value::Int32(1)).unwrap();
-
-        let row = Row::new(vec![]);
-        let schema = TableSchema::default();
-        let expr = sqlparser::ast::Expr::Function(count_star_filter);
-        let result = eval_having_expr(
-            &expr,
-            &row,
-            &schema,
-            &agg_funcs,
-            &[count_all, count_filtered],
-        )
-        .unwrap();
-        assert_eq!(result, Value::Int64(1));
     }
 }

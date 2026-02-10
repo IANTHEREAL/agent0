@@ -75,47 +75,6 @@ pub(super) fn projection_has_non_window_aggregate(projection: &[SelectItem]) -> 
         .any(expr_has_non_window_aggregate)
 }
 
-/// Recursively check if an expression contains a subquery (for routing decisions).
-pub(super) fn expr_has_subquery(expr: &Expr) -> bool {
-    match expr {
-        Expr::Subquery(_) => true,
-        Expr::BinaryOp { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
-        Expr::UnaryOp { expr: inner, .. }
-        | Expr::Nested(inner)
-        | Expr::Cast { expr: inner, .. }
-        | Expr::TryCast { expr: inner, .. }
-        | Expr::IsNull(inner)
-        | Expr::IsNotNull(inner)
-        | Expr::IsTrue(inner)
-        | Expr::IsFalse(inner) => expr_has_subquery(inner),
-        Expr::Case {
-            operand,
-            conditions,
-            results,
-            else_result,
-        } => {
-            operand.as_ref().map_or(false, |o| expr_has_subquery(o))
-                || conditions.iter().any(|c| expr_has_subquery(c))
-                || results.iter().any(|r| expr_has_subquery(r))
-                || else_result.as_ref().map_or(false, |e| expr_has_subquery(e))
-        }
-        Expr::Function(f) => f.args.iter().any(|arg| match arg {
-            FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
-            | FunctionArg::Named {
-                arg: FunctionArgExpr::Expr(e),
-                ..
-            } => expr_has_subquery(e),
-            _ => false,
-        }),
-        Expr::InList { expr: e, list, .. } => {
-            expr_has_subquery(e) || list.iter().any(|i| expr_has_subquery(i))
-        }
-        Expr::InSubquery { .. } => true,
-        Expr::Exists { .. } => true,
-        _ => false,
-    }
-}
-
 fn expr_is_select_list_srf(expr: &Expr) -> bool {
     let Expr::Function(f) = expr else {
         return false;

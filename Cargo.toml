@@ -11,8 +11,9 @@ async-trait = "0.1"
 anyhow = "1.0"
 thiserror = "1.0"
 
-# TiKV Client (from master for Keyspace support)
-tikv-client = { git = "https://github.com/tikv/client-rust.git", branch = "master" }
+# TiKV Client (vendored locally to add pessimistic_lock_wait_timeout support
+# for SKIP LOCKED / NOWAIT semantics — upstream has `wait_timeout = 0` hardcoded)
+tikv-client = { path = "vendor/tikv-client" }
 
 # SQL Parser (standalone, no execution engine)
 sqlparser = { version = "0.40", features = ["visitor"] }
