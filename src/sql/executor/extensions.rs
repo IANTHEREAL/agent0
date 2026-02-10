@@ -5,6 +5,7 @@ use super::super::Session;
 use super::core::Executor;
 use super::triggers::strip_leading_sql_comments;
 use crate::extensions::{descriptor, InstalledExtension};
+use crate::sql::operators::{BoxedOperator, TableFunctionScanOperator};
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, ObjectName, TableAlias};
@@ -15,6 +16,32 @@ use crate::types::{Row, TableSchema, Value};
 
 use crate::extensions::fs::{self, Fs9Mode};
 use crate::extensions::http::{self, HttpTableFunctionCall};
+
+/// Result of executing an extension table function.
+/// Streaming mode returns an operator that yields rows lazily.
+/// Batch mode returns all rows materialized in a Vec.
+pub(crate) enum ExtensionTableFunctionResult {
+    Batch(TableSchema, Vec<Row>),
+    Streaming(TableSchema, BoxedOperator),
+}
+
+fn apply_table_function_alias(schema: &mut TableSchema, alias: Option<&TableAlias>) -> Result<()> {
+    if let Some(alias) = alias {
+        if !alias.columns.is_empty() {
+            if alias.columns.len() != schema.columns.len() {
+                return Err(anyhow!(
+                    "Table function alias column count mismatch: expected {}, got {}",
+                    schema.columns.len(),
+                    alias.columns.len()
+                ));
+            }
+            for (i, ident) in alias.columns.iter().enumerate() {
+                schema.columns[i].name = normalize_ident(ident);
+            }
+        }
+    }
+    Ok(())
+}
 
 fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
@@ -96,7 +123,7 @@ impl Executor {
         name: &ObjectName,
         args: &[FunctionArg],
         alias: Option<&TableAlias>,
-    ) -> Result<Option<(TableSchema, Vec<Row>)>> {
+    ) -> Result<Option<ExtensionTableFunctionResult>> {
         let (schema_opt, func_name) = names::split_object_name(name)?;
 
         let schema = match schema_opt {
@@ -211,23 +238,8 @@ impl Executor {
 
             let (mut schema, rows) =
                 http::execute_table_function(self.tenant_keyspace(), call).await?;
-
-            if let Some(alias) = alias {
-                if !alias.columns.is_empty() {
-                    if alias.columns.len() != schema.columns.len() {
-                        return Err(anyhow!(
-                            "Table function alias column count mismatch: expected {}, got {}",
-                            schema.columns.len(),
-                            alias.columns.len()
-                        ));
-                    }
-                    for (i, ident) in alias.columns.iter().enumerate() {
-                        schema.columns[i].name = normalize_ident(ident);
-                    }
-                }
-            }
-
-            return Ok(Some((schema, rows)));
+            apply_table_function_alias(&mut schema, alias)?;
+            return Ok(Some(ExtensionTableFunctionResult::Batch(schema, rows)));
         }
 
         if func_upper == "FS9" {
@@ -350,25 +362,27 @@ impl Executor {
                 return Err(anyhow!("extension \"fs9\" is disabled"));
             }
 
-            let (mut schema, rows) =
-                fs::execute_table_function(self.tenant_keyspace(), mode).await?;
-
-            if let Some(alias) = alias {
-                if !alias.columns.is_empty() {
-                    if alias.columns.len() != schema.columns.len() {
-                        return Err(anyhow!(
-                            "Table function alias column count mismatch: expected {}, got {}",
-                            schema.columns.len(),
-                            alias.columns.len()
-                        ));
-                    }
-                    for (i, ident) in alias.columns.iter().enumerate() {
-                        schema.columns[i].name = normalize_ident(ident);
-                    }
+            if let Fs9Mode::File {
+                path,
+                format,
+                delimiter,
+                header,
+            } = &mode
+            {
+                if let Some((mut schema, receiver)) =
+                    fs::start_file_stream(path, format.as_deref(), *delimiter, *header).await?
+                {
+                    apply_table_function_alias(&mut schema, alias)?;
+                    let operator: BoxedOperator = Box::new(
+                        TableFunctionScanOperator::new_with_channel(schema.clone(), receiver),
+                    );
+                    return Ok(Some(ExtensionTableFunctionResult::Streaming(schema, operator)));
                 }
             }
 
-            return Ok(Some((schema, rows)));
+            let (mut schema, rows) = fs::execute_table_function(self.tenant_keyspace(), mode).await?;
+            apply_table_function_alias(&mut schema, alias)?;
+            return Ok(Some(ExtensionTableFunctionResult::Batch(schema, rows)));
         }
 
         Ok(None)

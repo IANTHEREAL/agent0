@@ -20,6 +20,7 @@ use super::super::{
     Aggregator, ExecuteResult,
 };
 use super::core::Executor;
+use super::extensions::ExtensionTableFunctionResult;
 use super::operators::rewrite_expr_for_multi_join;
 use super::operators::{
     eval_having_expr_for_operators, extract_limit, extract_offset, is_aggregate_func,
@@ -264,6 +265,7 @@ impl Executor {
         }
 
         let mut generate_series_offset_limit_pushed_down = false;
+        let mut streaming_scan_operator: Option<BoxedOperator> = None;
         let mut query_with_evaluated_offset_limit_fetch: Option<Query> = None;
         let (t, outer_alias, schema, all_rows_base, is_virtual, rows_loaded) = match &select.from[0]
             .relation
@@ -305,7 +307,7 @@ impl Executor {
                     }
                 } else {
                     if let Some(func_args) = args {
-                        if let Some((schema, rows)) = self
+                        if let Some(result) = self
                             .try_execute_extension_table_function(
                                 txn,
                                 db_id,
@@ -320,7 +322,15 @@ impl Executor {
                                 .as_ref()
                                 .map(|a| a.name.value.clone())
                                 .unwrap_or_else(|| obj_name.clone());
-                            (schema.name.clone(), alias_str, schema, rows, true, true)
+                            match result {
+                                ExtensionTableFunctionResult::Batch(schema, rows) => {
+                                    (schema.name.clone(), alias_str, schema, rows, true, true)
+                                }
+                                ExtensionTableFunctionResult::Streaming(schema, operator) => {
+                                    streaming_scan_operator = Some(operator);
+                                    (schema.name.clone(), alias_str, schema, Vec::new(), true, true)
+                                }
+                            }
                         } else if let Some((schema, rows)) = self
                             .try_execute_user_table_function(
                                 txn,
@@ -545,8 +555,13 @@ impl Executor {
         {
             // Preloaded rows: virtual tables, materialized views, CTEs, derived tables,
             // generate_series results already have all rows in memory.
-            let preloaded_rows = if is_virtual || rows_loaded {
-                Some(all_rows_base)
+            let preloaded_source: Option<BoxedOperator> = if let Some(op) = streaming_scan_operator.take() {
+                Some(op)
+            } else if is_virtual || rows_loaded {
+                Some(Box::new(TableScanOperator::new_with_rows(
+                    schema.clone(),
+                    all_rows_base,
+                )))
             } else {
                 None
             };
@@ -599,7 +614,7 @@ impl Executor {
                         super::operators::extract_offset(query),
                         &resolved_projection,
                         ctes,
-                        preloaded_rows,
+                        preloaded_source,
                     )
                     .await;
             } else if has_agg_or_group_by {
@@ -624,7 +639,7 @@ impl Executor {
                         super::operators::extract_offset(query),
                         &resolved_projection,
                         ctes,
-                        preloaded_rows,
+                        preloaded_source,
                     )
                     .await;
             } else {
@@ -642,7 +657,7 @@ impl Executor {
                         &resolved_projection,
                         select.distinct.as_ref(),
                         ctes,
-                        preloaded_rows,
+                        preloaded_source,
                     )
                     .await;
             }

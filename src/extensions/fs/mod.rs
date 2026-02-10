@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use tokio::sync::mpsc;
 
 use crate::extensions::context;
 use crate::types::{ColumnDef, DataType, Row, TableSchema};
@@ -212,6 +213,114 @@ pub(crate) async fn execute_table_function(
             Ok((schema, all_rows))
         }
     }
+}
+
+pub(crate) async fn start_file_stream(
+    path: &str,
+    format: Option<&str>,
+    delimiter: Option<char>,
+    header: Option<bool>,
+) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
+    if !context::allow_local_fs() {
+        return Err(anyhow!("permission denied for extension \"fs9\""));
+    }
+
+    use backend::FsBackend;
+
+    let backend = backend::local_backend();
+    let info = backend.stat(path).await?;
+    if info.is_dir {
+        return Ok(None);
+    }
+
+    let fmt = decoders::detect_format(path, format);
+    let reader = backend.read_file_stream(path, usize::MAX).await?;
+
+    let (schema, rx) = match fmt {
+        "csv" | "tsv" => {
+            let delim = if fmt == "tsv" && delimiter.is_none() {
+                Some('\t')
+            } else {
+                delimiter
+            };
+            let has_headers = header.unwrap_or(true);
+            let mut decoder = streaming::StreamingCsvDecoder::new(
+                reader,
+                path.to_string(),
+                delim,
+                has_headers,
+            )
+            .await?;
+            let schema = decoder.schema().clone();
+            let (tx, rx) = mpsc::channel(256);
+            let stream_path = path.to_string();
+            tokio::spawn(async move {
+                loop {
+                    match decoder.next_row().await {
+                        Ok(Some(row)) => {
+                            if tx.send(row).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            warn!("fs9: streaming decode error for {}: {}", stream_path, err);
+                            break;
+                        }
+                    }
+                }
+            });
+            (schema, rx)
+        }
+        "jsonl" | "ndjson" => {
+            let mut decoder = streaming::StreamingJsonlDecoder::new(reader, path.to_string());
+            let schema = decoder.schema().clone();
+            let (tx, rx) = mpsc::channel(256);
+            let stream_path = path.to_string();
+            tokio::spawn(async move {
+                loop {
+                    match decoder.next_row().await {
+                        Ok(Some(row)) => {
+                            if tx.send(row).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            warn!("fs9: streaming decode error for {}: {}", stream_path, err);
+                            break;
+                        }
+                    }
+                }
+            });
+            (schema, rx)
+        }
+        _ => {
+            let mut decoder = streaming::StreamingTextDecoder::new(reader, path.to_string());
+            let schema = decoder.schema().clone();
+            let (tx, rx) = mpsc::channel(256);
+            let stream_path = path.to_string();
+            tokio::spawn(async move {
+                loop {
+                    match decoder.next_row().await {
+                        Ok(Some(row)) => {
+                            if tx.send(row).await.is_err() {
+                                break;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(err) => {
+                            warn!("fs9: streaming decode error for {}: {}", stream_path, err);
+                            break;
+                        }
+                    }
+                }
+            });
+            (schema, rx)
+        }
+    };
+
+    Ok(Some((schema, rx)))
 }
 
 async fn list_directory_entries(

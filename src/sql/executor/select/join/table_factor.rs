@@ -1,4 +1,5 @@
 use super::super::*;
+use crate::sql::executor::extensions::ExtensionTableFunctionResult;
 
 static NESTED_JOIN_ALIAS_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -211,7 +212,7 @@ impl Executor {
                             .await?;
                         return Ok(Some((alias_str, schema, Some(rows))));
                     }
-                    if let Some((schema, rows)) = self
+                    if let Some(result) = self
                         .try_execute_extension_table_function(
                             txn,
                             db_id,
@@ -222,7 +223,23 @@ impl Executor {
                         )
                         .await?
                     {
-                        return Ok(Some((alias_str, schema, Some(rows))));
+                        match result {
+                            ExtensionTableFunctionResult::Batch(schema, rows) => {
+                                return Ok(Some((alias_str, schema, Some(rows))));
+                            }
+                            ExtensionTableFunctionResult::Streaming(schema, mut operator) => {
+                                let rows = execute_operator_tree(
+                                    &mut operator,
+                                    txn,
+                                    self.store(),
+                                    db_id,
+                                    search_path,
+                                    sequence_values,
+                                )
+                                .await?;
+                                return Ok(Some((alias_str, schema, Some(rows))));
+                            }
+                        }
                     }
                     if let Some((schema, rows)) = self
                         .try_execute_user_table_function(

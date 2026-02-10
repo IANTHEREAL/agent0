@@ -1520,7 +1520,7 @@ impl Executor {
         offset: usize,
         projection: &[SelectItem],
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
-        preloaded_rows: Option<Vec<Row>>,
+        preloaded_source: Option<BoxedOperator>,
     ) -> Result<ExecuteResult> {
         let (mut group_by_exprs, mut group_by_names, mut group_by_types) =
             Self::extract_group_by_info(group_by, &schema);
@@ -1576,8 +1576,8 @@ impl Executor {
 
         let group_by_count = group_by_names.len();
 
-        let mut root: BoxedOperator = if let Some(rows) = preloaded_rows {
-            Box::new(TableScanOperator::new_with_rows(schema.clone(), rows))
+        let mut root: BoxedOperator = if let Some(op) = preloaded_source {
+            op
         } else {
             Box::new(TableScanOperator::new(schema.clone()))
         };
@@ -2252,7 +2252,7 @@ impl Executor {
         projection: &[SelectItem],
         distinct: Option<&Distinct>,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
-        preloaded_rows: Option<Vec<Row>>,
+        preloaded_source: Option<BoxedOperator>,
     ) -> Result<ExecuteResult> {
         let planner = PhysicalPlanner::new(self.store(), search_path.to_vec());
 
@@ -2472,14 +2472,13 @@ impl Executor {
             };
 
         let estimated_rows = 1000;
+        let mut preloaded_source = preloaded_source;
 
         let is_distinct = matches!(distinct, Some(Distinct::Distinct));
         let is_distinct_on = matches!(distinct, Some(Distinct::On(_)));
 
         if (is_distinct && !is_wildcard_only) || is_distinct_on {
-            let scan_operator = if let Some(rows) = preloaded_rows {
-                let mut op: BoxedOperator =
-                    Box::new(TableScanOperator::new_with_rows(schema.clone(), rows));
+            let scan_operator = if let Some(mut op) = preloaded_source.take() {
                 if let Some(filter_expr) = filter {
                     op = Box::new(FilterOperator::new(op, filter_expr.clone()));
                 }
@@ -2576,9 +2575,7 @@ impl Executor {
             });
         }
 
-        let base_operator = if let Some(rows) = preloaded_rows {
-            let mut op: BoxedOperator =
-                Box::new(TableScanOperator::new_with_rows(schema.clone(), rows));
+        let base_operator = if let Some(mut op) = preloaded_source.take() {
             if let Some(filter_expr) = filter {
                 op = Box::new(FilterOperator::new(op, filter_expr.clone()));
             }
@@ -2670,11 +2667,9 @@ impl Executor {
         offset: usize,
         projection: &[SelectItem],
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
-        preloaded_rows: Option<Vec<Row>>,
+        preloaded_source: Option<BoxedOperator>,
     ) -> Result<ExecuteResult> {
-        let scan_operator: BoxedOperator = if let Some(rows) = preloaded_rows {
-            let mut op: BoxedOperator =
-                Box::new(TableScanOperator::new_with_rows(schema.clone(), rows));
+        let scan_operator: BoxedOperator = if let Some(mut op) = preloaded_source {
             if let Some(filter_expr) = filter {
                 op = Box::new(FilterOperator::new(op, filter_expr.clone()));
             }
