@@ -418,7 +418,6 @@ impl Executor {
                         Statement::SetVariable { .. }
                         | Statement::SetTimeZone { .. }
                         | Statement::SetNames { .. }
-                        | Statement::SetRole { .. }
                         | Statement::SetTransaction { .. } => {
                             results.push(ExecuteResult::CommandComplete { tag: "SET" });
                             continue;
