@@ -664,8 +664,13 @@ impl TriggerWorker {
         let start = Instant::now();
         // Wrap trigger body execution with extension context so that
         // extensions (e.g. HTTP) are accessible from trigger functions.
-        // Trigger workers run as superuser since they are system-level.
-        crate::extensions::context::with_context(true, async {
+        // Trigger workers run as superuser since they are system-level, but must not
+        // allow unsafe local filesystem access (fs9) without an actual session context.
+        let ext_ctx = crate::extensions::context::ExtensionContextOpts {
+            is_superuser: true,
+            allow_local_fs: false,
+        };
+        crate::extensions::context::with_context_opts(ext_ctx, async {
             self.execute_trigger_body(
                 executor,
                 &mut txn,

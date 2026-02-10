@@ -4,6 +4,7 @@
 //! Per-tenant install state is persisted in TiKV via `_sys_*` metadata keys.
 
 pub(crate) mod context;
+pub(crate) mod fs;
 pub(crate) mod http;
 
 use serde::{Deserialize, Serialize};
@@ -81,6 +82,13 @@ const HSTORE_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
     default_schema: "public",
 };
 
+const FS9_EXTENSION: ExtensionDescriptor = ExtensionDescriptor {
+    name: "fs9",
+    oid: 2003,
+    version: "1.0.0",
+    default_schema: EXTENSIONS_SCHEMA,
+};
+
 /// Lookup an extension descriptor by name (case-insensitive).
 pub fn descriptor(name: &str) -> Option<&'static ExtensionDescriptor> {
     if name.eq_ignore_ascii_case(HTTP_EXTENSION.name) {
@@ -91,6 +99,9 @@ pub fn descriptor(name: &str) -> Option<&'static ExtensionDescriptor> {
     }
     if name.eq_ignore_ascii_case(HSTORE_EXTENSION.name) {
         return Some(&HSTORE_EXTENSION);
+    }
+    if name.eq_ignore_ascii_case(FS9_EXTENSION.name) {
+        return Some(&FS9_EXTENSION);
     }
     None
 }
@@ -119,5 +130,13 @@ mod tests {
         assert_eq!(desc.name, "hstore");
         assert_eq!(desc.default_schema, "public");
         assert_eq!(desc.oid, 2002);
+    }
+
+    #[test]
+    fn descriptor_fs9_is_registered() {
+        let desc = descriptor("fs9").expect("fs9 must be registered");
+        assert_eq!(desc.name, "fs9");
+        assert_eq!(desc.default_schema, "extensions");
+        assert_eq!(desc.oid, 2003);
     }
 }

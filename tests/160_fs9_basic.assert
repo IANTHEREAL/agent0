@@ -1,0 +1,15 @@
+path|type
+/tmp/pgtikv-fs9-test/data.tsv|file
+/tmp/pgtikv-fs9-test/empty.csv|file
+/tmp/pgtikv-fs9-test/header_only.csv|file
+/tmp/pgtikv-fs9-test/hello.txt|file
+/tmp/pgtikv-fs9-test/logs.jsonl|file
+/tmp/pgtikv-fs9-test/sales|dir
+/tmp/pgtikv-fs9-test/subdir|dir
+/tmp/pgtikv-fs9-test/users.csv|file
+(8 rows)
+_line_number|line
+1|Hello World
+2|This is line two
+3|Third line here
+(3 rows)

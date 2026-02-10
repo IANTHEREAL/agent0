@@ -13,6 +13,7 @@ use tikv_client::Transaction;
 use crate::extensions::EXTENSIONS_SCHEMA;
 use crate::types::{Row, TableSchema, Value};
 
+use crate::extensions::fs::{self, Fs9Mode};
 use crate::extensions::http::{self, HttpTableFunctionCall};
 
 fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
@@ -136,27 +137,27 @@ impl Executor {
         }
 
         let func_upper = func_name.to_ascii_uppercase();
-        let call = match func_upper.as_str() {
+        let http_call = match func_upper.as_str() {
             "HTTP_GET" => {
                 if args.len() != 1 {
                     return Err(anyhow!("http_get(url text) requires 1 argument"));
                 }
                 let url = expect_text(eval_expr(extract_expr_arg(&args[0])?, None, None)?, "url")?;
-                HttpTableFunctionCall::Get { url }
+                Some(HttpTableFunctionCall::Get { url })
             }
             "HTTP_HEAD" => {
                 if args.len() != 1 {
                     return Err(anyhow!("http_head(url text) requires 1 argument"));
                 }
                 let url = expect_text(eval_expr(extract_expr_arg(&args[0])?, None, None)?, "url")?;
-                HttpTableFunctionCall::Head { url }
+                Some(HttpTableFunctionCall::Head { url })
             }
             "HTTP_DELETE" => {
                 if args.len() != 1 {
                     return Err(anyhow!("http_delete(url text) requires 1 argument"));
                 }
                 let url = expect_text(eval_expr(extract_expr_arg(&args[0])?, None, None)?, "url")?;
-                HttpTableFunctionCall::Delete { url }
+                Some(HttpTableFunctionCall::Delete { url })
             }
             "HTTP_POST" => {
                 if args.len() != 3 {
@@ -171,11 +172,11 @@ impl Executor {
                     eval_expr(extract_expr_arg(&args[2])?, None, None)?,
                     "content_type",
                 )?;
-                HttpTableFunctionCall::Post {
+                Some(HttpTableFunctionCall::Post {
                     url,
                     body,
                     content_type,
-                }
+                })
             }
             "HTTP_PUT" => {
                 if args.len() != 3 {
@@ -190,41 +191,187 @@ impl Executor {
                     eval_expr(extract_expr_arg(&args[2])?, None, None)?,
                     "content_type",
                 )?;
-                HttpTableFunctionCall::Put {
+                Some(HttpTableFunctionCall::Put {
                     url,
                     body,
                     content_type,
+                })
+            }
+            _ => None,
+        };
+
+        if let Some(call) = http_call {
+            let installed = self.store().get_extension(txn, db_id, "http").await?;
+            let Some(installed) = installed else {
+                return Err(anyhow!("extension \"http\" is not installed"));
+            };
+            if !installed.enabled {
+                return Err(anyhow!("extension \"http\" is disabled"));
+            }
+
+            let (mut schema, rows) =
+                http::execute_table_function(self.tenant_keyspace(), call).await?;
+
+            if let Some(alias) = alias {
+                if !alias.columns.is_empty() {
+                    if alias.columns.len() != schema.columns.len() {
+                        return Err(anyhow!(
+                            "Table function alias column count mismatch: expected {}, got {}",
+                            schema.columns.len(),
+                            alias.columns.len()
+                        ));
+                    }
+                    for (i, ident) in alias.columns.iter().enumerate() {
+                        schema.columns[i].name = normalize_ident(ident);
+                    }
                 }
             }
-            _ => return Ok(None),
-        };
 
-        let installed = self.store().get_extension(txn, db_id, "http").await?;
-        let Some(installed) = installed else {
-            return Err(anyhow!("extension \"http\" is not installed"));
-        };
-        if !installed.enabled {
-            return Err(anyhow!("extension \"http\" is disabled"));
+            return Ok(Some((schema, rows)));
         }
 
-        let (mut schema, rows) = http::execute_table_function(self.tenant_keyspace(), call).await?;
+        if func_upper == "FS9" {
+            if args.is_empty() {
+                return Err(anyhow!("fs9(path text) requires at least 1 argument"));
+            }
 
-        if let Some(alias) = alias {
-            if !alias.columns.is_empty() {
-                if alias.columns.len() != schema.columns.len() {
+            // Extract first positional arg as path
+            let path_expr = match &args[0] {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+                FunctionArg::Named { .. } => {
                     return Err(anyhow!(
-                        "Table function alias column count mismatch: expected {}, got {}",
-                        schema.columns.len(),
-                        alias.columns.len()
+                        "fs9: first argument must be an unnamed path string"
                     ));
                 }
-                for (i, ident) in alias.columns.iter().enumerate() {
-                    schema.columns[i].name = normalize_ident(ident);
+                _ => return Err(anyhow!("fs9: first argument must be a path string")),
+            };
+            let path = match eval_expr(path_expr, None, None)? {
+                Value::Text(s) => s,
+                Value::Null => return Err(anyhow!("fs9: path must not be NULL")),
+                _ => return Err(anyhow!("fs9: path must be TEXT")),
+            };
+
+            // Parse named parameters from remaining args
+            let mut format: Option<String> = None;
+            let mut delimiter: Option<char> = None;
+            let mut header: Option<bool> = None;
+            let mut recursive: Option<bool> = None;
+            let mut exclude: Option<String> = None;
+
+            for arg in &args[1..] {
+                match arg {
+                    FunctionArg::Named {
+                        name,
+                        arg: FunctionArgExpr::Expr(e),
+                        ..
+                    } => {
+                        let param_name = name.value.to_ascii_lowercase();
+                        let val = eval_expr(e, None, None)?;
+                        match param_name.as_str() {
+                            "format" => {
+                                format = Some(match val {
+                                    Value::Text(s) => s,
+                                    _ => return Err(anyhow!("fs9: 'format' must be TEXT")),
+                                });
+                            }
+                            "delimiter" => {
+                                let s = match val {
+                                    Value::Text(s) => s,
+                                    _ => return Err(anyhow!("fs9: 'delimiter' must be TEXT")),
+                                };
+                                if s.len() != 1 {
+                                    return Err(anyhow!(
+                                        "fs9: 'delimiter' must be a single character"
+                                    ));
+                                }
+                                delimiter = Some(s.chars().next().unwrap());
+                            }
+                            "header" => {
+                                header = Some(match val {
+                                    Value::Boolean(b) => b,
+                                    Value::Text(s) if s.eq_ignore_ascii_case("true") => true,
+                                    Value::Text(s) if s.eq_ignore_ascii_case("false") => false,
+                                    _ => return Err(anyhow!("fs9: 'header' must be BOOLEAN")),
+                                });
+                            }
+                            "recursive" => {
+                                recursive = Some(match val {
+                                    Value::Boolean(b) => b,
+                                    Value::Text(s) if s.eq_ignore_ascii_case("true") => true,
+                                    Value::Text(s) if s.eq_ignore_ascii_case("false") => false,
+                                    _ => return Err(anyhow!("fs9: 'recursive' must be BOOLEAN")),
+                                });
+                            }
+                            "exclude" => {
+                                exclude = Some(match val {
+                                    Value::Text(s) => s,
+                                    _ => return Err(anyhow!("fs9: 'exclude' must be TEXT")),
+                                });
+                            }
+                            _ => return Err(anyhow!("fs9: unknown parameter '{}'", param_name)),
+                        }
+                    }
+                    _ => {
+                        // Additional unnamed args after the first are not supported
+                        return Err(anyhow!("fs9: unexpected positional argument (use named parameters like format => 'csv')"));
+                    }
                 }
             }
+
+            // Determine mode based on path
+            let mode = if path.ends_with('/') {
+                Fs9Mode::Directory {
+                    path,
+                    recursive: recursive.unwrap_or(false),
+                    exclude,
+                }
+            } else if fs::glob::is_glob_pattern(&path) {
+                Fs9Mode::Glob {
+                    pattern: path,
+                    format,
+                    delimiter,
+                    header,
+                    exclude,
+                }
+            } else {
+                Fs9Mode::File {
+                    path,
+                    format,
+                    delimiter,
+                    header,
+                }
+            };
+
+            let installed = self.store().get_extension(txn, db_id, "fs9").await?;
+            let Some(installed) = installed else {
+                return Err(anyhow!("extension \"fs9\" is not installed"));
+            };
+            if !installed.enabled {
+                return Err(anyhow!("extension \"fs9\" is disabled"));
+            }
+
+            let (mut schema, rows) =
+                fs::execute_table_function(self.tenant_keyspace(), mode).await?;
+
+            if let Some(alias) = alias {
+                if !alias.columns.is_empty() {
+                    if alias.columns.len() != schema.columns.len() {
+                        return Err(anyhow!(
+                            "Table function alias column count mismatch: expected {}, got {}",
+                            schema.columns.len(),
+                            alias.columns.len()
+                        ));
+                    }
+                    for (i, ident) in alias.columns.iter().enumerate() {
+                        schema.columns[i].name = normalize_ident(ident);
+                    }
+                }
+            }
+
+            return Ok(Some((schema, rows)));
         }
 
-        Ok(Some((schema, rows)))
+        Ok(None)
     }
 
     pub(crate) async fn execute_create_extension_cmd(

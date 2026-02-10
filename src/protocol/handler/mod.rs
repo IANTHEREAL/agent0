@@ -1,7 +1,8 @@
+use crate::sql::expr::eval_expr;
 use crate::sql::types::{TypeContext, TypeInferrer};
 use crate::sql::{ExecuteResult, Session};
 use crate::storage::TikvStore;
-use crate::types::{ColumnDef, DataType, TableSchema};
+use crate::types::{ColumnDef, DataType, TableSchema, Value};
 use futures::{Sink, SinkExt};
 use pgwire::api::results::{FieldFormat, FieldInfo, Response};
 use pgwire::api::Type;
@@ -447,6 +448,7 @@ async fn resolve_table_schema_for_object_name(
     db_id: u64,
     table_name: &ObjectName,
     search_path: &[String],
+    is_superuser: bool,
 ) -> Option<crate::types::TableSchema> {
     let (schema_opt, name) = split_object_name_for_catalog(table_name)?;
 
@@ -456,6 +458,7 @@ async fn resolve_table_schema_for_object_name(
         db_id: u64,
         search_path: &[String],
         full_name: &str,
+        is_superuser: bool,
     ) -> Option<crate::types::TableSchema> {
         let view_def = store.get_view(txn, db_id, full_name).await.ok()??;
         let view_query = view_def.query;
@@ -467,9 +470,16 @@ async fn resolve_table_schema_for_object_name(
                 return None;
             };
             let ctes: HashMap<String, TableSchema> = HashMap::new();
-            let cols =
-                infer_query_output_columns_with_txn(store, txn, db_id, search_path, &q, &ctes)
-                    .await?;
+            let cols = infer_query_output_columns_with_txn(
+                store,
+                txn,
+                db_id,
+                search_path,
+                &q,
+                &ctes,
+                is_superuser,
+            )
+            .await?;
             Some(schema_from_inferred_columns(full_name.to_string(), &cols))
         })
         .await
@@ -480,8 +490,15 @@ async fn resolve_table_schema_for_object_name(
         if let Some(schema) = crate::sql::get_information_schema_schema(&full) {
             return Some(schema);
         }
-        if let Some(schema) =
-            Box::pin(infer_view_schema(store, txn, db_id, search_path, &full)).await
+        if let Some(schema) = Box::pin(infer_view_schema(
+            store,
+            txn,
+            db_id,
+            search_path,
+            &full,
+            is_superuser,
+        ))
+        .await
         {
             return Some(schema);
         }
@@ -494,8 +511,15 @@ async fn resolve_table_schema_for_object_name(
 
     for schema in search_path {
         let full = format!("{}.{}", schema, name);
-        if let Some(schema) =
-            Box::pin(infer_view_schema(store, txn, db_id, search_path, &full)).await
+        if let Some(schema) = Box::pin(infer_view_schema(
+            store,
+            txn,
+            db_id,
+            search_path,
+            &full,
+            is_superuser,
+        ))
+        .await
         {
             return Some(schema);
         }
@@ -507,7 +531,16 @@ async fn resolve_table_schema_for_object_name(
     // As a last resort, try the default schema even if it's not present in the session search_path.
     let default_schema = search_path.first().map(String::as_str).unwrap_or("public");
     let full = format!("{}.{}", default_schema, name);
-    if let Some(schema) = Box::pin(infer_view_schema(store, txn, db_id, search_path, &full)).await {
+    if let Some(schema) = Box::pin(infer_view_schema(
+        store,
+        txn,
+        db_id,
+        search_path,
+        &full,
+        is_superuser,
+    ))
+    .await
+    {
         return Some(schema);
     }
     store.get_schema(txn, db_id, &full).await.ok().flatten()
@@ -520,9 +553,17 @@ async fn infer_returning_fields_with_txn(
     search_path: &[String],
     table_name: &ObjectName,
     returning: &[SelectItem],
+    is_superuser: bool,
 ) -> Option<Vec<FieldInfo>> {
-    let schema =
-        resolve_table_schema_for_object_name(store, txn, db_id, table_name, search_path).await?;
+    let schema = resolve_table_schema_for_object_name(
+        store,
+        txn,
+        db_id,
+        table_name,
+        search_path,
+        is_superuser,
+    )
+    .await?;
 
     let mut fields = Vec::new();
     for item in returning {
@@ -599,6 +640,7 @@ async fn infer_returning_fields_from_statement(
     let search_path = session.search_path().to_vec();
     let search_path = search_path.as_slice();
     let db_id = session.current_database_id();
+    let is_superuser = session.is_superuser();
 
     if let Some(txn) = session.get_mut_txn() {
         infer_returning_fields_with_txn(
@@ -608,6 +650,7 @@ async fn infer_returning_fields_from_statement(
             search_path,
             table_name,
             returning,
+            is_superuser,
         )
         .await
     } else {
@@ -619,6 +662,7 @@ async fn infer_returning_fields_from_statement(
             search_path,
             table_name,
             returning,
+            is_superuser,
         )
         .await
     }
@@ -740,6 +784,250 @@ fn base_table_name(full: &str) -> &str {
     full.rsplit('.').next().unwrap_or(full)
 }
 
+async fn infer_extension_table_function_schema(
+    search_path: &[String],
+    schema_opt: Option<&str>,
+    func_name: &str,
+    args: &[FunctionArg],
+    is_superuser: bool,
+) -> Option<TableSchema> {
+    let in_extensions_schema = match schema_opt {
+        Some(schema) => schema.eq_ignore_ascii_case(crate::extensions::EXTENSIONS_SCHEMA),
+        None => search_path
+            .iter()
+            .any(|s| s.eq_ignore_ascii_case(crate::extensions::EXTENSIONS_SCHEMA)),
+    };
+    if !in_extensions_schema {
+        return None;
+    }
+
+    if let Some(schema) = crate::extensions::http::table_function_schema(func_name) {
+        return Some(schema);
+    }
+
+    if func_name.eq_ignore_ascii_case("fs9") {
+        return infer_fs9_table_function_schema(args, is_superuser).await;
+    }
+
+    crate::extensions::fs::table_function_schema(func_name)
+}
+
+fn try_parse_fs9_mode_from_args(args: &[FunctionArg]) -> Option<crate::extensions::fs::Fs9Mode> {
+    if args.is_empty() {
+        return None;
+    }
+
+    let path_expr = match &args[0] {
+        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
+        _ => return None,
+    };
+    let path = match eval_expr(path_expr, None, None).ok()? {
+        Value::Text(s) => s,
+        _ => return None,
+    };
+
+    let mut format: Option<String> = None;
+    let mut delimiter: Option<char> = None;
+    let mut header: Option<bool> = None;
+    let mut recursive: Option<bool> = None;
+    let mut exclude: Option<String> = None;
+
+    for arg in &args[1..] {
+        match arg {
+            FunctionArg::Named {
+                name,
+                arg: FunctionArgExpr::Expr(e),
+                ..
+            } => {
+                let param_name = name.value.to_ascii_lowercase();
+                let val = eval_expr(e, None, None).ok()?;
+                match param_name.as_str() {
+                    "format" => match val {
+                        Value::Text(s) => format = Some(s),
+                        _ => return None,
+                    },
+                    "delimiter" => match val {
+                        Value::Text(s) => {
+                            if s.chars().count() != 1 {
+                                return None;
+                            }
+                            delimiter = s.chars().next();
+                        }
+                        _ => return None,
+                    },
+                    "header" => match val {
+                        Value::Boolean(b) => header = Some(b),
+                        Value::Text(s) if s.eq_ignore_ascii_case("true") => header = Some(true),
+                        Value::Text(s) if s.eq_ignore_ascii_case("false") => header = Some(false),
+                        _ => return None,
+                    },
+                    "recursive" => match val {
+                        Value::Boolean(b) => recursive = Some(b),
+                        Value::Text(s) if s.eq_ignore_ascii_case("true") => recursive = Some(true),
+                        Value::Text(s) if s.eq_ignore_ascii_case("false") => {
+                            recursive = Some(false)
+                        }
+                        _ => return None,
+                    },
+                    "exclude" => match val {
+                        Value::Text(s) => exclude = Some(s),
+                        _ => return None,
+                    },
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+
+    let mode = if path.ends_with('/') {
+        crate::extensions::fs::Fs9Mode::Directory {
+            path,
+            recursive: recursive.unwrap_or(false),
+            exclude,
+        }
+    } else if crate::extensions::fs::glob::is_glob_pattern(&path) {
+        crate::extensions::fs::Fs9Mode::Glob {
+            pattern: path,
+            format,
+            delimiter,
+            header,
+            exclude,
+        }
+    } else {
+        crate::extensions::fs::Fs9Mode::File {
+            path,
+            format,
+            delimiter,
+            header,
+        }
+    };
+
+    Some(mode)
+}
+
+async fn infer_fs9_table_function_schema(
+    args: &[FunctionArg],
+    is_superuser: bool,
+) -> Option<TableSchema> {
+    let fallback = crate::extensions::fs::table_function_schema("fs9")?;
+    if !is_superuser {
+        return Some(fallback);
+    }
+
+    let mode = match try_parse_fs9_mode_from_args(args) {
+        Some(mode) => mode,
+        None => return Some(fallback),
+    };
+
+    use crate::extensions::fs::backend::FsBackend;
+    let backend = crate::extensions::fs::backend::local_backend();
+
+    match mode {
+        crate::extensions::fs::Fs9Mode::Directory { .. } => {
+            Some(crate::extensions::fs::decoders::decode_directory(Vec::new()).schema)
+        }
+        crate::extensions::fs::Fs9Mode::File {
+            path,
+            format,
+            delimiter,
+            header,
+        } => {
+            if backend
+                .stat(&path)
+                .await
+                .ok()
+                .is_some_and(|info| info.is_dir)
+            {
+                return Some(crate::extensions::fs::decoders::decode_directory(Vec::new()).schema);
+            }
+
+            let fmt = crate::extensions::fs::decoders::detect_format(&path, format.as_deref());
+            match fmt {
+                "csv" | "tsv" => {
+                    let delim = if fmt == "tsv" && delimiter.is_none() {
+                        Some('\t')
+                    } else {
+                        delimiter
+                    };
+                    let data = match backend
+                        .read_file(&path, crate::extensions::fs::MAX_BYTES_PER_FILE)
+                        .await
+                    {
+                        Ok(data) => data,
+                        Err(_) => return Some(fallback),
+                    };
+                    let decoded =
+                        crate::extensions::fs::decoders::decode_csv(&data, &path, delim, header, 0)
+                            .ok()?;
+                    Some(decoded.schema)
+                }
+                "jsonl" | "ndjson" => {
+                    Some(crate::extensions::fs::decoders::decode_jsonl(&[], &path, 0).schema)
+                }
+                _ => Some(crate::extensions::fs::decoders::decode_raw_text(&[], &path, 0).schema),
+            }
+        }
+        crate::extensions::fs::Fs9Mode::Glob {
+            pattern,
+            format,
+            delimiter,
+            header,
+            exclude,
+        } => {
+            let files = match crate::extensions::fs::glob::expand_glob(
+                backend,
+                &pattern,
+                crate::extensions::fs::MAX_FILES_PER_GLOB,
+                exclude.as_deref(),
+            )
+            .await
+            {
+                Ok(files) => files,
+                Err(_) => return Some(fallback),
+            };
+
+            if files.is_empty() {
+                return Some(
+                    crate::extensions::fs::decoders::decode_raw_text(&[], &pattern, 0).schema,
+                );
+            }
+
+            let first = files.get(0).cloned().unwrap_or_default();
+            if first.is_empty() {
+                return Some(fallback);
+            }
+
+            let fmt = crate::extensions::fs::decoders::detect_format(&first, format.as_deref());
+            match fmt {
+                "csv" | "tsv" => {
+                    let delim = if fmt == "tsv" && delimiter.is_none() {
+                        Some('\t')
+                    } else {
+                        delimiter
+                    };
+                    let data = match backend
+                        .read_file(&first, crate::extensions::fs::MAX_BYTES_PER_FILE)
+                        .await
+                    {
+                        Ok(data) => data,
+                        Err(_) => return Some(fallback),
+                    };
+                    let decoded = crate::extensions::fs::decoders::decode_csv(
+                        &data, &first, delim, header, 0,
+                    )
+                    .ok()?;
+                    Some(decoded.schema)
+                }
+                "jsonl" | "ndjson" => {
+                    Some(crate::extensions::fs::decoders::decode_jsonl(&[], &first, 0).schema)
+                }
+                _ => Some(crate::extensions::fs::decoders::decode_raw_text(&[], &first, 0).schema),
+            }
+        }
+    }
+}
+
 async fn infer_query_output_columns(
     store: &Arc<TikvStore>,
     session: &mut Session,
@@ -748,6 +1036,7 @@ async fn infer_query_output_columns(
     let search_path = session.search_path().to_vec();
     let search_path = search_path.as_slice();
     let db_id = session.current_database_id();
+    let is_superuser = session.is_superuser();
     let outer_ctes: HashMap<String, TableSchema> = HashMap::new();
 
     if let Some(txn) = session.get_mut_txn() {
@@ -758,6 +1047,7 @@ async fn infer_query_output_columns(
             search_path,
             query,
             &outer_ctes,
+            is_superuser,
         )
         .await
     } else {
@@ -769,6 +1059,7 @@ async fn infer_query_output_columns(
             search_path,
             query,
             &outer_ctes,
+            is_superuser,
         )
         .await;
         let _ = temp_txn.rollback().await;
@@ -783,6 +1074,7 @@ async fn build_cte_schemas_with_txn(
     search_path: &[String],
     query: &Query,
     outer_ctes: &HashMap<String, TableSchema>,
+    is_superuser: bool,
 ) -> Option<HashMap<String, TableSchema>> {
     let with = query.with.as_ref()?;
     if with.recursive {
@@ -799,6 +1091,7 @@ async fn build_cte_schemas_with_txn(
             search_path,
             &cte.query,
             &ctes,
+            is_superuser,
         ))
         .await?;
 
@@ -825,12 +1118,30 @@ async fn infer_query_output_columns_with_txn(
     search_path: &[String],
     query: &Query,
     outer_ctes: &HashMap<String, TableSchema>,
+    is_superuser: bool,
 ) -> Option<Vec<InferredColumn>> {
-    let ctes = build_cte_schemas_with_txn(store, txn, db_id, search_path, query, outer_ctes)
-        .await
-        .unwrap_or_else(|| outer_ctes.clone());
+    let ctes = build_cte_schemas_with_txn(
+        store,
+        txn,
+        db_id,
+        search_path,
+        query,
+        outer_ctes,
+        is_superuser,
+    )
+    .await
+    .unwrap_or_else(|| outer_ctes.clone());
 
-    infer_setexpr_output_columns_with_txn(store, txn, db_id, search_path, &query.body, &ctes).await
+    infer_setexpr_output_columns_with_txn(
+        store,
+        txn,
+        db_id,
+        search_path,
+        &query.body,
+        &ctes,
+        is_superuser,
+    )
+    .await
 }
 
 async fn infer_setexpr_output_columns_with_txn(
@@ -840,10 +1151,20 @@ async fn infer_setexpr_output_columns_with_txn(
     search_path: &[String],
     body: &SetExpr,
     ctes: &HashMap<String, TableSchema>,
+    is_superuser: bool,
 ) -> Option<Vec<InferredColumn>> {
     match body {
         SetExpr::Select(select) => {
-            infer_select_output_columns_with_txn(store, txn, db_id, search_path, select, ctes).await
+            infer_select_output_columns_with_txn(
+                store,
+                txn,
+                db_id,
+                search_path,
+                select,
+                ctes,
+                is_superuser,
+            )
+            .await
         }
         SetExpr::Values(values) => infer_values_output_columns(values),
         SetExpr::SetOperation { left, .. } => {
@@ -854,6 +1175,7 @@ async fn infer_setexpr_output_columns_with_txn(
                 search_path,
                 left,
                 ctes,
+                is_superuser,
             ))
             .await
         }
@@ -886,9 +1208,19 @@ async fn collect_sources_from_table_with_joins(
     twj: &TableWithJoins,
     ctes: &HashMap<String, TableSchema>,
     out: &mut Vec<SourceSchema>,
+    is_superuser: bool,
 ) -> Option<()> {
-    collect_sources_from_table_factor(store, txn, db_id, search_path, &twj.relation, ctes, out)
-        .await?;
+    collect_sources_from_table_factor(
+        store,
+        txn,
+        db_id,
+        search_path,
+        &twj.relation,
+        ctes,
+        out,
+        is_superuser,
+    )
+    .await?;
     for join in &twj.joins {
         collect_sources_from_table_factor(
             store,
@@ -898,6 +1230,7 @@ async fn collect_sources_from_table_with_joins(
             &join.relation,
             ctes,
             out,
+            is_superuser,
         )
         .await?;
     }
@@ -912,6 +1245,7 @@ async fn collect_sources_from_table_factor(
     factor: &TableFactor,
     ctes: &HashMap<String, TableSchema>,
     out: &mut Vec<SourceSchema>,
+    is_superuser: bool,
 ) -> Option<()> {
     fn infer_generate_series_schema(
         args: &[FunctionArg],
@@ -991,23 +1325,6 @@ async fn collect_sources_from_table_factor(
         })
     }
 
-    fn infer_extension_table_function_schema(
-        search_path: &[String],
-        schema_opt: Option<&str>,
-        func_name: &str,
-    ) -> Option<TableSchema> {
-        let in_extensions_schema = match schema_opt {
-            Some(schema) => schema.eq_ignore_ascii_case(crate::extensions::EXTENSIONS_SCHEMA),
-            None => search_path
-                .iter()
-                .any(|s| s.eq_ignore_ascii_case(crate::extensions::EXTENSIONS_SCHEMA)),
-        };
-        if !in_extensions_schema {
-            return None;
-        }
-        crate::extensions::http::table_function_schema(func_name)
-    }
-
     match factor {
         TableFactor::Table {
             name, alias, args, ..
@@ -1029,18 +1346,36 @@ async fn collect_sources_from_table_factor(
                         search_path,
                         schema_opt.as_deref(),
                         &obj_name_norm,
-                    )?
+                        args,
+                        is_superuser,
+                    )
+                    .await?
                 }
             } else if schema_opt.is_none() {
                 match ctes.get(&obj_name_norm) {
                     Some(cte_schema) => cte_schema.clone(),
                     None => {
-                        resolve_table_schema_for_object_name(store, txn, db_id, name, search_path)
-                            .await?
+                        resolve_table_schema_for_object_name(
+                            store,
+                            txn,
+                            db_id,
+                            name,
+                            search_path,
+                            is_superuser,
+                        )
+                        .await?
                     }
                 }
             } else {
-                resolve_table_schema_for_object_name(store, txn, db_id, name, search_path).await?
+                resolve_table_schema_for_object_name(
+                    store,
+                    txn,
+                    db_id,
+                    name,
+                    search_path,
+                    is_superuser,
+                )
+                .await?
             };
 
             if let Some(alias) = alias {
@@ -1071,6 +1406,7 @@ async fn collect_sources_from_table_factor(
                 search_path,
                 subquery.as_ref(),
                 ctes,
+                is_superuser,
             );
             let mut cols = Box::pin(cols).await?;
 
@@ -1099,6 +1435,7 @@ async fn infer_select_output_columns_with_txn(
     search_path: &[String],
     select: &Select,
     ctes: &HashMap<String, TableSchema>,
+    is_superuser: bool,
 ) -> Option<Vec<InferredColumn>> {
     let mut sources = Vec::new();
     for twj in &select.from {
@@ -1110,6 +1447,7 @@ async fn infer_select_output_columns_with_txn(
             twj,
             ctes,
             &mut sources,
+            is_superuser,
         )
         .await?;
     }

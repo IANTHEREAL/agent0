@@ -67,10 +67,9 @@ id|customer_id|amount|status
 (3 rows)
 name|order_count
 Alice|2
-Diana|0
 Bob|1
 Charlie|1
-(4 rows)
+(3 rows)
 name|price|above_min
 Widget|10|0
 Gadget|20|10

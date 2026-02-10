@@ -1,0 +1,5 @@
+_line_number|line
+1|{"level":"INFO","message":"started"}
+2|{"level":"WARN","message":"slow query"}
+3|{"level":"ERROR","message":"connection lost"}
+(3 rows)

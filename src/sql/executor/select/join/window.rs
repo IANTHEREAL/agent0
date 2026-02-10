@@ -41,7 +41,7 @@ impl Executor {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let mut window_funcs =
+        let (mut window_funcs, window_sig_to_column) =
             Executor::extract_window_function_exprs(&rewritten_projection, &join_schema);
 
         for wf in &mut window_funcs {
@@ -161,6 +161,7 @@ impl Executor {
             &rewritten_projection,
             &join_schema,
             &window_funcs,
+            &window_sig_to_column,
             raw_rows,
         )?;
 

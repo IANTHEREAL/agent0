@@ -1146,12 +1146,19 @@ pub fn substitute_outer_values(
                         let table_part = normalize_ident(&parts[parts.len() - 2]);
                         if table_part.eq_ignore_ascii_case(self.outer_alias) {
                             let col_name = parts.last().map(normalize_ident).unwrap_or_default();
-                            if let Some(col_idx) = self
+                            let qualified = format!("{}.{}", table_part, col_name);
+                            let col_idx = self
                                 .outer_schema
                                 .columns
                                 .iter()
-                                .position(|c| c.name.eq_ignore_ascii_case(&col_name))
-                            {
+                                .position(|c| c.name.eq_ignore_ascii_case(&qualified))
+                                .or_else(|| {
+                                    self.outer_schema
+                                        .columns
+                                        .iter()
+                                        .position(|c| c.name.eq_ignore_ascii_case(&col_name))
+                                });
+                            if let Some(col_idx) = col_idx {
                                 if let Some(value) = self.outer_row.values.get(col_idx) {
                                     *expr = value_to_sql_expr(value);
                                 }

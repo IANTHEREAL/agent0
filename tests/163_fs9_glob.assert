@@ -1,0 +1,7 @@
+_path|product|amount
+/tmp/pgtikv-fs9-test/sales/feb.csv|Gadget|250
+/tmp/pgtikv-fs9-test/sales/feb.csv|Widget|150
+/tmp/pgtikv-fs9-test/sales/jan.csv|Gadget|200
+/tmp/pgtikv-fs9-test/sales/jan.csv|Widget|100
+(4 rows)
+(0 rows)

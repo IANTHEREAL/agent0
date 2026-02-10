@@ -1586,7 +1586,57 @@ impl Executor {
             root = Box::new(FilterOperator::new(root, filter_expr.clone()));
         }
 
+        let ordered_array_agg_order_by: Option<Vec<OrderByExpr>> = {
+            let mut ordered: Vec<Vec<OrderByExpr>> = Vec::new();
+            for item in projection {
+                let expr = match item {
+                    SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
+                    _ => continue,
+                };
+                if let Expr::ArrayAgg(arr) = expr {
+                    if let Some(order_by) = arr.order_by.as_ref() {
+                        if !order_by.is_empty() {
+                            ordered.push(order_by.clone());
+                        }
+                    }
+                }
+            }
+            if ordered.is_empty() {
+                None
+            } else {
+                let canonical = |obs: &[OrderByExpr]| -> String {
+                    obs.iter()
+                        .map(|o| format!("{}|{:?}|{:?}", o.expr, o.asc, o.nulls_first))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                };
+                let first_key = canonical(&ordered[0]);
+                if ordered.iter().any(|o| canonical(o) != first_key) {
+                    return Err(SqlError::Unsupported(
+                        "Multiple ordered aggregates with different ORDER BY are not supported"
+                            .into(),
+                    )
+                    .into());
+                }
+                Some(ordered.remove(0))
+            }
+        };
+
         let group_by_exprs_clone = group_by_exprs.clone();
+
+        if let Some(order_by) = ordered_array_agg_order_by {
+            let mut sort_keys: Vec<OrderByExpr> = group_by_exprs_clone
+                .iter()
+                .map(|e| OrderByExpr {
+                    expr: e.clone(),
+                    asc: Some(true),
+                    nulls_first: None,
+                })
+                .collect();
+            sort_keys.extend(order_by);
+            root = Box::new(SortOperator::new(root, sort_keys));
+        }
+
         root = Box::new(HashAggregateOperator::new(
             root,
             group_by_exprs,
@@ -2643,12 +2693,65 @@ impl Executor {
             )?
         };
 
-        let window_funcs = Self::extract_window_function_exprs(projection, &schema);
+        let (window_funcs, window_sig_to_column) =
+            Self::extract_window_function_exprs(projection, &schema);
 
         let window_operator = Box::new(WindowOperator::new(scan_operator, window_funcs.clone()));
 
-        let mut operator: BoxedOperator = if !order_by.is_empty() {
-            let sort_op = Box::new(SortOperator::new(window_operator, order_by.to_vec()));
+        let mut alias_exprs_for_order_by: HashMap<String, Expr> = HashMap::new();
+        let mut output_exprs_for_positional_order_by: Vec<Expr> = Vec::new();
+        for item in projection {
+            if let SelectItem::ExprWithAlias { expr, alias } = item {
+                alias_exprs_for_order_by.insert(
+                    alias.value.to_lowercase(),
+                    Self::rewrite_window_refs(expr, &window_sig_to_column),
+                );
+            }
+
+            match item {
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
+                    output_exprs_for_positional_order_by.extend(
+                        schema.columns.iter().map(|col| {
+                            Expr::Identifier(sqlparser::ast::Ident::new(col.name.clone()))
+                        }),
+                    );
+                }
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    output_exprs_for_positional_order_by
+                        .push(Self::rewrite_window_refs(expr, &window_sig_to_column));
+                }
+            }
+        }
+
+        let rewritten_order_by: Vec<OrderByExpr> = order_by
+            .iter()
+            .map(|o| {
+                let expr = match &o.expr {
+                    Expr::Identifier(ident) => alias_exprs_for_order_by
+                        .get(&ident.value.to_lowercase())
+                        .cloned()
+                        .unwrap_or_else(|| o.expr.clone()),
+                    Expr::Value(SqlValue::Number(n, _)) => {
+                        let Ok(pos) = n.parse::<usize>() else {
+                            return Ok(o.clone());
+                        };
+                        if pos == 0 || pos > output_exprs_for_positional_order_by.len() {
+                            return Err(anyhow!("ORDER BY position {} is not in select list", pos));
+                        }
+                        output_exprs_for_positional_order_by[pos - 1].clone()
+                    }
+                    _ => Self::rewrite_window_refs(&o.expr, &window_sig_to_column),
+                };
+                Ok(OrderByExpr {
+                    expr,
+                    asc: o.asc,
+                    nulls_first: o.nulls_first,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut operator: BoxedOperator = if !rewritten_order_by.is_empty() {
+            let sort_op = Box::new(SortOperator::new(window_operator, rewritten_order_by));
             if limit.is_some() || offset > 0 {
                 Box::new(LimitOperator::new(sort_op, limit, offset))
             } else {
@@ -2683,8 +2786,13 @@ impl Executor {
             .await?
         };
 
-        let (columns, column_types, projected_rows) =
-            Self::project_window_results(projection, &schema, &window_funcs, raw_rows)?;
+        let (columns, column_types, projected_rows) = Self::project_window_results(
+            projection,
+            &schema,
+            &window_funcs,
+            &window_sig_to_column,
+            raw_rows,
+        )?;
 
         Ok(ExecuteResult::Select {
             columns,
@@ -2697,58 +2805,272 @@ impl Executor {
     pub(crate) fn extract_window_function_exprs(
         projection: &[SelectItem],
         schema: &TableSchema,
-    ) -> Vec<WindowFunctionExpr> {
+    ) -> (Vec<WindowFunctionExpr>, HashMap<String, String>) {
         use sqlparser::ast::WindowType;
 
-        let mut result = Vec::new();
-        for (idx, item) in projection.iter().enumerate() {
-            let (func, alias) = match item {
-                SelectItem::UnnamedExpr(Expr::Function(f)) => (Some(f), None),
-                SelectItem::ExprWithAlias {
-                    expr: Expr::Function(f),
-                    alias,
-                } => (Some(f), Some(alias.value.clone())),
-                _ => (None, None),
-            };
+        fn collect_window_funcs_in_expr(
+            expr: &Expr,
+            schema: &TableSchema,
+            out: &mut Vec<WindowFunctionExpr>,
+            sig_to_col: &mut HashMap<String, String>,
+        ) {
+            match expr {
+                Expr::Function(f) if f.over.is_some() => {
+                    if let Some(WindowType::WindowSpec(spec)) = &f.over {
+                        let sig = format!("{}", expr).to_lowercase();
+                        if !sig_to_col.contains_key(&sig) {
+                            let func_name = f
+                                .name
+                                .0
+                                .last()
+                                .map(|i| i.value.to_lowercase())
+                                .unwrap_or_default();
 
-            if let Some(f) = func {
-                if let Some(WindowType::WindowSpec(spec)) = &f.over {
-                    let func_name = f
-                        .name
-                        .0
-                        .last()
-                        .map(|i| i.value.to_lowercase())
-                        .unwrap_or_default();
+                            let extract_arg = |index: usize| -> Option<Expr> {
+                                f.args.get(index).and_then(|a| match a {
+                                    FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                                        Some(e.clone())
+                                    }
+                                    _ => None,
+                                })
+                            };
 
-                    let extract_arg = |index: usize| -> Option<Expr> {
-                        f.args.get(index).and_then(|a| match a {
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
-                            _ => None,
-                        })
-                    };
+                            let arg_expr = extract_arg(0);
+                            let offset_expr = extract_arg(1);
+                            let default_value_expr = extract_arg(2);
 
-                    let arg_expr = extract_arg(0);
-                    let offset_expr = extract_arg(1);
-                    let default_value_expr = extract_arg(2);
+                            let output_name = format!("__window_{}", out.len());
+                            let output_type =
+                                Executor::infer_window_func_type(&func_name, &arg_expr, schema);
 
-                    let output_name = alias.unwrap_or_else(|| format!("window_{}", idx));
-                    let output_type = Self::infer_window_func_type(&func_name, &arg_expr, schema);
-
-                    result.push(WindowFunctionExpr {
-                        func_name,
-                        arg_expr,
-                        partition_by: spec.partition_by.clone(),
-                        order_by: spec.order_by.clone(),
-                        offset_expr,
-                        default_value_expr,
-                        window_frame: spec.window_frame.clone(),
-                        output_name,
-                        output_type,
-                    });
+                            sig_to_col.insert(sig, output_name.clone());
+                            out.push(WindowFunctionExpr {
+                                func_name,
+                                arg_expr,
+                                partition_by: spec.partition_by.clone(),
+                                order_by: spec.order_by.clone(),
+                                offset_expr,
+                                default_value_expr,
+                                window_frame: spec.window_frame.clone(),
+                                output_name,
+                                output_type,
+                            });
+                        }
+                    }
                 }
+                Expr::BinaryOp { left, right, .. } => {
+                    collect_window_funcs_in_expr(left, schema, out, sig_to_col);
+                    collect_window_funcs_in_expr(right, schema, out, sig_to_col);
+                }
+                Expr::UnaryOp { expr: inner, .. }
+                | Expr::Nested(inner)
+                | Expr::Cast { expr: inner, .. }
+                | Expr::TryCast { expr: inner, .. }
+                | Expr::IsNull(inner)
+                | Expr::IsNotNull(inner)
+                | Expr::IsTrue(inner)
+                | Expr::IsFalse(inner)
+                | Expr::IsNotTrue(inner)
+                | Expr::IsNotFalse(inner) => {
+                    collect_window_funcs_in_expr(inner, schema, out, sig_to_col);
+                }
+                Expr::Case {
+                    operand,
+                    conditions,
+                    results,
+                    else_result,
+                } => {
+                    if let Some(op) = operand.as_ref() {
+                        collect_window_funcs_in_expr(op, schema, out, sig_to_col);
+                    }
+                    for cond in conditions {
+                        collect_window_funcs_in_expr(cond, schema, out, sig_to_col);
+                    }
+                    for res in results {
+                        collect_window_funcs_in_expr(res, schema, out, sig_to_col);
+                    }
+                    if let Some(el) = else_result.as_ref() {
+                        collect_window_funcs_in_expr(el, schema, out, sig_to_col);
+                    }
+                }
+                Expr::Function(f) => {
+                    for arg in &f.args {
+                        if let FunctionArg::Unnamed(FunctionArgExpr::Expr(e))
+                        | FunctionArg::Named {
+                            arg: FunctionArgExpr::Expr(e),
+                            ..
+                        } = arg
+                        {
+                            collect_window_funcs_in_expr(e, schema, out, sig_to_col);
+                        }
+                    }
+                }
+                Expr::InList { expr: e, list, .. } => {
+                    collect_window_funcs_in_expr(e, schema, out, sig_to_col);
+                    for item in list {
+                        collect_window_funcs_in_expr(item, schema, out, sig_to_col);
+                    }
+                }
+                Expr::Between {
+                    expr, low, high, ..
+                } => {
+                    collect_window_funcs_in_expr(expr, schema, out, sig_to_col);
+                    collect_window_funcs_in_expr(low, schema, out, sig_to_col);
+                    collect_window_funcs_in_expr(high, schema, out, sig_to_col);
+                }
+                // Ignore nested query scopes; window functions inside subqueries are handled when
+                // executing that query block.
+                Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {}
+                _ => {}
             }
         }
-        result
+
+        let mut result = Vec::new();
+        let mut sig_to_col: HashMap<String, String> = HashMap::new();
+        for item in projection {
+            if let Some(expr) = match item {
+                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
+                _ => None,
+            } {
+                collect_window_funcs_in_expr(expr, schema, &mut result, &mut sig_to_col);
+            }
+        }
+
+        (result, sig_to_col)
+    }
+
+    fn rewrite_window_refs(expr: &Expr, sig_to_col: &HashMap<String, String>) -> Expr {
+        use sqlparser::ast::WindowType;
+
+        match expr {
+            Expr::Function(f) if f.over.is_some() => {
+                if let Some(WindowType::WindowSpec(_spec)) = &f.over {
+                    let sig = format!("{}", expr).to_lowercase();
+                    if let Some(col_name) = sig_to_col.get(&sig) {
+                        return Expr::Identifier(Ident::new(col_name.clone()));
+                    }
+                }
+                expr.clone()
+            }
+            Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+                left: Box::new(Self::rewrite_window_refs(left, sig_to_col)),
+                op: op.clone(),
+                right: Box::new(Self::rewrite_window_refs(right, sig_to_col)),
+            },
+            Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+                op: op.clone(),
+                expr: Box::new(Self::rewrite_window_refs(inner, sig_to_col)),
+            },
+            Expr::Nested(inner) => {
+                Expr::Nested(Box::new(Self::rewrite_window_refs(inner, sig_to_col)))
+            }
+            Expr::Cast {
+                expr: inner,
+                data_type,
+                format,
+            } => Expr::Cast {
+                expr: Box::new(Self::rewrite_window_refs(inner, sig_to_col)),
+                data_type: data_type.clone(),
+                format: format.clone(),
+            },
+            Expr::TryCast {
+                expr: inner,
+                data_type,
+                format,
+            } => Expr::TryCast {
+                expr: Box::new(Self::rewrite_window_refs(inner, sig_to_col)),
+                data_type: data_type.clone(),
+                format: format.clone(),
+            },
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|o| Box::new(Self::rewrite_window_refs(o, sig_to_col))),
+                conditions: conditions
+                    .iter()
+                    .map(|c| Self::rewrite_window_refs(c, sig_to_col))
+                    .collect(),
+                results: results
+                    .iter()
+                    .map(|r| Self::rewrite_window_refs(r, sig_to_col))
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(Self::rewrite_window_refs(e, sig_to_col))),
+            },
+            Expr::Function(f) => {
+                let new_args: Vec<FunctionArg> = f
+                    .args
+                    .iter()
+                    .map(|a| match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => FunctionArg::Unnamed(
+                            FunctionArgExpr::Expr(Self::rewrite_window_refs(e, sig_to_col)),
+                        ),
+                        FunctionArg::Named {
+                            name,
+                            arg: FunctionArgExpr::Expr(e),
+                        } => FunctionArg::Named {
+                            name: name.clone(),
+                            arg: FunctionArgExpr::Expr(Self::rewrite_window_refs(e, sig_to_col)),
+                        },
+                        other => other.clone(),
+                    })
+                    .collect();
+                Expr::Function(Function {
+                    name: f.name.clone(),
+                    args: new_args,
+                    filter: f.filter.clone(),
+                    null_treatment: f.null_treatment.clone(),
+                    over: f.over.clone(),
+                    distinct: f.distinct,
+                    special: f.special,
+                    order_by: f.order_by.clone(),
+                })
+            }
+            Expr::IsNull(e) => Expr::IsNull(Box::new(Self::rewrite_window_refs(e, sig_to_col))),
+            Expr::IsNotNull(e) => {
+                Expr::IsNotNull(Box::new(Self::rewrite_window_refs(e, sig_to_col)))
+            }
+            Expr::IsTrue(e) => Expr::IsTrue(Box::new(Self::rewrite_window_refs(e, sig_to_col))),
+            Expr::IsFalse(e) => Expr::IsFalse(Box::new(Self::rewrite_window_refs(e, sig_to_col))),
+            Expr::IsNotTrue(e) => {
+                Expr::IsNotTrue(Box::new(Self::rewrite_window_refs(e, sig_to_col)))
+            }
+            Expr::IsNotFalse(e) => {
+                Expr::IsNotFalse(Box::new(Self::rewrite_window_refs(e, sig_to_col)))
+            }
+            Expr::InList {
+                expr: e,
+                list,
+                negated,
+            } => Expr::InList {
+                expr: Box::new(Self::rewrite_window_refs(e, sig_to_col)),
+                list: list
+                    .iter()
+                    .map(|i| Self::rewrite_window_refs(i, sig_to_col))
+                    .collect(),
+                negated: *negated,
+            },
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => Expr::Between {
+                expr: Box::new(Self::rewrite_window_refs(expr, sig_to_col)),
+                negated: *negated,
+                low: Box::new(Self::rewrite_window_refs(low, sig_to_col)),
+                high: Box::new(Self::rewrite_window_refs(high, sig_to_col)),
+            },
+            // Ignore nested query scopes.
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => expr.clone(),
+            _ => expr.clone(),
+        }
     }
 
     pub(crate) fn infer_window_func_type(
@@ -2777,94 +3099,83 @@ impl Executor {
         projection: &[SelectItem],
         schema: &TableSchema,
         window_funcs: &[WindowFunctionExpr],
+        window_sig_to_column: &HashMap<String, String>,
         rows: Vec<Row>,
     ) -> Result<(Vec<String>, Vec<DataType>, Vec<Row>)> {
-        let mut columns = Vec::new();
-        let mut column_types = Vec::new();
-        let mut proj_info: Vec<(String, DataType, ProjectionSource)> = Vec::new();
+        use crate::types::ColumnDef;
 
-        let input_col_count = schema.columns.len();
-        let mut window_idx = 0;
+        let mut window_columns: Vec<ColumnDef> = schema
+            .columns
+            .iter()
+            .map(|c| ColumnDef {
+                name: c.name.clone(),
+                data_type: c.data_type.clone(),
+                nullable: c.nullable,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            })
+            .collect();
+
+        for wf in window_funcs {
+            window_columns.push(ColumnDef {
+                name: wf.output_name.clone(),
+                data_type: wf.output_type.clone(),
+                nullable: true,
+                primary_key: false,
+                unique: false,
+                is_serial: false,
+                default_expr: None,
+            });
+        }
+
+        let window_schema = TableSchema {
+            name: "window_result".to_string(),
+            table_id: 0,
+            columns: window_columns,
+            version: 1,
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+        };
+
+        let mut columns: Vec<String> = Vec::new();
+        let mut column_types: Vec<DataType> = Vec::new();
+        let mut projection_exprs: Vec<Expr> = Vec::new();
 
         for item in projection {
             match item {
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
                     for col in &schema.columns {
-                        proj_info.push((
-                            col.name.clone(),
-                            col.data_type.clone(),
-                            ProjectionSource::InputColumn(col.name.clone()),
-                        ));
+                        columns.push(col.name.clone());
+                        column_types.push(col.data_type.clone());
+                        projection_exprs.push(Expr::Identifier(Ident::new(col.name.clone())));
                     }
                 }
-                SelectItem::UnnamedExpr(Expr::Function(f))
-                | SelectItem::ExprWithAlias {
-                    expr: Expr::Function(f),
-                    ..
-                } if f.over.is_some() => {
-                    if window_idx < window_funcs.len() {
-                        let wf = &window_funcs[window_idx];
-                        proj_info.push((
-                            wf.output_name.clone(),
-                            wf.output_type.clone(),
-                            ProjectionSource::WindowColumn(input_col_count + window_idx),
-                        ));
-                        window_idx += 1;
-                    }
-                }
-                SelectItem::UnnamedExpr(e) => {
-                    let name = get_select_item_name(item);
-                    let dtype = infer_expr_type(e, schema);
-                    proj_info.push((name, dtype, ProjectionSource::Expression(e.clone())));
-                }
-                SelectItem::ExprWithAlias { expr, alias } => {
-                    let dtype = infer_expr_type(expr, schema);
-                    proj_info.push((
-                        alias.value.clone(),
-                        dtype,
-                        ProjectionSource::Expression(expr.clone()),
-                    ));
+                SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                    columns.push(get_select_item_name(item));
+                    let rewritten = Self::rewrite_window_refs(expr, window_sig_to_column);
+                    column_types.push(infer_expr_type(&rewritten, &window_schema));
+                    projection_exprs.push(rewritten);
                 }
             }
         }
 
-        for (name, dtype, _) in &proj_info {
-            columns.push(name.clone());
-            column_types.push(dtype.clone());
-        }
-
-        let mut projected_rows = Vec::with_capacity(rows.len());
+        let mut projected_rows: Vec<Row> = Vec::with_capacity(rows.len());
         for row in rows {
-            let mut values = Vec::with_capacity(proj_info.len());
-            for (_, _, source) in &proj_info {
-                let value = match source {
-                    ProjectionSource::InputColumn(name) => {
-                        if let Some(idx) = schema.column_index(name) {
-                            row.values.get(idx).cloned().unwrap_or(Value::Null)
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    ProjectionSource::WindowColumn(idx) => {
-                        row.values.get(*idx).cloned().unwrap_or(Value::Null)
-                    }
-                    ProjectionSource::Expression(expr) => {
-                        eval_expr(expr, Some(&row), Some(schema))?
-                    }
-                };
-                values.push(value);
+            let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
+            for expr in &projection_exprs {
+                values.push(eval_expr(expr, Some(&row), Some(&window_schema))?);
             }
             projected_rows.push(Row::new(values));
         }
 
         Ok((columns, column_types, projected_rows))
     }
-}
-
-enum ProjectionSource {
-    InputColumn(String),
-    WindowColumn(usize),
-    Expression(Expr),
 }
 
 #[cfg(test)]
