@@ -1,0 +1,35 @@
+valid_int
+123
+(1 row)
+valid_neg_int
+-456
+(1 row)
+valid_bigint
+789
+(1 row)
+valid_float
+3.14
+(1 row)
+valid_bool_true
+t
+(1 row)
+valid_bool_false
+f
+(1 row)
+valid_bool_f
+f
+(1 row)
+valid_bool_yes
+t
+(1 row)
+ERROR:  invalid input syntax for type integer: "abc"
+ERROR:  invalid input syntax for type integer: ""
+ERROR:  invalid input syntax for type bigint: "xyz"
+ERROR:  invalid input syntax for type double precision: "not_a_float"
+ERROR:  invalid input syntax for type boolean: "nope"
+ERROR:  invalid input syntax for type boolean: "maybe"
+ERROR:  integer out of range
+ERROR:  integer out of range
+ERROR:  integer out of range
+ERROR:  bigint out of range
+ERROR:  bigint out of range

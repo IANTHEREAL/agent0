@@ -1075,111 +1075,120 @@ fn cast_to_bytea(v: Value) -> Result<Value> {
 
 fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value> {
     use sqlparser::ast::DataType as SqlType;
-    match (val, data_type) {
-        (Value::Null, _) => Ok(Value::Null),
-        (v, SqlType::Numeric(info) | SqlType::Decimal(info)) => {
-            let (precision, scale) = match info {
-                sqlparser::ast::ExactNumberInfo::None => (None, None),
-                // Postgres: NUMERIC(p) implies scale=0
-                sqlparser::ast::ExactNumberInfo::Precision(p) => (Some(*p as u32), Some(0)),
-                sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
-                    (Some(*p as u32), Some(*s as u32))
-                }
-            };
-            if let Some(p) = precision {
-                if p > 28 {
-                    return Err(anyhow!(
-                        "NUMERIC precision {} exceeds supported maximum 28",
-                        p
-                    ));
-                }
-            }
-            if let Some(s) = scale {
-                if s > 28 {
-                    return Err(anyhow!("NUMERIC scale {} exceeds supported maximum 28", s));
-                }
-            }
-            if let (Some(p), Some(s)) = (precision, scale) {
-                if s > p {
-                    return Err(anyhow!(
-                        "NUMERIC scale {} must be between 0 and precision {}",
-                        s,
-                        p
-                    ));
-                }
-            }
 
-            let mut d = match v {
-                Value::Numeric(d) => d,
-                Value::Int32(i) => Decimal::from(i),
-                Value::Int64(i) => Decimal::from(i),
-                Value::Float64(f) => {
-                    Decimal::try_from(f).map_err(|_| SqlError::InvalidInputSyntax {
-                        type_name: "numeric".into(),
-                        value: f.to_string(),
-                    })?
-                }
-                Value::Text(s) => {
-                    Decimal::from_str(s.trim()).map_err(|_| SqlError::InvalidInputSyntax {
-                        type_name: "numeric".into(),
-                        value: s.clone(),
-                    })?
-                }
-                other => {
-                    return Err(SqlError::InvalidCast {
-                        from: other.data_type().unwrap_or(crate::types::DataType::Text),
-                        to: crate::types::DataType::Numeric {
-                            precision: None,
-                            scale: None,
-                        },
-                    }
-                    .into())
-                }
-            };
-            if let Some(s) = scale {
-                d.rescale(s);
-            }
-            Ok(Value::Numeric(d))
+    // Handle NULL early — castable to any type.
+    if val == Value::Null {
+        return Ok(Value::Null);
+    }
+
+    // --- Phase 1: handle SqlType variants that carry extra metadata (lengths,
+    //     precision/scale, timezone info, custom type names) which would be lost
+    //     after normalisation to internal DataType. ---
+
+    match data_type {
+        // NUMERIC / DECIMAL — need precision & scale from the SqlType.
+        SqlType::Numeric(info)
+        | SqlType::Decimal(info)
+        | SqlType::Dec(info)
+        | SqlType::BigNumeric(info)
+        | SqlType::BigDecimal(info) => {
+            return cast_to_numeric(val, info);
         }
-        (v, SqlType::Text) => Ok(Value::Text(v.to_string())),
-        (v, SqlType::Varchar(len_opt)) => {
-            let s = v.to_string();
+
+        // VARCHAR(n) — need the length limit.
+        SqlType::Varchar(len_opt) => {
+            let s = val.to_string();
             if let Some(sqlparser::ast::CharacterLength::IntegerLength { length, .. }) = len_opt {
                 let max_len = *length as usize;
                 if s.chars().count() > max_len {
                     return Ok(Value::Text(s.chars().take(max_len).collect()));
                 }
             }
-            Ok(Value::Text(s))
+            return Ok(Value::Text(s));
         }
-        (v, SqlType::String(len_opt)) => {
-            let s = v.to_string();
+
+        // String(n) — need the length limit.
+        SqlType::String(len_opt) => {
+            let s = val.to_string();
             if let Some(n) = len_opt {
                 let max_len = *n as usize;
                 if s.chars().count() > max_len {
                     return Ok(Value::Text(s.chars().take(max_len).collect()));
                 }
             }
-            Ok(Value::Text(s))
+            return Ok(Value::Text(s));
         }
-        (Value::Text(s), SqlType::Int(_) | SqlType::Integer(_)) => {
-            Ok(Value::Int32(s.trim().parse().unwrap_or(0)))
+
+        // Timestamp — need timezone info to pick Timestamp vs TimestampTz.
+        SqlType::Timestamp(_, _) => {
+            return match val {
+                Value::Text(s) => parse_timestamp_string(&s),
+                Value::Timestamp(ts) => Ok(Value::Timestamp(ts)),
+                Value::Date(days) => {
+                    crate::types::date::date_days_to_timestamp_millis(days).map(Value::Timestamp)
+                }
+                other => Ok(other),
+            };
         }
-        (Value::Text(s), SqlType::BigInt(_) | SqlType::Int8(_)) => {
-            Ok(Value::Int64(s.trim().parse().unwrap_or(0)))
+
+        // Custom types — need the type name string.
+        SqlType::Custom(name, _) => {
+            return cast_custom_type(val, name);
         }
-        (Value::Text(s), SqlType::Float(_) | SqlType::Double | SqlType::Real) => {
-            Ok(Value::Float64(s.trim().parse().unwrap_or(0.0)))
+
+        // Regclass — pass-through (Postgres OID lookup, not implemented).
+        SqlType::Regclass => return Ok(val),
+
+        // Everything else is handled by normalising below.
+        _ => {}
+    }
+
+    // --- Phase 2: normalise the SqlType to internal DataType via the single
+    //     source of truth in mapping.rs, then dispatch on (Value, DataType). ---
+
+    let target = crate::sql::types::try_sql_datatype_to_internal(data_type)?;
+    cast_value_to_type(val, &target)
+}
+
+/// Cast a value to an internal DataType (normalised from SqlType).
+fn cast_value_to_type(val: Value, target: &DataType) -> Result<Value> {
+    match (val, target) {
+        // --- To Boolean ---
+        (Value::Text(s), DataType::Boolean) => match s.trim().to_lowercase().as_str() {
+            "true" | "t" | "yes" | "y" | "1" => Ok(Value::Boolean(true)),
+            "false" | "f" | "no" | "n" | "0" => Ok(Value::Boolean(false)),
+            _ => Err(SqlError::InvalidInputSyntax {
+                type_name: "boolean".into(),
+                value: s.clone(),
+            }
+            .into()),
+        },
+        (Value::Int32(n), DataType::Boolean) => Ok(Value::Boolean(n != 0)),
+        (Value::Int64(n), DataType::Boolean) => Ok(Value::Boolean(n != 0)),
+        (Value::Float64(n), DataType::Boolean) => Ok(Value::Boolean(n != 0.0)),
+        (Value::Numeric(d), DataType::Boolean) => Ok(Value::Boolean(!d.is_zero())),
+
+        // --- To Int32 ---
+        (Value::Text(s), DataType::Int32) => {
+            s.trim().parse::<i32>().map(Value::Int32).map_err(|_| {
+                SqlError::InvalidInputSyntax {
+                    type_name: "integer".into(),
+                    value: s.clone(),
+                }
+                .into()
+            })
         }
-        (Value::Text(s), SqlType::Boolean) => Ok(Value::Boolean(matches!(
-            s.to_lowercase().as_str(),
-            "true" | "t" | "yes" | "y" | "1"
-        ))),
-        (Value::Int32(n), SqlType::Boolean) => Ok(Value::Boolean(n != 0)),
-        (Value::Int64(n), SqlType::Boolean) => Ok(Value::Boolean(n != 0)),
-        (Value::Float64(n), SqlType::Boolean) => Ok(Value::Boolean(n != 0.0)),
-        (Value::Numeric(d), SqlType::Boolean) => Ok(Value::Boolean(!d.is_zero())),
-        (Value::Numeric(d), SqlType::Int(_) | SqlType::Integer(_)) => {
+        (Value::Int64(n), DataType::Int32) => i32::try_from(n)
+            .map(Value::Int32)
+            .map_err(|_| anyhow!("integer out of range")),
+        (Value::Float64(n), DataType::Int32) => {
+            let rounded = round_half_away_from_zero(n);
+            if n.is_nan() || rounded < (i32::MIN as f64) || rounded > (i32::MAX as f64) {
+                return Err(anyhow!("integer out of range"));
+            }
+            Ok(Value::Int32(rounded as i32))
+        }
+        (Value::Numeric(d), DataType::Int32) => {
             use rust_decimal::prelude::ToPrimitive;
             use rust_decimal::RoundingStrategy;
             d.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
@@ -1187,7 +1196,27 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                 .map(Value::Int32)
                 .ok_or_else(|| anyhow!("numeric value out of range for integer"))
         }
-        (Value::Numeric(d), SqlType::BigInt(_) | SqlType::Int8(_)) => {
+        (Value::Boolean(b), DataType::Int32) => Ok(Value::Int32(if b { 1 } else { 0 })),
+
+        // --- To Int64 ---
+        (Value::Text(s), DataType::Int64) => {
+            s.trim().parse::<i64>().map(Value::Int64).map_err(|_| {
+                SqlError::InvalidInputSyntax {
+                    type_name: "bigint".into(),
+                    value: s.clone(),
+                }
+                .into()
+            })
+        }
+        (Value::Int32(n), DataType::Int64) => Ok(Value::Int64(n as i64)),
+        (Value::Float64(n), DataType::Int64) => {
+            let rounded = round_half_away_from_zero(n);
+            if n.is_nan() || rounded < (i64::MIN as f64) || rounded > (i64::MAX as f64) {
+                return Err(anyhow!("bigint out of range"));
+            }
+            Ok(Value::Int64(rounded as i64))
+        }
+        (Value::Numeric(d), DataType::Int64) => {
             use rust_decimal::prelude::ToPrimitive;
             use rust_decimal::RoundingStrategy;
             d.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
@@ -1195,114 +1224,205 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
                 .map(Value::Int64)
                 .ok_or_else(|| anyhow!("numeric value out of range for bigint"))
         }
-        (Value::Numeric(d), SqlType::Float(_) | SqlType::Double | SqlType::Real) => {
+
+        // --- To Float64 ---
+        (Value::Text(s), DataType::Float64) => {
+            s.trim().parse::<f64>().map(Value::Float64).map_err(|_| {
+                SqlError::InvalidInputSyntax {
+                    type_name: "double precision".into(),
+                    value: s.clone(),
+                }
+                .into()
+            })
+        }
+        (Value::Int32(n), DataType::Float64) => Ok(Value::Float64(n as f64)),
+        (Value::Int64(n), DataType::Float64) => Ok(Value::Float64(n as f64)),
+        (Value::Numeric(d), DataType::Float64) => {
             use rust_decimal::prelude::ToPrimitive;
             d.to_f64()
                 .map(Value::Float64)
                 .ok_or_else(|| anyhow!("numeric value out of range for double precision"))
         }
-        (Value::Int32(n), SqlType::BigInt(_) | SqlType::Int8(_)) => Ok(Value::Int64(n as i64)),
-        (Value::Int32(n), SqlType::Float(_) | SqlType::Double | SqlType::Real) => {
-            Ok(Value::Float64(n as f64))
+
+        // --- To Text (all remaining text-like types: Char, Nvarchar, Clob, etc.) ---
+        (v, DataType::Text) => Ok(Value::Text(v.to_string())),
+
+        // --- To Bytes ---
+        (v, DataType::Bytes) => cast_to_bytea(v),
+
+        // --- Temporal ---
+        (Value::Text(s), DataType::Interval) => parse_interval_string(&s),
+        (Value::Text(s), DataType::Date) => {
+            crate::types::date::parse_date_days(&s).map(Value::Date)
         }
-        (Value::Int64(n), SqlType::Int(_) | SqlType::Integer(_)) => Ok(Value::Int32(n as i32)),
-        (Value::Int64(n), SqlType::Float(_) | SqlType::Double | SqlType::Real) => {
-            Ok(Value::Float64(n as f64))
-        }
-        (Value::Float64(n), SqlType::Int(_) | SqlType::Integer(_)) => {
-            Ok(Value::Int32(round_half_away_from_zero(n) as i32))
-        }
-        (Value::Float64(n), SqlType::BigInt(_) | SqlType::Int8(_)) => {
-            Ok(Value::Int64(round_half_away_from_zero(n) as i64))
-        }
-        (Value::Boolean(b), SqlType::Int(_) | SqlType::Integer(_)) => {
-            Ok(Value::Int32(if b { 1 } else { 0 }))
-        }
-        (Value::Text(s), SqlType::Interval) => parse_interval_string(&s),
-        (Value::Text(s), SqlType::Timestamp(_, _)) => parse_timestamp_string(&s),
-        (Value::Timestamp(ts), SqlType::Timestamp(_, _)) => Ok(Value::Timestamp(ts)),
-        (Value::Text(s), SqlType::Date) => crate::types::date::parse_date_days(&s).map(Value::Date),
-        (Value::Timestamp(ts), SqlType::Date) => {
+        (Value::Timestamp(ts), DataType::Date) => {
             crate::types::date::timestamp_millis_to_date_days(ts).map(Value::Date)
         }
-        (Value::Date(days), SqlType::Date) => Ok(Value::Date(days)),
-        (Value::Date(days), SqlType::Timestamp(_, _)) => {
+        (Value::Date(days), DataType::Date) => Ok(Value::Date(days)),
+        (Value::Text(s), DataType::Timestamp) => parse_timestamp_string(&s),
+        (Value::Date(days), DataType::Timestamp) => {
             crate::types::date::date_days_to_timestamp_millis(days).map(Value::Timestamp)
         }
-        (Value::Text(s), SqlType::Time(_, _)) => {
+        (Value::Text(s), DataType::Time) => {
             use crate::sql::value_coercion::parse_time_string;
             parse_time_string(&s)
                 .map(Value::Time)
                 .ok_or_else(|| anyhow!("Invalid time format: {}", s))
         }
-        (Value::Time(micros), SqlType::Time(_, _)) => Ok(Value::Time(micros)),
-        (Value::Text(s), SqlType::Uuid) => {
+        (Value::Time(micros), DataType::Time) => Ok(Value::Time(micros)),
+
+        // --- UUID ---
+        (Value::Text(s), DataType::Uuid) => {
             let uuid =
                 uuid::Uuid::parse_str(s.trim()).map_err(|e| anyhow!("Invalid UUID: {}", e))?;
             Ok(Value::Uuid(*uuid.as_bytes()))
         }
-        (Value::Uuid(bytes), SqlType::Uuid) => Ok(Value::Uuid(bytes)),
-        (v, SqlType::Bytea) => cast_to_bytea(v),
-        (v, SqlType::Custom(name, _)) => {
-            if let Some(ident) = name.0.last() {
-                let type_name = ident.value.to_uppercase();
-                match type_name.as_str() {
-                    "JSON" => {
-                        let s = match &v {
-                            Value::Text(s) => s.clone(),
-                            Value::Json(s) => s.clone(),
-                            Value::Jsonb(s) => s.clone(),
-                            other => other.to_string(),
-                        };
-                        serde_json::from_str::<serde_json::Value>(&s).map_err(|e| {
-                            SqlError::InvalidInputSyntax {
-                                type_name: "json".into(),
-                                value: e.to_string(),
-                            }
-                        })?;
-                        Ok(Value::Json(s))
-                    }
-                    "BYTEA" => cast_to_bytea(v),
-                    "JSONB" => {
-                        let s = match &v {
-                            Value::Text(s) => s.clone(),
-                            Value::Json(s) => s.clone(),
-                            Value::Jsonb(s) => return Ok(Value::Jsonb(s.clone())),
-                            other => other.to_string(),
-                        };
-                        let parsed: serde_json::Value =
-                            serde_json::from_str(&s).map_err(|e| SqlError::InvalidInputSyntax {
-                                type_name: "jsonb".into(),
-                                value: e.to_string(),
-                            })?;
-                        Ok(Value::Jsonb(parsed.to_string()))
-                    }
-                    "VECTOR" => match &v {
-                        Value::Text(s) => parse_vector_literal(s).map(Value::Vector),
-                        Value::Vector(_) => Ok(v),
-                        _ => Err(SqlError::InvalidCast {
-                            from: v.data_type().unwrap_or(crate::types::DataType::Text),
-                            to: crate::types::DataType::Vector(0),
-                        }
-                        .into()),
-                    },
-                    "REGTYPE" => {
-                        let s = match &v {
-                            Value::Text(s) => s.clone(),
-                            other => other.to_string(),
-                        };
-                        let s = s.replace('"', "");
-                        let type_name = s.rsplit('.').next().unwrap_or_else(|| s.as_str()).trim();
-                        Ok(Value::Text(type_name.to_string()))
-                    }
-                    _ => Ok(v),
+        (Value::Uuid(bytes), DataType::Uuid) => Ok(Value::Uuid(bytes)),
+
+        // --- JSON (via SqlType::JSON, not Custom) ---
+        (v, DataType::Json) => {
+            let s = match &v {
+                Value::Text(s) => s.clone(),
+                Value::Json(s) => s.clone(),
+                Value::Jsonb(s) => s.clone(),
+                other => other.to_string(),
+            };
+            serde_json::from_str::<serde_json::Value>(&s).map_err(|e| {
+                SqlError::InvalidInputSyntax {
+                    type_name: "json".into(),
+                    value: e.to_string(),
                 }
-            } else {
-                Ok(v)
-            }
+            })?;
+            Ok(Value::Json(s))
         }
-        (v, SqlType::Regclass) => Ok(v),
+
+        // --- Identity / pass-through for same-type casts ---
         (v, _) => Ok(v),
+    }
+}
+
+/// Cast to NUMERIC with precision/scale from the raw SqlType.
+fn cast_to_numeric(val: Value, info: &sqlparser::ast::ExactNumberInfo) -> Result<Value> {
+    let (precision, scale) = match info {
+        sqlparser::ast::ExactNumberInfo::None => (None, None),
+        sqlparser::ast::ExactNumberInfo::Precision(p) => (Some(*p as u32), Some(0)),
+        sqlparser::ast::ExactNumberInfo::PrecisionAndScale(p, s) => {
+            (Some(*p as u32), Some(*s as u32))
+        }
+    };
+    if let Some(p) = precision {
+        if p > 28 {
+            return Err(anyhow!(
+                "NUMERIC precision {} exceeds supported maximum 28",
+                p
+            ));
+        }
+    }
+    if let Some(s) = scale {
+        if s > 28 {
+            return Err(anyhow!("NUMERIC scale {} exceeds supported maximum 28", s));
+        }
+    }
+    if let (Some(p), Some(s)) = (precision, scale) {
+        if s > p {
+            return Err(anyhow!(
+                "NUMERIC scale {} must be between 0 and precision {}",
+                s,
+                p
+            ));
+        }
+    }
+
+    let mut d = match val {
+        Value::Numeric(d) => d,
+        Value::Int32(i) => Decimal::from(i),
+        Value::Int64(i) => Decimal::from(i),
+        Value::Float64(f) => {
+            Decimal::try_from(f).map_err(|_| SqlError::InvalidInputSyntax {
+                type_name: "numeric".into(),
+                value: f.to_string(),
+            })?
+        }
+        Value::Text(s) => {
+            Decimal::from_str(s.trim()).map_err(|_| SqlError::InvalidInputSyntax {
+                type_name: "numeric".into(),
+                value: s.clone(),
+            })?
+        }
+        other => {
+            return Err(SqlError::InvalidCast {
+                from: other.data_type().unwrap_or(DataType::Text),
+                to: DataType::Numeric {
+                    precision: None,
+                    scale: None,
+                },
+            }
+            .into())
+        }
+    };
+    if let Some(s) = scale {
+        d.rescale(s);
+    }
+    Ok(Value::Numeric(d))
+}
+
+/// Cast to a Custom type identified by name (JSON, JSONB, VECTOR, REGTYPE, etc.).
+fn cast_custom_type(val: Value, name: &sqlparser::ast::ObjectName) -> Result<Value> {
+    if let Some(ident) = name.0.last() {
+        let type_name = ident.value.to_uppercase();
+        match type_name.as_str() {
+            "JSON" => {
+                let s = match &val {
+                    Value::Text(s) => s.clone(),
+                    Value::Json(s) => s.clone(),
+                    Value::Jsonb(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                serde_json::from_str::<serde_json::Value>(&s).map_err(|e| {
+                    SqlError::InvalidInputSyntax {
+                        type_name: "json".into(),
+                        value: e.to_string(),
+                    }
+                })?;
+                Ok(Value::Json(s))
+            }
+            "BYTEA" => cast_to_bytea(val),
+            "JSONB" => {
+                let s = match &val {
+                    Value::Text(s) => s.clone(),
+                    Value::Json(s) => s.clone(),
+                    Value::Jsonb(s) => return Ok(Value::Jsonb(s.clone())),
+                    other => other.to_string(),
+                };
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&s).map_err(|e| SqlError::InvalidInputSyntax {
+                        type_name: "jsonb".into(),
+                        value: e.to_string(),
+                    })?;
+                Ok(Value::Jsonb(parsed.to_string()))
+            }
+            "VECTOR" => match &val {
+                Value::Text(s) => parse_vector_literal(s).map(Value::Vector),
+                Value::Vector(_) => Ok(val),
+                _ => Err(SqlError::InvalidCast {
+                    from: val.data_type().unwrap_or(DataType::Text),
+                    to: DataType::Vector(0),
+                }
+                .into()),
+            },
+            "REGTYPE" => {
+                let s = match &val {
+                    Value::Text(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let s = s.replace('"', "");
+                let type_name = s.rsplit('.').next().unwrap_or_else(|| s.as_str()).trim();
+                Ok(Value::Text(type_name.to_string()))
+            }
+            _ => Ok(val),
+        }
+    } else {
+        Ok(val)
     }
 }
 
