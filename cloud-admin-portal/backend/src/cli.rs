@@ -216,7 +216,7 @@ async fn main() {
                 let mut display_items = items.clone();
                 for item in &mut display_items {
                     if let Some(obj) = item.as_object_mut() {
-                        let formatted = format_time(obj.get("created_at").map(|v| v));
+                        let formatted = format_time(obj.get("created_at"));
                         obj.insert("created_at".into(), Value::String(formatted));
                     }
                 }

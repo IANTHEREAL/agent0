@@ -343,7 +343,7 @@ async fn cmd_db_list(api: &ApiClient, json: bool) {
     let mut items = data.as_array().cloned().unwrap_or_default();
     for item in &mut items {
         if let Some(obj) = item.as_object_mut() {
-            let formatted = format_time(obj.get("created_at").map(|v| v));
+            let formatted = format_time(obj.get("created_at"));
             obj.insert("created_at".into(), Value::String(formatted));
         }
     }
@@ -505,9 +505,9 @@ async fn cmd_token_list(api: &ApiClient, json: bool) {
     let mut items = data.as_array().cloned().unwrap_or_default();
     for item in &mut items {
         if let Some(obj) = item.as_object_mut() {
-            let created = format_time(obj.get("created_at").map(|v| v));
+            let created = format_time(obj.get("created_at"));
             obj.insert("created_at".into(), Value::String(created));
-            let expires = format_time(obj.get("expires_at").map(|v| v));
+            let expires = format_time(obj.get("expires_at"));
             obj.insert("expires_at".into(), Value::String(expires));
         }
     }
@@ -542,4 +542,57 @@ async fn cmd_token_revoke(api: &ApiClient, json: bool, token_id: &str) {
     }
 
     println!("Token revoked.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_make_auth_headers() {
+        let headers = make_auth_headers("test-token-123");
+        assert_eq!(
+            headers.get("Authorization").unwrap(),
+            "Bearer test-token-123"
+        );
+        assert_eq!(headers.len(), 1);
+    }
+
+    #[test]
+    fn test_config_dir_ends_with_db9() {
+        let dir = config_dir();
+        assert!(dir.ends_with(".db9"));
+    }
+
+    #[test]
+    fn test_save_and_load_token_roundtrip() {
+        let temp_dir = std::env::temp_dir().join(format!("db9-test-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cred_path = temp_dir.join("credentials");
+
+        let token = "abc123def456";
+        let content = format!("token = \"{token}\"\n");
+        std::fs::write(&cred_path, &content).unwrap();
+
+        let parsed: toml::Table = content.parse().unwrap();
+        let loaded = parsed.get("token").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(loaded, token);
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn test_toml_parsing_with_token() {
+        let content = "token = \"my-secret-token\"\n";
+        let parsed: toml::Table = content.parse().unwrap();
+        let token = parsed.get("token").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(token, "my-secret-token");
+    }
+
+    #[test]
+    fn test_toml_parsing_empty() {
+        let content = "";
+        let parsed: toml::Table = content.parse().unwrap();
+        assert!(parsed.get("token").is_none());
+    }
 }

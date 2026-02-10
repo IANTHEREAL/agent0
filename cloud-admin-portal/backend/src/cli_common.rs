@@ -163,3 +163,74 @@ pub fn format_time(v: Option<&Value>) -> String {
 pub fn print_json(data: &Value) {
     println!("{}", serde_json::to_string_pretty(data).unwrap_or_default());
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn format_val_string() {
+        let v = json!("hello");
+        assert_eq!(format_val(Some(&v)), "hello");
+    }
+
+    #[test]
+    fn format_val_null() {
+        assert_eq!(format_val(None), "-");
+        assert_eq!(format_val(Some(&Value::Null)), "-");
+    }
+
+    #[test]
+    fn format_val_number() {
+        let v = json!(42);
+        assert_eq!(format_val(Some(&v)), "42");
+    }
+
+    #[test]
+    fn format_val_bool() {
+        let v = json!(true);
+        assert_eq!(format_val(Some(&v)), "true");
+    }
+
+    #[test]
+    fn format_val_empty_array() {
+        let v = json!([]);
+        assert_eq!(format_val(Some(&v)), "-");
+    }
+
+    #[test]
+    fn format_val_string_array() {
+        let v = json!(["a", "b", "c"]);
+        assert_eq!(format_val(Some(&v)), "a, b, c");
+    }
+
+    #[test]
+    fn format_val_object_falls_through() {
+        let v = json!({"key": "val"});
+        let result = format_val(Some(&v));
+        assert!(result.contains("key"));
+    }
+
+    #[test]
+    fn format_time_valid_rfc3339() {
+        let v = json!("2026-02-10T19:30:00+00:00");
+        assert_eq!(format_time(Some(&v)), "2026-02-10 19:30");
+    }
+
+    #[test]
+    fn format_time_null() {
+        assert_eq!(format_time(None), "-");
+    }
+
+    #[test]
+    fn format_time_invalid() {
+        let v = json!("not-a-date");
+        assert_eq!(format_time(Some(&v)), "not-a-date");
+    }
+
+    #[test]
+    fn format_time_json_null() {
+        assert_eq!(format_time(Some(&Value::Null)), "-");
+    }
+}

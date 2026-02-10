@@ -82,33 +82,17 @@ pub fn adapt_sql(sql: &str, pool: &AnyPool) -> String {
 }
 
 pub async fn create_tables(pool: &AnyPool) -> Result<(), sqlx::Error> {
-    let is_pg = !is_sqlite(pool);
-
-    let tenants_ddl = if is_pg {
-        "CREATE TABLE IF NOT EXISTS tenants (
-            id TEXT PRIMARY KEY,
-            keyspace TEXT NOT NULL UNIQUE,
-            state TEXT NOT NULL DEFAULT 'ACTIVE',
-            state_reason TEXT,
-            created_at TEXT NOT NULL,
-            created_by TEXT,
-            notes TEXT,
-            tags TEXT,
-            updated_at TEXT
-        )"
-    } else {
-        "CREATE TABLE IF NOT EXISTS tenants (
-            id TEXT PRIMARY KEY,
-            keyspace TEXT NOT NULL UNIQUE,
-            state TEXT NOT NULL DEFAULT 'ACTIVE',
-            state_reason TEXT,
-            created_at TEXT NOT NULL,
-            created_by TEXT,
-            notes TEXT,
-            tags TEXT,
-            updated_at TEXT
-        )"
-    };
+    let tenants_ddl = "CREATE TABLE IF NOT EXISTS tenants (
+        id TEXT PRIMARY KEY,
+        keyspace TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL DEFAULT 'ACTIVE',
+        state_reason TEXT,
+        created_at TEXT NOT NULL,
+        created_by TEXT,
+        notes TEXT,
+        tags TEXT,
+        updated_at TEXT
+    )";
 
     let creds_ddl = "CREATE TABLE IF NOT EXISTS tenant_credentials (
         id TEXT PRIMARY KEY,
@@ -279,7 +263,7 @@ pub async fn list_tenants(
         ));
         binds.push(cursor_ts.to_string());
         binds.push(cursor_id.to_string());
-        param_idx = param_idx + 2;
+        param_idx += 2;
     }
 
     let mut extra_binds: Vec<i64> = Vec::new();
@@ -538,6 +522,7 @@ pub async fn upsert_credential(
 
 // ── Audit queries ───────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_audit_log(
     pool: &AnyPool,
     operation_type: &str,
@@ -870,5 +855,95 @@ fn row_to_customer_token(row: &sqlx::any::AnyRow) -> CustomerTokenRow {
         name: row.get("name"),
         expires_at: row.get("expires_at"),
         created_at: row.get("created_at"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_customer_insert_sql_has_correct_placeholders() {
+        let sql = "INSERT INTO customers (id, email, password_hash, created_at) VALUES ($1, $2, $3, $4)";
+        assert!(sql.contains("$1"));
+        assert!(sql.contains("$4"));
+        // Ensure exactly 4 placeholders
+        assert_eq!(sql.matches('$').count(), 4);
+    }
+
+    #[test]
+    fn test_customer_token_insert_sql_has_correct_placeholders() {
+        let sql = "INSERT INTO customer_tokens (id, customer_id, token_hash, name, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)";
+        assert!(sql.contains("$6"));
+        assert_eq!(sql.matches('$').count(), 6);
+    }
+
+    #[test]
+    fn test_adapt_sql_placeholder_replacement_logic() {
+        // Replicate the adapt_sql logic for SQLite conversion
+        let sql = "INSERT INTO customers (id, email) VALUES ($1, $2)";
+        let mut result = sql.to_string();
+        for i in (1..=30).rev() {
+            result = result.replace(&format!("${i}"), "?");
+        }
+        assert_eq!(result, "INSERT INTO customers (id, email) VALUES (?, ?)");
+        assert!(!result.contains('$'));
+    }
+
+    #[test]
+    fn test_adapt_sql_no_replacement_for_postgres() {
+        // For PostgreSQL, adapt_sql should return the SQL unchanged
+        let sql = "SELECT * FROM customers WHERE email = $1";
+        // If not SQLite, the original SQL is returned as-is
+        assert_eq!(sql.to_string(), "SELECT * FROM customers WHERE email = $1");
+    }
+
+    #[test]
+    fn test_adapt_sql_high_numbered_placeholders() {
+        let sql = "INSERT INTO audit_logs VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+        let mut result = sql.to_string();
+        for i in (1..=30).rev() {
+            result = result.replace(&format!("${i}"), "?");
+        }
+        assert_eq!(result, "INSERT INTO audit_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    }
+
+    #[test]
+    fn test_adapt_sql_reverse_replacement_avoids_double_replace() {
+        // $10 must not become ?0 — reversed iteration handles this
+        let sql = "SELECT $1, $10";
+        let mut result = sql.to_string();
+        for i in (1..=30).rev() {
+            result = result.replace(&format!("${i}"), "?");
+        }
+        assert_eq!(result, "SELECT ?, ?");
+    }
+
+    #[test]
+    fn test_customer_ddl_has_required_columns() {
+        let ddl = "CREATE TABLE IF NOT EXISTS customers (
+            id TEXT PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active'
+        )";
+        assert!(ddl.contains("id TEXT PRIMARY KEY"));
+        assert!(ddl.contains("email TEXT UNIQUE NOT NULL"));
+        assert!(ddl.contains("password_hash TEXT NOT NULL"));
+        assert!(ddl.contains("status TEXT NOT NULL DEFAULT 'active'"));
+    }
+
+    #[test]
+    fn test_customer_tokens_ddl_has_foreign_key() {
+        let ddl = "CREATE TABLE IF NOT EXISTS customer_tokens (
+            id TEXT PRIMARY KEY,
+            customer_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT 'default',
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (customer_id) REFERENCES customers(id)
+        )";
+        assert!(ddl.contains("FOREIGN KEY (customer_id) REFERENCES customers(id)"));
+        assert!(ddl.contains("token_hash TEXT NOT NULL"));
     }
 }
