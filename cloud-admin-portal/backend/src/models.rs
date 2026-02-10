@@ -285,3 +285,83 @@ pub struct CredentialRow {
     pub username: String,
     pub password_plain: String,
 }
+
+// ── Customer types ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct RegisterRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Deserialize)]
+pub struct CreateDatabaseRequest {
+    pub name: String,
+    pub region: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct CustomerResponse {
+    pub id: String,
+    pub email: String,
+    pub created_at: String,
+    pub status: String,
+}
+
+#[derive(Serialize)]
+pub struct LoginResponse {
+    pub token: String,
+    pub expires_at: String,
+}
+
+#[derive(Serialize)]
+pub struct DatabaseResponse {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoints: Option<Vec<Endpoint>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_password: Option<String>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_string: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct TokenResponse {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+// ── Customer DB row types ───────────────────────────────────────
+
+pub struct CustomerRow {
+    pub id: String,
+    pub email: String,
+    pub password_hash: String,
+    pub created_at: String,
+    pub status: String,
+}
+
+pub struct CustomerTokenRow {
+    pub id: String,
+    pub customer_id: String,
+    pub token_hash: String,
+    pub name: String,
+    pub expires_at: Option<String>,
+    pub created_at: String,
+}
