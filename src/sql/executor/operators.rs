@@ -1193,17 +1193,33 @@ impl Executor {
         match expr {
             Expr::Identifier(ident) => {
                 let col_name = &ident.value;
-                if !schema
+                if schema
                     .columns
                     .iter()
                     .any(|c| c.name.eq_ignore_ascii_case(col_name))
                 {
-                    return Err(SqlError::ColumnNotFound {
-                        column: col_name.to_string(),
-                    }
-                    .into());
+                    return Ok(());
                 }
-                Ok(())
+
+                // Whole-row reference: `SELECT t_alias` (composite value), only if it doesn't
+                // resolve to a column name.
+                let schema_short_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                if schema_short_name.eq_ignore_ascii_case(col_name) {
+                    return Ok(());
+                }
+                let prefix = format!("{}.", col_name.to_lowercase());
+                if schema
+                    .columns
+                    .iter()
+                    .any(|c| c.name.to_lowercase().starts_with(&prefix))
+                {
+                    return Ok(());
+                }
+
+                Err(SqlError::ColumnNotFound {
+                    column: col_name.to_string(),
+                }
+                .into())
             }
             Expr::CompoundIdentifier(parts) => {
                 if let Some(col_ident) = parts.last() {
@@ -1380,6 +1396,7 @@ impl Executor {
             distinct: f.distinct,
             delimiter,
             filter,
+            order_by: vec![],
         });
         agg_names.push(name);
         agg_types.push(data_type);
@@ -1428,6 +1445,7 @@ impl Executor {
                         distinct: arr.distinct,
                         delimiter: None,
                         filter: None,
+                        order_by: arr.order_by.clone().unwrap_or_default(),
                     });
                     agg_names.push(name);
                     agg_types.push(DataType::Array(Box::new(infer_expr_type(

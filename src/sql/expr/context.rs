@@ -4,6 +4,53 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::Expr;
 use std::collections::HashMap;
 
+fn is_hidden_subquery_column(name: &str) -> bool {
+    name.rsplit_once('.')
+        .map(|(_, col)| col)
+        .unwrap_or(name)
+        .starts_with("__tipg_subquery_")
+}
+
+fn composite_field_needs_quotes(s: &str) -> bool {
+    s.is_empty()
+        || s.chars()
+            .any(|c| matches!(c, ',' | '(' | ')' | '"' | '\\') || c.is_whitespace())
+}
+
+fn format_composite_field(value: &Value) -> String {
+    let field_str = match value {
+        Value::Null => return String::new(),
+        Value::Text(s) => s.clone(),
+        other => other.to_string(),
+    };
+
+    if !composite_field_needs_quotes(&field_str) {
+        return field_str;
+    }
+
+    let mut out = String::with_capacity(field_str.len() + 2);
+    out.push('"');
+    for ch in field_str.chars() {
+        if ch == '"' || ch == '\\' {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out.push('"');
+    out
+}
+
+fn format_composite_value(values: impl IntoIterator<Item = Value>) -> Value {
+    let mut fields = String::new();
+    for (idx, v) in values.into_iter().enumerate() {
+        if idx > 0 {
+            fields.push(',');
+        }
+        fields.push_str(&format_composite_field(&v));
+    }
+    Value::Text(format!("({})", fields))
+}
+
 pub trait EvalContext {
     #[allow(dead_code)] // Part of EvalContext trait API
     fn row(&self) -> Option<&Row>;
@@ -82,10 +129,53 @@ impl EvalContext for SingleTableContext<'_> {
 
         match (self.row, self.schema) {
             (Some(row), Some(schema)) => {
-                let idx = schema
-                    .column_index(name)
-                    .ok_or_else(|| anyhow!("Column '{}' not found", name))?;
-                Ok(row.values[idx].clone())
+                if let Some(idx) = schema.column_index(name) {
+                    return Ok(row.values[idx].clone());
+                }
+
+                let name_lower = name.to_lowercase();
+                let prefix = format!("{}.", name_lower);
+                let prefixed_indices: Vec<usize> = schema
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, col)| {
+                        if col.name.to_lowercase().starts_with(&prefix)
+                            && !is_hidden_subquery_column(&col.name)
+                        {
+                            Some(idx)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if !prefixed_indices.is_empty() {
+                    let values = prefixed_indices
+                        .into_iter()
+                        .filter_map(|idx| row.values.get(idx).cloned())
+                        .collect::<Vec<_>>();
+                    return Ok(format_composite_value(values));
+                }
+
+                let schema_short_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                if schema_short_name.eq_ignore_ascii_case(name) {
+                    let values = schema
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, col)| {
+                            if is_hidden_subquery_column(&col.name) {
+                                None
+                            } else {
+                                row.values.get(idx).cloned()
+                            }
+                        })
+                        .collect::<Vec<_>>();
+                    return Ok(format_composite_value(values));
+                }
+
+                Err(anyhow!("Column '{}' not found", name))
             }
             _ => Err(anyhow!(
                 "Cannot evaluate identifier '{}' without row context",
@@ -368,5 +458,50 @@ mod tests {
         let ctx = JoinEvalContext::new(&column_offsets, None, &combined_row, &combined_schema);
         let err = ctx.resolve_column("id").unwrap_err().to_string();
         assert!(err.contains("column reference \"id\" is ambiguous"));
+    }
+
+    #[test]
+    fn test_resolve_column_whole_row_reference_by_schema_name() {
+        let schema = TableSchema {
+            name: "foo".to_string(),
+            columns: vec![int_col("i"), int_col("mod2")],
+            ..Default::default()
+        };
+        let row = Row::new(vec![Value::Int32(5), Value::Int32(1)]);
+        let ctx = SingleTableContext::new(Some(&row), Some(&schema));
+        assert_eq!(
+            ctx.resolve_column("foo").unwrap(),
+            Value::Text("(5,1)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_column_whole_row_reference_by_prefix() {
+        let schema = TableSchema {
+            name: "join_result".to_string(),
+            columns: vec![int_col("foo.a"), int_col("foo.b"), int_col("bar.c")],
+            ..Default::default()
+        };
+        let row = Row::new(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)]);
+        let ctx = SingleTableContext::new(Some(&row), Some(&schema));
+        assert_eq!(
+            ctx.resolve_column("foo").unwrap(),
+            Value::Text("(1,2)".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_column_whole_row_skips_hidden_subquery_columns() {
+        let schema = TableSchema {
+            name: "foo".to_string(),
+            columns: vec![int_col("i"), int_col("__tipg_subquery_0")],
+            ..Default::default()
+        };
+        let row = Row::new(vec![Value::Int32(1), Value::Int32(999)]);
+        let ctx = SingleTableContext::new(Some(&row), Some(&schema));
+        assert_eq!(
+            ctx.resolve_column("foo").unwrap(),
+            Value::Text("(1)".to_string())
+        );
     }
 }

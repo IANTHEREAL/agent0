@@ -2,10 +2,10 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use sqlparser::ast::Expr;
+use sqlparser::ast::{Expr, OrderByExpr};
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::eval_expr;
+use crate::sql::expr::{compare_order_by_values, eval_expr};
 use crate::sql::value_key::{serialize_value_for_key, serialize_values_for_key};
 use crate::sql::Aggregator;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
@@ -17,6 +17,7 @@ pub struct AggregateExpr {
     pub distinct: bool,
     pub delimiter: Option<String>,
     pub filter: Option<Expr>,
+    pub order_by: Vec<OrderByExpr>,
 }
 
 #[derive(Debug)]
@@ -115,6 +116,7 @@ impl PhysicalOperator for HashAggregateOperator {
             group_values: Vec<Value>,
             aggregators: Vec<Aggregator>,
             seen_distinct: Vec<HashSet<Vec<u8>>>,
+            ordered_agg_buffers: Vec<Option<Vec<(Vec<Value>, Value)>>>,
         }
 
         let mut groups: HashMap<Vec<u8>, GroupState> = HashMap::new();
@@ -138,12 +140,24 @@ impl PhysicalOperator for HashAggregateOperator {
                 let seen_distinct = (0..self.aggregate_exprs.len())
                     .map(|_| HashSet::new())
                     .collect();
+                let ordered_agg_buffers = self
+                    .aggregate_exprs
+                    .iter()
+                    .map(|agg_expr| {
+                        if agg_expr.func_name == "ARRAY_AGG" && !agg_expr.order_by.is_empty() {
+                            Some(Vec::new())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 groups.insert(
                     key_bytes.clone(),
                     GroupState {
                         group_values: group_key_values.clone(),
                         aggregators,
                         seen_distinct,
+                        ordered_agg_buffers,
                     },
                 );
             }
@@ -174,7 +188,16 @@ impl PhysicalOperator for HashAggregateOperator {
                     }
                 }
 
-                state.aggregators[i].update(&val)?;
+                if let Some(buf) = state.ordered_agg_buffers[i].as_mut() {
+                    let mut keys = Vec::with_capacity(agg_expr.order_by.len());
+                    for o in &agg_expr.order_by {
+                        let key = eval_expr(&o.expr, Some(row), Some(input_schema))?;
+                        keys.push(key);
+                    }
+                    buf.push((keys, val));
+                } else {
+                    state.aggregators[i].update(&val)?;
+                }
             }
         }
 
@@ -189,9 +212,41 @@ impl PhysicalOperator for HashAggregateOperator {
             self.result_rows.push(Row::new(values));
         } else {
             for (_, state) in groups {
-                let mut values = state.group_values;
-                for agg in state.aggregators {
-                    values.push(agg.result());
+                let GroupState {
+                    group_values,
+                    aggregators,
+                    mut ordered_agg_buffers,
+                    ..
+                } = state;
+                let mut values = group_values;
+                for (i, agg) in aggregators.into_iter().enumerate() {
+                    if let Some(mut buf) = ordered_agg_buffers.get_mut(i).and_then(Option::take) {
+                        let order_by = &self.aggregate_exprs[i].order_by;
+                        buf.sort_by(|(keys_a, _), (keys_b, _)| {
+                            for (key_idx, order_expr) in order_by.iter().enumerate() {
+                                let asc = order_expr.asc.unwrap_or(true);
+                                let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+                                let ord = compare_order_by_values(
+                                    &keys_a[key_idx],
+                                    &keys_b[key_idx],
+                                    asc,
+                                    nulls_first,
+                                );
+                                if ord != std::cmp::Ordering::Equal {
+                                    return ord;
+                                }
+                            }
+                            std::cmp::Ordering::Equal
+                        });
+                        let sorted_values = buf.into_iter().map(|(_, v)| v).collect::<Vec<_>>();
+                        values.push(if sorted_values.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::Array(sorted_values)
+                        });
+                    } else {
+                        values.push(agg.result());
+                    }
                 }
                 self.result_rows.push(Row::new(values));
             }
@@ -311,6 +366,7 @@ mod tests {
             distinct: false,
             delimiter: None,
             filter: None,
+            order_by: vec![],
         }];
 
         let op = HashAggregateOperator::new(
@@ -342,6 +398,7 @@ mod tests {
                 distinct: false,
                 delimiter: None,
                 filter: None,
+                order_by: vec![],
             },
             AggregateExpr {
                 func_name: "SUM".to_string(),
@@ -349,6 +406,7 @@ mod tests {
                 distinct: false,
                 delimiter: None,
                 filter: None,
+                order_by: vec![],
             },
         ];
 
@@ -380,6 +438,7 @@ mod tests {
             distinct: false,
             delimiter: None,
             filter: None,
+            order_by: vec![],
         }];
 
         let op = HashAggregateOperator::new(
@@ -412,6 +471,7 @@ mod tests {
             distinct: false,
             delimiter: None,
             filter: None,
+            order_by: vec![],
         }];
 
         let op = HashAggregateOperator::new(
@@ -442,6 +502,7 @@ mod tests {
             distinct: false,
             delimiter: Some(", ".to_string()),
             filter: None,
+            order_by: vec![],
         };
 
         let aggregator = HashAggregateOperator::create_aggregator(&agg_expr).unwrap();
@@ -466,6 +527,7 @@ mod tests {
                     false,
                 ))),
             }),
+            order_by: vec![],
         }];
 
         let op = HashAggregateOperator::new(
