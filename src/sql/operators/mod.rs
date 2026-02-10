@@ -39,6 +39,7 @@ mod project;
 mod scan;
 mod set_operation;
 mod sort;
+mod table_function;
 mod window;
 
 pub use aggregate::*;
@@ -56,6 +57,7 @@ pub use project::*;
 pub use scan::*;
 pub use set_operation::*;
 pub use sort::*;
+pub use table_function::*;
 pub use window::*;
 
 use crate::types::{Row, TableSchema};
