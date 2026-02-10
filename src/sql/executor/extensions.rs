@@ -380,6 +380,31 @@ impl Executor {
                 }
             }
 
+            if let Fs9Mode::Glob {
+                pattern,
+                format,
+                delimiter,
+                header,
+                exclude,
+            } = &mode
+            {
+                if let Some((mut schema, receiver)) = fs::start_glob_stream(
+                    pattern,
+                    format.as_deref(),
+                    *delimiter,
+                    *header,
+                    exclude.as_deref(),
+                )
+                .await?
+                {
+                    apply_table_function_alias(&mut schema, alias)?;
+                    let operator: BoxedOperator = Box::new(
+                        TableFunctionScanOperator::new_with_channel(schema.clone(), receiver),
+                    );
+                    return Ok(Some(ExtensionTableFunctionResult::Streaming(schema, operator)));
+                }
+            }
+
             let (mut schema, rows) = fs::execute_table_function(self.tenant_keyspace(), mode).await?;
             apply_table_function_alias(&mut schema, alias)?;
             return Ok(Some(ExtensionTableFunctionResult::Batch(schema, rows)));

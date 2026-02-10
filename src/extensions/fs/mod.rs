@@ -323,6 +323,197 @@ pub(crate) async fn start_file_stream(
     Ok(Some((schema, rx)))
 }
 
+pub(crate) async fn start_glob_stream(
+    pattern: &str,
+    format: Option<&str>,
+    delimiter: Option<char>,
+    header: Option<bool>,
+    exclude: Option<&str>,
+) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
+    start_glob_stream_with_budget(pattern, format, delimiter, header, exclude, MAX_TOTAL_BYTES).await
+}
+
+async fn start_glob_stream_with_budget(
+    pattern: &str,
+    format: Option<&str>,
+    delimiter: Option<char>,
+    header: Option<bool>,
+    exclude: Option<&str>,
+    max_total_bytes: usize,
+) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
+    if !context::allow_local_fs() {
+        return Err(anyhow!("permission denied for extension \"fs9\""));
+    }
+
+    use backend::FsBackend;
+
+    let backend = backend::local_backend();
+    let matching_files =
+        glob::expand_glob(backend, pattern, MAX_FILES_PER_GLOB, exclude).await?;
+
+    if matching_files.is_empty() {
+        return Ok(None);
+    }
+
+    let first_path = matching_files[0].clone();
+    let fmt = decoders::detect_format(&first_path, format);
+
+    let schema = match fmt {
+        "csv" | "tsv" => {
+            let delim = if fmt == "tsv" && delimiter.is_none() {
+                Some('\t')
+            } else {
+                delimiter
+            };
+            let has_headers = header.unwrap_or(true);
+            let reader = backend.read_file_stream(&first_path, usize::MAX).await?;
+            let decoder = streaming::StreamingCsvDecoder::new(
+                reader,
+                first_path.clone(),
+                delim,
+                has_headers,
+            )
+            .await?;
+            decoder.schema().clone()
+        }
+        "jsonl" | "ndjson" => {
+            let reader = backend.read_file_stream(&first_path, usize::MAX).await?;
+            let decoder = streaming::StreamingJsonlDecoder::new(reader, first_path.clone());
+            decoder.schema().clone()
+        }
+        _ => {
+            let reader = backend.read_file_stream(&first_path, usize::MAX).await?;
+            let decoder = streaming::StreamingTextDecoder::new(reader, first_path.clone());
+            decoder.schema().clone()
+        }
+    };
+
+    let (tx, rx) = mpsc::channel(256);
+    let fmt_owned = fmt.to_string();
+    let pattern_owned = pattern.to_string();
+    tokio::spawn(async move {
+        let mut total_bytes: usize = 0;
+        let mut files_read_count: usize = 0;
+
+        for file_path in matching_files {
+            if total_bytes >= max_total_bytes {
+                warn!(
+                    "fs9: bytes budget exhausted ({} MB), {} files were streamed for pattern {}",
+                    total_bytes / (1024 * 1024),
+                    files_read_count,
+                    pattern_owned
+                );
+                break;
+            }
+
+            let reader = match backend.read_file_stream(&file_path, usize::MAX).await {
+                Ok(reader) => reader,
+                Err(err) => {
+                    warn!("fs9: cannot stream {}: {}", file_path, err);
+                    continue;
+                }
+            };
+
+            match fmt_owned.as_str() {
+                "csv" | "tsv" => {
+                    let delim = if fmt_owned == "tsv" && delimiter.is_none() {
+                        Some('\t')
+                    } else {
+                        delimiter
+                    };
+                    let has_headers = header.unwrap_or(true);
+                    let mut decoder = match streaming::StreamingCsvDecoder::new(
+                        reader,
+                        file_path.clone(),
+                        delim,
+                        has_headers,
+                    )
+                    .await
+                    {
+                        Ok(decoder) => decoder,
+                        Err(err) => {
+                            warn!("fs9: streaming decode error for {}: {}", file_path, err);
+                            continue;
+                        }
+                    };
+
+                    loop {
+                        match decoder.next_row().await {
+                            Ok(Some(row)) => {
+                                if tx.send(row).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(err) => {
+                                warn!("fs9: streaming decode error for {}: {}", file_path, err);
+                                break;
+                            }
+                        }
+                    }
+
+                    total_bytes = total_bytes.saturating_add(decoder.bytes_read());
+                    files_read_count += 1;
+                }
+                "jsonl" | "ndjson" => {
+                    let mut decoder = streaming::StreamingJsonlDecoder::new(reader, file_path.clone());
+
+                    loop {
+                        match decoder.next_row().await {
+                            Ok(Some(row)) => {
+                                if tx.send(row).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(err) => {
+                                warn!("fs9: streaming decode error for {}: {}", file_path, err);
+                                break;
+                            }
+                        }
+                    }
+
+                    total_bytes = total_bytes.saturating_add(decoder.bytes_read());
+                    files_read_count += 1;
+                }
+                _ => {
+                    let mut decoder = streaming::StreamingTextDecoder::new(reader, file_path.clone());
+
+                    loop {
+                        match decoder.next_row().await {
+                            Ok(Some(row)) => {
+                                if tx.send(row).await.is_err() {
+                                    return;
+                                }
+                            }
+                            Ok(None) => break,
+                            Err(err) => {
+                                warn!("fs9: streaming decode error for {}: {}", file_path, err);
+                                break;
+                            }
+                        }
+                    }
+
+                    total_bytes = total_bytes.saturating_add(decoder.bytes_read());
+                    files_read_count += 1;
+                }
+            }
+
+            if total_bytes >= max_total_bytes {
+                warn!(
+                    "fs9: bytes budget exhausted ({} MB), {} files were streamed for pattern {}",
+                    total_bytes / (1024 * 1024),
+                    files_read_count,
+                    pattern_owned
+                );
+                break;
+            }
+        }
+    });
+
+    Ok(Some((schema, rx)))
+}
+
 async fn list_directory_entries(
     backend: &dyn backend::FsBackend,
     path: &str,
@@ -394,7 +585,9 @@ mod tests {
 
     use tokio::time::{timeout, Duration};
 
-    use super::{backend, list_directory_entries};
+    use super::{backend, list_directory_entries, start_glob_stream, start_glob_stream_with_budget};
+    use crate::extensions::context;
+    use crate::types::Value;
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -436,6 +629,65 @@ mod tests {
         let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
         assert!(paths.iter().any(|p| p.ends_with("/loop")));
         assert!(paths.iter().any(|p| p.ends_with("/subdir")));
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_glob_stream_multiple_text_files() {
+        let dir = unique_base("glob-stream-multi");
+        fs::write(dir.join("a.txt"), "alpha\nbeta\n").expect("write a.txt");
+        fs::write(dir.join("b.txt"), "gamma\n").expect("write b.txt");
+        fs::write(dir.join("c.txt"), "delta\nepsilon\n").expect("write c.txt");
+
+        let pattern = format!("{}/*.txt", dir.display());
+        let (schema, mut rx) = context::with_context(true, async {
+            start_glob_stream(&pattern, None, None, None, None)
+                .await
+                .expect("start glob stream")
+                .expect("expected streaming result")
+        })
+        .await;
+
+        assert_eq!(schema.columns[1].name, "line");
+
+        let mut lines = Vec::new();
+        while let Some(row) = rx.recv().await {
+            if let Value::Text(line) = &row.values[1] {
+                lines.push(line.clone());
+            }
+        }
+
+        assert_eq!(lines, vec!["alpha", "beta", "gamma", "delta", "epsilon"]);
+
+        cleanup(&dir);
+    }
+
+    #[tokio::test]
+    async fn test_glob_stream_bytes_budget_stops_following_files() {
+        let dir = unique_base("glob-stream-budget");
+        fs::write(dir.join("a.txt"), "line1\nline2\nline3\n").expect("write a.txt");
+        fs::write(dir.join("b.txt"), "line4\nline5\n").expect("write b.txt");
+
+        let pattern = format!("{}/*.txt", dir.display());
+        let budget = "line1\nline2\nline3\n".len();
+
+        let (_schema, mut rx) = context::with_context(true, async {
+            start_glob_stream_with_budget(&pattern, None, None, None, None, budget)
+                .await
+                .expect("start glob stream")
+                .expect("expected streaming result")
+        })
+        .await;
+
+        let mut lines = Vec::new();
+        while let Some(row) = rx.recv().await {
+            if let Value::Text(line) = &row.values[1] {
+                lines.push(line.clone());
+            }
+        }
+
+        assert_eq!(lines, vec!["line1", "line2", "line3"]);
 
         cleanup(&dir);
     }
