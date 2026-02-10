@@ -328,7 +328,14 @@ impl Executor {
                                 }
                                 ExtensionTableFunctionResult::Streaming(schema, operator) => {
                                     streaming_scan_operator = Some(operator);
-                                    (schema.name.clone(), alias_str, schema, Vec::new(), true, true)
+                                    (
+                                        schema.name.clone(),
+                                        alias_str,
+                                        schema,
+                                        Vec::new(),
+                                        true,
+                                        true,
+                                    )
                                 }
                             }
                         } else if let Some((schema, rows)) = self
@@ -555,16 +562,17 @@ impl Executor {
         {
             // Preloaded rows: virtual tables, materialized views, CTEs, derived tables,
             // generate_series results already have all rows in memory.
-            let preloaded_source: Option<BoxedOperator> = if let Some(op) = streaming_scan_operator.take() {
-                Some(op)
-            } else if is_virtual || rows_loaded {
-                Some(Box::new(TableScanOperator::new_with_rows(
-                    schema.clone(),
-                    all_rows_base,
-                )))
-            } else {
-                None
-            };
+            let preloaded_source: Option<BoxedOperator> =
+                if let Some(op) = streaming_scan_operator.take() {
+                    Some(op)
+                } else if is_virtual || rows_loaded {
+                    Some(Box::new(TableScanOperator::new_with_rows(
+                        schema.clone(),
+                        all_rows_base,
+                    )))
+                } else {
+                    None
+                };
 
             if has_for_update {
                 let planner = PhysicalPlanner::new(self.store(), search_path.to_vec());

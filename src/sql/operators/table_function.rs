@@ -20,8 +20,13 @@ unsafe impl Sync for TableFunctionScanOperator {}
 
 enum RowSource {
     #[allow(dead_code)]
-    Preloaded { rows: Vec<Row>, position: usize },
-    Channel { receiver: mpsc::Receiver<Row> },
+    Preloaded {
+        rows: Vec<Row>,
+        position: usize,
+    },
+    Channel {
+        receiver: mpsc::Receiver<Row>,
+    },
 }
 
 impl TableFunctionScanOperator {

@@ -5,8 +5,8 @@ use super::super::Session;
 use super::core::Executor;
 use super::triggers::strip_leading_sql_comments;
 use crate::extensions::{descriptor, InstalledExtension};
-use crate::sql::operators::{BoxedOperator, TableFunctionScanOperator};
 use crate::sql::error::SqlError;
+use crate::sql::operators::{BoxedOperator, TableFunctionScanOperator};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, ObjectName, TableAlias};
 use tikv_client::Transaction;
@@ -376,7 +376,9 @@ impl Executor {
                     let operator: BoxedOperator = Box::new(
                         TableFunctionScanOperator::new_with_channel(schema.clone(), receiver),
                     );
-                    return Ok(Some(ExtensionTableFunctionResult::Streaming(schema, operator)));
+                    return Ok(Some(ExtensionTableFunctionResult::Streaming(
+                        schema, operator,
+                    )));
                 }
             }
 
@@ -401,11 +403,14 @@ impl Executor {
                     let operator: BoxedOperator = Box::new(
                         TableFunctionScanOperator::new_with_channel(schema.clone(), receiver),
                     );
-                    return Ok(Some(ExtensionTableFunctionResult::Streaming(schema, operator)));
+                    return Ok(Some(ExtensionTableFunctionResult::Streaming(
+                        schema, operator,
+                    )));
                 }
             }
 
-            let (mut schema, rows) = fs::execute_table_function(self.tenant_keyspace(), mode).await?;
+            let (mut schema, rows) =
+                fs::execute_table_function(self.tenant_keyspace(), mode).await?;
             apply_table_function_alias(&mut schema, alias)?;
             return Ok(Some(ExtensionTableFunctionResult::Batch(schema, rows)));
         }

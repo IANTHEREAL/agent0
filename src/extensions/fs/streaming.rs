@@ -244,7 +244,11 @@ impl StreamingCsvDecoder {
     }
 }
 
-fn csv_schema_from_data(data: &[u8], delimiter: u8, has_headers: bool) -> Result<(TableSchema, usize)> {
+fn csv_schema_from_data(
+    data: &[u8],
+    delimiter: u8,
+    has_headers: bool,
+) -> Result<(TableSchema, usize)> {
     let mut reader = csv::ReaderBuilder::new()
         .delimiter(delimiter)
         .flexible(true)

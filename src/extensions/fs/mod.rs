@@ -244,13 +244,9 @@ pub(crate) async fn start_file_stream(
                 delimiter
             };
             let has_headers = header.unwrap_or(true);
-            let mut decoder = streaming::StreamingCsvDecoder::new(
-                reader,
-                path.to_string(),
-                delim,
-                has_headers,
-            )
-            .await?;
+            let mut decoder =
+                streaming::StreamingCsvDecoder::new(reader, path.to_string(), delim, has_headers)
+                    .await?;
             let schema = decoder.schema().clone();
             let (tx, rx) = mpsc::channel(256);
             let stream_path = path.to_string();
@@ -330,7 +326,8 @@ pub(crate) async fn start_glob_stream(
     header: Option<bool>,
     exclude: Option<&str>,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
-    start_glob_stream_with_budget(pattern, format, delimiter, header, exclude, MAX_TOTAL_BYTES).await
+    start_glob_stream_with_budget(pattern, format, delimiter, header, exclude, MAX_TOTAL_BYTES)
+        .await
 }
 
 async fn start_glob_stream_with_budget(
@@ -348,8 +345,7 @@ async fn start_glob_stream_with_budget(
     use backend::FsBackend;
 
     let backend = backend::local_backend();
-    let matching_files =
-        glob::expand_glob(backend, pattern, MAX_FILES_PER_GLOB, exclude).await?;
+    let matching_files = glob::expand_glob(backend, pattern, MAX_FILES_PER_GLOB, exclude).await?;
 
     if matching_files.is_empty() {
         return Ok(None);
@@ -367,13 +363,9 @@ async fn start_glob_stream_with_budget(
             };
             let has_headers = header.unwrap_or(true);
             let reader = backend.read_file_stream(&first_path, usize::MAX).await?;
-            let decoder = streaming::StreamingCsvDecoder::new(
-                reader,
-                first_path.clone(),
-                delim,
-                has_headers,
-            )
-            .await?;
+            let decoder =
+                streaming::StreamingCsvDecoder::new(reader, first_path.clone(), delim, has_headers)
+                    .await?;
             decoder.schema().clone()
         }
         "jsonl" | "ndjson" => {
@@ -456,7 +448,8 @@ async fn start_glob_stream_with_budget(
                     files_read_count += 1;
                 }
                 "jsonl" | "ndjson" => {
-                    let mut decoder = streaming::StreamingJsonlDecoder::new(reader, file_path.clone());
+                    let mut decoder =
+                        streaming::StreamingJsonlDecoder::new(reader, file_path.clone());
 
                     loop {
                         match decoder.next_row().await {
@@ -477,7 +470,8 @@ async fn start_glob_stream_with_budget(
                     files_read_count += 1;
                 }
                 _ => {
-                    let mut decoder = streaming::StreamingTextDecoder::new(reader, file_path.clone());
+                    let mut decoder =
+                        streaming::StreamingTextDecoder::new(reader, file_path.clone());
 
                     loop {
                         match decoder.next_row().await {
@@ -585,7 +579,9 @@ mod tests {
 
     use tokio::time::{timeout, Duration};
 
-    use super::{backend, list_directory_entries, start_glob_stream, start_glob_stream_with_budget};
+    use super::{
+        backend, list_directory_entries, start_glob_stream, start_glob_stream_with_budget,
+    };
     use crate::extensions::context;
     use crate::types::Value;
 

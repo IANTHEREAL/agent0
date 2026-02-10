@@ -23,7 +23,9 @@ fn estimated_value_size(value: &Value) -> usize {
                 + arr.iter().map(estimated_value_size).sum::<usize>()
                 + arr.len() * std::mem::size_of::<Value>()
         }
-        Value::Vector(vec) => std::mem::size_of::<Vec<f64>>() + vec.len() * std::mem::size_of::<f64>(),
+        Value::Vector(vec) => {
+            std::mem::size_of::<Vec<f64>>() + vec.len() * std::mem::size_of::<f64>()
+        }
         Value::Json(s) | Value::Jsonb(s) => s.len(),
         Value::Time(_) => 8,
         Value::Date(_) => 4,
@@ -39,7 +41,11 @@ fn estimated_row_size(row: &Row) -> usize {
         + row.values.iter().map(estimated_value_size).sum::<usize>()
 }
 
-fn enforce_sort_memory_limit(total_bytes: &mut usize, row: &Row, max_sort_bytes: usize) -> Result<()> {
+fn enforce_sort_memory_limit(
+    total_bytes: &mut usize,
+    row: &Row,
+    max_sort_bytes: usize,
+) -> Result<()> {
     if max_sort_bytes == 0 {
         return Ok(());
     }
