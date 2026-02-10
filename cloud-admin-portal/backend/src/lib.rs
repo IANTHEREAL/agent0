@@ -16,6 +16,7 @@ pub mod tenant_state {
 
 pub mod api;
 pub mod auth;
+pub mod cli_common;
 pub mod config;
 pub mod crypto;
 pub mod db;
