@@ -28,6 +28,7 @@ fn make_schema(name: &str, columns: Vec<ColumnDef>) -> TableSchema {
         check_constraints: vec![],
         foreign_keys: vec![],
         owner: String::new(),
+        from_alias: None,
     }
 }
 
