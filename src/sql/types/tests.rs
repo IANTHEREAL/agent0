@@ -153,3 +153,100 @@ fn test_is_numeric() {
     assert!(!is_numeric(&DataType::Text));
     assert!(!is_numeric(&DataType::Boolean));
 }
+
+#[test]
+fn test_window_function_sum_returns_numeric() {
+    use sqlparser::ast::{Function, Ident, ObjectName, WindowSpec, WindowType};
+
+    let schema = make_schema(vec![int_col("amount")]);
+    let ctx = TypeContext::single(&schema);
+    let mut inferrer = infer::TypeInferrer::new(ctx);
+
+    // Window SUM should return Numeric
+    let window_sum = Function {
+        name: ObjectName(vec![Ident::new("SUM")]),
+        args: vec![],
+        over: Some(WindowType::WindowSpec(WindowSpec {
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+        })),
+        filter: None,
+        null_treatment: None,
+        distinct: false,
+        special: false,
+        order_by: vec![],
+    };
+
+    let result = inferrer.infer(&sqlparser::ast::Expr::Function(window_sum));
+    assert_eq!(
+        result.unwrap(),
+        DataType::Numeric {
+            precision: None,
+            scale: None
+        }
+    );
+}
+
+#[test]
+fn test_window_function_avg_returns_numeric() {
+    use sqlparser::ast::{Function, Ident, ObjectName, WindowSpec, WindowType};
+
+    let schema = make_schema(vec![int_col("amount")]);
+    let ctx = TypeContext::single(&schema);
+    let mut inferrer = infer::TypeInferrer::new(ctx);
+
+    // Window AVG should return Numeric
+    let window_avg = Function {
+        name: ObjectName(vec![Ident::new("AVG")]),
+        args: vec![],
+        over: Some(WindowType::WindowSpec(WindowSpec {
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: None,
+        })),
+        filter: None,
+        null_treatment: None,
+        distinct: false,
+        special: false,
+        order_by: vec![],
+    };
+
+    let result = inferrer.infer(&sqlparser::ast::Expr::Function(window_avg));
+    assert_eq!(
+        result.unwrap(),
+        DataType::Numeric {
+            precision: None,
+            scale: None
+        }
+    );
+}
+
+#[test]
+fn test_aggregate_function_sum_uses_registry() {
+    use sqlparser::ast::{Function, Ident, ObjectName};
+
+    let schema = make_schema(vec![int_col("amount")]);
+    let ctx = TypeContext::single(&schema);
+    let mut inferrer = infer::TypeInferrer::new(ctx);
+
+    // Regular (non-window) SUM should use registry logic (Int32 -> Int64)
+    let agg_sum = Function {
+        name: ObjectName(vec![Ident::new("SUM")]),
+        args: vec![sqlparser::ast::FunctionArg::Unnamed(
+            sqlparser::ast::FunctionArgExpr::Expr(sqlparser::ast::Expr::Identifier(Ident::new(
+                "amount",
+            ))),
+        )],
+        over: None, // No window clause
+        filter: None,
+        null_treatment: None,
+        distinct: false,
+        special: false,
+        order_by: vec![],
+    };
+
+    let result = inferrer.infer(&sqlparser::ast::Expr::Function(agg_sum));
+    // For aggregate SUM(int32), registry returns Int64
+    assert_eq!(result.unwrap(), DataType::Int64);
+}

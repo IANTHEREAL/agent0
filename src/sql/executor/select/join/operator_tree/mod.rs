@@ -1,3 +1,4 @@
+use super::super::analysis::projection_has_window_function;
 use super::super::*;
 use super::table_factor::{
     collect_visible_aliases_in_table_with_joins, duplicate_column_names_lowercase,
@@ -1616,18 +1617,7 @@ impl Executor {
                 .await;
         }
 
-        let has_window_funcs = resolved_projection.iter().any(|item| {
-            if let SelectItem::UnnamedExpr(Expr::Function(f))
-            | SelectItem::ExprWithAlias {
-                expr: Expr::Function(f),
-                ..
-            } = item
-            {
-                f.over.is_some()
-            } else {
-                false
-            }
-        });
+        let has_window_funcs = projection_has_window_function(&resolved_projection);
 
         if has_window_funcs {
             return self

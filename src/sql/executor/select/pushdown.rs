@@ -1,3 +1,4 @@
+use super::analysis::projection_has_window_function;
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,7 +18,7 @@ pub(super) fn generate_series_offset_limit_pushdown_eligible(
         &select.group_by,
         GroupByExpr::Expressions(exprs) if exprs.is_empty()
     );
-    let has_window_funcs = !extract_window_functions(&select.projection).is_empty();
+    let has_window_funcs = projection_has_window_function(&select.projection);
     let has_agg_funcs = {
         let extra_start = select.projection.len();
         let mut agg_funcs: Vec<(usize, AggExpr)> = Vec::new();

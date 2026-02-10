@@ -117,7 +117,7 @@ SELECT id, ROW_NUMBER() OVER (ORDER BY id) FROM table;
 SELECT id, SUM(amount) OVER (PARTITION BY category) FROM table;
 ```
 
-**Status:** ✅ Completed. Window function queries now route through `WindowOperator` when they match the `is_window_operator_query()` predicate.
+**Status:** ✅ Completed. Window function queries now route through `WindowOperator` in the operator path when window functions are present in the projection (and there is no GROUP BY / HAVING / non-window aggregation).
 
 Tasks:
 - [x] Parse window functions from SELECT to build WindowFunctionExpr
@@ -207,10 +207,9 @@ Tasks:
 - All 107 integration tests + 584 ORM tests pass
 
 **Phase 5 Completed:**
-- Added `is_window_operator_query()` predicate to detect eligible window function queries
-- Implemented `extract_window_function_exprs()` to parse window functions from SELECT clause
+- Routed window queries through the operator path when the projection contains window functions (and there is no GROUP BY / HAVING / non-window aggregation)
 - Implemented `execute_window_with_operators()` to build operator tree: Scan → Window → Sort → Limit
-- Added helper functions for projection mapping (`ProjectionSource`, `project_window_results()`)
+- Hoisted window functions out of nested projection expressions so `row_number() OVER (...) + 1` works in the operator path
 - Integrated at `executor_select.rs` line ~472
 - All 107 integration tests + 584 ORM tests pass
 
@@ -284,14 +283,14 @@ After each phase:
 
 2. **Window function type inference**: Each window function has a specific output type:
    - `row_number`, `rank`, `dense_rank` → Int64
-   - `sum`, `avg` → Float64
+   - `sum`, `avg` → Numeric
    - `count` → Int64
    - `min`, `max`, `first_value`, `last_value` → Same as argument type
    - `lag`, `lead` → Same as argument type (nullable)
 
 3. **Operator ordering for window queries**: The correct order is `Scan → Window → Sort → Limit`. The WindowOperator handles its own internal ordering for PARTITION BY and ORDER BY within each window function.
 
-4. **Keep existing window.rs as fallback**: The `is_window_operator_query()` predicate only routes simple window queries through the operator path. Complex cases (multiple tables, CTEs, subqueries) fall back to the existing `compute_window_functions()` in `src/sql/window.rs`.
+4. **Keep existing window.rs as fallback**: The operator-path routing is intentionally conservative; complex cases (multiple tables, CTEs, scalar subqueries/UDFs, etc.) fall back to `compute_window_functions()` in `src/sql/window.rs`.
 
 ### Phase 6: DISTINCT Operator Support
 

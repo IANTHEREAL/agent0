@@ -4,6 +4,7 @@ use super::super::aggregate::{collect_having_agg_funcs, eval_having_expr, AggExp
 use super::super::distinct::{apply_offset_limit_fetch, dedup_rows, distinct_on_rows_with_indices};
 use super::super::gin;
 use super::super::names;
+use super::super::operators::WindowFunctionExpr;
 use super::super::operators::{
     execute_operator_tree, BoxedOperator, FilterOperator, HashAggregateOperator, HashJoinConfig,
     HashJoinOperator, HashJoinType, JoinType, LimitOperator, NestedLoopJoinOperator,
@@ -14,7 +15,7 @@ use super::super::projection::{fill_row_defaults, get_select_item_name, infer_ex
 use super::super::sequences;
 use super::super::value_key::{serialize_value_for_key, serialize_values_for_key};
 use super::super::wildcard::build_join_wildcard_plan;
-use super::super::window::{compute_window_functions, extract_window_functions, WindowFuncInfo};
+use super::super::window::{compute_window_functions, WindowFuncInfo};
 use super::super::{
     expr::{coerce_text_literal_to_bool, eval_expr, validate_bool_expr_in_boolean_context},
     Aggregator, ExecuteResult,
@@ -27,7 +28,7 @@ use super::operators::{
 };
 use crate::sql::error::SqlError;
 use crate::sql::information_schema::VirtualTableFilter;
-use crate::types::{DataType, Row, TableSchema, Value};
+use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     BinaryOperator, Distinct, Expr, Function, FunctionArg, FunctionArgExpr, GroupByExpr, Ident,
@@ -1214,7 +1215,24 @@ impl Executor {
         let grouping_sets = extract_grouping_sets(group_keys_exprs);
         let has_grouping_sets = grouping_sets.is_some();
 
-        let window_funcs = extract_window_functions(&select.projection);
+        let (all_wf_exprs, window_sig_to_col) =
+            Executor::extract_window_function_exprs(&resolved_projection, &schema);
+        let has_window_funcs_flag = !all_wf_exprs.is_empty();
+
+        // Convert WindowFunctionExpr → WindowFuncInfo for compute_window_functions
+        let window_funcs: Vec<WindowFuncInfo> = all_wf_exprs
+            .iter()
+            .map(|wf| WindowFuncInfo {
+                proj_idx: usize::MAX, // sentinel — not used for matching
+                func_name: wf.func_name.clone(),
+                arg_expr: wf.arg_expr.clone(),
+                partition_by: wf.partition_by.clone(),
+                order_by: wf.order_by.clone(),
+                offset_expr: wf.offset_expr.clone(),
+                default_value_expr: wf.default_value_expr.clone(),
+                window_frame: wf.window_frame.clone(),
+            })
+            .collect();
 
         let mut agg_funcs: Vec<(usize, AggExpr)> = Vec::new();
         let extra_start = select.projection.len();
@@ -1363,7 +1381,7 @@ impl Executor {
                 (filtered_rows, window_results)
             };
 
-        let has_window_funcs = !window_funcs.is_empty();
+        let has_window_funcs = has_window_funcs_flag;
         let wildcard = select
             .projection
             .iter()
@@ -1447,8 +1465,9 @@ impl Executor {
                 &outer_alias,
                 rows_for_projection,
                 &resolved_projection,
-                &window_funcs,
                 window_results.as_ref(),
+                &all_wf_exprs,
+                &window_sig_to_col,
             )
             .await?
         };

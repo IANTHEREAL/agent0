@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Pre-commit hook: run the same lint checks as CI (.github/workflows/orm-tests.yml)
+set -euo pipefail
+
+echo "Running pre-commit checks..."
+
+# Check formatting (matches CI step "Check formatting")
+if ! cargo fmt -- --check 2>&1; then
+    echo ""
+    echo "ERROR: cargo fmt check failed."
+    echo "Run 'cargo fmt' to fix formatting, then stage the changes and retry."
+    exit 1
+fi
+
+echo "Pre-commit checks passed."

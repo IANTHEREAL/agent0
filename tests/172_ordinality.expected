@@ -59,3 +59,12 @@ t
 x|ordinality
 a|1
 (1 row)
+window_0|x
+3|c
+2|b
+1|a
+(3 rows)
+rn
+1
+2
+(2 rows)

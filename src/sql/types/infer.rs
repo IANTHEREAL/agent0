@@ -263,6 +263,26 @@ impl<'a> TypeInferrer<'a> {
             })
             .collect();
 
+        // Special handling for window functions
+        // Window functions SUM/AVG always return Numeric for consistency
+        if f.over.is_some() {
+            match func_name.as_str() {
+                "SUM" => {
+                    return Ok(DataType::Numeric {
+                        precision: None,
+                        scale: None,
+                    })
+                }
+                "AVG" => {
+                    return Ok(DataType::Numeric {
+                        precision: None,
+                        scale: None,
+                    })
+                }
+                _ => {}
+            }
+        }
+
         let registry = global_registry();
         if let Some(return_type) = registry.resolve_return_type(&func_name, &arg_types) {
             return Ok(return_type);

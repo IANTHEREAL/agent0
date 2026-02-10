@@ -1,5 +1,5 @@
 -- PostgreSQL compatible tests from ordinality
--- 18 tests
+-- 20 tests
 
 -- Cleanup for rerun
 DROP TABLE IF EXISTS foo;
@@ -130,3 +130,13 @@ SELECT x, row_number() OVER (ORDER BY x) AS ordinality
 FROM foo
 ORDER BY x
 LIMIT 1;
+
+-- Test 19: query (line 108)
+SELECT row_number() OVER (ORDER BY x), x
+FROM foo
+ORDER BY window_0 DESC;
+
+-- Test 20: query (line 113)
+SELECT row_number() OVER (ORDER BY x) + 0 AS rn
+FROM (VALUES (10, 'a'), (20, 'b')) AS t(__tipg_internal_window_0, x)
+ORDER BY x;

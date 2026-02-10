@@ -2,17 +2,14 @@ use std::collections::HashMap;
 
 use crate::sql::error::SqlError;
 use anyhow::Result;
-use rust_decimal::prelude::ToPrimitive;
-use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, OrderByExpr, SelectItem, Value as SqlValue, WindowFrame,
-    WindowFrameBound, WindowType,
-};
+use sqlparser::ast::{Expr, OrderByExpr, Value as SqlValue, WindowFrame, WindowFrameBound};
 
 use super::expr::{compare_order_by_values, compare_values, eval_expr};
 use super::value_key::serialize_values_for_key;
 use crate::types::{Row, TableSchema, Value};
 
 pub(crate) struct WindowFuncInfo {
+    #[allow(dead_code)]
     pub proj_idx: usize,
     pub func_name: String,
     pub arg_expr: Option<Expr>,
@@ -21,50 +18,6 @@ pub(crate) struct WindowFuncInfo {
     pub offset_expr: Option<Expr>,
     pub default_value_expr: Option<Expr>,
     pub window_frame: Option<WindowFrame>,
-}
-
-pub(crate) fn extract_window_functions(projection: &[SelectItem]) -> Vec<WindowFuncInfo> {
-    let mut result = Vec::new();
-    for (idx, item) in projection.iter().enumerate() {
-        let func = match item {
-            SelectItem::UnnamedExpr(Expr::Function(f)) => Some(f),
-            SelectItem::ExprWithAlias {
-                expr: Expr::Function(f),
-                ..
-            } => Some(f),
-            _ => None,
-        };
-        if let Some(f) = func {
-            if let Some(WindowType::WindowSpec(spec)) = &f.over {
-                let func_name = f
-                    .name
-                    .0
-                    .last()
-                    .map(|i| i.value.to_lowercase())
-                    .unwrap_or_default();
-                let extract_arg = |index: usize| -> Option<Expr> {
-                    f.args.get(index).and_then(|a| match a {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e.clone()),
-                        _ => None,
-                    })
-                };
-                let arg_expr = extract_arg(0);
-                let offset_expr = extract_arg(1);
-                let default_value_expr = extract_arg(2);
-                result.push(WindowFuncInfo {
-                    proj_idx: idx,
-                    func_name,
-                    arg_expr,
-                    partition_by: spec.partition_by.clone(),
-                    order_by: spec.order_by.clone(),
-                    offset_expr,
-                    default_value_expr,
-                    window_frame: spec.window_frame.clone(),
-                });
-            }
-        }
-    }
-    result
 }
 
 pub(crate) fn compute_window_functions(
@@ -284,6 +237,16 @@ fn get_frame_bounds(
     (start, end)
 }
 
+fn value_to_decimal(val: &Value) -> Option<rust_decimal::Decimal> {
+    match val {
+        Value::Int32(n) => Some(rust_decimal::Decimal::from(*n)),
+        Value::Int64(n) => Some(rust_decimal::Decimal::from(*n)),
+        Value::Float64(f) => rust_decimal::Decimal::try_from(*f).ok(),
+        Value::Numeric(d) => Some(*d),
+        _ => None,
+    }
+}
+
 fn compute_sum(
     rows: &[Row],
     schema: &TableSchema,
@@ -296,23 +259,25 @@ fn compute_sum(
 
     for (pos, &row_idx) in row_indices.iter().enumerate() {
         let (start, end) = get_frame_bounds(wf, pos, partition_size);
-        let mut sum = 0.0f64;
+        let mut sum = rust_decimal::Decimal::ZERO;
+        let mut has_value = false;
         for i in start..end {
             if i < partition_size {
                 let frame_row_idx = row_indices[i];
                 if let Some(ref arg) = wf.arg_expr {
                     let val = eval_expr(arg, Some(&rows[frame_row_idx]), Some(schema))?;
-                    match val {
-                        Value::Int32(n) => sum += n as f64,
-                        Value::Int64(n) => sum += n as f64,
-                        Value::Float64(n) => sum += n,
-                        Value::Numeric(d) => sum += d.to_f64().unwrap_or(0.0),
-                        _ => {}
+                    if let Some(n) = value_to_decimal(&val) {
+                        sum += n;
+                        has_value = true;
                     }
                 }
             }
         }
-        results[row_idx][wf_idx] = Value::Float64(sum);
+        results[row_idx][wf_idx] = if has_value {
+            Value::Numeric(sum)
+        } else {
+            Value::Null
+        };
     }
     Ok(())
 }
@@ -344,40 +309,24 @@ fn compute_avg(
 
     for (pos, &row_idx) in row_indices.iter().enumerate() {
         let (start, end) = get_frame_bounds(wf, pos, partition_size);
-        let mut frame_sum = 0.0f64;
+        let mut frame_sum = rust_decimal::Decimal::ZERO;
         let mut frame_count = 0i64;
         for i in start..end {
             if i < partition_size {
                 let frame_row_idx = row_indices[i];
                 if let Some(ref arg) = wf.arg_expr {
                     let val = eval_expr(arg, Some(&rows[frame_row_idx]), Some(schema))?;
-                    match val {
-                        Value::Int32(n) => {
-                            frame_sum += n as f64;
-                            frame_count += 1;
-                        }
-                        Value::Int64(n) => {
-                            frame_sum += n as f64;
-                            frame_count += 1;
-                        }
-                        Value::Float64(n) => {
-                            frame_sum += n;
-                            frame_count += 1;
-                        }
-                        Value::Numeric(d) => {
-                            frame_sum += d.to_f64().unwrap_or(0.0);
-                            frame_count += 1;
-                        }
-                        Value::Null => {}
-                        _ => {
-                            frame_count += 1;
-                        }
+                    if let Some(n) = value_to_decimal(&val) {
+                        frame_sum += n;
+                        frame_count += 1;
+                    } else if !matches!(val, Value::Null) {
+                        frame_count += 1;
                     }
                 }
             }
         }
         results[row_idx][wf_idx] = if frame_count > 0 {
-            Value::Float64(frame_sum / frame_count as f64)
+            Value::Numeric(frame_sum / rust_decimal::Decimal::from(frame_count))
         } else {
             Value::Null
         };

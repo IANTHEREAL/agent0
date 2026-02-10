@@ -12,8 +12,9 @@ impl Executor {
         outer_alias: &str,
         rows_for_projection: Vec<Row>,
         resolved_projection: &[SelectItem],
-        window_funcs: &[WindowFuncInfo],
         window_results: Option<&Vec<Vec<Value>>>,
+        all_wf_exprs: &[WindowFunctionExpr],
+        window_sig_to_col: &HashMap<String, String>,
     ) -> Result<(Vec<String>, Vec<Row>)> {
         let mut cols = Vec::new();
         for item in &select.projection {
@@ -66,6 +67,49 @@ impl Executor {
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => {}
             }
         }
+
+        // Build enriched schema for window expression evaluation
+        let enriched_schema = if !all_wf_exprs.is_empty() {
+            let mut window_columns: Vec<ColumnDef> = schema
+                .columns
+                .iter()
+                .map(|c| ColumnDef {
+                    name: c.name.clone(),
+                    data_type: c.data_type.clone(),
+                    nullable: c.nullable,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                })
+                .collect();
+            for wf in all_wf_exprs {
+                window_columns.push(ColumnDef {
+                    name: wf.output_name.clone(),
+                    data_type: wf.output_type.clone(),
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                });
+            }
+            Some(TableSchema {
+                name: "window_result".to_string(),
+                table_id: 0,
+                columns: window_columns,
+                version: 1,
+                pk_constraint_name: None,
+                pk_indices: vec![],
+                indexes: vec![],
+                check_constraints: vec![],
+                foreign_keys: vec![],
+                owner: String::new(),
+                from_alias: None,
+            })
+        } else {
+            None
+        };
 
         #[derive(Copy, Clone)]
         enum SrfKind {
@@ -122,14 +166,44 @@ impl Executor {
             let mut row_values = Vec::new();
             let mut srf_outputs: Vec<(usize, Vec<Value>)> = Vec::new();
 
-            for (proj_idx, item) in resolved_projection.iter().enumerate() {
-                if let Some(wf_pos) = window_funcs.iter().position(|wf| wf.proj_idx == proj_idx) {
-                    if let Some(wr) = window_results {
-                        row_values.push(wr[row_idx][wf_pos].clone());
-                    } else {
-                        row_values.push(Value::Null);
+            for item in resolved_projection.iter() {
+                // Try to handle via window rewriting (handles both top-level and nested)
+                if let Some(enriched) = &enriched_schema {
+                    let expr = match item {
+                        SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
+                            Some(e)
+                        }
+                        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => None,
+                    };
+                    if let Some(expr) = expr {
+                        let rewritten = Executor::rewrite_window_refs(expr, window_sig_to_col);
+                        if rewritten != *expr {
+                            // Expression contained window functions — evaluate against enriched row
+                            if let Some(wr) = window_results {
+                                let mut enriched_values = row.values.clone();
+                                enriched_values.extend(wr[row_idx].iter().cloned());
+                                let enriched_row = Row::new(enriched_values);
+                                let val = self
+                                    .eval_expr_maybe_sequence(
+                                        txn,
+                                        db_id,
+                                        sequence_values,
+                                        search_path,
+                                        &rewritten,
+                                        Some(&enriched_row),
+                                        Some(enriched),
+                                    )
+                                    .await?;
+                                row_values.push(val);
+                            } else {
+                                row_values.push(Value::Null);
+                            }
+                            continue;
+                        }
                     }
-                } else {
+                }
+                // Fall through to normal expression evaluation (no window functions in this item)
+                {
                     let expr = match item {
                         SelectItem::UnnamedExpr(e) => e,
                         SelectItem::ExprWithAlias { expr: e, .. } => e,

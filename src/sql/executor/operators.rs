@@ -2934,7 +2934,15 @@ impl Executor {
                             let offset_expr = extract_arg(1);
                             let default_value_expr = extract_arg(2);
 
-                            let output_name = format!("__window_{}", out.len());
+                            let mut output_name = format!("__window_{}", out.len());
+                            let mut collision_suffix = 0u32;
+                            while schema.columns.iter().any(|c| c.name == output_name)
+                                || sig_to_col.values().any(|v| v == &output_name)
+                            {
+                                collision_suffix += 1;
+                                output_name =
+                                    format!("__window_{}_{}", out.len(), collision_suffix);
+                            }
                             let output_type =
                                 Executor::infer_window_func_type(&func_name, &arg_expr, schema);
 
@@ -3034,7 +3042,7 @@ impl Executor {
         (result, sig_to_col)
     }
 
-    fn rewrite_window_refs(expr: &Expr, sig_to_col: &HashMap<String, String>) -> Expr {
+    pub(crate) fn rewrite_window_refs(expr: &Expr, sig_to_col: &HashMap<String, String>) -> Expr {
         use sqlparser::ast::WindowType;
 
         match expr {
