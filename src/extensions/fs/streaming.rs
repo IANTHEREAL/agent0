@@ -1,49 +1,158 @@
 use anyhow::Result;
-use tokio::io::AsyncBufRead;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
-use crate::types::{Row, TableSchema};
+use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+
+fn make_column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
+    ColumnDef {
+        name: name.to_string(),
+        data_type,
+        nullable,
+        primary_key: false,
+        unique: false,
+        is_serial: false,
+        default_expr: None,
+    }
+}
+
+fn make_schema(name: &str, columns: Vec<ColumnDef>) -> TableSchema {
+    TableSchema {
+        table_id: 0,
+        name: name.to_string(),
+        columns,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        version: 1,
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+    }
+}
+
+fn text_schema() -> TableSchema {
+    make_schema(
+        "fs9",
+        vec![
+            make_column("_line_number", DataType::Int64, false),
+            make_column("line", DataType::Text, false),
+            make_column("_path", DataType::Text, false),
+        ],
+    )
+}
+
+fn jsonl_schema() -> TableSchema {
+    make_schema(
+        "fs9",
+        vec![
+            make_column("_line_number", DataType::Int64, false),
+            make_column("line", DataType::Jsonb, false),
+            make_column("_path", DataType::Text, false),
+        ],
+    )
+}
 
 pub(crate) struct StreamingTextDecoder {
-    _private: (),
+    reader: Box<dyn AsyncBufRead + Unpin + Send>,
+    path: String,
+    schema: TableSchema,
+    line_number: usize,
+    total_bytes: usize,
+    buf: String,
 }
 
 impl StreamingTextDecoder {
-    pub(crate) fn new(_reader: Box<dyn AsyncBufRead + Unpin + Send>, _path: String) -> Self {
-        todo!("StreamingTextDecoder::new")
+    pub(crate) fn new(reader: Box<dyn AsyncBufRead + Unpin + Send>, path: String) -> Self {
+        Self {
+            reader,
+            path,
+            schema: text_schema(),
+            line_number: 0,
+            total_bytes: 0,
+            buf: String::new(),
+        }
     }
 
     pub(crate) fn schema(&self) -> &TableSchema {
-        todo!("StreamingTextDecoder::schema")
+        &self.schema
     }
 
     pub(crate) async fn next_row(&mut self) -> Result<Option<Row>> {
-        todo!("StreamingTextDecoder::next_row")
+        self.buf.clear();
+        let n = self.reader.read_line(&mut self.buf).await?;
+        if n == 0 {
+            return Ok(None);
+        }
+        self.total_bytes += n;
+        self.line_number += 1;
+
+        let line = self.buf.trim_end_matches('\n').trim_end_matches('\r');
+        Ok(Some(Row::new(vec![
+            Value::Int64(self.line_number as i64),
+            Value::Text(line.to_string()),
+            Value::Text(self.path.clone()),
+        ])))
     }
 
     pub(crate) fn bytes_read(&self) -> usize {
-        todo!("StreamingTextDecoder::bytes_read")
+        self.total_bytes
     }
 }
 
 pub(crate) struct StreamingJsonlDecoder {
-    _private: (),
+    reader: Box<dyn AsyncBufRead + Unpin + Send>,
+    path: String,
+    schema: TableSchema,
+    line_number: usize,
+    total_bytes: usize,
+    buf: String,
 }
 
 impl StreamingJsonlDecoder {
-    pub(crate) fn new(_reader: Box<dyn AsyncBufRead + Unpin + Send>, _path: String) -> Self {
-        todo!("StreamingJsonlDecoder::new")
+    pub(crate) fn new(reader: Box<dyn AsyncBufRead + Unpin + Send>, path: String) -> Self {
+        Self {
+            reader,
+            path,
+            schema: jsonl_schema(),
+            line_number: 0,
+            total_bytes: 0,
+            buf: String::new(),
+        }
     }
 
     pub(crate) fn schema(&self) -> &TableSchema {
-        todo!("StreamingJsonlDecoder::schema")
+        &self.schema
     }
 
     pub(crate) async fn next_row(&mut self) -> Result<Option<Row>> {
-        todo!("StreamingJsonlDecoder::next_row")
+        loop {
+            self.buf.clear();
+            let n = self.reader.read_line(&mut self.buf).await?;
+            if n == 0 {
+                return Ok(None);
+            }
+            self.total_bytes += n;
+            self.line_number += 1;
+
+            let trimmed = self.buf.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if serde_json::from_str::<serde_json::Value>(trimmed).is_err() {
+                continue;
+            }
+
+            return Ok(Some(Row::new(vec![
+                Value::Int64(self.line_number as i64),
+                Value::Jsonb(trimmed.to_string()),
+                Value::Text(self.path.clone()),
+            ])));
+        }
     }
 
     pub(crate) fn bytes_read(&self) -> usize {
-        todo!("StreamingJsonlDecoder::bytes_read")
+        self.total_bytes
     }
 }
 
