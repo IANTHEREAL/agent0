@@ -1163,18 +1163,38 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
             Ok(Value::Text(s))
         }
         (Value::Text(s), SqlType::Int(_) | SqlType::Integer(_)) => {
-            Ok(Value::Int32(s.trim().parse().unwrap_or(0)))
+            s.trim().parse::<i32>().map(Value::Int32).map_err(|_| {
+                anyhow::Error::from(SqlError::InvalidInputSyntax {
+                    type_name: "integer".into(),
+                    value: s.clone(),
+                })
+            })
         }
         (Value::Text(s), SqlType::BigInt(_) | SqlType::Int8(_)) => {
-            Ok(Value::Int64(s.trim().parse().unwrap_or(0)))
+            s.trim().parse::<i64>().map(Value::Int64).map_err(|_| {
+                anyhow::Error::from(SqlError::InvalidInputSyntax {
+                    type_name: "bigint".into(),
+                    value: s.clone(),
+                })
+            })
         }
         (Value::Text(s), SqlType::Float(_) | SqlType::Double | SqlType::Real) => {
-            Ok(Value::Float64(s.trim().parse().unwrap_or(0.0)))
+            s.trim().parse::<f64>().map(Value::Float64).map_err(|_| {
+                anyhow::Error::from(SqlError::InvalidInputSyntax {
+                    type_name: "double precision".into(),
+                    value: s.clone(),
+                })
+            })
         }
-        (Value::Text(s), SqlType::Boolean) => Ok(Value::Boolean(matches!(
-            s.to_lowercase().as_str(),
-            "true" | "t" | "yes" | "y" | "1"
-        ))),
+        (Value::Text(s), SqlType::Boolean) => match s.trim().to_lowercase().as_str() {
+            "true" | "t" | "yes" | "y" | "1" => Ok(Value::Boolean(true)),
+            "false" | "f" | "no" | "n" | "0" => Ok(Value::Boolean(false)),
+            _ => Err(SqlError::InvalidInputSyntax {
+                type_name: "boolean".into(),
+                value: s.clone(),
+            }
+            .into()),
+        },
         (Value::Int32(n), SqlType::Boolean) => Ok(Value::Boolean(n != 0)),
         (Value::Int64(n), SqlType::Boolean) => Ok(Value::Boolean(n != 0)),
         (Value::Float64(n), SqlType::Boolean) => Ok(Value::Boolean(n != 0.0)),
