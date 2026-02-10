@@ -209,7 +209,8 @@ impl Executor {
                 return Err(anyhow!("extension \"http\" is disabled"));
             }
 
-            let (mut schema, rows) = http::execute_table_function(self.tenant_keyspace(), call).await?;
+            let (mut schema, rows) =
+                http::execute_table_function(self.tenant_keyspace(), call).await?;
 
             if let Some(alias) = alias {
                 if !alias.columns.is_empty() {
@@ -233,12 +234,14 @@ impl Executor {
             if args.is_empty() {
                 return Err(anyhow!("fs9(path text) requires at least 1 argument"));
             }
-            
+
             // Extract first positional arg as path
             let path_expr = match &args[0] {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
                 FunctionArg::Named { .. } => {
-                    return Err(anyhow!("fs9: first argument must be an unnamed path string"));
+                    return Err(anyhow!(
+                        "fs9: first argument must be an unnamed path string"
+                    ));
                 }
                 _ => return Err(anyhow!("fs9: first argument must be a path string")),
             };
@@ -247,17 +250,21 @@ impl Executor {
                 Value::Null => return Err(anyhow!("fs9: path must not be NULL")),
                 _ => return Err(anyhow!("fs9: path must be TEXT")),
             };
-            
+
             // Parse named parameters from remaining args
             let mut format: Option<String> = None;
             let mut delimiter: Option<char> = None;
             let mut header: Option<bool> = None;
             let mut recursive: Option<bool> = None;
             let mut exclude: Option<String> = None;
-            
+
             for arg in &args[1..] {
                 match arg {
-                    FunctionArg::Named { name, arg: FunctionArgExpr::Expr(e), .. } => {
+                    FunctionArg::Named {
+                        name,
+                        arg: FunctionArgExpr::Expr(e),
+                        ..
+                    } => {
                         let param_name = name.value.to_ascii_lowercase();
                         let val = eval_expr(e, None, None)?;
                         match param_name.as_str() {
@@ -273,7 +280,9 @@ impl Executor {
                                     _ => return Err(anyhow!("fs9: 'delimiter' must be TEXT")),
                                 };
                                 if s.len() != 1 {
-                                    return Err(anyhow!("fs9: 'delimiter' must be a single character"));
+                                    return Err(anyhow!(
+                                        "fs9: 'delimiter' must be a single character"
+                                    ));
                                 }
                                 delimiter = Some(s.chars().next().unwrap());
                             }
@@ -308,7 +317,7 @@ impl Executor {
                     }
                 }
             }
-            
+
             // Determine mode based on path
             let mode = if path.ends_with('/') {
                 Fs9Mode::Directory {
@@ -341,7 +350,8 @@ impl Executor {
                 return Err(anyhow!("extension \"fs9\" is disabled"));
             }
 
-            let (mut schema, rows) = fs::execute_table_function(self.tenant_keyspace(), mode).await?;
+            let (mut schema, rows) =
+                fs::execute_table_function(self.tenant_keyspace(), mode).await?;
 
             if let Some(alias) = alias {
                 if !alias.columns.is_empty() {

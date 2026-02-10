@@ -2710,9 +2710,11 @@ impl Executor {
 
             match item {
                 SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
-                    output_exprs_for_positional_order_by.extend(schema.columns.iter().map(|col| {
-                        Expr::Identifier(sqlparser::ast::Ident::new(col.name.clone()))
-                    }));
+                    output_exprs_for_positional_order_by.extend(
+                        schema.columns.iter().map(|col| {
+                            Expr::Identifier(sqlparser::ast::Ident::new(col.name.clone()))
+                        }),
+                    );
                 }
                 SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                     output_exprs_for_positional_order_by
@@ -2959,9 +2961,9 @@ impl Executor {
                 op: op.clone(),
                 expr: Box::new(Self::rewrite_window_refs(inner, sig_to_col)),
             },
-            Expr::Nested(inner) => Expr::Nested(Box::new(Self::rewrite_window_refs(
-                inner, sig_to_col,
-            ))),
+            Expr::Nested(inner) => {
+                Expr::Nested(Box::new(Self::rewrite_window_refs(inner, sig_to_col)))
+            }
             Expr::Cast {
                 expr: inner,
                 data_type,
@@ -3006,11 +3008,9 @@ impl Executor {
                     .args
                     .iter()
                     .map(|a| match a {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(Self::rewrite_window_refs(
-                                e, sig_to_col,
-                            )))
-                        }
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => FunctionArg::Unnamed(
+                            FunctionArgExpr::Expr(Self::rewrite_window_refs(e, sig_to_col)),
+                        ),
                         FunctionArg::Named {
                             name,
                             arg: FunctionArgExpr::Expr(e),
@@ -3032,24 +3032,18 @@ impl Executor {
                     order_by: f.order_by.clone(),
                 })
             }
-            Expr::IsNull(e) => Expr::IsNull(Box::new(Self::rewrite_window_refs(
-                e, sig_to_col,
-            ))),
-            Expr::IsNotNull(e) => Expr::IsNotNull(Box::new(Self::rewrite_window_refs(
-                e, sig_to_col,
-            ))),
-            Expr::IsTrue(e) => Expr::IsTrue(Box::new(Self::rewrite_window_refs(
-                e, sig_to_col,
-            ))),
-            Expr::IsFalse(e) => Expr::IsFalse(Box::new(Self::rewrite_window_refs(
-                e, sig_to_col,
-            ))),
-            Expr::IsNotTrue(e) => Expr::IsNotTrue(Box::new(Self::rewrite_window_refs(
-                e, sig_to_col,
-            ))),
-            Expr::IsNotFalse(e) => Expr::IsNotFalse(Box::new(Self::rewrite_window_refs(
-                e, sig_to_col,
-            ))),
+            Expr::IsNull(e) => Expr::IsNull(Box::new(Self::rewrite_window_refs(e, sig_to_col))),
+            Expr::IsNotNull(e) => {
+                Expr::IsNotNull(Box::new(Self::rewrite_window_refs(e, sig_to_col)))
+            }
+            Expr::IsTrue(e) => Expr::IsTrue(Box::new(Self::rewrite_window_refs(e, sig_to_col))),
+            Expr::IsFalse(e) => Expr::IsFalse(Box::new(Self::rewrite_window_refs(e, sig_to_col))),
+            Expr::IsNotTrue(e) => {
+                Expr::IsNotTrue(Box::new(Self::rewrite_window_refs(e, sig_to_col)))
+            }
+            Expr::IsNotFalse(e) => {
+                Expr::IsNotFalse(Box::new(Self::rewrite_window_refs(e, sig_to_col)))
+            }
             Expr::InList {
                 expr: e,
                 list,

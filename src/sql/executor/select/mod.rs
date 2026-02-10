@@ -45,8 +45,8 @@ mod legacy;
 mod order;
 mod pushdown;
 
-use analysis::{expr_has_subquery, projection_has_non_window_aggregate};
 use analysis::projection_has_window_function;
+use analysis::{expr_has_subquery, projection_has_non_window_aggregate};
 use join::ensure_no_locking_clauses_for_join;
 use order::{
     expand_projection_exprs_for_positional_order_by, expr_matches, extract_grouping_sets,

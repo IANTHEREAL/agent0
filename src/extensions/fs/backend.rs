@@ -144,7 +144,11 @@ impl FsBackend for LocalFsBackend {
             .map_err(|err| anyhow!("fs9: cannot read file '{path}': {err}"))?;
 
         let mut buf = Vec::new();
-        let mut limited = file.take(u64::try_from(max_bytes).unwrap_or(u64::MAX).saturating_add(1));
+        let mut limited = file.take(
+            u64::try_from(max_bytes)
+                .unwrap_or(u64::MAX)
+                .saturating_add(1),
+        );
         limited
             .read_to_end(&mut buf)
             .await
@@ -229,7 +233,10 @@ mod tests {
             "/tmp/pgtikv-fs9-backend-missing-stat-{}",
             NEXT_ID.fetch_add(1, Ordering::Relaxed)
         );
-        let err = backend.stat(&path).await.expect_err("stat missing should fail");
+        let err = backend
+            .stat(&path)
+            .await
+            .expect_err("stat missing should fail");
         assert!(err.to_string().contains("fs9: file not found"));
     }
 

@@ -103,7 +103,8 @@ pub(crate) async fn execute_table_function(
             exclude,
         } => {
             let exclude_set = glob::build_exclude_globset(exclude.as_deref())?;
-            let entries = list_directory_entries(backend, &path, recursive, exclude_set.as_ref()).await?;
+            let entries =
+                list_directory_entries(backend, &path, recursive, exclude_set.as_ref()).await?;
             let decoded = decoders::decode_directory(entries);
             Ok((decoded.schema, decoded.rows))
         }
@@ -130,8 +131,9 @@ pub(crate) async fn execute_table_function(
                     } else {
                         delimiter
                     };
-                    let decoded = decoders::decode_csv(&data, &path, delim, header, MAX_ROWS_PER_QUERY)
-                        .map_err(|e| anyhow!("fs9: CSV decode error: {e}"))?;
+                    let decoded =
+                        decoders::decode_csv(&data, &path, delim, header, MAX_ROWS_PER_QUERY)
+                            .map_err(|e| anyhow!("fs9: CSV decode error: {e}"))?;
                     Ok((decoded.schema, decoded.rows))
                 }
                 "jsonl" | "ndjson" => {
@@ -151,13 +153,9 @@ pub(crate) async fn execute_table_function(
             header,
             exclude,
         } => {
-            let matching_files = glob::expand_glob(
-                backend,
-                &pattern,
-                MAX_FILES_PER_GLOB,
-                exclude.as_deref(),
-            )
-            .await?;
+            let matching_files =
+                glob::expand_glob(backend, &pattern, MAX_FILES_PER_GLOB, exclude.as_deref())
+                    .await?;
 
             if matching_files.is_empty() {
                 let decoded = decoders::decode_raw_text(&[], &pattern, 0);
@@ -197,7 +195,8 @@ pub(crate) async fn execute_table_function(
                 all_rows.extend(decoded.rows);
             }
 
-            let schema = result_schema.unwrap_or_else(|| decoders::decode_raw_text(&[], &pattern, 0).schema);
+            let schema =
+                result_schema.unwrap_or_else(|| decoders::decode_raw_text(&[], &pattern, 0).schema);
 
             Ok((schema, all_rows))
         }

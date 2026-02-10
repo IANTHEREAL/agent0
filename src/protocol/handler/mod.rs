@@ -1,8 +1,8 @@
+use crate::sql::expr::eval_expr;
 use crate::sql::types::{TypeContext, TypeInferrer};
 use crate::sql::{ExecuteResult, Session};
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, TableSchema, Value};
-use crate::sql::expr::eval_expr;
 use futures::{Sink, SinkExt};
 use pgwire::api::results::{FieldFormat, FieldInfo, Response};
 use pgwire::api::Type;
@@ -490,8 +490,15 @@ async fn resolve_table_schema_for_object_name(
         if let Some(schema) = crate::sql::get_information_schema_schema(&full) {
             return Some(schema);
         }
-        if let Some(schema) =
-            Box::pin(infer_view_schema(store, txn, db_id, search_path, &full, is_superuser)).await
+        if let Some(schema) = Box::pin(infer_view_schema(
+            store,
+            txn,
+            db_id,
+            search_path,
+            &full,
+            is_superuser,
+        ))
+        .await
         {
             return Some(schema);
         }
@@ -504,8 +511,15 @@ async fn resolve_table_schema_for_object_name(
 
     for schema in search_path {
         let full = format!("{}.{}", schema, name);
-        if let Some(schema) =
-            Box::pin(infer_view_schema(store, txn, db_id, search_path, &full, is_superuser)).await
+        if let Some(schema) = Box::pin(infer_view_schema(
+            store,
+            txn,
+            db_id,
+            search_path,
+            &full,
+            is_superuser,
+        ))
+        .await
         {
             return Some(schema);
         }
@@ -517,8 +531,15 @@ async fn resolve_table_schema_for_object_name(
     // As a last resort, try the default schema even if it's not present in the session search_path.
     let default_schema = search_path.first().map(String::as_str).unwrap_or("public");
     let full = format!("{}.{}", default_schema, name);
-    if let Some(schema) =
-        Box::pin(infer_view_schema(store, txn, db_id, search_path, &full, is_superuser)).await
+    if let Some(schema) = Box::pin(infer_view_schema(
+        store,
+        txn,
+        db_id,
+        search_path,
+        &full,
+        is_superuser,
+    ))
+    .await
     {
         return Some(schema);
     }
@@ -843,7 +864,9 @@ fn try_parse_fs9_mode_from_args(args: &[FunctionArg]) -> Option<crate::extension
                     "recursive" => match val {
                         Value::Boolean(b) => recursive = Some(b),
                         Value::Text(s) if s.eq_ignore_ascii_case("true") => recursive = Some(true),
-                        Value::Text(s) if s.eq_ignore_ascii_case("false") => recursive = Some(false),
+                        Value::Text(s) if s.eq_ignore_ascii_case("false") => {
+                            recursive = Some(false)
+                        }
                         _ => return None,
                     },
                     "exclude" => match val {
@@ -939,12 +962,9 @@ async fn infer_fs9_table_function_schema(
                             .ok()?;
                     Some(decoded.schema)
                 }
-                "jsonl" | "ndjson" => Some(crate::extensions::fs::decoders::decode_jsonl(
-                    &[],
-                    &path,
-                    0,
-                )
-                .schema),
+                "jsonl" | "ndjson" => {
+                    Some(crate::extensions::fs::decoders::decode_jsonl(&[], &path, 0).schema)
+                }
                 _ => Some(crate::extensions::fs::decoders::decode_raw_text(&[], &path, 0).schema),
             }
         }
@@ -968,7 +988,9 @@ async fn infer_fs9_table_function_schema(
             };
 
             if files.is_empty() {
-                return Some(crate::extensions::fs::decoders::decode_raw_text(&[], &pattern, 0).schema);
+                return Some(
+                    crate::extensions::fs::decoders::decode_raw_text(&[], &pattern, 0).schema,
+                );
             }
 
             let first = files.get(0).cloned().unwrap_or_default();
@@ -991,17 +1013,15 @@ async fn infer_fs9_table_function_schema(
                         Ok(data) => data,
                         Err(_) => return Some(fallback),
                     };
-                    let decoded =
-                        crate::extensions::fs::decoders::decode_csv(&data, &first, delim, header, 0)
-                            .ok()?;
+                    let decoded = crate::extensions::fs::decoders::decode_csv(
+                        &data, &first, delim, header, 0,
+                    )
+                    .ok()?;
                     Some(decoded.schema)
                 }
-                "jsonl" | "ndjson" => Some(crate::extensions::fs::decoders::decode_jsonl(
-                    &[],
-                    &first,
-                    0,
-                )
-                .schema),
+                "jsonl" | "ndjson" => {
+                    Some(crate::extensions::fs::decoders::decode_jsonl(&[], &first, 0).schema)
+                }
                 _ => Some(crate::extensions::fs::decoders::decode_raw_text(&[], &first, 0).schema),
             }
         }
@@ -1109,8 +1129,8 @@ async fn infer_query_output_columns_with_txn(
         outer_ctes,
         is_superuser,
     )
-        .await
-        .unwrap_or_else(|| outer_ctes.clone());
+    .await
+    .unwrap_or_else(|| outer_ctes.clone());
 
     infer_setexpr_output_columns_with_txn(
         store,
@@ -1200,7 +1220,7 @@ async fn collect_sources_from_table_with_joins(
         out,
         is_superuser,
     )
-        .await?;
+    .await?;
     for join in &twj.joins {
         collect_sources_from_table_factor(
             store,

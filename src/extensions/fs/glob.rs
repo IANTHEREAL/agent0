@@ -112,7 +112,9 @@ fn glob_prefix_dir(pattern: &str) -> &str {
     }
 }
 
-pub(crate) fn build_exclude_globset(exclude_pattern: Option<&str>) -> Result<Option<globset::GlobSet>> {
+pub(crate) fn build_exclude_globset(
+    exclude_pattern: Option<&str>,
+) -> Result<Option<globset::GlobSet>> {
     let Some(exclude_pattern) = exclude_pattern else {
         return Ok(None);
     };

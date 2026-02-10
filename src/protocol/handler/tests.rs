@@ -38,10 +38,10 @@ use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Qu
 use pgwire::messages::data::DataRow;
 use pgwire::messages::response::TransactionStatus;
 use std::fs;
-use tokio::sync::Mutex;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 
 #[derive(Default)]
 struct RecordingSink {
