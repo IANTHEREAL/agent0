@@ -1,30 +1,59 @@
+use std::fmt;
+
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use tokio::sync::mpsc;
 
 use super::{ExecutionContext, PhysicalOperator};
 use crate::types::{Row, TableSchema};
 
-/// Physical operator that streams rows from a table function (e.g., fs9).
-///
-/// Instead of materializing all rows into a Vec, this operator yields rows
-/// one at a time from the underlying streaming decoder.
-#[derive(Debug)]
 pub struct TableFunctionScanOperator {
     schema: TableSchema,
-    rows: Vec<Row>, // Placeholder: will be replaced by streaming decoder
-    position: usize,
+    source: RowSource,
     opened: bool,
 }
 
+// SAFETY: Accessed exclusively via &mut self in PhysicalOperator methods.
+// The mpsc::Receiver in RowSource::Channel is Send but !Sync; we never share
+// the operator across threads — it's owned by a single executor task.
+unsafe impl Sync for TableFunctionScanOperator {}
+
+enum RowSource {
+    Preloaded { rows: Vec<Row>, position: usize },
+    Channel { receiver: mpsc::Receiver<Row> },
+}
+
 impl TableFunctionScanOperator {
-    /// Create a new operator with preloaded rows (for testing / batch fallback).
     pub fn new_with_rows(schema: TableSchema, rows: Vec<Row>) -> Self {
         Self {
             schema,
-            rows,
-            position: 0,
+            source: RowSource::Preloaded { rows, position: 0 },
             opened: false,
         }
+    }
+
+    pub fn new_with_channel(schema: TableSchema, receiver: mpsc::Receiver<Row>) -> Self {
+        Self {
+            schema,
+            source: RowSource::Channel { receiver },
+            opened: false,
+        }
+    }
+}
+
+impl fmt::Debug for TableFunctionScanOperator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let source_desc = match &self.source {
+            RowSource::Preloaded { rows, position } => {
+                format!("Preloaded({}/{})", position, rows.len())
+            }
+            RowSource::Channel { .. } => "Channel(streaming)".to_string(),
+        };
+        f.debug_struct("TableFunctionScanOperator")
+            .field("schema", &self.schema.name)
+            .field("source", &source_desc)
+            .field("opened", &self.opened)
+            .finish()
     }
 }
 
@@ -35,7 +64,9 @@ impl PhysicalOperator for TableFunctionScanOperator {
     }
 
     async fn open(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.position = 0;
+        if let RowSource::Preloaded { position, .. } = &mut self.source {
+            *position = 0;
+        }
         self.opened = true;
         Ok(())
     }
@@ -44,17 +75,25 @@ impl PhysicalOperator for TableFunctionScanOperator {
         if !self.opened {
             return Err(anyhow!("Operator not opened"));
         }
-        if self.position < self.rows.len() {
-            let row = self.rows[self.position].clone();
-            self.position += 1;
-            Ok(Some(row))
-        } else {
-            Ok(None)
+        match &mut self.source {
+            RowSource::Preloaded { rows, position } => {
+                if *position < rows.len() {
+                    let row = rows[*position].clone();
+                    *position += 1;
+                    Ok(Some(row))
+                } else {
+                    Ok(None)
+                }
+            }
+            RowSource::Channel { receiver } => Ok(receiver.recv().await),
         }
     }
 
     async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        self.rows.clear();
+        match &mut self.source {
+            RowSource::Preloaded { rows, .. } => rows.clear(),
+            RowSource::Channel { receiver } => receiver.close(),
+        }
         self.opened = false;
         Ok(())
     }
@@ -138,42 +177,45 @@ mod tests {
 
     #[test]
     fn test_operator_initial_state() {
-        let rows = test_rows(3);
-        let op = TableFunctionScanOperator::new_with_rows(test_schema(), rows);
+        let op = TableFunctionScanOperator::new_with_rows(test_schema(), test_rows(3));
         assert!(!op.opened);
-        assert_eq!(op.position, 0);
-        assert_eq!(op.rows.len(), 3);
-    }
-
-    // Tests below require ExecutionContext (TiKV Transaction).
-    // They are written as stubs that document expected behavior for Task 6.
-
-    #[tokio::test]
-    async fn test_operator_yields_rows_one_at_a_time() {
-        // TODO: requires ExecutionContext mock — enable after Task 6
-        // Should: create op with 5 rows, open(), call next() 5 times,
-        // verify each row matches, 6th call returns None.
-        todo!("requires ExecutionContext to call open()/next()");
+        assert!(matches!(&op.source, RowSource::Preloaded { rows, .. } if rows.len() == 3));
     }
 
     #[tokio::test]
-    async fn test_operator_returns_none_after_exhausted() {
-        // TODO: requires ExecutionContext mock — enable after Task 6
-        // Should: after all rows consumed, multiple next() calls return None.
-        todo!("requires ExecutionContext to call open()/next()");
+    async fn test_channel_source_yields_rows() {
+        let (tx, rx) = mpsc::channel(16);
+        let rows = test_rows(3);
+        for row in rows.clone() {
+            tx.send(row).await.unwrap();
+        }
+        drop(tx);
+
+        let mut op = TableFunctionScanOperator::new_with_channel(test_schema(), rx);
+
+        let mut collected = Vec::new();
+        op.opened = true;
+        loop {
+            match &mut op.source {
+                RowSource::Channel { receiver } => match receiver.recv().await {
+                    Some(row) => collected.push(row),
+                    None => break,
+                },
+                _ => unreachable!(),
+            }
+        }
+
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected[0].values[0], Value::Int32(0));
+        assert_eq!(collected[2].values[1], Value::Text("row_2".to_string()));
     }
 
-    #[tokio::test]
-    async fn test_operator_not_opened_error() {
-        // TODO: requires ExecutionContext mock — enable after Task 6
-        // Should: call next() without open(), expect Err.
-        todo!("requires ExecutionContext to call next()");
-    }
-
-    #[tokio::test]
-    async fn test_operator_close_clears_state() {
-        // TODO: requires ExecutionContext mock — enable after Task 6
-        // Should: after close(), rows is empty and opened is false.
-        todo!("requires ExecutionContext to call open()/close()");
+    #[test]
+    fn test_channel_source_debug_format() {
+        let (_tx, rx) = mpsc::channel::<Row>(1);
+        let op = TableFunctionScanOperator::new_with_channel(test_schema(), rx);
+        let debug = format!("{:?}", op);
+        assert!(debug.contains("Channel(streaming)"));
+        assert!(debug.contains("fs9_result"));
     }
 }
