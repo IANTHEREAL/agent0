@@ -16,6 +16,8 @@ pub(crate) struct FsFileInfo {
     pub is_dir: bool,
     /// Whether this entry is a regular file.
     pub is_file: bool,
+    /// Whether this entry is a symbolic link.
+    pub is_symlink: bool,
     /// File size in bytes (0 for directories).
     pub size: u64,
     /// Unix permission mode (e.g., 0o644). 0 on non-Unix platforms.
@@ -69,7 +71,7 @@ fn metadata_mode(_metadata: &std::fs::Metadata, is_dir: bool) -> u32 {
     }
 }
 
-fn to_file_info(path: &str, metadata: std::fs::Metadata) -> Result<FsFileInfo> {
+fn to_file_info(path: &str, metadata: std::fs::Metadata, is_symlink: bool) -> Result<FsFileInfo> {
     let is_dir = metadata.is_dir();
     let is_file = metadata.is_file();
     let mtime = metadata
@@ -83,6 +85,7 @@ fn to_file_info(path: &str, metadata: std::fs::Metadata) -> Result<FsFileInfo> {
         path: path.to_string(),
         is_dir,
         is_file,
+        is_symlink,
         size: metadata.len(),
         mode: metadata_mode(&metadata, is_dir),
         mtime,
@@ -95,7 +98,7 @@ impl FsBackend for LocalFsBackend {
         let metadata = tokio::fs::metadata(path)
             .await
             .map_err(|err| map_stat_error(path, err))?;
-        to_file_info(path, metadata)
+        to_file_info(path, metadata, false)
     }
 
     async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>> {
@@ -118,7 +121,15 @@ impl FsBackend for LocalFsBackend {
         {
             let entry_path: PathBuf = entry.path();
             let entry_path = entry_path.to_string_lossy().to_string();
-            out.push(self.stat(&entry_path).await?);
+            let is_symlink = entry
+                .file_type()
+                .await
+                .map(|ft| ft.is_symlink())
+                .unwrap_or(false);
+            let metadata = tokio::fs::metadata(&entry_path)
+                .await
+                .map_err(|err| map_stat_error(&entry_path, err))?;
+            out.push(to_file_info(&entry_path, metadata, is_symlink)?);
         }
 
         out.sort_by(|a, b| a.path.cmp(&b.path));

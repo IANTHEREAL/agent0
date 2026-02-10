@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use tracing::warn;
 
 use super::backend::FsBackend;
 
@@ -64,7 +65,10 @@ async fn walk_dir(
 
         let entries = match backend.readdir(&current_dir).await {
             Ok(entries) => entries,
-            Err(_) => continue,
+            Err(e) => {
+                warn!("fs9: skipping directory '{}': {}", current_dir, e);
+                continue;
+            }
         };
 
         for entry in entries {

@@ -259,11 +259,7 @@ async fn list_directory_entries(
 
             if entry.is_dir && depth < MAX_RECURSIVE_DEPTH {
                 // Avoid following directory symlinks in recursive mode to prevent loops.
-                let is_symlink = tokio::fs::symlink_metadata(&entry.path)
-                    .await
-                    .map(|m| m.file_type().is_symlink())
-                    .unwrap_or(true);
-                if !is_symlink {
+                if !entry.is_symlink {
                     stack.push((entry.path.clone(), depth + 1));
                 }
             }
