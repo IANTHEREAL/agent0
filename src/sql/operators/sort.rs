@@ -2,10 +2,65 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use sqlparser::ast::OrderByExpr;
 
-use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
+use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::expr::{compare_order_by_values, eval_expr};
 use crate::sql::sequences;
 use crate::types::{Row, TableSchema, Value};
+
+fn estimated_value_size(value: &Value) -> usize {
+    match value {
+        Value::Null | Value::Boolean(_) => 0,
+        Value::Int32(_) => 4,
+        Value::Int64(_) => 8,
+        Value::Float64(_) => 8,
+        Value::Text(s) => s.len(),
+        Value::Bytes(b) => b.len(),
+        Value::Timestamp(_) => 8,
+        Value::Interval(_) => std::mem::size_of::<crate::types::IntervalValue>(),
+        Value::Uuid(_) => 16,
+        Value::Array(arr) => {
+            std::mem::size_of::<Vec<Value>>()
+                + arr.iter().map(estimated_value_size).sum::<usize>()
+                + arr.len() * std::mem::size_of::<Value>()
+        }
+        Value::Vector(vec) => {
+            std::mem::size_of::<Vec<f64>>() + vec.len() * std::mem::size_of::<f64>()
+        }
+        Value::Json(s) | Value::Jsonb(s) => s.len(),
+        Value::Time(_) => 8,
+        Value::Date(_) => 4,
+        Value::Numeric(_) => 16,
+        Value::Tsvector(s) | Value::Tsquery(s) => s.len(),
+    }
+}
+
+fn estimated_row_size(row: &Row) -> usize {
+    std::mem::size_of::<Row>()
+        + std::mem::size_of::<Vec<Value>>()
+        + row.values.len() * std::mem::size_of::<Value>()
+        + row.values.iter().map(estimated_value_size).sum::<usize>()
+}
+
+fn enforce_sort_memory_limit(
+    total_bytes: &mut usize,
+    row: &Row,
+    max_sort_bytes: usize,
+) -> Result<()> {
+    if max_sort_bytes == 0 {
+        return Ok(());
+    }
+
+    *total_bytes = total_bytes.saturating_add(estimated_row_size(row));
+    if *total_bytes > max_sort_bytes {
+        return Err(anyhow!(
+            "ORDER BY sort memory limit exceeded: estimated {} bytes exceeds pgtikv.max_sort_bytes={} bytes. Reduce result set with WHERE/LIMIT or increase pgtikv.max_sort_bytes",
+            *total_bytes,
+            max_sort_bytes
+        ));
+    }
+
+    Ok(())
+}
 
 #[derive(Debug)]
 pub struct SortOperator {
@@ -78,7 +133,13 @@ impl PhysicalOperator for SortOperator {
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
 
-        let rows = collect_all(self.child.as_mut(), ctx).await?;
+        let max_sort_bytes = crate::session_context::current_max_sort_bytes();
+        let mut total_bytes = 0usize;
+        let mut rows = Vec::new();
+        while let Some(row) = self.child.next(ctx).await? {
+            enforce_sort_memory_limit(&mut total_bytes, &row, max_sort_bytes)?;
+            rows.push(row);
+        }
         let mut keyed_rows: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
         for row in rows {
             let keys = self.compute_sort_keys(&row, ctx).await?;
@@ -367,5 +428,48 @@ mod tests {
             sort.compare_keys(&keys_a, &keys_c),
             std::cmp::Ordering::Less
         );
+    }
+
+    #[test]
+    fn test_estimated_row_size_includes_payload() {
+        let small = Row::new(vec![Value::Int32(1), Value::Text("a".to_string())]);
+        let big = Row::new(vec![
+            Value::Int32(1),
+            Value::Text("a".repeat(1024)),
+            Value::Json("{\"k\":\"v\"}".repeat(128)),
+        ]);
+
+        assert!(estimated_row_size(&big) > estimated_row_size(&small));
+    }
+
+    #[test]
+    fn test_sort_memory_limit_within_limit() {
+        let row = Row::new(vec![Value::Text("abc".to_string())]);
+        let mut total_bytes = 0usize;
+        let limit = estimated_row_size(&row) + 1;
+
+        enforce_sort_memory_limit(&mut total_bytes, &row, limit).unwrap();
+        assert!(total_bytes <= limit);
+    }
+
+    #[test]
+    fn test_sort_memory_limit_exceeded() {
+        let row = Row::new(vec![Value::Text("x".repeat(1024))]);
+        let mut total_bytes = 0usize;
+        let limit = estimated_row_size(&row) - 1;
+
+        let err = enforce_sort_memory_limit(&mut total_bytes, &row, limit).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("ORDER BY sort memory limit exceeded"));
+        assert!(msg.contains("pgtikv.max_sort_bytes"));
+    }
+
+    #[test]
+    fn test_sort_memory_limit_zero_is_unlimited() {
+        let row = Row::new(vec![Value::Text("x".repeat(2048))]);
+        let mut total_bytes = 0usize;
+
+        enforce_sort_memory_limit(&mut total_bytes, &row, 0).unwrap();
+        assert_eq!(total_bytes, 0);
     }
 }
