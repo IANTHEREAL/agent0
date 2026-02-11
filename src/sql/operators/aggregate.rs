@@ -6,6 +6,7 @@ use sqlparser::ast::{Expr, OrderByExpr};
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::expr::{compare_order_by_values, eval_expr};
+use crate::sql::expr::operators::sort_by_fallible;
 use crate::sql::value_key::{serialize_value_for_key, serialize_values_for_key};
 use crate::sql::Aggregator;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
@@ -223,7 +224,7 @@ impl PhysicalOperator for HashAggregateOperator {
                 for (i, agg) in aggregators.into_iter().enumerate() {
                     if let Some(mut buf) = ordered_agg_buffers.get_mut(i).and_then(Option::take) {
                         let order_by = &self.aggregate_exprs[i].order_by;
-                        buf.sort_by(|(keys_a, _), (keys_b, _)| {
+                        sort_by_fallible(&mut buf, |(keys_a, _), (keys_b, _)| {
                             for (key_idx, order_expr) in order_by.iter().enumerate() {
                                 let asc = order_expr.asc.unwrap_or(true);
                                 let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
@@ -232,13 +233,13 @@ impl PhysicalOperator for HashAggregateOperator {
                                     &keys_b[key_idx],
                                     asc,
                                     nulls_first,
-                                );
+                                )?;
                                 if ord != std::cmp::Ordering::Equal {
-                                    return ord;
+                                    return Ok(ord);
                                 }
                             }
-                            std::cmp::Ordering::Equal
-                        });
+                            Ok(std::cmp::Ordering::Equal)
+                        })?;
                         let sorted_values = buf.into_iter().map(|(_, v)| v).collect::<Vec<_>>();
                         values.push(if sorted_values.is_empty() {
                             Value::Null

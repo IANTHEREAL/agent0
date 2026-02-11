@@ -591,21 +591,21 @@ fn test_compare_order_by_values_nulls() {
 
     // ASC defaults to NULLS LAST.
     assert_eq!(
-        compare_order_by_values(&Value::Null, &Value::Date(0), true, false),
+        compare_order_by_values(&Value::Null, &Value::Date(0), true, false).unwrap(),
         Ordering::Greater
     );
     assert_eq!(
-        compare_order_by_values(&Value::Date(0), &Value::Null, true, false),
+        compare_order_by_values(&Value::Date(0), &Value::Null, true, false).unwrap(),
         Ordering::Less
     );
 
     // DESC defaults to NULLS FIRST.
     assert_eq!(
-        compare_order_by_values(&Value::Null, &Value::Date(0), false, true),
+        compare_order_by_values(&Value::Null, &Value::Date(0), false, true).unwrap(),
         Ordering::Less
     );
     assert_eq!(
-        compare_order_by_values(&Value::Date(0), &Value::Null, false, true),
+        compare_order_by_values(&Value::Date(0), &Value::Null, false, true).unwrap(),
         Ordering::Greater
     );
 }
@@ -615,11 +615,11 @@ fn test_compare_order_by_values_nan() {
     use std::cmp::Ordering;
 
     assert_eq!(
-        compare_order_by_values(&Value::Float64(f64::NAN), &Value::Float64(1.0), true, false),
+        compare_order_by_values(&Value::Float64(f64::NAN), &Value::Float64(1.0), true, false).unwrap(),
         Ordering::Greater
     );
     assert_eq!(
-        compare_order_by_values(&Value::Float64(1.0), &Value::Float64(f64::NAN), true, false),
+        compare_order_by_values(&Value::Float64(1.0), &Value::Float64(f64::NAN), true, false).unwrap(),
         Ordering::Less
     );
 
@@ -630,7 +630,8 @@ fn test_compare_order_by_values_nan() {
             &Value::Float64(1.0),
             false,
             false
-        ),
+        )
+        .unwrap(),
         Ordering::Less
     );
 }

@@ -221,7 +221,15 @@ impl Executor {
                 Value::Int64(n) => n as f64,
                 Value::Float64(f) => f,
                 Value::Numeric(d) => d.to_f64().unwrap_or(0.0),
-                Value::Text(s) => s.parse::<f64>().unwrap_or(0.0),
+                Value::Text(s) => s.parse::<f64>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "{}",
+                        crate::sql::error::SqlError::InvalidInputSyntax {
+                            type_name: "double precision".into(),
+                            value: s.clone(),
+                        }
+                    )
+                })?,
                 _ => 0.0,
             }
             .max(0.0);

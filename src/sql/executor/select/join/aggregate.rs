@@ -375,7 +375,7 @@ impl Executor {
 
         if !query.order_by.is_empty() {
             projected_rows =
-                self.apply_order_by_for_aggregate(projected_rows, &query.order_by, &columns);
+                self.apply_order_by_for_aggregate(projected_rows, &query.order_by, &columns)?;
         }
 
         let offset = extract_offset(query);

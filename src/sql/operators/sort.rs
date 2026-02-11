@@ -4,6 +4,7 @@ use sqlparser::ast::OrderByExpr;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::expr::{compare_order_by_values, eval_expr};
+use crate::sql::expr::operators::sort_by_fallible;
 use crate::sql::sequences;
 use crate::types::{Row, TableSchema, Value};
 
@@ -110,17 +111,17 @@ impl SortOperator {
         Ok(keys)
     }
 
-    fn compare_keys(&self, keys_a: &[Value], keys_b: &[Value]) -> std::cmp::Ordering {
+    fn compare_keys(&self, keys_a: &[Value], keys_b: &[Value]) -> Result<std::cmp::Ordering> {
         for (i, order_expr) in self.order_by.iter().enumerate() {
             let asc = order_expr.asc.unwrap_or(true);
             let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
 
-            let ordering = compare_order_by_values(&keys_a[i], &keys_b[i], asc, nulls_first);
+            let ordering = compare_order_by_values(&keys_a[i], &keys_b[i], asc, nulls_first)?;
             if ordering != std::cmp::Ordering::Equal {
-                return ordering;
+                return Ok(ordering);
             }
         }
-        std::cmp::Ordering::Equal
+        Ok(std::cmp::Ordering::Equal)
     }
 }
 
@@ -145,7 +146,9 @@ impl PhysicalOperator for SortOperator {
             let keys = self.compute_sort_keys(&row, ctx).await?;
             keyed_rows.push((keys, row));
         }
-        keyed_rows.sort_by(|(keys_a, _), (keys_b, _)| self.compare_keys(keys_a, keys_b));
+        sort_by_fallible(&mut keyed_rows, |(keys_a, _), (keys_b, _)| {
+            self.compare_keys(keys_a, keys_b)
+        })?;
         let rows = keyed_rows.into_iter().map(|(_, row)| row).collect();
 
         self.sorted_rows = rows;
@@ -308,12 +311,12 @@ mod tests {
         let keys1 = vec![Value::Int32(1)];
         let keys2 = vec![Value::Int32(2)];
 
-        assert_eq!(sort.compare_keys(&keys1, &keys2), std::cmp::Ordering::Less);
+        assert_eq!(sort.compare_keys(&keys1, &keys2).unwrap(), std::cmp::Ordering::Less);
         assert_eq!(
-            sort.compare_keys(&keys2, &keys1),
+            sort.compare_keys(&keys2, &keys1).unwrap(),
             std::cmp::Ordering::Greater
         );
-        assert_eq!(sort.compare_keys(&keys1, &keys1), std::cmp::Ordering::Equal);
+        assert_eq!(sort.compare_keys(&keys1, &keys1).unwrap(), std::cmp::Ordering::Equal);
     }
 
     #[test]
@@ -336,10 +339,10 @@ mod tests {
         let keys2 = vec![Value::Int32(2)];
 
         assert_eq!(
-            sort.compare_keys(&keys1, &keys2),
+            sort.compare_keys(&keys1, &keys2).unwrap(),
             std::cmp::Ordering::Greater
         );
-        assert_eq!(sort.compare_keys(&keys2, &keys1), std::cmp::Ordering::Less);
+        assert_eq!(sort.compare_keys(&keys2, &keys1).unwrap(), std::cmp::Ordering::Less);
     }
 
     #[test]
@@ -362,11 +365,11 @@ mod tests {
         let val_key = vec![Value::Int32(1)];
 
         assert_eq!(
-            sort.compare_keys(&null_key, &val_key),
+            sort.compare_keys(&null_key, &val_key).unwrap(),
             std::cmp::Ordering::Less
         );
         assert_eq!(
-            sort.compare_keys(&val_key, &null_key),
+            sort.compare_keys(&val_key, &null_key).unwrap(),
             std::cmp::Ordering::Greater
         );
 
@@ -380,11 +383,11 @@ mod tests {
         let sort = SortOperator::new(child, order_by);
 
         assert_eq!(
-            sort.compare_keys(&null_key, &val_key),
+            sort.compare_keys(&null_key, &val_key).unwrap(),
             std::cmp::Ordering::Greater
         );
         assert_eq!(
-            sort.compare_keys(&val_key, &null_key),
+            sort.compare_keys(&val_key, &null_key).unwrap(),
             std::cmp::Ordering::Less
         );
     }
@@ -418,14 +421,14 @@ mod tests {
 
         // Second column is DESC, so 2 comes before 1
         assert_eq!(
-            sort.compare_keys(&keys_a, &keys_b),
+            sort.compare_keys(&keys_a, &keys_b).unwrap(),
             std::cmp::Ordering::Greater
         );
 
         // Different first key — tiebreak not needed
         let keys_c = vec![Value::Text("Bob".to_string()), Value::Int32(1)];
         assert_eq!(
-            sort.compare_keys(&keys_a, &keys_c),
+            sort.compare_keys(&keys_a, &keys_c).unwrap(),
             std::cmp::Ordering::Less
         );
     }

@@ -9,6 +9,7 @@ use sqlparser::ast::{
 use tikv_client::Transaction;
 
 use super::super::expr::{coerce_text_literal_to_bool, compare_values, eval_expr};
+use super::super::expr::operators::sort_by_fallible;
 use super::super::operators::{
     execute_operator_tree, execute_operator_tree_with_ctes, AggregateExpr, BoxedOperator,
     DistinctOnOperator, DistinctOperator, FilterOperator, HashAggregateOperator, HashJoinConfig,
@@ -1864,7 +1865,7 @@ impl Executor {
         }
 
         if !order_by.is_empty() {
-            projected_rows = self.apply_order_by_for_aggregate(projected_rows, order_by, &columns);
+            projected_rows = self.apply_order_by_for_aggregate(projected_rows, order_by, &columns)?;
         }
 
         if offset > 0 {
@@ -2288,7 +2289,7 @@ impl Executor {
         // ORDER BY, OFFSET, LIMIT
         if !order_by.is_empty() {
             all_result_rows =
-                self.apply_order_by_for_aggregate(all_result_rows, order_by, &columns);
+                self.apply_order_by_for_aggregate(all_result_rows, order_by, &columns)?;
         }
         if offset > 0 {
             all_result_rows = all_result_rows.into_iter().skip(offset).collect();
@@ -3206,12 +3207,12 @@ impl Executor {
         // Sort using precomputed keys from pre-projection rows.
         let rows = if let (Some(keys), Some(ref ppo)) = (sort_keys, &pre_proj_order) {
             let mut keyed: Vec<(Vec<Value>, Row)> = keys.into_iter().zip(rows).collect();
-            keyed.sort_by(|(ka, _), (kb, _)| {
+            sort_by_fallible(&mut keyed, |(ka, _), (kb, _)| {
                 for (idx, o) in ppo.iter().enumerate() {
                     let asc = o.asc.unwrap_or(true);
                     let va = &ka[idx];
                     let vb = &kb[idx];
-                    let cmp_val = compare_values(va, vb).unwrap_or(0);
+                    let cmp_val = compare_values(va, vb)?;
                     let ord = match cmp_val {
                         x if x < 0 => std::cmp::Ordering::Less,
                         x if x > 0 => std::cmp::Ordering::Greater,
@@ -3219,11 +3220,11 @@ impl Executor {
                     };
                     let ord = if asc { ord } else { ord.reverse() };
                     if ord != std::cmp::Ordering::Equal {
-                        return ord;
+                        return Ok(ord);
                     }
                 }
-                std::cmp::Ordering::Equal
-            });
+                Ok(std::cmp::Ordering::Equal)
+            })?;
             let mut sorted: Vec<Row> = keyed.into_iter().map(|(_, row)| row).collect();
             if offset > 0 {
                 sorted = sorted.into_iter().skip(offset).collect();

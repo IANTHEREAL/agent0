@@ -140,7 +140,7 @@ impl Executor {
             {
                 let mut rows = rows;
                 if !query.order_by.is_empty() {
-                    rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns);
+                    rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns)?;
                 }
                 rows = apply_offset_limit_fetch(rows, query);
                 return Ok(ExecuteResult::Select {
@@ -204,7 +204,7 @@ impl Executor {
             let mut rows = rows;
 
             if !query.order_by.is_empty() {
-                rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns);
+                rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns)?;
             }
             rows = apply_offset_limit_fetch(rows, query);
 

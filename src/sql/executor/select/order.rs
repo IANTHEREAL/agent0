@@ -131,9 +131,9 @@ impl Executor {
         rows: Vec<Row>,
         order_by: &[sqlparser::ast::OrderByExpr],
         col_names: &[String],
-    ) -> Vec<Row> {
+    ) -> anyhow::Result<Vec<Row>> {
         let mut indexed: Vec<(usize, Row)> = rows.into_iter().enumerate().collect();
-        indexed.sort_by(|(idx_a, a), (idx_b, b)| {
+        crate::sql::expr::operators::sort_by_fallible(&mut indexed, |(idx_a, a), (idx_b, b)| {
             for order_expr in order_by {
                 let col_idx = match &order_expr.expr {
                     Expr::Identifier(ident) => col_names
@@ -165,25 +165,25 @@ impl Executor {
                 match (&val_a, &val_b) {
                     (Value::Null, Value::Null) => continue,
                     (Value::Null, _) => {
-                        return if nulls_first {
+                        return Ok(if nulls_first {
                             std::cmp::Ordering::Less
                         } else {
                             std::cmp::Ordering::Greater
-                        }
+                        })
                     }
                     (_, Value::Null) => {
-                        return if nulls_first {
+                        return Ok(if nulls_first {
                             std::cmp::Ordering::Greater
                         } else {
                             std::cmp::Ordering::Less
-                        }
+                        })
                     }
                     _ => {}
                 }
 
-                let cmp = crate::sql::expr::compare_values(&val_a, &val_b).unwrap_or(0);
+                let cmp = crate::sql::expr::compare_values(&val_a, &val_b)?;
                 if cmp != 0 {
-                    return if asc {
+                    return Ok(if asc {
                         if cmp > 0 {
                             std::cmp::Ordering::Greater
                         } else {
@@ -193,7 +193,7 @@ impl Executor {
                         std::cmp::Ordering::Less
                     } else {
                         std::cmp::Ordering::Greater
-                    };
+                    });
                 }
             }
 
@@ -203,18 +203,18 @@ impl Executor {
             for i in 0..max_cols {
                 let va = a.values.get(i).unwrap_or(&Value::Null);
                 let vb = b.values.get(i).unwrap_or(&Value::Null);
-                let cmp = crate::sql::expr::compare_values(va, vb).unwrap_or(0);
+                let cmp = crate::sql::expr::compare_values(va, vb)?;
                 if cmp != 0 {
-                    return if cmp > 0 {
+                    return Ok(if cmp > 0 {
                         std::cmp::Ordering::Greater
                     } else {
                         std::cmp::Ordering::Less
-                    };
+                    });
                 }
             }
 
-            idx_a.cmp(idx_b)
-        });
-        indexed.into_iter().map(|(_, r)| r).collect()
+            Ok(idx_a.cmp(idx_b))
+        })?;
+        Ok(indexed.into_iter().map(|(_, r)| r).collect())
     }
 }
