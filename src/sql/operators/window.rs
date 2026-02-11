@@ -194,21 +194,16 @@ impl WindowOperator {
                 }
 
                 // Compute peer groups for RANGE/GROUPS frame mode support
-                let peer_groups =
-                    Self::compute_peer_groups(rows, schema, wf, &row_indices)?;
+                let peer_groups = Self::compute_peer_groups(rows, schema, wf, &row_indices)?;
 
                 // Compute function for this partition
                 match wf.func_name.as_str() {
                     "row_number" => self.compute_row_number(&row_indices, wf_idx, &mut results),
-                    "rank" => {
-                        self.compute_rank(&peer_groups, &row_indices, wf_idx, &mut results)
-                    }
+                    "rank" => self.compute_rank(&peer_groups, &row_indices, wf_idx, &mut results),
                     "dense_rank" => {
                         self.compute_dense_rank(&peer_groups, &row_indices, wf_idx, &mut results)
                     }
-                    "ntile" => {
-                        self.compute_ntile(wf, &row_indices, wf_idx, &mut results)?
-                    }
+                    "ntile" => self.compute_ntile(wf, &row_indices, wf_idx, &mut results)?,
                     "percent_rank" => {
                         self.compute_percent_rank(&peer_groups, &row_indices, wf_idx, &mut results)
                     }
@@ -216,19 +211,49 @@ impl WindowOperator {
                         self.compute_cume_dist(&peer_groups, &row_indices, wf_idx, &mut results)
                     }
                     "sum" => self.compute_sum(
-                        rows, schema, wf, &row_indices, wf_idx, &mut results, &peer_groups,
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        &peer_groups,
                     )?,
                     "count" => self.compute_count(
-                        rows, schema, wf, &row_indices, wf_idx, &mut results, &peer_groups,
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        &peer_groups,
                     )?,
                     "avg" => self.compute_avg(
-                        rows, schema, wf, &row_indices, wf_idx, &mut results, &peer_groups,
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        &peer_groups,
                     )?,
                     "min" => self.compute_min(
-                        rows, schema, wf, &row_indices, wf_idx, &mut results, &peer_groups,
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        &peer_groups,
                     )?,
                     "max" => self.compute_max(
-                        rows, schema, wf, &row_indices, wf_idx, &mut results, &peer_groups,
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        &peer_groups,
                     )?,
                     "lag" => {
                         self.compute_lag(rows, schema, wf, &row_indices, wf_idx, &mut results)?
@@ -237,13 +262,31 @@ impl WindowOperator {
                         self.compute_lead(rows, schema, wf, &row_indices, wf_idx, &mut results)?
                     }
                     "first_value" => self.compute_first_value(
-                        rows, schema, wf, &row_indices, wf_idx, &mut results, &peer_groups,
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        &peer_groups,
                     )?,
                     "last_value" => self.compute_last_value(
-                        rows, schema, wf, &row_indices, wf_idx, &mut results, &peer_groups,
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        &peer_groups,
                     )?,
                     "nth_value" => self.compute_nth_value(
-                        rows, schema, wf, &row_indices, wf_idx, &mut results, &peer_groups,
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        &peer_groups,
                     )?,
                     _ => {
                         return Err(SqlError::Unsupported(format!(
@@ -579,11 +622,7 @@ impl WindowOperator {
     }
 
     /// Check if a row passes the FILTER (WHERE ...) clause for a window aggregate.
-    fn passes_filter(
-        filter_expr: &Option<Expr>,
-        row: &Row,
-        schema: &TableSchema,
-    ) -> Result<bool> {
+    fn passes_filter(filter_expr: &Option<Expr>, row: &Row, schema: &TableSchema) -> Result<bool> {
         match filter_expr {
             None => Ok(true),
             Some(expr) => {

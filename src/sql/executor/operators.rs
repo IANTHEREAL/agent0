@@ -3369,12 +3369,11 @@ impl Executor {
                     .args
                     .iter()
                     .map(|a| match a {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => FunctionArg::Unnamed(
-                            FunctionArgExpr::Expr(Self::resolve_named_windows_in_expr(
-                                e,
-                                named_window,
-                            )),
-                        ),
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                Self::resolve_named_windows_in_expr(e, named_window),
+                            ))
+                        }
                         other => other.clone(),
                     })
                     .collect();
@@ -3420,24 +3419,30 @@ impl Executor {
                 data_type: data_type.clone(),
                 format: format.clone(),
             },
-            Expr::IsNull(e) => {
-                Expr::IsNull(Box::new(Self::resolve_named_windows_in_expr(e, named_window)))
-            }
-            Expr::IsNotNull(e) => {
-                Expr::IsNotNull(Box::new(Self::resolve_named_windows_in_expr(e, named_window)))
-            }
-            Expr::IsTrue(e) => {
-                Expr::IsTrue(Box::new(Self::resolve_named_windows_in_expr(e, named_window)))
-            }
-            Expr::IsFalse(e) => {
-                Expr::IsFalse(Box::new(Self::resolve_named_windows_in_expr(e, named_window)))
-            }
-            Expr::IsNotTrue(e) => {
-                Expr::IsNotTrue(Box::new(Self::resolve_named_windows_in_expr(e, named_window)))
-            }
-            Expr::IsNotFalse(e) => {
-                Expr::IsNotFalse(Box::new(Self::resolve_named_windows_in_expr(e, named_window)))
-            }
+            Expr::IsNull(e) => Expr::IsNull(Box::new(Self::resolve_named_windows_in_expr(
+                e,
+                named_window,
+            ))),
+            Expr::IsNotNull(e) => Expr::IsNotNull(Box::new(Self::resolve_named_windows_in_expr(
+                e,
+                named_window,
+            ))),
+            Expr::IsTrue(e) => Expr::IsTrue(Box::new(Self::resolve_named_windows_in_expr(
+                e,
+                named_window,
+            ))),
+            Expr::IsFalse(e) => Expr::IsFalse(Box::new(Self::resolve_named_windows_in_expr(
+                e,
+                named_window,
+            ))),
+            Expr::IsNotTrue(e) => Expr::IsNotTrue(Box::new(Self::resolve_named_windows_in_expr(
+                e,
+                named_window,
+            ))),
+            Expr::IsNotFalse(e) => Expr::IsNotFalse(Box::new(Self::resolve_named_windows_in_expr(
+                e,
+                named_window,
+            ))),
             Expr::Case {
                 operand,
                 conditions,
@@ -3536,8 +3541,7 @@ impl Executor {
                             let output_type =
                                 Executor::infer_window_func_type(&func_name, &arg_expr, schema);
 
-                            let filter_expr =
-                                f.filter.as_ref().map(|flt| *flt.clone());
+                            let filter_expr = f.filter.as_ref().map(|flt| *flt.clone());
 
                             sig_to_col.insert(sig, output_name.clone());
                             out.push(WindowFunctionExpr {
