@@ -39,8 +39,8 @@ impl SetOperationOperator {
         }
     }
 
-    fn row_to_key(row: &Row) -> Vec<u8> {
-        serialize_values_for_key(&row.values).unwrap_or_default()
+    fn row_to_key(row: &Row) -> Result<Vec<u8>> {
+        serialize_values_for_key(&row.values)
     }
 }
 
@@ -67,7 +67,7 @@ impl PhysicalOperator for SetOperationOperator {
             SetOperationType::Union => {
                 let mut seen: HashSet<Vec<u8>> = HashSet::new();
                 for row in left_rows.into_iter().chain(right_rows.into_iter()) {
-                    let key = Self::row_to_key(&row);
+                    let key = Self::row_to_key(&row)?;
                     if seen.insert(key) {
                         self.result_rows.push(row);
                     }
@@ -75,10 +75,10 @@ impl PhysicalOperator for SetOperationOperator {
             }
             SetOperationType::Intersect => {
                 let right_keys: HashSet<Vec<u8>> =
-                    right_rows.iter().map(Self::row_to_key).collect();
+                    right_rows.iter().map(Self::row_to_key).collect::<Result<_>>()?;
                 let mut seen: HashSet<Vec<u8>> = HashSet::new();
                 for row in left_rows {
-                    let key = Self::row_to_key(&row);
+                    let key = Self::row_to_key(&row)?;
                     if right_keys.contains(&key) && seen.insert(key) {
                         self.result_rows.push(row);
                     }
@@ -88,11 +88,11 @@ impl PhysicalOperator for SetOperationOperator {
                 let mut right_counts: std::collections::HashMap<Vec<u8>, usize> =
                     std::collections::HashMap::new();
                 for row in &right_rows {
-                    let key = Self::row_to_key(row);
+                    let key = Self::row_to_key(row)?;
                     *right_counts.entry(key).or_insert(0) += 1;
                 }
                 for row in left_rows {
-                    let key = Self::row_to_key(&row);
+                    let key = Self::row_to_key(&row)?;
                     if let Some(count) = right_counts.get_mut(&key) {
                         if *count > 0 {
                             *count -= 1;
@@ -103,10 +103,10 @@ impl PhysicalOperator for SetOperationOperator {
             }
             SetOperationType::Except => {
                 let right_keys: HashSet<Vec<u8>> =
-                    right_rows.iter().map(Self::row_to_key).collect();
+                    right_rows.iter().map(Self::row_to_key).collect::<Result<_>>()?;
                 let mut seen: HashSet<Vec<u8>> = HashSet::new();
                 for row in left_rows {
-                    let key = Self::row_to_key(&row);
+                    let key = Self::row_to_key(&row)?;
                     if !right_keys.contains(&key) && seen.insert(key) {
                         self.result_rows.push(row);
                     }
@@ -116,11 +116,11 @@ impl PhysicalOperator for SetOperationOperator {
                 let mut right_counts: std::collections::HashMap<Vec<u8>, usize> =
                     std::collections::HashMap::new();
                 for row in &right_rows {
-                    let key = Self::row_to_key(row);
+                    let key = Self::row_to_key(row)?;
                     *right_counts.entry(key).or_insert(0) += 1;
                 }
                 for row in left_rows {
-                    let key = Self::row_to_key(&row);
+                    let key = Self::row_to_key(&row)?;
                     if let Some(count) = right_counts.get_mut(&key) {
                         if *count > 0 {
                             *count -= 1;
@@ -251,8 +251,8 @@ mod tests {
         let row_neg = Row::new(vec![Value::Float64(-0.0)]);
         let row_pos = Row::new(vec![Value::Float64(0.0)]);
         assert_eq!(
-            SetOperationOperator::row_to_key(&row_neg),
-            SetOperationOperator::row_to_key(&row_pos)
+            SetOperationOperator::row_to_key(&row_neg).unwrap(),
+            SetOperationOperator::row_to_key(&row_pos).unwrap()
         );
     }
 
@@ -265,8 +265,8 @@ mod tests {
         let row1 = Row::new(vec![Value::Float64(nan1)]);
         let row2 = Row::new(vec![Value::Float64(nan2)]);
         assert_eq!(
-            SetOperationOperator::row_to_key(&row1),
-            SetOperationOperator::row_to_key(&row2)
+            SetOperationOperator::row_to_key(&row1).unwrap(),
+            SetOperationOperator::row_to_key(&row2).unwrap()
         );
     }
 
@@ -281,8 +281,8 @@ mod tests {
         let row1 = Row::new(vec![Value::Numeric(d1)]);
         let row2 = Row::new(vec![Value::Numeric(d2)]);
         assert_eq!(
-            SetOperationOperator::row_to_key(&row1),
-            SetOperationOperator::row_to_key(&row2)
+            SetOperationOperator::row_to_key(&row1).unwrap(),
+            SetOperationOperator::row_to_key(&row2).unwrap()
         );
     }
 
@@ -293,12 +293,12 @@ mod tests {
         let row_a2 = Row::new(vec![Value::Int32(1), Value::Text("a".to_string())]);
 
         assert_ne!(
-            SetOperationOperator::row_to_key(&row_a),
-            SetOperationOperator::row_to_key(&row_b)
+            SetOperationOperator::row_to_key(&row_a).unwrap(),
+            SetOperationOperator::row_to_key(&row_b).unwrap()
         );
         assert_eq!(
-            SetOperationOperator::row_to_key(&row_a),
-            SetOperationOperator::row_to_key(&row_a2)
+            SetOperationOperator::row_to_key(&row_a).unwrap(),
+            SetOperationOperator::row_to_key(&row_a2).unwrap()
         );
     }
 
@@ -308,14 +308,14 @@ mod tests {
         let row_int = Row::new(vec![Value::Int32(0)]);
 
         assert_ne!(
-            SetOperationOperator::row_to_key(&row_null),
-            SetOperationOperator::row_to_key(&row_int)
+            SetOperationOperator::row_to_key(&row_null).unwrap(),
+            SetOperationOperator::row_to_key(&row_int).unwrap()
         );
 
         let row_null2 = Row::new(vec![Value::Null]);
         assert_eq!(
-            SetOperationOperator::row_to_key(&row_null),
-            SetOperationOperator::row_to_key(&row_null2)
+            SetOperationOperator::row_to_key(&row_null).unwrap(),
+            SetOperationOperator::row_to_key(&row_null2).unwrap()
         );
     }
 
