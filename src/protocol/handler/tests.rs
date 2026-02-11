@@ -1060,61 +1060,71 @@ fn test_parse_copy_command_copy_to() {
 #[test]
 fn test_parse_copy_to_command_basic() {
     let result = DynamicPgHandler::parse_copy_to_command("COPY users TO STDOUT").unwrap();
-    assert_eq!(result, Some(("users".to_string(), vec![])));
+    let (table, cols, _opts) = result.unwrap();
+    assert_eq!(table, "users");
+    assert!(cols.is_empty());
 }
 
 #[test]
 fn test_parse_copy_to_command_with_columns() {
     let result =
         DynamicPgHandler::parse_copy_to_command("COPY users (id, name) TO STDOUT").unwrap();
-    assert_eq!(
-        result,
-        Some((
-            "users".to_string(),
-            vec!["id".to_string(), "name".to_string()]
-        ))
-    );
+    let (table, cols, _opts) = result.unwrap();
+    assert_eq!(table, "users");
+    assert_eq!(cols, vec!["id".to_string(), "name".to_string()]);
 }
 
 #[test]
 fn test_parse_copy_to_command_with_schema() {
     let result = DynamicPgHandler::parse_copy_to_command("COPY myschema.users TO STDOUT").unwrap();
-    assert_eq!(result, Some(("myschema.users".to_string(), vec![])));
+    let (table, cols, _opts) = result.unwrap();
+    assert_eq!(table, "myschema.users");
+    assert!(cols.is_empty());
 }
 
 #[test]
 fn test_parse_copy_to_command_not_stdout() {
-    assert_eq!(
-        DynamicPgHandler::parse_copy_to_command("COPY users TO '/tmp/file'").unwrap(),
-        None,
+    assert!(
+        DynamicPgHandler::parse_copy_to_command("COPY users TO '/tmp/file'")
+            .unwrap()
+            .is_none()
     );
 }
 
 #[test]
 fn test_parse_copy_to_command_from_stdin() {
-    assert_eq!(
-        DynamicPgHandler::parse_copy_to_command("COPY users FROM stdin").unwrap(),
-        None,
+    assert!(
+        DynamicPgHandler::parse_copy_to_command("COPY users FROM stdin")
+            .unwrap()
+            .is_none()
     );
 }
 
 #[test]
 fn test_parse_copy_to_command_leading_comments() {
-    assert_eq!(
-        DynamicPgHandler::parse_copy_to_command("-- comment\nCOPY users TO STDOUT").unwrap(),
-        Some(("users".to_string(), vec![]))
-    );
-    assert_eq!(
-        DynamicPgHandler::parse_copy_to_command("/* comment */ COPY users TO STDOUT").unwrap(),
-        Some(("users".to_string(), vec![]))
-    );
+    let result1 =
+        DynamicPgHandler::parse_copy_to_command("-- comment\nCOPY users TO STDOUT").unwrap();
+    let (t1, c1, _) = result1.unwrap();
+    assert_eq!(t1, "users");
+    assert!(c1.is_empty());
+
+    let result2 =
+        DynamicPgHandler::parse_copy_to_command("/* comment */ COPY users TO STDOUT").unwrap();
+    let (t2, c2, _) = result2.unwrap();
+    assert_eq!(t2, "users");
+    assert!(c2.is_empty());
 }
 
 #[test]
-fn test_parse_copy_to_command_rejects_options() {
-    let err = DynamicPgHandler::parse_copy_to_command("COPY users TO STDOUT WITH (FORMAT csv)")
-        .unwrap_err();
-    assert_eq!(err.code, "0A000");
+fn test_parse_copy_to_command_with_csv_format() {
+    use crate::protocol::copy_format::CopyFormat;
+    let result =
+        DynamicPgHandler::parse_copy_to_command("COPY users TO STDOUT WITH (FORMAT csv)").unwrap();
+    let (table, cols, opts) = result.unwrap();
+    assert_eq!(table, "users");
+    assert!(cols.is_empty());
+    assert_eq!(opts.format, CopyFormat::Csv);
+    assert_eq!(opts.delimiter, b',');
 }
 
 #[test]

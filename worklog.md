@@ -53,3 +53,55 @@ Verified every `#[allow(dead_code)]` item against actual call sites. Major corre
 
 ### Deliverable
 - `dead_code_report.md` — verified categorized report with corrected dispositions
+
+---
+
+# Issue #633: COPY TO STDOUT FORMAT binary silently treated as text; option chars lossy-cast
+
+## 2026-02-11
+
+### Root Cause Analysis
+
+**Problem 1: Unsupported FORMAT silently ignored**
+- Location: `src/protocol/copy_format.rs:48-61` (`CopyOptions::from_copy_options`)
+- The FORMAT option only checks for `"CSV"` and sets `CopyFormat::Csv`. All other values — including `"BINARY"`, `"FOO"` — fall through silently and keep the default `CopyFormat::Text`.
+- PostgreSQL behavior: `COPY ... WITH (FORMAT binary)` uses a completely different binary wire protocol. Silently downgrading to text breaks clients expecting binary frames.
+
+**Problem 2: Delimiter/quote/escape chars lossy-cast via `as u8`**
+- Location: `src/protocol/copy_format.rs:62-75`
+- `char as u8` truncates to the low byte of the Unicode scalar value (e.g., `'€'` U+20AC → `0xAC`).
+- PostgreSQL requires these to be single-byte characters and rejects multi-byte.
+
+### Fix Plan
+1. Change `from_copy_options` return type to `Result<Self, String>` for validation errors.
+2. Validate FORMAT: accept TEXT/CSV, reject BINARY (not supported), reject unknown.
+3. Validate delimiter/quote/escape: require `is_ascii()`, reject non-ASCII.
+4. Update caller at `dynamic.rs:619` to propagate error via ErrorInfo.
+5. Add tests for new validation paths.
+
+### Error Codes (PostgreSQL-compatible)
+- `0A000` (feature_not_supported) for all COPY option errors (matches PostgreSQL)
+
+---
+
+# Issues #630, #631, #632: COPY format encoding fixes
+
+## 2026-02-11
+
+### #630 (P0): CSV NULL vs empty string conflation
+- **Root cause**: `encode_csv_value` only quoted values containing delimiter/quote/newline/CR. Empty string and custom NULL sentinel were never force-quoted.
+- **Fix**: Added `tmp == opts.null_string.as_bytes()` to `needs_quote` condition in `encode_csv_value`.
+- **Also fixed**: `encode_value_raw` for `Value::Bytes` — was falling through to `encode_value` which emits `\\x` (text-mode double escaping). Now emits `\x` directly.
+
+### #631 (P1): Text mode custom delimiter/NULL not round-trippable
+- **Root cause 1**: `escape_text` was hardcoded to escape only TAB/newline/CR/backslash. Custom delimiters (e.g. `|`) in values were not escaped.
+- **Root cause 2**: Non-NULL values matching null_string were output identically to NULL.
+- **Fix 1**: Added `delimiter` parameter to `escape_text` and `encode_value`. Custom delimiter byte is now escaped with backslash prefix.
+- **Fix 2**: Post-encoding check in text mode: if encoded bytes match null_string, insert backslash before first byte. On import, `\X` unescapes to `X`, recovering the original value.
+
+### #632 (P1): HEADER row bypasses format encoding
+- **Root cause**: `handle_copy_to_stdout` emitted header by raw-concatenating column names with delimiter. Column names with delimiter/quote/newline produced invalid output.
+- **Fix**: Wrap column names as `Value::Text` and route through `encode_row_with_options`.
+
+### Verification
+- 1064 tests pass (27 copy_format tests including 16 new). Zero regressions.

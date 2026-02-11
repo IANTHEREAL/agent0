@@ -1,4 +1,4 @@
-mod copy_format;
+pub(crate) mod copy_format;
 mod handler;
 
 pub use handler::*;
