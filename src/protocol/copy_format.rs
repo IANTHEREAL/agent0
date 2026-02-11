@@ -166,9 +166,10 @@ fn encode_csv_value(value: &Value, buf: &mut Vec<u8>, opts: &CopyOptions) {
     // Render value to a temporary buffer, then quote if needed.
     let mut tmp = Vec::new();
     encode_value_raw(value, &mut tmp);
-    let needs_quote = tmp
-        .iter()
-        .any(|&c| c == opts.delimiter || c == opts.quote || c == NEWLINE || c == b'\r');
+    let needs_quote = tmp == opts.null_string.as_bytes()
+        || tmp
+            .iter()
+            .any(|&c| c == opts.delimiter || c == opts.quote || c == NEWLINE || c == b'\r');
     if needs_quote {
         buf.push(opts.quote);
         for &c in &tmp {
@@ -196,6 +197,13 @@ fn encode_value_raw(value: &Value, buf: &mut Vec<u8>) {
         Value::Text(s) => buf.extend_from_slice(s.as_bytes()),
         Value::Json(s) | Value::Jsonb(s) => buf.extend_from_slice(s.as_bytes()),
         Value::Tsvector(s) | Value::Tsquery(s) => buf.extend_from_slice(s.as_bytes()),
+        Value::Bytes(b) => {
+            // CSV uses single-backslash hex (no text-mode double escaping).
+            buf.extend_from_slice(b"\\x");
+            for byte in b {
+                write_hex_byte(*byte, buf);
+            }
+        }
         _ => {
             // For all other types, use the standard encoder which adds text escaping.
             // CSV doesn't need backslash escaping, but the numeric/date/etc types don't
@@ -591,5 +599,65 @@ mod tests {
         let opts = CopyOptions::from_copy_options(&[CopyOption::Escape('\\')]);
         assert!(opts.is_ok());
         assert_eq!(opts.unwrap().escape, b'\\');
+    }
+
+    // --- #630: CSV NULL vs empty string disambiguation ---
+
+    #[test]
+    fn test_csv_null_vs_empty_string() {
+        // With default CSV NULL '' : NULL → unquoted empty, '' → quoted empty
+        let opts = CopyOptions {
+            format: CopyFormat::Csv,
+            delimiter: b',',
+            null_string: String::new(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+        };
+        let mut buf = Vec::new();
+        encode_row_with_options(
+            &[Value::Null, Value::Text(String::new())],
+            &mut buf,
+            &opts,
+        );
+        // NULL=unquoted empty, empty string=quoted ""
+        assert_eq!(buf, b",\"\"\n");
+    }
+
+    #[test]
+    fn test_csv_value_equals_null_string_is_quoted() {
+        // With NULL 'NULL': literal "NULL" must be quoted to distinguish from NULL
+        let opts = CopyOptions {
+            format: CopyFormat::Csv,
+            delimiter: b',',
+            null_string: "NULL".to_string(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+        };
+        let mut buf = Vec::new();
+        encode_row_with_options(
+            &[Value::Null, Value::Text("NULL".to_string())],
+            &mut buf,
+            &opts,
+        );
+        // NULL=unquoted NULL, literal "NULL"=quoted "NULL"
+        assert_eq!(buf, b"NULL,\"NULL\"\n");
+    }
+
+    #[test]
+    fn test_csv_bytes_no_double_backslash() {
+        // CSV mode should emit \x... not \\x...
+        let opts = CopyOptions {
+            format: CopyFormat::Csv,
+            delimiter: b',',
+            null_string: String::new(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+        };
+        let mut buf = Vec::new();
+        encode_row_with_options(&[Value::Bytes(vec![0xde, 0xad])], &mut buf, &opts);
+        assert_eq!(buf, b"\\xdead\n");
     }
 }
