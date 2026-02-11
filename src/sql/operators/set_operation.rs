@@ -74,8 +74,10 @@ impl PhysicalOperator for SetOperationOperator {
                 }
             }
             SetOperationType::Intersect => {
-                let right_keys: HashSet<Vec<u8>> =
-                    right_rows.iter().map(Self::row_to_key).collect::<Result<_>>()?;
+                let right_keys: HashSet<Vec<u8>> = right_rows
+                    .iter()
+                    .map(Self::row_to_key)
+                    .collect::<Result<_>>()?;
                 let mut seen: HashSet<Vec<u8>> = HashSet::new();
                 for row in left_rows {
                     let key = Self::row_to_key(&row)?;
@@ -102,8 +104,10 @@ impl PhysicalOperator for SetOperationOperator {
                 }
             }
             SetOperationType::Except => {
-                let right_keys: HashSet<Vec<u8>> =
-                    right_rows.iter().map(Self::row_to_key).collect::<Result<_>>()?;
+                let right_keys: HashSet<Vec<u8>> = right_rows
+                    .iter()
+                    .map(Self::row_to_key)
+                    .collect::<Result<_>>()?;
                 let mut seen: HashSet<Vec<u8>> = HashSet::new();
                 for row in left_rows {
                     let key = Self::row_to_key(&row)?;
