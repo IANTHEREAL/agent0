@@ -123,7 +123,7 @@ pub fn encode_row(values: &[Value], buf: &mut Vec<u8>) {
         if i > 0 {
             buf.push(TAB);
         }
-        encode_value(value, buf);
+        encode_value(value, buf, TAB);
     }
     buf.push(NEWLINE);
 }
@@ -140,7 +140,13 @@ pub fn encode_row_with_options(values: &[Value], buf: &mut Vec<u8>, opts: &CopyO
                 if matches!(value, Value::Null) {
                     buf.extend_from_slice(opts.null_string.as_bytes());
                 } else {
-                    encode_value(value, buf);
+                    let start = buf.len();
+                    encode_value(value, buf, opts.delimiter);
+                    // If the encoded value exactly matches the NULL sentinel,
+                    // escape the first byte so it won't be read as NULL on import.
+                    if buf[start..] == *opts.null_string.as_bytes() {
+                        buf.insert(start, BACKSLASH);
+                    }
                 }
             }
             buf.push(NEWLINE);
@@ -205,16 +211,16 @@ fn encode_value_raw(value: &Value, buf: &mut Vec<u8>) {
             }
         }
         _ => {
-            // For all other types, use the standard encoder which adds text escaping.
-            // CSV doesn't need backslash escaping, but the numeric/date/etc types don't
-            // produce backslashes anyway. Only text types need special handling (above).
-            encode_value(value, buf);
+            // For all other types, use the standard encoder. Numeric/date/etc types
+            // don't produce backslashes or special chars, so text escaping is harmless.
+            // TAB delimiter is passed because CSV doesn't use this escaping anyway.
+            encode_value(value, buf, TAB);
         }
     }
 }
 
 #[inline]
-fn encode_value(value: &Value, buf: &mut Vec<u8>) {
+fn encode_value(value: &Value, buf: &mut Vec<u8>, delimiter: u8) {
     match value {
         Value::Null => {
             buf.extend_from_slice(b"\\N");
@@ -245,7 +251,7 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
             }
         }
         Value::Text(s) => {
-            escape_text(s.as_bytes(), buf);
+            escape_text(s.as_bytes(), buf, delimiter);
         }
         Value::Bytes(b) => {
             buf.extend_from_slice(b"\\\\x");
@@ -316,13 +322,13 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>) {
             buf.push(b']');
         }
         Value::Json(s) | Value::Jsonb(s) => {
-            escape_text(s.as_bytes(), buf);
+            escape_text(s.as_bytes(), buf, delimiter);
         }
         Value::Numeric(d) => {
             buf.extend_from_slice(d.to_string().as_bytes());
         }
         Value::Tsvector(s) | Value::Tsquery(s) => {
-            escape_text(s.as_bytes(), buf);
+            escape_text(s.as_bytes(), buf, delimiter);
         }
     }
 }
@@ -342,18 +348,22 @@ fn encode_array_element(value: &Value, buf: &mut Vec<u8>) {
             }
             buf.push(b'"');
         }
-        _ => encode_value(value, buf),
+        _ => encode_value(value, buf, TAB),
     }
 }
 
 #[inline]
-fn escape_text(input: &[u8], buf: &mut Vec<u8>) {
+fn escape_text(input: &[u8], buf: &mut Vec<u8>, delimiter: u8) {
     for &c in input {
         match c {
             BACKSLASH => buf.extend_from_slice(b"\\\\"),
-            TAB => buf.extend_from_slice(b"\\t"),
             NEWLINE => buf.extend_from_slice(b"\\n"),
             b'\r' => buf.extend_from_slice(b"\\r"),
+            TAB => buf.extend_from_slice(b"\\t"),
+            _ if c == delimiter => {
+                buf.push(BACKSLASH);
+                buf.push(c);
+            }
             _ => buf.push(c),
         }
     }
@@ -659,5 +669,58 @@ mod tests {
         let mut buf = Vec::new();
         encode_row_with_options(&[Value::Bytes(vec![0xde, 0xad])], &mut buf, &opts);
         assert_eq!(buf, b"\\xdead\n");
+    }
+
+    // --- #631: Text mode custom delimiter escaping + NULL collision ---
+
+    #[test]
+    fn test_text_custom_delimiter_escaped_in_value() {
+        // With DELIMITER '|', a pipe in a value must be escaped as \|
+        let opts = CopyOptions {
+            format: CopyFormat::Text,
+            delimiter: b'|',
+            null_string: "\\N".to_string(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+        };
+        let mut buf = Vec::new();
+        encode_row_with_options(&[Value::Text("a|b".to_string())], &mut buf, &opts);
+        assert_eq!(buf, b"a\\|b\n");
+    }
+
+    #[test]
+    fn test_text_null_string_collision_escaped() {
+        // With NULL 'NULL', literal text "NULL" must be escaped to avoid collision
+        let opts = CopyOptions {
+            format: CopyFormat::Text,
+            delimiter: b'\t',
+            null_string: "NULL".to_string(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+        };
+        let mut buf = Vec::new();
+        encode_row_with_options(
+            &[Value::Null, Value::Text("NULL".to_string())],
+            &mut buf,
+            &opts,
+        );
+        // NULL emits "NULL", literal "NULL" emits "\NULL" (escaped first char)
+        assert_eq!(buf, b"NULL\t\\NULL\n");
+    }
+
+    #[test]
+    fn test_text_default_null_no_collision() {
+        // With default NULL '\N', literal "\N" is already escaped as "\\N"
+        let opts = CopyOptions::default();
+        let mut buf = Vec::new();
+        encode_row_with_options(
+            &[Value::Null, Value::Text("\\N".to_string())],
+            &mut buf,
+            &opts,
+        );
+        // NULL emits \N, literal "\N" is escaped to \\N — no collision
+        assert_eq!(buf, b"\\N\t\\\\N\n");
     }
 }
