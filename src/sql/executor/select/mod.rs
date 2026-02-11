@@ -742,14 +742,19 @@ impl Executor {
                 )
                 .await?;
                 if !lock_rows.is_empty() {
-                    self.store().lock_rows(txn, db_id, &t, &lock_rows).await?;
+                    if has_nowait {
+                        self.store()
+                            .lock_rows_nowait(txn, db_id, &t, &lock_rows)
+                            .await?;
+                    } else {
+                        self.store().lock_rows(txn, db_id, &t, &lock_rows).await?;
+                    }
                 }
                 // Do not set preloaded_rows: the main query independently scans
                 // and applies WHERE/ORDER BY/LIMIT, preserving correct behavior
                 // when async WHERE conjuncts have already pre-filtered rows.
             }
         }
-        let _ = has_nowait; // TODO: implement NOWAIT semantics
 
         // Detect grouping sets (CUBE/ROLLUP/GROUPING SETS).
         let group_by_exprs_for_grouping_sets_check = match &select.group_by {
