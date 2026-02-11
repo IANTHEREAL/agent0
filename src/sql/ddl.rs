@@ -1280,6 +1280,7 @@ pub async fn execute_drop_view(
     search_path: &[String],
     names: &[ObjectName],
     if_exists: bool,
+    cascade: bool,
 ) -> Result<ExecuteResult> {
     let mut last = String::new();
     for name in names {
@@ -1295,6 +1296,12 @@ pub async fn execute_drop_view(
                     continue;
                 }
             };
+
+        // CASCADE: drop views that depend on this view.
+        if cascade {
+            drop_dependent_views(store, txn, db_id, &resolved.full).await?;
+        }
+
         if !store.drop_view(txn, db_id, &resolved.full).await? && !if_exists {
             return Err(anyhow!("View '{}' does not exist", resolved.full));
         }
@@ -1439,6 +1446,7 @@ pub async fn execute_drop_table(
     search_path: &[String],
     names: &[ObjectName],
     if_exists: bool,
+    cascade: bool,
 ) -> Result<ExecuteResult> {
     let mut last = String::new();
     for name in names {
@@ -1454,6 +1462,12 @@ pub async fn execute_drop_table(
                     continue;
                 }
             };
+
+        // CASCADE: drop views that depend on this table.
+        if cascade {
+            drop_dependent_views(store, txn, db_id, &resolved.full).await?;
+        }
+
         for trigger in store
             .list_triggers_for_table(txn, db_id, &resolved.full)
             .await?
@@ -1467,6 +1481,31 @@ pub async fn execute_drop_table(
         last = resolved.full;
     }
     Ok(ExecuteResult::DropTable { table_name: last })
+}
+
+/// Drop all views whose SQL definition references `table_name`.
+async fn drop_dependent_views(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    table_name: &str,
+) -> Result<()> {
+    let views = store.list_views(txn, db_id).await?;
+    for view in views {
+        // Check if view SQL references this table (simple substring match on
+        // the fully-qualified or unqualified name).
+        let query_upper = view.query.to_uppercase();
+        let full_upper = table_name.to_uppercase();
+        let short_upper = table_name
+            .split('.')
+            .last()
+            .unwrap_or(table_name)
+            .to_uppercase();
+        if query_upper.contains(&full_upper) || query_upper.contains(&short_upper) {
+            let _ = store.drop_view(txn, db_id, &view.full_name()).await?;
+        }
+    }
+    Ok(())
 }
 
 pub async fn execute_truncate(
