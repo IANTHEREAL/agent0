@@ -28,6 +28,10 @@ pub fn router() -> Router<AppState> {
             "/databases/:database_id",
             get(get_database).delete(delete_database),
         )
+        .route(
+            "/databases/:database_id/reset-password",
+            post(reset_database_password),
+        )
 }
 
 // ── Helper functions ────────────────────────────────────────────
@@ -303,6 +307,17 @@ pub async fn create_database(
     db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None).await?;
     db::set_tenant_customer_id(&state.db, &tenant_id, &auth.customer_id).await?;
 
+    db::upsert_credential(
+        &state.db,
+        &tenant_id,
+        "admin",
+        &admin_user,
+        &password,
+        state.config.credential_key.as_deref(),
+    )
+    .await
+    .ok();
+
     let tags_json = req
         .region
         .as_ref()
@@ -503,5 +518,100 @@ pub async fn delete_database(
 
     Ok(Json(MessageResponse {
         message: "Database disabled".to_string(),
+    }))
+}
+
+// ── POST /databases/:database_id/reset-password ──────────────
+
+pub async fn reset_database_password(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+    Path(database_id): Path<String>,
+) -> Result<Json<CustomerPasswordResetResponse>, AppError> {
+    let tenant = db::get_tenant_for_customer(&state.db, &database_id, &auth.customer_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("Database not found"))?;
+
+    let cred = db::get_credential(
+        &state.db,
+        &tenant.id,
+        "admin",
+        state.config.credential_key.as_deref(),
+    )
+    .await?;
+
+    let cred = cred.ok_or_else(|| {
+        AppError::conflict("No stored admin credential for this database. Cannot reset password.")
+    })?;
+
+    let new_password = generate_password();
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+    let success = pg
+        .reset_password(
+            &tenant.id,
+            &cred.username,
+            &cred.password_plain,
+            &cred.username,
+            &new_password,
+        )
+        .await;
+
+    if !success {
+        db::insert_audit_log(
+            &state.db,
+            "RESET_PASSWORD",
+            "DATABASE",
+            &database_id,
+            Some(&database_id),
+            Some(&auth.customer_id),
+            false,
+            Some("Failed to reset password in pg-tikv"),
+            None,
+        )
+        .await
+        .ok();
+        return Err(AppError::bad_gateway(
+            "Failed to reset password. The database may be unreachable.",
+        ));
+    }
+
+    db::upsert_credential(
+        &state.db,
+        &tenant.id,
+        "admin",
+        &cred.username,
+        &new_password,
+        state.config.credential_key.as_deref(),
+    )
+    .await
+    .ok();
+
+    db::insert_audit_log(
+        &state.db,
+        "RESET_PASSWORD",
+        "DATABASE",
+        &database_id,
+        Some(&database_id),
+        Some(&auth.customer_id),
+        true,
+        None,
+        None,
+    )
+    .await
+    .ok();
+
+    let endpoints = state.config.parse_public_endpoints();
+    let (host, port) = endpoints
+        .first()
+        .cloned()
+        .unwrap_or_else(|| ("127.0.0.1".into(), DEFAULT_PG_PORT));
+    let connection_string =
+        build_connection_string(&tenant.id, &cred.username, &new_password, &host, port);
+
+    Ok(Json(CustomerPasswordResetResponse {
+        admin_user: cred.username,
+        admin_password: new_password,
+        connection_string,
     }))
 }

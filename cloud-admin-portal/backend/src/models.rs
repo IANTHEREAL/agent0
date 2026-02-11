@@ -181,6 +181,13 @@ pub struct PasswordResetResponse {
 }
 
 #[derive(Serialize)]
+pub struct CustomerPasswordResetResponse {
+    pub admin_user: String,
+    pub admin_password: String,
+    pub connection_string: String,
+}
+
+#[derive(Serialize)]
 pub struct MessageResponse {
     pub message: String,
 }

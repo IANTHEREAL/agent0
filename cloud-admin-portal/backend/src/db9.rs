@@ -64,6 +64,8 @@ enum DbAction {
     Status { id: String },
     /// Delete a database
     Delete { id: String },
+    /// Reset database admin password
+    ResetPassword { id: String },
     /// Show connection info for a database
     Connect { id: String },
 }
@@ -189,6 +191,7 @@ async fn main() {
             DbAction::List => cmd_db_list(&api, cli.json).await,
             DbAction::Status { id } => cmd_db_status(&api, cli.json, &id).await,
             DbAction::Delete { id } => cmd_db_delete(&api, cli.json, &id).await,
+            DbAction::ResetPassword { id } => cmd_db_reset_password(&api, cli.json, &id).await,
             DbAction::Connect { id } => cmd_db_connect(&api, cli.json, &id).await,
         },
         Commands::Token { action } => match action {
@@ -454,6 +457,39 @@ async fn cmd_db_delete(api: &ApiClient, json: bool, id: &str) {
     }
 
     println!("Database {id} has been disabled.");
+}
+
+async fn cmd_db_reset_password(api: &ApiClient, json: bool, id: &str) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let data = api
+        .request(
+            "POST",
+            &format!("/customer/databases/{id}/reset-password"),
+            None,
+            Some(&headers),
+        )
+        .await;
+
+    if json {
+        print_json(&data);
+        return;
+    }
+
+    println!("Password reset successfully!\n");
+    if let Some(user) = data.get("admin_user").and_then(|v| v.as_str()) {
+        println!("Admin User:  {user}");
+    }
+    if let Some(pass) = data.get("admin_password").and_then(|v| v.as_str()) {
+        println!("Admin Pass:  {pass}");
+    }
+    if let Some(conn) = data.get("connection_string").and_then(|v| v.as_str()) {
+        println!("\nConnection String:");
+        println!("  {conn}");
+        println!("\npsql Command:");
+        println!("  psql \"{conn}\"");
+    }
 }
 
 async fn cmd_db_connect(api: &ApiClient, json: bool, id: &str) {
