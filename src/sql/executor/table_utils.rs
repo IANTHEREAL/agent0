@@ -678,6 +678,7 @@ impl Executor {
                 name: table_name.to_string(),
                 columns: vec![ColumnDef {
                     name: col_name,
+                    // INTENTIONAL: single-value type inference — NULL defaults to Text
                     data_type: result.data_type().unwrap_or(DataType::Text),
                     nullable: false,
                     primary_key: false,
@@ -747,15 +748,7 @@ impl Executor {
                             timezone: _,
                         } => {
                             let inferred_types = column_types.unwrap_or_else(|| {
-                                if let Some(first) = rows.first() {
-                                    first
-                                        .values
-                                        .iter()
-                                        .map(|v| v.data_type().unwrap_or(DataType::Text))
-                                        .collect()
-                                } else {
-                                    vec![DataType::Text; columns.len()]
-                                }
+                                crate::types::infer_column_types_from_rows(&rows, columns.len())
                             });
 
                             let schema = TableSchema {
@@ -766,6 +759,7 @@ impl Executor {
                                     .enumerate()
                                     .map(|(i, n)| ColumnDef {
                                         name: n.clone(),
+                                        // INTENTIONAL: index guard — unreachable when types match columns
                                         data_type: inferred_types
                                             .get(i)
                                             .cloned()
@@ -818,6 +812,7 @@ impl Executor {
                 name: table_name.to_string(),
                 columns: vec![ColumnDef {
                     name: col_name,
+                    // INTENTIONAL: single-value type inference — NULL defaults to Text
                     data_type: result.data_type().unwrap_or(DataType::Text),
                     nullable: false,
                     primary_key: false,
@@ -982,15 +977,7 @@ impl Executor {
                     };
 
                     let inferred_types = column_types.unwrap_or_else(|| {
-                        if let Some(first) = rows.first() {
-                            first
-                                .values
-                                .iter()
-                                .map(|v| v.data_type().unwrap_or(DataType::Text))
-                                .collect()
-                        } else {
-                            vec![DataType::Text; column_names.len()]
-                        }
+                        crate::types::infer_column_types_from_rows(&rows, column_names.len())
                     });
 
                     let schema = TableSchema {
@@ -1001,6 +988,7 @@ impl Executor {
                             .enumerate()
                             .map(|(i, n)| ColumnDef {
                                 name: n.clone(),
+                                // INTENTIONAL: index guard — unreachable when types match columns
                                 data_type: inferred_types.get(i).cloned().unwrap_or(DataType::Text),
                                 nullable: true,
                                 primary_key: false,

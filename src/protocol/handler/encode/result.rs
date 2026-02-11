@@ -73,14 +73,9 @@ pub(in crate::protocol::handler) fn result_to_response(
 
             let internal_types: Vec<DataType> = if let Some(types) = column_types.as_ref() {
                 types.clone()
-            } else if let Some(first) = rows.first() {
-                first
-                    .values
-                    .iter()
-                    .map(|v| v.data_type().unwrap_or(DataType::Text))
-                    .collect()
             } else {
-                vec![DataType::Text; fixed_columns.len()]
+                // INTENTIONAL: wire protocol encoding — Text OID is universally safe
+                crate::types::infer_column_types_from_rows(&rows, fixed_columns.len())
             };
 
             let mut data_rows: Vec<PgWireResult<DataRow>> = Vec::new();

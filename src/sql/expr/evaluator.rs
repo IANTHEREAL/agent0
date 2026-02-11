@@ -39,7 +39,7 @@ fn try_infer_expr_type_for_validation<C: EvalContext>(ctx: &C, expr: &Expr) -> R
 
     let empty_schema = TableSchema::default();
     let schema = ctx.schema().unwrap_or(&empty_schema);
-    crate::sql::types::try_infer_expr_type(expr, schema)
+    crate::sql::types::infer_expr_type(expr, schema)
         .map_err(|e| crate::sql::error::SqlError::from(e).into())
 }
 
@@ -178,7 +178,7 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(
             None => {
                 let empty_schema = TableSchema::default();
                 let schema = ctx.schema().unwrap_or(&empty_schema);
-                match crate::sql::types::try_infer_expr_type(expr, schema) {
+                match crate::sql::types::infer_expr_type(expr, schema) {
                     Ok(DataType::Boolean) => Ok(()),
                     Err(e) => Err(crate::sql::error::SqlError::from(e).into()),
                     _ => Err(anyhow!(err_msg)),
@@ -331,7 +331,7 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(
         other => {
             let empty_schema = TableSchema::default();
             let schema = ctx.schema().unwrap_or(&empty_schema);
-            match crate::sql::types::try_infer_expr_type(other, schema) {
+            match crate::sql::types::infer_expr_type(other, schema) {
                 Ok(DataType::Boolean) => Ok(()),
                 Err(e) => Err(crate::sql::error::SqlError::from(e).into()),
                 _ => Err(anyhow!(err_msg)),

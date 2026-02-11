@@ -62,7 +62,7 @@ impl Executor {
                         .join("."),
                     _ => format!("{}", rewritten),
                 };
-                let data_type = infer_expr_type(&rewritten, &join_schema);
+                let data_type = infer_expr_type(&rewritten, &join_schema)?;
                 exprs.push(rewritten);
                 names.push(name);
                 types.push(data_type);
@@ -76,7 +76,7 @@ impl Executor {
             &mut group_by_names,
             &mut group_by_types,
             &join_schema,
-        );
+        )?;
 
         let (mut agg_exprs, mut agg_names, mut agg_types) =
             Executor::extract_aggregate_info(&rewritten_projection, &join_schema)?;
@@ -152,7 +152,7 @@ impl Executor {
                                 crate::sql::projection::infer_expr_type(
                                     arr.expr.as_ref(),
                                     &join_schema,
-                                ),
+                                )?,
                             )));
                         }
                     }
@@ -351,12 +351,12 @@ impl Executor {
                     let expr_str = format!("{}", expr).to_lowercase();
                     if let Some(gb_col) = group_by_expr_map.get(&expr_str) {
                         let rewritten = Expr::Identifier(Ident::new(gb_col.clone()));
-                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema));
+                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema)?);
                         projection_exprs.push(rewritten);
                     } else {
                         let rewritten =
                             rewrite_agg_refs_to_columns(expr, &agg_column_map, &group_by_names);
-                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema));
+                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema)?);
                         projection_exprs.push(rewritten);
                     }
                 }

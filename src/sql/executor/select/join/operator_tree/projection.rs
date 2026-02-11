@@ -97,13 +97,13 @@ pub(super) fn project_join_output(
                         let original_name = get_select_item_name(item);
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(original_name);
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(alias.value.clone());
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                 }
@@ -184,13 +184,13 @@ pub(super) fn project_join_output(
                         let original_name = get_select_item_name(item);
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(original_name);
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(alias.value.clone());
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                 }
@@ -314,13 +314,13 @@ pub(super) fn project_join_output(
                         let original_name = get_select_item_name(item);
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(original_name);
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(alias.value.clone());
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                 }
@@ -404,13 +404,13 @@ pub(super) fn project_join_output(
                         let original_name = get_select_item_name(item);
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(original_name);
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(alias.value.clone());
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                     SelectItem::Wildcard(_) => {
@@ -497,15 +497,15 @@ pub(super) fn project_join_output(
                 .map(|item| get_select_item_name(item))
                 .collect();
 
-            let types: Vec<DataType> = rewritten_projection
-                .iter()
-                .map(|item| match item {
+            let mut types: Vec<DataType> = Vec::with_capacity(rewritten_projection.len());
+            for item in &rewritten_projection {
+                types.push(match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        infer_expr_type(expr, final_schema)
+                        infer_expr_type(expr, final_schema)?
                     }
                     _ => DataType::Text,
-                })
-                .collect();
+                });
+            }
 
             fn unnest_arg_expr<'a>(expr: &'a Expr) -> Option<&'a Expr> {
                 match expr {

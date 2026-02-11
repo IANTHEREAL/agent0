@@ -96,8 +96,8 @@ impl FunctionRegistry {
         let sig = self.functions.get(&name.to_uppercase())?;
         Some(match &sig.return_type {
             ReturnType::Fixed(dt) => dt.clone(),
-            ReturnType::SameAsArg(idx) => arg_types.get(*idx).cloned().unwrap_or(DataType::Text),
-            ReturnType::FirstNonNull => arg_types.first().cloned().unwrap_or(DataType::Text),
+            ReturnType::SameAsArg(idx) => arg_types.get(*idx).cloned()?,
+            ReturnType::FirstNonNull => arg_types.first().cloned()?,
             ReturnType::NumericPromotion => promote_numeric_types(arg_types),
             ReturnType::Custom(f) => f(arg_types),
         })
@@ -187,6 +187,7 @@ fn register_builtin_functions(r: &mut FunctionRegistry) {
     r.register(
         "ARRAY_AGG",
         FunctionSignature::custom(|args| {
+            // INTENTIONAL: unreachable after arg validation (min_args=1)
             DataType::Array(Box::new(args.first().cloned().unwrap_or(DataType::Text)))
         })
         .with_args(1, Some(1))
@@ -862,6 +863,7 @@ fn register_builtin_functions(r: &mut FunctionRegistry) {
         "UNNEST",
         FunctionSignature::custom(|args| match args.first() {
             Some(DataType::Array(inner)) => inner.as_ref().clone(),
+            // INTENTIONAL: non-array input to UNNEST — best-effort type inference
             _ => DataType::Text,
         })
         .with_args(1, Some(1)),

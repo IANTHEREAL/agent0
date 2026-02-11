@@ -189,15 +189,8 @@ impl Executor {
                         } else {
                             alias_cols.iter().map(|c| c.value.clone()).collect()
                         };
-                        let inferred_types: Vec<DataType> = if let Some(first) = sub_rows.first() {
-                            first
-                                .values
-                                .iter()
-                                .map(|v| v.data_type().unwrap_or(DataType::Text))
-                                .collect()
-                        } else {
-                            vec![DataType::Text; col_names.len()]
-                        };
+                        let inferred_types: Vec<DataType> =
+                            crate::types::infer_column_types_from_rows(&sub_rows, col_names.len());
                         lateral_schema = Some(TableSchema {
                             table_id: 0,
                             name: lateral_alias_name.clone(),
@@ -585,15 +578,15 @@ impl Executor {
                 .iter()
                 .map(|item| get_select_item_name(item))
                 .collect();
-            let types: Vec<DataType> = rewritten_projection
-                .iter()
-                .map(|item| match item {
+            let mut types: Vec<DataType> = Vec::with_capacity(rewritten_projection.len());
+            for item in &rewritten_projection {
+                types.push(match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        infer_expr_type(expr, &combined_schema)
+                        infer_expr_type(expr, &combined_schema)?
                     }
                     _ => DataType::Text,
-                })
-                .collect();
+                });
+            }
             let mut projected = Vec::with_capacity(combined_rows.len());
             for row in &combined_rows {
                 let mut values = Vec::with_capacity(rewritten_projection.len());
