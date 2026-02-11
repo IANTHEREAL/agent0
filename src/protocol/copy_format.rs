@@ -492,7 +492,10 @@ mod tests {
         };
         let mut buf = Vec::new();
         encode_row_with_options(
-            &[Value::Text("a,b".to_string()), Value::Text("c\"d".to_string())],
+            &[
+                Value::Text("a,b".to_string()),
+                Value::Text("c\"d".to_string()),
+            ],
             &mut buf,
             &opts,
         );
@@ -573,21 +576,27 @@ mod tests {
     fn test_non_ascii_delimiter_rejected() {
         let opts = CopyOptions::from_copy_options(&[CopyOption::Delimiter('€')]);
         assert!(opts.is_err());
-        assert!(opts.unwrap_err().contains("COPY delimiter must be a single one-byte character"));
+        assert!(opts
+            .unwrap_err()
+            .contains("COPY delimiter must be a single one-byte character"));
     }
 
     #[test]
     fn test_non_ascii_quote_rejected() {
         let opts = CopyOptions::from_copy_options(&[CopyOption::Quote('é')]);
         assert!(opts.is_err());
-        assert!(opts.unwrap_err().contains("COPY quote must be a single one-byte character"));
+        assert!(opts
+            .unwrap_err()
+            .contains("COPY quote must be a single one-byte character"));
     }
 
     #[test]
     fn test_non_ascii_escape_rejected() {
         let opts = CopyOptions::from_copy_options(&[CopyOption::Escape('ñ')]);
         assert!(opts.is_err());
-        assert!(opts.unwrap_err().contains("COPY escape must be a single one-byte character"));
+        assert!(opts
+            .unwrap_err()
+            .contains("COPY escape must be a single one-byte character"));
     }
 
     #[test]
@@ -625,11 +634,7 @@ mod tests {
             escape: b'"',
         };
         let mut buf = Vec::new();
-        encode_row_with_options(
-            &[Value::Null, Value::Text(String::new())],
-            &mut buf,
-            &opts,
-        );
+        encode_row_with_options(&[Value::Null, Value::Text(String::new())], &mut buf, &opts);
         // NULL=unquoted empty, empty string=quoted ""
         assert_eq!(buf, b",\"\"\n");
     }

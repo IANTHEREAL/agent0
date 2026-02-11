@@ -616,10 +616,8 @@ impl DynamicPgHandler {
             return Err(unsupported_copy_to_stdout_syntax());
         }
 
-        let copy_opts =
-            crate::protocol::copy_format::CopyOptions::from_copy_options(options).map_err(|e| {
-                ErrorInfo::new("ERROR".to_string(), "0A000".to_string(), e)
-            })?;
+        let copy_opts = crate::protocol::copy_format::CopyOptions::from_copy_options(options)
+            .map_err(|e| ErrorInfo::new("ERROR".to_string(), "0A000".to_string(), e))?;
 
         let CopySource::Table {
             table_name,
@@ -673,7 +671,11 @@ impl DynamicPgHandler {
             ExecuteResult::Select { columns, rows, .. } => {
                 let col_count = columns.len();
                 let column_formats: Vec<i16> = vec![0; col_count];
-                Ok((CopyResponse::new(0, col_count, column_formats), columns, rows))
+                Ok((
+                    CopyResponse::new(0, col_count, column_formats),
+                    columns,
+                    rows,
+                ))
             }
             _ => Err(ErrorInfo::new(
                 "ERROR".to_string(),
