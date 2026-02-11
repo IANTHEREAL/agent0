@@ -36,3 +36,30 @@ SHORT_VIEW=1
 (1 row)
 id
 (0 rows)
+?column?
+CYCLE_V1=0
+(1 row)
+?column?
+CYCLE_V2=0
+(1 row)
+?column?
+CTE_VIEW=1
+(1 row)
+id
+42
+(1 row)
+?column?
+MULTI_V1=0
+(1 row)
+?column?
+MULTI_V2=0
+(1 row)
+?column?
+SELF_V=0
+(1 row)
+?column?
+MULTI_MV1=0
+(1 row)
+?column?
+MULTI_MV2=0
+(1 row)

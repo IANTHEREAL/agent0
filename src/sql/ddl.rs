@@ -1282,6 +1282,10 @@ pub async fn execute_drop_view(
     if_exists: bool,
     cascade: bool,
 ) -> Result<ExecuteResult> {
+    // Track names already dropped by CASCADE dependency resolution so that
+    // multi-name DROP statements (e.g. DROP VIEW v1, v2 CASCADE where v2
+    // depends on v1) don't error when a later name was already removed.
+    let mut cascade_dropped: HashSet<String> = HashSet::new();
     let mut last = String::new();
     for name in names {
         let resolved =
@@ -1290,6 +1294,10 @@ pub async fn execute_drop_view(
             {
                 Some(resolved) => resolved,
                 None => {
+                    // Already dropped as a transitive dependent — not an error.
+                    if cascade && was_cascade_dropped(name, search_path, &cascade_dropped) {
+                        continue;
+                    }
                     if !if_exists {
                         return Err(anyhow!("View '{}' does not exist", name));
                     }
@@ -1299,7 +1307,8 @@ pub async fn execute_drop_view(
 
         // CASCADE: drop views that depend on this view.
         if cascade {
-            drop_dependent_views(store, txn, db_id, &resolved.full).await?;
+            let dropped = drop_dependent_views(store, txn, db_id, &resolved.full).await?;
+            cascade_dropped.extend(dropped);
         }
 
         if !store.drop_view(txn, db_id, &resolved.full).await? && !if_exists {
@@ -1367,6 +1376,7 @@ pub async fn execute_drop_materialized_view(
     if_exists: bool,
     cascade: bool,
 ) -> Result<ExecuteResult> {
+    let mut cascade_dropped: HashSet<String> = HashSet::new();
     let mut last = String::new();
     for name in names {
         let resolved = match names::resolve_existing_materialized_view_name(
@@ -1380,6 +1390,9 @@ pub async fn execute_drop_materialized_view(
         {
             Some(resolved) => resolved,
             None => {
+                if cascade && was_cascade_dropped(name, search_path, &cascade_dropped) {
+                    continue;
+                }
                 if !if_exists {
                     return Err(anyhow!("Materialized view '{}' does not exist", name));
                 }
@@ -1389,7 +1402,8 @@ pub async fn execute_drop_materialized_view(
 
         // CASCADE: drop views/matviews that depend on this materialized view.
         if cascade {
-            drop_dependent_views(store, txn, db_id, &resolved.full).await?;
+            let dropped = drop_dependent_views(store, txn, db_id, &resolved.full).await?;
+            cascade_dropped.extend(dropped);
         }
 
         let exists = store
@@ -1471,7 +1485,7 @@ pub async fn execute_drop_table(
 
         // CASCADE: drop views that depend on this table.
         if cascade {
-            drop_dependent_views(store, txn, db_id, &resolved.full).await?;
+            let _dropped = drop_dependent_views(store, txn, db_id, &resolved.full).await?;
         }
 
         for trigger in store
@@ -1490,13 +1504,18 @@ pub async fn execute_drop_table(
 }
 
 /// Compare a parsed relation reference against a fully-qualified target
-/// name (e.g. `"public.orders"`).  Handles both qualified and unqualified
-/// references in the SQL text.
-fn relation_matches(rel_parts: &[String], target: &str) -> bool {
+/// name (e.g. `"public.orders"`).
+///
+/// `view_schema` is the schema of the view whose SQL we are inspecting.
+/// For unqualified references (`FROM t`), we only match when the target
+/// lives in the same schema as the view — this avoids cross-schema
+/// over-drops when the original search_path is unavailable (#638).
+fn relation_matches(rel_parts: &[String], target: &str, view_schema: &str) -> bool {
     let (target_schema, target_table) = target.split_once('.').unwrap_or(("public", target));
     match rel_parts.len() {
-        // Unqualified: `FROM orders` — match if the table part equals.
-        1 => rel_parts[0] == target_table,
+        // Unqualified: `FROM orders` — only match when the target is in the
+        // view's own schema so we don't over-drop across schemas.
+        1 => target_schema == view_schema && rel_parts[0] == target_table,
         // Schema-qualified: `FROM public.orders` — match both parts.
         2 => rel_parts[0] == target_schema && rel_parts[1] == target_table,
         // db.schema.table — match schema + table parts.
@@ -1505,9 +1524,34 @@ fn relation_matches(rel_parts: &[String], target: &str) -> bool {
     }
 }
 
+/// Collect all CTE alias names from parsed statements so they can be
+/// excluded from dependency matching (CTE aliases shadow real tables).
+fn collect_cte_names(stmts: &[sqlparser::ast::Statement]) -> HashSet<String> {
+    let mut cte_names = HashSet::new();
+    for stmt in stmts {
+        if let sqlparser::ast::Statement::Query(query) = stmt {
+            collect_cte_names_from_query(query, &mut cte_names);
+        }
+    }
+    cte_names
+}
+
+fn collect_cte_names_from_query(query: &Query, names: &mut HashSet<String>) {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            names.insert(names::normalize_ident(&cte.alias.name));
+        }
+    }
+}
+
 /// Check whether `view_sql` references any of the fully-qualified names in
 /// `targets` by parsing the SQL and visiting all relation references.
-fn view_references_any(view_sql: &str, targets: &[String]) -> bool {
+///
+/// `view_schema` is the schema the view lives in; it is used to scope
+/// unqualified relation references and avoid cross-schema false positives.
+/// CTE aliases are excluded so that shadowed names do not cause
+/// false-positive drops (#638).
+fn view_references_any(view_sql: &str, view_schema: &str, targets: &[String]) -> bool {
     use core::ops::ControlFlow;
     use sqlparser::ast::visit_relations;
     use sqlparser::dialect::PostgreSqlDialect;
@@ -1519,6 +1563,8 @@ fn view_references_any(view_sql: &str, targets: &[String]) -> bool {
         Err(_) => return false,
     };
 
+    let cte_names = collect_cte_names(&stmts);
+
     let mut found = false;
     let _ = visit_relations(&stmts, |relation| {
         if found {
@@ -1529,8 +1575,13 @@ fn view_references_any(view_sql: &str, targets: &[String]) -> bool {
             .iter()
             .map(|id| names::normalize_ident(id))
             .collect();
+        // Skip unqualified references that match a CTE alias — the CTE
+        // shadows the real table so this is not a true dependency.
+        if rel_parts.len() == 1 && cte_names.contains(&rel_parts[0]) {
+            return ControlFlow::<()>::Continue(());
+        }
         for target in targets {
-            if relation_matches(&rel_parts, target) {
+            if relation_matches(&rel_parts, target, view_schema) {
                 found = true;
                 return ControlFlow::Break(());
             }
@@ -1538,6 +1589,38 @@ fn view_references_any(view_sql: &str, targets: &[String]) -> bool {
         ControlFlow::<()>::Continue(())
     });
     found
+}
+
+/// Check whether `name` (possibly unqualified) resolves to any entry in
+/// `dropped` (a set of fully-qualified names).  Tries all schemas in the
+/// search path for unqualified names.
+fn was_cascade_dropped(
+    name: &ObjectName,
+    search_path: &[String],
+    dropped: &HashSet<String>,
+) -> bool {
+    let (schema_opt, obj) = match names::split_object_name(name) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    match schema_opt {
+        Some(schema) => names::ResolvedName::new(schema, obj)
+            .map(|r| dropped.contains(&r.full))
+            .unwrap_or(false),
+        None => {
+            let default: Vec<String> = vec!["public".to_string()];
+            let schemas = if search_path.is_empty() {
+                &default
+            } else {
+                search_path
+            };
+            schemas.iter().any(|schema| {
+                names::ResolvedName::new(schema.clone(), obj.clone())
+                    .map(|r| dropped.contains(&r.full))
+                    .unwrap_or(false)
+            })
+        }
+    }
 }
 
 /// Drop all views and materialized views whose SQL definition references
@@ -1548,12 +1631,21 @@ fn view_references_any(view_sql: &str, targets: &[String]) -> bool {
 /// from each view's parsed query, then compares names with proper schema
 /// qualification.  Iterates until a fixed point so transitive chains
 /// (table → v1 → mv1 → v2) are fully resolved.
+///
+/// The root `target_name` is never dropped here — the caller is responsible
+/// for dropping it.  This prevents cycles (e.g. v1 ↔ v2) from removing
+/// the target before the caller can, which would cause a spurious
+/// "does not exist" error (#639).
+///
+/// Returns the set of fully-qualified names that were dropped, so the
+/// caller can skip names already handled in multi-name DROP (#640).
 async fn drop_dependent_views(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
     target_name: &str,
-) -> Result<()> {
+) -> Result<HashSet<String>> {
+    let mut dropped = HashSet::new();
     // Names pending dependency resolution; starts with the dropped object.
     let mut pending: Vec<String> = vec![target_name.to_string()];
 
@@ -1564,9 +1656,14 @@ async fn drop_dependent_views(
         // --- regular views ---
         let views = store.list_views(txn, db_id).await?;
         for view in &views {
-            if view_references_any(&view.query, &pending) {
-                let full = view.full_name();
+            let full = view.full_name();
+            // Never drop the root target — the caller handles that.
+            if full == target_name {
+                continue;
+            }
+            if view_references_any(&view.query, &view.schema, &pending) {
                 store.drop_view(txn, db_id, &full).await?;
+                dropped.insert(full.clone());
                 next_pending.push(full);
             }
         }
@@ -1574,11 +1671,20 @@ async fn drop_dependent_views(
         // --- materialized views ---
         let matview_names = store.list_materialized_views(txn, db_id).await?;
         for mv_name in &matview_names {
+            // Never drop the root target.
+            if mv_name == target_name {
+                continue;
+            }
             if let Some(query) = store.get_materialized_view(txn, db_id, mv_name).await? {
-                if view_references_any(&query, &pending) {
+                let mv_schema = mv_name
+                    .split_once('.')
+                    .map(|(s, _)| s)
+                    .unwrap_or("public");
+                if view_references_any(&query, mv_schema, &pending) {
                     store.drop_materialized_view(txn, db_id, mv_name).await?;
                     drop_owned_sequences_for_table(store, txn, db_id, mv_name).await?;
                     store.drop_table(txn, db_id, mv_name).await?;
+                    dropped.insert(mv_name.clone());
                     next_pending.push(mv_name.clone());
                 }
             }
@@ -1587,7 +1693,7 @@ async fn drop_dependent_views(
         pending = next_pending;
     }
 
-    Ok(())
+    Ok(dropped)
 }
 
 pub async fn execute_truncate(
@@ -2718,20 +2824,31 @@ mod tests {
     }
 
     #[test]
-    fn relation_matches_unqualified() {
-        assert!(relation_matches(&["users".into()], "public.users"));
-        assert!(!relation_matches(&["other".into()], "public.users"));
+    fn relation_matches_unqualified_same_schema() {
+        // Unqualified ref in a public-schema view matches public.users.
+        assert!(relation_matches(&["users".into()], "public.users", "public"));
+        assert!(!relation_matches(&["other".into()], "public.users", "public"));
+    }
+
+    #[test]
+    fn relation_matches_unqualified_cross_schema() {
+        // Unqualified ref must NOT match a target in a different schema (#638).
+        assert!(!relation_matches(&["t".into()], "s1.t", "s2"));
+        // But matches when schemas agree.
+        assert!(relation_matches(&["t".into()], "s1.t", "s1"));
     }
 
     #[test]
     fn relation_matches_qualified() {
         assert!(relation_matches(
             &["public".into(), "users".into()],
-            "public.users"
+            "public.users",
+            "public"
         ));
         assert!(!relation_matches(
             &["other_schema".into(), "users".into()],
-            "public.users"
+            "public.users",
+            "public"
         ));
     }
 
@@ -2739,17 +2856,19 @@ mod tests {
     fn relation_matches_three_part() {
         assert!(relation_matches(
             &["mydb".into(), "public".into(), "users".into()],
-            "public.users"
+            "public.users",
+            "public"
         ));
     }
 
     #[test]
     fn view_references_any_from_clause() {
         let targets = vec!["public.users".into()];
-        assert!(view_references_any("SELECT * FROM users", &targets));
-        assert!(view_references_any("SELECT * FROM public.users", &targets));
+        assert!(view_references_any("SELECT * FROM users", "public", &targets));
+        assert!(view_references_any("SELECT * FROM public.users", "public", &targets));
         assert!(view_references_any(
             "SELECT a.id FROM users a JOIN orders b ON a.id = b.uid",
+            "public",
             &targets
         ));
     }
@@ -2760,24 +2879,29 @@ mod tests {
         // Column names, string literals, and unrelated tables must not match.
         assert!(!view_references_any(
             "SELECT t FROM other_table",
+            "public",
             &targets
         ));
         assert!(!view_references_any(
             "SELECT * FROM all_tables WHERE name = 't'",
+            "public",
             &targets
         ));
         assert!(!view_references_any(
             "SELECT * FROM tab",
+            "public",
             &targets
         ));
         assert!(!view_references_any(
             "SELECT * FROM other_t",
+            "public",
             &targets
         ));
         // But standalone t in FROM should match.
-        assert!(view_references_any("SELECT * FROM t", &targets));
+        assert!(view_references_any("SELECT * FROM t", "public", &targets));
         assert!(view_references_any(
             "SELECT * FROM t WHERE 1=1",
+            "public",
             &targets
         ));
     }
@@ -2787,6 +2911,7 @@ mod tests {
         let targets = vec!["public.users".into()];
         assert!(view_references_any(
             "SELECT * FROM (SELECT id FROM users) sub",
+            "public",
             &targets
         ));
     }
@@ -2795,30 +2920,45 @@ mod tests {
     fn view_references_any_unparseable_sql() {
         let targets = vec!["public.users".into()];
         // Malformed SQL should not match (returns false, not panic).
-        assert!(!view_references_any("NOT VALID SQL !!!", &targets));
+        assert!(!view_references_any("NOT VALID SQL !!!", "public", &targets));
     }
 
     #[test]
     fn view_references_any_cte() {
         let targets = vec!["public.orders".into()];
+        // CTE that references the real table inside its definition.
         assert!(view_references_any(
             "WITH recent AS (SELECT * FROM orders WHERE date > '2024-01-01') SELECT * FROM recent",
+            "public",
             &targets
         ));
         // The CTE alias itself is not the target table.
         assert!(!view_references_any(
             "WITH orders AS (SELECT 1 AS id) SELECT * FROM orders",
+            "public",
             &["public.unrelated".into()]
         ));
-        // Known limitation: CTE that shadows a table name — visit_relations
-        // still sees "orders" in `FROM orders` as a relation reference even
-        // though it actually resolves to the CTE.  This is a false positive
-        // (conservative: over-drops rather than leaving broken views).
-        // If this ever needs to change, this assertion should flip to `!`.
-        assert!(view_references_any(
+    }
+
+    #[test]
+    fn view_references_any_cte_shadowing() {
+        // CTE that shadows a table name — the outer `FROM orders` resolves to
+        // the CTE, not the real table.  Must NOT trigger a false-positive (#638).
+        let targets = vec!["public.orders".into()];
+        assert!(!view_references_any(
             "WITH orders AS (SELECT 1 AS id) SELECT * FROM orders",
+            "public",
             &targets
         ));
+    }
+
+    #[test]
+    fn view_references_any_cross_schema_no_false_positive() {
+        // A view in s2 with `FROM t` should NOT match s1.t (#638).
+        let targets = vec!["s1.t".into()];
+        assert!(!view_references_any("SELECT * FROM t", "s2", &targets));
+        // But a qualified reference does match regardless of view schema.
+        assert!(view_references_any("SELECT * FROM s1.t", "s2", &targets));
     }
 
     #[test]
@@ -2827,6 +2967,7 @@ mod tests {
         // Target in second branch of UNION.
         assert!(view_references_any(
             "SELECT id FROM admins UNION ALL SELECT id FROM users",
+            "public",
             &targets
         ));
     }
@@ -2834,41 +2975,41 @@ mod tests {
     #[test]
     fn view_references_any_multiple_targets() {
         let targets = vec!["public.a".into(), "public.b".into()];
-        assert!(view_references_any("SELECT * FROM a", &targets));
-        assert!(view_references_any("SELECT * FROM b", &targets));
-        assert!(!view_references_any("SELECT * FROM c", &targets));
+        assert!(view_references_any("SELECT * FROM a", "public", &targets));
+        assert!(view_references_any("SELECT * FROM b", "public", &targets));
+        assert!(!view_references_any("SELECT * FROM c", "public", &targets));
     }
 
     #[test]
     fn view_references_any_aliased_table() {
         // `FROM users AS u` — the relation is `users`, the alias is `u`.
         let targets = vec!["public.users".into()];
-        assert!(view_references_any("SELECT u.id FROM users AS u", &targets));
+        assert!(view_references_any("SELECT u.id FROM users AS u", "public", &targets));
         // Alias name alone must not trigger a match.
         let targets2 = vec!["public.u".into()];
-        assert!(!view_references_any("SELECT u.id FROM users AS u", &targets2));
+        assert!(!view_references_any("SELECT u.id FROM users AS u", "public", &targets2));
     }
 
     #[test]
     fn relation_matches_empty_parts() {
-        assert!(!relation_matches(&[], "public.users"));
+        assert!(!relation_matches(&[], "public.users", "public"));
     }
 
     #[test]
     fn relation_matches_non_public_schema() {
         assert!(relation_matches(
             &["myschema".into(), "mytable".into()],
-            "myschema.mytable"
+            "myschema.mytable",
+            "myschema"
         ));
-        // Known limitation: an unqualified reference matches ANY schema's
-        // table with the same name.  Without a stored search_path we cannot
-        // know which schema the view author intended, so we over-match
-        // (conservative for CASCADE — drops rather than leaves broken).
-        assert!(relation_matches(&["mytable".into()], "myschema.mytable"));
+        // Unqualified ref only matches when view_schema == target_schema (#638).
+        assert!(relation_matches(&["mytable".into()], "myschema.mytable", "myschema"));
+        assert!(!relation_matches(&["mytable".into()], "myschema.mytable", "public"));
         // Qualified references with wrong schema correctly reject.
         assert!(!relation_matches(
             &["public".into(), "mytable".into()],
-            "myschema.mytable"
+            "myschema.mytable",
+            "myschema"
         ));
     }
 }
