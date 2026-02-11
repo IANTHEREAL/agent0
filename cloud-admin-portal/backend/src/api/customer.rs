@@ -46,7 +46,7 @@ fn make_keyspace(id: &str) -> String {
 
 fn generate_password() -> String {
     let mut rng = rand::thread_rng();
-    let charset = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*";
+    let charset = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_=+.~";
     (0..16)
         .map(|_| charset[rng.gen_range(0..charset.len())] as char)
         .collect()
