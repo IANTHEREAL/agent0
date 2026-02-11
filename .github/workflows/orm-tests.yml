@@ -172,7 +172,7 @@ jobs:
 
       - name: Run ORM tests
         working-directory: orm-tests
-        run: npm test -- --json --outputFile=test-results.json || true
+        run: npm test
         env:
           PG_DSN: postgres://${{ env.PG_USER }}:${{ env.PG_PASSWORD }}@127.0.0.1:${{ env.PG_PORT }}/postgres
 
@@ -214,22 +214,6 @@ jobs:
             echo "## pg-tikv Test Results" >> \$GITHUB_STEP_SUMMARY
             echo "" >> \$GITHUB_STEP_SUMMARY
             echo "⚠️ No test results file found" >> \$GITHUB_STEP_SUMMARY
-          fi
-
-      - name: Check test results
-        working-directory: orm-tests
-        run: |
-          if [ -f test-results.json ]; then
-            node -e "
-            const results = require('./test-results.json');
-            const failed = results.numFailedTests || 0;
-            // Allow up to 120 failures (known pg-tikv limitations)
-            if (failed > 120) {
-              console.error('Too many test failures: ' + failed + ' (max allowed: 120)');
-              process.exit(1);
-            }
-            console.log('Test failures within acceptable range: ' + failed + '/120');
-            "
           fi
 
   lint:

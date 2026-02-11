@@ -515,7 +515,7 @@ describe('Kysely - Joins', () => {
         'kysely_users.name',
         eb.fn.count<number>('kysely_posts.id').as('post_count'),
       ])
-      .groupBy('kysely_users.id')
+      .groupBy(['kysely_users.id', 'kysely_users.name'])
       .execute();
 
     expect(result.length).toBeGreaterThan(0);
@@ -922,7 +922,15 @@ async function cleanupTables(pool: pg.Pool) {
 }
 
 async function truncateTables(pool: pg.Pool) {
-  await pool.query('TRUNCATE kysely_order_items, kysely_orders, kysely_products, kysely_posts_tags, kysely_tags, kysely_comments, kysely_posts, kysely_profiles, kysely_users RESTART IDENTITY CASCADE');
+  await pool.query('DELETE FROM kysely_order_items');
+  await pool.query('DELETE FROM kysely_orders');
+  await pool.query('DELETE FROM kysely_products');
+  await pool.query('DELETE FROM kysely_posts_tags');
+  await pool.query('DELETE FROM kysely_tags');
+  await pool.query('DELETE FROM kysely_comments');
+  await pool.query('DELETE FROM kysely_posts');
+  await pool.query('DELETE FROM kysely_profiles');
+  await pool.query('DELETE FROM kysely_users');
 }
 
 async function seedTestData(db: Kysely<Database>) {
