@@ -1579,10 +1579,7 @@ fn view_references_any(view_sql: &str, view_schema: &str, targets: &[String]) ->
     impl Visitor for ScopeAwareChecker<'_> {
         type Break = ();
 
-        fn pre_visit_query(
-            &mut self,
-            query: &sqlparser::ast::Query,
-        ) -> ControlFlow<Self::Break> {
+        fn pre_visit_query(&mut self, query: &sqlparser::ast::Query) -> ControlFlow<Self::Break> {
             let mut shadows = HashSet::new();
             if let Some(with) = &query.with {
                 for cte in &with.cte_tables {
@@ -1613,10 +1610,7 @@ fn view_references_any(view_sql: &str, view_schema: &str, targets: &[String]) ->
             ControlFlow::Continue(())
         }
 
-        fn post_visit_query(
-            &mut self,
-            _query: &sqlparser::ast::Query,
-        ) -> ControlFlow<Self::Break> {
+        fn post_visit_query(&mut self, _query: &sqlparser::ast::Query) -> ControlFlow<Self::Break> {
             self.shadow_stack.pop();
             ControlFlow::Continue(())
         }
@@ -1747,16 +1741,10 @@ async fn drop_dependent_views(
                 continue;
             }
             if let Some(query) = store.get_materialized_view(txn, db_id, mv_name).await? {
-                let mv_schema = mv_name
-                    .split_once('.')
-                    .map(|(s, _)| s)
-                    .unwrap_or("public");
+                let mv_schema = mv_name.split_once('.').map(|(s, _)| s).unwrap_or("public");
                 if view_references_any(&query, mv_schema, &pending) {
                     store.drop_materialized_view(txn, db_id, mv_name).await?;
-                    for trigger in store
-                        .list_triggers_for_table(txn, db_id, mv_name)
-                        .await?
-                    {
+                    for trigger in store.list_triggers_for_table(txn, db_id, mv_name).await? {
                         let _ = store
                             .drop_trigger(txn, db_id, mv_name, &trigger.name)
                             .await?;
@@ -2905,8 +2893,16 @@ mod tests {
     #[test]
     fn relation_matches_unqualified_same_schema() {
         // Unqualified ref in a public-schema view matches public.users.
-        assert!(relation_matches(&["users".into()], "public.users", "public"));
-        assert!(!relation_matches(&["other".into()], "public.users", "public"));
+        assert!(relation_matches(
+            &["users".into()],
+            "public.users",
+            "public"
+        ));
+        assert!(!relation_matches(
+            &["other".into()],
+            "public.users",
+            "public"
+        ));
     }
 
     #[test]
@@ -2943,8 +2939,16 @@ mod tests {
     #[test]
     fn view_references_any_from_clause() {
         let targets = vec!["public.users".into()];
-        assert!(view_references_any("SELECT * FROM users", "public", &targets));
-        assert!(view_references_any("SELECT * FROM public.users", "public", &targets));
+        assert!(view_references_any(
+            "SELECT * FROM users",
+            "public",
+            &targets
+        ));
+        assert!(view_references_any(
+            "SELECT * FROM public.users",
+            "public",
+            &targets
+        ));
         assert!(view_references_any(
             "SELECT a.id FROM users a JOIN orders b ON a.id = b.uid",
             "public",
@@ -2999,7 +3003,11 @@ mod tests {
     fn view_references_any_unparseable_sql() {
         let targets = vec!["public.users".into()];
         // Malformed SQL should not match (returns false, not panic).
-        assert!(!view_references_any("NOT VALID SQL !!!", "public", &targets));
+        assert!(!view_references_any(
+            "NOT VALID SQL !!!",
+            "public",
+            &targets
+        ));
     }
 
     #[test]
@@ -3093,10 +3101,18 @@ mod tests {
     fn view_references_any_aliased_table() {
         // `FROM users AS u` — the relation is `users`, the alias is `u`.
         let targets = vec!["public.users".into()];
-        assert!(view_references_any("SELECT u.id FROM users AS u", "public", &targets));
+        assert!(view_references_any(
+            "SELECT u.id FROM users AS u",
+            "public",
+            &targets
+        ));
         // Alias name alone must not trigger a match.
         let targets2 = vec!["public.u".into()];
-        assert!(!view_references_any("SELECT u.id FROM users AS u", "public", &targets2));
+        assert!(!view_references_any(
+            "SELECT u.id FROM users AS u",
+            "public",
+            &targets2
+        ));
     }
 
     #[test]
@@ -3112,8 +3128,16 @@ mod tests {
             "myschema"
         ));
         // Unqualified ref only matches when view_schema == target_schema (#638).
-        assert!(relation_matches(&["mytable".into()], "myschema.mytable", "myschema"));
-        assert!(!relation_matches(&["mytable".into()], "myschema.mytable", "public"));
+        assert!(relation_matches(
+            &["mytable".into()],
+            "myschema.mytable",
+            "myschema"
+        ));
+        assert!(!relation_matches(
+            &["mytable".into()],
+            "myschema.mytable",
+            "public"
+        ));
         // Qualified references with wrong schema correctly reject.
         assert!(!relation_matches(
             &["public".into(), "mytable".into()],
