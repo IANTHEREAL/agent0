@@ -65,6 +65,9 @@ pub enum SqlError {
     #[error("canceling statement due to statement timeout")]
     StatementTimeout,
 
+    #[error("could not obtain lock on row in relation \"{relation}\"")]
+    LockNotAvailable { relation: String },
+
     #[error("current transaction is aborted, commands ignored until end of transaction block")]
     InFailedTransaction,
 
@@ -100,6 +103,7 @@ impl SqlError {
             Self::CheckViolation { .. } => "23514",
             Self::DivisionByZero => "22012",
             Self::StatementTimeout => "57014",
+            Self::LockNotAvailable { .. } => "55P03",
             Self::InFailedTransaction => "25P02",
             Self::PermissionDenied { .. } => "42501",
             Self::Unsupported(_) => "0A000",
@@ -190,6 +194,13 @@ mod tests {
             }
             .sqlstate(),
             "42501"
+        );
+        assert_eq!(
+            SqlError::LockNotAvailable {
+                relation: "t".into()
+            }
+            .sqlstate(),
+            "55P03"
         );
         assert_eq!(SqlError::Unsupported("x".into()).sqlstate(), "0A000");
         let internal = SqlError::Internal(anyhow::anyhow!("boom"));

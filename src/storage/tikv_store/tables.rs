@@ -118,6 +118,72 @@ impl TikvStore {
         Ok(available_indices)
     }
 
+    /// Lock rows with NOWAIT semantics.  Fails immediately if any row is
+    /// already locked by another transaction.
+    ///
+    /// Uses a separate NOWAIT probe transaction (`wait_timeout = -1`) to test
+    /// all keys.  If any key is held by another txn, returns
+    /// `SqlError::LockNotAvailable`.  On success, acquires the real locks in
+    /// the caller's transaction.
+    pub async fn lock_rows_nowait(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_name: &str,
+        rows: &[Row],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let schema = self
+            .get_schema(txn, db_id, table_name)
+            .await?
+            .ok_or_else(|| anyhow!("Table not found"))?;
+        if schema.pk_indices.is_empty() {
+            return Err(anyhow!(
+                "cannot lock rows: table '{}' has no primary key",
+                table_name
+            ));
+        }
+
+        let keys: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|row| {
+                let pk_values = schema.get_pk_values(row);
+                let row_key = encode_pk_values(&pk_values);
+                self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key))
+            })
+            .collect();
+
+        // Probe with a NOWAIT transaction — fail on the first locked key.
+        let mut nowait_options = TransactionOptions::new_pessimistic()
+            .drop_check(CheckLevel::Warn)
+            .no_resolve_locks();
+        nowait_options.pessimistic_lock_wait_timeout = Some(-1);
+
+        let mut nowait_txn = self
+            .client()
+            .begin_with_options(nowait_options)
+            .await
+            .map_err(|e| anyhow!(e))?;
+
+        match nowait_txn.lock_keys(keys.clone()).await {
+            Ok(()) => {
+                // All keys are available — rollback probe and lock for real.
+                let _ = nowait_txn.rollback().await;
+                txn.lock_keys(keys).await.map_err(|e| anyhow!(e))
+            }
+            Err(_) => {
+                let _ = nowait_txn.rollback().await;
+                Err(crate::sql::error::SqlError::LockNotAvailable {
+                    relation: table_name.to_string(),
+                }
+                .into())
+            }
+        }
+    }
+
     /// Check if a table exists (using txn)
     pub async fn table_exists(
         &self,
