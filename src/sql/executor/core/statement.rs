@@ -564,9 +564,10 @@ impl Executor {
             }
         };
 
-        // Find the table that owns this index
+        // Find the table that owns this index (check both regular indexes and PK constraint)
         let tables = self.store().list_tables(txn, db_id).await?;
         let mut found_table: Option<String> = None;
+        let mut is_pk = false;
         for table_name in &tables {
             let table_schema = table_name.splitn(2, '.').next().unwrap_or("");
             if !schema_filter.iter().any(|s| *s == table_schema) {
@@ -576,6 +577,22 @@ impl Executor {
                 Some(s) => s,
                 None => continue,
             };
+            // Check PK constraint name
+            if !schema.pk_indices.is_empty() {
+                let pk_name = schema.pk_constraint_name.as_deref().unwrap_or("");
+                let short = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                let default_pk = format!("{}_pkey", short);
+                let effective_pk = if pk_name.is_empty() {
+                    &default_pk
+                } else {
+                    pk_name
+                };
+                if effective_pk == idx_name {
+                    found_table = Some(table_name.clone());
+                    is_pk = true;
+                    break;
+                }
+            }
             if schema.indexes.iter().any(|i| i.name == idx_name) {
                 found_table = Some(table_name.clone());
                 break;
@@ -585,22 +602,50 @@ impl Executor {
         let table_name =
             found_table.ok_or_else(|| anyhow!("index \"{}\" does not exist", idx_name))?;
 
+        // Check for name conflict across all tables in the same schema (PostgreSQL
+        // requires index names to be unique within a namespace, not just a table).
+        let owning_schema = table_name.splitn(2, '.').next().unwrap_or("");
+        for t in &tables {
+            let t_schema = t.splitn(2, '.').next().unwrap_or("");
+            if t_schema != owning_schema {
+                continue;
+            }
+            let s = match self.store().get_schema(txn, db_id, t).await? {
+                Some(s) => s,
+                None => continue,
+            };
+            if s.indexes.iter().any(|i| i.name == new_idx_name) {
+                return Err(anyhow!("relation \"{}\" already exists", new_idx_name));
+            }
+            if !s.pk_indices.is_empty() {
+                let pk_name = s.pk_constraint_name.as_deref().unwrap_or("");
+                let short = s.name.rsplit('.').next().unwrap_or(&s.name);
+                let default_pk = format!("{}_pkey", short);
+                let effective_pk = if pk_name.is_empty() {
+                    &default_pk
+                } else {
+                    pk_name
+                };
+                if effective_pk == new_idx_name {
+                    return Err(anyhow!("relation \"{}\" already exists", new_idx_name));
+                }
+            }
+        }
+
         let mut schema = self
             .store()
             .get_schema(txn, db_id, &table_name)
             .await?
             .ok_or_else(|| SqlError::RelationNotFound(table_name.clone()))?;
 
-        // Check for name conflict
-        if schema.indexes.iter().any(|i| i.name == new_idx_name) {
-            return Err(anyhow!("relation \"{}\" already exists", new_idx_name));
-        }
-
-        // Rename the index
-        for idx in &mut schema.indexes {
-            if idx.name == idx_name {
-                idx.name = new_idx_name.clone();
-                break;
+        if is_pk {
+            schema.pk_constraint_name = Some(new_idx_name.clone());
+        } else {
+            for idx in &mut schema.indexes {
+                if idx.name == idx_name {
+                    idx.name = new_idx_name.clone();
+                    break;
+                }
             }
         }
 
