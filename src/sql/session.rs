@@ -222,8 +222,16 @@ impl SessionSettings {
                 let normalized = value.trim().to_lowercase();
                 match normalized.as_str() {
                     "read uncommitted" | "read committed" => {
-                        // TiKV snapshot isolation provides at least read committed.
-                        self.transaction_isolation = Some("read committed".to_string());
+                        // TiKV snapshot isolation is equivalent to REPEATABLE READ.
+                        // Accept these levels for driver compatibility but honestly
+                        // report what the engine actually provides.
+                        tracing::warn!(
+                            requested = normalized.as_str(),
+                            actual = "repeatable read",
+                            "TiKV provides snapshot isolation (REPEATABLE READ); \
+                             the requested isolation level has been upgraded"
+                        );
+                        self.transaction_isolation = Some("repeatable read".to_string());
                     }
                     "repeatable read" => {
                         self.transaction_isolation = Some("repeatable read".to_string());
@@ -330,7 +338,7 @@ impl SessionSettings {
             "transaction_isolation" | "transaction.isolation.level" => Some(
                 self.transaction_isolation
                     .as_deref()
-                    .unwrap_or("read committed")
+                    .unwrap_or("repeatable read")
                     .to_string(),
             ),
             "default_transaction_read_only" => Some(
@@ -779,13 +787,13 @@ mod tests {
 
         assert_eq!(
             settings.show_value("transaction_isolation").as_deref(),
-            Some("read committed")
+            Some("repeatable read")
         );
         assert_eq!(
             settings
                 .show_value("transaction.isolation.level")
                 .as_deref(),
-            Some("read committed")
+            Some("repeatable read")
         );
     }
 
@@ -892,10 +900,10 @@ mod tests {
     fn test_session_settings_transaction_isolation() {
         let mut settings = SessionSettings::new();
 
-        // Default value
+        // Default value — TiKV snapshot isolation = REPEATABLE READ
         assert_eq!(
             settings.show_value("transaction_isolation").as_deref(),
-            Some("read committed")
+            Some("repeatable read")
         );
         assert_eq!(
             settings
@@ -962,13 +970,22 @@ mod tests {
             .set_known_setting("transaction_isolation", "snapshot".to_string())
             .is_err());
 
-        // READ UNCOMMITTED maps to read committed (TiKV minimum)
+        // READ UNCOMMITTED is upgraded to REPEATABLE READ (TiKV snapshot isolation)
         assert!(settings
             .set_known_setting("transaction_isolation", "read uncommitted".to_string())
             .unwrap());
         assert_eq!(
             settings.show_value("transaction_isolation").as_deref(),
-            Some("read committed")
+            Some("repeatable read")
+        );
+
+        // READ COMMITTED is also upgraded to REPEATABLE READ
+        assert!(settings
+            .set_known_setting("transaction_isolation", "read committed".to_string())
+            .unwrap());
+        assert_eq!(
+            settings.show_value("transaction_isolation").as_deref(),
+            Some("repeatable read")
         );
 
         // default_transaction_read_only: boolean aliases
