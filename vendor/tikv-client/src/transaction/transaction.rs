@@ -628,6 +628,37 @@ impl<PdC: PdClient> Transaction<PdC> {
         Ok(())
     }
 
+    /// Lock the given keys with NOWAIT semantics.
+    ///
+    /// Behaves like [`lock_keys`](Transaction::lock_keys) but returns an error
+    /// immediately if any key is locked by *another* transaction instead of
+    /// blocking.  Keys already held by *this* transaction succeed as expected.
+    ///
+    /// Callers can use [`Error::is_lock_conflict`] on a returned error to
+    /// distinguish "key is locked" from unrelated failures.
+    pub async fn lock_keys_nowait(
+        &mut self,
+        keys: impl IntoIterator<Item = impl Into<Key>>,
+    ) -> Result<()> {
+        debug!("invoking transactional lock_keys_nowait request");
+        self.check_allow_operation().await?;
+        let keyspace = self.keyspace;
+        let keys = keys
+            .into_iter()
+            .map(move |k| k.into().encode_keyspace(keyspace, KeyMode::Txn));
+        match self.options.kind {
+            TransactionKind::Optimistic => {
+                for key in keys {
+                    self.buffer.lock(key);
+                }
+            }
+            TransactionKind::Pessimistic(_) => {
+                self.pessimistic_lock_nowait(keys).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Commits the actions of the transaction. On success, we return the commit timestamp (or
     /// `None` if there was nothing to commit).
     ///
@@ -888,6 +919,81 @@ impl<PdC: PdClient> Transaction<PdC> {
                 self.buffer.lock(key.key());
             }
 
+            pairs
+        }
+    }
+
+    /// Acquire pessimistic locks with NOWAIT semantics (`wait_timeout = -1`).
+    ///
+    /// Identical to [`pessimistic_lock`] except:
+    /// - The TiKV PessimisticLockRequest carries `wait_timeout = -1`, so TiKV
+    ///   returns an error immediately when a key is held by another txn.
+    /// - Lock-resolution uses `Backoff::no_backoff()` so the client does not
+    ///   retry after encountering an active lock.
+    async fn pessimistic_lock_nowait(
+        &mut self,
+        keys: impl IntoIterator<Item = impl PessimisticLock>,
+    ) -> Result<Vec<KvPair>> {
+        debug!("acquiring pessimistic lock (nowait)");
+        assert!(
+            matches!(self.options.kind, TransactionKind::Pessimistic(_)),
+            "`pessimistic_lock_nowait` is only valid with pessimistic transactions"
+        );
+
+        let keys: Vec<_> = keys.into_iter().collect();
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let first_key = keys[0].clone().key();
+        let primary_lock = self
+            .buffer
+            .get_primary_key()
+            .unwrap_or_else(|| first_key.clone());
+        let for_update_ts = self.rpc.clone().get_timestamp().await?;
+        self.options.push_for_update_ts(for_update_ts.clone());
+        let mut request = new_pessimistic_lock_request(
+            keys.clone().into_iter(),
+            primary_lock,
+            self.timestamp.clone(),
+            MAX_TTL,
+            for_update_ts.clone(),
+            false, // need_value
+        );
+        request.wait_timeout = -1; // NOWAIT: fail immediately on lock conflict
+        let plan = PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
+            .resolve_lock(Backoff::no_backoff(), self.keyspace)
+            .preserve_shard()
+            .retry_multi_region_preserve_results(
+                self.options.retry_options.region_backoff.clone(),
+            )
+            .merge(CollectWithShard)
+            .plan();
+        let pairs = plan.execute().await;
+
+        if let Err(err) = pairs {
+            match err {
+                Error::PessimisticLockError {
+                    inner,
+                    success_keys,
+                } if !success_keys.is_empty() => {
+                    let keys = success_keys.into_iter().map(Key::from);
+                    self.pessimistic_lock_rollback(
+                        keys,
+                        self.timestamp.clone(),
+                        for_update_ts,
+                    )
+                    .await?;
+                    Err(*inner)
+                }
+                _ => Err(err),
+            }
+        } else {
+            self.buffer.primary_key_or(&first_key);
+            self.start_auto_heartbeat().await;
+            for key in keys {
+                self.buffer.lock(key.key());
+            }
             pairs
         }
     }
