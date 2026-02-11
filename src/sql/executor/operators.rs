@@ -25,6 +25,32 @@ use super::subquery::expr_contains_subquery;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use sqlparser::ast::Ident;
 
+/// Map internal DataType to PostgreSQL-style lowercase type name for error messages.
+fn pg_type_name(dt: &DataType) -> &'static str {
+    match dt {
+        DataType::Boolean => "boolean",
+        DataType::Int32 => "integer",
+        DataType::Int64 => "bigint",
+        DataType::Float64 => "double precision",
+        DataType::Text | DataType::Name => "text",
+        DataType::Numeric { .. } => "numeric",
+        DataType::Bytes => "bytea",
+        DataType::Timestamp => "timestamp without time zone",
+        DataType::TimestampTz => "timestamp with time zone",
+        DataType::Interval => "interval",
+        DataType::Uuid => "uuid",
+        DataType::Json => "json",
+        DataType::Jsonb => "jsonb",
+        DataType::Date => "date",
+        DataType::Time => "time",
+        DataType::Array(_) => "array",
+        DataType::Vector(_) => "vector",
+        DataType::Tsvector => "tsvector",
+        DataType::Tsquery => "tsquery",
+        DataType::UserDefined(_) => "user-defined",
+    }
+}
+
 pub(crate) fn rewrite_expr_for_multi_join(
     expr: &Expr,
     table_aliases: &[(String, TableSchema)],
@@ -1183,60 +1209,117 @@ impl Executor {
         }
     }
 
-    fn infer_agg_type(func_name: &str, arg: &Option<Expr>, schema: &TableSchema) -> DataType {
+    fn infer_agg_type(
+        func_name: &str,
+        arg: &Option<Expr>,
+        schema: &TableSchema,
+    ) -> Result<DataType> {
+        // Use try_infer so column-not-found / type errors surface correctly
+        // instead of being masked behind a Text default.
+        let try_infer = |a: &Expr| -> Result<DataType> {
+            crate::sql::types::try_infer_expr_type(a, schema).map_err(|e| SqlError::from(e).into())
+        };
+
         match func_name {
-            "COUNT" => DataType::Int64,
+            "COUNT" => {
+                // COUNT accepts any type, but we still validate that the arg column exists.
+                if let Some(ref a) = arg {
+                    let _ = try_infer(a)?;
+                }
+                Ok(DataType::Int64)
+            }
             "SUM" => {
                 if let Some(ref a) = arg {
-                    match infer_expr_type(a, schema) {
-                        DataType::Int32 | DataType::Int64 => DataType::Int64,
-                        DataType::Float64 => DataType::Float64,
-                        DataType::Numeric { .. } => DataType::Numeric {
+                    let arg_type = try_infer(a)?;
+                    match arg_type {
+                        DataType::Int32 | DataType::Int64 => Ok(DataType::Int64),
+                        DataType::Float64 => Ok(DataType::Float64),
+                        DataType::Numeric { .. } => Ok(DataType::Numeric {
                             precision: None,
                             scale: None,
-                        },
-                        _ => DataType::Numeric {
-                            precision: None,
-                            scale: None,
-                        },
+                        }),
+                        _ => Err(SqlError::FunctionNotFound(format!(
+                            "sum({})",
+                            pg_type_name(&arg_type)
+                        ))
+                        .into()),
                     }
                 } else {
-                    DataType::Int64
+                    Ok(DataType::Int64)
                 }
             }
             "AVG" => {
                 if let Some(ref a) = arg {
-                    match infer_expr_type(a, schema) {
-                        DataType::Float64 => DataType::Float64,
-                        _ => DataType::Numeric {
-                            precision: None,
-                            scale: None,
-                        },
+                    let arg_type = try_infer(a)?;
+                    match arg_type {
+                        DataType::Int32 | DataType::Int64 | DataType::Numeric { .. } => {
+                            Ok(DataType::Numeric {
+                                precision: None,
+                                scale: None,
+                            })
+                        }
+                        DataType::Float64 => Ok(DataType::Float64),
+                        _ => Err(SqlError::FunctionNotFound(format!(
+                            "avg({})",
+                            pg_type_name(&arg_type)
+                        ))
+                        .into()),
                     }
                 } else {
-                    DataType::Numeric {
+                    Ok(DataType::Numeric {
                         precision: None,
                         scale: None,
-                    }
+                    })
                 }
             }
             "MIN" | "MAX" => {
                 if let Some(ref a) = arg {
-                    infer_expr_type(a, schema)
+                    Ok(try_infer(a)?)
                 } else {
-                    DataType::Text
+                    Ok(DataType::Text)
                 }
             }
-            "STRING_AGG" => DataType::Text,
-            "ARRAY_AGG" => {
-                let elem_type = arg
-                    .as_ref()
-                    .map(|a| infer_expr_type(a, schema))
-                    .unwrap_or(DataType::Text);
-                DataType::Array(Box::new(elem_type))
+            "STRING_AGG" => {
+                if let Some(ref a) = arg {
+                    let arg_type = try_infer(a)?;
+                    if arg_type != DataType::Text {
+                        return Err(SqlError::FunctionNotFound(format!(
+                            "string_agg({}, text)",
+                            pg_type_name(&arg_type)
+                        ))
+                        .into());
+                    }
+                }
+                Ok(DataType::Text)
             }
-            "BOOL_AND" | "BOOL_OR" | "EVERY" => DataType::Boolean,
-            _ => DataType::Text,
+            "ARRAY_AGG" => {
+                if let Some(ref a) = arg {
+                    let elem_type = try_infer(a)?;
+                    Ok(DataType::Array(Box::new(elem_type)))
+                } else {
+                    Ok(DataType::Array(Box::new(DataType::Text)))
+                }
+            }
+            "BOOL_AND" | "BOOL_OR" | "EVERY" => {
+                if let Some(ref a) = arg {
+                    let arg_type = try_infer(a)?;
+                    if arg_type != DataType::Boolean {
+                        let pg_name = match func_name {
+                            "EVERY" => "every",
+                            "BOOL_OR" => "bool_or",
+                            _ => "bool_and",
+                        };
+                        return Err(SqlError::FunctionNotFound(format!(
+                            "{}({})",
+                            pg_name,
+                            pg_type_name(&arg_type)
+                        ))
+                        .into());
+                    }
+                }
+                Ok(DataType::Boolean)
+            }
+            _ => Ok(DataType::Text),
         }
     }
 
@@ -1248,7 +1331,7 @@ impl Executor {
         agg_names: &mut Vec<String>,
         agg_types: &mut Vec<DataType>,
         seen_sigs: &mut std::collections::HashSet<String>,
-    ) {
+    ) -> Result<()> {
         let func_name = f
             .name
             .0
@@ -1258,7 +1341,7 @@ impl Executor {
 
         let sig = agg_func_signature(f);
         if seen_sigs.contains(&sig) {
-            return;
+            return Ok(());
         }
         seen_sigs.insert(sig);
 
@@ -1280,7 +1363,7 @@ impl Executor {
         };
 
         let name = alias.unwrap_or_else(|| func_name.to_lowercase());
-        let data_type = Self::infer_agg_type(&func_name, &arg, schema);
+        let data_type = Self::infer_agg_type(&func_name, &arg, schema)?;
         let filter = f.filter.as_ref().map(|f| *f.clone());
 
         agg_exprs.push(AggregateExpr {
@@ -1293,12 +1376,13 @@ impl Executor {
         });
         agg_names.push(name);
         agg_types.push(data_type);
+        Ok(())
     }
 
     pub(crate) fn extract_aggregate_info(
         projection: &[SelectItem],
         schema: &TableSchema,
-    ) -> (Vec<AggregateExpr>, Vec<String>, Vec<DataType>) {
+    ) -> Result<(Vec<AggregateExpr>, Vec<String>, Vec<DataType>)> {
         let mut agg_exprs = Vec::new();
         let mut agg_names = Vec::new();
         let mut agg_types = Vec::new();
@@ -1321,7 +1405,7 @@ impl Executor {
                         &mut agg_names,
                         &mut agg_types,
                         &mut seen_sigs,
-                    );
+                    )?;
                     continue;
                 }
             }
@@ -1361,7 +1445,7 @@ impl Executor {
                             &mut agg_names,
                             &mut agg_types,
                             &mut seen_sigs,
-                        );
+                        )?;
                     }
                     NestedAggregateRef::ArrayAgg(arr) => {
                         let sig = format!("{}", arr).to_lowercase();
@@ -1387,7 +1471,7 @@ impl Executor {
             }
         }
 
-        (agg_exprs, agg_names, agg_types)
+        Ok((agg_exprs, agg_names, agg_types))
     }
 
     pub(crate) fn extract_group_by_info(
@@ -1442,7 +1526,7 @@ impl Executor {
         let (mut group_by_exprs, mut group_by_names, mut group_by_types) =
             Self::extract_group_by_info(group_by, &schema);
         let (mut agg_exprs, mut agg_names, mut agg_types) =
-            Self::extract_aggregate_info(projection, &schema);
+            Self::extract_aggregate_info(projection, &schema)?;
 
         Self::add_pg_get_indexdef_support_to_group_by(
             projection,
@@ -1494,7 +1578,7 @@ impl Executor {
                             &mut agg_names,
                             &mut agg_types,
                             &mut seen_sigs,
-                        );
+                        )?;
                     }
                     NestedAggregateRef::ArrayAgg(arr) => {
                         let sig = format!("{}", arr).to_lowercase();
@@ -1840,7 +1924,7 @@ impl Executor {
             all
         };
 
-        let (agg_exprs, agg_names, agg_types) = Self::extract_aggregate_info(projection, &schema);
+        let (agg_exprs, agg_names, agg_types) = Self::extract_aggregate_info(projection, &schema)?;
 
         // Pre-load rows once so we can reuse them across grouping sets.
         let was_preloaded = preloaded_rows.is_some();
@@ -4018,7 +4102,8 @@ mod tests {
         let select = get_select(&query);
         let schema = schema_with_column("x", DataType::Float64);
 
-        let (_, names, types) = Executor::extract_aggregate_info(&select.projection, &schema);
+        let (_, names, types) =
+            Executor::extract_aggregate_info(&select.projection, &schema).unwrap();
         assert_eq!(names, vec!["s".to_string(), "a".to_string()]);
         assert_eq!(types, vec![DataType::Float64, DataType::Float64]);
         assert_eq!(
@@ -4413,7 +4498,7 @@ mod tests {
         let schema = schema_with_column("x", DataType::Float64);
 
         let (agg_exprs, names, _types) =
-            Executor::extract_aggregate_info(&select.projection, &schema);
+            Executor::extract_aggregate_info(&select.projection, &schema).unwrap();
         // Should find AVG(x) as a nested aggregate
         assert_eq!(agg_exprs.len(), 1);
         assert!(
@@ -4430,11 +4515,164 @@ mod tests {
         let schema = schema_with_column("x", DataType::Int32);
 
         let (agg_exprs, _names, _types) =
-            Executor::extract_aggregate_info(&select.projection, &schema);
+            Executor::extract_aggregate_info(&select.projection, &schema).unwrap();
         // Should find COUNT(*) nested in the BinaryOp
         assert!(
             !agg_exprs.is_empty(),
             "expected at least one aggregate from nested COUNT(*)"
+        );
+    }
+
+    #[test]
+    fn test_bool_and_rejects_integer_arg() {
+        let query = parse_query("SELECT BOOL_AND(x) FROM t");
+        let select = get_select(&query);
+        let schema = schema_with_column("x", DataType::Int32);
+
+        let err = Executor::extract_aggregate_info(&select.projection, &schema).unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("bool_and(integer)") && err_str.contains("does not exist"),
+            "expected FunctionNotFound for bool_and(integer), got: {}",
+            err_str
+        );
+    }
+
+    #[test]
+    fn test_bool_or_rejects_text_arg() {
+        let query = parse_query("SELECT BOOL_OR(x) FROM t");
+        let select = get_select(&query);
+        let schema = schema_with_column("x", DataType::Text);
+
+        let err = Executor::extract_aggregate_info(&select.projection, &schema).unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("bool_or(text)") && err_str.contains("does not exist"),
+            "expected FunctionNotFound for bool_or(text), got: {}",
+            err_str
+        );
+    }
+
+    #[test]
+    fn test_sum_rejects_text_arg() {
+        let query = parse_query("SELECT SUM(x) FROM t");
+        let select = get_select(&query);
+        let schema = schema_with_column("x", DataType::Text);
+
+        let err = Executor::extract_aggregate_info(&select.projection, &schema).unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("sum(text)") && err_str.contains("does not exist"),
+            "expected FunctionNotFound for sum(text), got: {}",
+            err_str
+        );
+    }
+
+    #[test]
+    fn test_avg_rejects_boolean_arg() {
+        let query = parse_query("SELECT AVG(x) FROM t");
+        let select = get_select(&query);
+        let schema = schema_with_column("x", DataType::Boolean);
+
+        let err = Executor::extract_aggregate_info(&select.projection, &schema).unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("avg(boolean)") && err_str.contains("does not exist"),
+            "expected FunctionNotFound for avg(boolean), got: {}",
+            err_str
+        );
+    }
+
+    #[test]
+    fn test_bool_and_accepts_boolean_arg() {
+        let query = parse_query("SELECT BOOL_AND(x) FROM t");
+        let select = get_select(&query);
+        let schema = schema_with_column("x", DataType::Boolean);
+
+        let (exprs, _, types) =
+            Executor::extract_aggregate_info(&select.projection, &schema).unwrap();
+        assert_eq!(exprs.len(), 1);
+        assert_eq!(types[0], DataType::Boolean);
+    }
+
+    #[test]
+    fn test_sum_accepts_numeric_types() {
+        for (dt, expected) in [
+            (DataType::Int32, DataType::Int64),
+            (DataType::Int64, DataType::Int64),
+            (DataType::Float64, DataType::Float64),
+            (
+                DataType::Numeric {
+                    precision: None,
+                    scale: None,
+                },
+                DataType::Numeric {
+                    precision: None,
+                    scale: None,
+                },
+            ),
+        ] {
+            let query = parse_query("SELECT SUM(x) FROM t");
+            let select = get_select(&query);
+            let schema = schema_with_column("x", dt.clone());
+
+            let (_, _, types) =
+                Executor::extract_aggregate_info(&select.projection, &schema).unwrap();
+            assert_eq!(
+                types[0], expected,
+                "SUM({}) should produce {}",
+                dt, expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_bool_and_integer_produces_correct_sqlstate() {
+        let query = parse_query("SELECT BOOL_AND(x) FROM t");
+        let select = get_select(&query);
+        let schema = schema_with_column("x", DataType::Int32);
+
+        let err = Executor::extract_aggregate_info(&select.projection, &schema).unwrap_err();
+        // The error must downcast to SqlError::FunctionNotFound with SQLSTATE 42883
+        let sql_err = err.downcast_ref::<SqlError>().expect("should be SqlError");
+        assert_eq!(sql_err.sqlstate(), "42883");
+    }
+
+    #[test]
+    fn test_aggregate_on_nonexistent_column_produces_column_not_found() {
+        // SUM(nonexistent) should give "column does not exist" (42703),
+        // NOT "function sum(text) does not exist" (42883).
+        let query = parse_query("SELECT SUM(nonexistent) FROM t");
+        let select = get_select(&query);
+        let schema = schema_with_column("x", DataType::Int32);
+
+        let err = Executor::extract_aggregate_info(&select.projection, &schema).unwrap_err();
+        let sql_err = err.downcast_ref::<SqlError>().expect("should be SqlError");
+        assert_eq!(
+            sql_err.sqlstate(),
+            "42703",
+            "expected ColumnNotFound (42703), got {}: {}",
+            sql_err.sqlstate(),
+            err
+        );
+    }
+
+    #[test]
+    fn test_count_nonexistent_column_produces_column_not_found() {
+        // COUNT(nonexistent) should give "column does not exist" (42703),
+        // not silently proceed and fail at eval time.
+        let query = parse_query("SELECT COUNT(nonexistent) FROM t");
+        let select = get_select(&query);
+        let schema = schema_with_column("x", DataType::Int32);
+
+        let err = Executor::extract_aggregate_info(&select.projection, &schema).unwrap_err();
+        let sql_err = err.downcast_ref::<SqlError>().expect("should be SqlError");
+        assert_eq!(
+            sql_err.sqlstate(),
+            "42703",
+            "expected ColumnNotFound (42703), got {}: {}",
+            sql_err.sqlstate(),
+            err
         );
     }
 }

@@ -584,7 +584,7 @@ async fn update_row_indexes(
     new_row: &Row,
 ) -> Result<()> {
     for index in &schema.indexes {
-        if index_helpers::index_values_unchanged(index, schema, old_row, new_row) {
+        if index_helpers::index_values_unchanged(index, schema, old_row, new_row)? {
             continue;
         }
 
@@ -1110,7 +1110,7 @@ pub async fn execute_update_row(
     }
 
     for index in &schema.indexes {
-        if !pk_changed && index_helpers::index_values_unchanged(index, schema, old_row, &new_row) {
+        if !pk_changed && index_helpers::index_values_unchanged(index, schema, old_row, &new_row)? {
             continue;
         }
 
@@ -1158,7 +1158,7 @@ pub async fn execute_update_row(
         .await?;
 
     for index in &schema.indexes {
-        if !pk_changed && index_helpers::index_values_unchanged(index, schema, old_row, &new_row) {
+        if !pk_changed && index_helpers::index_values_unchanged(index, schema, old_row, &new_row)? {
             continue;
         }
 

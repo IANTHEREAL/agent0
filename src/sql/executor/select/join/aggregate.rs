@@ -79,7 +79,7 @@ impl Executor {
         );
 
         let (mut agg_exprs, mut agg_names, mut agg_types) =
-            Executor::extract_aggregate_info(&rewritten_projection, &join_schema);
+            Executor::extract_aggregate_info(&rewritten_projection, &join_schema)?;
 
         if let Some(having_expr) = &select.having {
             let rewritten_having_for_agg =
@@ -132,7 +132,7 @@ impl Executor {
                             &mut agg_names,
                             &mut agg_types,
                             &mut seen_sigs,
-                        );
+                        )?;
                     }
                     NestedAggregateRef::ArrayAgg(arr) => {
                         let sig = format!("{}", arr).to_lowercase();

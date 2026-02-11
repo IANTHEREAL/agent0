@@ -42,7 +42,11 @@ fn pg_weight_and_firstdigit(d: &Decimal) -> (i32, i32) {
         while end > 0 {
             let start = end.saturating_sub(group_digits);
             let chunk = &int_part[start..end];
-            int_groups.push(chunk.parse::<i32>().unwrap_or(0));
+            int_groups.push(
+                chunk
+                    .parse::<i32>()
+                    .expect("digit-only chunk from u128 mantissa must parse"),
+            );
             end = start;
         }
         int_groups.reverse();
@@ -58,7 +62,10 @@ fn pg_weight_and_firstdigit(d: &Decimal) -> (i32, i32) {
             if buf.len() < group_digits {
                 buf.push_str(&"0".repeat(group_digits - buf.len()));
             }
-            groups.push(buf.parse::<i32>().unwrap_or(0));
+            groups.push(
+                buf.parse::<i32>()
+                    .expect("digit-only chunk from u128 mantissa must parse"),
+            );
             start = end;
         }
     }

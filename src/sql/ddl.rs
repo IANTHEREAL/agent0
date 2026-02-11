@@ -994,6 +994,11 @@ pub async fn execute_create_index(
     }
 
     let method = using.map(|m| m.value.to_lowercase());
+
+    if let Some(pred_expr) = predicate {
+        index_helpers::validate_index_predicate(pred_expr, &schema)?;
+    }
+
     let predicate_str = predicate.map(|p| p.to_string());
 
     let mut idx_cols = Vec::new();

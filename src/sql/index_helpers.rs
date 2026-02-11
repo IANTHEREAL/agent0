@@ -1,7 +1,8 @@
 //! Index evaluation helpers for partial and expression indexes.
 
-use crate::types::{IndexDef, Row, TableSchema, Value};
+use crate::types::{DataType, IndexDef, Row, TableSchema, Value};
 use anyhow::Result;
+use sqlparser::ast::Expr;
 
 pub fn is_index_materializable(index: &IndexDef) -> bool {
     let is_btree = index
@@ -13,30 +14,63 @@ pub fn is_index_materializable(index: &IndexDef) -> bool {
     is_btree && (!index.columns.is_empty() || !index.expressions.is_empty())
 }
 
+/// Validate that a WHERE predicate expression for a partial index type-checks
+/// and produces a boolean result. PostgreSQL performs this validation at DDL time.
+pub fn validate_index_predicate(predicate: &Expr, schema: &TableSchema) -> Result<()> {
+    match super::types::try_infer_expr_type(predicate, schema) {
+        Ok(DataType::Boolean) => Ok(()),
+        Ok(actual_type) => Err(anyhow::anyhow!(
+            "argument of WHERE must be type boolean, not type {}",
+            actual_type
+        )),
+        // If type inference fails (e.g. column not found), surface that error
+        // with the correct SQLSTATE code via SqlError conversion.
+        Err(e) => Err(super::error::SqlError::from(e).into()),
+    }
+}
+
 pub fn eval_index_predicate(index: &IndexDef, schema: &TableSchema, row: &Row) -> Result<bool> {
     let Some(predicate) = &index.predicate else {
         return Ok(true);
     };
 
     let sql = format!("SELECT {}", predicate);
-    if let Ok(stmts) = super::parse_sql(&sql) {
-        if let Some(sqlparser::ast::Statement::Query(query)) = stmts.into_iter().next() {
-            if let sqlparser::ast::SetExpr::Select(select) = *query.body {
-                if let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) =
-                    select.projection.into_iter().next()
-                {
-                    let value = super::expr::eval_expr(&expr, Some(row), Some(schema))?;
-                    return match value {
-                        Value::Boolean(b) => Ok(b),
-                        Value::Null => Ok(false),
-                        _ => Ok(true),
-                    };
-                }
-            }
-        }
-    }
+    let stmts = super::parse_sql(&sql)
+        .map_err(|e| anyhow::anyhow!("failed to parse index predicate '{}': {}", predicate, e))?;
 
-    Ok(true)
+    let stmt = stmts
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("empty parse result for index predicate '{}'", predicate))?;
+
+    let query = match stmt {
+        sqlparser::ast::Statement::Query(q) => q,
+        _ => anyhow::bail!("index predicate '{}' did not parse as a query", predicate),
+    };
+
+    let select = match *query.body {
+        sqlparser::ast::SetExpr::Select(s) => s,
+        _ => anyhow::bail!("index predicate '{}' did not parse as a SELECT", predicate),
+    };
+
+    let expr = match select.projection.into_iter().next() {
+        Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) => e,
+        _ => anyhow::bail!(
+            "index predicate '{}' did not produce an expression",
+            predicate
+        ),
+    };
+
+    let value = super::expr::eval_expr(&expr, Some(row), Some(schema))?;
+    match value {
+        Value::Boolean(b) => Ok(b),
+        Value::Null => Ok(false),
+        _ => anyhow::bail!(
+            "index predicate '{}' evaluated to non-boolean value: {:?}",
+            predicate,
+            value
+        ),
+    }
 }
 
 pub fn get_index_values_with_expressions(
@@ -82,22 +116,19 @@ pub fn index_values_unchanged(
     schema: &TableSchema,
     old_row: &Row,
     new_row: &Row,
-) -> bool {
+) -> Result<bool> {
     if is_index_materializable(index) {
-        let old_pred = eval_index_predicate(index, schema, old_row).unwrap_or(true);
-        let new_pred = eval_index_predicate(index, schema, new_row).unwrap_or(true);
+        let old_pred = eval_index_predicate(index, schema, old_row)?;
+        let new_pred = eval_index_predicate(index, schema, new_row)?;
         if old_pred != new_pred {
-            return false;
+            return Ok(false);
         }
 
-        let old_vals = get_index_values_with_expressions(index, schema, old_row);
-        let new_vals = get_index_values_with_expressions(index, schema, new_row);
-        match (old_vals, new_vals) {
-            (Ok(old_values), Ok(new_values)) => old_values == new_values,
-            _ => false,
-        }
+        let old_vals = get_index_values_with_expressions(index, schema, old_row)?;
+        let new_vals = get_index_values_with_expressions(index, schema, new_row)?;
+        Ok(old_vals == new_vals)
     } else {
-        false
+        Ok(false)
     }
 }
 
@@ -195,7 +226,7 @@ mod tests {
         let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
         let new_row = Row::new(vec![Value::Text("Alice".to_string())]);
 
-        assert!(index_values_unchanged(&index, &schema, &old_row, &new_row));
+        assert!(index_values_unchanged(&index, &schema, &old_row, &new_row).unwrap());
     }
 
     #[test]
@@ -213,7 +244,7 @@ mod tests {
         let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
         let new_row = Row::new(vec![Value::Text("Bob".to_string())]);
 
-        assert!(!index_values_unchanged(&index, &schema, &old_row, &new_row));
+        assert!(!index_values_unchanged(&index, &schema, &old_row, &new_row).unwrap());
     }
 
     #[test]
@@ -231,7 +262,7 @@ mod tests {
         let old_row = Row::new(vec![Value::Text("Alice".to_string())]);
         let new_row = Row::new(vec![Value::Text("Alice".to_string())]);
 
-        assert!(index_values_unchanged(&index, &schema, &old_row, &new_row));
+        assert!(index_values_unchanged(&index, &schema, &old_row, &new_row).unwrap());
     }
 
     #[test]
@@ -257,7 +288,7 @@ mod tests {
             Value::Text("new bio".to_string()),
         ]);
 
-        assert!(index_values_unchanged(&index, &schema, &old_row, &new_row));
+        assert!(index_values_unchanged(&index, &schema, &old_row, &new_row).unwrap());
     }
 
     #[test]
@@ -275,6 +306,77 @@ mod tests {
         let old_row = Row::new(vec![Value::Text("a@b.com".to_string())]);
         let new_row = Row::new(vec![Value::Text("a@b.com".to_string())]);
 
-        assert!(index_values_unchanged(&index, &schema, &old_row, &new_row));
+        assert!(index_values_unchanged(&index, &schema, &old_row, &new_row).unwrap());
+    }
+
+    fn parse_expr(sql_fragment: &str) -> Expr {
+        let sql = format!("SELECT {}", sql_fragment);
+        let stmts = super::super::parse_sql(&sql).unwrap();
+        let stmt = stmts.into_iter().next().unwrap();
+        match stmt {
+            sqlparser::ast::Statement::Query(q) => match *q.body {
+                sqlparser::ast::SetExpr::Select(s) => match s.projection.into_iter().next() {
+                    Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) => e,
+                    other => panic!("unexpected projection: {:?}", other),
+                },
+                other => panic!("unexpected set expr: {:?}", other),
+            },
+            other => panic!("unexpected statement: {:?}", other),
+        }
+    }
+
+    fn test_col_typed(name: &str, data_type: crate::types::DataType) -> crate::types::ColumnDef {
+        crate::types::ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_index_predicate_accepts_boolean_expr() {
+        let schema = test_schema(vec![test_col_typed(
+            "active",
+            crate::types::DataType::Boolean,
+        )]);
+        let expr = parse_expr("active");
+        assert!(validate_index_predicate(&expr, &schema).is_ok());
+    }
+
+    #[test]
+    fn test_validate_index_predicate_accepts_comparison() {
+        let schema = test_schema(vec![test_col_typed("age", crate::types::DataType::Int32)]);
+        let expr = parse_expr("age > 0");
+        assert!(validate_index_predicate(&expr, &schema).is_ok());
+    }
+
+    #[test]
+    fn test_validate_index_predicate_rejects_non_boolean() {
+        let schema = test_schema(vec![test_col_typed("name", crate::types::DataType::Text)]);
+        let expr = parse_expr("name");
+        let err = validate_index_predicate(&expr, &schema).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("argument of WHERE must be type boolean"),
+            "expected boolean type error, got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_validate_index_predicate_rejects_integer_expr() {
+        let schema = test_schema(vec![test_col_typed("x", crate::types::DataType::Int32)]);
+        let expr = parse_expr("x + 1");
+        let err = validate_index_predicate(&expr, &schema).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("argument of WHERE must be type boolean"),
+            "expected boolean type error, got: {}",
+            err
+        );
     }
 }

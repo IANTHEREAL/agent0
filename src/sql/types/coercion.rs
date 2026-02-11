@@ -182,7 +182,12 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
         "HashLongArrow" | "#>>" => Some(DataType::Text),
         "AtArrow" | "ArrowAt" | "@>" | "<@" | "?" | "?|" | "?&" => Some(DataType::Boolean),
 
-        // Array operators
+        // Regex operators (PostgreSQL-specific, always return boolean)
+        "PGRegexMatch" | "PGRegexIMatch" | "PGRegexNotMatch" | "PGRegexNotIMatch" | "~" | "~*"
+        | "!~" | "!~*" => Some(DataType::Boolean),
+
+        // Array overlap operator
+        "PGOverlap" => Some(DataType::Boolean),
         "&&" if matches!(left, DataType::Array(_)) => Some(DataType::Boolean),
 
         _ => None,

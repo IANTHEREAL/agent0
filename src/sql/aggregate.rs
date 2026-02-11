@@ -169,16 +169,20 @@ impl Aggregator {
             Aggregator::ArrayAgg { values } => {
                 values.push(val.clone());
             }
-            Aggregator::BoolAnd(current) => {
-                if let Value::Boolean(b) = val {
+            Aggregator::BoolAnd(current) => match val {
+                Value::Null => {}
+                Value::Boolean(b) => {
                     *current = Some(current.unwrap_or(true) && *b);
                 }
-            }
-            Aggregator::BoolOr(current) => {
-                if let Value::Boolean(b) = val {
+                _ => return Err(anyhow!("BOOL_AND requires boolean type")),
+            },
+            Aggregator::BoolOr(current) => match val {
+                Value::Null => {}
+                Value::Boolean(b) => {
                     *current = Some(current.unwrap_or(false) || *b);
                 }
-            }
+                _ => return Err(anyhow!("BOOL_OR requires boolean type")),
+            },
         }
         Ok(())
     }

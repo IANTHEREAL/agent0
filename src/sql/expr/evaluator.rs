@@ -32,14 +32,15 @@ fn is_string_literal_expr(expr: &Expr) -> bool {
     }
 }
 
-fn infer_expr_type_for_validation<C: EvalContext>(ctx: &C, expr: &Expr) -> DataType {
+fn try_infer_expr_type_for_validation<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<DataType> {
     if let Some(data_type) = ctx.column_type(expr) {
-        return data_type.clone();
+        return Ok(data_type.clone());
     }
 
     let empty_schema = TableSchema::default();
     let schema = ctx.schema().unwrap_or(&empty_schema);
-    crate::sql::types::infer_expr_type(expr, schema)
+    crate::sql::types::try_infer_expr_type(expr, schema)
+        .map_err(|e| crate::sql::error::SqlError::from(e).into())
 }
 
 fn ensure_text_or_explicit_null_operand<C: EvalContext>(
@@ -51,14 +52,14 @@ fn ensure_text_or_explicit_null_operand<C: EvalContext>(
         return Ok(());
     }
 
-    match infer_expr_type_for_validation(ctx, expr) {
+    match try_infer_expr_type_for_validation(ctx, expr)? {
         DataType::Text => Ok(()),
         _ => Err(anyhow!(err_msg)),
     }
 }
 
 fn ensure_array_operand<C: EvalContext>(ctx: &C, expr: &Expr, err_msg: &'static str) -> Result<()> {
-    match infer_expr_type_for_validation(ctx, expr) {
+    match try_infer_expr_type_for_validation(ctx, expr)? {
         DataType::Array(_) => Ok(()),
         _ => Err(anyhow!(err_msg)),
     }
@@ -139,8 +140,8 @@ fn eval_array_subquery_with_context<C: EvalContext, Q: AsRef<Query>>(
     // `ARRAY(SELECT ARRAY[1,2])` => `{{1,2}}`), while still treating set-returning projections as a
     // list (e.g. jsonb_array_elements_text => `{...}`).
     match eval_expr_impl(ctx, proj_expr)? {
-        Value::Array(arr) => match infer_expr_type_for_validation(ctx, proj_expr) {
-            DataType::Array(_) => Ok(Value::Array(vec![Value::Array(arr)])),
+        Value::Array(arr) => match try_infer_expr_type_for_validation(ctx, proj_expr) {
+            Ok(DataType::Array(_)) => Ok(Value::Array(vec![Value::Array(arr)])),
             _ => Ok(Value::Array(arr)),
         },
         other => Ok(Value::Array(vec![other])),
@@ -177,8 +178,9 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(
             None => {
                 let empty_schema = TableSchema::default();
                 let schema = ctx.schema().unwrap_or(&empty_schema);
-                match crate::sql::types::infer_expr_type(expr, schema) {
-                    DataType::Boolean => Ok(()),
+                match crate::sql::types::try_infer_expr_type(expr, schema) {
+                    Ok(DataType::Boolean) => Ok(()),
+                    Err(e) => Err(crate::sql::error::SqlError::from(e).into()),
                     _ => Err(anyhow!(err_msg)),
                 }
             }
@@ -329,8 +331,9 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(
         other => {
             let empty_schema = TableSchema::default();
             let schema = ctx.schema().unwrap_or(&empty_schema);
-            match crate::sql::types::infer_expr_type(other, schema) {
-                DataType::Boolean => Ok(()),
+            match crate::sql::types::try_infer_expr_type(other, schema) {
+                Ok(DataType::Boolean) => Ok(()),
+                Err(e) => Err(crate::sql::error::SqlError::from(e).into()),
                 _ => Err(anyhow!(err_msg)),
             }
         }

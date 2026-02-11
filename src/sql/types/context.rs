@@ -142,7 +142,6 @@ impl<'a> TypeContext<'a> {
         })
     }
 
-    #[allow(dead_code)] // type inference module
     pub fn available_columns(&self) -> Vec<String> {
         let mut cols = Vec::new();
         for (alias, schema) in &self.tables {

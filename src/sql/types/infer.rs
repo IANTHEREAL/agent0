@@ -41,7 +41,10 @@ impl<'a> TypeInferrer<'a> {
 
             Expr::CompoundIdentifier(parts) => {
                 if parts.is_empty() {
-                    return Ok(DataType::Text);
+                    return Err(TypeError::ColumnNotFound {
+                        name: String::new(),
+                        available: self.ctx.available_columns(),
+                    });
                 }
 
                 // First try: full name as a single column (for JOIN schemas with "table.col" column names)
@@ -88,7 +91,10 @@ impl<'a> TypeInferrer<'a> {
                     }
                 }
 
-                Ok(DataType::Text)
+                Err(TypeError::ColumnNotFound {
+                    name: full_name,
+                    available: self.ctx.available_columns(),
+                })
             }
 
             Expr::Value(val) => Ok(self.infer_value(val)),
@@ -253,11 +259,13 @@ impl<'a> TypeInferrer<'a> {
             .args
             .iter()
             .filter_map(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self.infer(expr).ok(),
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
+                    Some(self.infer(expr).unwrap_or(DataType::Text))
+                }
                 FunctionArg::Named {
                     arg: FunctionArgExpr::Expr(expr),
                     ..
-                } => self.infer(expr).ok(),
+                } => Some(self.infer(expr).unwrap_or(DataType::Text)),
                 FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Some(DataType::Int64),
                 _ => None,
             })

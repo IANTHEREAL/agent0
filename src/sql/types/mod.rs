@@ -34,7 +34,6 @@ pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
     inferrer.infer(expr).unwrap_or(DataType::Text)
 }
 
-#[allow(dead_code)] // type inference module, partially integrated
 pub fn try_infer_expr_type(expr: &Expr, schema: &TableSchema) -> Result<DataType, TypeError> {
     let ctx = TypeContext::single(schema);
     let mut inferrer = TypeInferrer::new(ctx);

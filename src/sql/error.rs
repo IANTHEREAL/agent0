@@ -4,6 +4,7 @@
 //! PostgreSQL wire protocol error responses. Uses `#[from] anyhow::Error`
 //! as a bridge so existing `anyhow!()` call sites can be migrated gradually.
 
+use crate::sql::types::TypeError;
 use crate::types::DataType;
 
 /// Structured SQL error with SQLSTATE code support.
@@ -109,6 +110,17 @@ impl SqlError {
     #[allow(dead_code)] // PG error reporting API
     pub fn severity(&self) -> &'static str {
         "ERROR"
+    }
+}
+
+impl From<TypeError> for SqlError {
+    fn from(e: TypeError) -> Self {
+        match e {
+            TypeError::ColumnNotFound { name, .. } => SqlError::ColumnNotFound { column: name },
+            TypeError::AmbiguousColumn { name, .. } => SqlError::AmbiguousColumn(name),
+            TypeError::UnknownFunction(name) => SqlError::FunctionNotFound(name),
+            other => SqlError::Internal(anyhow::anyhow!("{}", other)),
+        }
     }
 }
 
