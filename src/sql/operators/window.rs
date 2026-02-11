@@ -410,12 +410,14 @@ impl WindowOperator {
         Ok(groups)
     }
 
-    /// Find which peer group a given position belongs to.
+    /// Find which peer group a given position belongs to (binary search, O(log G)).
     fn peer_group_of(peer_groups: &[(usize, usize)], pos: usize) -> usize {
-        peer_groups
-            .iter()
-            .position(|(start, end)| pos >= *start && pos < *end)
-            .unwrap_or(0)
+        debug_assert!(!peer_groups.is_empty(), "peer_groups must not be empty");
+        // Binary search: find the last group whose start <= pos
+        let idx = peer_groups.partition_point(|&(start, _)| start <= pos);
+        // partition_point returns the first index where start > pos,
+        // so the group is at idx - 1
+        idx.saturating_sub(1)
     }
 
     fn get_frame_bounds(

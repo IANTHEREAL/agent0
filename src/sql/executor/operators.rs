@@ -3354,7 +3354,9 @@ impl Executor {
             Expr::Function(f) => {
                 let new_over = match &f.over {
                     Some(WindowType::NamedWindow(name)) => {
-                        // Find the named window definition
+                        // Find the named window definition.
+                        // If not found, keep as NamedWindow — extraction will skip it
+                        // and the query will fail with a column-not-found error at eval time.
                         named_window
                             .iter()
                             .find(|def| def.0.value.eq_ignore_ascii_case(&name.value))
@@ -3409,6 +3411,78 @@ impl Executor {
                 data_type: data_type.clone(),
                 format: format.clone(),
             },
+            Expr::TryCast {
+                expr: inner,
+                data_type,
+                format,
+            } => Expr::TryCast {
+                expr: Box::new(Self::resolve_named_windows_in_expr(inner, named_window)),
+                data_type: data_type.clone(),
+                format: format.clone(),
+            },
+            Expr::IsNull(e) => {
+                Expr::IsNull(Box::new(Self::resolve_named_windows_in_expr(e, named_window)))
+            }
+            Expr::IsNotNull(e) => {
+                Expr::IsNotNull(Box::new(Self::resolve_named_windows_in_expr(e, named_window)))
+            }
+            Expr::IsTrue(e) => {
+                Expr::IsTrue(Box::new(Self::resolve_named_windows_in_expr(e, named_window)))
+            }
+            Expr::IsFalse(e) => {
+                Expr::IsFalse(Box::new(Self::resolve_named_windows_in_expr(e, named_window)))
+            }
+            Expr::IsNotTrue(e) => {
+                Expr::IsNotTrue(Box::new(Self::resolve_named_windows_in_expr(e, named_window)))
+            }
+            Expr::IsNotFalse(e) => {
+                Expr::IsNotFalse(Box::new(Self::resolve_named_windows_in_expr(e, named_window)))
+            }
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|o| Box::new(Self::resolve_named_windows_in_expr(o, named_window))),
+                conditions: conditions
+                    .iter()
+                    .map(|c| Self::resolve_named_windows_in_expr(c, named_window))
+                    .collect(),
+                results: results
+                    .iter()
+                    .map(|r| Self::resolve_named_windows_in_expr(r, named_window))
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(Self::resolve_named_windows_in_expr(e, named_window))),
+            },
+            Expr::InList {
+                expr: e,
+                list,
+                negated,
+            } => Expr::InList {
+                expr: Box::new(Self::resolve_named_windows_in_expr(e, named_window)),
+                list: list
+                    .iter()
+                    .map(|i| Self::resolve_named_windows_in_expr(i, named_window))
+                    .collect(),
+                negated: *negated,
+            },
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => Expr::Between {
+                expr: Box::new(Self::resolve_named_windows_in_expr(expr, named_window)),
+                negated: *negated,
+                low: Box::new(Self::resolve_named_windows_in_expr(low, named_window)),
+                high: Box::new(Self::resolve_named_windows_in_expr(high, named_window)),
+            },
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => expr.clone(),
             other => other.clone(),
         }
     }
