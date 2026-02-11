@@ -25,8 +25,8 @@ impl DistinctOperator {
         }
     }
 
-    fn row_to_key(row: &Row) -> Vec<u8> {
-        serialize_values_for_key(&row.values).unwrap_or_default()
+    fn row_to_key(row: &Row) -> Result<Vec<u8>> {
+        serialize_values_for_key(&row.values)
     }
 }
 
@@ -49,7 +49,7 @@ impl PhysicalOperator for DistinctOperator {
         }
 
         while let Some(row) = self.child.next(ctx).await? {
-            let key = Self::row_to_key(&row);
+            let key = Self::row_to_key(&row)?;
             if self.seen.insert(key) {
                 return Ok(Some(row));
             }
@@ -105,7 +105,7 @@ impl DistinctOnOperator {
         for expr in &self.on_exprs {
             key_values.push(eval_expr(expr, Some(row), Some(schema))?);
         }
-        Ok(serialize_values_for_key(&key_values).unwrap_or_default())
+        serialize_values_for_key(&key_values)
     }
 }
 
@@ -238,8 +238,8 @@ mod tests {
         let row1 = Row::new(vec![Value::Numeric(d1)]);
         let row2 = Row::new(vec![Value::Numeric(d2)]);
         assert_eq!(
-            DistinctOperator::row_to_key(&row1),
-            DistinctOperator::row_to_key(&row2)
+            DistinctOperator::row_to_key(&row1).unwrap(),
+            DistinctOperator::row_to_key(&row2).unwrap()
         );
     }
 }

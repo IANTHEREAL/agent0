@@ -574,7 +574,7 @@ pub(super) fn project_join_output(
         };
 
     let projected_rows = if matches!(&select.distinct, Some(Distinct::Distinct)) {
-        dedup_rows(projected_rows)
+        dedup_rows(projected_rows)?
     } else {
         projected_rows
     };

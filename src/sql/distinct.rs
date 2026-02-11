@@ -5,7 +5,6 @@
 
 use std::collections::HashSet;
 
-#[cfg(test)]
 use anyhow::Result;
 #[cfg(test)]
 use sqlparser::ast::Expr;
@@ -18,16 +17,16 @@ use crate::types::TableSchema;
 use crate::types::{Row, Value};
 
 /// Deduplicate rows based on their serialized values
-pub fn dedup_rows(rows: Vec<Row>) -> Vec<Row> {
+pub fn dedup_rows(rows: Vec<Row>) -> Result<Vec<Row>> {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut result = Vec::new();
     for row in rows {
-        let key = serialize_values_for_key(&row.values).unwrap_or_default();
+        let key = serialize_values_for_key(&row.values)?;
         if seen.insert(key) {
             result.push(row);
         }
     }
-    result
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -134,7 +133,7 @@ mod tests {
                 values: vec![Value::Float64(0.0)],
             },
         ];
-        let result = dedup_rows(rows);
+        let result = dedup_rows(rows).unwrap();
         assert_eq!(result.len(), 4);
     }
 
