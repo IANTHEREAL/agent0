@@ -123,6 +123,7 @@ impl Executor {
                             search_path,
                             names,
                             *if_exists,
+                            *cascade,
                         )
                         .await
                     }
@@ -134,6 +135,7 @@ impl Executor {
                             search_path,
                             names,
                             *if_exists,
+                            *cascade,
                         )
                         .await
                     }

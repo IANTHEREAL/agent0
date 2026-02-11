@@ -1,0 +1,65 @@
+?column?
+BEFORE_TABLE=1
+(1 row)
+?column?
+BEFORE_V1=1
+(1 row)
+?column?
+BEFORE_V2=1
+(1 row)
+?column?
+BEFORE_UNREL=1
+(1 row)
+?column?
+AFTER_V1=0
+(1 row)
+?column?
+AFTER_V2=0
+(1 row)
+?column?
+AFTER_UNREL=1
+(1 row)
+answer
+42
+(1 row)
+?column?
+MID_V2=0
+(1 row)
+?column?
+MID_V3=0
+(1 row)
+?column?
+MID_TABLE=1
+(1 row)
+?column?
+SHORT_VIEW=1
+(1 row)
+id
+(0 rows)
+?column?
+CYCLE_V1=0
+(1 row)
+?column?
+CYCLE_V2=0
+(1 row)
+?column?
+CTE_VIEW=1
+(1 row)
+id
+42
+(1 row)
+?column?
+MULTI_V1=0
+(1 row)
+?column?
+MULTI_V2=0
+(1 row)
+?column?
+SELF_V=0
+(1 row)
+?column?
+MULTI_MV1=0
+(1 row)
+?column?
+MULTI_MV2=0
+(1 row)
