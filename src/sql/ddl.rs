@@ -1416,6 +1416,14 @@ pub async fn execute_drop_materialized_view(
             ));
         }
         if exists {
+            for trigger in store
+                .list_triggers_for_table(txn, db_id, &resolved.full)
+                .await?
+            {
+                let _ = store
+                    .drop_trigger(txn, db_id, &resolved.full, &trigger.name)
+                    .await?;
+            }
             drop_owned_sequences_for_table(store, txn, db_id, &resolved.full).await?;
             store.drop_table(txn, db_id, &resolved.full).await?;
         }
@@ -1524,26 +1532,52 @@ fn relation_matches(rel_parts: &[String], target: &str, view_schema: &str) -> bo
     }
 }
 
-/// Collect CTE alias names that are "pure shadows" — the CTE body does
-/// NOT reference a table with the same name, so the outer `FROM <alias>`
-/// is guaranteed to resolve to the CTE, not a real table.
+/// Check whether `view_sql` references any of the fully-qualified names in
+/// `targets` by parsing the SQL and visiting all relation references.
 ///
-/// CTEs whose body references the same-named table (e.g.
-/// `WITH orders AS (SELECT * FROM orders WHERE …)`) are excluded from
-/// this set because there IS a real dependency on the table, even though
-/// the outer query's reference resolves to the CTE.
-fn collect_pure_cte_shadows(stmts: &[sqlparser::ast::Statement]) -> HashSet<String> {
+/// `view_schema` is the schema the view lives in; it is used to scope
+/// unqualified relation references and avoid cross-schema false positives.
+///
+/// CTE aliases are tracked per-scope using a stack so that both top-level
+/// and nested `WITH` clauses (e.g. CTEs inside subqueries) correctly shadow
+/// table names (#638, #641).  A CTE whose body does NOT reference a table
+/// with the same name is a "pure shadow" — its alias is added to the scope
+/// and any matching unqualified `FROM <alias>` is skipped.
+fn view_references_any(view_sql: &str, view_schema: &str, targets: &[String]) -> bool {
     use core::ops::ControlFlow;
-    use sqlparser::ast::visit_relations;
+    use sqlparser::ast::{visit_relations, Visit, Visitor};
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
 
-    let mut shadow_names = HashSet::new();
-    for stmt in stmts {
-        if let sqlparser::ast::Statement::Query(query) = stmt {
+    let dialect = PostgreSqlDialect {};
+    let stmts = match Parser::parse_sql(&dialect, view_sql) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    struct ScopeAwareChecker<'a> {
+        view_schema: &'a str,
+        targets: &'a [String],
+        /// Stack of CTE pure-shadow sets — one entry per enclosing Query.
+        shadow_stack: Vec<HashSet<String>>,
+        found: bool,
+    }
+
+    impl Visitor for ScopeAwareChecker<'_> {
+        type Break = ();
+
+        fn pre_visit_query(
+            &mut self,
+            query: &sqlparser::ast::Query,
+        ) -> ControlFlow<Self::Break> {
+            let mut shadows = HashSet::new();
             if let Some(with) = &query.with {
                 for cte in &with.cte_tables {
                     let alias = names::normalize_ident(&cte.alias.name);
-                    // Check whether the CTE body itself references a table
-                    // with the same name (real dependency, not a shadow).
+                    // A CTE is a "pure shadow" if its body does NOT reference
+                    // a table with the same unqualified name.  CTEs whose body
+                    // wraps the real table (e.g. `WITH t AS (SELECT * FROM t)`)
+                    // are excluded — there IS a real dependency.
                     let mut body_refs_same = false;
                     let _ = visit_relations(&*cte.query, |rel| {
                         if body_refs_same {
@@ -1558,62 +1592,61 @@ fn collect_pure_cte_shadows(stmts: &[sqlparser::ast::Statement]) -> HashSet<Stri
                         ControlFlow::<()>::Continue(())
                     });
                     if !body_refs_same {
-                        shadow_names.insert(alias);
+                        shadows.insert(alias);
                     }
                 }
             }
+            self.shadow_stack.push(shadows);
+            ControlFlow::Continue(())
         }
-    }
-    shadow_names
-}
 
-/// Check whether `view_sql` references any of the fully-qualified names in
-/// `targets` by parsing the SQL and visiting all relation references.
-///
-/// `view_schema` is the schema the view lives in; it is used to scope
-/// unqualified relation references and avoid cross-schema false positives.
-/// Pure CTE shadow aliases (where the CTE body does NOT reference the
-/// same-named table) are excluded so that shadowed names do not cause
-/// false-positive drops (#638).
-fn view_references_any(view_sql: &str, view_schema: &str, targets: &[String]) -> bool {
-    use core::ops::ControlFlow;
-    use sqlparser::ast::visit_relations;
-    use sqlparser::dialect::PostgreSqlDialect;
-    use sqlparser::parser::Parser;
-
-    let dialect = PostgreSqlDialect {};
-    let stmts = match Parser::parse_sql(&dialect, view_sql) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-
-    let pure_shadows = collect_pure_cte_shadows(&stmts);
-
-    let mut found = false;
-    let _ = visit_relations(&stmts, |relation| {
-        if found {
-            return ControlFlow::Break(());
+        fn post_visit_query(
+            &mut self,
+            _query: &sqlparser::ast::Query,
+        ) -> ControlFlow<Self::Break> {
+            self.shadow_stack.pop();
+            ControlFlow::Continue(())
         }
-        let rel_parts: Vec<String> = relation
-            .0
-            .iter()
-            .map(|id| names::normalize_ident(id))
-            .collect();
-        // Skip unqualified references that match a pure CTE shadow — the
-        // CTE body does not reference the same-named table, so this
-        // `FROM <alias>` resolves to the CTE, not a real table.
-        if rel_parts.len() == 1 && pure_shadows.contains(&rel_parts[0]) {
-            return ControlFlow::<()>::Continue(());
-        }
-        for target in targets {
-            if relation_matches(&rel_parts, target, view_schema) {
-                found = true;
+
+        fn pre_visit_relation(
+            &mut self,
+            relation: &sqlparser::ast::ObjectName,
+        ) -> ControlFlow<Self::Break> {
+            if self.found {
                 return ControlFlow::Break(());
             }
+            let rel_parts: Vec<String> = relation
+                .0
+                .iter()
+                .map(|id| names::normalize_ident(id))
+                .collect();
+            // Skip unqualified references that match a CTE shadow in any
+            // enclosing scope.
+            if rel_parts.len() == 1 {
+                for shadows in &self.shadow_stack {
+                    if shadows.contains(&rel_parts[0]) {
+                        return ControlFlow::Continue(());
+                    }
+                }
+            }
+            for target in self.targets {
+                if relation_matches(&rel_parts, target, self.view_schema) {
+                    self.found = true;
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
         }
-        ControlFlow::<()>::Continue(())
-    });
-    found
+    }
+
+    let mut checker = ScopeAwareChecker {
+        view_schema,
+        targets,
+        shadow_stack: Vec::new(),
+        found: false,
+    };
+    let _ = stmts.visit(&mut checker);
+    checker.found
 }
 
 /// Check whether `name` (possibly unqualified) resolves to any entry in
@@ -1707,6 +1740,14 @@ async fn drop_dependent_views(
                     .unwrap_or("public");
                 if view_references_any(&query, mv_schema, &pending) {
                     store.drop_materialized_view(txn, db_id, mv_name).await?;
+                    for trigger in store
+                        .list_triggers_for_table(txn, db_id, mv_name)
+                        .await?
+                    {
+                        let _ = store
+                            .drop_trigger(txn, db_id, mv_name, &trigger.name)
+                            .await?;
+                    }
                     drop_owned_sequences_for_table(store, txn, db_id, mv_name).await?;
                     store.drop_table(txn, db_id, mv_name).await?;
                     dropped.insert(mv_name.clone());
@@ -2984,6 +3025,24 @@ mod tests {
         let targets = vec!["public.orders".into()];
         assert!(view_references_any(
             "WITH orders AS (SELECT * FROM orders WHERE amount > 100) SELECT * FROM orders",
+            "public",
+            &targets
+        ));
+    }
+
+    #[test]
+    fn view_references_any_nested_cte_shadowing() {
+        // Nested WITH inside a subquery shadows the table name — the outer
+        // query does NOT depend on the real table (#641).
+        let targets = vec!["public.orders".into()];
+        assert!(!view_references_any(
+            "SELECT * FROM (WITH orders AS (SELECT 1 AS id) SELECT * FROM orders) sub",
+            "public",
+            &targets
+        ));
+        // Nested CTE whose body references the real table — still a dependency.
+        assert!(view_references_any(
+            "SELECT * FROM (WITH orders AS (SELECT * FROM orders) SELECT * FROM orders) sub",
             "public",
             &targets
         ));
