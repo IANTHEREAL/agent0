@@ -319,7 +319,7 @@ fn parse_refresh_materialized_view_name(sql: &str) -> Result<ObjectName> {
     Ok(name)
 }
 
-fn parse_drop_materialized_view(sql: &str) -> Result<(Vec<ObjectName>, bool)> {
+fn parse_drop_materialized_view(sql: &str) -> Result<(Vec<ObjectName>, bool, bool)> {
     let tokens = tokenize_non_whitespace(sql)?;
     let mut i = 0usize;
 
@@ -372,7 +372,15 @@ fn parse_drop_materialized_view(sql: &str) -> Result<(Vec<ObjectName>, bool)> {
         i += consumed;
     }
 
-    Ok((names, if_exists))
+    let mut cascade = false;
+    if tokens
+        .get(i)
+        .is_some_and(|t| is_unquoted_keyword(t, "CASCADE"))
+    {
+        cascade = true;
+    }
+
+    Ok((names, if_exists, cascade))
 }
 
 #[cfg(test)]
@@ -390,9 +398,10 @@ mod tests {
 
     #[test]
     fn parse_drop_materialized_view_preserves_quoted_ident_case() {
-        let (names, if_exists) =
+        let (names, if_exists, cascade) =
             parse_drop_materialized_view(r#"DROP MATERIALIZED VIEW IF EXISTS "MyMV";"#).unwrap();
         assert!(if_exists);
+        assert!(!cascade);
         assert_eq!(names.len(), 1);
         assert_eq!(names[0].0.len(), 1);
         assert_eq!(names[0].0[0].value, "MyMV");
@@ -414,7 +423,7 @@ mod tests {
 
     #[test]
     fn parse_drop_materialized_view_supports_multiple_names() {
-        let (names, if_exists) = parse_drop_materialized_view(
+        let (names, if_exists, _cascade) = parse_drop_materialized_view(
             r#"DROP MATERIALIZED VIEW IF EXISTS public."MyMV", "Other";"#,
         )
         .unwrap();
@@ -426,6 +435,16 @@ mod tests {
         assert_eq!(names[1].0.len(), 1);
         assert_eq!(names[1].0[0].value, "Other");
         assert_eq!(names[1].0[0].quote_style, Some('"'));
+    }
+
+    #[test]
+    fn parse_drop_materialized_view_cascade() {
+        let (names, if_exists, cascade) =
+            parse_drop_materialized_view(r#"DROP MATERIALIZED VIEW mv1 CASCADE;"#).unwrap();
+        assert!(!if_exists);
+        assert!(cascade);
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].0[0].value, "mv1");
     }
 
     #[test]
@@ -774,7 +793,7 @@ impl Executor {
         session: &mut Session,
         sql: &str,
     ) -> Result<ExecuteResult> {
-        let (names, if_exists) = parse_drop_materialized_view(sql)?;
+        let (names, if_exists, cascade) = parse_drop_materialized_view(sql)?;
 
         let is_autocommit = !session.is_in_transaction();
         if is_autocommit {
@@ -793,6 +812,7 @@ impl Executor {
                 search_path,
                 &names,
                 if_exists,
+                cascade,
             )
             .await
         }
