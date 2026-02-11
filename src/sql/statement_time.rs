@@ -28,6 +28,13 @@ pub(crate) fn statement_timestamp_millis_or_now() -> i64 {
     statement_timestamp_millis().unwrap_or_else(now_timestamp_millis)
 }
 
+/// Read the task-local TRANSACTION_TIMESTAMP_MILLIS, falling back to
+/// statement time (which is the correct PostgreSQL semantics for implicit
+/// autocommit transactions where transaction_ts == statement_ts).
+pub(super) fn transaction_timestamp_millis_or_now() -> i64 {
+    transaction_timestamp_millis().unwrap_or_else(statement_timestamp_millis_or_now)
+}
+
 pub(super) fn now_timestamp_millis() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -113,5 +120,28 @@ mod tests {
         .await;
         assert_eq!(got_stmt, stmt);
         assert_eq!(got_txn, txn);
+    }
+
+    #[tokio::test]
+    async fn transaction_timestamp_millis_or_now_reads_task_local() {
+        let stmt = 1_700_000_001_000_i64;
+        let txn = 1_700_000_000_000_i64;
+        let got = with_timestamps(stmt, txn, async { transaction_timestamp_millis_or_now() }).await;
+        assert_eq!(
+            got, txn,
+            "should read TRANSACTION_TIMESTAMP_MILLIS task-local"
+        );
+    }
+
+    #[tokio::test]
+    async fn transaction_timestamp_millis_or_now_falls_back_to_statement() {
+        let stmt = 1_700_000_001_000_i64;
+        let got =
+            with_statement_timestamp_millis(stmt, async { transaction_timestamp_millis_or_now() })
+                .await;
+        assert_eq!(
+            got, stmt,
+            "without TRANSACTION_TIMESTAMP_MILLIS, should fall back to statement time"
+        );
     }
 }
