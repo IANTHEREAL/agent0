@@ -1343,6 +1343,14 @@ pub async fn execute_create_materialized_view(
         .is_some()
     {
         if or_replace {
+            for trigger in store
+                .list_triggers_for_table(txn, db_id, &view_name)
+                .await?
+            {
+                let _ = store
+                    .drop_trigger(txn, db_id, &view_name, &trigger.name)
+                    .await?;
+            }
             drop_owned_sequences_for_table(store, txn, db_id, &view_name).await?;
             store.drop_materialized_view(txn, db_id, &view_name).await?;
             store.drop_table(txn, db_id, &view_name).await?;
