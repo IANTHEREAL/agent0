@@ -1524,24 +1524,47 @@ fn relation_matches(rel_parts: &[String], target: &str, view_schema: &str) -> bo
     }
 }
 
-/// Collect all CTE alias names from parsed statements so they can be
-/// excluded from dependency matching (CTE aliases shadow real tables).
-fn collect_cte_names(stmts: &[sqlparser::ast::Statement]) -> HashSet<String> {
-    let mut cte_names = HashSet::new();
+/// Collect CTE alias names that are "pure shadows" — the CTE body does
+/// NOT reference a table with the same name, so the outer `FROM <alias>`
+/// is guaranteed to resolve to the CTE, not a real table.
+///
+/// CTEs whose body references the same-named table (e.g.
+/// `WITH orders AS (SELECT * FROM orders WHERE …)`) are excluded from
+/// this set because there IS a real dependency on the table, even though
+/// the outer query's reference resolves to the CTE.
+fn collect_pure_cte_shadows(stmts: &[sqlparser::ast::Statement]) -> HashSet<String> {
+    use core::ops::ControlFlow;
+    use sqlparser::ast::visit_relations;
+
+    let mut shadow_names = HashSet::new();
     for stmt in stmts {
         if let sqlparser::ast::Statement::Query(query) = stmt {
-            collect_cte_names_from_query(query, &mut cte_names);
+            if let Some(with) = &query.with {
+                for cte in &with.cte_tables {
+                    let alias = names::normalize_ident(&cte.alias.name);
+                    // Check whether the CTE body itself references a table
+                    // with the same name (real dependency, not a shadow).
+                    let mut body_refs_same = false;
+                    let _ = visit_relations(&*cte.query, |rel| {
+                        if body_refs_same {
+                            return ControlFlow::Break(());
+                        }
+                        let parts: Vec<String> =
+                            rel.0.iter().map(|id| names::normalize_ident(id)).collect();
+                        if parts.len() == 1 && parts[0] == alias {
+                            body_refs_same = true;
+                            return ControlFlow::Break(());
+                        }
+                        ControlFlow::<()>::Continue(())
+                    });
+                    if !body_refs_same {
+                        shadow_names.insert(alias);
+                    }
+                }
+            }
         }
     }
-    cte_names
-}
-
-fn collect_cte_names_from_query(query: &Query, names: &mut HashSet<String>) {
-    if let Some(with) = &query.with {
-        for cte in &with.cte_tables {
-            names.insert(names::normalize_ident(&cte.alias.name));
-        }
-    }
+    shadow_names
 }
 
 /// Check whether `view_sql` references any of the fully-qualified names in
@@ -1549,7 +1572,8 @@ fn collect_cte_names_from_query(query: &Query, names: &mut HashSet<String>) {
 ///
 /// `view_schema` is the schema the view lives in; it is used to scope
 /// unqualified relation references and avoid cross-schema false positives.
-/// CTE aliases are excluded so that shadowed names do not cause
+/// Pure CTE shadow aliases (where the CTE body does NOT reference the
+/// same-named table) are excluded so that shadowed names do not cause
 /// false-positive drops (#638).
 fn view_references_any(view_sql: &str, view_schema: &str, targets: &[String]) -> bool {
     use core::ops::ControlFlow;
@@ -1563,7 +1587,7 @@ fn view_references_any(view_sql: &str, view_schema: &str, targets: &[String]) ->
         Err(_) => return false,
     };
 
-    let cte_names = collect_cte_names(&stmts);
+    let pure_shadows = collect_pure_cte_shadows(&stmts);
 
     let mut found = false;
     let _ = visit_relations(&stmts, |relation| {
@@ -1575,9 +1599,10 @@ fn view_references_any(view_sql: &str, view_schema: &str, targets: &[String]) ->
             .iter()
             .map(|id| names::normalize_ident(id))
             .collect();
-        // Skip unqualified references that match a CTE alias — the CTE
-        // shadows the real table so this is not a true dependency.
-        if rel_parts.len() == 1 && cte_names.contains(&rel_parts[0]) {
+        // Skip unqualified references that match a pure CTE shadow — the
+        // CTE body does not reference the same-named table, so this
+        // `FROM <alias>` resolves to the CTE, not a real table.
+        if rel_parts.len() == 1 && pure_shadows.contains(&rel_parts[0]) {
             return ControlFlow::<()>::Continue(());
         }
         for target in targets {
@@ -2947,6 +2972,18 @@ mod tests {
         let targets = vec!["public.orders".into()];
         assert!(!view_references_any(
             "WITH orders AS (SELECT 1 AS id) SELECT * FROM orders",
+            "public",
+            &targets
+        ));
+    }
+
+    #[test]
+    fn view_references_any_cte_shadow_with_real_ref() {
+        // CTE whose body references the same-named real table — the CTE is
+        // NOT a pure shadow.  The view has a real dependency on `orders`.
+        let targets = vec!["public.orders".into()];
+        assert!(view_references_any(
+            "WITH orders AS (SELECT * FROM orders WHERE amount > 100) SELECT * FROM orders",
             "public",
             &targets
         ));
