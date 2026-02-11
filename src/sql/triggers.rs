@@ -217,66 +217,6 @@ pub async fn apply_before_triggers_with_cache(
     Ok(Some(current_row))
 }
 
-#[allow(dead_code)]
-pub async fn apply_before_triggers(
-    store: &Arc<TikvStore>,
-    txn: &mut Transaction,
-    db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
-    search_path: &[String],
-    triggers: &[TriggerDef],
-    schema: &TableSchema,
-    event: &str,
-    new_row: Row,
-    old_row: Option<&Row>,
-) -> Result<Option<Row>> {
-    let before_triggers: Vec<&TriggerDef> = triggers
-        .iter()
-        .filter(|t| {
-            t.timing.eq_ignore_ascii_case("BEFORE")
-                && t.events.iter().any(|e| e.eq_ignore_ascii_case(event))
-        })
-        .collect();
-
-    if before_triggers.is_empty() {
-        return Ok(Some(new_row));
-    }
-
-    let mut current_row = new_row;
-
-    for trigger in before_triggers {
-        let func_def = match store.get_function(txn, db_id, &trigger.function).await? {
-            Some(f) => f,
-            None => continue,
-        };
-
-        let result = execute_trigger_function(
-            store,
-            txn,
-            db_id,
-            sequence_values,
-            search_path,
-            &func_def,
-            schema,
-            &current_row,
-            old_row,
-        )
-        .await?;
-
-        match result {
-            TriggerResult::Row(modified_row) => {
-                current_row = modified_row;
-            }
-            TriggerResult::Null => {
-                return Ok(None);
-            }
-            TriggerResult::Unchanged => {}
-        }
-    }
-
-    Ok(Some(current_row))
-}
-
 enum TriggerResult {
     Row(Row),
     Null,

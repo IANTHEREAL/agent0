@@ -35,8 +35,7 @@ use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
-    CopyResponse, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
-    Response,
+    CopyResponse, DescribePortalResponse, DescribeStatementResponse, FieldInfo, Response,
 };
 use pgwire::api::stmt::StoredStatement;
 use pgwire::api::store::PortalStore;
@@ -74,23 +73,6 @@ pub struct DynamicPgHandler {
 }
 
 impl DynamicPgHandler {
-    #[allow(dead_code)]
-    pub fn new(pd_endpoints: Vec<String>, default_keyspace: Option<String>) -> Self {
-        Self {
-            client_pool: None,
-            pd_endpoints,
-            default_keyspace,
-            executor: OnceCell::new(),
-            session: Mutex::new(None),
-            connection_guard: OnceCell::new(),
-            tenant_handle: OnceCell::new(),
-            copy_context: Mutex::new(None),
-            suspended_portals: Mutex::new(HashMap::new()),
-            query_parser: Arc::new(TipgQueryParser::new()),
-            connection_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
-        }
-    }
-
     pub fn new_with_pool(
         client_pool: Arc<TikvClientPool>,
         default_keyspace: Option<String>,
@@ -108,11 +90,6 @@ impl DynamicPgHandler {
             query_parser: Arc::new(TipgQueryParser::new()),
             connection_id: CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn connection_id(&self) -> i32 {
-        self.connection_id
     }
 
     async fn infer_insert_parameter_types(
@@ -1832,34 +1809,11 @@ impl ExtendedQueryHandler for DynamicPgHandler {
     }
 }
 
-#[allow(dead_code)]
-fn infer_result_fields(query: &str) -> Vec<FieldInfo> {
-    let query_upper = query.to_uppercase();
-    if query_upper.starts_with("SELECT") {
-        vec![FieldInfo::new(
-            "column".to_string(),
-            None,
-            None,
-            Type::TEXT,
-            FieldFormat::Text,
-        )]
-    } else {
-        vec![]
-    }
-}
-
 pub struct DynamicHandlerFactory {
     handler: Arc<DynamicPgHandler>,
 }
 
 impl DynamicHandlerFactory {
-    #[allow(dead_code)]
-    pub fn new(pd_endpoints: Vec<String>, default_keyspace: Option<String>) -> Self {
-        Self {
-            handler: Arc::new(DynamicPgHandler::new(pd_endpoints, default_keyspace)),
-        }
-    }
-
     pub fn new_with_pool(
         client_pool: Arc<TikvClientPool>,
         default_keyspace: Option<String>,

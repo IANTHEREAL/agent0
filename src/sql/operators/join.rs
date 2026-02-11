@@ -41,8 +41,8 @@ pub struct NestedLoopJoinOperator {
     opened: bool,
 }
 
-#[allow(dead_code)] // Operator framework
 impl NestedLoopJoinOperator {
+    #[allow(dead_code)] // operator framework: join path
     pub fn new(
         left: BoxedOperator,
         right: BoxedOperator,

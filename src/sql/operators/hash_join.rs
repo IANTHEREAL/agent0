@@ -29,7 +29,7 @@ use crate::types::{ColumnDef, Row, TableSchema, Value};
 ///
 /// Hashing is defined to be compatible with [`join_keys_equal`]:
 /// if `join_keys_equal(a, b)` is `true`, then `hash_join_key(a) == hash_join_key(b)`.
-#[allow(dead_code)] // Public API for hash join callers and tests
+#[allow(dead_code)] // hash join operator framework
 pub fn hash_join_key(values: &[Value]) -> u64 {
     let mut hasher = DefaultHasher::new();
     values.len().hash(&mut hasher);
@@ -125,7 +125,7 @@ fn hash_single_value_for_join<H: Hasher>(hasher: &mut H, value: &Value) {
 /// - `NaN == NaN` (returns `true`, PostgreSQL-like)
 /// - `Int32` and `Int64` are compared as `i64`
 /// - `Numeric` is normalized before compare (`1.0 == 1.00`)
-#[allow(dead_code)] // Public API for hash join callers and tests
+#[allow(dead_code)] // hash join operator framework
 pub fn join_keys_equal(left: &[Value], right: &[Value]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -297,7 +297,7 @@ impl JoinHashTable {
         row_key_has_null_for_join(row, &self.key_indices)
     }
 
-    #[allow(dead_code)] // Used by tests and future probe-by-value path
+    #[allow(dead_code)] // hash join operator framework
     fn row_key_equals_values(&self, row: &Row, probe_key: &[Value]) -> bool {
         if self.key_indices.len() != probe_key.len() {
             return false;
@@ -341,7 +341,7 @@ impl JoinHashTable {
             .map(|b| (b.rows.as_slice(), b.global_indices.as_slice()))
     }
 
-    #[allow(dead_code)] // Operator framework
+    #[allow(dead_code)] // hash join operator framework
     pub fn all_rows_with_indices(&self) -> impl Iterator<Item = (usize, &Row)> + '_ {
         self.buckets
             .values()
@@ -392,7 +392,7 @@ enum HashJoinState {
 pub struct HashJoinOperator {
     build_child: BoxedOperator,
     probe_child: BoxedOperator,
-    #[allow(dead_code)] // Used in explain_info()
+    #[allow(dead_code)] // hash join operator framework
     join_type: HashJoinType,
     left_is_build: bool,
     build_key_indices: Vec<usize>,
@@ -405,7 +405,6 @@ pub struct HashJoinOperator {
     state: HashJoinState,
 }
 
-#[allow(dead_code)] // Operator framework — helpers used by PhysicalOperator trait impl
 impl HashJoinOperator {
     /// Create a new hash join operator.
     ///
@@ -576,6 +575,7 @@ impl HashJoinOperator {
     }
 }
 
+#[allow(dead_code)] // hash join operator framework
 #[async_trait]
 impl PhysicalOperator for HashJoinOperator {
     fn schema(&self) -> &TableSchema {

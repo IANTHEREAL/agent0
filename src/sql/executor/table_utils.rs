@@ -677,7 +677,7 @@ impl Executor {
                 table_id: 0,
                 name: table_name.to_string(),
                 columns: vec![ColumnDef {
-                    name: col_name.clone(),
+                    name: col_name,
                     data_type: result.data_type().unwrap_or(DataType::Text),
                     nullable: false,
                     primary_key: false,
@@ -817,7 +817,7 @@ impl Executor {
                 table_id: 0,
                 name: table_name.to_string(),
                 columns: vec![ColumnDef {
-                    name: col_name.clone(),
+                    name: col_name,
                     data_type: result.data_type().unwrap_or(DataType::Text),
                     nullable: false,
                     primary_key: false,

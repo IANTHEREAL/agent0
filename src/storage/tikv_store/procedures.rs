@@ -46,7 +46,6 @@ impl TikvStore {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn replace_procedure(
         &self,
         txn: &mut Transaction,

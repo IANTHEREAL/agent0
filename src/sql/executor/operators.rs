@@ -2656,7 +2656,7 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
         preloaded_source: Option<BoxedOperator>,
     ) -> Result<ExecuteResult> {
-        let planner = PhysicalPlanner::new(self.store(), search_path.to_vec());
+        let planner = PhysicalPlanner::new(search_path.to_vec());
 
         let is_wildcard_only = projection.iter().all(|item| {
             matches!(
@@ -3182,7 +3182,7 @@ impl Executor {
             }
             op
         } else {
-            let planner = PhysicalPlanner::new(self.store(), search_path.to_vec());
+            let planner = PhysicalPlanner::new(search_path.to_vec());
             let estimated_rows = 1000;
             planner.plan_simple_select(
                 db_id,

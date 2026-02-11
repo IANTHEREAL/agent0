@@ -213,11 +213,6 @@ impl TriggerWorker {
         &self.config
     }
 
-    #[allow(dead_code)] // trigger worker lifecycle API
-    pub(crate) fn worker_id(&self) -> &str {
-        &self.worker_id
-    }
-
     pub(crate) fn mark_active(&self, keyspace: &str) {
         self.active_keyspaces.insert(keyspace.to_string());
         self.active_keyspaces_marked_at
@@ -277,11 +272,6 @@ impl TriggerWorker {
         entry.next_retry_at = now + delay;
 
         (delay, entry.failures)
-    }
-
-    #[allow(dead_code)] // trigger worker lifecycle API
-    pub(crate) fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::Relaxed);
     }
 
     pub(crate) async fn run(&self, pool: Arc<TikvClientPool>) {

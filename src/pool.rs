@@ -21,7 +21,7 @@ fn now_epoch_ms() -> u64 {
 }
 
 /// Per-tenant metadata inside the pool.
-#[allow(dead_code)]
+#[allow(dead_code)] // fields accessed by pool lifecycle tests
 pub(crate) struct TenantEntry {
     store: Arc<TikvStore>,
     /// Number of active connection-scoped handles (TenantHandle instances).
@@ -42,12 +42,12 @@ impl TenantEntry {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in pool tests
     pub(crate) fn store(&self) -> &Arc<TikvStore> {
         &self.store
     }
 
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in pool tests
     pub(crate) fn active_connections(&self) -> u32 {
         self.active_connections.load(Ordering::Relaxed)
     }
@@ -64,11 +64,6 @@ pub struct TenantHandle {
 impl TenantHandle {
     pub fn store(&self) -> &Arc<TikvStore> {
         &self.entry.store
-    }
-
-    #[allow(dead_code)]
-    pub fn keyspace(&self) -> &str {
-        &self.entry.keyspace
     }
 }
 
@@ -133,11 +128,6 @@ impl TikvClientPool {
             idle_timeout,
             reaper_interval,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn pd_endpoints(&self) -> &[String] {
-        &self.pd_endpoints
     }
 
     /// Acquire a connection-scoped handle to a tenant's TikvStore.
@@ -274,13 +264,13 @@ impl TikvClientPool {
     }
 
     /// Number of tenants currently cached in the pool.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in pool tests
     pub async fn tenant_count(&self) -> usize {
         self.tenants.read().await.len()
     }
 
     /// Number of tenants with at least one active connection handle.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in pool tests
     pub async fn active_tenant_count(&self) -> usize {
         let tenants = self.tenants.read().await;
         tenants
@@ -291,7 +281,7 @@ impl TikvClientPool {
 
     /// Snapshot of the active connection count for a specific keyspace.
     /// Returns None if the keyspace is not in the pool.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // used in pool tests
     pub async fn connections_for(&self, keyspace: &str) -> Option<u32> {
         let tenants = self.tenants.read().await;
         tenants

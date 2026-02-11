@@ -55,7 +55,7 @@ pub struct ScanContext<'a> {
 #[async_trait]
 pub trait VirtualTable: Send + Sync {
     fn name(&self) -> &str;
-    #[allow(dead_code)] // trait API: schema namespace for future qualified name resolution
+    #[allow(dead_code)] // virtual table trait API
     fn schema_name(&self) -> &str;
     fn schema(&self) -> TableSchema;
     async fn scan(&self, ctx: &mut ScanContext<'_>) -> Result<Vec<Row>>;

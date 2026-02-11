@@ -101,11 +101,6 @@ impl ObservabilityRegistry {
         }
     }
 
-    #[allow(dead_code)]
-    pub fn config(&self) -> &ObservabilityConfig {
-        &self.config
-    }
-
     pub fn tenant(&self, keyspace: &str) -> Arc<TenantObservability> {
         let key = if keyspace.is_empty() {
             "default".to_string()

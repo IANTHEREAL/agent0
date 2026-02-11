@@ -4,8 +4,8 @@ use crate::types::{DataType, Row, TableSchema};
 use std::sync::Arc;
 
 /// Result of executing a SQL statement
+#[allow(dead_code)] // PG result message structural field
 #[derive(Debug)]
-#[allow(dead_code)] // variant name fields are structural, for future logging/error reporting
 pub enum ExecuteResult {
     /// SELECT result with rows
     Select {
@@ -114,7 +114,7 @@ pub enum ExecuteResult {
         tables: Vec<String>,
     },
     /// DESCRIBE table result
-    #[allow(dead_code)]
+    #[allow(dead_code)] // PG protocol
     // variant constructed in protocol layer, field for schema introspection
     Describe {
         schema: TableSchema,

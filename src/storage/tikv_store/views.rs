@@ -177,7 +177,6 @@ impl TikvStore {
         }
     }
 
-    #[allow(dead_code)]
     pub async fn list_materialized_views(
         &self,
         txn: &mut Transaction,

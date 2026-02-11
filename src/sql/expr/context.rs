@@ -52,7 +52,6 @@ fn format_composite_value(values: impl IntoIterator<Item = Value>) -> Value {
 }
 
 pub trait EvalContext {
-    #[allow(dead_code)] // Part of EvalContext trait API
     fn row(&self) -> Option<&Row>;
 
     fn resolve_column(&self, name: &str) -> Result<Value>;
@@ -97,7 +96,7 @@ impl<'a> SingleTableContext<'a> {
         }
     }
 
-    #[allow(dead_code)] // Public API
+    #[allow(dead_code)] // eval context API
     pub fn empty() -> Self {
         Self {
             row: None,
@@ -106,12 +105,12 @@ impl<'a> SingleTableContext<'a> {
         }
     }
 
-    #[allow(dead_code)] // Public API
+    #[allow(dead_code)] // eval context API
     pub fn row(&self) -> Option<&Row> {
         self.row
     }
 
-    #[allow(dead_code)] // Public API
+    #[allow(dead_code)] // eval context API
     pub fn get_schema(&self) -> Option<&TableSchema> {
         self.schema
     }

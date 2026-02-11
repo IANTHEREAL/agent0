@@ -2,8 +2,8 @@
 
 use crate::types::DataType;
 
+#[allow(dead_code)] // type inference module
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)] // new type inference module, not yet fully integrated
 pub enum TypeError {
     /// Column does not exist
     ColumnNotFound {

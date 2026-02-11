@@ -13,7 +13,7 @@ use super::registry::global_registry;
 
 pub struct TypeInferrer<'a> {
     ctx: TypeContext<'a>,
-    #[allow(dead_code)] // new type inference module, not yet fully integrated
+    #[allow(dead_code)] // type inference module
     cache: Option<HashMap<usize, DataType>>,
 }
 
@@ -22,7 +22,7 @@ impl<'a> TypeInferrer<'a> {
         Self { ctx, cache: None }
     }
 
-    #[allow(dead_code)] // new type inference module, not yet fully integrated
+    #[allow(dead_code)] // type inference module
     pub fn with_cache(mut self) -> Self {
         self.cache = Some(HashMap::new());
         self

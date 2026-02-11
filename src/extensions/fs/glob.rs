@@ -4,7 +4,6 @@ use tracing::warn;
 use super::backend::FsBackend;
 
 /// Check if a path contains glob metacharacters.
-#[allow(dead_code)]
 pub(crate) fn is_glob_pattern(path: &str) -> bool {
     path.contains('*') || path.contains('?') || path.contains('[')
 }

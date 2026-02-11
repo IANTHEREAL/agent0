@@ -7,9 +7,10 @@ use crate::types::{ColumnDef, TableSchema};
 use super::error::TypeError;
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // new type inference module, not yet fully integrated
 pub struct ResolvedColumn<'a> {
+    #[allow(dead_code)] // type inference module
     pub table_alias: Option<&'a str>,
+    #[allow(dead_code)] // type inference module
     pub column_index: usize,
     pub column_def: &'a ColumnDef,
 }
@@ -53,7 +54,7 @@ impl<'a> TypeContext<'a> {
         }
     }
 
-    #[allow(dead_code)] // new type inference module, not yet fully integrated
+    #[allow(dead_code)] // type inference module
     pub fn join(
         left_alias: &'a str,
         left: &'a TableSchema,
@@ -141,7 +142,7 @@ impl<'a> TypeContext<'a> {
         })
     }
 
-    #[allow(dead_code)] // new type inference module, not yet fully integrated
+    #[allow(dead_code)] // type inference module
     pub fn available_columns(&self) -> Vec<String> {
         let mut cols = Vec::new();
         for (alias, schema) in &self.tables {

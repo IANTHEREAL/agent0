@@ -450,7 +450,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                             Value::Float64(f) => Ok(Value::Float64(-f)),
                             Value::Text(_) => Err(SqlError::InvalidInputSyntax {
                                 type_name: "numeric".into(),
-                                value: s.to_string(),
+                                value: s,
                             }
                             .into()),
                             other => Err(anyhow!("Cannot negate {:?}", other)),

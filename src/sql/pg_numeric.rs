@@ -23,7 +23,7 @@ fn pg_weight_and_firstdigit(d: &Decimal) -> (i32, i32) {
 
     let digits = mantissa.to_string();
     let (int_part, frac_part) = if scale == 0 {
-        (digits.clone(), String::new())
+        (digits, String::new())
     } else if digits.len() > scale {
         (
             digits[..digits.len() - scale].to_string(),

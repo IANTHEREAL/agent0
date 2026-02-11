@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use super::{ExecutionContext, PhysicalOperator};
 use crate::types::{Row, TableSchema};
 
+#[allow(dead_code)] // operator framework: CTE scan path
 #[derive(Debug)]
-#[allow(dead_code)] // Operator framework — used by future CTE operator path
 pub struct CTEScanOperator {
     schema: TableSchema,
     rows: Vec<Row>,
@@ -13,8 +13,8 @@ pub struct CTEScanOperator {
     opened: bool,
 }
 
+#[allow(dead_code)] // operator framework
 impl CTEScanOperator {
-    #[allow(dead_code)] // Operator framework
     pub fn new(schema: TableSchema, rows: Vec<Row>) -> Self {
         Self {
             schema,

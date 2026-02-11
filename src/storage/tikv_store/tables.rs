@@ -374,26 +374,6 @@ impl TikvStore {
         }
     }
 
-    #[allow(dead_code)]
-    pub async fn get_by_pk(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        table_name: &str,
-        pk_values: &[Value],
-    ) -> Result<Option<Row>> {
-        let schema = self
-            .get_schema(txn, db_id, table_name)
-            .await?
-            .ok_or_else(|| anyhow!("Table not found"))?;
-        let row_key = encode_pk_values(pk_values);
-        let data_key = self.key(&encode_data_key_v2(db_id, schema.table_id, &row_key));
-        match txn.get(data_key).await? {
-            Some(data) => Ok(Some(deserialize_row(&data)?)),
-            None => Ok(None),
-        }
-    }
-
     pub async fn list_tables(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<String>> {
         {
             let cache = self.cache.read().await;

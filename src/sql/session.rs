@@ -428,30 +428,16 @@ impl Session {
         }
     }
 
-    #[allow(dead_code)] // session accessor API
-    pub fn store(&self) -> Arc<TikvStore> {
-        self.store.clone()
-    }
-
     pub fn current_user(&self) -> Option<&str> {
         self.current_user.as_deref()
     }
 
-    #[allow(dead_code)] // accessor for session_user vs current_user
     pub fn session_user(&self) -> Option<&str> {
         self.session_user.as_deref()
     }
 
     pub fn is_superuser(&self) -> bool {
         self.is_superuser
-    }
-
-    #[allow(dead_code)] // session accessor API
-    pub fn set_user(&mut self, username: String, is_superuser: bool) {
-        self.session_user = Some(username.clone());
-        self.session_user_is_superuser = is_superuser;
-        self.current_user = Some(username);
-        self.is_superuser = is_superuser;
     }
 
     pub(crate) fn set_current_role(&mut self, role: String, is_superuser: bool) {
@@ -470,11 +456,6 @@ impl Session {
 
     pub fn current_database_id(&self) -> u64 {
         self.current_database_id
-    }
-
-    #[allow(dead_code)] // session accessor API
-    pub fn current_database(&self) -> &str {
-        &self.current_database_name
     }
 
     pub(crate) fn current_database_name_arc(&self) -> Arc<str> {

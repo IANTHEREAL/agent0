@@ -1460,7 +1460,7 @@ pub fn validate_check_constraints(schema: &TableSchema, row: &Row) -> Result<()>
                     .join(", ");
                 return Err(SqlError::CheckViolation {
                     table: short_table.to_string(),
-                    constraint: name.to_string(),
+                    constraint: name,
                     detail: row_str,
                 }
                 .into());

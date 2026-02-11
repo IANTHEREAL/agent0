@@ -224,7 +224,7 @@ fn eval_srf(
 pub struct ProjectOperator {
     child: BoxedOperator,
     expressions: Vec<Expr>,
-    #[allow(dead_code)] // Preserved for EXPLAIN output in future
+    #[allow(dead_code)] // preserved for EXPLAIN output
     output_names: Vec<String>,
     output_schema: TableSchema,
     opened: bool,

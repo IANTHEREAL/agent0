@@ -249,7 +249,7 @@ pub(super) fn is_ident_char_or_dollar(b: u8) -> bool {
     is_ident_char(b) || b == b'$'
 }
 
-#[allow(dead_code)]
+#[allow(dead_code)] // called from parser.rs, but transitively dead in production
 pub(in crate::protocol::handler) fn find_keyword_outside_strings(
     query: &str,
     keyword: &str,

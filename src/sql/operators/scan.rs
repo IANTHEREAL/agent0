@@ -138,26 +138,6 @@ pub struct IndexScanOperator {
 }
 
 impl IndexScanOperator {
-    pub fn new(
-        schema: TableSchema,
-        index_id: u64,
-        index_name: String,
-        lookup_values: Vec<Value>,
-    ) -> Self {
-        Self {
-            schema,
-            index_id,
-            index_name,
-            lookup_values,
-            scan_limit: None,
-            pk_queue: Vec::new(),
-            row_buffer: Vec::new(),
-            position: 0,
-            opened: false,
-        }
-    }
-
-    #[allow(dead_code)] // reserved for future limit pushdown
     pub fn new_with_scan_limit(
         schema: TableSchema,
         index_id: u64,
@@ -368,35 +348,6 @@ impl RangeIndexScanOperator {
         }
     }
 
-    #[allow(dead_code)] // reserved for future limit pushdown
-    pub fn new_with_scan_limit(
-        schema: TableSchema,
-        index_id: u64,
-        index_name: String,
-        prefix_values: Vec<Value>,
-        range_start: Option<Value>,
-        start_inclusive: bool,
-        range_end: Option<Value>,
-        end_inclusive: bool,
-        scan_limit: Option<usize>,
-    ) -> Self {
-        Self {
-            schema,
-            index_id,
-            index_name,
-            prefix_values,
-            range_start,
-            start_inclusive,
-            range_end,
-            end_inclusive,
-            scan_limit,
-            pk_queue: Vec::new(),
-            row_buffer: Vec::new(),
-            position: 0,
-            opened: false,
-        }
-    }
-
     async fn load_next_batch(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         self.row_buffer.clear();
         self.position = 0;
@@ -558,27 +509,6 @@ impl InListScanOperator {
             index_name,
             column_values,
             scan_limit: None,
-            pk_queue: Vec::new(),
-            row_buffer: Vec::new(),
-            position: 0,
-            opened: false,
-        }
-    }
-
-    #[allow(dead_code)] // reserved for future limit pushdown
-    pub fn new_with_scan_limit(
-        schema: TableSchema,
-        index_id: u64,
-        index_name: String,
-        column_values: Vec<Vec<Value>>,
-        scan_limit: Option<usize>,
-    ) -> Self {
-        Self {
-            schema,
-            index_id,
-            index_name,
-            column_values,
-            scan_limit,
             pk_queue: Vec::new(),
             row_buffer: Vec::new(),
             position: 0,

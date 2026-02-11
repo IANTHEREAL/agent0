@@ -14,24 +14,22 @@
 //! # Example
 //!
 //! ```ignore
-//! let planner = PhysicalPlanner::new(store, search_path);
+//! let planner = PhysicalPlanner::new(search_path);
 //! let operator = planner.plan_simple_select(db_id, schema, filter, order_by, limit, offset, 1000)?;
 //! ```
 
 use anyhow::Result;
 use sqlparser::ast::{BinaryOperator, Expr, OrderByExpr};
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use super::{
     BoxedOperator, FilterOperator, InListScanOperator, IndexScanOperator, LimitOperator,
-    ProjectOperator, RangeIndexScanOperator, SortOperator, TableScanOperator,
+    RangeIndexScanOperator, SortOperator, TableScanOperator,
 };
 use crate::sql::expr::eval_expr;
 use crate::sql::planner::{choose_best_access_path_for_filter, ScanType};
 use crate::sql::value_coercion::coerce_value_for_column;
-use crate::storage::TikvStore;
-use crate::types::{DataType, TableSchema, Value};
+use crate::types::{TableSchema, Value};
 
 fn extract_column_name(expr: &Expr) -> Option<String> {
     match expr {
@@ -129,8 +127,6 @@ fn filter_is_exact_index_lookup(
 /// The planner uses cost-based optimization to choose access paths (full scan vs index scan)
 /// and constructs a tree of physical operators that implement the Volcano iterator model.
 pub struct PhysicalPlanner {
-    #[allow(dead_code)] // used by future index-aware planning
-    store: Arc<TikvStore>,
     search_path: Vec<String>,
 }
 
@@ -144,8 +140,8 @@ impl std::fmt::Debug for PhysicalPlanner {
 
 impl PhysicalPlanner {
     /// Create a new physical planner.
-    pub fn new(store: Arc<TikvStore>, search_path: Vec<String>) -> Self {
-        Self { store, search_path }
+    pub fn new(search_path: Vec<String>) -> Self {
+        Self { search_path }
     }
 
     /// Plan a simple SELECT query (single table, no JOINs).
@@ -199,10 +195,7 @@ impl PhysicalPlanner {
                 } else {
                     None
                 };
-                Box::new(TableScanOperator::new_with_scan_limit(
-                    schema.clone(),
-                    scan_limit,
-                ))
+                Box::new(TableScanOperator::new_with_scan_limit(schema, scan_limit))
             }
             ScanType::IndexScan {
                 index_id,
@@ -220,11 +213,7 @@ impl PhysicalPlanner {
                     None
                 };
                 Box::new(IndexScanOperator::new_with_scan_limit(
-                    schema.clone(),
-                    index_id,
-                    index_name,
-                    values,
-                    scan_limit,
+                    schema, index_id, index_name, values, scan_limit,
                 ))
             }
             ScanType::IndexRangeScan {
@@ -243,7 +232,7 @@ impl PhysicalPlanner {
                     None
                 };
                 Box::new(IndexScanOperator::new_with_scan_limit(
-                    schema.clone(),
+                    schema,
                     index_id,
                     index_name,
                     prefix_values,
@@ -260,7 +249,7 @@ impl PhysicalPlanner {
                 end_inclusive,
                 ..
             } => Box::new(RangeIndexScanOperator::new(
-                schema.clone(),
+                schema,
                 index_id,
                 index_name,
                 prefix_values,
@@ -275,12 +264,12 @@ impl PhysicalPlanner {
                 column_values,
                 ..
             } => Box::new(InListScanOperator::new(
-                schema.clone(),
+                schema,
                 index_id,
                 index_name,
                 column_values,
             )),
-            ScanType::GinIndexScan { .. } => Box::new(TableScanOperator::new(schema.clone())),
+            ScanType::GinIndexScan { .. } => Box::new(TableScanOperator::new(schema)),
         };
 
         if let Some(filter_expr) = filter {
@@ -297,155 +286,12 @@ impl PhysicalPlanner {
 
         Ok(root)
     }
-
-    #[allow(dead_code)] // accessor for future index-aware planning
-    pub fn store(&self) -> &Arc<TikvStore> {
-        &self.store
-    }
-
-    #[allow(dead_code)] // accessor for future index-aware planning
-    pub fn search_path(&self) -> &[String] {
-        &self.search_path
-    }
-}
-
-/// Builder for constructing operator trees programmatically.
-///
-/// This provides a fluent API for building operator trees, useful for testing
-/// and for more complex query patterns.
-#[derive(Debug)]
-#[allow(dead_code)] // Operator framework — fluent builder API for future use
-pub struct OperatorBuilder {
-    root: BoxedOperator,
-}
-
-#[allow(dead_code)] // Operator framework
-impl OperatorBuilder {
-    /// Start building with a scan operator.
-    pub fn scan(schema: TableSchema) -> Self {
-        Self {
-            root: Box::new(TableScanOperator::new(schema)),
-        }
-    }
-
-    /// Start building with an index scan operator.
-    pub fn index_scan(
-        schema: TableSchema,
-        index_id: u64,
-        index_name: String,
-        lookup_values: Vec<crate::types::Value>,
-    ) -> Self {
-        Self {
-            root: Box::new(IndexScanOperator::new(
-                schema,
-                index_id,
-                index_name,
-                lookup_values,
-            )),
-        }
-    }
-
-    /// Add a filter operator.
-    pub fn filter(self, predicate: Expr) -> Self {
-        Self {
-            root: Box::new(FilterOperator::new(self.root, predicate)),
-        }
-    }
-
-    /// Add a sort operator.
-    pub fn sort(self, order_by: Vec<OrderByExpr>) -> Self {
-        Self {
-            root: Box::new(SortOperator::new(self.root, order_by)),
-        }
-    }
-
-    /// Add a limit operator.
-    pub fn limit(self, limit: Option<usize>, offset: usize) -> Self {
-        Self {
-            root: Box::new(LimitOperator::new(self.root, limit, offset)),
-        }
-    }
-
-    /// Add a project operator.
-    pub fn project(
-        self,
-        expressions: Vec<Expr>,
-        output_names: Vec<String>,
-        output_types: Vec<DataType>,
-    ) -> Self {
-        Self {
-            root: Box::new(ProjectOperator::new(
-                self.root,
-                expressions,
-                output_names,
-                output_types,
-            )),
-        }
-    }
-
-    /// Build the final operator tree.
-    pub fn build(self) -> BoxedOperator {
-        self.root
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ColumnDef, DataType, IndexDef, Value};
     use sqlparser::ast::{BinaryOperator, Ident};
-
-    fn test_schema() -> TableSchema {
-        TableSchema {
-            name: "users".to_string(),
-            table_id: 1,
-            columns: vec![
-                ColumnDef {
-                    name: "id".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: false,
-                    primary_key: true,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                },
-                ColumnDef {
-                    name: "name".to_string(),
-                    data_type: DataType::Text,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                },
-                ColumnDef {
-                    name: "age".to_string(),
-                    data_type: DataType::Int32,
-                    nullable: true,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                },
-            ],
-            version: 1,
-            pk_constraint_name: None,
-            pk_indices: vec![0],
-            indexes: vec![IndexDef {
-                id: 1,
-                name: "idx_name".to_string(),
-                columns: vec!["name".to_string()],
-                unique: false,
-                method: None,
-                predicate: None,
-                expressions: Vec::new(),
-            }],
-            check_constraints: vec![],
-            foreign_keys: vec![],
-            owner: String::new(),
-            from_alias: None,
-        }
-    }
 
     fn make_eq_expr(col: &str, val: i32) -> Expr {
         Expr::BinaryOp {
@@ -456,94 +302,6 @@ mod tests {
                 false,
             ))),
         }
-    }
-
-    #[test]
-    fn test_operator_builder_scan_only() {
-        let schema = test_schema();
-        let op = OperatorBuilder::scan(schema).build();
-
-        assert_eq!(op.name(), "TableScan");
-        assert!(op.children().is_empty());
-    }
-
-    #[test]
-    fn test_operator_builder_with_filter() {
-        let schema = test_schema();
-        let predicate = make_eq_expr("id", 42);
-
-        let op = OperatorBuilder::scan(schema).filter(predicate).build();
-
-        assert_eq!(op.name(), "Filter");
-        assert_eq!(op.children().len(), 1);
-        assert_eq!(op.children()[0].name(), "TableScan");
-    }
-
-    #[test]
-    fn test_operator_builder_with_sort() {
-        let schema = test_schema();
-        let order_by = vec![OrderByExpr {
-            expr: Expr::Identifier(Ident::new("name")),
-            asc: Some(true),
-            nulls_first: None,
-        }];
-
-        let op = OperatorBuilder::scan(schema).sort(order_by).build();
-
-        assert_eq!(op.name(), "Sort");
-        assert_eq!(op.children().len(), 1);
-        assert_eq!(op.children()[0].name(), "TableScan");
-    }
-
-    #[test]
-    fn test_operator_builder_with_limit() {
-        let schema = test_schema();
-
-        let op = OperatorBuilder::scan(schema).limit(Some(10), 5).build();
-
-        assert_eq!(op.name(), "Limit");
-        assert_eq!(op.children().len(), 1);
-        assert_eq!(op.children()[0].name(), "TableScan");
-    }
-
-    #[test]
-    fn test_operator_builder_full_chain() {
-        let schema = test_schema();
-        let predicate = make_eq_expr("id", 42);
-        let order_by = vec![OrderByExpr {
-            expr: Expr::Identifier(Ident::new("name")),
-            asc: Some(true),
-            nulls_first: None,
-        }];
-
-        let op = OperatorBuilder::scan(schema)
-            .filter(predicate)
-            .sort(order_by)
-            .limit(Some(10), 0)
-            .build();
-
-        assert_eq!(op.name(), "Limit");
-        let sort = op.children()[0];
-        assert_eq!(sort.name(), "Sort");
-        let filter = sort.children()[0];
-        assert_eq!(filter.name(), "Filter");
-        let scan = filter.children()[0];
-        assert_eq!(scan.name(), "TableScan");
-    }
-
-    #[test]
-    fn test_operator_builder_index_scan() {
-        let schema = test_schema();
-
-        let op = OperatorBuilder::index_scan(
-            schema,
-            1,
-            "idx_name".to_string(),
-            vec![Value::Text("Alice".to_string())],
-        )
-        .build();
-
-        assert_eq!(op.name(), "IndexScan");
     }
 
     #[test]
@@ -596,27 +354,5 @@ mod tests {
         };
         let mut out = HashMap::new();
         assert!(super::collect_eq_predicates(&expr, &mut out).is_none());
-    }
-
-    #[test]
-    fn test_operator_builder_with_project() {
-        let schema = test_schema();
-        let expressions = vec![
-            Expr::Identifier(Ident::new("id")),
-            Expr::Identifier(Ident::new("name")),
-        ];
-
-        let op = OperatorBuilder::scan(schema)
-            .project(
-                expressions,
-                vec!["id".to_string(), "name".to_string()],
-                vec![DataType::Int32, DataType::Text],
-            )
-            .build();
-
-        assert_eq!(op.name(), "Project");
-        assert_eq!(op.children().len(), 1);
-        assert_eq!(op.children()[0].name(), "TableScan");
-        assert_eq!(op.schema().columns.len(), 2);
     }
 }

@@ -106,7 +106,6 @@ impl Executor {
         &self.observability
     }
 
-    #[allow(dead_code)] // accessor for future permission checks
     pub fn auth_manager(&self) -> &AuthManager {
         &self.auth_manager
     }

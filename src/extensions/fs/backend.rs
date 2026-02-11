@@ -36,9 +36,6 @@ pub(crate) trait FsBackend: Send + Sync {
     async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>>;
     /// Read entire file contents. Returns error if file exceeds max_bytes.
     async fn read_file(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>>;
-    /// Check if a path exists.
-    async fn exists(&self, path: &str) -> Result<bool>;
-
     /// Open a file for streaming line-by-line reads.
     ///
     /// Returns a buffered async reader limited to `max_bytes`.
@@ -183,14 +180,6 @@ impl FsBackend for LocalFsBackend {
         }
 
         Ok(buf)
-    }
-
-    async fn exists(&self, path: &str) -> Result<bool> {
-        match tokio::fs::metadata(path).await {
-            Ok(_) => Ok(true),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(err) => Err(anyhow!("fs9: cannot stat '{path}': {err}")),
-        }
     }
 
     async fn read_file_stream(
@@ -413,22 +402,6 @@ mod tests {
             .await
             .expect_err("expected too large error");
         assert!(err.to_string().contains("fs9: file too large"));
-    }
-
-    #[tokio::test]
-    async fn test_exists_true() {
-        let backend = LocalFsBackend::new();
-        assert!(backend.exists("/tmp").await.expect("exists /tmp"));
-    }
-
-    #[tokio::test]
-    async fn test_exists_false() {
-        let backend = LocalFsBackend::new();
-        let path = format!(
-            "/tmp/pgtikv-fs9-backend-missing-exists-{}",
-            NEXT_ID.fetch_add(1, Ordering::Relaxed)
-        );
-        assert!(!backend.exists(&path).await.expect("exists missing"));
     }
 
     #[tokio::test]

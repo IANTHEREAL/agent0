@@ -14,7 +14,7 @@ pub struct QueryContext {
     pub database_name: Arc<str>,
     /// NOW() / CURRENT_TIMESTAMP — stable within a statement per PostgreSQL semantics
     pub statement_timestamp_ms: i64,
-    #[allow(dead_code)] // read by executor formatting, not yet by eval_function
+    #[allow(dead_code)] // set during init; read path uses session_context fallback
     pub timezone: Arc<str>,
 }
 

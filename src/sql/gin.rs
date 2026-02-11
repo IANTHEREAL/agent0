@@ -27,7 +27,7 @@ pub(crate) struct GinTokens {
 }
 
 impl GinTokens {
-    #[allow(dead_code)] // used in tests for GIN token verification
+    #[allow(dead_code)] // used in unit tests only
     pub(crate) fn iter_hashes(&self) -> impl Iterator<Item = u64> + '_ {
         self.key_values
             .iter()
@@ -39,6 +39,7 @@ impl GinTokens {
     ///
     /// For intersection-based scans, scanning key-value tokens first typically reduces
     /// the candidate set size earlier.
+    #[allow(dead_code)] // used in unit tests only
     pub(crate) fn into_scan_hashes(mut self) -> Vec<u64> {
         self.key_values.sort_unstable();
         self.key_values.dedup();
@@ -388,34 +389,6 @@ pub(crate) fn extract_tsvector_gin_tokens(tsvector: &str) -> Vec<u64> {
     tokens
 }
 
-/// Extract GIN tokens from a tsquery for index lookup.
-///
-/// Parses query terms from tsquery format: "'hello' & 'world'" => ["hello", "world"]
-pub(crate) fn extract_tsquery_gin_tokens(tsquery: &str) -> Vec<u64> {
-    if tsquery.contains('|') {
-        return Vec::new();
-    }
-
-    let mut tokens = Vec::new();
-    for segment in tsquery.split('&') {
-        let term = segment
-            .trim()
-            .trim_matches(|c| matches!(c, '(' | ')'))
-            .trim();
-        if term.starts_with('!') {
-            continue;
-        }
-
-        let word = term.trim_matches('\'').trim().to_lowercase();
-        if !word.is_empty() {
-            tokens.push(hash_tsvector_lexeme(&word));
-        }
-    }
-    tokens.sort_unstable();
-    tokens.dedup();
-    tokens
-}
-
 fn hash_tsvector_lexeme(word: &str) -> u64 {
     let mut h = FNV1A_OFFSET_BASIS;
     h = fnv1a_u64(h, b"T");
@@ -604,52 +577,5 @@ mod tests {
             hash_array_element(&Value::Int32(1)),
             hash_array_element(&Value::Int64(2))
         );
-    }
-
-    #[test]
-    fn tsquery_tokens_pure_and() {
-        let tokens = extract_tsquery_gin_tokens("'hello' & 'world'");
-        assert_eq!(tokens.len(), 2);
-        assert!(tokens.contains(&hash_tsvector_lexeme("hello")));
-        assert!(tokens.contains(&hash_tsvector_lexeme("world")));
-    }
-
-    #[test]
-    fn tsquery_tokens_not_excluded() {
-        let tokens = extract_tsquery_gin_tokens("'hello' & !'world'");
-        assert_eq!(tokens.len(), 1);
-        assert!(tokens.contains(&hash_tsvector_lexeme("hello")));
-    }
-
-    #[test]
-    fn tsquery_tokens_only_not() {
-        let tokens = extract_tsquery_gin_tokens("!'hello'");
-        assert_eq!(tokens.len(), 0);
-    }
-
-    #[test]
-    fn tsquery_tokens_or_returns_empty() {
-        let tokens = extract_tsquery_gin_tokens("'hello' | 'world'");
-        assert_eq!(tokens.len(), 0);
-    }
-
-    #[test]
-    fn tsquery_tokens_complex_or() {
-        let tokens = extract_tsquery_gin_tokens("'hello' & 'world' | 'rust'");
-        assert_eq!(tokens.len(), 0);
-    }
-
-    #[test]
-    fn tsquery_tokens_empty_string() {
-        let tokens = extract_tsquery_gin_tokens("");
-        assert_eq!(tokens.len(), 0);
-    }
-
-    #[test]
-    fn tsquery_tokens_parenthesized() {
-        let tokens = extract_tsquery_gin_tokens("('hello' & 'world')");
-        assert_eq!(tokens.len(), 2);
-        assert!(tokens.contains(&hash_tsvector_lexeme("hello")));
-        assert!(tokens.contains(&hash_tsvector_lexeme("world")));
     }
 }

@@ -260,11 +260,13 @@ pub enum ScanType {
         column_values: Vec<Vec<Value>>,
         estimated_rows: usize,
     },
-    #[allow(dead_code)] // Planned GIN index scan feature
     GinIndexScan {
+        #[allow(dead_code)] // planned GIN index scan feature
         index_id: u64,
         index_name: String,
+        #[allow(dead_code)] // planned GIN index scan feature
         column: String,
+        #[allow(dead_code)] // planned GIN index scan feature
         pattern: Value,
         estimated_rows: usize,
     },

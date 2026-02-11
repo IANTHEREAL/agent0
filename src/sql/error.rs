@@ -12,8 +12,8 @@ use crate::types::DataType;
 /// Variants are defined for all major PostgreSQL error categories.
 /// Not all variants are actively constructed yet — they exist for
 /// gradual migration from `anyhow!()` call sites.
+#[allow(dead_code)] // PG error code compatibility
 #[derive(Debug, thiserror::Error)]
-#[allow(dead_code)] // Variants added for gradual migration
 pub enum SqlError {
     // Syntax / parsing
     #[error("syntax error: {0}")]
@@ -106,7 +106,7 @@ impl SqlError {
         }
     }
 
-    #[allow(dead_code)] // public API for future pgwire error reporting
+    #[allow(dead_code)] // PG error reporting API
     pub fn severity(&self) -> &'static str {
         "ERROR"
     }

@@ -19,26 +19,10 @@ pub struct TableFunctionScanOperator {
 unsafe impl Sync for TableFunctionScanOperator {}
 
 enum RowSource {
-    #[allow(dead_code)]
-    Preloaded {
-        rows: Vec<Row>,
-        position: usize,
-    },
-    Channel {
-        receiver: mpsc::Receiver<Row>,
-    },
+    Channel { receiver: mpsc::Receiver<Row> },
 }
 
 impl TableFunctionScanOperator {
-    #[allow(dead_code)]
-    pub fn new_with_rows(schema: TableSchema, rows: Vec<Row>) -> Self {
-        Self {
-            schema,
-            source: RowSource::Preloaded { rows, position: 0 },
-            opened: false,
-        }
-    }
-
     pub fn new_with_channel(schema: TableSchema, receiver: mpsc::Receiver<Row>) -> Self {
         Self {
             schema,
@@ -51,9 +35,6 @@ impl TableFunctionScanOperator {
 impl fmt::Debug for TableFunctionScanOperator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let source_desc = match &self.source {
-            RowSource::Preloaded { rows, position } => {
-                format!("Preloaded({}/{})", position, rows.len())
-            }
             RowSource::Channel { .. } => "Channel(streaming)".to_string(),
         };
         f.debug_struct("TableFunctionScanOperator")
@@ -71,9 +52,6 @@ impl PhysicalOperator for TableFunctionScanOperator {
     }
 
     async fn open(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        if let RowSource::Preloaded { position, .. } = &mut self.source {
-            *position = 0;
-        }
         self.opened = true;
         Ok(())
     }
@@ -83,22 +61,12 @@ impl PhysicalOperator for TableFunctionScanOperator {
             return Err(anyhow!("Operator not opened"));
         }
         match &mut self.source {
-            RowSource::Preloaded { rows, position } => {
-                if *position < rows.len() {
-                    let row = rows[*position].clone();
-                    *position += 1;
-                    Ok(Some(row))
-                } else {
-                    Ok(None)
-                }
-            }
             RowSource::Channel { receiver } => Ok(receiver.recv().await),
         }
     }
 
     async fn close(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<()> {
         match &mut self.source {
-            RowSource::Preloaded { rows, .. } => rows.clear(),
             RowSource::Channel { receiver } => receiver.close(),
         }
         self.opened = false;
@@ -167,8 +135,9 @@ mod tests {
 
     #[test]
     fn test_operator_schema_matches() {
+        let (_tx, rx) = mpsc::channel::<Row>(1);
         let schema = test_schema();
-        let op = TableFunctionScanOperator::new_with_rows(schema.clone(), vec![]);
+        let op = TableFunctionScanOperator::new_with_channel(schema.clone(), rx);
         assert_eq!(op.schema().name, "fs9_result");
         assert_eq!(op.schema().columns.len(), 2);
         assert_eq!(op.schema().columns[0].name, "id");
@@ -177,7 +146,8 @@ mod tests {
 
     #[test]
     fn test_operator_name_and_explain() {
-        let op = TableFunctionScanOperator::new_with_rows(test_schema(), vec![]);
+        let (_tx, rx) = mpsc::channel::<Row>(1);
+        let op = TableFunctionScanOperator::new_with_channel(test_schema(), rx);
         assert_eq!(op.name(), "TableFunctionScan");
         let info = op.explain_info().expect("explain_info should return Some");
         assert!(info.contains("fs9"), "explain_info should mention fs9");
@@ -185,9 +155,10 @@ mod tests {
 
     #[test]
     fn test_operator_initial_state() {
-        let op = TableFunctionScanOperator::new_with_rows(test_schema(), test_rows(3));
+        let (_tx, rx) = mpsc::channel::<Row>(1);
+        let op = TableFunctionScanOperator::new_with_channel(test_schema(), rx);
         assert!(!op.opened);
-        assert!(matches!(&op.source, RowSource::Preloaded { rows, .. } if rows.len() == 3));
+        assert!(matches!(&op.source, RowSource::Channel { .. }));
     }
 
     #[tokio::test]
@@ -209,7 +180,6 @@ mod tests {
                     Some(row) => collected.push(row),
                     None => break,
                 },
-                _ => unreachable!(),
             }
         }
 
