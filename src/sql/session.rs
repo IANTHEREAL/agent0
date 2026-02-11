@@ -623,10 +623,16 @@ impl Session {
     pub async fn begin(&mut self) -> Result<()> {
         match self.state {
             TransactionState::Idle => {
+                // Capture the transaction start timestamp before awaiting store/savepoint
+                // operations, so TiKV begin latency does not skew NOW()/TRANSACTION_TIMESTAMP().
+                // Use the task-local statement timestamp when available (i.e. when called
+                // from within execute_single's with_timestamps scope) to match PostgreSQL
+                // semantics where transaction_timestamp = start of the BEGIN statement.
+                let ts = super::statement_time::statement_timestamp_millis_or_now();
                 let txn = self.store.begin().await?;
                 self.savepoints.reset().await?;
                 self.state = TransactionState::Active(txn);
-                self.transaction_timestamp_ms = Some(super::statement_time::now_timestamp_millis());
+                self.transaction_timestamp_ms = Some(ts);
                 Ok(())
             }
             TransactionState::Active(_) | TransactionState::Failed(_) => {

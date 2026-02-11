@@ -117,6 +117,19 @@ fn sql_datatype_is_timestamptz(dt: &sqlparser::ast::DataType) -> Option<bool> {
     }
 }
 
+/// Returns `true` if the given SQL function name is known to return `TIMESTAMPTZ`.
+///
+/// This is a lightweight check used by `expr_is_timestamptz*()` to determine
+/// whether a function expression should be treated as timestamptz for
+/// `::text` formatting and `AT TIME ZONE` direction.
+fn fn_returns_timestamptz(name: &str) -> bool {
+    name.eq_ignore_ascii_case("NOW")
+        || name.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+        || name.eq_ignore_ascii_case("STATEMENT_TIMESTAMP")
+        || name.eq_ignore_ascii_case("TRANSACTION_TIMESTAMP")
+        || name.eq_ignore_ascii_case("CLOCK_TIMESTAMP")
+}
+
 fn expr_is_timestamptz(expr: &Expr, schema: Option<&TableSchema>) -> bool {
     match expr {
         Expr::Identifier(ident) => schema
@@ -134,10 +147,11 @@ fn expr_is_timestamptz(expr: &Expr, schema: Option<&TableSchema>) -> bool {
                 })
             })
             .is_some_and(|dt| matches!(dt, DataType::TimestampTz)),
-        Expr::Function(func) => func.name.0.last().is_some_and(|ident| {
-            ident.value.eq_ignore_ascii_case("NOW")
-                || ident.value.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
-        }),
+        Expr::Function(func) => func
+            .name
+            .0
+            .last()
+            .is_some_and(|ident| fn_returns_timestamptz(&ident.value)),
         Expr::Cast { data_type, .. } | Expr::TypedString { data_type, .. } => {
             sql_datatype_is_timestamptz(data_type).unwrap_or(false)
         }
@@ -192,10 +206,11 @@ fn expr_is_timestamptz_join_with_schema(
             column_type_from_expr(expr, column_offsets, combined_schema)
                 .is_some_and(|dt| matches!(dt, DataType::TimestampTz))
         }
-        Expr::Function(func) => func.name.0.last().is_some_and(|ident| {
-            ident.value.eq_ignore_ascii_case("NOW")
-                || ident.value.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
-        }),
+        Expr::Function(func) => func
+            .name
+            .0
+            .last()
+            .is_some_and(|ident| fn_returns_timestamptz(&ident.value)),
         Expr::Cast { data_type, .. } | Expr::TypedString { data_type, .. } => {
             sql_datatype_is_timestamptz(data_type).unwrap_or(false)
         }
