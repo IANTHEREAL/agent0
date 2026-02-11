@@ -12,12 +12,17 @@ use crate::types::TableSchema;
 
 fn build_query_ctx_from_task_locals() -> QueryContext {
     use crate::sql::expr::{get_connection_id_value, get_current_database_name};
-    use crate::sql::statement_time::statement_timestamp_millis_or_now;
+    use crate::sql::statement_time::{
+        statement_timestamp_millis_or_now, transaction_timestamp_millis,
+    };
 
+    let stmt_ts = statement_timestamp_millis_or_now();
+    let txn_ts = transaction_timestamp_millis().unwrap_or(stmt_ts);
     QueryContext::new(
         get_connection_id_value(),
         get_current_database_name().unwrap_or_else(|| Arc::from("postgres")),
-        statement_timestamp_millis_or_now(),
+        stmt_ts,
+        txn_ts,
         crate::session_context::current_timezone(),
     )
 }

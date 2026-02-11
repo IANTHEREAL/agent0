@@ -1915,34 +1915,80 @@ async fn test_current_database_reads_task_local_context() {
 
 #[tokio::test]
 async fn test_current_timestamp_precision_truncates_to_second() {
-    let fixed = 1_700_000_001_234_i64;
+    let txn = 1_700_000_001_234_i64;
+    let stmt = txn + 1000; // statement is later; CURRENT_TIMESTAMP should use txn
     let expr = parse_expr("CURRENT_TIMESTAMP(0)");
-    let val = statement_time::with_statement_timestamp_millis(fixed, async {
-        eval_expr(&expr, None, None).unwrap()
-    })
-    .await;
+    let val =
+        statement_time::with_timestamps(stmt, txn, async { eval_expr(&expr, None, None).unwrap() })
+            .await;
     assert_eq!(val, Value::Timestamp(1_700_000_001_000));
 }
 
 #[tokio::test]
+async fn test_current_date_uses_transaction_timestamp() {
+    let txn = 1_700_000_001_234_i64;
+    let stmt = txn + 1000;
+    let expr = parse_expr("CURRENT_DATE");
+    let val =
+        statement_time::with_timestamps(stmt, txn, async { eval_expr(&expr, None, None).unwrap() })
+            .await;
+    let expected_days = crate::types::date::timestamp_millis_to_date_days(txn).unwrap();
+    assert_eq!(val, Value::Date(expected_days));
+}
+
+#[test]
+fn test_current_date_reads_from_query_context() {
+    use crate::sql::query_context::QueryContext;
+
+    let stmt_ts = 1_700_000_099_000_i64;
+    let txn_ts = 1_700_000_001_234_i64;
+    let qc = QueryContext::new(1, Arc::from("db"), stmt_ts, txn_ts, Arc::from("UTC"));
+    let expr = parse_expr("CURRENT_DATE");
+    let val = eval_expr_with_query_ctx(&expr, None, None, Some(&qc)).unwrap();
+    let expected_days = crate::types::date::timestamp_millis_to_date_days(txn_ts).unwrap();
+    assert_eq!(val, Value::Date(expected_days));
+}
+
+#[tokio::test]
+async fn test_age_single_arg_uses_transaction_timestamp() {
+    // AGE(CURRENT_TIMESTAMP) should produce a zero interval when both
+    // the argument and the implicit "current" reference resolve to the
+    // same transaction timestamp — proving AGE reads from the task-local
+    // rather than calling SystemTime::now().
+    let txn = 1_700_000_001_000_i64;
+    let stmt = txn + 5000;
+    let expr = parse_expr("AGE(CURRENT_TIMESTAMP)");
+    let val =
+        statement_time::with_timestamps(stmt, txn, async { eval_expr(&expr, None, None).unwrap() })
+            .await;
+    match val {
+        Value::Interval(iv) => {
+            assert_eq!(iv.months, 0, "months should be 0");
+            assert_eq!(iv.millis, 0, "millis should be 0");
+        }
+        other => panic!("expected Interval, got {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn test_now_precision_matches_current_timestamp_precision() {
-    let fixed = 1_700_000_001_234_i64;
+    let txn = 1_700_000_001_234_i64;
+    let stmt = txn + 1000;
     let expr = parse_expr("NOW(0) = CURRENT_TIMESTAMP(0)");
-    let val = statement_time::with_statement_timestamp_millis(fixed, async {
-        eval_expr(&expr, None, None).unwrap()
-    })
-    .await;
+    let val =
+        statement_time::with_timestamps(stmt, txn, async { eval_expr(&expr, None, None).unwrap() })
+            .await;
     assert_eq!(val, Value::Boolean(true));
 }
 
 #[tokio::test]
 async fn test_current_timestamp_equals_date_trunc_second_within_statement() {
-    let fixed = 1_700_000_001_234_i64;
+    let txn = 1_700_000_001_234_i64;
+    let stmt = txn + 1000;
     let expr = parse_expr("CURRENT_TIMESTAMP(0) = DATE_TRUNC('second', CURRENT_TIMESTAMP)");
-    let val = statement_time::with_statement_timestamp_millis(fixed, async {
-        eval_expr(&expr, None, None).unwrap()
-    })
-    .await;
+    let val =
+        statement_time::with_timestamps(stmt, txn, async { eval_expr(&expr, None, None).unwrap() })
+            .await;
     assert_eq!(val, Value::Boolean(true));
 }
 
@@ -1982,6 +2028,7 @@ fn test_pg_backend_pid_reads_from_query_context() {
         999,
         Arc::from("testdb"),
         1_700_000_000_000,
+        1_700_000_000_000,
         Arc::from("UTC"),
     );
     let expr = parse_expr("pg_backend_pid()");
@@ -1997,6 +2044,7 @@ fn test_current_database_reads_from_query_context() {
         1,
         Arc::from("context_db"),
         1_700_000_000_000,
+        1_700_000_000_000,
         Arc::from("UTC"),
     );
     let expr = parse_expr("current_database()");
@@ -2005,24 +2053,28 @@ fn test_current_database_reads_from_query_context() {
 }
 
 #[test]
-fn test_now_reads_from_query_context() {
+fn test_now_reads_transaction_timestamp_from_query_context() {
     use crate::sql::query_context::QueryContext;
 
-    let fixed_ts = 1_700_000_001_234_i64;
-    let qc = QueryContext::new(1, Arc::from("db"), fixed_ts, Arc::from("UTC"));
+    let stmt_ts = 1_700_000_099_000_i64;
+    let txn_ts = 1_700_000_001_234_i64;
+    let qc = QueryContext::new(1, Arc::from("db"), stmt_ts, txn_ts, Arc::from("UTC"));
     let expr = parse_expr("NOW(0)");
     let val = eval_expr_with_query_ctx(&expr, None, None, Some(&qc)).unwrap();
+    // NOW() uses transaction time per PostgreSQL semantics
     assert_eq!(val, Value::Timestamp(1_700_000_001_000));
 }
 
 #[test]
-fn test_current_timestamp_reads_from_query_context() {
+fn test_current_timestamp_reads_transaction_timestamp_from_query_context() {
     use crate::sql::query_context::QueryContext;
 
-    let fixed_ts = 1_700_000_001_500_i64;
-    let qc = QueryContext::new(1, Arc::from("db"), fixed_ts, Arc::from("UTC"));
+    let stmt_ts = 1_700_000_099_000_i64;
+    let txn_ts = 1_700_000_001_500_i64;
+    let qc = QueryContext::new(1, Arc::from("db"), stmt_ts, txn_ts, Arc::from("UTC"));
     let expr = parse_expr("CURRENT_TIMESTAMP(3)");
     let val = eval_expr_with_query_ctx(&expr, None, None, Some(&qc)).unwrap();
+    // CURRENT_TIMESTAMP uses transaction time per PostgreSQL semantics
     assert_eq!(val, Value::Timestamp(1_700_000_001_500));
 }
 
@@ -2030,7 +2082,13 @@ fn test_current_timestamp_reads_from_query_context() {
 async fn test_query_context_overrides_task_local() {
     use crate::sql::query_context::QueryContext;
 
-    let qc = QueryContext::new(777, Arc::from("qc_db"), 1_600_000_000_000, Arc::from("UTC"));
+    let qc = QueryContext::new(
+        777,
+        Arc::from("qc_db"),
+        1_600_000_000_000,
+        1_600_000_000_000,
+        Arc::from("UTC"),
+    );
 
     let pid_expr = parse_expr("pg_backend_pid()");
     let db_expr = parse_expr("current_database()");
@@ -2044,6 +2102,77 @@ async fn test_query_context_overrides_task_local() {
 
     assert_eq!(pid, Value::Int32(777));
     assert_eq!(db, Value::Text("qc_db".to_string()));
+}
+
+#[test]
+fn test_transaction_timestamp_reads_from_query_context() {
+    use crate::sql::query_context::QueryContext;
+
+    let stmt_ts = 1_700_000_001_000_i64;
+    let txn_ts = 1_700_000_000_000_i64;
+    let qc = QueryContext::new(1, Arc::from("db"), stmt_ts, txn_ts, Arc::from("UTC"));
+    let expr = parse_expr("TRANSACTION_TIMESTAMP(0)");
+    let val = eval_expr_with_query_ctx(&expr, None, None, Some(&qc)).unwrap();
+    assert_eq!(val, Value::Timestamp(txn_ts));
+}
+
+#[tokio::test]
+async fn test_transaction_timestamp_reads_task_local_without_query_ctx() {
+    let stmt = 1_700_000_001_000_i64;
+    let txn = 1_700_000_000_000_i64;
+    let expr = parse_expr("TRANSACTION_TIMESTAMP(0)");
+    let val =
+        statement_time::with_timestamps(stmt, txn, async { eval_expr(&expr, None, None).unwrap() })
+            .await;
+    assert_eq!(
+        val,
+        Value::Timestamp(txn),
+        "TRANSACTION_TIMESTAMP() should read TRANSACTION_TIMESTAMP_MILLIS task-local even without QueryContext"
+    );
+}
+
+#[tokio::test]
+async fn test_transaction_timestamp_differs_from_statement_timestamp() {
+    let stmt = 1_700_000_001_000_i64;
+    let txn = 1_700_000_000_000_i64;
+    let txn_expr = parse_expr("TRANSACTION_TIMESTAMP(0)");
+    let stmt_expr = parse_expr("STATEMENT_TIMESTAMP(0)");
+    let (txn_val, stmt_val) = statement_time::with_timestamps(stmt, txn, async {
+        (
+            eval_expr(&txn_expr, None, None).unwrap(),
+            eval_expr(&stmt_expr, None, None).unwrap(),
+        )
+    })
+    .await;
+    assert_eq!(txn_val, Value::Timestamp(txn));
+    assert_eq!(stmt_val, Value::Timestamp(stmt));
+    assert_ne!(
+        txn_val, stmt_val,
+        "transaction and statement timestamps should differ in explicit transaction"
+    );
+}
+
+#[tokio::test]
+async fn test_now_equals_transaction_timestamp_not_statement_timestamp() {
+    // Per PostgreSQL: NOW() = CURRENT_TIMESTAMP = TRANSACTION_TIMESTAMP()
+    // and all differ from STATEMENT_TIMESTAMP() inside an explicit transaction.
+    let stmt = 1_700_000_005_000_i64;
+    let txn = 1_700_000_000_000_i64;
+    let (now_val, ct_val, tt_val, st_val) = statement_time::with_timestamps(stmt, txn, async {
+        (
+            eval_expr(&parse_expr("NOW(0)"), None, None).unwrap(),
+            eval_expr(&parse_expr("CURRENT_TIMESTAMP(0)"), None, None).unwrap(),
+            eval_expr(&parse_expr("TRANSACTION_TIMESTAMP(0)"), None, None).unwrap(),
+            eval_expr(&parse_expr("STATEMENT_TIMESTAMP(0)"), None, None).unwrap(),
+        )
+    })
+    .await;
+    // NOW, CURRENT_TIMESTAMP, TRANSACTION_TIMESTAMP all return transaction time
+    assert_eq!(now_val, Value::Timestamp(txn));
+    assert_eq!(ct_val, Value::Timestamp(txn));
+    assert_eq!(tt_val, Value::Timestamp(txn));
+    // STATEMENT_TIMESTAMP returns statement time
+    assert_eq!(st_val, Value::Timestamp(stmt));
 }
 
 #[test]

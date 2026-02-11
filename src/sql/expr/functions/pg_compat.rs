@@ -14,8 +14,8 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("PG_TABLE_IS_VISIBLE", pg_table_is_visible);
     map.insert("PG_TYPE_IS_VISIBLE", pg_type_is_visible);
     map.insert("CLOCK_TIMESTAMP", clock_timestamp);
-    map.insert("STATEMENT_TIMESTAMP", clock_timestamp);
-    map.insert("TRANSACTION_TIMESTAMP", clock_timestamp);
+    // STATEMENT_TIMESTAMP and TRANSACTION_TIMESTAMP are handled as special cases
+    // in eval_function (expr/mod.rs) because they need access to QueryContext.
     map.insert("TXID_CURRENT", txid_current);
     map.insert("PG_ENCODING_TO_CHAR", pg_encoding_to_char);
     map.insert("OBJ_DESCRIPTION", obj_description);

@@ -114,7 +114,7 @@ Writing conventions:
 **SQL Engine**
 - `src/sql/parser.rs` (Unknown): sqlparser-rs Postgres dialect → AST
 - `src/sql/executor.rs` (Verified): statement dispatch + autocommit/transaction glue (core dispatch point)
-  - Statement-level task-local: `statement_time::with_statement_timestamp_millis(...)` + `txn::with_savepoints(session.savepoints(), ...)` (affects `now()`/time functions and SAVEPOINT rollback log)
+  - Statement-level task-local: `statement_time::with_timestamps(statement_ts, transaction_ts, ...)` + `txn::with_savepoints(session.savepoints(), ...)` (affects `now()`/time functions, `transaction_timestamp()`, and SAVEPOINT rollback log)
     - Fact: `statement_ts = now_timestamp_millis()` is computed once at the beginning of `Executor::execute()` and wraps the entire multi-statement loop; `UNKNOWN`: whether this matches PostgreSQL semantics for `statement_timestamp()`/`now()` (read `src/sql/statement_time.rs` + the time function implementations)
   - Pre-parse interception (bypasses sqlparser AST):
     - `CREATE/DROP EXTENSION`, `CREATE/DROP FUNCTION`, `CREATE/DROP TRIGGER`

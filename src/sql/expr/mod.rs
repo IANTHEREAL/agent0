@@ -117,6 +117,19 @@ fn sql_datatype_is_timestamptz(dt: &sqlparser::ast::DataType) -> Option<bool> {
     }
 }
 
+/// Returns `true` if the given SQL function name is known to return `TIMESTAMPTZ`.
+///
+/// This is a lightweight check used by `expr_is_timestamptz*()` to determine
+/// whether a function expression should be treated as timestamptz for
+/// `::text` formatting and `AT TIME ZONE` direction.
+fn fn_returns_timestamptz(name: &str) -> bool {
+    name.eq_ignore_ascii_case("NOW")
+        || name.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
+        || name.eq_ignore_ascii_case("STATEMENT_TIMESTAMP")
+        || name.eq_ignore_ascii_case("TRANSACTION_TIMESTAMP")
+        || name.eq_ignore_ascii_case("CLOCK_TIMESTAMP")
+}
+
 fn expr_is_timestamptz(expr: &Expr, schema: Option<&TableSchema>) -> bool {
     match expr {
         Expr::Identifier(ident) => schema
@@ -134,10 +147,11 @@ fn expr_is_timestamptz(expr: &Expr, schema: Option<&TableSchema>) -> bool {
                 })
             })
             .is_some_and(|dt| matches!(dt, DataType::TimestampTz)),
-        Expr::Function(func) => func.name.0.last().is_some_and(|ident| {
-            ident.value.eq_ignore_ascii_case("NOW")
-                || ident.value.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
-        }),
+        Expr::Function(func) => func
+            .name
+            .0
+            .last()
+            .is_some_and(|ident| fn_returns_timestamptz(&ident.value)),
         Expr::Cast { data_type, .. } | Expr::TypedString { data_type, .. } => {
             sql_datatype_is_timestamptz(data_type).unwrap_or(false)
         }
@@ -192,10 +206,11 @@ fn expr_is_timestamptz_join_with_schema(
             column_type_from_expr(expr, column_offsets, combined_schema)
                 .is_some_and(|dt| matches!(dt, DataType::TimestampTz))
         }
-        Expr::Function(func) => func.name.0.last().is_some_and(|ident| {
-            ident.value.eq_ignore_ascii_case("NOW")
-                || ident.value.eq_ignore_ascii_case("CURRENT_TIMESTAMP")
-        }),
+        Expr::Function(func) => func
+            .name
+            .0
+            .last()
+            .is_some_and(|ident| fn_returns_timestamptz(&ident.value)),
         Expr::Cast { data_type, .. } | Expr::TypedString { data_type, .. } => {
             sql_datatype_is_timestamptz(data_type).unwrap_or(false)
         }
@@ -693,7 +708,7 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
         // TRANSLATE, INITCAP are handled by the registry (functions/string.rs)
         // ABS, CEIL, CEILING, FLOOR, ROUND, TRUNC, TRUNCATE, SQRT, CBRT, POWER, POW, EXP, LN, LOG, LOG10,
         // SIGN, MOD, DEGREES, RADIANS, SIN, COS, TAN, PI, RANDOM are handled by the registry (functions/math.rs)
-        "NOW" | "CURRENT_TIMESTAMP" => {
+        "NOW" | "CURRENT_TIMESTAMP" | "STATEMENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" => {
             if args.len() > 1 {
                 return Err(anyhow!("{} expects 0 or 1 argument", func_name));
             }
@@ -703,17 +718,31 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                 Some(Value::Int64(p)) => (*p).clamp(0, 6) as u32,
                 _ => 6_u32,
             };
-            let ts = ctx
-                .query_context()
-                .map(|qc| qc.statement_timestamp_ms)
-                .unwrap_or_else(super::statement_time::statement_timestamp_millis_or_now);
+            let ts = if func_name_upper == "STATEMENT_TIMESTAMP" {
+                // STATEMENT_TIMESTAMP() is the only function scoped to the
+                // current statement — it changes between statements inside a
+                // BEGIN/COMMIT block.
+                ctx.query_context()
+                    .map(|qc| qc.statement_timestamp_ms)
+                    .unwrap_or_else(super::statement_time::statement_timestamp_millis_or_now)
+            } else {
+                // NOW, CURRENT_TIMESTAMP, TRANSACTION_TIMESTAMP — all return
+                // the transaction start time per PostgreSQL semantics.  For
+                // implicit (autocommit) transactions this equals statement time.
+                ctx.query_context()
+                    .map(|qc| qc.transaction_timestamp_ms)
+                    .unwrap_or_else(super::statement_time::transaction_timestamp_millis_or_now)
+            };
             let ts = crate::types::timestamp::truncate_timestamp_millis(ts, precision);
             Ok(Value::Timestamp(ts))
         }
         "CURRENT_DATE" => {
-            use chrono::Utc;
-            let today = Utc::now().date_naive();
-            let days = crate::types::date::naive_date_to_days(today)?;
+            // CURRENT_DATE uses transaction time per PostgreSQL semantics.
+            let ts = ctx
+                .query_context()
+                .map(|qc| qc.transaction_timestamp_ms)
+                .unwrap_or_else(super::statement_time::transaction_timestamp_millis_or_now);
+            let days = crate::types::date::timestamp_millis_to_date_days(ts)?;
             Ok(Value::Date(days))
         }
         "DATE_TRUNC" => eval_date_trunc_from_args(args),
@@ -739,7 +768,6 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
         "TO_CHAR" => eval_to_char_from_args(args),
         "AGE" => {
             use chrono::{Datelike, TimeZone, Utc};
-            use std::time::{SystemTime, UNIX_EPOCH};
             let mut iter = args.into_iter();
             let ts1 = match iter.next() {
                 Some(Value::Timestamp(t)) => t,
@@ -749,10 +777,12 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
             let ts2 = match iter.next() {
                 Some(Value::Timestamp(t)) => t,
                 Some(Value::Date(days)) => crate::types::date::date_days_to_timestamp_millis(days)?,
-                _ => SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|e| anyhow!("Failed to get current time: {}", e))?
-                    .as_millis() as i64,
+                // AGE(ts) subtracts from "current date", which is
+                // transaction-scoped per PostgreSQL semantics.
+                _ => ctx
+                    .query_context()
+                    .map(|qc| qc.transaction_timestamp_ms)
+                    .unwrap_or_else(super::statement_time::transaction_timestamp_millis_or_now),
             };
 
             let dt1 = Utc
@@ -906,8 +936,8 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
         }
 
         // REGEXP_REPLACE, REGEXP_MATCHES, REGEXP_SPLIT_TO_ARRAY are handled by the registry (functions/regex.rs)
-        // PG_TYPEOF, QUOTE_IDENT, QUOTE_LITERAL, QUOTE_NULLABLE, CLOCK_TIMESTAMP, STATEMENT_TIMESTAMP,
-        // TRANSACTION_TIMESTAMP, TXID_CURRENT, PG_COLUMN_SIZE, PG_TABLE_IS_VISIBLE are handled by the registry (functions/pg_compat.rs)
+        // PG_TYPEOF, QUOTE_IDENT, QUOTE_LITERAL, QUOTE_NULLABLE, CLOCK_TIMESTAMP,
+        // TXID_CURRENT, PG_COLUMN_SIZE, PG_TABLE_IS_VISIBLE are handled by the registry (functions/pg_compat.rs)
         // JSONB_SET, JSON_SET, JSONB_ARRAY_ELEMENTS, JSON_ARRAY_ELEMENTS, JSONB_ARRAY_ELEMENTS_TEXT,
         // JSON_ARRAY_ELEMENTS_TEXT, JSONB_EACH, JSON_EACH, JSONB_EACH_TEXT, JSON_EACH_TEXT are handled by the registry (functions/json.rs)
         _ => Err(SqlError::Unsupported(format!("Unsupported function: {}", func_name)).into()),
