@@ -1,4 +1,4 @@
-//! PostgreSQL COPY text format encoding.
+//! PostgreSQL COPY format encoding (text and CSV).
 
 use crate::types::Value;
 use chrono::{TimeZone, Utc};
@@ -6,6 +6,80 @@ use chrono::{TimeZone, Utc};
 const TAB: u8 = b'\t';
 const NEWLINE: u8 = b'\n';
 const BACKSLASH: u8 = b'\\';
+
+/// COPY format (text or CSV).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyFormat {
+    Text,
+    Csv,
+}
+
+/// Parsed COPY options (FORMAT, DELIMITER, NULL, HEADER, QUOTE, ESCAPE).
+#[derive(Debug, Clone)]
+pub struct CopyOptions {
+    pub format: CopyFormat,
+    pub delimiter: u8,
+    pub null_string: String,
+    pub header: bool,
+    pub quote: u8,
+    pub escape: u8,
+}
+
+impl Default for CopyOptions {
+    fn default() -> Self {
+        Self {
+            format: CopyFormat::Text,
+            delimiter: TAB,
+            null_string: "\\N".to_string(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+        }
+    }
+}
+
+impl CopyOptions {
+    /// Build from sqlparser CopyOption list.
+    pub fn from_copy_options(options: &[sqlparser::ast::CopyOption]) -> Self {
+        use sqlparser::ast::CopyOption;
+        let mut opts = Self::default();
+        for opt in options {
+            match opt {
+                CopyOption::Format(ident) => {
+                    let fmt = ident.value.to_uppercase();
+                    if fmt == "CSV" {
+                        opts.format = CopyFormat::Csv;
+                        // CSV defaults differ from text
+                        if opts.delimiter == TAB {
+                            opts.delimiter = b',';
+                        }
+                        if opts.null_string == "\\N" {
+                            opts.null_string = String::new();
+                        }
+                    }
+                    // TEXT is the default; BINARY not supported.
+                }
+                CopyOption::Delimiter(c) => {
+                    opts.delimiter = *c as u8;
+                }
+                CopyOption::Null(s) => {
+                    opts.null_string = s.clone();
+                }
+                CopyOption::Header(b) => {
+                    opts.header = *b;
+                }
+                CopyOption::Quote(c) => {
+                    opts.quote = *c as u8;
+                }
+                CopyOption::Escape(c) => {
+                    opts.escape = *c as u8;
+                }
+                _ => {} // Ignore FREEZE, FORCE_QUOTE, etc.
+            }
+        }
+        opts
+    }
+}
 
 /// Encode a row of values into PostgreSQL COPY text format.
 ///
@@ -23,6 +97,83 @@ pub fn encode_row(values: &[Value], buf: &mut Vec<u8>) {
         encode_value(value, buf);
     }
     buf.push(NEWLINE);
+}
+
+/// Encode a row using the given options (supports text and CSV formats).
+#[inline]
+pub fn encode_row_with_options(values: &[Value], buf: &mut Vec<u8>, opts: &CopyOptions) {
+    match opts.format {
+        CopyFormat::Text => {
+            for (i, value) in values.iter().enumerate() {
+                if i > 0 {
+                    buf.push(opts.delimiter);
+                }
+                if matches!(value, Value::Null) {
+                    buf.extend_from_slice(opts.null_string.as_bytes());
+                } else {
+                    encode_value(value, buf);
+                }
+            }
+            buf.push(NEWLINE);
+        }
+        CopyFormat::Csv => {
+            for (i, value) in values.iter().enumerate() {
+                if i > 0 {
+                    buf.push(opts.delimiter);
+                }
+                encode_csv_value(value, buf, opts);
+            }
+            buf.push(NEWLINE);
+        }
+    }
+}
+
+/// Encode a single value in CSV format with quoting.
+fn encode_csv_value(value: &Value, buf: &mut Vec<u8>, opts: &CopyOptions) {
+    if matches!(value, Value::Null) {
+        buf.extend_from_slice(opts.null_string.as_bytes());
+        return;
+    }
+    // Render value to a temporary buffer, then quote if needed.
+    let mut tmp = Vec::new();
+    encode_value_raw(value, &mut tmp);
+    let needs_quote = tmp
+        .iter()
+        .any(|&c| c == opts.delimiter || c == opts.quote || c == NEWLINE || c == b'\r');
+    if needs_quote {
+        buf.push(opts.quote);
+        for &c in &tmp {
+            if c == opts.quote {
+                // Double the quote character for escaping.
+                if opts.escape == opts.quote {
+                    buf.push(opts.quote);
+                } else {
+                    buf.push(opts.escape);
+                }
+            }
+            buf.push(c);
+        }
+        buf.push(opts.quote);
+    } else {
+        buf.extend_from_slice(&tmp);
+    }
+}
+
+/// Render value to bytes without COPY text escaping (for CSV quoting).
+fn encode_value_raw(value: &Value, buf: &mut Vec<u8>) {
+    match value {
+        Value::Null => {} // handled by caller
+        Value::Boolean(b) => buf.push(if *b { b't' } else { b'f' }),
+        Value::Text(s) => buf.extend_from_slice(s.as_bytes()),
+        Value::Json(s) | Value::Jsonb(s) => buf.extend_from_slice(s.as_bytes()),
+        Value::Tsvector(s) | Value::Tsquery(s) => buf.extend_from_slice(s.as_bytes()),
+        _ => {
+            // For all other types, use the standard encoder which adds text escaping.
+            // CSV doesn't need backslash escaping, but the numeric/date/etc types don't
+            // produce backslashes anyway. Only text types need special handling (above).
+            encode_value(value, buf);
+        }
+    }
 }
 
 #[inline]
@@ -257,5 +408,82 @@ mod tests {
         buf.clear();
         encode_row(&[Value::Float64(f64::NEG_INFINITY)], &mut buf);
         assert_eq!(buf, b"-Infinity\n");
+    }
+
+    #[test]
+    fn test_csv_format_basic() {
+        let opts = CopyOptions {
+            format: CopyFormat::Csv,
+            delimiter: b',',
+            null_string: String::new(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+        };
+        let mut buf = Vec::new();
+        encode_row_with_options(
+            &[
+                Value::Int32(1),
+                Value::Text("hello".to_string()),
+                Value::Null,
+            ],
+            &mut buf,
+            &opts,
+        );
+        assert_eq!(buf, b"1,hello,\n");
+    }
+
+    #[test]
+    fn test_csv_format_quoting() {
+        let opts = CopyOptions {
+            format: CopyFormat::Csv,
+            delimiter: b',',
+            null_string: String::new(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+        };
+        let mut buf = Vec::new();
+        encode_row_with_options(
+            &[Value::Text("a,b".to_string()), Value::Text("c\"d".to_string())],
+            &mut buf,
+            &opts,
+        );
+        // "a,b" is quoted because it contains comma; "c""d" has doubled quote
+        assert_eq!(buf, b"\"a,b\",\"c\"\"d\"\n");
+    }
+
+    #[test]
+    fn test_custom_delimiter() {
+        let opts = CopyOptions {
+            format: CopyFormat::Text,
+            delimiter: b'|',
+            null_string: "\\N".to_string(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+        };
+        let mut buf = Vec::new();
+        encode_row_with_options(
+            &[Value::Int32(1), Value::Int32(2), Value::Null],
+            &mut buf,
+            &opts,
+        );
+        assert_eq!(buf, b"1|2|\\N\n");
+    }
+
+    #[test]
+    fn test_csv_null_string() {
+        let opts = CopyOptions {
+            format: CopyFormat::Csv,
+            delimiter: b',',
+            null_string: "NULL".to_string(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+        };
+        let mut buf = Vec::new();
+        encode_row_with_options(&[Value::Null, Value::Int32(1)], &mut buf, &opts);
+        assert_eq!(buf, b"NULL,1\n");
     }
 }

@@ -552,12 +552,19 @@ impl DynamicPgHandler {
 
     pub(super) fn parse_copy_to_command(
         query: &str,
-    ) -> Result<Option<(String, Vec<String>)>, ErrorInfo> {
+    ) -> Result<
+        Option<(
+            String,
+            Vec<String>,
+            crate::protocol::copy_format::CopyOptions,
+        )>,
+        ErrorInfo,
+    > {
         fn unsupported_copy_to_stdout_syntax() -> ErrorInfo {
             ErrorInfo::new(
                 "ERROR".to_string(),
                 "0A000".to_string(),
-                "Unsupported COPY TO STDOUT syntax. Supported: COPY [schema.]table [(col1, col2, ...)] TO STDOUT".to_string(),
+                "Unsupported COPY TO STDOUT syntax. Supported: COPY [schema.]table [(col1, col2, ...)] TO STDOUT [WITH (options)]".to_string(),
             )
         }
 
@@ -605,13 +612,11 @@ impl DynamicPgHandler {
             return Ok(None);
         }
 
-        if stmts.len() != 1
-            || !options.is_empty()
-            || !legacy_options.is_empty()
-            || !values.is_empty()
-        {
+        if stmts.len() != 1 || !legacy_options.is_empty() || !values.is_empty() {
             return Err(unsupported_copy_to_stdout_syntax());
         }
+
+        let copy_opts = crate::protocol::copy_format::CopyOptions::from_copy_options(options);
 
         let CopySource::Table {
             table_name,
@@ -655,17 +660,17 @@ impl DynamicPgHandler {
         };
         let columns = columns.iter().map(|c| c.value.clone()).collect();
 
-        Ok(Some((table_name, columns)))
+        Ok(Some((table_name, columns, copy_opts)))
     }
 
     fn copy_out_response_from_select_result(
         result: ExecuteResult,
-    ) -> Result<(CopyResponse, Vec<crate::types::Row>), ErrorInfo> {
+    ) -> Result<(CopyResponse, Vec<String>, Vec<crate::types::Row>), ErrorInfo> {
         match result {
             ExecuteResult::Select { columns, rows, .. } => {
                 let col_count = columns.len();
                 let column_formats: Vec<i16> = vec![0; col_count];
-                Ok((CopyResponse::new(0, col_count, column_formats), rows))
+                Ok((CopyResponse::new(0, col_count, column_formats), columns, rows))
             }
             _ => Err(ErrorInfo::new(
                 "ERROR".to_string(),
@@ -680,6 +685,7 @@ impl DynamicPgHandler {
         client: &mut C,
         table_name: &str,
         columns: &[String],
+        copy_opts: &crate::protocol::copy_format::CopyOptions,
     ) -> PgWireResult<Vec<Response<'a>>>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -715,7 +721,7 @@ impl DynamicPgHandler {
                 )))
             })?;
 
-        let (copy_resp, rows) = Self::copy_out_response_from_select_result(result)
+        let (copy_resp, col_names, rows) = Self::copy_out_response_from_select_result(result)
             .map_err(|e| PgWireError::UserError(Box::new(e)))?;
 
         drop(session_guard);
@@ -723,9 +729,23 @@ impl DynamicPgHandler {
         pgwire::api::copy::send_copy_out_response(client, copy_resp).await?;
 
         let mut buf = Vec::with_capacity(4096);
+
+        // Emit HEADER row if requested.
+        if copy_opts.header {
+            for (i, name) in col_names.iter().enumerate() {
+                if i > 0 {
+                    buf.push(copy_opts.delimiter);
+                }
+                buf.extend_from_slice(name.as_bytes());
+            }
+            buf.push(b'\n');
+            let data = pgwire::messages::copy::CopyData::new(bytes::Bytes::copy_from_slice(&buf));
+            client.send(PgWireBackendMessage::CopyData(data)).await?;
+        }
+
         for row in &rows {
             buf.clear();
-            crate::protocol::copy_format::encode_row(&row.values, &mut buf);
+            crate::protocol::copy_format::encode_row_with_options(&row.values, &mut buf, copy_opts);
             let data = pgwire::messages::copy::CopyData::new(bytes::Bytes::copy_from_slice(&buf));
             client.send(PgWireBackendMessage::CopyData(data)).await?;
         }
@@ -1013,13 +1033,13 @@ impl SimpleQueryHandler for DynamicPgHandler {
         let executor = self.get_executor()?;
 
         match Self::parse_copy_to_command(query) {
-            Ok(Some((table_name, columns))) => {
+            Ok(Some((table_name, columns, copy_opts))) => {
                 debug!(
-                    "COPY TO STDOUT: table={}, columns={:?}",
-                    table_name, columns
+                    "COPY TO STDOUT: table={}, columns={:?}, format={:?}",
+                    table_name, columns, copy_opts.format
                 );
                 return self
-                    .handle_copy_to_stdout(client, &table_name, &columns)
+                    .handle_copy_to_stdout(client, &table_name, &columns, &copy_opts)
                     .await;
             }
             Ok(None) => {}
