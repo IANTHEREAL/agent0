@@ -67,15 +67,20 @@ impl Executor {
 
     async fn execute_single(&self, session: &mut Session, sql: &str) -> Result<ExecuteResults> {
         let statement_ts = statement_time::now_timestamp_millis();
+        // For explicit transactions, use the stored transaction start time;
+        // for implicit (autocommit), the transaction timestamp equals the statement timestamp.
+        let transaction_ts = session.transaction_timestamp_ms().unwrap_or(statement_ts);
         let savepoints = session.savepoints();
         let connection_id = session.connection_id();
         let database_name = session.current_database_name_arc();
         crate::sql::expr::with_query_context(
             connection_id,
             database_name,
-            statement_time::with_statement_timestamp_millis(
-                statement_ts,
-                crate::txn::with_savepoints(savepoints, async {
+            statement_time::with_transaction_timestamp_millis(
+                transaction_ts,
+                statement_time::with_statement_timestamp_millis(
+                    statement_ts,
+                    crate::txn::with_savepoints(savepoints, async {
                 let sql_stripped = strip_leading_sql_comments(sql);
                 let sql_trimmed = sql_stripped.trim_start();
                 let is_observability_user =
@@ -865,6 +870,7 @@ impl Executor {
 
             Ok(ExecuteResults(results))
                 }),
+                ),
             ),
         )
         .await

@@ -10,10 +10,15 @@ use std::future::Future;
 
 tokio::task_local! {
     static STATEMENT_TIMESTAMP_MILLIS: i64;
+    static TRANSACTION_TIMESTAMP_MILLIS: i64;
 }
 
 pub(super) fn statement_timestamp_millis() -> Option<i64> {
     STATEMENT_TIMESTAMP_MILLIS.try_with(|v| *v).ok()
+}
+
+pub(crate) fn transaction_timestamp_millis() -> Option<i64> {
+    TRANSACTION_TIMESTAMP_MILLIS.try_with(|v| *v).ok()
 }
 
 pub(crate) fn statement_timestamp_millis_or_now() -> i64 {
@@ -43,6 +48,23 @@ where
     #[cfg(not(debug_assertions))]
     {
         STATEMENT_TIMESTAMP_MILLIS.scope(ts_millis, fut).await
+    }
+}
+
+pub(super) async fn with_transaction_timestamp_millis<R, Fut>(ts_millis: i64, fut: Fut) -> R
+where
+    Fut: Future<Output = R>,
+{
+    #[cfg(debug_assertions)]
+    {
+        TRANSACTION_TIMESTAMP_MILLIS
+            .scope(ts_millis, Box::pin(fut))
+            .await
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        TRANSACTION_TIMESTAMP_MILLIS.scope(ts_millis, fut).await
     }
 }
 

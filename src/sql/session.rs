@@ -373,6 +373,9 @@ pub struct Session {
     current_database_name: Arc<str>,
     /// Connection ID for pg_backend_pid() support
     connection_id: i32,
+    /// Timestamp (epoch millis) when the current explicit transaction started.
+    /// None when not in an explicit transaction block.
+    transaction_timestamp_ms: Option<i64>,
 }
 
 impl Session {
@@ -398,6 +401,7 @@ impl Session {
             current_database_id: database_id,
             current_database_name: Arc::from(database_name),
             connection_id,
+            transaction_timestamp_ms: None,
         }
     }
 
@@ -425,6 +429,7 @@ impl Session {
             current_database_id: database_id,
             current_database_name: Arc::from(database_name),
             connection_id,
+            transaction_timestamp_ms: None,
         }
     }
 
@@ -621,6 +626,8 @@ impl Session {
                 let txn = self.store.begin().await?;
                 self.savepoints.reset().await?;
                 self.state = TransactionState::Active(txn);
+                self.transaction_timestamp_ms =
+                    Some(super::statement_time::now_timestamp_millis());
                 Ok(())
             }
             TransactionState::Active(_) | TransactionState::Failed(_) => {
@@ -630,8 +637,14 @@ impl Session {
         }
     }
 
+    /// Returns the transaction start timestamp, or None if not in an explicit transaction.
+    pub fn transaction_timestamp_ms(&self) -> Option<i64> {
+        self.transaction_timestamp_ms
+    }
+
     /// Commit a transaction block (COMMIT)
     pub async fn commit(&mut self) -> Result<()> {
+        self.transaction_timestamp_ms = None;
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset().await?;
@@ -662,6 +675,7 @@ impl Session {
 
     /// Rollback a transaction block (ROLLBACK)
     pub async fn rollback(&mut self) -> Result<()> {
+        self.transaction_timestamp_ms = None;
         match std::mem::replace(&mut self.state, TransactionState::Idle) {
             TransactionState::Active(mut txn) => {
                 self.savepoints.reset().await?;

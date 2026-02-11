@@ -693,7 +693,7 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
         // TRANSLATE, INITCAP are handled by the registry (functions/string.rs)
         // ABS, CEIL, CEILING, FLOOR, ROUND, TRUNC, TRUNCATE, SQRT, CBRT, POWER, POW, EXP, LN, LOG, LOG10,
         // SIGN, MOD, DEGREES, RADIANS, SIN, COS, TAN, PI, RANDOM are handled by the registry (functions/math.rs)
-        "NOW" | "CURRENT_TIMESTAMP" => {
+        "NOW" | "CURRENT_TIMESTAMP" | "STATEMENT_TIMESTAMP" | "TRANSACTION_TIMESTAMP" => {
             if args.len() > 1 {
                 return Err(anyhow!("{} expects 0 or 1 argument", func_name));
             }
@@ -703,10 +703,16 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                 Some(Value::Int64(p)) => (*p).clamp(0, 6) as u32,
                 _ => 6_u32,
             };
-            let ts = ctx
-                .query_context()
-                .map(|qc| qc.statement_timestamp_ms)
-                .unwrap_or_else(super::statement_time::statement_timestamp_millis_or_now);
+            let ts = if func_name_upper == "TRANSACTION_TIMESTAMP" {
+                ctx.query_context()
+                    .map(|qc| qc.transaction_timestamp_ms)
+                    .unwrap_or_else(super::statement_time::statement_timestamp_millis_or_now)
+            } else {
+                // NOW, CURRENT_TIMESTAMP, STATEMENT_TIMESTAMP all use statement time
+                ctx.query_context()
+                    .map(|qc| qc.statement_timestamp_ms)
+                    .unwrap_or_else(super::statement_time::statement_timestamp_millis_or_now)
+            };
             let ts = crate::types::timestamp::truncate_timestamp_millis(ts, precision);
             Ok(Value::Timestamp(ts))
         }

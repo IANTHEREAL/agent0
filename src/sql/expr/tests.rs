@@ -1982,6 +1982,7 @@ fn test_pg_backend_pid_reads_from_query_context() {
         999,
         Arc::from("testdb"),
         1_700_000_000_000,
+        1_700_000_000_000,
         Arc::from("UTC"),
     );
     let expr = parse_expr("pg_backend_pid()");
@@ -1997,6 +1998,7 @@ fn test_current_database_reads_from_query_context() {
         1,
         Arc::from("context_db"),
         1_700_000_000_000,
+        1_700_000_000_000,
         Arc::from("UTC"),
     );
     let expr = parse_expr("current_database()");
@@ -2009,7 +2011,7 @@ fn test_now_reads_from_query_context() {
     use crate::sql::query_context::QueryContext;
 
     let fixed_ts = 1_700_000_001_234_i64;
-    let qc = QueryContext::new(1, Arc::from("db"), fixed_ts, Arc::from("UTC"));
+    let qc = QueryContext::new(1, Arc::from("db"), fixed_ts, fixed_ts, Arc::from("UTC"));
     let expr = parse_expr("NOW(0)");
     let val = eval_expr_with_query_ctx(&expr, None, None, Some(&qc)).unwrap();
     assert_eq!(val, Value::Timestamp(1_700_000_001_000));
@@ -2020,7 +2022,7 @@ fn test_current_timestamp_reads_from_query_context() {
     use crate::sql::query_context::QueryContext;
 
     let fixed_ts = 1_700_000_001_500_i64;
-    let qc = QueryContext::new(1, Arc::from("db"), fixed_ts, Arc::from("UTC"));
+    let qc = QueryContext::new(1, Arc::from("db"), fixed_ts, fixed_ts, Arc::from("UTC"));
     let expr = parse_expr("CURRENT_TIMESTAMP(3)");
     let val = eval_expr_with_query_ctx(&expr, None, None, Some(&qc)).unwrap();
     assert_eq!(val, Value::Timestamp(1_700_000_001_500));
@@ -2030,7 +2032,7 @@ fn test_current_timestamp_reads_from_query_context() {
 async fn test_query_context_overrides_task_local() {
     use crate::sql::query_context::QueryContext;
 
-    let qc = QueryContext::new(777, Arc::from("qc_db"), 1_600_000_000_000, Arc::from("UTC"));
+    let qc = QueryContext::new(777, Arc::from("qc_db"), 1_600_000_000_000, 1_600_000_000_000, Arc::from("UTC"));
 
     let pid_expr = parse_expr("pg_backend_pid()");
     let db_expr = parse_expr("current_database()");
