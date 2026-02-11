@@ -733,15 +733,18 @@ impl DynamicPgHandler {
 
         let mut buf = Vec::with_capacity(4096);
 
-        // Emit HEADER row if requested.
+        // Emit HEADER row if requested, encoding through format-specific logic
+        // so column names containing delimiter/quote/newline are handled correctly.
         if copy_opts.header {
-            for (i, name) in col_names.iter().enumerate() {
-                if i > 0 {
-                    buf.push(copy_opts.delimiter);
-                }
-                buf.extend_from_slice(name.as_bytes());
-            }
-            buf.push(b'\n');
+            let header_values: Vec<crate::types::Value> = col_names
+                .iter()
+                .map(|name| crate::types::Value::Text(name.clone()))
+                .collect();
+            crate::protocol::copy_format::encode_row_with_options(
+                &header_values,
+                &mut buf,
+                copy_opts,
+            );
             let data = pgwire::messages::copy::CopyData::new(bytes::Bytes::copy_from_slice(&buf));
             client.send(PgWireBackendMessage::CopyData(data)).await?;
         }
