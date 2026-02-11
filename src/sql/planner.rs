@@ -310,14 +310,11 @@ pub fn analyze_predicates(expr: &Expr) -> Vec<PredicateInfo> {
 /// This extends the equality-based index selection with JSONB `@>` scans that can use
 /// a GIN-like inverted index.
 pub fn choose_best_access_path_for_filter(
-    db_id: u64,
+    _db_id: u64,
     schema: &TableSchema,
     filter: Option<&Expr>,
     estimated_table_rows: usize,
 ) -> AccessPath {
-    let estimated_table_rows = crate::sql::stats::get_row_count_estimate(db_id, schema.table_id)
-        .unwrap_or(estimated_table_rows);
-
     let Some(filter_expr) = filter else {
         return AccessPath {
             scan_type: ScanType::FullTableScan,

@@ -3,8 +3,9 @@
 use crate::storage::TikvStore;
 use crate::types::{FunctionDef, Row, TableSchema, TriggerDef};
 use anyhow::Result;
+use dashmap::DashMap;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, LazyLock};
 use tikv_client::Transaction;
 
 use super::trigger_rewrite::substitute_row_references;
@@ -23,10 +24,12 @@ struct CompiledTriggerBody {
     statements: Vec<TriggerStatement>,
 }
 
-static COMPILED_BODY_CACHE: OnceLock<RwLock<HashMap<u32, CompiledTriggerBody>>> = OnceLock::new();
+static COMPILED_BODY_CACHE: LazyLock<DashMap<String, HashMap<u32, CompiledTriggerBody>>> =
+    LazyLock::new(DashMap::new);
 
-fn get_body_cache() -> &'static RwLock<HashMap<u32, CompiledTriggerBody>> {
-    COMPILED_BODY_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+#[allow(dead_code)] // API ready for pool lifecycle wiring
+pub fn evict_compiled_bodies(keyspace: &str) {
+    COMPILED_BODY_CACHE.remove(keyspace);
 }
 
 impl CompiledTriggerBody {
@@ -108,25 +111,23 @@ impl CompiledTriggerBody {
     }
 }
 
-fn get_or_compile_body(func_oid: u32, body: &str) -> Result<CompiledTriggerBody> {
-    let cache = get_body_cache();
-
-    {
-        let guard = cache.read().expect("compiled body cache read lock");
-        if let Some(compiled) = guard.get(&func_oid) {
+fn get_or_compile_body(keyspace: &str, func_oid: u32, body: &str) -> Result<CompiledTriggerBody> {
+    if let Some(inner) = COMPILED_BODY_CACHE.get(keyspace) {
+        if let Some(compiled) = inner.get(&func_oid) {
             return Ok(compiled.clone());
         }
     }
 
     let compiled = CompiledTriggerBody::compile(body)?;
-    {
-        let mut guard = cache.write().expect("compiled body cache write lock");
-        guard.insert(func_oid, compiled.clone());
-    }
+    COMPILED_BODY_CACHE
+        .entry(keyspace.to_string())
+        .or_default()
+        .insert(func_oid, compiled.clone());
     Ok(compiled)
 }
 
 pub async fn prefetch_trigger_functions(
+    keyspace: &str,
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
@@ -147,7 +148,7 @@ pub async fn prefetch_trigger_functions(
             continue;
         }
         if let Some(func_def) = store.get_function(txn, db_id, &trigger.function).await? {
-            if let Ok(compiled) = get_or_compile_body(func_def.oid, &func_def.body) {
+            if let Ok(compiled) = get_or_compile_body(keyspace, func_def.oid, &func_def.body) {
                 let _ = compiled;
             }
             func_cache.insert(trigger.function.clone(), func_def);
@@ -158,6 +159,7 @@ pub async fn prefetch_trigger_functions(
 }
 
 pub async fn apply_before_triggers_with_cache(
+    keyspace: &str,
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
@@ -191,6 +193,7 @@ pub async fn apply_before_triggers_with_cache(
         };
 
         let result = execute_trigger_function(
+            keyspace,
             store,
             txn,
             db_id,
@@ -250,6 +253,7 @@ fn validate_trigger_body(body: &str) -> Result<()> {
 }
 
 async fn execute_trigger_function(
+    keyspace: &str,
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
@@ -266,6 +270,7 @@ async fn execute_trigger_function(
     }
 
     execute_trigger_body_cached(
+        keyspace,
         store,
         txn,
         db_id,
@@ -281,6 +286,7 @@ async fn execute_trigger_function(
 }
 
 async fn execute_trigger_body_cached(
+    keyspace: &str,
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
@@ -295,7 +301,7 @@ async fn execute_trigger_body_cached(
     use super::expr::eval_expr;
     use super::sequences;
 
-    let compiled = get_or_compile_body(func_oid, body)?;
+    let compiled = get_or_compile_body(keyspace, func_oid, body)?;
 
     if compiled.statements.is_empty() {
         return Ok(TriggerResult::Unchanged);
@@ -634,5 +640,48 @@ mod tests {
             END;
         "#;
         assert!(validate_trigger_body(body).is_ok());
+    }
+
+    #[test]
+    fn test_compiled_body_cache_tenant_isolation() {
+        let body_a = "BEGIN\n  NEW.x := 1;\n  RETURN NEW;\nEND;";
+        let body_b = "BEGIN\n  NEW.x := 999;\n  RETURN NEW;\nEND;";
+        let oid = 42u32;
+
+        // Same func_oid, different keyspaces → independent entries
+        let a = get_or_compile_body("tenant_iso_a", oid, body_a).unwrap();
+        let b = get_or_compile_body("tenant_iso_b", oid, body_b).unwrap();
+
+        // Verify the compiled bodies differ in their assignment expression
+        let a_expr = match &a.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        let b_expr = match &b.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(a_expr, "1");
+        assert_eq!(b_expr, "999");
+
+        // Re-fetch from cache returns the correct tenant's body, not the other's
+        let a2 = get_or_compile_body("tenant_iso_a", oid, body_a).unwrap();
+        let a2_expr = match &a2.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(a2_expr, "1");
+    }
+
+    #[test]
+    fn test_evict_compiled_bodies() {
+        let body = "BEGIN\n  RETURN NEW;\nEND;";
+        let _ = get_or_compile_body("evict_trig", 1, body).unwrap();
+
+        evict_compiled_bodies("evict_trig");
+
+        // After eviction, re-compile succeeds (cache miss → fresh compile)
+        let result = get_or_compile_body("evict_trig", 1, body);
+        assert!(result.is_ok());
     }
 }

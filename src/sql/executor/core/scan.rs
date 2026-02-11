@@ -29,7 +29,7 @@ impl Executor {
             filled_rows.push(row);
         }
         if limit.is_none() {
-            crate::sql::stats::update_row_count_estimate(db_id, schema.table_id, filled_rows.len());
+            crate::sql::stats::update_row_count_estimate(self.tenant_keyspace(), db_id, schema.table_id, filled_rows.len());
         }
         Ok(filled_rows)
     }
