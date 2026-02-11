@@ -53,3 +53,32 @@ Verified every `#[allow(dead_code)]` item against actual call sites. Major corre
 
 ### Deliverable
 - `dead_code_report.md` — verified categorized report with corrected dispositions
+
+---
+
+# Issue #633: COPY TO STDOUT FORMAT binary silently treated as text; option chars lossy-cast
+
+## 2026-02-11
+
+### Root Cause Analysis
+
+**Problem 1: Unsupported FORMAT silently ignored**
+- Location: `src/protocol/copy_format.rs:48-61` (`CopyOptions::from_copy_options`)
+- The FORMAT option only checks for `"CSV"` and sets `CopyFormat::Csv`. All other values — including `"BINARY"`, `"FOO"` — fall through silently and keep the default `CopyFormat::Text`.
+- PostgreSQL behavior: `COPY ... WITH (FORMAT binary)` uses a completely different binary wire protocol. Silently downgrading to text breaks clients expecting binary frames.
+
+**Problem 2: Delimiter/quote/escape chars lossy-cast via `as u8`**
+- Location: `src/protocol/copy_format.rs:62-75`
+- `char as u8` truncates to the low byte of the Unicode scalar value (e.g., `'€'` U+20AC → `0xAC`).
+- PostgreSQL requires these to be single-byte characters and rejects multi-byte.
+
+### Fix Plan
+1. Change `from_copy_options` return type to `Result<Self, String>` for validation errors.
+2. Validate FORMAT: accept TEXT/CSV, reject BINARY (not supported), reject unknown.
+3. Validate delimiter/quote/escape: require `is_ascii()`, reject non-ASCII.
+4. Update caller at `dynamic.rs:619` to propagate error via ErrorInfo.
+5. Add tests for new validation paths.
+
+### Error Codes (PostgreSQL-compatible)
+- `0A000` (feature_not_supported) for BINARY format
+- `22023` (invalid_parameter_value) for non-ASCII delimiter/quote/escape

@@ -40,26 +40,43 @@ impl Default for CopyOptions {
 
 impl CopyOptions {
     /// Build from sqlparser CopyOption list.
-    pub fn from_copy_options(options: &[sqlparser::ast::CopyOption]) -> Self {
+    ///
+    /// Returns an error for unsupported formats (e.g. BINARY) or non-ASCII
+    /// delimiter/quote/escape characters.
+    pub fn from_copy_options(options: &[sqlparser::ast::CopyOption]) -> Result<Self, String> {
         use sqlparser::ast::CopyOption;
         let mut opts = Self::default();
         for opt in options {
             match opt {
                 CopyOption::Format(ident) => {
                     let fmt = ident.value.to_uppercase();
-                    if fmt == "CSV" {
-                        opts.format = CopyFormat::Csv;
-                        // CSV defaults differ from text
-                        if opts.delimiter == TAB {
-                            opts.delimiter = b',';
+                    match fmt.as_str() {
+                        "TEXT" => {} // default, nothing to change
+                        "CSV" => {
+                            opts.format = CopyFormat::Csv;
+                            // CSV defaults differ from text
+                            if opts.delimiter == TAB {
+                                opts.delimiter = b',';
+                            }
+                            if opts.null_string == "\\N" {
+                                opts.null_string = String::new();
+                            }
                         }
-                        if opts.null_string == "\\N" {
-                            opts.null_string = String::new();
+                        "BINARY" => {
+                            return Err("COPY FORMAT binary is not supported".to_string());
+                        }
+                        other => {
+                            return Err(format!("unrecognized COPY FORMAT: \"{}\"", other));
                         }
                     }
-                    // TEXT is the default; BINARY not supported.
                 }
                 CopyOption::Delimiter(c) => {
+                    if !c.is_ascii() {
+                        return Err(format!(
+                            "COPY delimiter must be a single one-byte character, got: '{}'",
+                            c
+                        ));
+                    }
                     opts.delimiter = *c as u8;
                 }
                 CopyOption::Null(s) => {
@@ -69,15 +86,27 @@ impl CopyOptions {
                     opts.header = *b;
                 }
                 CopyOption::Quote(c) => {
+                    if !c.is_ascii() {
+                        return Err(format!(
+                            "COPY quote must be a single one-byte character, got: '{}'",
+                            c
+                        ));
+                    }
                     opts.quote = *c as u8;
                 }
                 CopyOption::Escape(c) => {
+                    if !c.is_ascii() {
+                        return Err(format!(
+                            "COPY escape must be a single one-byte character, got: '{}'",
+                            c
+                        ));
+                    }
                     opts.escape = *c as u8;
                 }
                 _ => {} // Ignore FREEZE, FORCE_QUOTE, etc.
             }
         }
-        opts
+        Ok(opts)
     }
 }
 
@@ -485,5 +514,82 @@ mod tests {
         let mut buf = Vec::new();
         encode_row_with_options(&[Value::Null, Value::Int32(1)], &mut buf, &opts);
         assert_eq!(buf, b"NULL,1\n");
+    }
+
+    // --- from_copy_options validation tests ---
+
+    use sqlparser::ast::{CopyOption, Ident};
+
+    #[test]
+    fn test_format_text_accepted() {
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Format(Ident::new("text"))]);
+        assert!(opts.is_ok());
+        assert_eq!(opts.unwrap().format, CopyFormat::Text);
+    }
+
+    #[test]
+    fn test_format_csv_accepted() {
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Format(Ident::new("csv"))]);
+        assert!(opts.is_ok());
+        let opts = opts.unwrap();
+        assert_eq!(opts.format, CopyFormat::Csv);
+        assert_eq!(opts.delimiter, b',');
+        assert!(opts.null_string.is_empty());
+    }
+
+    #[test]
+    fn test_format_binary_rejected() {
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Format(Ident::new("binary"))]);
+        assert!(opts.is_err());
+        assert!(opts.unwrap_err().contains("binary is not supported"));
+    }
+
+    #[test]
+    fn test_format_unknown_rejected() {
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Format(Ident::new("parquet"))]);
+        assert!(opts.is_err());
+        assert!(opts.unwrap_err().contains("unrecognized COPY FORMAT"));
+    }
+
+    #[test]
+    fn test_non_ascii_delimiter_rejected() {
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Delimiter('€')]);
+        assert!(opts.is_err());
+        assert!(opts.unwrap_err().contains("COPY delimiter must be a single one-byte character"));
+    }
+
+    #[test]
+    fn test_non_ascii_quote_rejected() {
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Quote('é')]);
+        assert!(opts.is_err());
+        assert!(opts.unwrap_err().contains("COPY quote must be a single one-byte character"));
+    }
+
+    #[test]
+    fn test_non_ascii_escape_rejected() {
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Escape('ñ')]);
+        assert!(opts.is_err());
+        assert!(opts.unwrap_err().contains("COPY escape must be a single one-byte character"));
+    }
+
+    #[test]
+    fn test_ascii_delimiter_accepted() {
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Delimiter('|')]);
+        assert!(opts.is_ok());
+        assert_eq!(opts.unwrap().delimiter, b'|');
+    }
+
+    #[test]
+    fn test_ascii_quote_accepted() {
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Quote('\'')]);
+        assert!(opts.is_ok());
+        assert_eq!(opts.unwrap().quote, b'\'');
+    }
+
+    #[test]
+    fn test_ascii_escape_accepted() {
+        let opts = CopyOptions::from_copy_options(&[CopyOption::Escape('\\')]);
+        assert!(opts.is_ok());
+        assert_eq!(opts.unwrap().escape, b'\\');
     }
 }

@@ -616,7 +616,10 @@ impl DynamicPgHandler {
             return Err(unsupported_copy_to_stdout_syntax());
         }
 
-        let copy_opts = crate::protocol::copy_format::CopyOptions::from_copy_options(options);
+        let copy_opts =
+            crate::protocol::copy_format::CopyOptions::from_copy_options(options).map_err(|e| {
+                ErrorInfo::new("ERROR".to_string(), "0A000".to_string(), e)
+            })?;
 
         let CopySource::Table {
             table_name,
