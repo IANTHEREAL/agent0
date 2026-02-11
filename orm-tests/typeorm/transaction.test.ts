@@ -199,12 +199,14 @@ describe('TypeORM Transactions & Isolation [pg-tikv]', () => {
       }
     });
 
-    it('should handle SERIALIZABLE isolation', async () => {
+    it('should reject SERIALIZABLE isolation (not supported by TiKV)', async () => {
       const queryRunner = dataSource.createQueryRunner();
       await queryRunner.connect();
-      await queryRunner.startTransaction('SERIALIZABLE');
 
+      let error: Error | null = null;
       try {
+        await queryRunner.startTransaction('SERIALIZABLE');
+
         await queryRunner.manager.save(User, {
           email: 'serial@example.com',
           name: 'Serial User',
@@ -212,14 +214,20 @@ describe('TypeORM Transactions & Isolation [pg-tikv]', () => {
         });
         await queryRunner.commitTransaction();
       } catch (err) {
+        error = err as Error;
         await queryRunner.rollbackTransaction();
-        throw err;
       } finally {
         await queryRunner.release();
       }
 
+      // TiKV does not support SERIALIZABLE; the server must reject it honestly
+      // rather than silently downgrading to snapshot isolation.
+      expect(error).not.toBeNull();
+      expect(error!.message).toMatch(/SERIALIZABLE/i);
+
+      // Verify no data was persisted
       const user = await dataSource.getRepository(User).findOneBy({ email: 'serial@example.com' });
-      expect(user).not.toBeNull();
+      expect(user).toBeNull();
     });
   });
 });

@@ -2,6 +2,40 @@
 
 use super::*;
 
+/// Validate and apply transaction modes (isolation level, access mode) from
+/// `BEGIN ISOLATION LEVEL ...` or `START TRANSACTION ...` statements.
+///
+/// Rejects SERIALIZABLE (TiKV cannot provide true serializable guarantees)
+/// and stores accepted modes in the session for `SHOW` readback.
+fn validate_transaction_modes(session: &mut Session, modes: &[TransactionMode]) -> Result<()> {
+    for mode in modes {
+        match mode {
+            TransactionMode::IsolationLevel(level) => {
+                let level_str = match level {
+                    TransactionIsolationLevel::ReadUncommitted
+                    | TransactionIsolationLevel::ReadCommitted => "read committed",
+                    TransactionIsolationLevel::RepeatableRead => "repeatable read",
+                    TransactionIsolationLevel::Serializable => {
+                        return Err(SqlError::Unsupported(
+                            "SERIALIZABLE isolation level is not supported".into(),
+                        )
+                        .into());
+                    }
+                };
+                session.set_known_setting("transaction_isolation", level_str.to_string())?;
+            }
+            TransactionMode::AccessMode(access_mode) => {
+                let mode_str = match access_mode {
+                    TransactionAccessMode::ReadOnly => "on",
+                    TransactionAccessMode::ReadWrite => "off",
+                };
+                session.set_known_setting("default_transaction_read_only", mode_str.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Executor {
     /// Execute a SQL statement string using the provided session.
     ///
@@ -180,9 +214,7 @@ impl Executor {
             let sql_upper = sql_trimmed.trim().to_uppercase();
             if !is_observability_user {
                 if let Some(reason) = get_skip_reason(&sql_upper) {
-                    return Ok(ExecuteResults::single(ExecuteResult::Skipped {
-                        message: reason,
-                    }));
+                    return Err(SqlError::Unsupported(reason).into());
                 }
             }
 
@@ -340,9 +372,7 @@ impl Executor {
                 Err(e) => {
                     if !is_observability_user {
                         if let Some(reason) = get_unsupported_reason(&sql_upper) {
-                            return Ok(ExecuteResults::single(ExecuteResult::Skipped {
-                                message: reason,
-                            }));
+                            return Err(SqlError::Unsupported(reason).into());
                         }
                         // Parse error counts as a statement attempt (for error rate / p99, etc).
                         self.observability.record_statement(
@@ -373,7 +403,8 @@ impl Executor {
                         // For observability user, allow common utility statements and return
                         // semantically correct protocol responses (never `EmptyQueryResponse` for
                         // non-empty SQL).
-                        Statement::StartTransaction { .. } => {
+                        Statement::StartTransaction { modes, .. } => {
+                            validate_transaction_modes(session, modes)?;
                             session.begin().await?;
                             results.push(ExecuteResult::TransactionStart { tag: "BEGIN" });
                             continue;
@@ -415,13 +446,13 @@ impl Executor {
                             results.push(ExecuteResult::TransactionEnd { tag: "ROLLBACK" });
                             continue;
                         }
+                        // SET variants: fall through to the real-user SET handling
+                        // below. Session settings are per-connection and safe for
+                        // observability users.
                         Statement::SetVariable { .. }
                         | Statement::SetTimeZone { .. }
                         | Statement::SetNames { .. }
-                        | Statement::SetTransaction { .. } => {
-                            results.push(ExecuteResult::CommandComplete { tag: "SET" });
-                            continue;
-                        }
+                        | Statement::SetTransaction { .. } => {}
                         Statement::ShowVariable { variable } => {
                             let var_name = variable
                                 .iter()
@@ -493,7 +524,8 @@ impl Executor {
                         crate::extensions::context::with_context(is_superuser, async {
                         match stmt {
                             // Transaction Control
-                            Statement::StartTransaction { .. } => {
+                            Statement::StartTransaction { modes, .. } => {
+                                validate_transaction_modes(session, modes)?;
                                 session.begin().await?;
                                 Ok(vec![ExecuteResult::TransactionStart { tag: "BEGIN" }])
                             }
@@ -651,23 +683,7 @@ impl Executor {
                                         new_search_path.push("public".to_string());
                                     }
                                     session.set_search_path(new_search_path);
-                                } else if matches!(
-                                    var_name.as_str(),
-                                    "statement_timeout"
-                                        | "lock_timeout"
-                                        | "idle_in_transaction_session_timeout"
-                                        | "pgtikv.max_sort_bytes"
-                                        | "timezone"
-                                        | "application_name"
-                                        | "client_encoding"
-                                        | "standard_conforming_strings"
-                                        | "check_function_bodies"
-                                        | "xmloption"
-                                        | "client_min_messages"
-                                        | "row_security"
-                                        | "default_tablespace"
-                                        | "default_table_access_method"
-                                ) {
+                                } else {
                                     let value = set_variable_value_to_string(value)?;
                                     session.set_known_setting(&var_name, value)?;
                                 }
@@ -678,6 +694,24 @@ impl Executor {
                                     value,
                                 ))?;
                                 session.set_known_setting("timezone", value)?;
+                                Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
+                            }
+                            Statement::SetNames { charset_name, collation_name } => {
+                                if collation_name.is_some() {
+                                    return Err(SqlError::Unsupported(
+                                        "SET NAMES with COLLATE is not supported".into()
+                                    ).into());
+                                }
+                                session.set_known_setting("client_encoding", charset_name.clone())?;
+                                Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
+                            }
+                            Statement::SetTransaction { modes, snapshot, session: _ } => {
+                                if snapshot.is_some() {
+                                    return Err(SqlError::Unsupported(
+                                        "SET TRANSACTION SNAPSHOT is not supported".into()
+                                    ).into());
+                                }
+                                validate_transaction_modes(session, modes)?;
                                 Ok(vec![ExecuteResult::CommandComplete { tag: "SET" }])
                             }
                             Statement::ShowVariable { variable } => {

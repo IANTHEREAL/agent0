@@ -59,9 +59,8 @@ fn is_unsupported_sql_that_executor_skips(sql_upper: &str) -> bool {
 }
 
 fn should_accept_sql_without_sqlparser(sql_upper: &str) -> bool {
-    // Keep consistent with `get_skip_reason` and `get_unsupported_reason` behavior in the executor:
-    // allow these statements to proceed (they'll be handled or skipped later) instead of failing
-    // Parse for Extended Query.
+    // Allow statements that sqlparser cannot parse but the executor handles via raw-SQL
+    // interception or returns a clear unsupported error for.
     if sql_upper.starts_with('\\') {
         return true;
     }

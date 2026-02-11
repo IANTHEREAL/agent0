@@ -158,8 +158,9 @@ describe('Knex Transactions & Isolation [pg-tikv]', () => {
       }
     });
 
-    it('should handle SERIALIZABLE isolation', async () => {
+    it('should reject SERIALIZABLE isolation (not supported by TiKV)', async () => {
       const trx = await db.transaction();
+      let error: Error | null = null;
       try {
         await trx.raw('SET TRANSACTION ISOLATION LEVEL SERIALIZABLE');
         await trx('knex_users').insert({
@@ -169,12 +170,16 @@ describe('Knex Transactions & Isolation [pg-tikv]', () => {
         });
         await trx.commit();
       } catch (err) {
+        error = err as Error;
         await trx.rollback();
-        throw err;
       }
 
+      // TiKV does not support SERIALIZABLE; the server must reject it honestly.
+      expect(error).not.toBeNull();
+      expect(error!.message).toMatch(/SERIALIZABLE/i);
+
       const user = await db('knex_users').where({ email: 'serial@example.com' }).first();
-      expect(user).not.toBeUndefined();
+      expect(user).toBeUndefined();
     });
   });
 

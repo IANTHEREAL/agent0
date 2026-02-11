@@ -27,7 +27,13 @@ describe('Drizzle Transactions & Isolation [pg-tikv]', () => {
     } finally {
       client.release();
     }
-    await pool.end();
+    // pool.end() may hang if drizzle left an unreleased connection after a
+    // failed BEGIN (e.g. SERIALIZABLE rejection). Race with a timeout so the
+    // test suite is not blocked.
+    await Promise.race([
+      pool.end(),
+      new Promise((resolve) => setTimeout(resolve, 5000)),
+    ]);
   });
 
   beforeEach(async () => {
@@ -157,24 +163,33 @@ describe('Drizzle Transactions & Isolation [pg-tikv]', () => {
       );
     });
 
-    it('should handle serializable isolation', async () => {
-      await db.transaction(
-        async (tx) => {
-          await tx.insert(drizzleUsers).values({
-            email: 'serial@example.com',
-            name: 'Serializable',
-            age: 25,
-          });
-        },
-        { isolationLevel: 'serializable' }
-      );
+    it('should reject serializable isolation (not supported by TiKV)', async () => {
+      let error: Error | null = null;
+      try {
+        await db.transaction(
+          async (tx) => {
+            await tx.insert(drizzleUsers).values({
+              email: 'serial@example.com',
+              name: 'Serializable',
+              age: 25,
+            });
+          },
+          { isolationLevel: 'serializable' }
+        );
+      } catch (err) {
+        error = err as Error;
+      }
 
-      const [user] = await db
+      // TiKV does not support SERIALIZABLE; the server must reject it honestly.
+      expect(error).not.toBeNull();
+      expect(error!.message).toMatch(/SERIALIZABLE/i);
+
+      const users = await db
         .select()
         .from(drizzleUsers)
         .where(eq(drizzleUsers.email, 'serial@example.com'));
 
-      expect(user).not.toBeUndefined();
+      expect(users).toHaveLength(0);
     });
   });
 

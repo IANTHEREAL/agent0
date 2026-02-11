@@ -153,19 +153,28 @@ describe('Sequelize Transactions & Isolation [pg-tikv]', () => {
       );
     });
 
-    it('should handle SERIALIZABLE isolation', async () => {
-      await sequelize.transaction(
-        { isolationLevel: Transaction.ISOLATION_LEVELS.SERIALIZABLE },
-        async (t) => {
-          await User.create(
-            { email: 'serial@example.com', name: 'Serializable', age: 25 },
-            { transaction: t }
-          );
-        }
-      );
+    it('should reject SERIALIZABLE isolation (not supported by TiKV)', async () => {
+      let error: Error | null = null;
+      try {
+        await sequelize.transaction(
+          { isolationLevel: Transaction.ISOLATION_LEVELS.SERIALIZABLE },
+          async (t) => {
+            await User.create(
+              { email: 'serial@example.com', name: 'Serializable', age: 25 },
+              { transaction: t }
+            );
+          }
+        );
+      } catch (err) {
+        error = err as Error;
+      }
+
+      // TiKV does not support SERIALIZABLE; the server must reject it honestly.
+      expect(error).not.toBeNull();
+      expect(error!.message).toMatch(/SERIALIZABLE/i);
 
       const user = await User.findOne({ where: { email: 'serial@example.com' } });
-      expect(user).not.toBeNull();
+      expect(user).toBeNull();
     });
   });
 

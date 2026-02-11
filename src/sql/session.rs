@@ -1,6 +1,7 @@
 //! Session management for transactions
 
 use crate::observability::TenantObservability;
+use crate::sql::error::SqlError;
 use crate::storage::TikvStore;
 use crate::txn::SavepointState;
 use anyhow::{anyhow, Result};
@@ -57,6 +58,13 @@ pub(crate) struct SessionSettings {
     row_security: Option<String>,
     default_tablespace: Option<String>,
     default_table_access_method: Option<String>,
+    transaction_isolation: Option<String>,
+    default_transaction_read_only: Option<String>,
+
+    /// Generic storage for GUC parameters that tipg does not actively use but
+    /// drivers expect to SET/SHOW without error (e.g. `extra_float_digits`,
+    /// `DateStyle`, `work_mem`). Values are stored as-is for `SHOW` readback.
+    extra_settings: HashMap<String, String>,
 }
 
 impl SessionSettings {
@@ -171,7 +179,10 @@ impl SessionSettings {
         Ok(total as usize)
     }
 
-    /// Set a known session setting. Returns `true` if the setting name is recognized.
+    /// Set a session setting. Known settings (timeout, encoding, etc.) are validated
+    /// and stored in typed fields. Unknown GUCs are stored in a generic map for
+    /// `SHOW` readback — this allows drivers that SET parameters like `extra_float_digits`
+    /// or `DateStyle` to work without error.
     pub(crate) fn set_known_setting(&mut self, name: &str, value: String) -> Result<bool> {
         match name {
             "statement_timeout" => self.statement_timeout_ms = Self::parse_timeout_millis(&value)?,
@@ -207,7 +218,53 @@ impl SessionSettings {
             "row_security" => self.row_security = Some(value),
             "default_tablespace" => self.default_tablespace = Some(value),
             "default_table_access_method" => self.default_table_access_method = Some(value),
-            _ => return Ok(false),
+            "transaction_isolation" => {
+                let normalized = value.trim().to_lowercase();
+                match normalized.as_str() {
+                    "read uncommitted" | "read committed" => {
+                        // TiKV snapshot isolation provides at least read committed.
+                        self.transaction_isolation = Some("read committed".to_string());
+                    }
+                    "repeatable read" => {
+                        self.transaction_isolation = Some("repeatable read".to_string());
+                    }
+                    "serializable" => {
+                        return Err(SqlError::Unsupported(
+                            "SERIALIZABLE isolation level is not supported".into(),
+                        )
+                        .into());
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "invalid value for parameter \"transaction_isolation\": \"{}\"",
+                            value
+                        ));
+                    }
+                }
+            }
+            "default_transaction_read_only" => {
+                let normalized = value.trim().to_lowercase();
+                match normalized.as_str() {
+                    "on" | "true" | "yes" | "1" => {
+                        self.default_transaction_read_only = Some("on".to_string());
+                    }
+                    "off" | "false" | "no" | "0" => {
+                        self.default_transaction_read_only = Some("off".to_string());
+                    }
+                    _ => {
+                        return Err(anyhow!(
+                            "parameter \"default_transaction_read_only\" requires a Boolean value"
+                        ));
+                    }
+                }
+            }
+            _ => {
+                // Generic storage for GUC parameters that tipg does not actively
+                // use but drivers expect to SET/SHOW (e.g. extra_float_digits,
+                // DateStyle, work_mem). Store as-is for SHOW readback.
+                self.extra_settings.insert(name.to_string(), value);
+                return Ok(true);
+            }
         }
         Ok(true)
     }
@@ -267,14 +324,22 @@ impl SessionSettings {
                     .unwrap_or("heap")
                     .to_string(),
             ),
-            // Transaction isolation level - TiKV uses snapshot isolation which maps to
-            // "repeatable read" in PostgreSQL terminology. Support both forms:
+            // Transaction isolation level. Support both forms:
             // - "transaction_isolation" (standard PostgreSQL GUC name)
             // - "transaction.isolation.level" (how SHOW transaction isolation level parses)
-            "transaction_isolation" | "transaction.isolation.level" => {
-                Some("read committed".to_string())
-            }
-            _ => None,
+            "transaction_isolation" | "transaction.isolation.level" => Some(
+                self.transaction_isolation
+                    .as_deref()
+                    .unwrap_or("read committed")
+                    .to_string(),
+            ),
+            "default_transaction_read_only" => Some(
+                self.default_transaction_read_only
+                    .as_deref()
+                    .unwrap_or("off")
+                    .to_string(),
+            ),
+            _ => self.extra_settings.get(name).cloned(),
         }
     }
 
@@ -725,10 +790,11 @@ mod tests {
             Some("pg-tikv-tests")
         );
 
-        assert!(!settings
+        // Unknown GUCs are stored in extra_settings for driver compatibility
+        assert!(settings
             .set_known_setting("unknown_setting", "x".to_string())
             .unwrap());
-        assert_eq!(settings.show_value("unknown_setting"), None);
+        assert_eq!(settings.show_value("unknown_setting").as_deref(), Some("x"));
 
         assert_eq!(
             settings.show_value("transaction_isolation").as_deref(),
@@ -838,6 +904,118 @@ mod tests {
             .is_err());
         assert!(settings
             .set_known_setting("pgtikv.max_sort_bytes", "abc".to_string())
+            .is_err());
+    }
+
+    #[test]
+    fn test_session_settings_transaction_isolation() {
+        let mut settings = SessionSettings::new();
+
+        // Default value
+        assert_eq!(
+            settings.show_value("transaction_isolation").as_deref(),
+            Some("read committed")
+        );
+        assert_eq!(
+            settings
+                .show_value("default_transaction_read_only")
+                .as_deref(),
+            Some("off")
+        );
+
+        // Set and readback
+        assert!(settings
+            .set_known_setting("transaction_isolation", "repeatable read".to_string())
+            .unwrap());
+        assert_eq!(
+            settings.show_value("transaction_isolation").as_deref(),
+            Some("repeatable read")
+        );
+        // SHOW transaction isolation level parses as "transaction.isolation.level"
+        assert_eq!(
+            settings
+                .show_value("transaction.isolation.level")
+                .as_deref(),
+            Some("repeatable read")
+        );
+
+        assert!(settings
+            .set_known_setting("default_transaction_read_only", "on".to_string())
+            .unwrap());
+        assert_eq!(
+            settings
+                .show_value("default_transaction_read_only")
+                .as_deref(),
+            Some("on")
+        );
+
+        // Reset back
+        assert!(settings
+            .set_known_setting("default_transaction_read_only", "off".to_string())
+            .unwrap());
+        assert_eq!(
+            settings
+                .show_value("default_transaction_read_only")
+                .as_deref(),
+            Some("off")
+        );
+
+        // SERIALIZABLE must be rejected
+        assert!(settings
+            .set_known_setting("transaction_isolation", "serializable".to_string())
+            .is_err());
+        assert!(settings
+            .set_known_setting("transaction_isolation", "SERIALIZABLE".to_string())
+            .is_err());
+        // Value should remain unchanged after rejection
+        assert_eq!(
+            settings.show_value("transaction_isolation").as_deref(),
+            Some("repeatable read")
+        );
+
+        // Garbage values must be rejected
+        assert!(settings
+            .set_known_setting("transaction_isolation", "garbage".to_string())
+            .is_err());
+        assert!(settings
+            .set_known_setting("transaction_isolation", "snapshot".to_string())
+            .is_err());
+
+        // READ UNCOMMITTED maps to read committed (TiKV minimum)
+        assert!(settings
+            .set_known_setting("transaction_isolation", "read uncommitted".to_string())
+            .unwrap());
+        assert_eq!(
+            settings.show_value("transaction_isolation").as_deref(),
+            Some("read committed")
+        );
+
+        // default_transaction_read_only: boolean aliases
+        for val in &["true", "yes", "1", "on", "TRUE", "Yes"] {
+            assert!(settings
+                .set_known_setting("default_transaction_read_only", val.to_string())
+                .unwrap());
+            assert_eq!(
+                settings
+                    .show_value("default_transaction_read_only")
+                    .as_deref(),
+                Some("on")
+            );
+        }
+        for val in &["false", "no", "0", "off", "FALSE", "No"] {
+            assert!(settings
+                .set_known_setting("default_transaction_read_only", val.to_string())
+                .unwrap());
+            assert_eq!(
+                settings
+                    .show_value("default_transaction_read_only")
+                    .as_deref(),
+                Some("off")
+            );
+        }
+        // Garbage boolean must be rejected
+        assert!(settings
+            .set_known_setting("default_transaction_read_only", "maybe".to_string())
             .is_err());
     }
 

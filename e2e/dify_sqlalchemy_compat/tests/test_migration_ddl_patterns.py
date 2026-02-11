@@ -141,10 +141,9 @@ def test_rename_table_and_index_visibility_in_pg_class(schema, db):
             assert not _relation_exists(conn, schema=pg_schema, name=old_table, relkind="r")
             assert _relation_exists(conn, schema=pg_schema, name=new_table, relkind="r")
 
-            # pg-tikv currently treats ALTER INDEX as a no-op; the index stays under
-            # the original name (but should remain visible in pg_class).
-            assert _relation_exists(conn, schema=pg_schema, name=old_index, relkind="i")
-            assert not _relation_exists(conn, schema=pg_schema, name=new_index, relkind="i")
+            # ALTER INDEX RENAME is now implemented — index should appear under the new name.
+            assert not _relation_exists(conn, schema=pg_schema, name=old_index, relkind="i")
+            assert _relation_exists(conn, schema=pg_schema, name=new_index, relkind="i")
     finally:
         with db.engine.begin() as conn:
             conn.exec_driver_sql(f"DROP TABLE IF EXISTS {_qname(pg_schema, old_table)} CASCADE")

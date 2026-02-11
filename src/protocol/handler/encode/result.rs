@@ -266,7 +266,7 @@ pub(in crate::protocol::handler) fn result_to_response(
 
         ExecuteResult::Empty => Ok(Response::EmptyQuery),
 
-        ExecuteResult::Notice { .. } => Ok(Response::EmptyQuery),
+        ExecuteResult::Notice { .. } => Ok(Response::Execution(Tag::new("DO"))),
 
         ExecuteResult::CreateRole => Ok(Response::Execution(Tag::new("CREATE ROLE"))),
 
@@ -277,22 +277,5 @@ pub(in crate::protocol::handler) fn result_to_response(
         ExecuteResult::Grant => Ok(Response::Execution(Tag::new("GRANT"))),
 
         ExecuteResult::Revoke => Ok(Response::Execution(Tag::new("REVOKE"))),
-
-        ExecuteResult::Skipped { message } => {
-            tracing::warn!("SKIPPED: {}", message);
-            let fields = vec![FieldInfo::new(
-                "warning".to_string(),
-                None,
-                None,
-                Type::TEXT,
-                FieldFormat::Text,
-            )];
-            let fields = Arc::new(fields);
-            let mut encoder = DataRowEncoder::new(fields.clone());
-            encoder.encode_field(&format!("SKIPPED: {}", message))?;
-            let data_rows = vec![encoder.finish()];
-            let row_stream = stream::iter(data_rows);
-            Ok(Response::Query(QueryResponse::new(fields, row_stream)))
-        }
     }
 }

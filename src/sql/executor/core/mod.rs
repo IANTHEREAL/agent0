@@ -61,8 +61,9 @@ use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, Query, ReferentialAction, SelectItem, SetExpr, SetOperator,
-    SetQuantifier, Statement, TableFactor, Visit, Visitor,
+    AlterIndexOperation, Expr, FunctionArg, FunctionArgExpr, Query, ReferentialAction, SelectItem,
+    SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, TransactionAccessMode,
+    TransactionIsolationLevel, TransactionMode, Visit, Visitor,
 };
 
 use std::collections::HashMap;

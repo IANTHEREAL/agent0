@@ -137,12 +137,9 @@ pub enum ExecuteResult {
     TransactionEnd {
         tag: &'static str,
     },
-    /// Empty result (for unsupported/noop statements)
+    /// Empty result — reserved for truly empty queries (empty string / whitespace / only `;`).
+    /// Do NOT use for unsupported or no-op statements; use `CommandComplete` or return an error.
     Empty,
-    /// Skipped statement with warning message
-    Skipped {
-        message: String,
-    },
     /// Server notice message (sent as NoticeResponse on the wire)
     Notice {
         message: String,

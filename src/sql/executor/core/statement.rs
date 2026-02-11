@@ -166,7 +166,11 @@ impl Executor {
                         )
                         .await
                     }
-                    _ => Ok(ExecuteResult::Empty),
+                    _ => Err(SqlError::Unsupported(format!(
+                        "DROP {} is not supported",
+                        object_type
+                    ))
+                    .into()),
                 }
             }
             Statement::Truncate { table_name, .. } => {
@@ -252,7 +256,9 @@ impl Executor {
             Statement::SetVariable { .. }
             | Statement::SetTimeZone { .. }
             | Statement::SetNames { .. }
-            | Statement::SetTransaction { .. } => Ok(ExecuteResult::CommandComplete { tag: "SET" }),
+            | Statement::SetTransaction { .. } => {
+                Err(SqlError::Unsupported("SET is not supported in this context".into()).into())
+            }
             Statement::CreateType {
                 name,
                 representation,
@@ -286,7 +292,10 @@ impl Executor {
                     tag: "CREATE SCHEMA",
                 })
             }
-            Statement::CreateFunction { .. } => Ok(ExecuteResult::Empty),
+            Statement::CreateFunction { .. } => Err(SqlError::Unsupported(
+                "CREATE FUNCTION is not supported in this context".into(),
+            )
+            .into()),
             Statement::CreateProcedure {
                 name, params, body, ..
             } => {
@@ -370,9 +379,14 @@ impl Executor {
                     Ok(result)
                 }
             }
-            Statement::AlterIndex { name, .. } => Ok(ExecuteResult::AlterIndex {
-                index_name: name.to_string(),
-            }),
+            Statement::AlterIndex { name, operation } => match operation {
+                AlterIndexOperation::RenameIndex {
+                    index_name: new_name,
+                } => {
+                    self.execute_alter_index_rename(txn, db_id, search_path, name, new_name)
+                        .await
+                }
+            },
             Statement::CreateRole {
                 names,
                 if_not_exists,
@@ -436,8 +450,12 @@ impl Executor {
                 )
                 .await
             }
-            Statement::Comment { .. } => Ok(ExecuteResult::CommandComplete { tag: "COMMENT" }),
-            Statement::Copy { .. } => Ok(ExecuteResult::Empty),
+            Statement::Comment { .. } => {
+                Err(SqlError::Unsupported("COMMENT is not supported in this context".into()).into())
+            }
+            Statement::Copy { .. } => {
+                Err(SqlError::Unsupported("COPY is not supported in this context".into()).into())
+            }
             Statement::Explain {
                 statement,
                 analyze,
@@ -524,6 +542,76 @@ impl Executor {
         }
         Ok(ExecuteResult::CommandComplete { tag: "DROP SCHEMA" })
     }
+    async fn execute_alter_index_rename(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        search_path: &[String],
+        old_name: &sqlparser::ast::ObjectName,
+        new_name: &sqlparser::ast::ObjectName,
+    ) -> Result<ExecuteResult> {
+        let (schema_opt, idx_name) = names::split_object_name(old_name)?;
+        let (_, new_idx_name) = names::split_object_name(new_name)?;
+
+        let schema_filter: Vec<&str> = match schema_opt.as_deref() {
+            Some(schema) => vec![schema],
+            None => {
+                if search_path.is_empty() {
+                    vec!["public"]
+                } else {
+                    search_path.iter().map(|s| s.as_str()).collect()
+                }
+            }
+        };
+
+        // Find the table that owns this index
+        let tables = self.store().list_tables(txn, db_id).await?;
+        let mut found_table: Option<String> = None;
+        for table_name in &tables {
+            let table_schema = table_name.splitn(2, '.').next().unwrap_or("");
+            if !schema_filter.iter().any(|s| *s == table_schema) {
+                continue;
+            }
+            let schema = match self.store().get_schema(txn, db_id, table_name).await? {
+                Some(s) => s,
+                None => continue,
+            };
+            if schema.indexes.iter().any(|i| i.name == idx_name) {
+                found_table = Some(table_name.clone());
+                break;
+            }
+        }
+
+        let table_name =
+            found_table.ok_or_else(|| anyhow!("index \"{}\" does not exist", idx_name))?;
+
+        let mut schema = self
+            .store()
+            .get_schema(txn, db_id, &table_name)
+            .await?
+            .ok_or_else(|| SqlError::RelationNotFound(table_name.clone()))?;
+
+        // Check for name conflict
+        if schema.indexes.iter().any(|i| i.name == new_idx_name) {
+            return Err(anyhow!("relation \"{}\" already exists", new_idx_name));
+        }
+
+        // Rename the index
+        for idx in &mut schema.indexes {
+            if idx.name == idx_name {
+                idx.name = new_idx_name.clone();
+                break;
+            }
+        }
+
+        schema.version += 1;
+        self.store().update_schema(txn, db_id, schema).await?;
+
+        Ok(ExecuteResult::AlterIndex {
+            index_name: new_idx_name,
+        })
+    }
+
     async fn execute_show_tables(
         &self,
         txn: &mut Transaction,
