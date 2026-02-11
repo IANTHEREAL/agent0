@@ -114,6 +114,30 @@ pub enum Error {
     KeyspaceNotFound(String),
 }
 
+impl Error {
+    /// Returns `true` if this error indicates that a pessimistic lock could
+    /// not be acquired because the key is already locked by another
+    /// transaction.  Used by NOWAIT / SKIP LOCKED callers to distinguish
+    /// genuine lock conflicts from unrelated failures (network, region, etc.).
+    pub fn is_lock_conflict(&self) -> bool {
+        match self {
+            // ResolveLockError: lock resolution gave up — the key is held by
+            // an active transaction.
+            Error::ResolveLockError(_) => true,
+            // KeyError with the `locked` field set means "key is locked".
+            Error::KeyError(ke) => ke.locked.is_some(),
+            // PessimisticLockError wraps an inner error for partial-success
+            // scenarios; delegate to the inner error.
+            Error::PessimisticLockError { inner, .. } => inner.is_lock_conflict(),
+            // ExtractedErrors / MultipleKeyErrors: if every sub-error is a
+            // lock conflict, treat the batch as a lock conflict.
+            Error::ExtractedErrors(errs) => !errs.is_empty() && errs.iter().all(|e| e.is_lock_conflict()),
+            Error::MultipleKeyErrors(errs) => !errs.is_empty() && errs.iter().all(|e| e.is_lock_conflict()),
+            _ => false,
+        }
+    }
+}
+
 impl From<crate::proto::errorpb::Error> for Error {
     fn from(e: crate::proto::errorpb::Error) -> Error {
         Error::RegionError(Box::new(e))

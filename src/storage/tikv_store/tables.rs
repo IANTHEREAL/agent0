@@ -32,10 +32,10 @@ impl TikvStore {
     /// Lock rows with SKIP LOCKED semantics.  Returns the indices (into `rows`)
     /// that were successfully locked in `txn`.
     ///
-    /// Uses a NOWAIT pessimistic lock per row (`wait_timeout = -1` on the TiKV
-    /// PessimisticLockRequest).  When TiKV encounters a key already held by
-    /// another transaction it returns an error immediately instead of blocking,
-    /// so we can skip that row and move on.
+    /// Attempts a NOWAIT lock on each row directly in the caller's transaction.
+    /// Rows held by another transaction are skipped; rows already held by this
+    /// transaction succeed without error.  Non-lock errors (network, region,
+    /// etc.) are propagated immediately.
     pub async fn lock_rows_skip_locked(
         &self,
         txn: &mut Transaction,
@@ -61,7 +61,6 @@ impl TikvStore {
 
         let max_locks = max_locks.unwrap_or(usize::MAX);
 
-        // Build keys for all candidate rows.
         let keys: Vec<Vec<u8>> = rows
             .iter()
             .map(|row| {
@@ -71,60 +70,32 @@ impl TikvStore {
             })
             .collect();
 
-        // Use a NOWAIT transaction to attempt locking one key at a time.
-        // `pessimistic_lock_wait_timeout = Some(-1)` sets `wait_timeout = -1`
-        // on the PessimisticLockRequest, which tells TiKV to return an error
-        // immediately if the key is locked instead of blocking.
-        let nowait_options = TransactionOptions::new_pessimistic()
-            .drop_check(CheckLevel::Warn)
-            .no_resolve_locks();
-        let mut nowait_options = nowait_options;
-        nowait_options.pessimistic_lock_wait_timeout = Some(-1);
-
-        let mut nowait_txn = self
-            .client()
-            .begin_with_options(nowait_options)
-            .await
-            .map_err(|e| anyhow!(e))?;
-
+        // Try-lock each key with NOWAIT directly in the caller's txn.
+        // - Keys already held by this txn succeed (no self-lock false positive).
+        // - Keys held by another txn fail immediately (no blocking).
+        // - Non-lock errors are propagated, not silently swallowed.
         let mut available_indices = Vec::new();
-        for (idx, key) in keys.iter().enumerate() {
+        for (idx, key) in keys.into_iter().enumerate() {
             if available_indices.len() >= max_locks {
                 break;
             }
-            match nowait_txn.lock_keys(vec![key.clone()]).await {
+            match txn.lock_keys_nowait(vec![key]).await {
                 Ok(()) => available_indices.push(idx),
-                Err(_) => continue, // Key is locked by another txn — skip
+                Err(e) if e.is_lock_conflict() => continue,
+                Err(e) => return Err(anyhow!(e)),
             }
         }
-
-        // Rollback the NOWAIT transaction — it was only used to discover which
-        // keys are available.
-        let _ = nowait_txn.rollback().await;
-
-        if available_indices.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Now acquire the real locks in the caller's transaction.
-        let available_keys: Vec<Vec<u8>> = available_indices
-            .iter()
-            .map(|&idx| keys[idx].clone())
-            .collect();
-        txn.lock_keys(available_keys)
-            .await
-            .map_err(|e| anyhow!(e))?;
 
         Ok(available_indices)
     }
 
-    /// Lock rows with NOWAIT semantics.  Fails immediately if any row is
-    /// already locked by another transaction.
+    /// Lock rows with NOWAIT semantics.  Fails immediately with
+    /// `SqlError::LockNotAvailable` (SQLSTATE 55P03) if any row is locked by
+    /// another transaction.
     ///
-    /// Uses a separate NOWAIT probe transaction (`wait_timeout = -1`) to test
-    /// all keys.  If any key is held by another txn, returns
-    /// `SqlError::LockNotAvailable`.  On success, acquires the real locks in
-    /// the caller's transaction.
+    /// Locks are acquired directly in the caller's transaction, so rows
+    /// already held by this transaction succeed without error (matching
+    /// PostgreSQL semantics).  Non-lock errors are propagated as-is.
     pub async fn lock_rows_nowait(
         &self,
         txn: &mut Transaction,
@@ -156,31 +127,17 @@ impl TikvStore {
             })
             .collect();
 
-        // Probe with a NOWAIT transaction — fail on the first locked key.
-        let mut nowait_options = TransactionOptions::new_pessimistic()
-            .drop_check(CheckLevel::Warn)
-            .no_resolve_locks();
-        nowait_options.pessimistic_lock_wait_timeout = Some(-1);
-
-        let mut nowait_txn = self
-            .client()
-            .begin_with_options(nowait_options)
-            .await
-            .map_err(|e| anyhow!(e))?;
-
-        match nowait_txn.lock_keys(keys.clone()).await {
-            Ok(()) => {
-                // All keys are available — rollback probe and lock for real.
-                let _ = nowait_txn.rollback().await;
-                txn.lock_keys(keys).await.map_err(|e| anyhow!(e))
+        // Lock directly in the caller's txn with NOWAIT semantics.
+        // - Self-locks succeed (same TiKV txn recognises its own locks).
+        // - Lock conflicts return an error immediately (wait_timeout = -1).
+        // - Non-lock errors propagate without being misclassified as 55P03.
+        match txn.lock_keys_nowait(keys).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.is_lock_conflict() => Err(crate::sql::error::SqlError::LockNotAvailable {
+                relation: table_name.to_string(),
             }
-            Err(_) => {
-                let _ = nowait_txn.rollback().await;
-                Err(crate::sql::error::SqlError::LockNotAvailable {
-                    relation: table_name.to_string(),
-                }
-                .into())
-            }
+            .into()),
+            Err(e) => Err(anyhow!(e)),
         }
     }
 
