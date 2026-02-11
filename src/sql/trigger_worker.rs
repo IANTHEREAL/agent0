@@ -27,7 +27,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tikv_client::BoundRange;
 use tikv_client::Transaction;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 const MAX_CONCURRENT_KEYSPACES: usize = 4;
 
@@ -564,7 +564,14 @@ impl TriggerWorker {
 
                 let ev: TriggerEvent = match bincode::deserialize(pair.value()) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(e) => {
+                        error!(
+                            key_len = key_bytes.len(),
+                            value_len = pair.value().len(),
+                            "trigger queue: skipping undecodable event (scan): {e}"
+                        );
+                        continue;
+                    }
                 };
                 if ev.status == EventStatus::Pending {
                     candidate_keys.push(key_bytes);
@@ -827,7 +834,14 @@ impl TriggerWorker {
                 batch_last = Some(key.clone());
                 let mut ev: TriggerEvent = match bincode::deserialize(pair.value()) {
                     Ok(v) => v,
-                    Err(_) => continue,
+                    Err(e) => {
+                        error!(
+                            key_len = key.len(),
+                            value_len = pair.value().len(),
+                            "trigger queue: skipping undecodable event (reaper): {e}"
+                        );
+                        continue;
+                    }
                 };
 
                 if ev.status != EventStatus::Processing {
