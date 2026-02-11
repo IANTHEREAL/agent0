@@ -7,10 +7,11 @@ use std::collections::HashMap;
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use sqlparser::ast::{Expr, OrderByExpr, WindowFrame, WindowFrameBound};
+use sqlparser::ast::{Expr, OrderByExpr, WindowFrame, WindowFrameBound, WindowFrameUnits};
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::expr::{compare_order_by_values, eval_expr};
+use crate::sql::pg_numeric::pg_numeric_div;
 use crate::sql::value_key::serialize_values_for_key;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
@@ -31,6 +32,8 @@ pub struct WindowFunctionExpr {
     pub default_value_expr: Option<Expr>,
     /// Window frame specification
     pub window_frame: Option<WindowFrame>,
+    /// FILTER (WHERE ...) clause for window aggregate functions
+    pub filter_expr: Option<Expr>,
     /// Output column name
     pub output_name: String,
     /// Output data type
@@ -190,33 +193,68 @@ impl WindowOperator {
                     });
                 }
 
+                // Compute peer groups for RANGE/GROUPS frame mode support
+                let peer_groups = Self::compute_peer_groups(rows, schema, wf, &row_indices)?;
+
                 // Compute function for this partition
                 match wf.func_name.as_str() {
                     "row_number" => self.compute_row_number(&row_indices, wf_idx, &mut results),
-                    "rank" => {
-                        self.compute_rank(rows, schema, wf, &row_indices, wf_idx, &mut results)?
+                    "rank" => self.compute_rank(&peer_groups, &row_indices, wf_idx, &mut results),
+                    "dense_rank" => {
+                        self.compute_dense_rank(&peer_groups, &row_indices, wf_idx, &mut results)
                     }
-                    "dense_rank" => self.compute_dense_rank(
+                    "ntile" => self.compute_ntile(wf, &row_indices, wf_idx, &mut results)?,
+                    "percent_rank" => {
+                        self.compute_percent_rank(&peer_groups, &row_indices, wf_idx, &mut results)
+                    }
+                    "cume_dist" => {
+                        self.compute_cume_dist(&peer_groups, &row_indices, wf_idx, &mut results)
+                    }
+                    "sum" => self.compute_sum(
                         rows,
                         schema,
                         wf,
                         &row_indices,
                         wf_idx,
                         &mut results,
+                        &peer_groups,
                     )?,
-                    "sum" => {
-                        self.compute_sum(rows, schema, wf, &row_indices, wf_idx, &mut results)?
-                    }
-                    "count" => self.compute_count(wf, &row_indices, wf_idx, &mut results)?,
-                    "avg" => {
-                        self.compute_avg(rows, schema, wf, &row_indices, wf_idx, &mut results)?
-                    }
-                    "min" => {
-                        self.compute_min(rows, schema, wf, &row_indices, wf_idx, &mut results)?
-                    }
-                    "max" => {
-                        self.compute_max(rows, schema, wf, &row_indices, wf_idx, &mut results)?
-                    }
+                    "count" => self.compute_count(
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        &peer_groups,
+                    )?,
+                    "avg" => self.compute_avg(
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        &peer_groups,
+                    )?,
+                    "min" => self.compute_min(
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        &peer_groups,
+                    )?,
+                    "max" => self.compute_max(
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        &peer_groups,
+                    )?,
                     "lag" => {
                         self.compute_lag(rows, schema, wf, &row_indices, wf_idx, &mut results)?
                     }
@@ -230,6 +268,7 @@ impl WindowOperator {
                         &row_indices,
                         wf_idx,
                         &mut results,
+                        &peer_groups,
                     )?,
                     "last_value" => self.compute_last_value(
                         rows,
@@ -238,6 +277,16 @@ impl WindowOperator {
                         &row_indices,
                         wf_idx,
                         &mut results,
+                        &peer_groups,
+                    )?,
+                    "nth_value" => self.compute_nth_value(
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        &peer_groups,
                     )?,
                     _ => {
                         return Err(SqlError::Unsupported(format!(
@@ -261,14 +310,130 @@ impl WindowOperator {
 
     fn compute_rank(
         &self,
-        rows: &[Row],
-        schema: &TableSchema,
+        peer_groups: &[(usize, usize)],
+        row_indices: &[usize],
+        wf_idx: usize,
+        results: &mut [Vec<Value>],
+    ) {
+        for (g_idx, &(g_start, g_end)) in peer_groups.iter().enumerate() {
+            let rank = (g_start + 1) as i64; // rank = position of first peer + 1
+            for pos in g_start..g_end {
+                let _ = g_idx; // suppress unused warning
+                results[row_indices[pos]][wf_idx] = Value::Int64(rank);
+            }
+        }
+    }
+
+    fn compute_dense_rank(
+        &self,
+        peer_groups: &[(usize, usize)],
+        row_indices: &[usize],
+        wf_idx: usize,
+        results: &mut [Vec<Value>],
+    ) {
+        for (g_idx, &(g_start, g_end)) in peer_groups.iter().enumerate() {
+            let rank = (g_idx + 1) as i64;
+            for pos in g_start..g_end {
+                results[row_indices[pos]][wf_idx] = Value::Int64(rank);
+            }
+        }
+    }
+
+    fn compute_ntile(
+        &self,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
         wf_idx: usize,
         results: &mut [Vec<Value>],
     ) -> Result<()> {
-        let mut current_rank = 1i64;
+        let n = match &wf.arg_expr {
+            Some(expr) => {
+                let val = eval_expr(expr, None, None)?;
+                match val {
+                    Value::Int32(v) if v > 0 => v as usize,
+                    Value::Int64(v) if v > 0 => v as usize,
+                    other => {
+                        return Err(anyhow!(
+                            "NTILE argument must be a positive integer, got {:?}",
+                            other
+                        ))
+                    }
+                }
+            }
+            None => return Err(anyhow!("NTILE requires exactly one argument")),
+        };
+
+        let total = row_indices.len();
+        let base_size = total / n;
+        let remainder = total % n;
+
+        for (pos, &row_idx) in row_indices.iter().enumerate() {
+            // First `remainder` buckets get base_size+1 rows, rest get base_size
+            let bucket = if base_size == 0 {
+                // More buckets than rows: each row gets its own bucket up to n
+                pos + 1
+            } else if pos < remainder * (base_size + 1) {
+                pos / (base_size + 1) + 1
+            } else {
+                let adjusted = pos - remainder * (base_size + 1);
+                remainder + adjusted / base_size + 1
+            };
+            results[row_idx][wf_idx] = Value::Int64(bucket as i64);
+        }
+        Ok(())
+    }
+
+    fn compute_percent_rank(
+        &self,
+        peer_groups: &[(usize, usize)],
+        row_indices: &[usize],
+        wf_idx: usize,
+        results: &mut [Vec<Value>],
+    ) {
+        let total = row_indices.len();
+        for &(g_start, g_end) in peer_groups {
+            let value = if total <= 1 {
+                0.0f64
+            } else {
+                g_start as f64 / (total - 1) as f64
+            };
+            for pos in g_start..g_end {
+                results[row_indices[pos]][wf_idx] = Value::Float64(value);
+            }
+        }
+    }
+
+    fn compute_cume_dist(
+        &self,
+        peer_groups: &[(usize, usize)],
+        row_indices: &[usize],
+        wf_idx: usize,
+        results: &mut [Vec<Value>],
+    ) {
+        let total = row_indices.len();
+        for &(_g_start, g_end) in peer_groups {
+            let value = g_end as f64 / total as f64;
+            for pos in _g_start..g_end {
+                results[row_indices[pos]][wf_idx] = Value::Float64(value);
+            }
+        }
+    }
+
+    /// Compute peer group boundaries for a sorted partition.
+    /// Returns a vec of (group_start, group_end) ranges, where each range
+    /// contains rows with equal ORDER BY values.
+    fn compute_peer_groups(
+        rows: &[Row],
+        schema: &TableSchema,
+        wf: &WindowFunctionExpr,
+        row_indices: &[usize],
+    ) -> Result<Vec<(usize, usize)>> {
+        if wf.order_by.is_empty() {
+            // No ORDER BY: all rows are peers
+            return Ok(vec![(0, row_indices.len())]);
+        }
+        let mut groups = Vec::new();
+        let mut group_start = 0usize;
         let mut prev_values: Option<Vec<Value>> = None;
         for (pos, &row_idx) in row_indices.iter().enumerate() {
             let current_values: Vec<Value> = wf
@@ -278,41 +443,24 @@ impl WindowOperator {
                 .collect::<Result<Vec<Value>>>()?;
             if let Some(prev) = &prev_values {
                 if !order_by_values_are_peers(prev, &current_values, &wf.order_by) {
-                    current_rank = (pos + 1) as i64;
+                    groups.push((group_start, pos));
+                    group_start = pos;
                 }
             }
-            results[row_idx][wf_idx] = Value::Int64(current_rank);
             prev_values = Some(current_values);
         }
-        Ok(())
+        groups.push((group_start, row_indices.len()));
+        Ok(groups)
     }
 
-    fn compute_dense_rank(
-        &self,
-        rows: &[Row],
-        schema: &TableSchema,
-        wf: &WindowFunctionExpr,
-        row_indices: &[usize],
-        wf_idx: usize,
-        results: &mut [Vec<Value>],
-    ) -> Result<()> {
-        let mut current_rank = 1i64;
-        let mut prev_values: Option<Vec<Value>> = None;
-        for &row_idx in row_indices {
-            let current_values: Vec<Value> = wf
-                .order_by
-                .iter()
-                .map(|o| eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema)))
-                .collect::<Result<Vec<Value>>>()?;
-            if let Some(prev) = &prev_values {
-                if !order_by_values_are_peers(prev, &current_values, &wf.order_by) {
-                    current_rank += 1;
-                }
-            }
-            results[row_idx][wf_idx] = Value::Int64(current_rank);
-            prev_values = Some(current_values);
-        }
-        Ok(())
+    /// Find which peer group a given position belongs to (binary search, O(log G)).
+    fn peer_group_of(peer_groups: &[(usize, usize)], pos: usize) -> usize {
+        debug_assert!(!peer_groups.is_empty(), "peer_groups must not be empty");
+        // Binary search: find the last group whose start <= pos
+        let idx = peer_groups.partition_point(|&(start, _)| start <= pos);
+        // partition_point returns the first index where start > pos,
+        // so the group is at idx - 1
+        idx.saturating_sub(1)
     }
 
     fn get_frame_bounds(
@@ -320,50 +468,142 @@ impl WindowOperator {
         wf: &WindowFunctionExpr,
         current_pos: usize,
         partition_size: usize,
+        peer_groups: &[(usize, usize)],
     ) -> Result<(usize, usize)> {
         let frame = match &wf.window_frame {
             Some(f) => f,
             None => {
+                // PostgreSQL default: no explicit frame
+                // - Without ORDER BY: whole partition (RANGE UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)
+                // - With ORDER BY: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
                 if wf.order_by.is_empty() {
                     return Ok((0, partition_size));
                 } else {
-                    return Ok((0, current_pos + 1));
+                    // Default is RANGE CURRENT ROW — include all peers of current row
+                    let g = Self::peer_group_of(peer_groups, current_pos);
+                    return Ok((0, peer_groups[g].1));
                 }
             }
         };
 
-        let start = match &frame.start_bound {
-            WindowFrameBound::Preceding(Some(n)) => {
-                let offset = self.eval_frame_bound_offset(n)?;
-                current_pos.saturating_sub(offset)
-            }
-            WindowFrameBound::Preceding(None) => 0, // UNBOUNDED PRECEDING
-            WindowFrameBound::CurrentRow => current_pos,
-            WindowFrameBound::Following(Some(n)) => {
-                let offset = self.eval_frame_bound_offset(n)?;
-                current_pos.saturating_add(offset).min(partition_size)
-            }
-            WindowFrameBound::Following(None) => partition_size, // UNBOUNDED FOLLOWING
-        };
+        let units = &frame.units;
 
-        let end = match &frame.end_bound {
-            Some(bound) => match bound {
+        let resolve_start = |bound: &WindowFrameBound| -> Result<usize> {
+            match bound {
+                WindowFrameBound::Preceding(None) => Ok(0), // UNBOUNDED PRECEDING
                 WindowFrameBound::Preceding(Some(n)) => {
                     let offset = self.eval_frame_bound_offset(n)?;
-                    current_pos.saturating_add(1).saturating_sub(offset)
+                    match units {
+                        WindowFrameUnits::Rows => Ok(current_pos.saturating_sub(offset)),
+                        WindowFrameUnits::Groups => {
+                            let g = Self::peer_group_of(peer_groups, current_pos);
+                            let target_g = g.saturating_sub(offset);
+                            Ok(peer_groups[target_g].0)
+                        }
+                        WindowFrameUnits::Range => {
+                            // For RANGE N PRECEDING, we need value-based comparison.
+                            // Currently only support UNBOUNDED and CURRENT ROW for RANGE with offsets.
+                            // For numeric ORDER BY, find first row where value >= current - N.
+                            // This requires access to row data; fall back to peer-group-based for now.
+                            let g = Self::peer_group_of(peer_groups, current_pos);
+                            let target_g = g.saturating_sub(offset);
+                            Ok(peer_groups[target_g].0)
+                        }
+                    }
                 }
-                WindowFrameBound::Preceding(None) => 0,
-                WindowFrameBound::CurrentRow => current_pos + 1,
+                WindowFrameBound::CurrentRow => match units {
+                    WindowFrameUnits::Rows => Ok(current_pos),
+                    WindowFrameUnits::Groups | WindowFrameUnits::Range => {
+                        let g = Self::peer_group_of(peer_groups, current_pos);
+                        Ok(peer_groups[g].0)
+                    }
+                },
                 WindowFrameBound::Following(Some(n)) => {
                     let offset = self.eval_frame_bound_offset(n)?;
-                    current_pos
-                        .saturating_add(1)
-                        .saturating_add(offset)
-                        .min(partition_size)
+                    match units {
+                        WindowFrameUnits::Rows => {
+                            Ok(current_pos.saturating_add(offset).min(partition_size))
+                        }
+                        WindowFrameUnits::Groups => {
+                            let g = Self::peer_group_of(peer_groups, current_pos);
+                            let target_g = (g + offset).min(peer_groups.len() - 1);
+                            Ok(peer_groups[target_g].0)
+                        }
+                        WindowFrameUnits::Range => {
+                            let g = Self::peer_group_of(peer_groups, current_pos);
+                            let target_g = (g + offset).min(peer_groups.len() - 1);
+                            Ok(peer_groups[target_g].0)
+                        }
+                    }
                 }
-                WindowFrameBound::Following(None) => partition_size,
-            },
-            None => current_pos + 1, // Default to CURRENT ROW
+                WindowFrameBound::Following(None) => Ok(partition_size), // UNBOUNDED FOLLOWING
+            }
+        };
+
+        let resolve_end = |bound: &WindowFrameBound| -> Result<usize> {
+            match bound {
+                WindowFrameBound::Preceding(None) => Ok(0),
+                WindowFrameBound::Preceding(Some(n)) => {
+                    let offset = self.eval_frame_bound_offset(n)?;
+                    match units {
+                        WindowFrameUnits::Rows => {
+                            Ok(current_pos.saturating_add(1).saturating_sub(offset))
+                        }
+                        WindowFrameUnits::Groups => {
+                            let g = Self::peer_group_of(peer_groups, current_pos);
+                            let target_g = g.saturating_sub(offset);
+                            Ok(peer_groups[target_g].1)
+                        }
+                        WindowFrameUnits::Range => {
+                            let g = Self::peer_group_of(peer_groups, current_pos);
+                            let target_g = g.saturating_sub(offset);
+                            Ok(peer_groups[target_g].1)
+                        }
+                    }
+                }
+                WindowFrameBound::CurrentRow => match units {
+                    WindowFrameUnits::Rows => Ok(current_pos + 1),
+                    WindowFrameUnits::Groups | WindowFrameUnits::Range => {
+                        let g = Self::peer_group_of(peer_groups, current_pos);
+                        Ok(peer_groups[g].1)
+                    }
+                },
+                WindowFrameBound::Following(Some(n)) => {
+                    let offset = self.eval_frame_bound_offset(n)?;
+                    match units {
+                        WindowFrameUnits::Rows => Ok(current_pos
+                            .saturating_add(1)
+                            .saturating_add(offset)
+                            .min(partition_size)),
+                        WindowFrameUnits::Groups => {
+                            let g = Self::peer_group_of(peer_groups, current_pos);
+                            let target_g = (g + offset).min(peer_groups.len() - 1);
+                            Ok(peer_groups[target_g].1)
+                        }
+                        WindowFrameUnits::Range => {
+                            let g = Self::peer_group_of(peer_groups, current_pos);
+                            let target_g = (g + offset).min(peer_groups.len() - 1);
+                            Ok(peer_groups[target_g].1)
+                        }
+                    }
+                }
+                WindowFrameBound::Following(None) => Ok(partition_size), // UNBOUNDED FOLLOWING
+            }
+        };
+
+        let start = resolve_start(&frame.start_bound)?;
+        let end = match &frame.end_bound {
+            Some(bound) => resolve_end(bound)?,
+            None => {
+                // Shorthand form: default end is CURRENT ROW
+                match units {
+                    WindowFrameUnits::Rows => current_pos + 1,
+                    WindowFrameUnits::Groups | WindowFrameUnits::Range => {
+                        let g = Self::peer_group_of(peer_groups, current_pos);
+                        peer_groups[g].1
+                    }
+                }
+            }
         };
 
         Ok((start, end))
@@ -381,6 +621,17 @@ impl WindowOperator {
         }
     }
 
+    /// Check if a row passes the FILTER (WHERE ...) clause for a window aggregate.
+    fn passes_filter(filter_expr: &Option<Expr>, row: &Row, schema: &TableSchema) -> Result<bool> {
+        match filter_expr {
+            None => Ok(true),
+            Some(expr) => {
+                let val = eval_expr(expr, Some(row), Some(schema))?;
+                Ok(matches!(val, Value::Boolean(true)))
+            }
+        }
+    }
+
     fn compute_sum(
         &self,
         rows: &[Row],
@@ -389,13 +640,17 @@ impl WindowOperator {
         row_indices: &[usize],
         wf_idx: usize,
         results: &mut [Vec<Value>],
+        peer_groups: &[(usize, usize)],
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size)?;
+            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
             let mut sum = rust_decimal::Decimal::ZERO;
             let mut has_value = false;
             for i in start..end {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema)? {
+                    continue;
+                }
                 if let Some(expr) = &wf.arg_expr {
                     let val = eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema))?;
                     if let Some(n) = self.value_to_decimal(&val) {
@@ -415,17 +670,32 @@ impl WindowOperator {
 
     fn compute_count(
         &self,
+        rows: &[Row],
+        schema: &TableSchema,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
         wf_idx: usize,
         results: &mut [Vec<Value>],
+        peer_groups: &[(usize, usize)],
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size)?;
-            let count = end
-                .saturating_sub(start)
-                .min(partition_size.saturating_sub(start)) as i64;
+            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
+            let mut count = 0i64;
+            for i in start..end.min(partition_size) {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema)? {
+                    continue;
+                }
+                if let Some(expr) = &wf.arg_expr {
+                    let val = eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema))?;
+                    if !matches!(val, Value::Null) {
+                        count += 1;
+                    }
+                } else {
+                    // COUNT(*) — count all rows
+                    count += 1;
+                }
+            }
             results[row_idx][wf_idx] = Value::Int64(count);
         }
         Ok(())
@@ -439,13 +709,17 @@ impl WindowOperator {
         row_indices: &[usize],
         wf_idx: usize,
         results: &mut [Vec<Value>],
+        peer_groups: &[(usize, usize)],
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size)?;
+            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
             let mut sum = rust_decimal::Decimal::ZERO;
             let mut count = 0i64;
             for i in start..end {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema)? {
+                    continue;
+                }
                 if let Some(expr) = &wf.arg_expr {
                     let val = eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema))?;
                     if let Some(n) = self.value_to_decimal(&val) {
@@ -455,7 +729,7 @@ impl WindowOperator {
                 }
             }
             results[row_idx][wf_idx] = if count > 0 {
-                Value::Numeric(sum / rust_decimal::Decimal::from(count))
+                Value::Numeric(pg_numeric_div(sum, rust_decimal::Decimal::from(count)))
             } else {
                 Value::Null
             };
@@ -471,12 +745,16 @@ impl WindowOperator {
         row_indices: &[usize],
         wf_idx: usize,
         results: &mut [Vec<Value>],
+        peer_groups: &[(usize, usize)],
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size)?;
+            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
             let mut min_val: Option<Value> = None;
             for i in start..end {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema)? {
+                    continue;
+                }
                 if let Some(expr) = &wf.arg_expr {
                     let val = eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema))?;
                     if !matches!(val, Value::Null) {
@@ -509,12 +787,16 @@ impl WindowOperator {
         row_indices: &[usize],
         wf_idx: usize,
         results: &mut [Vec<Value>],
+        peer_groups: &[(usize, usize)],
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size)?;
+            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
             let mut max_val: Option<Value> = None;
             for i in start..end {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema)? {
+                    continue;
+                }
                 if let Some(expr) = &wf.arg_expr {
                     let val = eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema))?;
                     if !matches!(val, Value::Null) {
@@ -642,10 +924,11 @@ impl WindowOperator {
         row_indices: &[usize],
         wf_idx: usize,
         results: &mut [Vec<Value>],
+        peer_groups: &[(usize, usize)],
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size)?;
+            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
             results[row_idx][wf_idx] = if start < end && start < partition_size {
                 if let Some(expr) = &wf.arg_expr {
                     eval_expr(expr, Some(&rows[row_indices[start]]), Some(schema))?
@@ -667,13 +950,59 @@ impl WindowOperator {
         row_indices: &[usize],
         wf_idx: usize,
         results: &mut [Vec<Value>],
+        peer_groups: &[(usize, usize)],
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size)?;
+            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
             results[row_idx][wf_idx] = if start < end && end > 0 && end <= partition_size {
                 if let Some(expr) = &wf.arg_expr {
                     eval_expr(expr, Some(&rows[row_indices[end - 1]]), Some(schema))?
+                } else {
+                    Value::Null
+                }
+            } else {
+                Value::Null
+            };
+        }
+        Ok(())
+    }
+
+    fn compute_nth_value(
+        &self,
+        rows: &[Row],
+        schema: &TableSchema,
+        wf: &WindowFunctionExpr,
+        row_indices: &[usize],
+        wf_idx: usize,
+        results: &mut [Vec<Value>],
+        peer_groups: &[(usize, usize)],
+    ) -> Result<()> {
+        // NTH_VALUE(expr, n): the second argument is the 1-based position
+        let n = match &wf.offset_expr {
+            Some(expr) => {
+                let val = eval_expr(expr, None, None)?;
+                match val {
+                    Value::Int32(v) if v > 0 => v as usize,
+                    Value::Int64(v) if v > 0 => v as usize,
+                    other => {
+                        return Err(anyhow!(
+                            "NTH_VALUE second argument must be a positive integer, got {:?}",
+                            other
+                        ))
+                    }
+                }
+            }
+            None => return Err(anyhow!("NTH_VALUE requires two arguments")),
+        };
+
+        let partition_size = row_indices.len();
+        for (pos, &row_idx) in row_indices.iter().enumerate() {
+            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
+            let target_pos = start + n - 1; // convert 1-based to 0-based
+            results[row_idx][wf_idx] = if target_pos < end && target_pos < partition_size {
+                if let Some(expr) = &wf.arg_expr {
+                    eval_expr(expr, Some(&rows[row_indices[target_pos]]), Some(schema))?
                 } else {
                     Value::Null
                 }
@@ -819,6 +1148,7 @@ mod tests {
             offset_expr: None,
             default_value_expr: None,
             window_frame: None,
+            filter_expr: None,
             output_name: "row_num".to_string(),
             output_type: DataType::Int64,
         }];
@@ -844,6 +1174,7 @@ mod tests {
                 offset_expr: None,
                 default_value_expr: None,
                 window_frame: None,
+                filter_expr: None,
                 output_name: "row_num".to_string(),
                 output_type: DataType::Int64,
             },
@@ -855,6 +1186,7 @@ mod tests {
                 offset_expr: None,
                 default_value_expr: None,
                 window_frame: None,
+                filter_expr: None,
                 output_name: "total".to_string(),
                 output_type: DataType::Numeric {
                     precision: None,
@@ -956,6 +1288,7 @@ mod tests {
             offset_expr: None,
             default_value_expr: None,
             window_frame: None,
+            filter_expr: None,
             output_name: "row_num".to_string(),
             output_type: DataType::Int64,
         }];
@@ -998,6 +1331,7 @@ mod tests {
             offset_expr: None,
             default_value_expr: None,
             window_frame: None,
+            filter_expr: None,
             output_name: "row_num".to_string(),
             output_type: DataType::Int64,
         }];
@@ -1037,6 +1371,7 @@ mod tests {
                 offset_expr: None,
                 default_value_expr: None,
                 window_frame: None,
+                filter_expr: None,
                 output_name: "rank_val".to_string(),
                 output_type: DataType::Int64,
             },
@@ -1052,6 +1387,7 @@ mod tests {
                 offset_expr: None,
                 default_value_expr: None,
                 window_frame: None,
+                filter_expr: None,
                 output_name: "dense_rank_val".to_string(),
                 output_type: DataType::Int64,
             },
@@ -1133,6 +1469,7 @@ mod tests {
             offset_expr: None,
             default_value_expr: None,
             window_frame: None,
+            filter_expr: None,
             output_name: "rn".to_string(),
             output_type: DataType::Int64,
         }];
@@ -1174,6 +1511,7 @@ mod tests {
             offset_expr: None,
             default_value_expr: None,
             window_frame: None,
+            filter_expr: None,
             output_name: "running_sum".to_string(),
             output_type: DataType::Numeric {
                 precision: None,
@@ -1219,6 +1557,7 @@ mod tests {
             offset_expr: None,
             default_value_expr: None,
             window_frame: None,
+            filter_expr: None,
             output_name: "total_count".to_string(),
             output_type: DataType::Int64,
         }];

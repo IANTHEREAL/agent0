@@ -813,6 +813,7 @@ impl Executor {
                 &resolved_projection,
                 ctes,
                 preloaded_source,
+                &select.named_window,
             )
             .await?
         } else if has_agg_or_group_by {

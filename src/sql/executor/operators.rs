@@ -3174,6 +3174,7 @@ impl Executor {
         projection: &[SelectItem],
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
         preloaded_source: Option<BoxedOperator>,
+        named_window: &[sqlparser::ast::NamedWindowDefinition],
     ) -> Result<ExecuteResult> {
         let scan_operator: BoxedOperator = if let Some(mut op) = preloaded_source {
             if let Some(filter_expr) = filter {
@@ -3193,6 +3194,17 @@ impl Executor {
                 estimated_rows,
             )?
         };
+
+        // Resolve named WINDOW references (e.g., OVER w) to inline WindowSpec
+        let resolved_projection: Vec<SelectItem> = if named_window.is_empty() {
+            projection.to_vec()
+        } else {
+            projection
+                .iter()
+                .map(|item| Self::resolve_named_windows_in_select_item(item, named_window))
+                .collect()
+        };
+        let projection = &resolved_projection;
 
         let (window_funcs, window_sig_to_column) =
             Self::extract_window_function_exprs(projection, &schema);
@@ -3314,6 +3326,172 @@ impl Executor {
         })
     }
 
+    /// Resolve named WINDOW references in a SelectItem.
+    /// Replaces `OVER w` (WindowType::NamedWindow) with the corresponding inline WindowSpec.
+    fn resolve_named_windows_in_select_item(
+        item: &SelectItem,
+        named_window: &[sqlparser::ast::NamedWindowDefinition],
+    ) -> SelectItem {
+        match item {
+            SelectItem::UnnamedExpr(e) => {
+                SelectItem::UnnamedExpr(Self::resolve_named_windows_in_expr(e, named_window))
+            }
+            SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias {
+                expr: Self::resolve_named_windows_in_expr(expr, named_window),
+                alias: alias.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
+    /// Recursively resolve named WINDOW references in an expression.
+    fn resolve_named_windows_in_expr(
+        expr: &Expr,
+        named_window: &[sqlparser::ast::NamedWindowDefinition],
+    ) -> Expr {
+        use sqlparser::ast::WindowType;
+        match expr {
+            Expr::Function(f) => {
+                let new_over = match &f.over {
+                    Some(WindowType::NamedWindow(name)) => {
+                        // Find the named window definition.
+                        // If not found, keep as NamedWindow — extraction will skip it
+                        // and the query will fail with a column-not-found error at eval time.
+                        named_window
+                            .iter()
+                            .find(|def| def.0.value.eq_ignore_ascii_case(&name.value))
+                            .map(|def| WindowType::WindowSpec(def.1.clone()))
+                            .or_else(|| Some(WindowType::NamedWindow(name.clone())))
+                    }
+                    other => other.clone(),
+                };
+                let new_args: Vec<FunctionArg> = f
+                    .args
+                    .iter()
+                    .map(|a| match a {
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                                Self::resolve_named_windows_in_expr(e, named_window),
+                            ))
+                        }
+                        other => other.clone(),
+                    })
+                    .collect();
+                Expr::Function(Function {
+                    name: f.name.clone(),
+                    args: new_args,
+                    filter: f.filter.clone(),
+                    null_treatment: f.null_treatment.clone(),
+                    over: new_over,
+                    distinct: f.distinct,
+                    special: f.special,
+                    order_by: f.order_by.clone(),
+                })
+            }
+            Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+                left: Box::new(Self::resolve_named_windows_in_expr(left, named_window)),
+                op: op.clone(),
+                right: Box::new(Self::resolve_named_windows_in_expr(right, named_window)),
+            },
+            Expr::UnaryOp { op, expr: inner } => Expr::UnaryOp {
+                op: op.clone(),
+                expr: Box::new(Self::resolve_named_windows_in_expr(inner, named_window)),
+            },
+            Expr::Nested(inner) => Expr::Nested(Box::new(Self::resolve_named_windows_in_expr(
+                inner,
+                named_window,
+            ))),
+            Expr::Cast {
+                expr: inner,
+                data_type,
+                format,
+            } => Expr::Cast {
+                expr: Box::new(Self::resolve_named_windows_in_expr(inner, named_window)),
+                data_type: data_type.clone(),
+                format: format.clone(),
+            },
+            Expr::TryCast {
+                expr: inner,
+                data_type,
+                format,
+            } => Expr::TryCast {
+                expr: Box::new(Self::resolve_named_windows_in_expr(inner, named_window)),
+                data_type: data_type.clone(),
+                format: format.clone(),
+            },
+            Expr::IsNull(e) => Expr::IsNull(Box::new(Self::resolve_named_windows_in_expr(
+                e,
+                named_window,
+            ))),
+            Expr::IsNotNull(e) => Expr::IsNotNull(Box::new(Self::resolve_named_windows_in_expr(
+                e,
+                named_window,
+            ))),
+            Expr::IsTrue(e) => Expr::IsTrue(Box::new(Self::resolve_named_windows_in_expr(
+                e,
+                named_window,
+            ))),
+            Expr::IsFalse(e) => Expr::IsFalse(Box::new(Self::resolve_named_windows_in_expr(
+                e,
+                named_window,
+            ))),
+            Expr::IsNotTrue(e) => Expr::IsNotTrue(Box::new(Self::resolve_named_windows_in_expr(
+                e,
+                named_window,
+            ))),
+            Expr::IsNotFalse(e) => Expr::IsNotFalse(Box::new(Self::resolve_named_windows_in_expr(
+                e,
+                named_window,
+            ))),
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => Expr::Case {
+                operand: operand
+                    .as_ref()
+                    .map(|o| Box::new(Self::resolve_named_windows_in_expr(o, named_window))),
+                conditions: conditions
+                    .iter()
+                    .map(|c| Self::resolve_named_windows_in_expr(c, named_window))
+                    .collect(),
+                results: results
+                    .iter()
+                    .map(|r| Self::resolve_named_windows_in_expr(r, named_window))
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(Self::resolve_named_windows_in_expr(e, named_window))),
+            },
+            Expr::InList {
+                expr: e,
+                list,
+                negated,
+            } => Expr::InList {
+                expr: Box::new(Self::resolve_named_windows_in_expr(e, named_window)),
+                list: list
+                    .iter()
+                    .map(|i| Self::resolve_named_windows_in_expr(i, named_window))
+                    .collect(),
+                negated: *negated,
+            },
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => Expr::Between {
+                expr: Box::new(Self::resolve_named_windows_in_expr(expr, named_window)),
+                negated: *negated,
+                low: Box::new(Self::resolve_named_windows_in_expr(low, named_window)),
+                high: Box::new(Self::resolve_named_windows_in_expr(high, named_window)),
+            },
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => expr.clone(),
+            other => other.clone(),
+        }
+    }
+
     pub(crate) fn extract_window_function_exprs(
         projection: &[SelectItem],
         schema: &TableSchema,
@@ -3363,6 +3541,8 @@ impl Executor {
                             let output_type =
                                 Executor::infer_window_func_type(&func_name, &arg_expr, schema);
 
+                            let filter_expr = f.filter.as_ref().map(|flt| *flt.clone());
+
                             sig_to_col.insert(sig, output_name.clone());
                             out.push(WindowFunctionExpr {
                                 func_name,
@@ -3372,6 +3552,7 @@ impl Executor {
                                 offset_expr,
                                 default_value_expr,
                                 window_frame: spec.window_frame.clone(),
+                                filter_expr,
                                 output_name,
                                 output_type,
                             });
@@ -3599,12 +3780,13 @@ impl Executor {
         schema: &TableSchema,
     ) -> DataType {
         match func_name {
-            "row_number" | "rank" | "dense_rank" | "count" => DataType::Int64,
+            "row_number" | "rank" | "dense_rank" | "ntile" | "count" => DataType::Int64,
+            "percent_rank" | "cume_dist" => DataType::Float64,
             "sum" | "avg" => DataType::Numeric {
                 precision: None,
                 scale: None,
             },
-            "min" | "max" | "lag" | "lead" | "first_value" | "last_value" => {
+            "min" | "max" | "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
                 if let Some(expr) = arg_expr {
                     infer_expr_type(expr, schema)
                 } else {
