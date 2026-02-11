@@ -1,6 +1,11 @@
 use super::*;
 
 impl TikvStore {
+    /// Acquire pessimistic (exclusive) locks on the given rows.
+    ///
+    /// Used for both FOR UPDATE and FOR SHARE.  TiKV only supports exclusive
+    /// pessimistic locks — there is no shared row-level lock — so FOR SHARE
+    /// is effectively upgraded to FOR UPDATE.
     pub async fn lock_rows(
         &self,
         txn: &mut Transaction,

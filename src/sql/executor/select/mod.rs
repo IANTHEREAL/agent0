@@ -653,6 +653,10 @@ impl Executor {
         };
 
         // FOR UPDATE / FOR SHARE: lock matching rows.
+        // NOTE: TiKV only supports exclusive pessimistic locks — there is no
+        // shared row-level lock.  FOR SHARE therefore behaves identically to
+        // FOR UPDATE (stricter than PostgreSQL, where FOR SHARE permits
+        // concurrent shared readers).
         let has_for_update = query
             .locks
             .iter()
@@ -661,6 +665,12 @@ impl Executor {
             .locks
             .iter()
             .any(|l| matches!(l.lock_type, LockType::Share));
+        if has_for_share {
+            tracing::warn!(
+                "FOR SHARE acquires exclusive locks on TiKV (no shared row locks); \
+                 this is stricter than PostgreSQL where FOR SHARE allows concurrent readers"
+            );
+        }
         let has_skip_locked = query
             .locks
             .iter()
