@@ -626,8 +626,7 @@ impl Session {
                 let txn = self.store.begin().await?;
                 self.savepoints.reset().await?;
                 self.state = TransactionState::Active(txn);
-                self.transaction_timestamp_ms =
-                    Some(super::statement_time::now_timestamp_millis());
+                self.transaction_timestamp_ms = Some(super::statement_time::now_timestamp_millis());
                 Ok(())
             }
             TransactionState::Active(_) | TransactionState::Failed(_) => {

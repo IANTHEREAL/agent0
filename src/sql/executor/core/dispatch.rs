@@ -76,11 +76,10 @@ impl Executor {
         crate::sql::expr::with_query_context(
             connection_id,
             database_name,
-            statement_time::with_transaction_timestamp_millis(
+            statement_time::with_timestamps(
+                statement_ts,
                 transaction_ts,
-                statement_time::with_statement_timestamp_millis(
-                    statement_ts,
-                    crate::txn::with_savepoints(savepoints, async {
+                crate::txn::with_savepoints(savepoints, async {
                 let sql_stripped = strip_leading_sql_comments(sql);
                 let sql_trimmed = sql_stripped.trim_start();
                 let is_observability_user =
@@ -870,7 +869,6 @@ impl Executor {
 
             Ok(ExecuteResults(results))
                 }),
-                ),
             ),
         )
         .await

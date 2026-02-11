@@ -2032,7 +2032,13 @@ fn test_current_timestamp_reads_from_query_context() {
 async fn test_query_context_overrides_task_local() {
     use crate::sql::query_context::QueryContext;
 
-    let qc = QueryContext::new(777, Arc::from("qc_db"), 1_600_000_000_000, 1_600_000_000_000, Arc::from("UTC"));
+    let qc = QueryContext::new(
+        777,
+        Arc::from("qc_db"),
+        1_600_000_000_000,
+        1_600_000_000_000,
+        Arc::from("UTC"),
+    );
 
     let pid_expr = parse_expr("pg_backend_pid()");
     let db_expr = parse_expr("current_database()");

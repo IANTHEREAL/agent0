@@ -912,8 +912,8 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
         }
 
         // REGEXP_REPLACE, REGEXP_MATCHES, REGEXP_SPLIT_TO_ARRAY are handled by the registry (functions/regex.rs)
-        // PG_TYPEOF, QUOTE_IDENT, QUOTE_LITERAL, QUOTE_NULLABLE, CLOCK_TIMESTAMP, STATEMENT_TIMESTAMP,
-        // TRANSACTION_TIMESTAMP, TXID_CURRENT, PG_COLUMN_SIZE, PG_TABLE_IS_VISIBLE are handled by the registry (functions/pg_compat.rs)
+        // PG_TYPEOF, QUOTE_IDENT, QUOTE_LITERAL, QUOTE_NULLABLE, CLOCK_TIMESTAMP,
+        // TXID_CURRENT, PG_COLUMN_SIZE, PG_TABLE_IS_VISIBLE are handled by the registry (functions/pg_compat.rs)
         // JSONB_SET, JSON_SET, JSONB_ARRAY_ELEMENTS, JSON_ARRAY_ELEMENTS, JSONB_ARRAY_ELEMENTS_TEXT,
         // JSON_ARRAY_ELEMENTS_TEXT, JSONB_EACH, JSON_EACH, JSONB_EACH_TEXT, JSON_EACH_TEXT are handled by the registry (functions/json.rs)
         _ => Err(SqlError::Unsupported(format!("Unsupported function: {}", func_name)).into()),
