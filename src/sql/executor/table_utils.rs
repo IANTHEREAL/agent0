@@ -3,6 +3,7 @@
 //! Extracted from join.rs during Phase 2 refactoring (B.2a).
 
 use super::super::information_schema::VirtualTableFilter;
+use super::super::ddl_export;
 use super::super::names;
 use super::super::names::normalize_ident;
 use super::super::{parse_sql, ExecuteResult};
@@ -311,6 +312,62 @@ impl Executor {
                         Value::Float64(g.latency_p99_ms),
                         Value::Float64(g.latency_max_ms),
                         Value::Int64(i64::try_from(g.last_seen_ms_ago).unwrap_or(i64::MAX)),
+                    ])
+                })
+                .collect();
+            return Ok((schema, rows));
+        }
+        if t_upper == "_PGTIKV_SYS_EXPORT_DDL" || t_upper.ends_with("._PGTIKV_SYS_EXPORT_DDL") {
+            let exported = ddl_export::export_all_ddl(self.store().as_ref(), txn, db_id).await?;
+            let schema = TableSchema {
+                table_id: 0,
+                name: table_name.to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "object_type".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "object_name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "ddl_sql".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                ],
+                pk_constraint_name: None,
+                pk_indices: vec![],
+                indexes: vec![],
+                version: 1,
+                check_constraints: vec![],
+                foreign_keys: vec![],
+                owner: String::new(),
+                from_alias: None,
+            };
+
+            let rows = exported
+                .into_iter()
+                .map(|entry| {
+                    Row::new(vec![
+                        Value::Text(entry.object_type),
+                        Value::Text(entry.object_name),
+                        Value::Text(entry.ddl_sql),
                     ])
                 })
                 .collect();

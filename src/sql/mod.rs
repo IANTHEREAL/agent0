@@ -9,6 +9,7 @@ mod alter_sequence_owned_by;
 pub(crate) mod catalog;
 mod comment_on;
 mod ddl;
+pub mod ddl_export;
 mod distinct;
 mod dml;
 pub mod error;
