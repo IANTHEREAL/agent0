@@ -754,7 +754,10 @@ pub async fn get_customer_token(
     token_hash: &str,
 ) -> Result<Option<CustomerTokenRow>, sqlx::Error> {
     let sql = adapt_sql("SELECT * FROM customer_tokens WHERE token_hash = $1", pool);
-    let row = sqlx::query(&sql).bind(token_hash).fetch_optional(pool).await?;
+    let row = sqlx::query(&sql)
+        .bind(token_hash)
+        .fetch_optional(pool)
+        .await?;
     Ok(row.as_ref().map(row_to_customer_token))
 }
 
@@ -825,10 +828,7 @@ pub async fn set_tenant_customer_id(
     tenant_id: &str,
     customer_id: &str,
 ) -> Result<(), sqlx::Error> {
-    let sql = adapt_sql(
-        "UPDATE tenants SET customer_id = $1 WHERE id = $2",
-        pool,
-    );
+    let sql = adapt_sql("UPDATE tenants SET customer_id = $1 WHERE id = $2", pool);
     sqlx::query(&sql)
         .bind(customer_id)
         .bind(tenant_id)
@@ -862,7 +862,8 @@ fn row_to_customer_token(row: &sqlx::any::AnyRow) -> CustomerTokenRow {
 mod tests {
     #[test]
     fn test_customer_insert_sql_has_correct_placeholders() {
-        let sql = "INSERT INTO customers (id, email, password_hash, created_at) VALUES ($1, $2, $3, $4)";
+        let sql =
+            "INSERT INTO customers (id, email, password_hash, created_at) VALUES ($1, $2, $3, $4)";
         assert!(sql.contains("$1"));
         assert!(sql.contains("$4"));
         // Ensure exactly 4 placeholders
@@ -903,7 +904,10 @@ mod tests {
         for i in (1..=30).rev() {
             result = result.replace(&format!("${i}"), "?");
         }
-        assert_eq!(result, "INSERT INTO audit_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        assert_eq!(
+            result,
+            "INSERT INTO audit_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::process;
 
 use clap::{Parser, Subcommand};
-use pgtikv_admin::cli_common::{ApiClient, format_time, format_val, print_json, print_table};
+use pgtikv_admin::cli_common::{format_time, format_val, print_json, print_table, ApiClient};
 use pgtikv_admin::{DEFAULT_ADMIN_USER, TENANT_ID_LEN};
 use serde_json::Value;
 

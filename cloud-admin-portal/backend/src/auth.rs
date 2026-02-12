@@ -73,15 +73,14 @@ impl FromRequestParts<AppState> for CustomerAuth {
                     AppError::unauthorized("Authorization header required. Use Bearer <token>.")
                 })?;
 
-            let token_str = if auth_header.len() > 7
-                && auth_header[..7].eq_ignore_ascii_case("bearer ")
-            {
-                &auth_header[7..]
-            } else {
-                return Err(AppError::unauthorized(
-                    "Invalid Authorization header. Expected: Bearer <token>",
-                ));
-            };
+            let token_str =
+                if auth_header.len() > 7 && auth_header[..7].eq_ignore_ascii_case("bearer ") {
+                    &auth_header[7..]
+                } else {
+                    return Err(AppError::unauthorized(
+                        "Invalid Authorization header. Expected: Bearer <token>",
+                    ));
+                };
 
             if token_str.is_empty() {
                 return Err(AppError::unauthorized("Bearer token must not be empty"));

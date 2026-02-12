@@ -2,11 +2,25 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::process;
 
-use clap::{Parser, Subcommand};
-use pgtikv_admin::cli_common::{format_time, format_val, print_json, print_table, ApiClient};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use pgtikv_admin::cli_common::{
+    format_time, format_val, print_csv, print_json, print_table, ApiClient,
+};
 use serde_json::Value;
 
 const DEFAULT_API_URL: &str = "http://localhost:8090/api";
+
+// ── Output format enum ──────────────────────────────────────────
+
+#[derive(Clone, Debug, ValueEnum)]
+enum OutputFormat {
+    /// Table format (default)
+    Table,
+    /// JSON format
+    Json,
+    /// CSV format
+    Csv,
+}
 
 // ── CLI definition ──────────────────────────────────────────────
 
@@ -21,12 +35,27 @@ struct Cli {
     #[arg(long, env = "DB9_API_URL", default_value = DEFAULT_API_URL)]
     api_url: String,
 
-    /// Output as JSON
+    /// Output format
+    #[arg(long, global = true, default_value = "table")]
+    output: OutputFormat,
+
+    /// Output as JSON (alias for --output json)
     #[arg(long, global = true)]
     json: bool,
 
     #[command(subcommand)]
     command: Commands,
+}
+
+impl Cli {
+    /// Get the effective output format, respecting --json flag for backward compatibility
+    fn effective_output(&self) -> OutputFormat {
+        if self.json {
+            OutputFormat::Json
+        } else {
+            self.output.clone()
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -46,6 +75,12 @@ enum Commands {
     Token {
         #[command(subcommand)]
         action: TokenAction,
+    },
+    /// Generate shell completion scripts
+    Completion {
+        /// Shell to generate for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 
@@ -139,8 +174,7 @@ fn save_token(token: &str) -> Result<(), String> {
     let dir = ensure_config_dir();
     let cred_path = dir.join("credentials");
     let content = format!("token = \"{token}\"\n");
-    std::fs::write(&cred_path, content)
-        .map_err(|e| format!("Failed to save credentials: {e}"))?;
+    std::fs::write(&cred_path, content).map_err(|e| format!("Failed to save credentials: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -163,10 +197,7 @@ fn require_token() -> String {
 
 fn make_auth_headers(token: &str) -> HashMap<String, String> {
     let mut headers = HashMap::new();
-    headers.insert(
-        "Authorization".to_string(),
-        format!("Bearer {token}"),
-    );
+    headers.insert("Authorization".to_string(), format!("Bearer {token}"));
     headers
 }
 
@@ -196,32 +227,35 @@ async fn main() {
     let api = ApiClient::new(&cli.api_url, None);
 
     match cli.command {
-        Commands::Register => cmd_register(&api, cli.json).await,
-        Commands::Login => cmd_login(&api, cli.json).await,
+        Commands::Register => cmd_register(&api, &cli.effective_output()).await,
+        Commands::Login => cmd_login(&api, &cli.effective_output()).await,
         Commands::Logout => cmd_logout(),
-        Commands::Db { action } => match action {
+        Commands::Completion { shell } => cmd_completion(shell),
+        Commands::Db { ref action } => match action {
             DbAction::Create { name, region } => {
-                cmd_db_create(&api, cli.json, &name, region.as_deref()).await
+                cmd_db_create(&api, &cli.effective_output(), name, region.as_deref()).await
             }
-            DbAction::List => cmd_db_list(&api, cli.json).await,
-            DbAction::Status { id } => cmd_db_status(&api, cli.json, &id).await,
-            DbAction::Delete { id } => cmd_db_delete(&api, cli.json, &id).await,
-            DbAction::ResetPassword { id } => cmd_db_reset_password(&api, cli.json, &id).await,
-            DbAction::Connect { id } => cmd_db_connect(&api, cli.json, &id).await,
+            DbAction::List => cmd_db_list(&api, &cli.effective_output()).await,
+            DbAction::Status { id } => cmd_db_status(&api, &cli.effective_output(), id).await,
+            DbAction::Delete { id } => cmd_db_delete(&api, &cli.effective_output(), id).await,
+            DbAction::ResetPassword { id } => {
+                cmd_db_reset_password(&api, &cli.effective_output(), id).await
+            }
+            DbAction::Connect { id } => cmd_db_connect(&api, &cli.effective_output(), id).await,
             DbAction::Inspect { id, action } => match action {
-                None => cmd_db_inspect(&api, cli.json, &id).await,
+                None => cmd_db_inspect(&api, &cli.effective_output(), id).await,
                 Some(InspectAction::Queries) => {
-                    cmd_db_inspect_queries(&api, cli.json, &id).await
+                    cmd_db_inspect_queries(&api, &cli.effective_output(), id).await
                 }
                 Some(InspectAction::Report) => {
-                    cmd_db_inspect_report(&api, cli.json, &id).await
+                    cmd_db_inspect_report(&api, &cli.effective_output(), id).await
                 }
             },
         },
-        Commands::Token { action } => match action {
-            TokenAction::List => cmd_token_list(&api, cli.json).await,
+        Commands::Token { ref action } => match action {
+            TokenAction::List => cmd_token_list(&api, &cli.effective_output()).await,
             TokenAction::Revoke { token_id } => {
-                cmd_token_revoke(&api, cli.json, &token_id).await
+                cmd_token_revoke(&api, &cli.effective_output(), token_id).await
             }
         },
     }
@@ -229,7 +263,12 @@ async fn main() {
 
 // ── Command implementations ─────────────────────────────────────
 
-async fn cmd_register(api: &ApiClient, json: bool) {
+fn cmd_completion(shell: clap_complete::Shell) {
+    let mut cmd = Cli::command();
+    clap_complete::generate(shell, &mut cmd, "db9", &mut io::stdout());
+}
+
+async fn cmd_register(api: &ApiClient, output: &OutputFormat) {
     let email = prompt_email();
     let password = prompt_password("Password: ");
     let confirm = prompt_password("Confirm password: ");
@@ -247,15 +286,13 @@ async fn cmd_register(api: &ApiClient, json: bool) {
         .request("POST", "/customer/register", Some(&body), None)
         .await;
 
-    if json {
-        print_json(&data);
-        return;
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => println!("Account created successfully! Run 'db9 login' to get started."),
     }
-
-    println!("Account created successfully! Run 'db9 login' to get started.");
 }
 
-async fn cmd_login(api: &ApiClient, json: bool) {
+async fn cmd_login(api: &ApiClient, output: &OutputFormat) {
     let email = prompt_email();
     let password = prompt_password("Password: ");
 
@@ -267,31 +304,30 @@ async fn cmd_login(api: &ApiClient, json: bool) {
         .request("POST", "/customer/login", Some(&body), None)
         .await;
 
-    let token = data["token"]
-        .as_str()
-        .unwrap_or_else(|| {
-            eprintln!("Login failed: no token in response");
-            process::exit(1);
-        });
+    let token = data["token"].as_str().unwrap_or_else(|| {
+        eprintln!("Login failed: no token in response");
+        process::exit(1);
+    });
 
     if let Err(e) = save_token(token) {
         eprintln!("{e}");
         process::exit(1);
     }
 
-    if json {
-        // NEVER include the token in JSON output for security
-        let safe = serde_json::json!({
-            "expires_at": data["expires_at"],
-        });
-        print_json(&safe);
-        return;
+    match output {
+        OutputFormat::Json => {
+            let safe = serde_json::json!({
+                "expires_at": data["expires_at"],
+            });
+            print_json(&safe);
+        }
+        _ => {
+            println!(
+                "Login successful! Token expires: {}",
+                format_time(data.get("expires_at"))
+            );
+        }
     }
-
-    println!(
-        "Login successful! Token expires: {}",
-        format_time(data.get("expires_at"))
-    );
 }
 
 fn cmd_logout() {
@@ -305,7 +341,7 @@ fn cmd_logout() {
     println!("Logged out successfully.");
 }
 
-async fn cmd_db_create(api: &ApiClient, json: bool, name: &str, region: Option<&str>) {
+async fn cmd_db_create(api: &ApiClient, output: &OutputFormat, name: &str, region: Option<&str>) {
     let token = require_token();
     let headers = make_auth_headers(&token);
 
@@ -318,43 +354,34 @@ async fn cmd_db_create(api: &ApiClient, json: bool, name: &str, region: Option<&
         .request("POST", "/customer/databases", Some(&body), Some(&headers))
         .await;
 
-    if json {
-        print_json(&data);
-        return;
-    }
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => {
+            println!("Database created successfully!\n");
+            println!("ID:          {}", format_val(data.get("id")));
+            println!("Name:        {}", format_val(data.get("name")));
+            println!("State:       {}", format_val(data.get("state")));
+            if let Some(r) = data.get("region").and_then(|v| v.as_str()) {
+                println!("Region:      {r}");
+            }
+            if let Some(user) = data.get("admin_user").and_then(|v| v.as_str()) {
+                println!("Admin User:  {user}");
+            }
+            if let Some(pass) = data.get("admin_password").and_then(|v| v.as_str()) {
+                println!("Admin Pass:  {pass}");
+            }
 
-    println!("Database created successfully!\n");
-    println!(
-        "ID:          {}",
-        format_val(data.get("id"))
-    );
-    println!(
-        "Name:        {}",
-        format_val(data.get("name"))
-    );
-    println!(
-        "State:       {}",
-        format_val(data.get("state"))
-    );
-    if let Some(r) = data.get("region").and_then(|v| v.as_str()) {
-        println!("Region:      {r}");
-    }
-    if let Some(user) = data.get("admin_user").and_then(|v| v.as_str()) {
-        println!("Admin User:  {user}");
-    }
-    if let Some(pass) = data.get("admin_password").and_then(|v| v.as_str()) {
-        println!("Admin Pass:  {pass}");
-    }
-
-    if let Some(conn) = data.get("connection_string").and_then(|v| v.as_str()) {
-        println!("\nConnection String:");
-        println!("  {conn}");
-        println!("\npsql Command:");
-        println!("  psql \"{conn}\"");
+            if let Some(conn) = data.get("connection_string").and_then(|v| v.as_str()) {
+                println!("\nConnection String:");
+                println!("  {conn}");
+                println!("\npsql Command:");
+                println!("  psql \"{conn}\"");
+            }
+        }
     }
 }
 
-async fn cmd_db_list(api: &ApiClient, json: bool) {
+async fn cmd_db_list(api: &ApiClient, output: &OutputFormat) {
     let token = require_token();
     let headers = make_auth_headers(&token);
 
@@ -362,32 +389,50 @@ async fn cmd_db_list(api: &ApiClient, json: bool) {
         .request("GET", "/customer/databases", None, Some(&headers))
         .await;
 
-    if json {
-        print_json(&data);
-        return;
-    }
-
-    let mut items = data.as_array().cloned().unwrap_or_default();
-    for item in &mut items {
-        if let Some(obj) = item.as_object_mut() {
-            let formatted = format_time(obj.get("created_at"));
-            obj.insert("created_at".into(), Value::String(formatted));
+    match output {
+        OutputFormat::Json => print_json(&data),
+        OutputFormat::Csv => {
+            let mut items = data.as_array().cloned().unwrap_or_default();
+            for item in &mut items {
+                if let Some(obj) = item.as_object_mut() {
+                    let formatted = format_time(obj.get("created_at"));
+                    obj.insert("created_at".into(), Value::String(formatted));
+                }
+            }
+            print_csv(
+                &items,
+                &[
+                    ("ID", "id", 12),
+                    ("NAME", "name", 15),
+                    ("STATE", "state", 8),
+                    ("REGION", "region", 10),
+                    ("CREATED", "created_at", 16),
+                ],
+            );
+        }
+        OutputFormat::Table => {
+            let mut items = data.as_array().cloned().unwrap_or_default();
+            for item in &mut items {
+                if let Some(obj) = item.as_object_mut() {
+                    let formatted = format_time(obj.get("created_at"));
+                    obj.insert("created_at".into(), Value::String(formatted));
+                }
+            }
+            print_table(
+                &items,
+                &[
+                    ("ID", "id", 12),
+                    ("NAME", "name", 15),
+                    ("STATE", "state", 8),
+                    ("REGION", "region", 10),
+                    ("CREATED", "created_at", 16),
+                ],
+            );
         }
     }
-
-    print_table(
-        &items,
-        &[
-            ("ID", "id", 12),
-            ("NAME", "name", 15),
-            ("STATE", "state", 8),
-            ("REGION", "region", 10),
-            ("CREATED", "created_at", 16),
-        ],
-    );
 }
 
-async fn cmd_db_status(api: &ApiClient, json: bool, id: &str) {
+async fn cmd_db_status(api: &ApiClient, output: &OutputFormat, id: &str) {
     let token = require_token();
     let headers = make_auth_headers(&token);
 
@@ -400,59 +445,45 @@ async fn cmd_db_status(api: &ApiClient, json: bool, id: &str) {
         )
         .await;
 
-    if json {
-        print_json(&data);
-        return;
-    }
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => {
+            println!("Database: {}", format_val(data.get("name")));
+            println!("ID:       {}", format_val(data.get("id")));
+            println!("State:    {}", format_val(data.get("state")));
+            if let Some(r) = data.get("region").and_then(|v| v.as_str()) {
+                println!("Region:   {r}");
+            }
+            println!("Created:  {}", format_time(data.get("created_at")));
 
-    println!(
-        "Database: {}",
-        format_val(data.get("name"))
-    );
-    println!(
-        "ID:       {}",
-        format_val(data.get("id"))
-    );
-    println!(
-        "State:    {}",
-        format_val(data.get("state"))
-    );
-    if let Some(r) = data.get("region").and_then(|v| v.as_str()) {
-        println!("Region:   {r}");
-    }
-    println!(
-        "Created:  {}",
-        format_time(data.get("created_at"))
-    );
+            if let Some(eps) = data["endpoints"].as_array() {
+                if !eps.is_empty() {
+                    println!("\nEndpoints:");
+                    for ep in eps {
+                        println!(
+                            "  Host: {}  Port: {}  Type: {}",
+                            ep["host"].as_str().unwrap_or("?"),
+                            ep["port"].as_u64().unwrap_or(0),
+                            ep["type"].as_str().unwrap_or("-"),
+                        );
+                    }
+                }
+            }
 
-    if let Some(eps) = data["endpoints"].as_array() {
-        if !eps.is_empty() {
-            println!("\nEndpoints:");
-            for ep in eps {
-                println!(
-                    "  Host: {}  Port: {}  Type: {}",
-                    ep["host"].as_str().unwrap_or("?"),
-                    ep["port"].as_u64().unwrap_or(0),
-                    ep["type"].as_str().unwrap_or("-"),
-                );
+            if let Some(conn) = data.get("connection_string").and_then(|v| v.as_str()) {
+                println!("\nConnection:");
+                println!("  {conn}");
             }
         }
     }
-
-    if let Some(conn) = data.get("connection_string").and_then(|v| v.as_str()) {
-        println!("\nConnection:");
-        println!("  {conn}");
-    }
 }
 
-async fn cmd_db_delete(api: &ApiClient, json: bool, id: &str) {
+async fn cmd_db_delete(api: &ApiClient, output: &OutputFormat, id: &str) {
     let token = require_token();
     let headers = make_auth_headers(&token);
 
-    if !json {
-        print!(
-            "Are you sure you want to delete database {id}? This cannot be undone. [y/N] "
-        );
+    if !matches!(output, OutputFormat::Json) {
+        print!("Are you sure you want to delete database {id}? This cannot be undone. [y/N] ");
         io::stdout().flush().ok();
         let mut answer = String::new();
         io::stdin().read_line(&mut answer).unwrap_or_else(|e| {
@@ -475,15 +506,13 @@ async fn cmd_db_delete(api: &ApiClient, json: bool, id: &str) {
         )
         .await;
 
-    if json {
-        print_json(&data);
-        return;
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => println!("Database {id} has been disabled."),
     }
-
-    println!("Database {id} has been disabled.");
 }
 
-async fn cmd_db_reset_password(api: &ApiClient, json: bool, id: &str) {
+async fn cmd_db_reset_password(api: &ApiClient, output: &OutputFormat, id: &str) {
     let token = require_token();
     let headers = make_auth_headers(&token);
 
@@ -496,27 +525,27 @@ async fn cmd_db_reset_password(api: &ApiClient, json: bool, id: &str) {
         )
         .await;
 
-    if json {
-        print_json(&data);
-        return;
-    }
-
-    println!("Password reset successfully!\n");
-    if let Some(user) = data.get("admin_user").and_then(|v| v.as_str()) {
-        println!("Admin User:  {user}");
-    }
-    if let Some(pass) = data.get("admin_password").and_then(|v| v.as_str()) {
-        println!("Admin Pass:  {pass}");
-    }
-    if let Some(conn) = data.get("connection_string").and_then(|v| v.as_str()) {
-        println!("\nConnection String:");
-        println!("  {conn}");
-        println!("\npsql Command:");
-        println!("  psql \"{conn}\"");
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => {
+            println!("Password reset successfully!\n");
+            if let Some(user) = data.get("admin_user").and_then(|v| v.as_str()) {
+                println!("Admin User:  {user}");
+            }
+            if let Some(pass) = data.get("admin_password").and_then(|v| v.as_str()) {
+                println!("Admin Pass:  {pass}");
+            }
+            if let Some(conn) = data.get("connection_string").and_then(|v| v.as_str()) {
+                println!("\nConnection String:");
+                println!("  {conn}");
+                println!("\npsql Command:");
+                println!("  psql \"{conn}\"");
+            }
+        }
     }
 }
 
-async fn cmd_db_connect(api: &ApiClient, json: bool, id: &str) {
+async fn cmd_db_connect(api: &ApiClient, output: &OutputFormat, id: &str) {
     let token = require_token();
     let headers = make_auth_headers(&token);
 
@@ -529,23 +558,25 @@ async fn cmd_db_connect(api: &ApiClient, json: bool, id: &str) {
         )
         .await;
 
-    if json {
-        let mut result = serde_json::json!({});
-        if let Some(conn) = data.get("connection_string") {
-            result["connection_string"] = conn.clone();
+    match output {
+        OutputFormat::Json => {
+            let mut result = serde_json::json!({});
+            if let Some(conn) = data.get("connection_string") {
+                result["connection_string"] = conn.clone();
+            }
+            if let Some(eps) = data.get("endpoints") {
+                result["endpoints"] = eps.clone();
+            }
+            print_json(&result);
         }
-        if let Some(eps) = data.get("endpoints") {
-            result["endpoints"] = eps.clone();
+        _ => {
+            if let Some(conn) = data.get("connection_string").and_then(|v| v.as_str()) {
+                println!("Connection String:");
+                println!("  {conn}");
+                println!("\npsql Command:");
+                println!("  psql \"{conn}\"");
+            }
         }
-        print_json(&result);
-        return;
-    }
-
-    if let Some(conn) = data.get("connection_string").and_then(|v| v.as_str()) {
-        println!("Connection String:");
-        println!("  {conn}");
-        println!("\npsql Command:");
-        println!("  psql \"{conn}\"");
     }
 }
 
@@ -661,36 +692,35 @@ async fn fetch_observability(api: &ApiClient, id: &str) -> Value {
     .await
 }
 
-async fn cmd_db_inspect(api: &ApiClient, json: bool, id: &str) {
+async fn cmd_db_inspect(api: &ApiClient, output: &OutputFormat, id: &str) {
     let data = fetch_observability(api, id).await;
-    if json {
-        print_json(&data["summary"]);
-        return;
+    match output {
+        OutputFormat::Json => print_json(&data["summary"]),
+        _ => print_inspect_summary(&data, id),
     }
-    print_inspect_summary(&data, id);
 }
 
-async fn cmd_db_inspect_queries(api: &ApiClient, json: bool, id: &str) {
+async fn cmd_db_inspect_queries(api: &ApiClient, output: &OutputFormat, id: &str) {
     let data = fetch_observability(api, id).await;
-    if json {
-        print_json(&data["samples"]);
-        return;
+    match output {
+        OutputFormat::Json => print_json(&data["samples"]),
+        _ => print_inspect_queries(&data),
     }
-    print_inspect_queries(&data);
 }
 
-async fn cmd_db_inspect_report(api: &ApiClient, json: bool, id: &str) {
+async fn cmd_db_inspect_report(api: &ApiClient, output: &OutputFormat, id: &str) {
     let data = fetch_observability(api, id).await;
-    if json {
-        print_json(&data);
-        return;
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => {
+            print_inspect_summary(&data, id);
+            println!();
+            print_inspect_queries(&data);
+        }
     }
-    print_inspect_summary(&data, id);
-    println!();
-    print_inspect_queries(&data);
 }
 
-async fn cmd_token_list(api: &ApiClient, json: bool) {
+async fn cmd_token_list(api: &ApiClient, output: &OutputFormat) {
     let token = require_token();
     let headers = make_auth_headers(&token);
 
@@ -698,33 +728,52 @@ async fn cmd_token_list(api: &ApiClient, json: bool) {
         .request("GET", "/customer/tokens", None, Some(&headers))
         .await;
 
-    if json {
-        print_json(&data);
-        return;
-    }
-
-    let mut items = data.as_array().cloned().unwrap_or_default();
-    for item in &mut items {
-        if let Some(obj) = item.as_object_mut() {
-            let created = format_time(obj.get("created_at"));
-            obj.insert("created_at".into(), Value::String(created));
-            let expires = format_time(obj.get("expires_at"));
-            obj.insert("expires_at".into(), Value::String(expires));
+    match output {
+        OutputFormat::Json => print_json(&data),
+        OutputFormat::Csv => {
+            let mut items = data.as_array().cloned().unwrap_or_default();
+            for item in &mut items {
+                if let Some(obj) = item.as_object_mut() {
+                    let created = format_time(obj.get("created_at"));
+                    obj.insert("created_at".into(), Value::String(created));
+                    let expires = format_time(obj.get("expires_at"));
+                    obj.insert("expires_at".into(), Value::String(expires));
+                }
+            }
+            print_csv(
+                &items,
+                &[
+                    ("ID", "id", 36),
+                    ("NAME", "name", 10),
+                    ("CREATED", "created_at", 16),
+                    ("EXPIRES", "expires_at", 16),
+                ],
+            );
+        }
+        OutputFormat::Table => {
+            let mut items = data.as_array().cloned().unwrap_or_default();
+            for item in &mut items {
+                if let Some(obj) = item.as_object_mut() {
+                    let created = format_time(obj.get("created_at"));
+                    obj.insert("created_at".into(), Value::String(created));
+                    let expires = format_time(obj.get("expires_at"));
+                    obj.insert("expires_at".into(), Value::String(expires));
+                }
+            }
+            print_table(
+                &items,
+                &[
+                    ("ID", "id", 36),
+                    ("NAME", "name", 10),
+                    ("CREATED", "created_at", 16),
+                    ("EXPIRES", "expires_at", 16),
+                ],
+            );
         }
     }
-
-    print_table(
-        &items,
-        &[
-            ("ID", "id", 36),
-            ("NAME", "name", 10),
-            ("CREATED", "created_at", 16),
-            ("EXPIRES", "expires_at", 16),
-        ],
-    );
 }
 
-async fn cmd_token_revoke(api: &ApiClient, json: bool, token_id: &str) {
+async fn cmd_token_revoke(api: &ApiClient, output: &OutputFormat, token_id: &str) {
     let token = require_token();
     let headers = make_auth_headers(&token);
 
@@ -737,12 +786,10 @@ async fn cmd_token_revoke(api: &ApiClient, json: bool, token_id: &str) {
         )
         .await;
 
-    if json {
-        print_json(&data);
-        return;
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => println!("Token revoked."),
     }
-
-    println!("Token revoked.");
 }
 
 #[cfg(test)]

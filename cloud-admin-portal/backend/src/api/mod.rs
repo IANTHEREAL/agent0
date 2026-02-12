@@ -10,6 +10,8 @@ use axum::Router;
 use crate::AppState;
 
 pub fn router() -> Router<AppState> {
+    let customer_router = customer::router();
+
     Router::new()
         // Tenants
         .route(
@@ -54,5 +56,5 @@ pub fn router() -> Router<AppState> {
         .route("/info", get(system::api_info))
         // Audit
         .route("/audit-logs", get(audit::query_audit_logs))
-        .nest("/customer", customer::router())
+        .nest("/customer", customer_router)
 }

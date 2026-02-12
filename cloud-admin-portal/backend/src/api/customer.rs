@@ -16,6 +16,8 @@ use crate::{
     KEYSPACE_PREFIX, OBSERVABILITY_USER, TENANT_ID_LEN,
 };
 
+const SYSTEM_USER_PREFIX: &str = "_pgtikv_sys_";
+
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/register", post(register))
@@ -35,6 +37,18 @@ pub fn router() -> Router<AppState> {
         .route(
             "/databases/:database_id/observability",
             get(get_database_observability),
+        )
+        .route(
+            "/databases/:database_id/sql",
+            post(execute_database_sql_structured),
+        )
+        .route(
+            "/databases/:database_id/users",
+            get(list_database_users).post(create_database_user),
+        )
+        .route(
+            "/databases/:database_id/users/:username",
+            delete(delete_database_user),
         )
 }
 
@@ -74,6 +88,35 @@ fn parse_region_from_tags(tags: &Option<String>) -> Option<String> {
     tags.as_ref()
         .and_then(|t| serde_json::from_str::<Vec<String>>(t).ok())
         .and_then(|v| v.into_iter().next())
+}
+
+async fn get_customer_tenant_and_admin_credential(
+    state: &AppState,
+    customer_id: &str,
+    database_id: &str,
+) -> Result<(TenantRow, CredentialRow), AppError> {
+    let tenant = db::get_tenant_for_customer(&state.db, database_id, customer_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("Database not found"))?;
+
+    if tenant.state != tenant_state::ACTIVE {
+        return Err(AppError::conflict(
+            "Database is not active. Retry when state is ACTIVE.",
+        ));
+    }
+
+    let cred = db::get_credential(
+        &state.db,
+        &tenant.id,
+        "admin",
+        state.config.credential_key.as_deref(),
+    )
+    .await?
+    .ok_or_else(|| {
+        AppError::conflict("No stored admin credential for this database. Reset password first.")
+    })?;
+
+    Ok((tenant, cred))
 }
 
 // ── POST /register ───────────────────────────────────────────────
@@ -168,8 +211,15 @@ pub async fn login(
     let expires_at = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
     let token_id = uuid::Uuid::new_v4().to_string();
 
-    db::create_customer_token(&state.db, &token_id, &customer.id, &token_hash, "default", &expires_at)
-        .await?;
+    db::create_customer_token(
+        &state.db,
+        &token_id,
+        &customer.id,
+        &token_hash,
+        "default",
+        &expires_at,
+    )
+    .await?;
 
     Ok(Json(LoginResponse { token, expires_at }))
 }
@@ -326,13 +376,8 @@ pub async fn create_database(
         .region
         .as_ref()
         .map(|r| serde_json::to_string(&vec![r]).unwrap_or_else(|_| "[]".into()));
-    db::update_tenant_metadata(
-        &state.db,
-        &tenant_id,
-        Some(&req.name),
-        tags_json.as_deref(),
-    )
-    .await?;
+    db::update_tenant_metadata(&state.db, &tenant_id, Some(&req.name), tags_json.as_deref())
+        .await?;
 
     db::insert_audit_log(
         &state.db,
@@ -754,4 +799,131 @@ pub async fn get_database_observability(
         .collect();
 
     Ok(Json(TenantObservabilityResponse { summary, samples }))
+}
+
+pub async fn execute_database_sql_structured(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+    Path(database_id): Path<String>,
+    Json(req): Json<SqlExecuteRequest>,
+) -> Result<Json<SqlResult>, AppError> {
+    let (tenant, cred) =
+        get_customer_tenant_and_admin_credential(&state, &auth.customer_id, &database_id).await?;
+
+    let sql = req
+        .query
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            req.file_content
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+        })
+        .ok_or_else(|| {
+            AppError::new(
+                StatusCode::BAD_REQUEST,
+                "Provide non-empty 'query' or 'file_content'",
+            )
+        })?;
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+    let result = pg
+        .run_sql_structured(&tenant.id, &cred.username, &cred.password_plain, sql)
+        .await
+        .map_err(|e| {
+            AppError::new(
+                StatusCode::BAD_REQUEST,
+                format!("SQL execution failed: {e}"),
+            )
+        })?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_database_users(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+    Path(database_id): Path<String>,
+) -> Result<Json<Vec<UserResponse>>, AppError> {
+    let (tenant, cred) =
+        get_customer_tenant_and_admin_credential(&state, &auth.customer_id, &database_id).await?;
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+    let users = pg
+        .list_users(&tenant.id, &cred.username, &cred.password_plain)
+        .await
+        .into_iter()
+        .filter(|u| !u.name.starts_with(SYSTEM_USER_PREFIX))
+        .collect::<Vec<_>>();
+
+    Ok(Json(users))
+}
+
+pub async fn create_database_user(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+    Path(database_id): Path<String>,
+    Json(req): Json<CreateUserRequest>,
+) -> Result<(StatusCode, Json<MessageResponse>), AppError> {
+    let (tenant, cred) =
+        get_customer_tenant_and_admin_credential(&state, &auth.customer_id, &database_id).await?;
+
+    if req.username.starts_with(SYSTEM_USER_PREFIX) {
+        return Err(AppError::forbidden(
+            "Cannot create reserved system user names",
+        ));
+    }
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+    let success = pg
+        .create_user(
+            &tenant.id,
+            &cred.username,
+            &cred.password_plain,
+            &req.username,
+            &req.password,
+            false,
+        )
+        .await;
+
+    if !success {
+        return Err(AppError::bad_gateway("Failed to create user"));
+    }
+
+    Ok((
+        StatusCode::CREATED,
+        Json(MessageResponse {
+            message: format!("User '{}' created", req.username),
+        }),
+    ))
+}
+
+pub async fn delete_database_user(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+    Path((database_id, username)): Path<(String, String)>,
+) -> Result<Json<MessageResponse>, AppError> {
+    let (tenant, cred) =
+        get_customer_tenant_and_admin_credential(&state, &auth.customer_id, &database_id).await?;
+
+    if username == DEFAULT_ADMIN_USER || username.starts_with(SYSTEM_USER_PREFIX) {
+        return Err(AppError::forbidden(format!(
+            "Cannot delete protected user '{username}'"
+        )));
+    }
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+    let success = pg
+        .drop_user(&tenant.id, &cred.username, &cred.password_plain, &username)
+        .await;
+
+    if !success {
+        return Err(AppError::bad_gateway("Failed to delete user"));
+    }
+
+    Ok(Json(MessageResponse {
+        message: format!("User '{username}' deleted"),
+    }))
 }

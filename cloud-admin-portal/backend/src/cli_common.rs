@@ -160,6 +160,31 @@ pub fn format_time(v: Option<&Value>) -> String {
     }
 }
 
+pub fn print_csv(rows: &[Value], columns: &[(&str, &str, usize)]) {
+    if rows.is_empty() {
+        println!("(empty)");
+        return;
+    }
+
+    let headers: Vec<&str> = columns.iter().map(|(h, _, _)| *h).collect();
+    println!("{}", headers.join(","));
+
+    for row in rows {
+        let values: Vec<String> = columns
+            .iter()
+            .map(|(_, key, _)| {
+                let val = format_val(row.get(key));
+                if val.contains(',') || val.contains('"') || val.contains('\n') {
+                    format!("\"{}\"", val.replace('"', "\"\""))
+                } else {
+                    val
+                }
+            })
+            .collect();
+        println!("{}", values.join(","));
+    }
+}
+
 pub fn print_json(data: &Value) {
     println!("{}", serde_json::to_string_pretty(data).unwrap_or_default());
 }

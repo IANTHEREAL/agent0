@@ -21,7 +21,7 @@ pub struct TenantUpdateRequest {
 }
 
 #[derive(Deserialize)]
-pub struct CreateUserRequest {
+pub struct AdminCreateUserRequest {
     pub username: String,
     pub password: Option<String>,
     pub superuser: Option<bool>,
@@ -30,6 +30,18 @@ pub struct CreateUserRequest {
 #[derive(Deserialize)]
 pub struct SqlQueryRequest {
     pub sql: String,
+}
+
+#[derive(Deserialize)]
+pub struct SqlExecuteRequest {
+    pub query: Option<String>,
+    pub file_content: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateUserRequest {
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Deserialize)]
@@ -205,6 +217,21 @@ pub struct SqlQueryResponse {
     pub result: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ColumnInfo {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub data_type: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SqlResult {
+    pub columns: Vec<ColumnInfo>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub row_count: usize,
+    pub command: String,
 }
 
 #[derive(Serialize)]

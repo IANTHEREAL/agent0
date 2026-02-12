@@ -52,7 +52,7 @@ pub async fn create_user(
     _auth: ApiKeyAuth,
     Path(tenant_id): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<CreateUserRequest>,
+    Json(request): Json<AdminCreateUserRequest>,
 ) -> Result<(StatusCode, Json<UserCreateResponse>), AppError> {
     let session = TenantSessionExtractor::from_headers(&headers, &tenant_id, &state)?;
 

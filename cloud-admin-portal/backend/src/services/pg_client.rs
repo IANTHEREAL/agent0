@@ -1,5 +1,7 @@
-use crate::models::UserResponse;
+use crate::models::{ColumnInfo, SqlResult, UserResponse};
+use serde_json::Value;
 use tokio_postgres::NoTls;
+use tokio_postgres::{types::Type, Row};
 
 pub struct PgClient {
     host: String,
@@ -34,6 +36,189 @@ fn escape_sql_string(s: &str) -> String {
 /// Wraps in single quotes, escaping backslashes and single quotes.
 fn escape_connstr_value(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+fn split_sql_statements(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut chars = sql.chars().peekable();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while let Some(ch) = chars.next() {
+        if in_line_comment {
+            current.push(ch);
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+
+        if in_block_comment {
+            current.push(ch);
+            if ch == '*' && chars.peek() == Some(&'/') {
+                current.push('/');
+                chars.next();
+                in_block_comment = false;
+            }
+            continue;
+        }
+
+        if !in_single && !in_double {
+            if ch == '-' && chars.peek() == Some(&'-') {
+                current.push(ch);
+                current.push('-');
+                chars.next();
+                in_line_comment = true;
+                continue;
+            }
+            if ch == '/' && chars.peek() == Some(&'*') {
+                current.push(ch);
+                current.push('*');
+                chars.next();
+                in_block_comment = true;
+                continue;
+            }
+        }
+
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            current.push(ch);
+            continue;
+        }
+
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            current.push(ch);
+            continue;
+        }
+
+        if ch == ';' && !in_single && !in_double {
+            let stmt = current.trim();
+            if !stmt.is_empty() {
+                statements.push(stmt.to_string());
+            }
+            current.clear();
+            continue;
+        }
+
+        current.push(ch);
+    }
+
+    let stmt = current.trim();
+    if !stmt.is_empty() {
+        statements.push(stmt.to_string());
+    }
+
+    statements
+}
+
+fn detect_command(sql: &str) -> String {
+    let compact = sql.split_whitespace().collect::<Vec<_>>();
+    if compact.is_empty() {
+        return "UNKNOWN".to_string();
+    }
+    let first = compact[0].to_ascii_uppercase();
+    if matches!(first.as_str(), "CREATE" | "ALTER" | "DROP") && compact.len() >= 2 {
+        format!("{} {}", first, compact[1].to_ascii_uppercase())
+    } else {
+        first
+    }
+}
+
+fn column_type_name(column_type: &Type) -> String {
+    match *column_type {
+        Type::BOOL => "boolean".to_string(),
+        Type::INT2 => "smallint".to_string(),
+        Type::INT4 => "integer".to_string(),
+        Type::INT8 => "bigint".to_string(),
+        Type::FLOAT4 => "real".to_string(),
+        Type::FLOAT8 => "double precision".to_string(),
+        Type::NUMERIC => "numeric".to_string(),
+        Type::TEXT => "text".to_string(),
+        Type::VARCHAR => "character varying".to_string(),
+        Type::BPCHAR => "character".to_string(),
+        Type::BYTEA => "bytea".to_string(),
+        Type::DATE => "date".to_string(),
+        Type::TIMESTAMP => "timestamp".to_string(),
+        Type::TIMESTAMPTZ => "timestamp with time zone".to_string(),
+        Type::TIME => "time".to_string(),
+        Type::TIMETZ => "time with time zone".to_string(),
+        Type::UUID => "uuid".to_string(),
+        Type::JSON => "json".to_string(),
+        Type::JSONB => "jsonb".to_string(),
+        Type::UNKNOWN => "unknown".to_string(),
+        _ => column_type.name().to_string(),
+    }
+}
+
+fn row_value_to_json(row: &Row, idx: usize) -> Value {
+    let ty = row.columns()[idx].type_();
+    match *ty {
+        Type::BOOL => row
+            .try_get::<_, Option<bool>>(idx)
+            .ok()
+            .flatten()
+            .map_or(Value::Null, Value::from),
+        Type::INT2 => row
+            .try_get::<_, Option<i16>>(idx)
+            .ok()
+            .flatten()
+            .map_or(Value::Null, Value::from),
+        Type::INT4 => row
+            .try_get::<_, Option<i32>>(idx)
+            .ok()
+            .flatten()
+            .map_or(Value::Null, Value::from),
+        Type::INT8 => row
+            .try_get::<_, Option<i64>>(idx)
+            .ok()
+            .flatten()
+            .map_or(Value::Null, Value::from),
+        Type::FLOAT4 => row
+            .try_get::<_, Option<f32>>(idx)
+            .ok()
+            .flatten()
+            .map_or(Value::Null, Value::from),
+        Type::FLOAT8 => row
+            .try_get::<_, Option<f64>>(idx)
+            .ok()
+            .flatten()
+            .map_or(Value::Null, Value::from),
+        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => row
+            .try_get::<_, Option<String>>(idx)
+            .ok()
+            .flatten()
+            .map_or(Value::Null, Value::from),
+        Type::BYTEA => row
+            .try_get::<_, Option<Vec<u8>>>(idx)
+            .ok()
+            .flatten()
+            .map_or(Value::Null, |v| {
+                Value::from(
+                    v.iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(""),
+                )
+            }),
+        _ => row
+            .try_get::<_, Option<String>>(idx)
+            .ok()
+            .flatten()
+            .map_or(Value::Null, Value::from),
+    }
+}
+
+fn query_like_statement(sql: &str) -> bool {
+    let upper = sql.trim_start().to_ascii_uppercase();
+    upper.starts_with("SELECT")
+        || upper.starts_with("WITH")
+        || upper.starts_with("SHOW")
+        || upper.starts_with("VALUES")
+        || upper.contains(" RETURNING ")
 }
 
 impl PgClient {
@@ -226,6 +411,91 @@ impl PgClient {
             }
         }
         Ok(output)
+    }
+
+    pub async fn run_sql_structured(
+        &self,
+        keyspace: &str,
+        user: &str,
+        password: &str,
+        sql: &str,
+    ) -> Result<SqlResult, String> {
+        let client = self.connect(keyspace, user, password).await?;
+        let statements = split_sql_statements(sql);
+        if statements.is_empty() {
+            return Err("Empty SQL query".to_string());
+        }
+
+        let mut last_result = SqlResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            command: "UNKNOWN".to_string(),
+        };
+
+        for statement in statements {
+            let command = detect_command(&statement);
+            if query_like_statement(&statement) {
+                let rows = client
+                    .query(&statement, &[])
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                let columns = if let Some(first_row) = rows.first() {
+                    first_row
+                        .columns()
+                        .iter()
+                        .map(|c| ColumnInfo {
+                            name: c.name().to_string(),
+                            data_type: column_type_name(c.type_()),
+                        })
+                        .collect()
+                } else {
+                    let stmt = client
+                        .prepare(&statement)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    stmt.columns()
+                        .iter()
+                        .map(|c| ColumnInfo {
+                            name: c.name().to_string(),
+                            data_type: column_type_name(c.type_()),
+                        })
+                        .collect()
+                };
+
+                let out_rows = rows
+                    .iter()
+                    .map(|row| {
+                        (0..row.len())
+                            .map(|idx| row_value_to_json(row, idx))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>();
+
+                last_result = SqlResult {
+                    columns,
+                    row_count: out_rows.len(),
+                    rows: out_rows,
+                    command,
+                };
+                continue;
+            }
+
+            let affected = client
+                .execute(&statement, &[])
+                .await
+                .map_err(|e| e.to_string())?;
+
+            last_result = SqlResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                row_count: affected as usize,
+                command,
+            };
+        }
+
+        Ok(last_result)
     }
 
     pub async fn get_observability_summary(
