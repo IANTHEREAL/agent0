@@ -2643,6 +2643,51 @@ ORDER BY qs_o.id;
         );
     }
 
+    /// Regression test for #678: substitute_outer_values (expr-entry path)
+    /// must still substitute inside CTEs even when the query body shadows
+    /// the outer alias.
+    #[test]
+    fn test_substitute_outer_values_subquery_cte_not_blocked_by_body_shadowing() {
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "WITH helper AS (SELECT t_outer.id AS oid FROM other_table) \
+                    SELECT helper.oid FROM helper, some_table AS t_outer \
+                    WHERE t_outer.id = helper.oid";
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
+            panic!("expected query");
+        };
+
+        let expr = Expr::Subquery(query.clone());
+        let outer_schema = make_schema(&["id"]);
+        let outer_row = Row::new(vec![Value::Int32(77)]);
+
+        let substituted_expr =
+            substitute_outer_values(&expr, "t_outer", &outer_schema, &outer_row);
+        let Expr::Subquery(substituted_query) = substituted_expr else {
+            panic!("expected subquery");
+        };
+
+        // CTE should have `t_outer.id` replaced with 77.
+        let cte_query = &substituted_query.with.as_ref().unwrap().cte_tables[0].query;
+        let cte_sql = cte_query.to_string();
+        assert!(
+            cte_sql.contains("77"),
+            "CTE should have outer ref substituted via expr path: {cte_sql}"
+        );
+
+        // Body's WHERE `t_outer.id` should NOT be substituted (shadowed by FROM).
+        let SetExpr::Select(select) = &*substituted_query.body else {
+            panic!("expected SELECT body");
+        };
+        let where_sql = select.selection.as_ref().unwrap().to_string();
+        assert!(
+            where_sql.contains("t_outer.id"),
+            "body WHERE should keep t_outer.id (shadowed): {where_sql}"
+        );
+    }
+
     #[test]
     fn test_setop_arm_shadowing_prevents_substitution() {
         use sqlparser::dialect::PostgreSqlDialect;
