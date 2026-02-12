@@ -199,11 +199,14 @@ impl Executor {
 
             // Deterministic tie-breaker to match PostgreSQL's stable-looking output:
             // compare full output rows when ORDER BY keys are equal.
+            // Errors (e.g. unorderable types like jsonb/vector) are treated as
+            // equal so that ORDER BY succeeds when the ORDER BY keys themselves
+            // are orderable.  See #666.
             let max_cols = a.values.len().max(b.values.len());
             for i in 0..max_cols {
                 let va = a.values.get(i).unwrap_or(&Value::Null);
                 let vb = b.values.get(i).unwrap_or(&Value::Null);
-                let cmp = crate::sql::expr::compare_values(va, vb)?;
+                let cmp = crate::sql::expr::compare_values(va, vb).unwrap_or(0);
                 if cmp != 0 {
                     return Ok(if cmp > 0 {
                         std::cmp::Ordering::Greater
