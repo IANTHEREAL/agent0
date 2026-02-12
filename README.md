@@ -414,6 +414,119 @@ Notable integration workloads:
 | Types | UUID, INTERVAL, TIMESTAMP, JSONB, ENUM |
 | Compatibility | COPY protocol, pg_restore, Extended Query, ORMs |
 
+## db9 CLI
+
+`db9` is the customer-facing CLI for managing databases on pg-tikv. It handles account registration, database lifecycle, SQL execution, schema inspection, migrations, and more.
+
+### Install
+
+```bash
+cd cloud-admin-portal/backend
+cargo build --release
+# Binary: target/release/db9
+```
+
+### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DB9_API_URL` | `http://localhost:8090/api` | API endpoint (or use `--api-url`) |
+
+Credentials are stored in `~/.db9/credentials` after login.
+
+### Quick Start
+
+```bash
+# 1. Register and login
+db9 register
+db9 login
+
+# 2. Create a database
+db9 db create --name myapp
+# → Database ID: x9y8z7w6v5u4
+# → Admin password: aB3kL9mP2xQr
+# → Connection: psql -h 127.0.0.1 -p 5433 -U x9y8z7w6v5u4.admin
+
+# 3. Run SQL
+db9 db sql x9y8z7w6v5u4 -q "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)"
+db9 db sql x9y8z7w6v5u4 -q "SELECT * FROM users"
+
+# 4. Inspect performance
+db9 db inspect x9y8z7w6v5u4 tables
+db9 db inspect x9y8z7w6v5u4 slow-queries
+
+# 5. Dump schema
+db9 db dump x9y8z7w6v5u4 --ddl-only
+```
+
+### Command Reference
+
+```
+db9
+├── register                          # Create account
+├── login                             # Login (stores token in ~/.db9/)
+├── logout                            # Remove stored credentials
+├── db
+│   ├── create --name <name>          # Create database
+│   ├── list                          # List databases
+│   ├── status <id>                   # Database details
+│   ├── delete <id>                   # Delete database
+│   ├── reset-password <id>           # Reset admin password
+│   ├── connect <id>                  # Show connection string
+│   ├── sql <id> -q <sql> | -f <file># Execute SQL
+│   ├── seed <id> <file>              # Run seed SQL file
+│   ├── dump <id> [--ddl-only]        # Export schema/data as SQL
+│   ├── users <id> list|create|delete # Manage database users
+│   ├── inspect <id> <subcommand>     # Observability (see below)
+│   └── branch create|list|delete     # Database branching
+├── gen types <id> --lang ts|python   # Generate type definitions
+├── migration
+│   ├── new <name>                    # Create migration file
+│   ├── list                          # List local migrations
+│   ├── up <id>                       # Apply pending migrations
+│   └── status <id>                   # Show applied vs pending
+├── token list|revoke                 # API token management
+└── completion bash|zsh|fish          # Shell completions
+```
+
+#### Inspect Subcommands
+
+```bash
+db9 db inspect <id>              # Summary dashboard (TPS, latency, connections)
+db9 db inspect <id> queries      # Query samples with latency stats
+db9 db inspect <id> report       # Combined summary + queries
+db9 db inspect <id> schemas      # List schemas
+db9 db inspect <id> tables       # List tables with row counts
+db9 db inspect <id> indexes      # List indexes
+db9 db inspect <id> slow-queries # Slow queries sorted by p99 latency
+```
+
+### Examples
+
+```bash
+# Run SQL from file
+db9 db sql x9y8z7w6v5u4 -f ./init.sql
+
+# Generate TypeScript types from schema
+db9 gen types x9y8z7w6v5u4 --lang typescript --schema public
+
+# Create and apply migrations
+db9 migration new add_users_table
+# → Created: migrations/20260212_add_users_table.sql
+# Edit the file, then apply:
+db9 migration up x9y8z7w6v5u4
+
+# Branch a database (schema copy for dev/test)
+db9 db branch create x9y8z7w6v5u4 --name feature-auth
+db9 db branch list x9y8z7w6v5u4
+
+# Output as JSON (for scripting)
+db9 --json db list
+db9 --output csv db list
+```
+
+Use `db9 --help` or `db9 <command> --help` for full option details.
+
 ## Admin Portal
 
 A web-based admin portal is available for managing multi-tenant deployments:
