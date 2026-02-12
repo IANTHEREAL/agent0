@@ -2642,4 +2642,61 @@ ORDER BY qs_o.id;
             "inner-scope `a` should not be qualified: {qualified_sql}"
         );
     }
+
+    #[test]
+    fn test_setop_arm_shadowing_prevents_substitution() {
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        // UNION query: left arm shadows `t_outer` in its FROM.
+        let sql = "SELECT 1 FROM some_table AS t_outer WHERE t_outer.id = 5 UNION SELECT 2";
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
+            panic!("expected query");
+        };
+
+        let outer_schema = make_schema(&["id"]);
+        let outer_row = Row::new(vec![Value::Int32(77)]);
+
+        let substituted =
+            substitute_outer_values_in_query(query, "t_outer", &outer_schema, &outer_row);
+        let out_sql = substituted.to_string();
+
+        // Left arm WHERE keeps `t_outer.id` (inner alias), no literal 77 inserted.
+        assert!(
+            out_sql.contains("t_outer.id"),
+            "shadowed t_outer.id should not be substituted: {out_sql}"
+        );
+        assert!(
+            !out_sql.contains("77"),
+            "literal 77 should not appear (shadowed): {out_sql}"
+        );
+    }
+
+    #[test]
+    fn test_setop_arm_without_shadow_allows_substitution() {
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        // UNION query: left arm does NOT shadow `t_outer`.
+        let sql =
+            "SELECT t_outer.id FROM other_table WHERE t_outer.id = 5 UNION SELECT 2";
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
+            panic!("expected query");
+        };
+
+        let outer_schema = make_schema(&["id"]);
+        let outer_row = Row::new(vec![Value::Int32(77)]);
+
+        let substituted =
+            substitute_outer_values_in_query(query, "t_outer", &outer_schema, &outer_row);
+        let out_sql = substituted.to_string();
+
+        // Left arm does NOT shadow t_outer, so substitution should happen.
+        assert!(
+            out_sql.contains("77"),
+            "non-shadowed t_outer.id should be substituted: {out_sql}"
+        );
+    }
 }
