@@ -286,6 +286,7 @@ fn build_output_schema(
                 .as_ref()
                 .and_then(|cts| cts.get(i))
                 .cloned()
+                // INTENTIONAL: no RETURNS clause — default to Text (PG-compatible)
                 .unwrap_or(DataType::Text);
             ColumnDef {
                 name: name.clone(),

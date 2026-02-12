@@ -18,6 +18,35 @@ use std::str::FromStr;
 
 use super::numeric;
 
+/// Sort with fallible comparison. Propagates the first comparison error.
+/// After the first error, remaining comparisons short-circuit to Equal
+/// and the partially-sorted result is discarded.
+///
+/// Rust's `slice::sort_by` always terminates even when the comparator
+/// returns Equal for error pairs.
+pub fn sort_by_fallible<T>(
+    items: &mut [T],
+    mut cmp: impl FnMut(&T, &T) -> Result<std::cmp::Ordering>,
+) -> Result<()> {
+    let mut first_error: Option<anyhow::Error> = None;
+    items.sort_by(|a, b| {
+        if first_error.is_some() {
+            return std::cmp::Ordering::Equal;
+        }
+        match cmp(a, b) {
+            Ok(ord) => ord,
+            Err(e) => {
+                first_error = Some(e);
+                std::cmp::Ordering::Equal
+            }
+        }
+    });
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
 /// Evaluate a binary operator on two values.
 pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<Value> {
     match op {
@@ -184,7 +213,7 @@ pub fn eval_binary_op(left: Value, op: &BinaryOperator, right: Value) -> Result<
             (Value::Array(l), Value::Array(r)) => {
                 for lv in l {
                     for rv in r {
-                        if compare_values(lv, rv).unwrap_or(1) == 0 {
+                        if compare_values(lv, rv)? == 0 {
                             return Ok(Value::Boolean(true));
                         }
                     }
@@ -936,37 +965,37 @@ pub fn compare_order_by_values(
     right: &Value,
     asc: bool,
     nulls_first: bool,
-) -> std::cmp::Ordering {
+) -> Result<std::cmp::Ordering> {
     match (left, right) {
-        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, Value::Null) => Ok(std::cmp::Ordering::Equal),
         (Value::Null, _) => {
             if nulls_first {
-                std::cmp::Ordering::Less
+                Ok(std::cmp::Ordering::Less)
             } else {
-                std::cmp::Ordering::Greater
+                Ok(std::cmp::Ordering::Greater)
             }
         }
         (_, Value::Null) => {
             if nulls_first {
-                std::cmp::Ordering::Greater
+                Ok(std::cmp::Ordering::Greater)
             } else {
-                std::cmp::Ordering::Less
+                Ok(std::cmp::Ordering::Less)
             }
         }
         _ => {
-            let cmp = compare_values(left, right).unwrap_or(0);
+            let cmp = compare_values(left, right)?;
             if cmp == 0 {
-                std::cmp::Ordering::Equal
+                Ok(std::cmp::Ordering::Equal)
             } else if asc {
                 if cmp > 0 {
-                    std::cmp::Ordering::Greater
+                    Ok(std::cmp::Ordering::Greater)
                 } else {
-                    std::cmp::Ordering::Less
+                    Ok(std::cmp::Ordering::Less)
                 }
             } else if cmp > 0 {
-                std::cmp::Ordering::Less
+                Ok(std::cmp::Ordering::Less)
             } else {
-                std::cmp::Ordering::Greater
+                Ok(std::cmp::Ordering::Greater)
             }
         }
     }

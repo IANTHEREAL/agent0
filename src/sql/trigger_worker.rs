@@ -341,7 +341,12 @@ impl TriggerWorker {
 
     async fn process_keyspace(&self, pool: &Arc<TikvClientPool>, keyspace: &str) -> Result<()> {
         let quota = self.get_quota(keyspace);
-        let store = pool.get_client(Some(keyspace.to_string())).await?;
+        // Use pool.acquire() so the tenant stays active during processing
+        // (prevents reaper from evicting mid-work) and gives us cache access.
+        let handle = pool.acquire(Some(keyspace.to_string())).await?;
+        let store = handle.store().clone();
+        let trigger_cache = handle.trigger_cache().clone();
+        let stats_cache = handle.stats_cache().clone();
 
         // Claim a fair batch (bounded per keyspace).
         let mut txn = store.begin().await?;
@@ -377,6 +382,8 @@ impl TriggerWorker {
             store.clone(),
             keyspace.to_string(),
             observability::registry().tenant(keyspace),
+            trigger_cache,
+            stats_cache,
         );
 
         for event in events {

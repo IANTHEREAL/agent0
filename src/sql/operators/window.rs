@@ -10,6 +10,7 @@ use async_trait::async_trait;
 use sqlparser::ast::{Expr, OrderByExpr, WindowFrame, WindowFrameBound, WindowFrameUnits};
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::sql::expr::operators::sort_by_fallible;
 use crate::sql::expr::{compare_order_by_values, eval_expr};
 use crate::sql::pg_numeric::pg_numeric_div;
 use crate::sql::value_key::serialize_values_for_key;
@@ -58,7 +59,7 @@ fn order_by_values_are_peers(
     prev_values: &[Value],
     current_values: &[Value],
     order_by: &[OrderByExpr],
-) -> bool {
+) -> Result<bool> {
     debug_assert_eq!(prev_values.len(), order_by.len());
     debug_assert_eq!(current_values.len(), order_by.len());
 
@@ -69,14 +70,14 @@ fn order_by_values_are_peers(
         let asc = order_expr.asc.unwrap_or(true);
         let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
         if !matches!(
-            compare_order_by_values(prev_value, current_value, asc, nulls_first),
+            compare_order_by_values(prev_value, current_value, asc, nulls_first)?,
             std::cmp::Ordering::Equal
         ) {
-            return false;
+            return Ok(false);
         }
     }
 
-    true
+    Ok(true)
 }
 
 impl WindowOperator {
@@ -177,20 +178,20 @@ impl WindowOperator {
                         order_key_map.insert(row_idx, keys);
                     }
 
-                    row_indices.sort_by(|&a, &b| {
+                    sort_by_fallible(&mut row_indices, |&a, &b| {
                         let keys_a = &order_key_map[&a];
                         let keys_b = &order_key_map[&b];
                         for (i, order_expr) in wf.order_by.iter().enumerate() {
                             let asc = order_expr.asc.unwrap_or(true);
                             let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
                             let ord =
-                                compare_order_by_values(&keys_a[i], &keys_b[i], asc, nulls_first);
+                                compare_order_by_values(&keys_a[i], &keys_b[i], asc, nulls_first)?;
                             if !matches!(ord, std::cmp::Ordering::Equal) {
-                                return ord;
+                                return Ok(ord);
                             }
                         }
-                        std::cmp::Ordering::Equal
-                    });
+                        Ok(std::cmp::Ordering::Equal)
+                    })?;
                 }
 
                 // Compute peer groups for RANGE/GROUPS frame mode support
@@ -442,7 +443,7 @@ impl WindowOperator {
                 .map(|o| eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema)))
                 .collect::<Result<Vec<Value>>>()?;
             if let Some(prev) = &prev_values {
-                if !order_by_values_are_peers(prev, &current_values, &wf.order_by) {
+                if !order_by_values_are_peers(prev, &current_values, &wf.order_by)? {
                     groups.push((group_start, pos));
                     group_start = pos;
                 }

@@ -42,7 +42,7 @@ impl Executor {
             .collect::<Result<Vec<_>>>()?;
 
         let (mut window_funcs, window_sig_to_column) =
-            Executor::extract_window_function_exprs(&rewritten_projection, &join_schema);
+            Executor::extract_window_function_exprs(&rewritten_projection, &join_schema)?;
 
         for wf in &mut window_funcs {
             wf.partition_by = wf

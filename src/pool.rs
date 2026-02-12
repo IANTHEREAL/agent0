@@ -1,3 +1,5 @@
+use crate::sql::stats::TableStatsCache;
+use crate::sql::triggers::TriggerBodyCache;
 use crate::storage::TikvStore;
 use anyhow::{anyhow, Result};
 use std::collections::HashMap;
@@ -30,6 +32,8 @@ pub(crate) struct TenantEntry {
     /// Zero means there are active connections or it was never idle.
     last_idle_at: AtomicU64,
     keyspace: String,
+    trigger_cache: Arc<TriggerBodyCache>,
+    stats_cache: Arc<TableStatsCache>,
 }
 
 impl TenantEntry {
@@ -39,6 +43,8 @@ impl TenantEntry {
             active_connections: AtomicU32::new(0),
             last_idle_at: AtomicU64::new(0),
             keyspace,
+            trigger_cache: Arc::new(TriggerBodyCache::new()),
+            stats_cache: Arc::new(TableStatsCache::new()),
         }
     }
 
@@ -64,6 +70,14 @@ pub struct TenantHandle {
 impl TenantHandle {
     pub fn store(&self) -> &Arc<TikvStore> {
         &self.entry.store
+    }
+
+    pub fn trigger_cache(&self) -> &Arc<TriggerBodyCache> {
+        &self.entry.trigger_cache
+    }
+
+    pub fn stats_cache(&self) -> &Arc<TableStatsCache> {
+        &self.entry.stats_cache
     }
 }
 
@@ -360,6 +374,8 @@ mod tests {
             active_connections: AtomicU32::new(0),
             last_idle_at: AtomicU64::new(0),
             keyspace: keyspace.to_string(),
+            trigger_cache: Arc::new(TriggerBodyCache::new()),
+            stats_cache: Arc::new(TableStatsCache::new()),
         })
     }
 

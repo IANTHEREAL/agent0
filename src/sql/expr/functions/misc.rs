@@ -21,7 +21,7 @@ pub fn coalesce(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn nullif(args: Vec<Value>) -> Result<Value> {
-    if args.len() >= 2 && crate::sql::expr::compare_values(&args[0], &args[1]).unwrap_or(1) == 0 {
+    if args.len() >= 2 && crate::sql::expr::compare_values(&args[0], &args[1])? == 0 {
         Ok(Value::Null)
     } else {
         Ok(args.into_iter().next().unwrap_or(Value::Null))
@@ -33,7 +33,7 @@ pub fn greatest(args: Vec<Value>) -> Result<Value> {
     for val in args {
         if matches!(max, Value::Null) {
             max = val;
-        } else if crate::sql::expr::compare_values(&val, &max).unwrap_or(0) > 0 {
+        } else if crate::sql::expr::compare_values(&val, &max)? > 0 {
             max = val;
         }
     }
@@ -45,7 +45,7 @@ pub fn least(args: Vec<Value>) -> Result<Value> {
     for val in args {
         if matches!(min, Value::Null) {
             min = val;
-        } else if crate::sql::expr::compare_values(&val, &min).unwrap_or(0) < 0 {
+        } else if crate::sql::expr::compare_values(&val, &min)? < 0 {
             min = val;
         }
     }

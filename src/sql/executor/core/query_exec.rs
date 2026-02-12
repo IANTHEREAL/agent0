@@ -221,7 +221,15 @@ impl Executor {
                 Value::Int64(n) => n as f64,
                 Value::Float64(f) => f,
                 Value::Numeric(d) => d.to_f64().unwrap_or(0.0),
-                Value::Text(s) => s.parse::<f64>().unwrap_or(0.0),
+                Value::Text(s) => s.parse::<f64>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "{}",
+                        crate::sql::error::SqlError::InvalidInputSyntax {
+                            type_name: "double precision".into(),
+                            value: s.clone(),
+                        }
+                    )
+                })?,
                 _ => 0.0,
             }
             .max(0.0);
@@ -824,15 +832,8 @@ impl Executor {
         };
 
         let empty_schema = TableSchema::default();
-        let mut column_types: Vec<DataType> = rows
-            .first()
-            .map(|row| {
-                row.values
-                    .iter()
-                    .map(|v| v.data_type().unwrap_or(DataType::Text))
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![DataType::Text; cols.len()]);
+        let mut column_types: Vec<DataType> =
+            crate::types::infer_column_types_from_rows(&rows, cols.len());
 
         // Refine timestamp-typed values that are actually `timestamptz` per SQL semantics.
         for (idx, item) in select.projection.iter().enumerate() {
@@ -843,7 +844,10 @@ impl Executor {
                 SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
                 _ => continue,
             };
-            if matches!(infer_expr_type(expr, &empty_schema), DataType::TimestampTz) {
+            if matches!(
+                infer_expr_type(expr, &empty_schema),
+                Ok(DataType::TimestampTz)
+            ) {
                 column_types[idx] = DataType::TimestampTz;
             }
         }

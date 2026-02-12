@@ -5,7 +5,7 @@ mod context;
 mod evaluator;
 pub mod functions;
 mod numeric;
-mod operators;
+pub(crate) mod operators;
 
 pub(crate) use boolean::{coerce_text_literal_to_bool, validate_bool_expr_in_boolean_context};
 pub use context::EvalContext;
@@ -257,7 +257,15 @@ pub fn eval_expr_with_query_ctx(
 #[inline(never)]
 fn parse_interval_from_expr(s: &str, interval: &sqlparser::ast::Interval) -> Result<Value> {
     if let Some(field) = &interval.leading_field {
-        let num: i64 = s.trim().parse().unwrap_or(0);
+        let num: i64 = s.trim().parse().map_err(|_| {
+            anyhow::anyhow!(
+                "{}",
+                SqlError::InvalidInputSyntax {
+                    type_name: "integer".into(),
+                    value: s.trim().to_string(),
+                }
+            )
+        })?;
         return interval_from_field(num, field);
     }
     parse_interval_string(s)
@@ -498,35 +506,7 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
     }
 
     match func_name_upper.as_str() {
-        "NULLIF" => {
-            if args.len() >= 2 && compare_values(&args[0], &args[1]).unwrap_or(1) == 0 {
-                Ok(Value::Null)
-            } else {
-                Ok(args.into_iter().next().unwrap_or(Value::Null))
-            }
-        }
-        "GREATEST" => {
-            let mut max = Value::Null;
-            for val in args {
-                if matches!(max, Value::Null) {
-                    max = val;
-                } else if compare_values(&val, &max).unwrap_or(0) > 0 {
-                    max = val;
-                }
-            }
-            Ok(max)
-        }
-        "LEAST" => {
-            let mut min = Value::Null;
-            for val in args {
-                if matches!(min, Value::Null) {
-                    min = val;
-                } else if compare_values(&val, &min).unwrap_or(0) < 0 {
-                    min = val;
-                }
-            }
-            Ok(min)
-        }
+        // NULLIF, GREATEST, LEAST are handled by the registry (functions/misc.rs)
         // String functions UPPER, LOWER, LENGTH, CHAR_LENGTH, CHARACTER_LENGTH, OCTET_LENGTH, BIT_LENGTH
         // are handled by the registry (functions/string.rs)
         "GET_BIT" => eval_get_bit_from_args(args),
@@ -612,10 +592,26 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                 if !digits.is_empty() {
                     if matches!(chars.peek(), Some('$')) {
                         chars.next();
-                        let pos = digits.parse::<usize>().unwrap_or(1);
+                        let pos = digits.parse::<usize>().map_err(|_| {
+                            anyhow!(
+                                "{}",
+                                SqlError::InvalidInputSyntax {
+                                    type_name: "integer".into(),
+                                    value: digits.clone(),
+                                }
+                            )
+                        })?;
                         arg_pos = Some(pos.saturating_sub(1));
                     } else {
-                        width = Some(digits.parse::<usize>().unwrap_or(0));
+                        width = Some(digits.parse::<usize>().map_err(|_| {
+                            anyhow!(
+                                "{}",
+                                SqlError::InvalidInputSyntax {
+                                    type_name: "integer".into(),
+                                    value: digits.clone(),
+                                }
+                            )
+                        })?);
                     }
                 }
 
@@ -636,7 +632,15 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                         }
                     }
                     if !width_digits.is_empty() {
-                        width = Some(width_digits.parse::<usize>().unwrap_or(0));
+                        width = Some(width_digits.parse::<usize>().map_err(|_| {
+                            anyhow!(
+                                "{}",
+                                SqlError::InvalidInputSyntax {
+                                    type_name: "integer".into(),
+                                    value: width_digits.clone(),
+                                }
+                            )
+                        })?);
                     }
                 }
 
@@ -878,7 +882,15 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
             let oid = match iter.next().unwrap_or(Value::Null) {
                 Value::Int32(n) => n as i64,
                 Value::Int64(n) => n,
-                Value::Text(s) => s.trim().parse::<i64>().unwrap_or(0),
+                Value::Text(s) => s.trim().parse::<i64>().map_err(|_| {
+                    anyhow!(
+                        "{}",
+                        SqlError::InvalidInputSyntax {
+                            type_name: "oid".into(),
+                            value: s.trim().to_string(),
+                        }
+                    )
+                })?,
                 Value::Null => return Ok(Value::Null),
                 _ => 0,
             };
@@ -1176,7 +1188,7 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
     // --- Phase 2: normalise the SqlType to internal DataType via the single
     //     source of truth in mapping.rs, then dispatch on (Value, DataType). ---
 
-    let target = crate::sql::types::try_sql_datatype_to_internal(data_type)?;
+    let target = crate::sql::types::sql_datatype_to_internal_strict(data_type)?;
     cast_value_to_type(val, &target)
 }
 
@@ -1886,7 +1898,7 @@ pub fn compare_order_by_values(
     right: &Value,
     asc: bool,
     nulls_first: bool,
-) -> std::cmp::Ordering {
+) -> anyhow::Result<std::cmp::Ordering> {
     operators::compare_order_by_values(left, right, asc, nulls_first)
 }
 
@@ -1908,10 +1920,14 @@ pub(super) fn eval_json_access(
                     return Err(anyhow!("@> on arrays requires array operand on right"));
                 };
                 for r in right_arr {
-                    if !left_arr
-                        .iter()
-                        .any(|l| compare_values(l, r).unwrap_or(1) == 0)
-                    {
+                    let mut found = false;
+                    for l in left_arr.iter() {
+                        if compare_values(l, r)? == 0 {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
                         return Ok(Value::Boolean(false));
                     }
                 }
@@ -1922,10 +1938,14 @@ pub(super) fn eval_json_access(
                     return Err(anyhow!("<@ on arrays requires array operand on right"));
                 };
                 for l in left_arr {
-                    if !right_arr
-                        .iter()
-                        .any(|r| compare_values(l, r).unwrap_or(1) == 0)
-                    {
+                    let mut found = false;
+                    for r in right_arr.iter() {
+                        if compare_values(l, r)? == 0 {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
                         return Ok(Value::Boolean(false));
                     }
                 }

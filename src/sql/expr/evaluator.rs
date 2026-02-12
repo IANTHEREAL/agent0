@@ -39,7 +39,7 @@ fn try_infer_expr_type_for_validation<C: EvalContext>(ctx: &C, expr: &Expr) -> R
 
     let empty_schema = TableSchema::default();
     let schema = ctx.schema().unwrap_or(&empty_schema);
-    crate::sql::types::try_infer_expr_type(expr, schema)
+    crate::sql::types::infer_expr_type(expr, schema)
         .map_err(|e| crate::sql::error::SqlError::from(e).into())
 }
 
@@ -178,7 +178,7 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(
             None => {
                 let empty_schema = TableSchema::default();
                 let schema = ctx.schema().unwrap_or(&empty_schema);
-                match crate::sql::types::try_infer_expr_type(expr, schema) {
+                match crate::sql::types::infer_expr_type(expr, schema) {
                     Ok(DataType::Boolean) => Ok(()),
                     Err(e) => Err(crate::sql::error::SqlError::from(e).into()),
                     _ => Err(anyhow!(err_msg)),
@@ -331,7 +331,7 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(
         other => {
             let empty_schema = TableSchema::default();
             let schema = ctx.schema().unwrap_or(&empty_schema);
-            match crate::sql::types::try_infer_expr_type(other, schema) {
+            match crate::sql::types::infer_expr_type(other, schema) {
                 Ok(DataType::Boolean) => Ok(()),
                 Err(e) => Err(crate::sql::error::SqlError::from(e).into()),
                 _ => Err(anyhow!(err_msg)),
@@ -544,7 +544,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                     has_null = true;
                     continue;
                 }
-                if compare_values(&val, &item_val).unwrap_or(1) == 0 {
+                if compare_values(&val, &item_val)? == 0 {
                     found = true;
                     break;
                 }
@@ -572,8 +572,8 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             {
                 return Ok(Value::Null);
             }
-            let ge_low = compare_values(&val, &low_val).unwrap_or(-1) >= 0;
-            let le_high = compare_values(&val, &high_val).unwrap_or(1) <= 0;
+            let ge_low = compare_values(&val, &low_val)? >= 0;
+            let le_high = compare_values(&val, &high_val)? <= 0;
             let in_range = ge_low && le_high;
             Ok(Value::Boolean(if *negated { !in_range } else { in_range }))
         }
@@ -653,7 +653,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                     if matches!(cond_val, Value::Null) {
                         continue;
                     }
-                    if compare_values(&op_val, &cond_val).unwrap_or(1) == 0 {
+                    if compare_values(&op_val, &cond_val)? == 0 {
                         return eval_expr_impl(ctx, &results[i]);
                     }
                 }
@@ -1108,7 +1108,7 @@ fn eval_json_access_with_context<C: EvalContext>(
         let mut found = false;
         for item in list {
             let item_val = eval_expr_impl(ctx, item)?;
-            if super::compare_values(&json_result, &item_val).unwrap_or(1) == 0 {
+            if super::compare_values(&json_result, &item_val)? == 0 {
                 found = true;
                 break;
             }

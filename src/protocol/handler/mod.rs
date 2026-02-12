@@ -1189,6 +1189,7 @@ fn infer_values_output_columns(values: &Values) -> Option<Vec<InferredColumn>> {
             .enumerate()
             .map(|(idx, expr)| InferredColumn {
                 name: format!("column{}", idx + 1),
+                // INTENTIONAL: wire protocol encoding — Text OID is universally safe
                 data_type: inferrer.infer(expr).unwrap_or(DataType::Text),
             })
             .collect(),
@@ -1499,12 +1500,14 @@ async fn infer_select_output_columns_with_txn(
             SelectItem::UnnamedExpr(expr) => {
                 out_cols.push(InferredColumn {
                     name: select_item_output_name(item),
+                    // INTENTIONAL: wire protocol encoding — Text OID is universally safe
                     data_type: inferrer.infer(expr).unwrap_or(DataType::Text),
                 });
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 out_cols.push(InferredColumn {
                     name: alias.value.clone(),
+                    // INTENTIONAL: wire protocol encoding — Text OID is universally safe
                     data_type: inferrer.infer(expr).unwrap_or(DataType::Text),
                 });
             }

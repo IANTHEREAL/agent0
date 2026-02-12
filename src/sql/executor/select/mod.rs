@@ -140,7 +140,7 @@ impl Executor {
             {
                 let mut rows = rows;
                 if !query.order_by.is_empty() {
-                    rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns);
+                    rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns)?;
                 }
                 rows = apply_offset_limit_fetch(rows, query);
                 return Ok(ExecuteResult::Select {
@@ -204,7 +204,7 @@ impl Executor {
             let mut rows = rows;
 
             if !query.order_by.is_empty() {
-                rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns);
+                rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns)?;
             }
             rows = apply_offset_limit_fetch(rows, query);
 
@@ -686,7 +686,10 @@ impl Executor {
 
         if has_for_update || has_for_share {
             let planner = PhysicalPlanner::new(search_path.to_vec());
-            let estimated_rows = 1000;
+            let estimated_rows = self
+                .stats_cache()
+                .get_estimate(db_id, schema.table_id)
+                .unwrap_or(1000);
 
             if has_skip_locked {
                 // SKIP LOCKED: scan all matching rows in ORDER BY order (no

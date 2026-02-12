@@ -16,13 +16,16 @@ enum UnknownCustomMode {
     UserDefined,
 }
 
-pub(crate) fn try_sql_datatype_to_internal(sql_type: &SqlDataType) -> Result<DataType> {
+/// Strict type mapping used by DDL — validates numeric precision/scale,
+/// and treats unknown custom types as Text for backwards compatibility.
+pub(crate) fn sql_datatype_to_internal_strict(sql_type: &SqlDataType) -> Result<DataType> {
     sql_datatype_to_internal_impl(sql_type, UnknownCustomMode::Text, true)
 }
 
-pub(crate) fn sql_datatype_to_internal(sql_type: &SqlDataType) -> DataType {
+/// Type mapping used by type inference — preserves user-defined type names
+/// and skips numeric validation (inference context, not DDL).
+pub(crate) fn sql_datatype_to_internal(sql_type: &SqlDataType) -> Result<DataType> {
     sql_datatype_to_internal_impl(sql_type, UnknownCustomMode::UserDefined, false)
-        .unwrap_or(DataType::Text)
 }
 
 fn sql_datatype_to_internal_impl(
