@@ -1,0 +1,13 @@
+index|idx_export_test_child_parent
+materialized_view|public.export_test_mv
+sequence|public.export_test_seq
+table|public.export_test_child
+table|public.export_test_main
+type|public.export_test_status
+view|public.export_test_view
+CREATE TABLE public.export_test_main
+NOT NULL
+PRIMARY KEY
+UNIQUE
+DEFAULT
+CHECK

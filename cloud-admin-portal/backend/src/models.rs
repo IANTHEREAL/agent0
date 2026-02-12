@@ -21,7 +21,7 @@ pub struct TenantUpdateRequest {
 }
 
 #[derive(Deserialize)]
-pub struct CreateUserRequest {
+pub struct AdminCreateUserRequest {
     pub username: String,
     pub password: Option<String>,
     pub superuser: Option<bool>,
@@ -30,6 +30,18 @@ pub struct CreateUserRequest {
 #[derive(Deserialize)]
 pub struct SqlQueryRequest {
     pub sql: String,
+}
+
+#[derive(Deserialize)]
+pub struct SqlExecuteRequest {
+    pub query: Option<String>,
+    pub file_content: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct CreateUserRequest {
+    pub username: String,
+    pub password: String,
 }
 
 #[derive(Deserialize)]
@@ -181,6 +193,13 @@ pub struct PasswordResetResponse {
 }
 
 #[derive(Serialize)]
+pub struct CustomerPasswordResetResponse {
+    pub admin_user: String,
+    pub admin_password: String,
+    pub connection_string: String,
+}
+
+#[derive(Serialize)]
 pub struct MessageResponse {
     pub message: String,
 }
@@ -198,6 +217,21 @@ pub struct SqlQueryResponse {
     pub result: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct ColumnInfo {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub data_type: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct SqlResult {
+    pub columns: Vec<ColumnInfo>,
+    pub rows: Vec<Vec<serde_json::Value>>,
+    pub row_count: usize,
+    pub command: String,
 }
 
 #[derive(Serialize)]
@@ -284,4 +318,151 @@ pub struct CredentialRow {
     pub credential_type: String,
     pub username: String,
     pub password_plain: String,
+}
+
+// ── Customer types ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct RegisterRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Deserialize)]
+pub struct LoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Deserialize)]
+pub struct CreateDatabaseRequest {
+    pub name: String,
+    pub region: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct DumpRequest {
+    #[serde(default)]
+    pub ddl_only: bool,
+}
+
+#[derive(Deserialize)]
+pub struct MigrationApplyRequest {
+    pub name: String,
+    pub sql: String,
+    pub checksum: String,
+}
+
+#[derive(Deserialize)]
+pub struct BranchRequest {
+    pub name: String,
+}
+
+#[derive(Serialize)]
+pub struct CustomerResponse {
+    pub id: String,
+    pub email: String,
+    pub created_at: String,
+    pub status: String,
+}
+
+#[derive(Serialize)]
+pub struct LoginResponse {
+    pub token: String,
+    pub expires_at: String,
+}
+
+#[derive(Serialize)]
+pub struct DatabaseResponse {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoints: Option<Vec<Endpoint>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admin_password: Option<String>,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connection_string: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct TokenResponse {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DumpResponse {
+    pub sql: String,
+    pub object_count: usize,
+}
+
+#[derive(Serialize)]
+pub struct SchemaResponse {
+    pub tables: Vec<TableMetadata>,
+    pub views: Vec<ViewMetadata>,
+}
+
+#[derive(Serialize)]
+pub struct TableMetadata {
+    pub name: String,
+    pub schema: String,
+    pub columns: Vec<ColumnMetadata>,
+}
+
+#[derive(Serialize)]
+pub struct ColumnMetadata {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub data_type: String,
+    pub nullable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ViewMetadata {
+    pub name: String,
+    pub schema: String,
+}
+
+#[derive(Serialize)]
+pub struct MigrationApplyResponse {
+    pub status: String,
+    pub name: String,
+}
+
+#[derive(Serialize)]
+pub struct MigrationMetadata {
+    pub name: String,
+    pub checksum: String,
+    pub applied_at: String,
+    pub sql_preview: String,
+}
+
+// ── Customer DB row types ───────────────────────────────────────
+
+pub struct CustomerRow {
+    pub id: String,
+    pub email: String,
+    pub password_hash: String,
+    pub created_at: String,
+    pub status: String,
+}
+
+pub struct CustomerTokenRow {
+    pub id: String,
+    pub customer_id: String,
+    pub token_hash: String,
+    pub name: String,
+    pub expires_at: Option<String>,
+    pub created_at: String,
 }

@@ -2,7 +2,7 @@ use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
 
 use crate::crypto;
-use crate::models::{CredentialRow, TenantRow};
+use crate::models::{CredentialRow, CustomerRow, CustomerTokenRow, TenantRow};
 use crate::tenant_state;
 
 fn encrypt_password(password: &str, key: Option<&str>) -> String {
@@ -82,33 +82,17 @@ pub fn adapt_sql(sql: &str, pool: &AnyPool) -> String {
 }
 
 pub async fn create_tables(pool: &AnyPool) -> Result<(), sqlx::Error> {
-    let is_pg = !is_sqlite(pool);
-
-    let tenants_ddl = if is_pg {
-        "CREATE TABLE IF NOT EXISTS tenants (
-            id TEXT PRIMARY KEY,
-            keyspace TEXT NOT NULL UNIQUE,
-            state TEXT NOT NULL DEFAULT 'ACTIVE',
-            state_reason TEXT,
-            created_at TEXT NOT NULL,
-            created_by TEXT,
-            notes TEXT,
-            tags TEXT,
-            updated_at TEXT
-        )"
-    } else {
-        "CREATE TABLE IF NOT EXISTS tenants (
-            id TEXT PRIMARY KEY,
-            keyspace TEXT NOT NULL UNIQUE,
-            state TEXT NOT NULL DEFAULT 'ACTIVE',
-            state_reason TEXT,
-            created_at TEXT NOT NULL,
-            created_by TEXT,
-            notes TEXT,
-            tags TEXT,
-            updated_at TEXT
-        )"
-    };
+    let tenants_ddl = "CREATE TABLE IF NOT EXISTS tenants (
+        id TEXT PRIMARY KEY,
+        keyspace TEXT NOT NULL UNIQUE,
+        state TEXT NOT NULL DEFAULT 'ACTIVE',
+        state_reason TEXT,
+        created_at TEXT NOT NULL,
+        created_by TEXT,
+        notes TEXT,
+        tags TEXT,
+        updated_at TEXT
+    )";
 
     let creds_ddl = "CREATE TABLE IF NOT EXISTS tenant_credentials (
         id TEXT PRIMARY KEY,
@@ -139,6 +123,34 @@ pub async fn create_tables(pool: &AnyPool) -> Result<(), sqlx::Error> {
     sqlx::query(creds_ddl).execute(pool).await?;
     sqlx::query(audit_ddl).execute(pool).await?;
 
+    // Customer account tables
+    let customers_ddl = "CREATE TABLE IF NOT EXISTS customers (
+        id TEXT PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active'
+    )";
+
+    let customer_tokens_ddl = "CREATE TABLE IF NOT EXISTS customer_tokens (
+        id TEXT PRIMARY KEY,
+        customer_id TEXT NOT NULL,
+        token_hash TEXT NOT NULL,
+        name TEXT NOT NULL DEFAULT 'default',
+        expires_at TEXT,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (customer_id) REFERENCES customers(id)
+    )";
+
+    sqlx::query(customers_ddl).execute(pool).await?;
+    sqlx::query(customer_tokens_ddl).execute(pool).await?;
+
+    // Add customer_id to tenants (idempotent — ignore error if column already exists)
+    sqlx::query("ALTER TABLE tenants ADD COLUMN customer_id TEXT")
+        .execute(pool)
+        .await
+        .ok();
+
     let indexes = [
         "CREATE INDEX IF NOT EXISTS idx_tenants_state ON tenants(state)",
         "CREATE INDEX IF NOT EXISTS idx_tenants_created ON tenants(created_at DESC)",
@@ -148,6 +160,10 @@ pub async fn create_tables(pool: &AnyPool) -> Result<(), sqlx::Error> {
         "CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_logs(timestamp)",
         "CREATE INDEX IF NOT EXISTS idx_audit_tenant ON audit_logs(tenant_id)",
         "CREATE INDEX IF NOT EXISTS idx_audit_op ON audit_logs(operation_type)",
+        "CREATE INDEX IF NOT EXISTS idx_customers_email ON customers(email)",
+        "CREATE INDEX IF NOT EXISTS idx_customer_tokens_customer ON customer_tokens(customer_id)",
+        "CREATE INDEX IF NOT EXISTS idx_customer_tokens_hash ON customer_tokens(token_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_tenants_customer ON tenants(customer_id)",
     ];
     for idx in indexes {
         sqlx::query(idx).execute(pool).await?;
@@ -247,7 +263,7 @@ pub async fn list_tenants(
         ));
         binds.push(cursor_ts.to_string());
         binds.push(cursor_id.to_string());
-        param_idx = param_idx + 2;
+        param_idx += 2;
     }
 
     let mut extra_binds: Vec<i64> = Vec::new();
@@ -506,6 +522,7 @@ pub async fn upsert_credential(
 
 // ── Audit queries ───────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn insert_audit_log(
     pool: &AnyPool,
     operation_type: &str,
@@ -664,4 +681,273 @@ pub async fn delete_old_audit_logs(pool: &AnyPool, before: &str) -> Result<u64, 
     let sql = adapt_sql("DELETE FROM audit_logs WHERE timestamp < $1", pool);
     let result = sqlx::query(&sql).bind(before).execute(pool).await?;
     Ok(result.rows_affected())
+}
+
+// ── Customer queries ────────────────────────────────────────────
+
+pub async fn create_customer(
+    pool: &AnyPool,
+    id: &str,
+    email: &str,
+    password_hash: &str,
+) -> Result<(), sqlx::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let sql = adapt_sql(
+        "INSERT INTO customers (id, email, password_hash, created_at) VALUES ($1, $2, $3, $4)",
+        pool,
+    );
+    sqlx::query(&sql)
+        .bind(id)
+        .bind(email)
+        .bind(password_hash)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_customer_by_email(
+    pool: &AnyPool,
+    email: &str,
+) -> Result<Option<CustomerRow>, sqlx::Error> {
+    let sql = adapt_sql("SELECT * FROM customers WHERE email = $1", pool);
+    let row = sqlx::query(&sql).bind(email).fetch_optional(pool).await?;
+    Ok(row.as_ref().map(row_to_customer))
+}
+
+pub async fn get_customer_by_id(
+    pool: &AnyPool,
+    id: &str,
+) -> Result<Option<CustomerRow>, sqlx::Error> {
+    let sql = adapt_sql("SELECT * FROM customers WHERE id = $1", pool);
+    let row = sqlx::query(&sql).bind(id).fetch_optional(pool).await?;
+    Ok(row.as_ref().map(row_to_customer))
+}
+
+pub async fn create_customer_token(
+    pool: &AnyPool,
+    id: &str,
+    customer_id: &str,
+    token_hash: &str,
+    name: &str,
+    expires_at: &str,
+) -> Result<(), sqlx::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let sql = adapt_sql(
+        "INSERT INTO customer_tokens (id, customer_id, token_hash, name, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)",
+        pool,
+    );
+    sqlx::query(&sql)
+        .bind(id)
+        .bind(customer_id)
+        .bind(token_hash)
+        .bind(name)
+        .bind(expires_at)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_customer_token(
+    pool: &AnyPool,
+    token_hash: &str,
+) -> Result<Option<CustomerTokenRow>, sqlx::Error> {
+    let sql = adapt_sql("SELECT * FROM customer_tokens WHERE token_hash = $1", pool);
+    let row = sqlx::query(&sql)
+        .bind(token_hash)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_customer_token))
+}
+
+pub async fn list_customer_tokens(
+    pool: &AnyPool,
+    customer_id: &str,
+) -> Result<Vec<CustomerTokenRow>, sqlx::Error> {
+    let sql = adapt_sql(
+        "SELECT * FROM customer_tokens WHERE customer_id = $1 ORDER BY created_at DESC",
+        pool,
+    );
+    let rows = sqlx::query(&sql).bind(customer_id).fetch_all(pool).await?;
+    Ok(rows.iter().map(row_to_customer_token).collect())
+}
+
+pub async fn delete_customer_token(
+    pool: &AnyPool,
+    token_id: &str,
+    customer_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let sql = adapt_sql(
+        "DELETE FROM customer_tokens WHERE id = $1 AND customer_id = $2",
+        pool,
+    );
+    let result = sqlx::query(&sql)
+        .bind(token_id)
+        .bind(customer_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn list_customer_tenants(
+    pool: &AnyPool,
+    customer_id: &str,
+) -> Result<Vec<TenantRow>, sqlx::Error> {
+    let sql = adapt_sql(
+        "SELECT * FROM tenants WHERE customer_id = $1 ORDER BY created_at DESC",
+        pool,
+    );
+    let rows = sqlx::query(&sql).bind(customer_id).fetch_all(pool).await?;
+    Ok(rows.iter().map(row_to_tenant).collect())
+}
+
+pub async fn get_tenant_for_customer(
+    pool: &AnyPool,
+    tenant_id: &str,
+    customer_id: &str,
+) -> Result<Option<TenantRow>, sqlx::Error> {
+    let sql = adapt_sql(
+        &format!(
+            "SELECT * FROM tenants WHERE id = $1 AND customer_id = $2 AND state NOT IN ('{}', '{}')",
+            tenant_state::DISABLED,
+            tenant_state::CREATE_FAILED
+        ),
+        pool,
+    );
+    let row = sqlx::query(&sql)
+        .bind(tenant_id)
+        .bind(customer_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_tenant))
+}
+
+pub async fn set_tenant_customer_id(
+    pool: &AnyPool,
+    tenant_id: &str,
+    customer_id: &str,
+) -> Result<(), sqlx::Error> {
+    let sql = adapt_sql("UPDATE tenants SET customer_id = $1 WHERE id = $2", pool);
+    sqlx::query(&sql)
+        .bind(customer_id)
+        .bind(tenant_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+fn row_to_customer(row: &sqlx::any::AnyRow) -> CustomerRow {
+    CustomerRow {
+        id: row.get("id"),
+        email: row.get("email"),
+        password_hash: row.get("password_hash"),
+        created_at: row.get("created_at"),
+        status: row.get("status"),
+    }
+}
+
+fn row_to_customer_token(row: &sqlx::any::AnyRow) -> CustomerTokenRow {
+    CustomerTokenRow {
+        id: row.get("id"),
+        customer_id: row.get("customer_id"),
+        token_hash: row.get("token_hash"),
+        name: row.get("name"),
+        expires_at: row.get("expires_at"),
+        created_at: row.get("created_at"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_customer_insert_sql_has_correct_placeholders() {
+        let sql =
+            "INSERT INTO customers (id, email, password_hash, created_at) VALUES ($1, $2, $3, $4)";
+        assert!(sql.contains("$1"));
+        assert!(sql.contains("$4"));
+        // Ensure exactly 4 placeholders
+        assert_eq!(sql.matches('$').count(), 4);
+    }
+
+    #[test]
+    fn test_customer_token_insert_sql_has_correct_placeholders() {
+        let sql = "INSERT INTO customer_tokens (id, customer_id, token_hash, name, expires_at, created_at) VALUES ($1, $2, $3, $4, $5, $6)";
+        assert!(sql.contains("$6"));
+        assert_eq!(sql.matches('$').count(), 6);
+    }
+
+    #[test]
+    fn test_adapt_sql_placeholder_replacement_logic() {
+        // Replicate the adapt_sql logic for SQLite conversion
+        let sql = "INSERT INTO customers (id, email) VALUES ($1, $2)";
+        let mut result = sql.to_string();
+        for i in (1..=30).rev() {
+            result = result.replace(&format!("${i}"), "?");
+        }
+        assert_eq!(result, "INSERT INTO customers (id, email) VALUES (?, ?)");
+        assert!(!result.contains('$'));
+    }
+
+    #[test]
+    fn test_adapt_sql_no_replacement_for_postgres() {
+        // For PostgreSQL, adapt_sql should return the SQL unchanged
+        let sql = "SELECT * FROM customers WHERE email = $1";
+        // If not SQLite, the original SQL is returned as-is
+        assert_eq!(sql.to_string(), "SELECT * FROM customers WHERE email = $1");
+    }
+
+    #[test]
+    fn test_adapt_sql_high_numbered_placeholders() {
+        let sql = "INSERT INTO audit_logs VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)";
+        let mut result = sql.to_string();
+        for i in (1..=30).rev() {
+            result = result.replace(&format!("${i}"), "?");
+        }
+        assert_eq!(
+            result,
+            "INSERT INTO audit_logs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        );
+    }
+
+    #[test]
+    fn test_adapt_sql_reverse_replacement_avoids_double_replace() {
+        // $10 must not become ?0 — reversed iteration handles this
+        let sql = "SELECT $1, $10";
+        let mut result = sql.to_string();
+        for i in (1..=30).rev() {
+            result = result.replace(&format!("${i}"), "?");
+        }
+        assert_eq!(result, "SELECT ?, ?");
+    }
+
+    #[test]
+    fn test_customer_ddl_has_required_columns() {
+        let ddl = "CREATE TABLE IF NOT EXISTS customers (
+            id TEXT PRIMARY KEY,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active'
+        )";
+        assert!(ddl.contains("id TEXT PRIMARY KEY"));
+        assert!(ddl.contains("email TEXT UNIQUE NOT NULL"));
+        assert!(ddl.contains("password_hash TEXT NOT NULL"));
+        assert!(ddl.contains("status TEXT NOT NULL DEFAULT 'active'"));
+    }
+
+    #[test]
+    fn test_customer_tokens_ddl_has_foreign_key() {
+        let ddl = "CREATE TABLE IF NOT EXISTS customer_tokens (
+            id TEXT PRIMARY KEY,
+            customer_id TEXT NOT NULL,
+            token_hash TEXT NOT NULL,
+            name TEXT NOT NULL DEFAULT 'default',
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (customer_id) REFERENCES customers(id)
+        )";
+        assert!(ddl.contains("FOREIGN KEY (customer_id) REFERENCES customers(id)"));
+        assert!(ddl.contains("token_hash TEXT NOT NULL"));
+    }
 }

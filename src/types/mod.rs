@@ -478,6 +478,15 @@ impl DatabaseDef {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationRecord {
+    pub name: String,
+    pub applied_at: String,
+    pub checksum: String,
+    #[serde(default)]
+    pub sql_preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ForeignKeyConstraint {
     pub name: String,
     pub columns: Vec<String>,

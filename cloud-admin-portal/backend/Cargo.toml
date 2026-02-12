@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "pgtikv-ctl"
 path = "src/cli.rs"
 
+[[bin]]
+name = "db9"
+path = "src/db9.rs"
+
 [dependencies]
 axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
@@ -18,6 +22,7 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "any", "sqlite", "postgre
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
+clap_complete = "4"
 tower-http = { version = "0.5", features = ["cors"] }
 reqwest = { version = "0.12", features = ["json"] }
 tokio-postgres = "0.7"
@@ -28,6 +33,11 @@ rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
 aes-gcm = "0.10"
 base64 = "0.22"
+argon2 = "0.5"
+sha2 = "0.10"
+toml = "0.8"
+rpassword = "7"
+dirs = "5"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }

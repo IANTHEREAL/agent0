@@ -212,6 +212,10 @@ impl Executor {
                             .await?;
                         return Ok(Some((alias_str, schema, Some(rows))));
                     }
+                    if tbl_upper == "_PGTIKV_SYS_RECORD_MIGRATION" {
+                        let (schema, rows) = self.execute_record_migration(txn, func_args).await?;
+                        return Ok(Some((alias_str, schema, Some(rows))));
+                    }
                     if let Some(result) = self
                         .try_execute_extension_table_function(
                             txn,

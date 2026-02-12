@@ -2,6 +2,7 @@
 //!
 //! Extracted from join.rs during Phase 2 refactoring (B.2a).
 
+use super::super::ddl_export;
 use super::super::information_schema::VirtualTableFilter;
 use super::super::names;
 use super::super::names::normalize_ident;
@@ -9,8 +10,9 @@ use super::super::{parse_sql, ExecuteResult};
 use super::core::Executor;
 use crate::sql::error::SqlError;
 use crate::sql::query_context::QueryContext;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::types::{ColumnDef, DataType, MigrationRecord, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
+use chrono::Utc;
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Ident, Query, Statement};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -312,6 +314,129 @@ impl Executor {
                         Value::Float64(g.latency_p99_ms),
                         Value::Float64(g.latency_max_ms),
                         Value::Int64(i64::try_from(g.last_seen_ms_ago).unwrap_or(i64::MAX)),
+                    ])
+                })
+                .collect();
+            return Ok((schema, rows));
+        }
+        if t_upper == "_PGTIKV_SYS_EXPORT_DDL" || t_upper.ends_with("._PGTIKV_SYS_EXPORT_DDL") {
+            let exported = ddl_export::export_all_ddl(self.store().as_ref(), txn, db_id).await?;
+            let schema = TableSchema {
+                table_id: 0,
+                name: table_name.to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "object_type".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "object_name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "ddl_sql".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                ],
+                pk_constraint_name: None,
+                pk_indices: vec![],
+                indexes: vec![],
+                version: 1,
+                check_constraints: vec![],
+                foreign_keys: vec![],
+                owner: String::new(),
+                from_alias: None,
+            };
+
+            let rows = exported
+                .into_iter()
+                .map(|entry| {
+                    Row::new(vec![
+                        Value::Text(entry.object_type),
+                        Value::Text(entry.object_name),
+                        Value::Text(entry.ddl_sql),
+                    ])
+                })
+                .collect();
+            return Ok((schema, rows));
+        }
+
+        if t_upper == "_PGTIKV_SYS_MIGRATIONS" || t_upper.ends_with("._PGTIKV_SYS_MIGRATIONS") {
+            let migrations = self.store().list_migrations(txn).await?;
+            let schema = TableSchema {
+                table_id: 0,
+                name: table_name.to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "applied_at".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "checksum".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "sql_preview".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                ],
+                pk_constraint_name: None,
+                pk_indices: vec![],
+                indexes: vec![],
+                version: 1,
+                check_constraints: vec![],
+                foreign_keys: vec![],
+                owner: String::new(),
+                from_alias: None,
+            };
+
+            let rows = migrations
+                .into_iter()
+                .map(|entry| {
+                    Row::new(vec![
+                        Value::Text(entry.name),
+                        Value::Text(entry.applied_at),
+                        Value::Text(entry.checksum),
+                        Value::Text(entry.sql_preview),
                     ])
                 })
                 .collect();
@@ -905,6 +1030,113 @@ impl Executor {
         };
 
         let rows: Vec<Row> = values.into_iter().map(|v| Row::new(vec![v])).collect();
+        Ok((schema, rows))
+    }
+
+    pub(crate) async fn execute_record_migration(
+        &self,
+        txn: &mut Transaction,
+        args: &[FunctionArg],
+    ) -> Result<(TableSchema, Vec<Row>)> {
+        use super::super::expr::eval_expr;
+        use crate::sql::query_context::QueryContext;
+
+        fn extract_expr(arg: &FunctionArg) -> Result<&Expr> {
+            match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+                _ => Err(anyhow!(
+                    "_pgtikv_sys_record_migration requires expression arguments"
+                )),
+            }
+        }
+
+        if args.len() != 3 {
+            return Err(anyhow!(
+                "_pgtikv_sys_record_migration requires exactly 3 arguments"
+            ));
+        }
+
+        let query_ctx = QueryContext::from_task_locals();
+
+        let name = match eval_expr(extract_expr(&args[0])?, None, None, &query_ctx)? {
+            Value::Text(v) => v,
+            _ => {
+                return Err(anyhow!("_pgtikv_sys_record_migration name must be TEXT"));
+            }
+        };
+        let checksum = match eval_expr(extract_expr(&args[1])?, None, None, &query_ctx)? {
+            Value::Text(v) => v,
+            _ => {
+                return Err(anyhow!(
+                    "_pgtikv_sys_record_migration checksum must be TEXT"
+                ));
+            }
+        };
+        let sql_preview = match eval_expr(extract_expr(&args[2])?, None, None, &query_ctx)? {
+            Value::Text(v) => v,
+            _ => {
+                return Err(anyhow!(
+                    "_pgtikv_sys_record_migration sql_preview must be TEXT"
+                ));
+            }
+        };
+
+        let applied_at = Utc::now().to_rfc3339();
+        let record = MigrationRecord {
+            name: name.clone(),
+            applied_at: applied_at.clone(),
+            checksum,
+            sql_preview,
+        };
+        self.store().record_migration(txn, record).await?;
+
+        let schema = TableSchema {
+            table_id: 0,
+            name: "_pgtikv_sys_record_migration".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "applied_at".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "status".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            version: 1,
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+            from_alias: None,
+        };
+
+        let rows = vec![Row::new(vec![
+            Value::Text(name),
+            Value::Text(applied_at),
+            Value::Text("recorded".to_string()),
+        ])];
         Ok((schema, rows))
     }
 
