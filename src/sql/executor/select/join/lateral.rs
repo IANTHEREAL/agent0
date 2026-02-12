@@ -164,6 +164,7 @@ impl Executor {
                         &outer_alias,
                         &outer_schema,
                         &outer_row,
+                        None,
                     );
 
                     let result = self
