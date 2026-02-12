@@ -174,39 +174,3 @@ pub(crate) fn extract_dependencies(sql: &str) -> Result<HashSet<RelationDep>> {
     Ok(binder.deps)
 }
 
-/// Check whether `view_sql` references any of the fully-qualified names in
-/// `targets`.
-///
-/// Drop-in replacement for the old `view_references_any()` in `ddl.rs`.
-/// Cross-schema unqualified deps are a known limitation until a proper
-/// dependency catalog is implemented (see #666).
-pub(crate) fn view_references_any(view_sql: &str, view_schema: &str, targets: &[String]) -> bool {
-    let deps = match extract_dependencies(view_sql) {
-        Ok(d) => d,
-        Err(_) => return false,
-    };
-    deps.iter().any(|dep| {
-        targets
-            .iter()
-            .any(|t| dep_matches_target(dep, t, view_schema))
-    })
-}
-
-/// Check whether a single dependency matches a single target.
-fn dep_matches_target(dep: &RelationDep, target: &str, view_schema: &str) -> bool {
-    let (target_schema, target_name) = target.split_once('.').unwrap_or(("public", target));
-    match dep {
-        RelationDep::Qualified { schema, name } => schema == target_schema && name == target_name,
-        RelationDep::Unqualified { name } => {
-            if name != target_name {
-                return false;
-            }
-            // Without a dependency catalog (pg_depend), we cannot resolve
-            // unqualified names across schemas — the creation-time search_path
-            // is lost.  Conservative: only match the view's own schema.
-            // Cross-schema unqualified deps are a known limitation until a
-            // proper dependency catalog is implemented (see #666).
-            target_schema == view_schema || target_schema == "public"
-        }
-    }
-}

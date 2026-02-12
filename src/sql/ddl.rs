@@ -1260,6 +1260,51 @@ pub async fn execute_create_index(
     })
 }
 
+/// Resolve raw `RelationDep`s into fully-qualified dependency names.
+///
+/// - `Qualified { schema, name }` → `"{schema}.{name}"` directly.
+/// - `Unqualified { name }` → search each schema in `search_path` order,
+///   checking tables, views, and materialized views.  First hit wins.
+///   Fallback: `"{view_schema}.{name}"`.
+async fn resolve_view_deps(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    view_schema: &str,
+    search_path: &[String],
+    raw_deps: std::collections::HashSet<super::binder::RelationDep>,
+) -> Result<Vec<String>> {
+    use super::binder::RelationDep;
+    let mut resolved = Vec::with_capacity(raw_deps.len());
+    for dep in raw_deps {
+        match dep {
+            RelationDep::Qualified { schema, name } => {
+                resolved.push(format!("{}.{}", schema, name));
+            }
+            RelationDep::Unqualified { name } => {
+                let mut found = false;
+                for schema in search_path {
+                    let full = format!("{}.{}", schema, name);
+                    if store.table_exists(txn, db_id, &full).await?
+                        || store.get_view(txn, db_id, &full).await?.is_some()
+                        || store.get_materialized_view(txn, db_id, &full).await?.is_some()
+                    {
+                        resolved.push(full);
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    resolved.push(format!("{}.{}", view_schema, name));
+                }
+            }
+        }
+    }
+    resolved.sort();
+    resolved.dedup();
+    Ok(resolved)
+}
+
 pub async fn execute_create_view(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -1276,8 +1321,12 @@ pub async fn execute_create_view(
     let view_name = resolved.full;
 
     let query_str = query.to_string();
+    let deps = match super::binder::extract_dependencies(&query_str) {
+        Ok(raw) => resolve_view_deps(store, txn, db_id, &resolved.schema, search_path, raw).await?,
+        Err(_) => Vec::new(),
+    };
     store
-        .create_view(txn, db_id, &view_name, &query_str, or_replace)
+        .create_view(txn, db_id, &view_name, &query_str, deps, or_replace)
         .await?;
 
     Ok(ExecuteResult::CreateView { view_name })
@@ -1370,8 +1419,12 @@ pub async fn execute_create_materialized_view(
     }
 
     let query_str = query.to_string();
+    let deps = match super::binder::extract_dependencies(&query_str) {
+        Ok(raw) => resolve_view_deps(store, txn, db_id, &resolved.schema, search_path, raw).await?,
+        Err(_) => Vec::new(),
+    };
     store
-        .create_materialized_view(txn, db_id, &view_name, &query_str)
+        .create_materialized_view(txn, db_id, &view_name, &query_str, deps)
         .await?;
 
     let row_count = rows.len();
@@ -1529,14 +1582,6 @@ pub async fn execute_drop_table(
     Ok(ExecuteResult::DropTable { table_name: last })
 }
 
-/// Compare a parsed relation reference against a fully-qualified target
-/// name (e.g. `"public.orders"`).
-///
-// `relation_matches`, `view_references_any`, and `ScopeAwareChecker` have been
-// replaced by the scope-chain binder in `src/sql/binder/`.
-// See binder::view_references_any() for the replacement.
-// Fixes: #643, #644, #653, #654.
-
 /// Check whether `name` (possibly unqualified) resolves to any entry in
 /// `dropped` (a set of fully-qualified names).  Tries all schemas in the
 /// search path for unqualified names.
@@ -1569,14 +1614,13 @@ fn was_cascade_dropped(
     }
 }
 
-/// Drop all views and materialized views whose SQL definition references
-/// `target_name`, then transitively drop anything that depended on the
-/// dropped objects.
+/// Drop all views and materialized views that depend on `target_name`,
+/// then transitively drop anything that depended on the dropped objects.
 ///
-/// Uses sqlparser's `visit_relations` to extract actual table/view references
-/// from each view's parsed query, then compares names with proper schema
-/// qualification.  Iterates until a fixed point so transitive chains
-/// (table → v1 → mv1 → v2) are fully resolved.
+/// Uses the `deps` field stored in each ViewDef / MatViewDef to determine
+/// dependencies — no SQL re-parsing needed at drop time.  Iterates until
+/// a fixed point so transitive chains (table → v1 → mv1 → v2) are fully
+/// resolved.
 ///
 /// The root `target_name` is never dropped here — the caller is responsible
 /// for dropping it.  This prevents cycles (e.g. v1 ↔ v2) from removing
@@ -1603,11 +1647,10 @@ async fn drop_dependent_views(
         let views = store.list_views(txn, db_id).await?;
         for view in &views {
             let full = view.full_name();
-            // Never drop the root target — the caller handles that.
             if full == target_name {
                 continue;
             }
-            if super::binder::view_references_any(&view.query, &view.schema, &pending) {
+            if pending.iter().any(|p| view.deps.contains(p)) {
                 store.drop_view(txn, db_id, &full).await?;
                 dropped.insert(full.clone());
                 next_pending.push(full);
@@ -1615,26 +1658,23 @@ async fn drop_dependent_views(
         }
 
         // --- materialized views ---
-        let matview_names = store.list_materialized_views(txn, db_id).await?;
-        for mv_name in &matview_names {
-            // Never drop the root target.
-            if mv_name == target_name {
+        let matviews = store.list_materialized_views(txn, db_id).await?;
+        for mv in &matviews {
+            let full = mv.full_name();
+            if full == target_name {
                 continue;
             }
-            if let Some(query) = store.get_materialized_view(txn, db_id, mv_name).await? {
-                let mv_schema = mv_name.split_once('.').map(|(s, _)| s).unwrap_or("public");
-                if super::binder::view_references_any(&query, mv_schema, &pending) {
-                    store.drop_materialized_view(txn, db_id, mv_name).await?;
-                    for trigger in store.list_triggers_for_table(txn, db_id, mv_name).await? {
-                        let _ = store
-                            .drop_trigger(txn, db_id, mv_name, &trigger.name)
-                            .await?;
-                    }
-                    drop_owned_sequences_for_table(store, txn, db_id, mv_name).await?;
-                    store.drop_table(txn, db_id, mv_name).await?;
-                    dropped.insert(mv_name.clone());
-                    next_pending.push(mv_name.clone());
+            if pending.iter().any(|p| mv.deps.contains(p)) {
+                store.drop_materialized_view(txn, db_id, &full).await?;
+                for trigger in store.list_triggers_for_table(txn, db_id, &full).await? {
+                    let _ = store
+                        .drop_trigger(txn, db_id, &full, &trigger.name)
+                        .await?;
                 }
+                drop_owned_sequences_for_table(store, txn, db_id, &full).await?;
+                store.drop_table(txn, db_id, &full).await?;
+                dropped.insert(full.clone());
+                next_pending.push(full);
             }
         }
 

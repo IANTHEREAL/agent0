@@ -344,8 +344,10 @@ impl TikvStore {
         }
 
         for matview in self.list_materialized_views(txn, db_id).await? {
-            if matview.starts_with(&schema_prefix) {
-                let _ = self.drop_materialized_view(txn, db_id, &matview).await?;
+            if matview.schema == schema {
+                let _ = self
+                    .drop_materialized_view(txn, db_id, &matview.full_name())
+                    .await?;
             }
         }
 
