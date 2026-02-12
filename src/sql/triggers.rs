@@ -49,6 +49,15 @@ impl TriggerBodyCache {
         self.inner.insert(key, compiled.clone());
         Ok(compiled)
     }
+
+    /// Remove all compiled trigger bodies for a database.
+    ///
+    /// Called on DDL that changes function definitions (CREATE OR REPLACE
+    /// FUNCTION, DROP FUNCTION). Invalidation is coarse-grained by db_id
+    /// because DDL is rare and entries are cheap to recompile on next use.
+    pub(crate) fn invalidate_db(&self, db_id: u64) {
+        self.inner.retain(|&(did, _), _| did != db_id);
+    }
 }
 
 impl CompiledTriggerBody {
@@ -704,5 +713,60 @@ mod tests {
         };
         assert_eq!(a_expr, "1");
         assert_eq!(b_expr, "50");
+    }
+
+    #[test]
+    fn test_invalidate_db_clears_stale_entries() {
+        // Simulates CREATE OR REPLACE FUNCTION: same (db_id, func_oid),
+        // DDL invalidates, next call recompiles with new body.
+        let cache = TriggerBodyCache::new();
+        let db_id = 1u64;
+        let oid = 10u32;
+
+        let body_v1 = "BEGIN\n  NEW.x := 1;\n  RETURN NEW;\nEND;";
+        let body_v2 = "BEGIN\n  NEW.x := 42;\n  RETURN NEW;\nEND;";
+
+        // Populate cache with v1
+        let v1 = cache.get_or_compile(db_id, oid, body_v1).unwrap();
+        let v1_expr = match &v1.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(v1_expr, "1");
+
+        // Without invalidation, cache returns stale v1
+        let stale = cache.get_or_compile(db_id, oid, body_v2).unwrap();
+        let stale_expr = match &stale.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(stale_expr, "1"); // stale!
+
+        // DDL invalidation clears entries for this db
+        cache.invalidate_db(db_id);
+
+        // Now the cache miss forces recompilation with v2
+        let v2 = cache.get_or_compile(db_id, oid, body_v2).unwrap();
+        let v2_expr = match &v2.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(v2_expr, "42");
+    }
+
+    #[test]
+    fn test_invalidate_db_does_not_affect_other_dbs() {
+        let cache = TriggerBodyCache::new();
+        let body = "BEGIN\n  NEW.x := 1;\n  RETURN NEW;\nEND;";
+
+        cache.get_or_compile(1, 10, body).unwrap();
+        cache.get_or_compile(2, 10, body).unwrap();
+
+        cache.invalidate_db(1);
+
+        // db_id=1 entry is gone (cache miss → recompile)
+        assert!(cache.inner.get(&(1u64, 10u32)).is_none());
+        // db_id=2 entry is still present
+        assert!(cache.inner.get(&(2u64, 10u32)).is_some());
     }
 }

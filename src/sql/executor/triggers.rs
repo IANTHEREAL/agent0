@@ -644,6 +644,7 @@ impl Executor {
 
             if or_replace {
                 self.store().replace_function(txn, db_id, def).await?;
+                self.trigger_cache().invalidate_db(db_id);
             } else {
                 self.store().create_function(txn, db_id, def).await?;
             }
@@ -688,6 +689,7 @@ impl Executor {
                 .expect("Transaction must be active");
 
             let mut last_name = None;
+            let mut any_dropped = false;
             for name in names {
                 let resolved = names::resolve_existing_function_name(
                     self.store().as_ref(),
@@ -709,6 +711,11 @@ impl Executor {
                 if !dropped && !if_exists {
                     return Err(anyhow!("Function '{}' does not exist", func_full_name));
                 }
+                any_dropped |= dropped;
+            }
+
+            if any_dropped {
+                self.trigger_cache().invalidate_db(db_id);
             }
 
             Ok(ExecuteResult::DropFunction {
