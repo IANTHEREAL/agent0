@@ -1714,6 +1714,325 @@ fn gen_python(tables: &[&Value]) -> String {
     out
 }
 
+struct LocalMigration {
+    filename: String,
+    name: String,
+    timestamp: String,
+    path: std::path::PathBuf,
+}
+
+fn scan_migration_files(dir: &str) -> Vec<LocalMigration> {
+    let dir_path = std::path::Path::new(dir);
+    if !dir_path.exists() {
+        return Vec::new();
+    }
+
+    let entries = std::fs::read_dir(dir_path).unwrap_or_else(|e| {
+        eprintln!("Failed to read directory '{dir}': {e}");
+        process::exit(1);
+    });
+
+    let mut migrations: Vec<LocalMigration> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let filename = entry.file_name().to_string_lossy().to_string();
+            if !filename.ends_with(".sql") {
+                return None;
+            }
+            let stem = filename.trim_end_matches(".sql");
+            let underscore_pos = stem.find('_')?;
+            let timestamp = stem[..underscore_pos].to_string();
+            if timestamp.len() != 14 || !timestamp.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            Some(LocalMigration {
+                filename: filename.clone(),
+                name: stem.to_string(),
+                timestamp,
+                path: entry.path(),
+            })
+        })
+        .collect();
+
+    migrations.sort_by(|a, b| a.filename.cmp(&b.filename));
+    migrations
+}
+
+fn format_migration_timestamp(ts: &str) -> String {
+    if ts.len() == 14 {
+        format!(
+            "{}-{}-{} {}:{}:{}",
+            &ts[0..4],
+            &ts[4..6],
+            &ts[6..8],
+            &ts[8..10],
+            &ts[10..12],
+            &ts[12..14]
+        )
+    } else {
+        ts.to_string()
+    }
+}
+
+fn cmd_migration_new(name: &str, dir: &str, output: &OutputFormat) {
+    std::fs::create_dir_all(dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create directory '{dir}': {e}");
+        process::exit(1);
+    });
+
+    let now = chrono::Utc::now();
+    let timestamp = now.format("%Y%m%d%H%M%S").to_string();
+    let safe_name: String = name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let filename = format!("{timestamp}_{safe_name}.sql");
+    let filepath = std::path::Path::new(dir).join(&filename);
+
+    let header = format!(
+        "-- Migration: {safe_name}\n-- Created: {}\n\n",
+        now.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    std::fs::write(&filepath, &header).unwrap_or_else(|e| {
+        eprintln!("Failed to create migration file: {e}");
+        process::exit(1);
+    });
+
+    match output {
+        OutputFormat::Json => {
+            print_json(&serde_json::json!({
+                "name": safe_name,
+                "filename": filename,
+                "path": filepath.to_string_lossy(),
+            }));
+        }
+        _ => {
+            println!("Created migration: {}", filepath.display());
+        }
+    }
+}
+
+fn cmd_migration_list(dir: &str, output: &OutputFormat) {
+    let migrations = scan_migration_files(dir);
+
+    if migrations.is_empty() {
+        match output {
+            OutputFormat::Json => print_json(&serde_json::json!([])),
+            _ => println!("No migration files found in '{dir}'."),
+        }
+        return;
+    }
+
+    match output {
+        OutputFormat::Json => {
+            let items: Vec<Value> = migrations
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "name": m.name,
+                        "created": format_migration_timestamp(&m.timestamp),
+                        "filename": m.filename,
+                    })
+                })
+                .collect();
+            print_json(&Value::Array(items));
+        }
+        OutputFormat::Csv => {
+            let items: Vec<Value> = migrations
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "name": m.name,
+                        "created": format_migration_timestamp(&m.timestamp),
+                    })
+                })
+                .collect();
+            print_csv(&items, &[("NAME", "name", 40), ("CREATED", "created", 20)]);
+        }
+        OutputFormat::Table => {
+            let items: Vec<Value> = migrations
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "name": m.name,
+                        "created": format_migration_timestamp(&m.timestamp),
+                    })
+                })
+                .collect();
+            print_table(&items, &[("NAME", "name", 40), ("CREATED", "created", 20)]);
+        }
+    }
+}
+
+async fn cmd_migration_up(api: &ApiClient, id: &str, dir: &str, output: &OutputFormat) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let local = scan_migration_files(dir);
+    if local.is_empty() {
+        match output {
+            OutputFormat::Json => {
+                print_json(&serde_json::json!({ "applied": 0, "up_to_date": 0 }));
+            }
+            _ => println!("No migration files found in '{dir}'."),
+        }
+        return;
+    }
+
+    let remote_data = api
+        .request(
+            "GET",
+            &format!("/customer/databases/{id}/migrations"),
+            None,
+            Some(&headers),
+        )
+        .await;
+
+    let applied_names: std::collections::HashSet<String> = remote_data
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|m| m["name"].as_str().map(|s| s.to_string()))
+        .collect();
+
+    let mut applied_count = 0u32;
+    let mut up_to_date_count = 0u32;
+
+    for m in &local {
+        if applied_names.contains(&m.name) {
+            up_to_date_count += 1;
+            if !matches!(output, OutputFormat::Json) {
+                println!("Applying: {} ... ALREADY APPLIED", m.filename);
+            }
+            continue;
+        }
+
+        let content = std::fs::read_to_string(&m.path).unwrap_or_else(|e| {
+            eprintln!("Failed to read '{}': {e}", m.path.display());
+            process::exit(1);
+        });
+
+        use sha2::{Digest, Sha256};
+        let hash = Sha256::digest(content.as_bytes());
+        let checksum: String = hash.iter().map(|b| format!("{b:02x}")).collect();
+
+        let body = serde_json::json!({
+            "name": m.name,
+            "sql": content,
+            "checksum": checksum,
+        });
+
+        let result = api
+            .request(
+                "POST",
+                &format!("/customer/databases/{id}/migrations"),
+                Some(&body),
+                Some(&headers),
+            )
+            .await;
+
+        let status = result["status"].as_str().unwrap_or("unknown");
+        if status == "already_applied" {
+            up_to_date_count += 1;
+            if !matches!(output, OutputFormat::Json) {
+                println!("Applying: {} ... ALREADY APPLIED", m.filename);
+            }
+        } else {
+            applied_count += 1;
+            if !matches!(output, OutputFormat::Json) {
+                println!("Applying: {} ... OK", m.filename);
+            }
+        }
+    }
+
+    match output {
+        OutputFormat::Json => {
+            print_json(&serde_json::json!({
+                "applied": applied_count,
+                "up_to_date": up_to_date_count,
+            }));
+        }
+        _ => {
+            println!(
+                "\nApplied {applied_count} migration(s). {up_to_date_count} already up-to-date."
+            );
+        }
+    }
+}
+
+async fn cmd_migration_status(api: &ApiClient, id: &str, dir: &str, output: &OutputFormat) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let local = scan_migration_files(dir);
+
+    let remote_data = api
+        .request(
+            "GET",
+            &format!("/customer/databases/{id}/migrations"),
+            None,
+            Some(&headers),
+        )
+        .await;
+
+    let applied_map: HashMap<String, String> = remote_data
+        .as_array()
+        .unwrap_or(&vec![])
+        .iter()
+        .filter_map(|m| {
+            let name = m["name"].as_str()?.to_string();
+            let applied_at = m["applied_at"].as_str().unwrap_or("-").to_string();
+            Some((name, applied_at))
+        })
+        .collect();
+
+    if local.is_empty() && applied_map.is_empty() {
+        match output {
+            OutputFormat::Json => print_json(&serde_json::json!([])),
+            _ => println!("No migrations found."),
+        }
+        return;
+    }
+
+    match output {
+        OutputFormat::Json => {
+            let items: Vec<Value> = local
+                .iter()
+                .map(|m| {
+                    let (status, applied_at) = if let Some(at) = applied_map.get(&m.name) {
+                        ("applied", at.as_str())
+                    } else {
+                        ("pending", "")
+                    };
+                    serde_json::json!({
+                        "name": m.name,
+                        "status": status,
+                        "applied_at": applied_at,
+                    })
+                })
+                .collect();
+            print_json(&Value::Array(items));
+        }
+        _ => {
+            println!("{:<40} {:<10} APPLIED AT", "NAME", "STATUS");
+            println!("{}", "\u{2500}".repeat(72));
+            for m in &local {
+                if let Some(at) = applied_map.get(&m.name) {
+                    println!("{:<40} \u{2713} applied  {at}", m.name);
+                } else {
+                    println!("{:<40} \u{25CB} pending", m.name);
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
