@@ -171,6 +171,86 @@ fn has_unresolvable_from(from: &[sqlparser::ast::TableWithJoins]) -> bool {
     false
 }
 
+/// Check whether a `TableFactor` exposes a name (alias or bare table name)
+/// that matches `outer_alias`.  Shared by both detection and substitution.
+fn table_factor_shadows_alias(factor: &sqlparser::ast::TableFactor, outer_alias: &str) -> bool {
+    fn exposed_name_for_object(name: &sqlparser::ast::ObjectName) -> Option<String> {
+        name.0.last().map(normalize_ident)
+    }
+
+    match factor {
+        sqlparser::ast::TableFactor::Table { name, alias, .. } => {
+            // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
+            let exposed = alias
+                .as_ref()
+                .map(|a| normalize_ident(&a.name))
+                .or_else(|| exposed_name_for_object(name))
+                .unwrap_or_default();
+            exposed.eq_ignore_ascii_case(outer_alias)
+        }
+        sqlparser::ast::TableFactor::Derived { alias, .. } => alias
+            .as_ref()
+            .map(|a| normalize_ident(&a.name))
+            .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
+        sqlparser::ast::TableFactor::Function { name, alias, .. } => {
+            // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
+            let exposed = alias
+                .as_ref()
+                .map(|a| normalize_ident(&a.name))
+                .or_else(|| exposed_name_for_object(name))
+                .unwrap_or_default();
+            exposed.eq_ignore_ascii_case(outer_alias)
+        }
+        sqlparser::ast::TableFactor::UNNEST { alias, .. } => alias
+            .as_ref()
+            .map(|a| normalize_ident(&a.name))
+            .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
+        sqlparser::ast::TableFactor::TableFunction { alias, .. } => alias
+            .as_ref()
+            .map(|a| normalize_ident(&a.name))
+            .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
+        sqlparser::ast::TableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } => {
+            if let Some(a) = alias.as_ref() {
+                normalize_ident(&a.name).eq_ignore_ascii_case(outer_alias)
+            } else {
+                table_factor_shadows_alias(&table_with_joins.relation, outer_alias)
+                    || table_with_joins
+                        .joins
+                        .iter()
+                        .any(|j| table_factor_shadows_alias(&j.relation, outer_alias))
+            }
+        }
+        sqlparser::ast::TableFactor::Pivot { alias, .. }
+        | sqlparser::ast::TableFactor::Unpivot { alias, .. } => alias
+            .as_ref()
+            .map(|a| normalize_ident(&a.name))
+            .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
+    }
+}
+
+/// Check whether any table in a FROM clause shadows `outer_alias`.
+fn from_clause_shadows_alias(from: &[sqlparser::ast::TableWithJoins], outer_alias: &str) -> bool {
+    from.iter().any(|twj| {
+        table_factor_shadows_alias(&twj.relation, outer_alias)
+            || twj
+                .joins
+                .iter()
+                .any(|j| table_factor_shadows_alias(&j.relation, outer_alias))
+    })
+}
+
+/// Check whether a `Query`'s top-level SELECT FROM clause shadows `outer_alias`.
+fn query_from_shadows_alias(query: &Query, outer_alias: &str) -> bool {
+    if let SetExpr::Select(select) = &*query.body {
+        from_clause_shadows_alias(&select.from, outer_alias)
+    } else {
+        false
+    }
+}
+
 /// Resolve FROM-clause table names to their column name sets.
 /// Returns `None` if any FROM entry cannot be resolved (derived tables, views,
 /// unrecognised names), signalling that bare-identifier qualification should be
@@ -230,81 +310,6 @@ pub(crate) async fn collect_inner_column_names(
     }
 
     Ok(Some(columns))
-}
-
-/// Qualify bare identifiers in a subquery that match outer-schema columns and
-/// are NOT shadowed by the subquery's own inner-scope columns.
-///
-/// Rewrites `Expr::Identifier("col")` → `Expr::CompoundIdentifier(["outer_alias", "col"])`
-/// so that the existing qualified-reference substitution handles them.
-///
-/// Only touches expressions at the subquery's immediate level; nested
-/// subqueries are left untouched (they need their own inner-column sets).
-pub(crate) fn qualify_bare_outer_refs_in_query(
-    query: &Query,
-    outer_alias: &str,
-    outer_schema: &TableSchema,
-    inner_columns: &HashSet<String>,
-) -> Query {
-    use core::ops::ControlFlow;
-    use sqlparser::ast::{VisitMut, VisitorMut};
-
-    struct QualifyVisitor<'a> {
-        outer_alias: &'a str,
-        outer_schema: &'a TableSchema,
-        inner_columns: &'a HashSet<String>,
-        query_depth: usize,
-    }
-
-    impl<'a> VisitorMut for QualifyVisitor<'a> {
-        type Break = ();
-
-        fn pre_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
-            self.query_depth += 1;
-            ControlFlow::Continue(())
-        }
-
-        fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
-            self.query_depth -= 1;
-            ControlFlow::Continue(())
-        }
-
-        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
-            // Only qualify at the immediate query level (depth 1: we entered
-            // the query node).  Deeper levels are nested subqueries.
-            if self.query_depth != 1 {
-                return ControlFlow::Continue(());
-            }
-            if let Expr::Identifier(ref ident) = expr {
-                let name = normalize_ident(ident);
-                // Skip if this column exists in inner scope.
-                if self.inner_columns.contains(&name.to_lowercase()) {
-                    return ControlFlow::Continue(());
-                }
-                // Qualify if it matches an outer column.
-                if self
-                    .outer_schema
-                    .columns
-                    .iter()
-                    .any(|c| c.name.eq_ignore_ascii_case(&name))
-                {
-                    *expr =
-                        Expr::CompoundIdentifier(vec![Ident::new(self.outer_alias), ident.clone()]);
-                }
-            }
-            ControlFlow::Continue(())
-        }
-    }
-
-    let mut out = query.clone();
-    let mut visitor = QualifyVisitor {
-        outer_alias,
-        outer_schema,
-        inner_columns,
-        query_depth: 0,
-    };
-    let _ = out.visit(&mut visitor);
-    out
 }
 
 impl Executor {
@@ -756,26 +761,16 @@ impl Executor {
         ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
         Box::pin(async move {
-            // Qualify bare outer references before substitution.
-            let qualified_query = if let Some(inner_columns) =
+            let inner_columns =
                 collect_inner_column_names(&self.store(), txn, db_id, search_path, subquery, ctes)
-                    .await?
-            {
-                qualify_bare_outer_refs_in_query(
-                    subquery,
-                    outer_alias,
-                    outer_schema,
-                    &inner_columns,
-                )
-            } else {
-                subquery.clone()
-            };
+                    .await?;
 
             let substituted_query = substitute_outer_values_in_query(
-                &qualified_query,
+                subquery,
                 outer_alias,
                 outer_schema,
                 outer_row,
+                inner_columns.as_ref(),
             );
             let result = self
                 .execute_query(txn, db_id, sequence_values, search_path, &substituted_query)
@@ -870,86 +865,6 @@ pub fn expr_has_outer_reference(expr: &Expr, outer_alias: &str) -> bool {
 
 /// Check if a query contains references to an outer table alias
 pub fn query_has_outer_reference(query: &Query, outer_alias: &str) -> bool {
-    fn table_factor_shadows_outer_alias(
-        factor: &sqlparser::ast::TableFactor,
-        outer_alias: &str,
-    ) -> bool {
-        fn exposed_name_for_object(name: &sqlparser::ast::ObjectName) -> Option<String> {
-            name.0.last().map(normalize_ident)
-        }
-
-        match factor {
-            sqlparser::ast::TableFactor::Table { name, alias, .. } => {
-                // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
-                let exposed = alias
-                    .as_ref()
-                    .map(|a| normalize_ident(&a.name))
-                    .or_else(|| exposed_name_for_object(name))
-                    .unwrap_or_default();
-                exposed.eq_ignore_ascii_case(outer_alias)
-            }
-            sqlparser::ast::TableFactor::Derived { alias, .. } => alias
-                .as_ref()
-                .map(|a| normalize_ident(&a.name))
-                .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
-            sqlparser::ast::TableFactor::Function { name, alias, .. } => {
-                // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
-                let exposed = alias
-                    .as_ref()
-                    .map(|a| normalize_ident(&a.name))
-                    .or_else(|| exposed_name_for_object(name))
-                    .unwrap_or_default();
-                exposed.eq_ignore_ascii_case(outer_alias)
-            }
-            sqlparser::ast::TableFactor::UNNEST { alias, .. } => alias
-                .as_ref()
-                .map(|a| normalize_ident(&a.name))
-                .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
-            sqlparser::ast::TableFactor::TableFunction { alias, .. } => alias
-                .as_ref()
-                .map(|a| normalize_ident(&a.name))
-                .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
-            sqlparser::ast::TableFactor::NestedJoin {
-                table_with_joins,
-                alias,
-            } => {
-                if let Some(a) = alias.as_ref() {
-                    normalize_ident(&a.name).eq_ignore_ascii_case(outer_alias)
-                } else {
-                    table_with_joins_shadows_outer_alias(table_with_joins, outer_alias)
-                }
-            }
-            sqlparser::ast::TableFactor::Pivot { alias, .. }
-            | sqlparser::ast::TableFactor::Unpivot { alias, .. } => alias
-                .as_ref()
-                .map(|a| normalize_ident(&a.name))
-                .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
-        }
-    }
-
-    fn table_with_joins_shadows_outer_alias(
-        table_with_joins: &sqlparser::ast::TableWithJoins,
-        outer_alias: &str,
-    ) -> bool {
-        if table_factor_shadows_outer_alias(&table_with_joins.relation, outer_alias) {
-            return true;
-        }
-        for join in &table_with_joins.joins {
-            if table_factor_shadows_outer_alias(&join.relation, outer_alias) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn from_shadows_outer_alias(
-        from: &[sqlparser::ast::TableWithJoins],
-        outer_alias: &str,
-    ) -> bool {
-        from.iter()
-            .any(|twj| table_with_joins_shadows_outer_alias(twj, outer_alias))
-    }
-
     fn window_frame_bound_has_outer_reference(
         bound: &sqlparser::ast::WindowFrameBound,
         outer_alias: &str,
@@ -1100,7 +1015,7 @@ pub fn query_has_outer_reference(query: &Query, outer_alias: &str) -> bool {
     }
 
     fn select_has_outer_reference(select: &sqlparser::ast::Select, outer_alias: &str) -> bool {
-        if from_shadows_outer_alias(&select.from, outer_alias) {
+        if from_clause_shadows_alias(&select.from, outer_alias) {
             return false;
         }
 
@@ -1228,7 +1143,7 @@ pub fn query_has_outer_reference(query: &Query, outer_alias: &str) -> bool {
 
     // Preserve existing FROM-scope alias shadowing behavior for SELECT query blocks.
     if let SetExpr::Select(select) = &*query.body {
-        if from_shadows_outer_alias(&select.from, outer_alias) {
+        if from_clause_shadows_alias(&select.from, outer_alias) {
             return false;
         }
     }
@@ -1268,821 +1183,174 @@ pub fn query_has_outer_reference(query: &Query, outer_alias: &str) -> bool {
     false
 }
 
-/// Substitute outer table column references with literal values from the current row
+/// VisitorMut that substitutes outer-scope column references with literal values.
+///
+/// Handles both qualified references (`outer_alias.col` → literal) and, when
+/// `inner_columns` is `Some`, bare references (`col` → literal) at the
+/// immediate query level (depth 1) for columns not shadowed by inner scope.
+///
+/// Tracks alias shadowing: if a query's FROM clause defines the same name as
+/// `outer_alias`, all substitution within that query scope is skipped.
+struct SubstituteVisitor<'a> {
+    outer_alias: &'a str,
+    outer_schema: &'a TableSchema,
+    outer_row: &'a Row,
+    inner_columns: Option<&'a HashSet<String>>,
+    /// Number of nested query scopes whose FROM shadows `outer_alias`.
+    shadow_count: usize,
+    /// Current query nesting depth (incremented on entering any Query node).
+    query_depth: usize,
+}
+
+impl<'a> sqlparser::ast::VisitorMut for SubstituteVisitor<'a> {
+    type Break = ();
+
+    fn pre_visit_query(&mut self, query: &mut Query) -> core::ops::ControlFlow<Self::Break> {
+        self.query_depth += 1;
+        if query_from_shadows_alias(query, self.outer_alias) {
+            self.shadow_count += 1;
+        }
+        core::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, query: &mut Query) -> core::ops::ControlFlow<Self::Break> {
+        if query_from_shadows_alias(query, self.outer_alias) {
+            self.shadow_count -= 1;
+        }
+        self.query_depth -= 1;
+        core::ops::ControlFlow::Continue(())
+    }
+
+    fn post_visit_expr(&mut self, expr: &mut Expr) -> core::ops::ControlFlow<Self::Break> {
+        if self.shadow_count > 0 {
+            return core::ops::ControlFlow::Continue(());
+        }
+
+        match expr {
+            // Qualified outer reference: `outer_alias.col` or `schema.outer_alias.col`
+            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+                let table_part = normalize_ident(&parts[parts.len() - 2]);
+                if table_part.eq_ignore_ascii_case(self.outer_alias) {
+                    let col_name = parts.last().map(normalize_ident).unwrap_or_default();
+                    let qualified = format!("{}.{}", table_part, col_name);
+                    let col_idx = self
+                        .outer_schema
+                        .columns
+                        .iter()
+                        .position(|c| c.name.eq_ignore_ascii_case(&qualified))
+                        .or_else(|| {
+                            self.outer_schema
+                                .columns
+                                .iter()
+                                .position(|c| c.name.eq_ignore_ascii_case(&col_name))
+                        });
+                    if let Some(col_idx) = col_idx {
+                        if let Some(value) = self.outer_row.values.get(col_idx) {
+                            *expr = value_to_sql_expr(value);
+                        }
+                    }
+                }
+            }
+            // Bare outer reference: unqualified `col` at the immediate query level
+            Expr::Identifier(ref ident) if self.query_depth == 1 => {
+                if let Some(inner_columns) = self.inner_columns {
+                    let name = normalize_ident(ident);
+                    if !inner_columns.contains(&name.to_lowercase()) {
+                        if let Some(col_idx) = self
+                            .outer_schema
+                            .columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(&name))
+                        {
+                            if let Some(value) = self.outer_row.values.get(col_idx) {
+                                *expr = value_to_sql_expr(value);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        core::ops::ControlFlow::Continue(())
+    }
+}
+
+/// Substitute outer table column references with literal values from the current row.
+///
+/// When `inner_columns` is `Some`, bare `Identifier` references at the immediate
+/// query level are also substituted if they match an outer-schema column and are
+/// not present in the inner-column set.
 pub fn substitute_outer_values(
     expr: &Expr,
     outer_alias: &str,
     outer_schema: &TableSchema,
     outer_row: &Row,
+    inner_columns: Option<&HashSet<String>>,
 ) -> Expr {
-    use core::ops::ControlFlow;
-    use sqlparser::ast::{VisitMut, VisitorMut};
-
-    #[derive(Clone)]
-    struct SubstituteVisitor<'a> {
-        outer_alias: &'a str,
-        outer_schema: &'a TableSchema,
-        outer_row: &'a Row,
-        query_depth: usize,
-    }
-
-    impl<'a> VisitorMut for SubstituteVisitor<'a> {
-        type Break = ();
-
-        fn pre_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
-            self.query_depth = self.query_depth.saturating_add(1);
-            ControlFlow::Continue(())
-        }
-
-        fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
-            self.query_depth = self.query_depth.saturating_sub(1);
-            ControlFlow::Continue(())
-        }
-
-        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
-            // Never mutate inside nested query scopes here; subqueries are substituted via
-            // `substitute_outer_values_in_query`, which handles alias shadowing per query block.
-            if self.query_depth > 0 {
-                return ControlFlow::Continue(());
-            }
-
-            match expr {
-                Expr::CompoundIdentifier(parts) => {
-                    if parts.len() >= 2 {
-                        // Support schema-qualified (schema.table.col) and even db.schema.table.col by
-                        // treating the second-to-last identifier as the table/alias.
-                        let table_part = normalize_ident(&parts[parts.len() - 2]);
-                        if table_part.eq_ignore_ascii_case(self.outer_alias) {
-                            // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
-                            let col_name = parts.last().map(normalize_ident).unwrap_or_default();
-                            let qualified = format!("{}.{}", table_part, col_name);
-                            let col_idx = self
-                                .outer_schema
-                                .columns
-                                .iter()
-                                .position(|c| c.name.eq_ignore_ascii_case(&qualified))
-                                .or_else(|| {
-                                    self.outer_schema
-                                        .columns
-                                        .iter()
-                                        .position(|c| c.name.eq_ignore_ascii_case(&col_name))
-                                });
-                            if let Some(col_idx) = col_idx {
-                                if let Some(value) = self.outer_row.values.get(col_idx) {
-                                    *expr = value_to_sql_expr(value);
-                                }
-                            }
-                        }
-                    }
-                }
-                Expr::Subquery(q) => {
-                    let substituted = substitute_outer_values_in_query(
-                        q,
-                        self.outer_alias,
-                        self.outer_schema,
-                        self.outer_row,
-                    );
-                    *q = Box::new(substituted);
-                }
-                Expr::InSubquery { subquery, .. } => {
-                    let substituted = substitute_outer_values_in_query(
-                        subquery,
-                        self.outer_alias,
-                        self.outer_schema,
-                        self.outer_row,
-                    );
-                    *subquery = Box::new(substituted);
-                }
-                Expr::Exists { subquery, .. } => {
-                    let substituted = substitute_outer_values_in_query(
-                        subquery,
-                        self.outer_alias,
-                        self.outer_schema,
-                        self.outer_row,
-                    );
-                    *subquery = Box::new(substituted);
-                }
-                _ => {}
-            }
-
-            ControlFlow::Continue(())
-        }
-    }
+    use sqlparser::ast::VisitMut;
 
     let mut out = expr.clone();
     let mut visitor = SubstituteVisitor {
         outer_alias,
         outer_schema,
         outer_row,
+        inner_columns,
+        shadow_count: 0,
         query_depth: 0,
     };
     let _ = out.visit(&mut visitor);
     out
 }
 
-/// Substitute outer values in a query
+/// Substitute outer values in a query.
+///
+/// When `inner_columns` is `Some`, bare `Identifier` references at the
+/// immediate query level (depth 1) are also substituted.
 pub fn substitute_outer_values_in_query(
     query: &Query,
     outer_alias: &str,
     outer_schema: &TableSchema,
     outer_row: &Row,
+    inner_columns: Option<&HashSet<String>>,
 ) -> Query {
-    fn table_factor_shadows_outer_alias(
-        factor: &sqlparser::ast::TableFactor,
-        outer_alias: &str,
-    ) -> bool {
-        fn exposed_name_for_object(name: &sqlparser::ast::ObjectName) -> Option<String> {
-            name.0.last().map(normalize_ident)
-        }
+    use sqlparser::ast::VisitMut;
 
-        match factor {
-            sqlparser::ast::TableFactor::Table { name, alias, .. } => {
-                // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
-                let exposed = alias
-                    .as_ref()
-                    .map(|a| normalize_ident(&a.name))
-                    .or_else(|| exposed_name_for_object(name))
-                    .unwrap_or_default();
-                exposed.eq_ignore_ascii_case(outer_alias)
-            }
-            sqlparser::ast::TableFactor::Derived { alias, .. } => alias
-                .as_ref()
-                .map(|a| normalize_ident(&a.name))
-                .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
-            sqlparser::ast::TableFactor::Function { name, alias, .. } => {
-                // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
-                let exposed = alias
-                    .as_ref()
-                    .map(|a| normalize_ident(&a.name))
-                    .or_else(|| exposed_name_for_object(name))
-                    .unwrap_or_default();
-                exposed.eq_ignore_ascii_case(outer_alias)
-            }
-            sqlparser::ast::TableFactor::UNNEST { alias, .. } => alias
-                .as_ref()
-                .map(|a| normalize_ident(&a.name))
-                .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
-            sqlparser::ast::TableFactor::TableFunction { alias, .. } => alias
-                .as_ref()
-                .map(|a| normalize_ident(&a.name))
-                .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
-            sqlparser::ast::TableFactor::NestedJoin {
-                table_with_joins,
-                alias,
-            } => {
-                if let Some(a) = alias.as_ref() {
-                    normalize_ident(&a.name).eq_ignore_ascii_case(outer_alias)
-                } else {
-                    table_with_joins_shadows_outer_alias(table_with_joins, outer_alias)
-                }
-            }
-            sqlparser::ast::TableFactor::Pivot { alias, .. }
-            | sqlparser::ast::TableFactor::Unpivot { alias, .. } => alias
-                .as_ref()
-                .map(|a| normalize_ident(&a.name))
-                .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
-        }
-    }
+    let mut out = query.clone();
 
-    fn table_with_joins_shadows_outer_alias(
-        table_with_joins: &sqlparser::ast::TableWithJoins,
-        outer_alias: &str,
-    ) -> bool {
-        if table_factor_shadows_outer_alias(&table_with_joins.relation, outer_alias) {
-            return true;
-        }
-        for join in &table_with_joins.joins {
-            if table_factor_shadows_outer_alias(&join.relation, outer_alias) {
-                return true;
-            }
-        }
-        false
-    }
-
-    fn from_shadows_outer_alias(
-        from: &[sqlparser::ast::TableWithJoins],
-        outer_alias: &str,
-    ) -> bool {
-        from.iter()
-            .any(|twj| table_with_joins_shadows_outer_alias(twj, outer_alias))
-    }
-
-    fn substitute_window_frame_bound(
-        bound: &sqlparser::ast::WindowFrameBound,
-        outer_alias: &str,
-        outer_schema: &TableSchema,
-        outer_row: &Row,
-    ) -> sqlparser::ast::WindowFrameBound {
-        match bound {
-            sqlparser::ast::WindowFrameBound::CurrentRow => bound.clone(),
-            sqlparser::ast::WindowFrameBound::Preceding(Some(expr)) => {
-                sqlparser::ast::WindowFrameBound::Preceding(Some(Box::new(
-                    substitute_outer_values(expr, outer_alias, outer_schema, outer_row),
-                )))
-            }
-            sqlparser::ast::WindowFrameBound::Following(Some(expr)) => {
-                sqlparser::ast::WindowFrameBound::Following(Some(Box::new(
-                    substitute_outer_values(expr, outer_alias, outer_schema, outer_row),
-                )))
-            }
-            sqlparser::ast::WindowFrameBound::Preceding(None)
-            | sqlparser::ast::WindowFrameBound::Following(None) => bound.clone(),
-        }
-    }
-
-    fn substitute_window_spec(
-        spec: &sqlparser::ast::WindowSpec,
-        outer_alias: &str,
-        outer_schema: &TableSchema,
-        outer_row: &Row,
-    ) -> sqlparser::ast::WindowSpec {
-        let new_partition_by = spec
-            .partition_by
-            .iter()
-            .map(|e| substitute_outer_values(e, outer_alias, outer_schema, outer_row))
-            .collect();
-        let new_order_by = spec
-            .order_by
-            .iter()
-            .map(|o| sqlparser::ast::OrderByExpr {
-                expr: substitute_outer_values(&o.expr, outer_alias, outer_schema, outer_row),
-                asc: o.asc,
-                nulls_first: o.nulls_first,
-            })
-            .collect();
-
-        let new_frame = spec.window_frame.as_ref().map(|f| {
-            let new_start =
-                substitute_window_frame_bound(&f.start_bound, outer_alias, outer_schema, outer_row);
-            let new_end = f
-                .end_bound
-                .as_ref()
-                .map(|b| substitute_window_frame_bound(b, outer_alias, outer_schema, outer_row));
-            sqlparser::ast::WindowFrame {
-                units: f.units,
-                start_bound: new_start,
-                end_bound: new_end,
-            }
-        });
-
-        sqlparser::ast::WindowSpec {
-            partition_by: new_partition_by,
-            order_by: new_order_by,
-            window_frame: new_frame,
-        }
-    }
-
-    fn substitute_join_operator(
-        op: &sqlparser::ast::JoinOperator,
-        outer_alias: &str,
-        outer_schema: &TableSchema,
-        outer_row: &Row,
-    ) -> sqlparser::ast::JoinOperator {
-        match op {
-            sqlparser::ast::JoinOperator::Inner(c) => sqlparser::ast::JoinOperator::Inner(
-                substitute_join_constraint(c, outer_alias, outer_schema, outer_row),
-            ),
-            sqlparser::ast::JoinOperator::LeftOuter(c) => sqlparser::ast::JoinOperator::LeftOuter(
-                substitute_join_constraint(c, outer_alias, outer_schema, outer_row),
-            ),
-            sqlparser::ast::JoinOperator::RightOuter(c) => {
-                sqlparser::ast::JoinOperator::RightOuter(substitute_join_constraint(
-                    c,
-                    outer_alias,
-                    outer_schema,
-                    outer_row,
-                ))
-            }
-            sqlparser::ast::JoinOperator::FullOuter(c) => sqlparser::ast::JoinOperator::FullOuter(
-                substitute_join_constraint(c, outer_alias, outer_schema, outer_row),
-            ),
-            sqlparser::ast::JoinOperator::LeftSemi(c) => sqlparser::ast::JoinOperator::LeftSemi(
-                substitute_join_constraint(c, outer_alias, outer_schema, outer_row),
-            ),
-            sqlparser::ast::JoinOperator::RightSemi(c) => sqlparser::ast::JoinOperator::RightSemi(
-                substitute_join_constraint(c, outer_alias, outer_schema, outer_row),
-            ),
-            sqlparser::ast::JoinOperator::LeftAnti(c) => sqlparser::ast::JoinOperator::LeftAnti(
-                substitute_join_constraint(c, outer_alias, outer_schema, outer_row),
-            ),
-            sqlparser::ast::JoinOperator::RightAnti(c) => sqlparser::ast::JoinOperator::RightAnti(
-                substitute_join_constraint(c, outer_alias, outer_schema, outer_row),
-            ),
-            sqlparser::ast::JoinOperator::CrossJoin => sqlparser::ast::JoinOperator::CrossJoin,
-            sqlparser::ast::JoinOperator::CrossApply => sqlparser::ast::JoinOperator::CrossApply,
-            sqlparser::ast::JoinOperator::OuterApply => sqlparser::ast::JoinOperator::OuterApply,
-        }
-    }
-
-    fn substitute_join_constraint(
-        c: &sqlparser::ast::JoinConstraint,
-        outer_alias: &str,
-        outer_schema: &TableSchema,
-        outer_row: &Row,
-    ) -> sqlparser::ast::JoinConstraint {
-        match c {
-            sqlparser::ast::JoinConstraint::On(e) => sqlparser::ast::JoinConstraint::On(
-                substitute_outer_values(e, outer_alias, outer_schema, outer_row),
-            ),
-            sqlparser::ast::JoinConstraint::Using(cols) => {
-                sqlparser::ast::JoinConstraint::Using(cols.clone())
-            }
-            sqlparser::ast::JoinConstraint::Natural => sqlparser::ast::JoinConstraint::Natural,
-            sqlparser::ast::JoinConstraint::None => sqlparser::ast::JoinConstraint::None,
-        }
-    }
-
-    fn substitute_table_factor(
-        factor: &sqlparser::ast::TableFactor,
-        outer_alias: &str,
-        outer_schema: &TableSchema,
-        outer_row: &Row,
-    ) -> sqlparser::ast::TableFactor {
-        match factor {
-            sqlparser::ast::TableFactor::Table {
-                name,
-                alias,
-                args,
-                with_hints,
-                version,
-                partitions,
-            } => {
-                let new_args = args.as_ref().map(|args| {
-                    args.iter()
-                        .map(|arg| match arg {
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => FunctionArg::Unnamed(
-                                FunctionArgExpr::Expr(substitute_outer_values(
-                                    e,
-                                    outer_alias,
-                                    outer_schema,
-                                    outer_row,
-                                )),
-                            ),
-                            other => other.clone(),
-                        })
-                        .collect()
-                });
-
-                let new_hints = with_hints
-                    .iter()
-                    .map(|e| substitute_outer_values(e, outer_alias, outer_schema, outer_row))
-                    .collect();
-
-                let new_version =
-                    version.as_ref().map(|v| match v {
-                        sqlparser::ast::TableVersion::ForSystemTimeAsOf(e) => {
-                            sqlparser::ast::TableVersion::ForSystemTimeAsOf(
-                                substitute_outer_values(e, outer_alias, outer_schema, outer_row),
-                            )
-                        }
-                    });
-
-                sqlparser::ast::TableFactor::Table {
-                    name: name.clone(),
-                    alias: alias.clone(),
-                    args: new_args,
-                    with_hints: new_hints,
-                    version: new_version,
-                    partitions: partitions.clone(),
-                }
-            }
-            sqlparser::ast::TableFactor::Derived {
-                lateral,
-                subquery,
-                alias,
-            } => sqlparser::ast::TableFactor::Derived {
-                lateral: *lateral,
-                subquery: Box::new(substitute_outer_values_in_query(
-                    subquery,
-                    outer_alias,
-                    outer_schema,
-                    outer_row,
-                )),
-                alias: alias.clone(),
-            },
-            sqlparser::ast::TableFactor::TableFunction { expr, alias } => {
-                sqlparser::ast::TableFactor::TableFunction {
-                    expr: substitute_outer_values(expr, outer_alias, outer_schema, outer_row),
-                    alias: alias.clone(),
-                }
-            }
-            sqlparser::ast::TableFactor::Function {
-                lateral,
-                name,
-                args,
-                alias,
-            } => sqlparser::ast::TableFactor::Function {
-                lateral: *lateral,
-                name: name.clone(),
-                args: args
-                    .iter()
-                    .map(|arg| match arg {
-                        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => {
-                            FunctionArg::Unnamed(FunctionArgExpr::Expr(substitute_outer_values(
-                                e,
-                                outer_alias,
-                                outer_schema,
-                                outer_row,
-                            )))
-                        }
-                        other => other.clone(),
-                    })
-                    .collect(),
-                alias: alias.clone(),
-            },
-            sqlparser::ast::TableFactor::UNNEST {
-                alias,
-                array_exprs,
-                with_offset,
-                with_offset_alias,
-            } => sqlparser::ast::TableFactor::UNNEST {
-                alias: alias.clone(),
-                array_exprs: array_exprs
-                    .iter()
-                    .map(|e| substitute_outer_values(e, outer_alias, outer_schema, outer_row))
-                    .collect(),
-                with_offset: *with_offset,
-                with_offset_alias: with_offset_alias.clone(),
-            },
-            sqlparser::ast::TableFactor::NestedJoin {
-                table_with_joins,
-                alias,
-            } => sqlparser::ast::TableFactor::NestedJoin {
-                table_with_joins: Box::new(substitute_table_with_joins(
-                    table_with_joins,
-                    outer_alias,
-                    outer_schema,
-                    outer_row,
-                )),
-                alias: alias.clone(),
-            },
-            sqlparser::ast::TableFactor::Pivot {
-                table,
-                aggregate_function,
-                value_column,
-                pivot_values,
-                alias,
-            } => sqlparser::ast::TableFactor::Pivot {
-                table: Box::new(substitute_table_factor(
-                    table,
-                    outer_alias,
-                    outer_schema,
-                    outer_row,
-                )),
-                aggregate_function: substitute_outer_values(
-                    aggregate_function,
-                    outer_alias,
-                    outer_schema,
-                    outer_row,
-                ),
-                value_column: value_column.clone(),
-                pivot_values: pivot_values.clone(),
-                alias: alias.clone(),
-            },
-            sqlparser::ast::TableFactor::Unpivot {
-                table,
-                value,
-                name,
-                columns,
-                alias,
-            } => sqlparser::ast::TableFactor::Unpivot {
-                table: Box::new(substitute_table_factor(
-                    table,
-                    outer_alias,
-                    outer_schema,
-                    outer_row,
-                )),
-                value: value.clone(),
-                name: name.clone(),
-                columns: columns.clone(),
-                alias: alias.clone(),
-            },
-        }
-    }
-
-    fn substitute_table_with_joins(
-        twj: &sqlparser::ast::TableWithJoins,
-        outer_alias: &str,
-        outer_schema: &TableSchema,
-        outer_row: &Row,
-    ) -> sqlparser::ast::TableWithJoins {
-        sqlparser::ast::TableWithJoins {
-            relation: substitute_table_factor(&twj.relation, outer_alias, outer_schema, outer_row),
-            joins: twj
-                .joins
-                .iter()
-                .map(|j| sqlparser::ast::Join {
-                    relation: substitute_table_factor(
-                        &j.relation,
-                        outer_alias,
-                        outer_schema,
-                        outer_row,
-                    ),
-                    join_operator: substitute_join_operator(
-                        &j.join_operator,
-                        outer_alias,
-                        outer_schema,
-                        outer_row,
-                    ),
-                })
-                .collect(),
-        }
-    }
-
-    fn substitute_select(
-        select: &sqlparser::ast::Select,
-        outer_alias: &str,
-        outer_schema: &TableSchema,
-        outer_row: &Row,
-    ) -> sqlparser::ast::Select {
-        // FROM-scope alias shadowing: if the SELECT block defines the same alias as the
-        // outer alias, treat it as non-outer-ref and avoid substitution in this scope.
-        if from_shadows_outer_alias(&select.from, outer_alias) {
-            return select.clone();
-        }
-
-        let new_distinct = select.distinct.as_ref().map(|d| match d {
-            sqlparser::ast::Distinct::Distinct => sqlparser::ast::Distinct::Distinct,
-            sqlparser::ast::Distinct::On(exprs) => sqlparser::ast::Distinct::On(
-                exprs
-                    .iter()
-                    .map(|e| substitute_outer_values(e, outer_alias, outer_schema, outer_row))
-                    .collect(),
-            ),
-        });
-
-        let new_top = select.top.as_ref().map(|t| sqlparser::ast::Top {
-            with_ties: t.with_ties,
-            percent: t.percent,
-            quantity: t
-                .quantity
-                .as_ref()
-                .map(|e| substitute_outer_values(e, outer_alias, outer_schema, outer_row)),
-        });
-
-        let new_projection = select
-            .projection
-            .iter()
-            .map(|item| match item {
-                sqlparser::ast::SelectItem::UnnamedExpr(e) => {
-                    sqlparser::ast::SelectItem::UnnamedExpr(substitute_outer_values(
-                        e,
-                        outer_alias,
-                        outer_schema,
-                        outer_row,
-                    ))
-                }
-                sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
-                    sqlparser::ast::SelectItem::ExprWithAlias {
-                        expr: substitute_outer_values(expr, outer_alias, outer_schema, outer_row),
-                        alias: alias.clone(),
-                    }
-                }
-                other => other.clone(),
-            })
-            .collect();
-
-        let new_from = select
-            .from
-            .iter()
-            .map(|twj| substitute_table_with_joins(twj, outer_alias, outer_schema, outer_row))
-            .collect();
-
-        let new_lateral_views = select
-            .lateral_views
-            .iter()
-            .map(|lv| sqlparser::ast::LateralView {
-                lateral_view: substitute_outer_values(
-                    &lv.lateral_view,
-                    outer_alias,
-                    outer_schema,
-                    outer_row,
-                ),
-                lateral_view_name: lv.lateral_view_name.clone(),
-                lateral_col_alias: lv.lateral_col_alias.clone(),
-                outer: lv.outer,
-            })
-            .collect();
-
-        let new_selection = select
-            .selection
-            .as_ref()
-            .map(|sel| substitute_outer_values(sel, outer_alias, outer_schema, outer_row));
-
-        let new_group_by = match &select.group_by {
-            sqlparser::ast::GroupByExpr::All => sqlparser::ast::GroupByExpr::All,
-            sqlparser::ast::GroupByExpr::Expressions(exprs) => {
-                sqlparser::ast::GroupByExpr::Expressions(
-                    exprs
-                        .iter()
-                        .map(|e| substitute_outer_values(e, outer_alias, outer_schema, outer_row))
-                        .collect(),
-                )
-            }
-        };
-
-        let new_cluster_by = select
-            .cluster_by
-            .iter()
-            .map(|e| substitute_outer_values(e, outer_alias, outer_schema, outer_row))
-            .collect();
-        let new_distribute_by = select
-            .distribute_by
-            .iter()
-            .map(|e| substitute_outer_values(e, outer_alias, outer_schema, outer_row))
-            .collect();
-        let new_sort_by = select
-            .sort_by
-            .iter()
-            .map(|e| substitute_outer_values(e, outer_alias, outer_schema, outer_row))
-            .collect();
-
-        let new_having = select
-            .having
-            .as_ref()
-            .map(|h| substitute_outer_values(h, outer_alias, outer_schema, outer_row));
-
-        let new_named_window = select
-            .named_window
-            .iter()
-            .map(|def| {
-                sqlparser::ast::NamedWindowDefinition(
-                    def.0.clone(),
-                    substitute_window_spec(&def.1, outer_alias, outer_schema, outer_row),
-                )
-            })
-            .collect();
-
-        let new_qualify = select
-            .qualify
-            .as_ref()
-            .map(|q| substitute_outer_values(q, outer_alias, outer_schema, outer_row));
-
-        sqlparser::ast::Select {
-            distinct: new_distinct,
-            top: new_top,
-            projection: new_projection,
-            into: select.into.clone(),
-            from: new_from,
-            lateral_views: new_lateral_views,
-            selection: new_selection,
-            group_by: new_group_by,
-            cluster_by: new_cluster_by,
-            distribute_by: new_distribute_by,
-            sort_by: new_sort_by,
-            having: new_having,
-            named_window: new_named_window,
-            qualify: new_qualify,
-        }
-    }
-
-    fn substitute_set_expr(
-        body: &SetExpr,
-        outer_alias: &str,
-        outer_schema: &TableSchema,
-        outer_row: &Row,
-    ) -> SetExpr {
-        match body {
-            SetExpr::Select(select) => SetExpr::Select(Box::new(substitute_select(
-                select,
+    // Process CTEs first, before the main walk.  CTEs live in the outer
+    // scope and must not be affected by alias shadowing in the query's own
+    // FROM clause.  (The old manual traversal substituted CTEs before the
+    // shadow check; we preserve that by extracting them here.)
+    let processed_with = out.with.take().map(|mut w| {
+        for cte in &mut w.cte_tables {
+            let mut cte_visitor = SubstituteVisitor {
                 outer_alias,
                 outer_schema,
                 outer_row,
-            ))),
-            SetExpr::Query(q) => SetExpr::Query(Box::new(substitute_outer_values_in_query(
-                q,
-                outer_alias,
-                outer_schema,
-                outer_row,
-            ))),
-            SetExpr::SetOperation {
-                op,
-                set_quantifier,
-                left,
-                right,
-            } => SetExpr::SetOperation {
-                op: *op,
-                set_quantifier: *set_quantifier,
-                left: Box::new(substitute_set_expr(
-                    left,
-                    outer_alias,
-                    outer_schema,
-                    outer_row,
-                )),
-                right: Box::new(substitute_set_expr(
-                    right,
-                    outer_alias,
-                    outer_schema,
-                    outer_row,
-                )),
-            },
-            SetExpr::Values(values) => SetExpr::Values(sqlparser::ast::Values {
-                explicit_row: values.explicit_row,
-                rows: values
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        row.iter()
-                            .map(|e| {
-                                substitute_outer_values(e, outer_alias, outer_schema, outer_row)
-                            })
-                            .collect()
-                    })
-                    .collect(),
-            }),
-            _ => body.clone(),
+                inner_columns: None, // bare-ref substitution not applicable inside CTEs
+                shadow_count: 0,
+                query_depth: 0,
+            };
+            let _ = cte.query.visit(&mut cte_visitor);
         }
-    }
-
-    let new_with = query.with.as_ref().map(|w| sqlparser::ast::With {
-        recursive: w.recursive,
-        cte_tables: w
-            .cte_tables
-            .iter()
-            .map(|cte| sqlparser::ast::Cte {
-                alias: cte.alias.clone(),
-                query: Box::new(substitute_outer_values_in_query(
-                    &cte.query,
-                    outer_alias,
-                    outer_schema,
-                    outer_row,
-                )),
-                from: cte.from.clone(),
-            })
-            .collect(),
+        w
     });
 
-    // Preserve existing FROM-scope alias shadowing behavior for SELECT query blocks:
-    // if this query block defines `outer_alias` in its FROM, do not substitute within it.
-    if let SetExpr::Select(select) = &*query.body {
-        if from_shadows_outer_alias(&select.from, outer_alias) {
-            return Query {
-                with: new_with,
-                body: query.body.clone(),
-                order_by: query.order_by.clone(),
-                limit: query.limit.clone(),
-                offset: query.offset.clone(),
-                fetch: query.fetch.clone(),
-                locks: query.locks.clone(),
-                limit_by: query.limit_by.clone(),
-                for_clause: query.for_clause.clone(),
-            };
-        }
-    }
-
-    let new_body = Box::new(substitute_set_expr(
-        &query.body,
+    // Visit the rest (body, ORDER BY, LIMIT, …) with shadow tracking.
+    let mut visitor = SubstituteVisitor {
         outer_alias,
         outer_schema,
         outer_row,
-    ));
+        inner_columns,
+        shadow_count: 0,
+        query_depth: 0,
+    };
+    let _ = out.visit(&mut visitor);
 
-    let new_order_by = query
-        .order_by
-        .iter()
-        .map(|o| sqlparser::ast::OrderByExpr {
-            expr: substitute_outer_values(&o.expr, outer_alias, outer_schema, outer_row),
-            asc: o.asc,
-            nulls_first: o.nulls_first,
-        })
-        .collect();
-
-    let new_limit = query
-        .limit
-        .as_ref()
-        .map(|e| substitute_outer_values(e, outer_alias, outer_schema, outer_row));
-
-    let new_limit_by = query
-        .limit_by
-        .iter()
-        .map(|e| substitute_outer_values(e, outer_alias, outer_schema, outer_row))
-        .collect();
-
-    let new_offset = query.offset.as_ref().map(|o| sqlparser::ast::Offset {
-        value: substitute_outer_values(&o.value, outer_alias, outer_schema, outer_row),
-        rows: o.rows,
-    });
-
-    let new_fetch = query.fetch.as_ref().map(|f| sqlparser::ast::Fetch {
-        with_ties: f.with_ties,
-        percent: f.percent,
-        quantity: f
-            .quantity
-            .as_ref()
-            .map(|e| substitute_outer_values(e, outer_alias, outer_schema, outer_row)),
-    });
-
-    Query {
-        with: new_with,
-        body: new_body,
-        order_by: new_order_by,
-        limit: new_limit,
-        offset: new_offset,
-        fetch: new_fetch,
-        locks: query.locks.clone(),
-        limit_by: new_limit_by,
-        for_clause: query.for_clause.clone(),
-    }
+    // Re-attach the processed CTEs.
+    out.with = processed_with;
+    out
 }
 
 /// Substitute outer column references in a subquery using join context
@@ -2433,7 +1701,7 @@ mod subquery_tests {
             Ident::new("o"),
             Ident::new("id"),
         ]);
-        let out = substitute_outer_values(&expr, "o", &outer_schema, &outer_row);
+        let out = substitute_outer_values(&expr, "o", &outer_schema, &outer_row, None);
         assert!(matches!(
             out,
             Expr::Value(SqlValue::Number(ref n, _)) if n == "9"
@@ -2513,7 +1781,7 @@ ORDER BY qs_o.id;
         let outer_row = Row::new(vec![Value::Int32(1)]);
 
         let substituted =
-            substitute_outer_values_in_query(subquery, "qs_o", &outer_schema, &outer_row);
+            substitute_outer_values_in_query(subquery, "qs_o", &outer_schema, &outer_row, None);
         assert!(!query_has_outer_reference(&substituted, "qs_o"));
 
         let sqlparser::ast::SetExpr::Select(substituted_select) = &*substituted.body else {
@@ -2584,7 +1852,7 @@ ORDER BY qs_o.id;
     }
 
     #[test]
-    fn test_qualify_bare_outer_refs_in_query() {
+    fn test_bare_outer_ref_substituted_via_inner_columns() {
         use sqlparser::dialect::PostgreSqlDialect;
         use sqlparser::parser::Parser;
 
@@ -2595,30 +1863,33 @@ ORDER BY qs_o.id;
         };
 
         let outer_schema = make_schema(&["a", "b"]);
+        let outer_row = Row::new(vec![Value::Int32(42), Value::Int32(99)]);
         let inner_columns: HashSet<String> = ["c", "d"].iter().map(|s| s.to_string()).collect();
 
-        let qualified =
-            qualify_bare_outer_refs_in_query(query, "t_outer", &outer_schema, &inner_columns);
+        let substituted = substitute_outer_values_in_query(
+            query,
+            "t_outer",
+            &outer_schema,
+            &outer_row,
+            Some(&inner_columns),
+        );
 
-        // After qualification, `a` should become `t_outer.a` (a CompoundIdentifier).
+        // After substitution, bare `a` (an outer column not in inner_columns)
+        // should be replaced with the literal 42.
         // `c` and `d` are in inner_columns so should remain bare.
-        let qualified_sql = qualified.to_string();
+        let substituted_sql = substituted.to_string();
         assert!(
-            qualified_sql.contains("t_outer.a"),
-            "expected t_outer.a in: {qualified_sql}"
+            substituted_sql.contains("42"),
+            "expected literal 42 for outer column `a`: {substituted_sql}"
         );
         assert!(
-            !qualified_sql.contains("t_outer.c"),
-            "c should not be qualified: {qualified_sql}"
-        );
-        assert!(
-            !qualified_sql.contains("t_outer.d"),
-            "d should not be qualified: {qualified_sql}"
+            !substituted_sql.contains("t_outer"),
+            "should not contain t_outer qualifier: {substituted_sql}"
         );
     }
 
     #[test]
-    fn test_qualify_bare_outer_refs_inner_shadow_prevents_qualification() {
+    fn test_bare_outer_ref_inner_shadow_prevents_substitution() {
         use sqlparser::dialect::PostgreSqlDialect;
         use sqlparser::parser::Parser;
 
@@ -2629,17 +1900,66 @@ ORDER BY qs_o.id;
         };
 
         let outer_schema = make_schema(&["a"]);
+        let outer_row = Row::new(vec![Value::Int32(42)]);
         // Inner table also has column "a" — it should shadow the outer.
         let inner_columns: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
 
-        let qualified =
-            qualify_bare_outer_refs_in_query(query, "t_outer", &outer_schema, &inner_columns);
-        let qualified_sql = qualified.to_string();
+        let substituted = substitute_outer_values_in_query(
+            query,
+            "t_outer",
+            &outer_schema,
+            &outer_row,
+            Some(&inner_columns),
+        );
+        let substituted_sql = substituted.to_string();
 
-        // `a` exists in inner scope, so it must NOT be qualified.
+        // `a` exists in inner scope, so it must NOT be substituted.
         assert!(
-            !qualified_sql.contains("t_outer.a"),
-            "inner-scope `a` should not be qualified: {qualified_sql}"
+            !substituted_sql.contains("42"),
+            "inner-scope `a` should not be substituted: {substituted_sql}"
+        );
+    }
+
+    #[test]
+    fn test_cte_substituted_even_when_body_shadows_alias() {
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        // The CTE references `t_outer.id` (outer scope).  The body's FROM
+        // shadows `t_outer`, so the body should NOT be substituted — but the
+        // CTE must still be substituted because it is defined in the outer scope.
+        let sql = "\
+            WITH helper AS (SELECT t_outer.id AS oid FROM other_table) \
+            SELECT helper.oid FROM helper, some_table AS t_outer \
+            WHERE t_outer.id = helper.oid";
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
+            panic!("expected query");
+        };
+
+        let outer_schema = make_schema(&["id"]);
+        let outer_row = Row::new(vec![Value::Int32(77)]);
+
+        let substituted =
+            substitute_outer_values_in_query(query, "t_outer", &outer_schema, &outer_row, None);
+        let sql_out = substituted.to_string();
+
+        // CTE should have `t_outer.id` replaced with 77.
+        let cte_query = &substituted.with.as_ref().unwrap().cte_tables[0].query;
+        let cte_sql = cte_query.to_string();
+        assert!(
+            cte_sql.contains("77"),
+            "CTE should have outer ref substituted: {cte_sql}"
+        );
+
+        // Body's WHERE `t_outer.id` should NOT be substituted (shadowed by FROM).
+        let SetExpr::Select(select) = &*substituted.body else {
+            panic!("expected SELECT body");
+        };
+        let where_sql = select.selection.as_ref().unwrap().to_string();
+        assert!(
+            where_sql.contains("t_outer.id"),
+            "body WHERE should keep t_outer.id (shadowed): {sql_out}"
         );
     }
 

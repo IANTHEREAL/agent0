@@ -613,8 +613,13 @@ impl Executor {
                 for row in base_rows {
                     let eval_expr_input = if has_subqueries {
                         // Substitute outer values and resolve any remaining subqueries.
-                        let substituted =
-                            substitute_outer_values(async_filter, &outer_alias, &schema, &row);
+                        let substituted = substitute_outer_values(
+                            async_filter,
+                            &outer_alias,
+                            &schema,
+                            &row,
+                            None,
+                        );
                         self.resolve_subqueries(
                             txn,
                             db_id,

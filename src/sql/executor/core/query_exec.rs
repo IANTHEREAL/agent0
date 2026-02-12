@@ -70,9 +70,7 @@ impl Executor {
         schema: &TableSchema,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<Value> {
-        use super::super::subquery::{
-            expr_contains_subquery, qualify_bare_outer_refs_in_query, substitute_outer_values,
-        };
+        use super::super::subquery::{expr_contains_subquery, substitute_outer_values};
 
         if expr_contains_subquery(expr) {
             let outer_alias = schema
@@ -80,9 +78,9 @@ impl Executor {
                 .as_deref()
                 .unwrap_or(schema.name.rsplit('.').next().unwrap_or(&schema.name));
 
-            // Qualify bare outer references in subqueries before substitution.
-            let qualified_expr = if let Expr::Subquery(ref q) = expr {
-                if let Some(inner_columns) = super::super::subquery::collect_inner_column_names(
+            // Collect inner column names for bare-ref disambiguation.
+            let inner_columns = if let Expr::Subquery(ref q) = expr {
+                super::super::subquery::collect_inner_column_names(
                     &self.store(),
                     txn,
                     db_id,
@@ -91,21 +89,12 @@ impl Executor {
                     ctes,
                 )
                 .await?
-                {
-                    Expr::Subquery(Box::new(qualify_bare_outer_refs_in_query(
-                        q,
-                        outer_alias,
-                        schema,
-                        &inner_columns,
-                    )))
-                } else {
-                    expr.clone()
-                }
             } else {
-                expr.clone()
+                None
             };
 
-            let substituted = substitute_outer_values(&qualified_expr, outer_alias, schema, row);
+            let substituted =
+                substitute_outer_values(expr, outer_alias, schema, row, inner_columns.as_ref());
             let resolved = self
                 .resolve_subqueries(
                     txn,
