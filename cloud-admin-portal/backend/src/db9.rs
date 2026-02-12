@@ -76,6 +76,16 @@ enum Commands {
         #[command(subcommand)]
         action: TokenAction,
     },
+    /// Generate code from database schema
+    Gen {
+        #[command(subcommand)]
+        action: GenAction,
+    },
+    /// Database migration management
+    Migration {
+        #[command(subcommand)]
+        action: MigrationAction,
+    },
     /// Generate shell completion scripts
     Completion {
         /// Shell to generate for
@@ -135,6 +145,44 @@ enum DbAction {
         /// Path to seed SQL file
         file: String,
     },
+    /// Export database schema (and optionally data) as SQL
+    Dump {
+        /// Database ID
+        id: String,
+        /// Export DDL only (no data)
+        #[arg(long)]
+        ddl_only: bool,
+        /// Write output to file instead of stdout
+        #[arg(short, long)]
+        output_file: Option<String>,
+    },
+    /// Database branching
+    Branch {
+        #[command(subcommand)]
+        action: BranchAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum BranchAction {
+    /// Create a branch (schema copy) from a database
+    Create {
+        /// Source database ID
+        id: String,
+        /// Branch name
+        #[arg(long)]
+        name: String,
+    },
+    /// List branches of a database
+    List {
+        /// Source database ID
+        id: String,
+    },
+    /// Delete a branch database
+    Delete {
+        /// Branch database ID
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -179,6 +227,61 @@ enum UserAction {
         /// Username to delete
         #[arg(long)]
         username: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum GenAction {
+    /// Generate type definitions from database schema
+    Types {
+        /// Database ID
+        id: String,
+        /// Target language
+        #[arg(long, default_value = "typescript")]
+        lang: TypeLang,
+        /// Schema to generate types for
+        #[arg(long, default_value = "public")]
+        schema: String,
+    },
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum TypeLang {
+    Typescript,
+    Python,
+}
+
+#[derive(Subcommand)]
+enum MigrationAction {
+    /// Create a new migration file
+    New {
+        /// Migration name (used in filename)
+        name: String,
+        /// Directory for migration files
+        #[arg(long, default_value = "./migrations")]
+        dir: String,
+    },
+    /// List local migration files
+    List {
+        /// Directory for migration files
+        #[arg(long, default_value = "./migrations")]
+        dir: String,
+    },
+    /// Apply pending migrations to a database
+    Up {
+        /// Database ID
+        id: String,
+        /// Directory for migration files
+        #[arg(long, default_value = "./migrations")]
+        dir: String,
+    },
+    /// Show migration status (applied vs pending)
+    Status {
+        /// Database ID
+        id: String,
+        /// Directory for migration files
+        #[arg(long, default_value = "./migrations")]
+        dir: String,
     },
 }
 
@@ -332,6 +435,44 @@ async fn main() {
             },
             DbAction::Seed { id, file } => {
                 cmd_db_seed(&api, &cli.effective_output(), id, file).await
+            }
+            DbAction::Dump {
+                id,
+                ddl_only,
+                output_file,
+            } => {
+                cmd_db_dump(&api, &cli.effective_output(), id, *ddl_only, output_file.as_deref())
+                    .await
+            }
+            DbAction::Branch { action } => match action {
+                BranchAction::Create { id, name } => {
+                    cmd_db_branch_create(&api, &cli.effective_output(), id, name).await
+                }
+                BranchAction::List { id } => {
+                    cmd_db_branch_list(&api, &cli.effective_output(), id).await
+                }
+                BranchAction::Delete { id } => {
+                    cmd_db_branch_delete(&api, &cli.effective_output(), id).await
+                }
+            },
+        },
+        Commands::Gen { ref action } => match action {
+            GenAction::Types { id, lang, schema } => {
+                cmd_gen_types(&api, &cli.effective_output(), id, lang, schema).await
+            }
+        },
+        Commands::Migration { ref action } => match action {
+            MigrationAction::New { name, dir } => {
+                cmd_migration_new(name, dir, &cli.effective_output())
+            }
+            MigrationAction::List { dir } => {
+                cmd_migration_list(dir, &cli.effective_output())
+            }
+            MigrationAction::Up { id, dir } => {
+                cmd_migration_up(&api, id, dir, &cli.effective_output()).await
+            }
+            MigrationAction::Status { id, dir } => {
+                cmd_migration_status(&api, id, dir, &cli.effective_output()).await
             }
         },
         Commands::Token { ref action } => match action {
@@ -1232,6 +1373,347 @@ async fn cmd_db_seed(api: &ApiClient, output: &OutputFormat, id: &str, file: &st
     }
 }
 
+async fn cmd_db_branch_create(api: &ApiClient, output: &OutputFormat, id: &str, name: &str) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let body = serde_json::json!({ "name": name });
+
+    let data = api
+        .request(
+            "POST",
+            &format!("/customer/databases/{id}/branch"),
+            Some(&body),
+            Some(&headers),
+        )
+        .await;
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => {
+            println!("Branch '{}' created from database {}.\n", name, id);
+            println!("ID:          {}", format_val(data.get("id")));
+            println!("Name:        {}", format_val(data.get("name")));
+            println!("State:       {}", format_val(data.get("state")));
+            if let Some(r) = data.get("region").and_then(|v| v.as_str()) {
+                println!("Region:      {r}");
+            }
+            if let Some(user) = data.get("admin_user").and_then(|v| v.as_str()) {
+                println!("Admin User:  {user}");
+            }
+            if let Some(pass) = data.get("admin_password").and_then(|v| v.as_str()) {
+                println!("Admin Pass:  {pass}");
+            }
+
+            if let Some(conn) = data.get("connection_string").and_then(|v| v.as_str()) {
+                println!("\nConnection String:");
+                println!("  {conn}");
+                println!("\npsql Command:");
+                println!("  psql \"{conn}\"");
+            }
+        }
+    }
+}
+
+async fn cmd_db_branch_list(api: &ApiClient, output: &OutputFormat, _id: &str) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let data = api
+        .request("GET", "/customer/databases", None, Some(&headers))
+        .await;
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        OutputFormat::Csv => {
+            let mut items = data.as_array().cloned().unwrap_or_default();
+            for item in &mut items {
+                if let Some(obj) = item.as_object_mut() {
+                    let formatted = format_time(obj.get("created_at"));
+                    obj.insert("created_at".into(), Value::String(formatted));
+                }
+            }
+            println!("Branches are independent databases. Showing all databases.");
+            print_csv(
+                &items,
+                &[
+                    ("ID", "id", 12),
+                    ("NAME", "name", 15),
+                    ("STATE", "state", 8),
+                    ("REGION", "region", 10),
+                    ("CREATED", "created_at", 16),
+                ],
+            );
+        }
+        OutputFormat::Table => {
+            let mut items = data.as_array().cloned().unwrap_or_default();
+            for item in &mut items {
+                if let Some(obj) = item.as_object_mut() {
+                    let formatted = format_time(obj.get("created_at"));
+                    obj.insert("created_at".into(), Value::String(formatted));
+                }
+            }
+            println!("Branches are independent databases. Showing all databases.\n");
+            print_table(
+                &items,
+                &[
+                    ("ID", "id", 12),
+                    ("NAME", "name", 15),
+                    ("STATE", "state", 8),
+                    ("REGION", "region", 10),
+                    ("CREATED", "created_at", 16),
+                ],
+            );
+        }
+    }
+}
+
+async fn cmd_db_branch_delete(api: &ApiClient, output: &OutputFormat, id: &str) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    if !matches!(output, OutputFormat::Json) {
+        print!("Are you sure you want to delete branch {id}? This cannot be undone. [y/N] ");
+        io::stdout().flush().ok();
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).unwrap_or_else(|e| {
+            eprintln!("Failed to read input: {e}");
+            process::exit(1);
+        });
+        let answer = answer.trim();
+        if answer != "y" && answer != "Y" {
+            println!("Cancelled.");
+            return;
+        }
+    }
+
+    let data = api
+        .request(
+            "DELETE",
+            &format!("/customer/databases/{id}"),
+            None,
+            Some(&headers),
+        )
+        .await;
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => println!("Branch {id} has been deleted."),
+    }
+}
+
+async fn cmd_db_dump(
+    api: &ApiClient,
+    output: &OutputFormat,
+    id: &str,
+    ddl_only: bool,
+    output_file: Option<&str>,
+) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let body = serde_json::json!({ "ddl_only": ddl_only });
+    let data = api
+        .request(
+            "POST",
+            &format!("/customer/databases/{id}/dump"),
+            Some(&body),
+            Some(&headers),
+        )
+        .await;
+
+    if matches!(output, OutputFormat::Json) {
+        print_json(&data);
+        return;
+    }
+
+    let sql = data["sql"].as_str().unwrap_or("");
+    let object_count = data["object_count"].as_u64().unwrap_or(0);
+
+    if let Some(path) = output_file {
+        std::fs::write(path, sql).unwrap_or_else(|e| {
+            eprintln!("Failed to write to '{path}': {e}");
+            process::exit(1);
+        });
+        eprintln!("Exported {object_count} objects to {path}");
+    } else {
+        print!("{sql}");
+        eprintln!("Exported {object_count} objects");
+    }
+}
+
+async fn cmd_gen_types(
+    api: &ApiClient,
+    output: &OutputFormat,
+    id: &str,
+    lang: &TypeLang,
+    schema_filter: &str,
+) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let data = api
+        .request(
+            "GET",
+            &format!("/customer/databases/{id}/schema"),
+            None,
+            Some(&headers),
+        )
+        .await;
+
+    if matches!(output, OutputFormat::Json) {
+        print_json(&data);
+        return;
+    }
+
+    let tables = data["tables"].as_array().cloned().unwrap_or_default();
+    let filtered: Vec<&Value> = tables
+        .iter()
+        .filter(|t| t["schema"].as_str().unwrap_or("") == schema_filter)
+        .collect();
+
+    let generated = match lang {
+        TypeLang::Typescript => gen_typescript(&filtered),
+        TypeLang::Python => gen_python(&filtered),
+    };
+
+    print!("{generated}");
+}
+
+fn to_pascal_case(s: &str) -> String {
+    s.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(c) => {
+                    let upper: String = c.to_uppercase().collect();
+                    format!("{upper}{}", chars.as_str().to_lowercase())
+                }
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+fn pg_type_to_ts(pg_type: &str) -> &'static str {
+    match pg_type.to_lowercase().as_str() {
+        "integer" | "bigint" | "smallint" | "serial" | "bigserial" | "int" | "int4" | "int8" => {
+            "number"
+        }
+        "real" | "double precision" | "float4" | "float8" | "numeric" | "decimal" => "number",
+        "text" | "varchar" | "char" | "character varying" => "string",
+        "boolean" | "bool" => "boolean",
+        "timestamp" | "timestamp without time zone" | "timestamp with time zone" | "timestamptz"
+        | "date" | "time" | "time without time zone" | "time with time zone" => "string",
+        "json" | "jsonb" => "Record<string, unknown>",
+        "uuid" => "string",
+        "bytea" => "string",
+        "interval" => "string",
+        _ => "unknown",
+    }
+}
+
+fn pg_type_to_python(pg_type: &str) -> &'static str {
+    match pg_type.to_lowercase().as_str() {
+        "integer" | "bigint" | "smallint" | "serial" | "bigserial" | "int" | "int4" | "int8" => {
+            "int"
+        }
+        "real" | "double precision" | "float4" | "float8" | "numeric" | "decimal" => "float",
+        "text" | "varchar" | "char" | "character varying" => "str",
+        "boolean" | "bool" => "bool",
+        "timestamp" | "timestamp without time zone" | "timestamp with time zone" | "timestamptz"
+        | "date" | "time" | "time without time zone" | "time with time zone" => "str",
+        "json" | "jsonb" => "dict",
+        "uuid" => "str",
+        "bytea" => "bytes",
+        "interval" => "str",
+        _ => "Any",
+    }
+}
+
+fn pg_type_to_ts_with_array(pg_type: &str) -> String {
+    let lower = pg_type.to_lowercase();
+    if let Some(inner) = lower.strip_suffix("[]") {
+        let base = pg_type_to_ts(inner);
+        return format!("{base}[]");
+    }
+    pg_type_to_ts(pg_type).to_string()
+}
+
+fn pg_type_to_python_with_array(pg_type: &str) -> String {
+    let lower = pg_type.to_lowercase();
+    if let Some(inner) = lower.strip_suffix("[]") {
+        let base = pg_type_to_python(inner);
+        return format!("list[{base}]");
+    }
+    pg_type_to_python(pg_type).to_string()
+}
+
+fn gen_typescript(tables: &[&Value]) -> String {
+    let mut out = String::from("// Generated by db9 gen types\n\n");
+
+    for table in tables {
+        let table_name = table["name"].as_str().unwrap_or("unknown");
+        let iface_name = to_pascal_case(table_name);
+        out.push_str(&format!("export interface {iface_name} {{\n"));
+
+        if let Some(columns) = table["columns"].as_array() {
+            for col in columns {
+                let col_name = col["name"].as_str().unwrap_or("unknown");
+                let col_type = col["type"].as_str().unwrap_or("text");
+                let nullable = col["nullable"].as_bool().unwrap_or(false);
+                let ts_type = pg_type_to_ts_with_array(col_type);
+                if nullable {
+                    out.push_str(&format!("  {col_name}: {ts_type} | null;\n"));
+                } else {
+                    out.push_str(&format!("  {col_name}: {ts_type};\n"));
+                }
+            }
+        }
+
+        out.push_str("}\n\n");
+    }
+
+    out
+}
+
+fn gen_python(tables: &[&Value]) -> String {
+    let mut out = String::from(
+        "# Generated by db9 gen types\n\nfrom typing import TypedDict, Optional, Any\n\n",
+    );
+
+    for table in tables {
+        let table_name = table["name"].as_str().unwrap_or("unknown");
+        let class_name = to_pascal_case(table_name);
+        out.push_str(&format!("class {class_name}(TypedDict):\n"));
+
+        if let Some(columns) = table["columns"].as_array() {
+            if columns.is_empty() {
+                out.push_str("    pass\n");
+            } else {
+                for col in columns {
+                    let col_name = col["name"].as_str().unwrap_or("unknown");
+                    let col_type = col["type"].as_str().unwrap_or("text");
+                    let nullable = col["nullable"].as_bool().unwrap_or(false);
+                    let py_type = pg_type_to_python_with_array(col_type);
+                    if nullable {
+                        out.push_str(&format!("    {col_name}: Optional[{py_type}]\n"));
+                    } else {
+                        out.push_str(&format!("    {col_name}: {py_type}\n"));
+                    }
+                }
+            }
+        } else {
+            out.push_str("    pass\n");
+        }
+
+        out.push('\n');
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1282,5 +1764,98 @@ mod tests {
         let content = "";
         let parsed: toml::Table = content.parse().unwrap();
         assert!(parsed.get("token").is_none());
+    }
+
+    #[test]
+    fn test_to_pascal_case() {
+        assert_eq!(to_pascal_case("user_accounts"), "UserAccounts");
+        assert_eq!(to_pascal_case("users"), "Users");
+        assert_eq!(to_pascal_case("order_line_items"), "OrderLineItems");
+        assert_eq!(to_pascal_case("a"), "A");
+        assert_eq!(to_pascal_case(""), "");
+    }
+
+    #[test]
+    fn test_pg_type_to_ts() {
+        assert_eq!(pg_type_to_ts("integer"), "number");
+        assert_eq!(pg_type_to_ts("bigint"), "number");
+        assert_eq!(pg_type_to_ts("text"), "string");
+        assert_eq!(pg_type_to_ts("boolean"), "boolean");
+        assert_eq!(pg_type_to_ts("jsonb"), "Record<string, unknown>");
+        assert_eq!(pg_type_to_ts("uuid"), "string");
+        assert_eq!(pg_type_to_ts("bytea"), "string");
+        assert_eq!(pg_type_to_ts("interval"), "string");
+        assert_eq!(pg_type_to_ts("timestamp"), "string");
+        assert_eq!(pg_type_to_ts("custom_type"), "unknown");
+    }
+
+    #[test]
+    fn test_pg_type_to_python() {
+        assert_eq!(pg_type_to_python("integer"), "int");
+        assert_eq!(pg_type_to_python("double precision"), "float");
+        assert_eq!(pg_type_to_python("text"), "str");
+        assert_eq!(pg_type_to_python("boolean"), "bool");
+        assert_eq!(pg_type_to_python("jsonb"), "dict");
+        assert_eq!(pg_type_to_python("bytea"), "bytes");
+        assert_eq!(pg_type_to_python("custom_type"), "Any");
+    }
+
+    #[test]
+    fn test_pg_type_to_ts_with_array() {
+        assert_eq!(pg_type_to_ts_with_array("text[]"), "string[]");
+        assert_eq!(pg_type_to_ts_with_array("integer[]"), "number[]");
+        assert_eq!(pg_type_to_ts_with_array("text"), "string");
+    }
+
+    #[test]
+    fn test_pg_type_to_python_with_array() {
+        assert_eq!(pg_type_to_python_with_array("text[]"), "list[str]");
+        assert_eq!(pg_type_to_python_with_array("integer[]"), "list[int]");
+        assert_eq!(pg_type_to_python_with_array("text"), "str");
+    }
+
+    #[test]
+    fn test_gen_typescript() {
+        let table = serde_json::json!({
+            "name": "user_accounts",
+            "schema": "public",
+            "columns": [
+                { "name": "id", "type": "integer", "nullable": false },
+                { "name": "email", "type": "text", "nullable": false },
+                { "name": "bio", "type": "text", "nullable": true },
+                { "name": "tags", "type": "text[]", "nullable": true },
+            ]
+        });
+        let tables = vec![&table];
+        let result = gen_typescript(&tables);
+        assert!(result.contains("// Generated by db9 gen types"));
+        assert!(result.contains("export interface UserAccounts {"));
+        assert!(result.contains("  id: number;"));
+        assert!(result.contains("  email: string;"));
+        assert!(result.contains("  bio: string | null;"));
+        assert!(result.contains("  tags: string[] | null;"));
+    }
+
+    #[test]
+    fn test_gen_python() {
+        let table = serde_json::json!({
+            "name": "user_accounts",
+            "schema": "public",
+            "columns": [
+                { "name": "id", "type": "integer", "nullable": false },
+                { "name": "email", "type": "text", "nullable": false },
+                { "name": "bio", "type": "text", "nullable": true },
+                { "name": "metadata", "type": "jsonb", "nullable": true },
+            ]
+        });
+        let tables = vec![&table];
+        let result = gen_python(&tables);
+        assert!(result.contains("# Generated by db9 gen types"));
+        assert!(result.contains("from typing import TypedDict, Optional, Any"));
+        assert!(result.contains("class UserAccounts(TypedDict):"));
+        assert!(result.contains("    id: int"));
+        assert!(result.contains("    email: str"));
+        assert!(result.contains("    bio: Optional[str]"));
+        assert!(result.contains("    metadata: Optional[dict]"));
     }
 }
