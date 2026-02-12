@@ -316,3 +316,43 @@ DDL-side invalidation (cold path) over per-execution body hash checks (hot path)
 
 ### Verification
 - All 7 CI checks pass
+
+---
+
+# Issue #652 PR 1 — Unified Cast Function with CastContext
+
+## 2026-02-12
+
+### Objective
+Unify `cast_value_to_type()` (explicit casts) and `coerce_value_for_column()` (assignment coercion) into a single `cast(value, target, context)` function with a `CastContext` enum.
+
+### Files
+- NEW: `src/sql/types/cast.rs` — CastContext enum + unified `cast()` function
+- MODIFY: `src/sql/types/mod.rs` — register module
+- MODIFY: `src/sql/expr/mod.rs` — delegate to unified cast, remove moved code
+- MODIFY: `src/sql/value_coercion.rs` — delegate to unified cast, remove moved code
+
+### Key Decisions
+- CastContext: Explicit, Assignment, Implicit (Implicit wired in follow-up PR)
+- 7 divergence points: Float64→Int32, Float64→Int64, Numeric→Int32, Numeric→Int64, Numeric→Float64, Bool→Int32, Int/Float/Numeric→Bool, catch-all
+- `cast_to_bytea()` made `pub(crate)` — used by both `cast()` and `cast_custom_type()`
+- `compare_values()` deferred to follow-up PR
+
+### Implementation (Local)
+
+**Commit**: `8721ac2` on branch `feat/652-unified-cast-context`
+
+**Files changed (4 modified, 1 created):**
+
+1. `src/sql/types/cast.rs` (NEW, 460 lines) — `CastContext` enum, unified `cast()` function, `cast_to_bytea()` (pub(crate)), `round_half_away_from_zero()`, `value_is_compatible_with_column_type()`, 19 unit tests covering all 7 divergence points.
+
+2. `src/sql/types/mod.rs` (+2 lines) — registered `cast` module, re-exported `CastContext`.
+
+3. `src/sql/expr/mod.rs` (-186 lines) — Deleted `round_half_away_from_zero`, `cast_to_bytea`, `cast_value_to_type`. Delegated `cast_value()` to `cast(..., Explicit)`. Widened `parse_interval_string`/`parse_timestamp_string` to `pub(crate)`.
+
+4. `src/sql/value_coercion.rs` (-322 lines) — Replaced entire `coerce_value_for_column` body with single-line delegation to `cast(..., Assignment)`. Deleted `value_is_compatible_with_column_type`.
+
+### Verification
+- `cargo check`: 0 errors, no new warnings
+- `cargo test`: **1140 passed** (1121 existing + 19 new), 0 failed
+- `cargo fmt` / `cargo clippy` / `lint_error_masking.sh`: all clean

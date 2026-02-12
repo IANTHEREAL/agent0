@@ -6,6 +6,7 @@
 //! - `TypeInferrer`: Core type inference logic
 //! - Compatibility API: Drop-in replacement for old `infer_expr_type`
 
+pub(crate) mod cast;
 mod coercion;
 mod context;
 mod error;
@@ -17,6 +18,7 @@ pub use context::TypeContext;
 pub use error::TypeError;
 pub use infer::TypeInferrer;
 
+pub(crate) use cast::CastContext;
 pub(crate) use mapping::{sql_datatype_to_internal, sql_datatype_to_internal_strict};
 
 // Re-exports for tests

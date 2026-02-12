@@ -1059,33 +1059,6 @@ fn similar_to_match(s: &str, pattern: &str, escape_char: Option<char>) -> Result
     Ok(re.is_match(s))
 }
 
-fn round_half_away_from_zero(n: f64) -> f64 {
-    if n >= 0.0 {
-        (n + 0.5).floor()
-    } else {
-        (n - 0.5).ceil()
-    }
-}
-
-fn cast_to_bytea(v: Value) -> Result<Value> {
-    match v {
-        Value::Null => Ok(Value::Null),
-        Value::Bytes(_) => Ok(v),
-        Value::Text(s) => {
-            if let Some(rest) = s.strip_prefix("\\x") {
-                let bytes = hex::decode(rest).map_err(|e| SqlError::InvalidInputSyntax {
-                    type_name: "bytea".into(),
-                    value: e.to_string(),
-                })?;
-                Ok(Value::Bytes(bytes))
-            } else {
-                Ok(Value::Bytes(s.into_bytes()))
-            }
-        }
-        other => Ok(Value::Bytes(other.to_string().into_bytes())),
-    }
-}
-
 fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value> {
     use sqlparser::ast::DataType as SqlType;
 
@@ -1160,158 +1133,7 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
     //     source of truth in mapping.rs, then dispatch on (Value, DataType). ---
 
     let target = crate::sql::types::sql_datatype_to_internal_strict(data_type)?;
-    cast_value_to_type(val, &target)
-}
-
-/// Cast a value to an internal DataType (normalised from SqlType).
-fn cast_value_to_type(val: Value, target: &DataType) -> Result<Value> {
-    match (val, target) {
-        // --- To Boolean ---
-        (Value::Text(s), DataType::Boolean) => match s.trim().to_lowercase().as_str() {
-            "true" | "t" | "yes" | "y" | "1" => Ok(Value::Boolean(true)),
-            "false" | "f" | "no" | "n" | "0" => Ok(Value::Boolean(false)),
-            _ => Err(SqlError::InvalidInputSyntax {
-                type_name: "boolean".into(),
-                value: s.clone(),
-            }
-            .into()),
-        },
-        (Value::Int32(n), DataType::Boolean) => Ok(Value::Boolean(n != 0)),
-        (Value::Int64(n), DataType::Boolean) => Ok(Value::Boolean(n != 0)),
-        (Value::Float64(n), DataType::Boolean) => Ok(Value::Boolean(n != 0.0)),
-        (Value::Numeric(d), DataType::Boolean) => Ok(Value::Boolean(!d.is_zero())),
-
-        // --- To Int32 ---
-        (Value::Text(s), DataType::Int32) => {
-            s.trim().parse::<i32>().map(Value::Int32).map_err(|_| {
-                SqlError::InvalidInputSyntax {
-                    type_name: "integer".into(),
-                    value: s.clone(),
-                }
-                .into()
-            })
-        }
-        (Value::Int64(n), DataType::Int32) => i32::try_from(n)
-            .map(Value::Int32)
-            .map_err(|_| anyhow!("integer out of range")),
-        (Value::Float64(n), DataType::Int32) => {
-            let rounded = round_half_away_from_zero(n);
-            if n.is_nan() || rounded < (i32::MIN as f64) || rounded > (i32::MAX as f64) {
-                return Err(anyhow!("integer out of range"));
-            }
-            Ok(Value::Int32(rounded as i32))
-        }
-        (Value::Numeric(d), DataType::Int32) => {
-            use rust_decimal::prelude::ToPrimitive;
-            use rust_decimal::RoundingStrategy;
-            d.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
-                .to_i32()
-                .map(Value::Int32)
-                .ok_or_else(|| anyhow!("numeric value out of range for integer"))
-        }
-        (Value::Boolean(b), DataType::Int32) => Ok(Value::Int32(if b { 1 } else { 0 })),
-
-        // --- To Int64 ---
-        (Value::Text(s), DataType::Int64) => {
-            s.trim().parse::<i64>().map(Value::Int64).map_err(|_| {
-                SqlError::InvalidInputSyntax {
-                    type_name: "bigint".into(),
-                    value: s.clone(),
-                }
-                .into()
-            })
-        }
-        (Value::Int32(n), DataType::Int64) => Ok(Value::Int64(n as i64)),
-        (Value::Float64(n), DataType::Int64) => {
-            let rounded = round_half_away_from_zero(n);
-            if n.is_nan() || rounded < (i64::MIN as f64) || rounded > (i64::MAX as f64) {
-                return Err(anyhow!("bigint out of range"));
-            }
-            Ok(Value::Int64(rounded as i64))
-        }
-        (Value::Numeric(d), DataType::Int64) => {
-            use rust_decimal::prelude::ToPrimitive;
-            use rust_decimal::RoundingStrategy;
-            d.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
-                .to_i64()
-                .map(Value::Int64)
-                .ok_or_else(|| anyhow!("numeric value out of range for bigint"))
-        }
-
-        // --- To Float64 ---
-        (Value::Text(s), DataType::Float64) => {
-            s.trim().parse::<f64>().map(Value::Float64).map_err(|_| {
-                SqlError::InvalidInputSyntax {
-                    type_name: "double precision".into(),
-                    value: s.clone(),
-                }
-                .into()
-            })
-        }
-        (Value::Int32(n), DataType::Float64) => Ok(Value::Float64(n as f64)),
-        (Value::Int64(n), DataType::Float64) => Ok(Value::Float64(n as f64)),
-        (Value::Numeric(d), DataType::Float64) => {
-            use rust_decimal::prelude::ToPrimitive;
-            d.to_f64()
-                .map(Value::Float64)
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))
-        }
-
-        // --- To Text (all remaining text-like types: Char, Nvarchar, Clob, etc.) ---
-        (v, DataType::Text) => Ok(Value::Text(v.to_string())),
-
-        // --- To Bytes ---
-        (v, DataType::Bytes) => cast_to_bytea(v),
-
-        // --- Temporal ---
-        (Value::Text(s), DataType::Interval) => parse_interval_string(&s),
-        (Value::Text(s), DataType::Date) => {
-            crate::types::date::parse_date_days(&s).map(Value::Date)
-        }
-        (Value::Timestamp(ts), DataType::Date) => {
-            crate::types::date::timestamp_millis_to_date_days(ts).map(Value::Date)
-        }
-        (Value::Date(days), DataType::Date) => Ok(Value::Date(days)),
-        (Value::Text(s), DataType::Timestamp) => parse_timestamp_string(&s),
-        (Value::Date(days), DataType::Timestamp) => {
-            crate::types::date::date_days_to_timestamp_millis(days).map(Value::Timestamp)
-        }
-        (Value::Text(s), DataType::Time) => {
-            use crate::sql::value_coercion::parse_time_string;
-            parse_time_string(&s)
-                .map(Value::Time)
-                .ok_or_else(|| anyhow!("Invalid time format: {}", s))
-        }
-        (Value::Time(micros), DataType::Time) => Ok(Value::Time(micros)),
-
-        // --- UUID ---
-        (Value::Text(s), DataType::Uuid) => {
-            let uuid =
-                uuid::Uuid::parse_str(s.trim()).map_err(|e| anyhow!("Invalid UUID: {}", e))?;
-            Ok(Value::Uuid(*uuid.as_bytes()))
-        }
-        (Value::Uuid(bytes), DataType::Uuid) => Ok(Value::Uuid(bytes)),
-
-        // --- JSON (via SqlType::JSON, not Custom) ---
-        (v, DataType::Json) => {
-            let s = match &v {
-                Value::Text(s) => s.clone(),
-                Value::Json(s) => s.clone(),
-                Value::Jsonb(s) => s.clone(),
-                other => other.to_string(),
-            };
-            serde_json::from_str::<serde_json::Value>(&s).map_err(|e| {
-                SqlError::InvalidInputSyntax {
-                    type_name: "json".into(),
-                    value: e.to_string(),
-                }
-            })?;
-            Ok(Value::Json(s))
-        }
-
-        // --- Identity / pass-through for same-type casts ---
-        (v, _) => Ok(v),
-    }
+    crate::sql::types::cast::cast(val, &target, crate::sql::types::CastContext::Explicit)
 }
 
 /// Cast to NUMERIC with precision/scale from the raw SqlType.
@@ -1397,7 +1219,7 @@ fn cast_custom_type(val: Value, name: &sqlparser::ast::ObjectName) -> Result<Val
                 })?;
                 Ok(Value::Json(s))
             }
-            "BYTEA" => cast_to_bytea(val),
+            "BYTEA" => crate::sql::types::cast::cast_to_bytea(val),
             "JSONB" => {
                 let s = match &val {
                     Value::Text(s) => s.clone(),
@@ -1437,7 +1259,7 @@ fn cast_custom_type(val: Value, name: &sqlparser::ast::ObjectName) -> Result<Val
     }
 }
 
-pub(super) fn parse_interval_string(s: &str) -> Result<Value> {
+pub(crate) fn parse_interval_string(s: &str) -> Result<Value> {
     use crate::types::IntervalValue;
     let s = s.trim().to_lowercase();
     let mut total_months: i32 = 0;
@@ -1472,7 +1294,7 @@ pub(super) fn parse_interval_string(s: &str) -> Result<Value> {
     Ok(Value::Interval(IntervalValue::new(total_months, total_ms)))
 }
 
-pub(super) fn parse_timestamp_string(s: &str) -> Result<Value> {
+pub(crate) fn parse_timestamp_string(s: &str) -> Result<Value> {
     let trimmed = s.trim();
 
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
