@@ -25,6 +25,7 @@ const SYS_NEXT_DATABASE_ID: &[u8] = b"_sys_next_database_id";
 const SYS_FORMAT_VERSION: &[u8] = b"_sys_format_version";
 const SYS_DATABASE_BY_NAME_PREFIX: &[u8] = b"_sys_dbname_";
 const SYS_DATABASE_BY_ID_PREFIX: &[u8] = b"_sys_dbid_";
+const SYS_MIGRATION_PREFIX: &[u8] = b"_sys_migration_";
 
 // === Storage format v2 (database-scoped prefixes) ===
 //
@@ -96,6 +97,17 @@ pub fn encode_database_id_key(db_id: u64) -> Vec<u8> {
 
 pub fn encode_database_id_prefix() -> Vec<u8> {
     SYS_DATABASE_BY_ID_PREFIX.to_vec()
+}
+
+pub fn encode_migration_key(name: &str) -> Vec<u8> {
+    let mut key = Vec::with_capacity(SYS_MIGRATION_PREFIX.len() + name.len());
+    key.extend_from_slice(SYS_MIGRATION_PREFIX);
+    key.extend_from_slice(name.as_bytes());
+    key
+}
+
+pub fn encode_migration_prefix() -> Vec<u8> {
+    SYS_MIGRATION_PREFIX.to_vec()
 }
 
 /// Encode the prefix for all keys belonging to a database (storage format v2).
@@ -961,6 +973,17 @@ mod tests {
         assert_eq!(&key[..2], b"d_");
         assert_eq!(&key[2..10], &1_u64.to_be_bytes());
         assert_eq!(key[10], b'_');
+    }
+
+    #[test]
+    fn test_encode_migration_key() {
+        let key = encode_migration_key("20260212_000001_init");
+        assert_eq!(key, b"_sys_migration_20260212_000001_init".to_vec());
+    }
+
+    #[test]
+    fn test_encode_migration_prefix() {
+        assert_eq!(encode_migration_prefix(), b"_sys_migration_".to_vec());
     }
 
     #[test]

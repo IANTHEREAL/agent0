@@ -3,8 +3,8 @@ use super::kv_stats;
 use crate::extensions::InstalledExtension;
 use crate::txn::{txn_delete, txn_put};
 use crate::types::{
-    DataType, DatabaseDef, FunctionDef, Row, SequenceBacking, SequenceDef, SequenceState,
-    TableSchema, TriggerDef, UserTypeDef, Value, ViewDef,
+    DataType, DatabaseDef, FunctionDef, MigrationRecord, Row, SequenceBacking, SequenceDef,
+    SequenceState, TableSchema, TriggerDef, UserTypeDef, Value, ViewDef,
 };
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
@@ -21,6 +21,7 @@ mod database;
 mod extensions;
 mod functions;
 mod indexes;
+mod migrations;
 mod procedures;
 mod schemas;
 mod sequences;

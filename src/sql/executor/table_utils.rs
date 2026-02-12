@@ -374,6 +374,73 @@ impl Executor {
             return Ok((schema, rows));
         }
 
+        if t_upper == "_PGTIKV_SYS_MIGRATIONS" || t_upper.ends_with("._PGTIKV_SYS_MIGRATIONS") {
+            let migrations = self.store().list_migrations(txn).await?;
+            let schema = TableSchema {
+                table_id: 0,
+                name: table_name.to_string(),
+                columns: vec![
+                    ColumnDef {
+                        name: "name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "applied_at".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "checksum".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                    ColumnDef {
+                        name: "sql_preview".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                        is_serial: false,
+                        default_expr: None,
+                    },
+                ],
+                pk_constraint_name: None,
+                pk_indices: vec![],
+                indexes: vec![],
+                version: 1,
+                check_constraints: vec![],
+                foreign_keys: vec![],
+                owner: String::new(),
+                from_alias: None,
+            };
+
+            let rows = migrations
+                .into_iter()
+                .map(|entry| {
+                    Row::new(vec![
+                        Value::Text(entry.name),
+                        Value::Text(entry.applied_at),
+                        Value::Text(entry.checksum),
+                        Value::Text(entry.sql_preview),
+                    ])
+                })
+                .collect();
+            return Ok((schema, rows));
+        }
+
         if t_upper == "_PGTIKV_SYS_TRIGGER_QUEUE_STATS"
             || t_upper.ends_with("._PGTIKV_SYS_TRIGGER_QUEUE_STATS")
         {
