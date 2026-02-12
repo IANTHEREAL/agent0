@@ -8,7 +8,7 @@ use crate::storage::TikvStore;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, Ident, Query, SelectItem, SetExpr, Value as SqlValue,
+    Expr, FunctionArg, FunctionArgExpr, Ident, Query, SelectItem, SetExpr, Value as SqlValue, With,
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1191,6 +1191,11 @@ pub fn query_has_outer_reference(query: &Query, outer_alias: &str) -> bool {
 ///
 /// Tracks alias shadowing: if a query's FROM clause defines the same name as
 /// `outer_alias`, all substitution within that query scope is skipped.
+///
+/// Per-query CTE scoping: a query's WITH clause is logically outside that
+/// query block's FROM scope, so CTEs are visited *before* FROM-shadow tracking
+/// is applied.  This ensures consistent behavior regardless of entry point
+/// (`substitute_outer_values` vs `substitute_outer_values_in_query`).
 struct SubstituteVisitor<'a> {
     outer_alias: &'a str,
     outer_schema: &'a TableSchema,
@@ -1200,24 +1205,102 @@ struct SubstituteVisitor<'a> {
     shadow_count: usize,
     /// Current query nesting depth (incremented on entering any Query node).
     query_depth: usize,
+    /// Stack of detached WITH clauses, processed before FROM-shadow tracking.
+    stashed_withs: Vec<Option<With>>,
+    /// Stack of detached SetOperation bodies, visited with per-arm shadow tracking.
+    stashed_bodies: Vec<Option<Box<SetExpr>>>,
+}
+
+impl<'a> SubstituteVisitor<'a> {
+    /// Visit a SetExpr tree with per-arm FROM-shadow tracking.
+    ///
+    /// For SetOperation (UNION/INTERSECT/EXCEPT), each arm may independently
+    /// shadow the outer alias in its FROM clause. We visit each arm separately
+    /// with its own shadow_count adjustment.
+    fn visit_set_expr_with_shadows(&mut self, set_expr: &mut SetExpr) {
+        use sqlparser::ast::VisitMut;
+
+        match set_expr {
+            SetExpr::Select(select) => {
+                let shadows = from_clause_shadows_alias(&select.from, self.outer_alias);
+                if shadows {
+                    self.shadow_count += 1;
+                }
+                let _ = set_expr.visit(self);
+                if shadows {
+                    self.shadow_count -= 1;
+                }
+            }
+            SetExpr::SetOperation { left, right, .. } => {
+                self.visit_set_expr_with_shadows(left);
+                self.visit_set_expr_with_shadows(right);
+            }
+            SetExpr::Query(q) => {
+                // Nested Query — the pre/post_visit_query hooks handle it.
+                let _ = q.visit(self);
+            }
+            other => {
+                let _ = other.visit(self);
+            }
+        }
+    }
 }
 
 impl<'a> sqlparser::ast::VisitorMut for SubstituteVisitor<'a> {
     type Break = ();
 
     fn pre_visit_query(&mut self, query: &mut Query) -> core::ops::ControlFlow<Self::Break> {
+        use sqlparser::ast::VisitMut;
+
         self.query_depth += 1;
-        if query_from_shadows_alias(query, self.outer_alias) {
-            self.shadow_count += 1;
+
+        // Detach CTEs so the default traversal skips them.  We visit them now,
+        // *before* applying this query block's FROM-shadow, because WITH is
+        // logically in the outer scope.
+        let mut detached_with = query.with.take();
+        if let Some(ref mut w) = detached_with {
+            for cte in &mut w.cte_tables {
+                let _ = cte.query.visit(self);
+            }
+        }
+        self.stashed_withs.push(detached_with);
+
+        // For SetOperation bodies (UNION/INTERSECT/EXCEPT), each arm may
+        // independently shadow the outer alias, so we visit the body manually
+        // with per-arm shadow tracking.  Detach the body so the default
+        // traversal skips it; reattach in post_visit_query.
+        let is_set_op = matches!(&*query.body, SetExpr::SetOperation { .. });
+        if is_set_op {
+            let mut detached_body = std::mem::replace(
+                &mut query.body,
+                Box::new(SetExpr::Values(sqlparser::ast::Values {
+                    explicit_row: false,
+                    rows: vec![],
+                })),
+            );
+            self.visit_set_expr_with_shadows(&mut detached_body);
+            self.stashed_bodies.push(Some(detached_body));
+        } else {
+            self.stashed_bodies.push(None);
+            // Apply FROM-shadow tracking for simple SELECT bodies.
+            if query_from_shadows_alias(query, self.outer_alias) {
+                self.shadow_count += 1;
+            }
         }
         core::ops::ControlFlow::Continue(())
     }
 
     fn post_visit_query(&mut self, query: &mut Query) -> core::ops::ControlFlow<Self::Break> {
-        if query_from_shadows_alias(query, self.outer_alias) {
+        // Reattach SetOperation body if it was detached, otherwise undo shadow.
+        if let Some(detached_body) = self.stashed_bodies.pop().flatten() {
+            query.body = detached_body;
+        } else if query_from_shadows_alias(query, self.outer_alias) {
             self.shadow_count -= 1;
         }
         self.query_depth -= 1;
+
+        // Reattach the processed CTEs.
+        query.with = self.stashed_withs.pop().flatten();
         core::ops::ControlFlow::Continue(())
     }
 
@@ -1298,6 +1381,8 @@ pub fn substitute_outer_values(
         inner_columns,
         shadow_count: 0,
         query_depth: 0,
+        stashed_withs: Vec::new(),
+        stashed_bodies: Vec::new(),
     };
     let _ = out.visit(&mut visitor);
     out
@@ -1307,6 +1392,9 @@ pub fn substitute_outer_values(
 ///
 /// When `inner_columns` is `Some`, bare `Identifier` references at the
 /// immediate query level (depth 1) are also substituted.
+///
+/// CTE scoping is handled by the visitor itself: each query's WITH clause
+/// is visited before FROM-shadow tracking is applied for that query block.
 pub fn substitute_outer_values_in_query(
     query: &Query,
     outer_alias: &str,
@@ -1317,27 +1405,6 @@ pub fn substitute_outer_values_in_query(
     use sqlparser::ast::VisitMut;
 
     let mut out = query.clone();
-
-    // Process CTEs first, before the main walk.  CTEs live in the outer
-    // scope and must not be affected by alias shadowing in the query's own
-    // FROM clause.  (The old manual traversal substituted CTEs before the
-    // shadow check; we preserve that by extracting them here.)
-    let processed_with = out.with.take().map(|mut w| {
-        for cte in &mut w.cte_tables {
-            let mut cte_visitor = SubstituteVisitor {
-                outer_alias,
-                outer_schema,
-                outer_row,
-                inner_columns: None, // bare-ref substitution not applicable inside CTEs
-                shadow_count: 0,
-                query_depth: 0,
-            };
-            let _ = cte.query.visit(&mut cte_visitor);
-        }
-        w
-    });
-
-    // Visit the rest (body, ORDER BY, LIMIT, …) with shadow tracking.
     let mut visitor = SubstituteVisitor {
         outer_alias,
         outer_schema,
@@ -1345,11 +1412,10 @@ pub fn substitute_outer_values_in_query(
         inner_columns,
         shadow_count: 0,
         query_depth: 0,
+        stashed_withs: Vec::new(),
+        stashed_bodies: Vec::new(),
     };
     let _ = out.visit(&mut visitor);
-
-    // Re-attach the processed CTEs.
-    out.with = processed_with;
     out
 }
 
@@ -1963,48 +2029,54 @@ ORDER BY qs_o.id;
         );
     }
 
-    /// Regression test for #678: substitute_outer_values (expr-entry path)
-    /// must still substitute inside CTEs even when the query body shadows
-    /// the outer alias.
+    /// Same scenario as `test_cte_substituted_even_when_body_shadows_alias`,
+    /// but entered through the expr-entry path (`substitute_outer_values`).
+    /// Before the visitor handled CTE scoping, this path would incorrectly
+    /// suppress substitution inside the CTE.
     #[test]
-    fn test_substitute_outer_values_subquery_cte_not_blocked_by_body_shadowing() {
+    fn test_cte_substitution_via_expr_entry_path() {
         use sqlparser::dialect::PostgreSqlDialect;
         use sqlparser::parser::Parser;
 
-        let sql = "WITH helper AS (SELECT t_outer.id AS oid FROM other_table) \
-                    SELECT helper.oid FROM helper, some_table AS t_outer \
-                    WHERE t_outer.id = helper.oid";
+        let sql = "\
+            WITH helper AS (SELECT t_outer.id AS oid FROM other_table) \
+            SELECT helper.oid FROM helper, some_table AS t_outer \
+            WHERE t_outer.id = helper.oid";
         let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
         let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
             panic!("expected query");
         };
-
+        // Wrap the parsed query in an Expr::Subquery to exercise the
+        // expr-entry path (substitute_outer_values) instead of
+        // substitute_outer_values_in_query.
         let expr = Expr::Subquery(query.clone());
+
         let outer_schema = make_schema(&["id"]);
         let outer_row = Row::new(vec![Value::Int32(77)]);
 
-        let substituted_expr =
-            substitute_outer_values(&expr, "t_outer", &outer_schema, &outer_row);
-        let Expr::Subquery(substituted_query) = substituted_expr else {
-            panic!("expected subquery");
+        let substituted =
+            substitute_outer_values(&expr, "t_outer", &outer_schema, &outer_row, None);
+
+        let Expr::Subquery(ref sub_query) = substituted else {
+            panic!("expected Subquery expr");
         };
 
         // CTE should have `t_outer.id` replaced with 77.
-        let cte_query = &substituted_query.with.as_ref().unwrap().cte_tables[0].query;
+        let cte_query = &sub_query.with.as_ref().unwrap().cte_tables[0].query;
         let cte_sql = cte_query.to_string();
         assert!(
             cte_sql.contains("77"),
             "CTE should have outer ref substituted via expr path: {cte_sql}"
         );
 
-        // Body's WHERE `t_outer.id` should NOT be substituted (shadowed by FROM).
-        let SetExpr::Select(select) = &*substituted_query.body else {
+        // Body's WHERE `t_outer.id` should NOT be substituted (shadowed).
+        let SetExpr::Select(select) = &*sub_query.body else {
             panic!("expected SELECT body");
         };
         let where_sql = select.selection.as_ref().unwrap().to_string();
         assert!(
             where_sql.contains("t_outer.id"),
-            "body WHERE should keep t_outer.id (shadowed): {where_sql}"
+            "body WHERE should keep t_outer.id (shadowed) via expr path: {where_sql}"
         );
     }
 
@@ -2024,7 +2096,7 @@ ORDER BY qs_o.id;
         let outer_row = Row::new(vec![Value::Int32(77)]);
 
         let substituted =
-            substitute_outer_values_in_query(query, "t_outer", &outer_schema, &outer_row);
+            substitute_outer_values_in_query(query, "t_outer", &outer_schema, &outer_row, None);
         let out_sql = substituted.to_string();
 
         // Left arm WHERE keeps `t_outer.id` (inner alias), no literal 77 inserted.
@@ -2044,8 +2116,7 @@ ORDER BY qs_o.id;
         use sqlparser::parser::Parser;
 
         // UNION query: left arm does NOT shadow `t_outer`.
-        let sql =
-            "SELECT t_outer.id FROM other_table WHERE t_outer.id = 5 UNION SELECT 2";
+        let sql = "SELECT t_outer.id FROM other_table WHERE t_outer.id = 5 UNION SELECT 2";
         let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
         let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
             panic!("expected query");
@@ -2055,7 +2126,7 @@ ORDER BY qs_o.id;
         let outer_row = Row::new(vec![Value::Int32(77)]);
 
         let substituted =
-            substitute_outer_values_in_query(query, "t_outer", &outer_schema, &outer_row);
+            substitute_outer_values_in_query(query, "t_outer", &outer_schema, &outer_row, None);
         let out_sql = substituted.to_string();
 
         // Left arm does NOT shadow t_outer, so substitution should happen.

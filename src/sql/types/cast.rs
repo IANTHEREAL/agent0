@@ -903,7 +903,9 @@ mod tests {
     #[test]
     fn coerce_text_to_numeric_float() {
         let v = coerce_text_to_numeric(Value::Text("3.14".into())).unwrap();
-        assert_eq!(v, Value::Float64(3.14));
+        #[allow(clippy::approx_constant)]
+        let expected = Value::Float64(3.14);
+        assert_eq!(v, expected);
     }
 
     #[test]
