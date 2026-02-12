@@ -96,7 +96,7 @@ pub fn array_position(args: Vec<Value>) -> Result<Value> {
         None => return Ok(Value::Null),
     };
     for (i, v) in arr.iter().enumerate() {
-        if crate::sql::expr::compare_values(v, &elem).unwrap_or(1) == 0 {
+        if crate::sql::expr::compare_values(v, &elem)? == 0 {
             return Ok(Value::Int32((i + 1) as i32));
         }
     }
@@ -151,10 +151,12 @@ pub fn array_remove(args: Vec<Value>) -> Result<Value> {
         Some(v) => v,
         None => return Ok(Value::Array(arr)),
     };
-    let result: Vec<Value> = arr
-        .into_iter()
-        .filter(|v| crate::sql::expr::compare_values(v, &elem).unwrap_or(1) != 0)
-        .collect();
+    let mut result = Vec::new();
+    for v in arr {
+        if crate::sql::expr::compare_values(&v, &elem)? != 0 {
+            result.push(v);
+        }
+    }
     Ok(Value::Array(result))
 }
 

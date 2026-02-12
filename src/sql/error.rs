@@ -58,6 +58,9 @@ pub enum SqlError {
         detail: String,
     },
 
+    #[error("numeric value out of range{}", if .detail.is_empty() { String::new() } else { format!(": {}", .detail) })]
+    NumericValueOutOfRange { detail: String },
+
     // Runtime errors
     #[error("Division by zero")]
     DivisionByZero,
@@ -101,6 +104,7 @@ impl SqlError {
             Self::UniqueViolation { .. } => "23505",
             Self::NotNullViolation { .. } => "23502",
             Self::CheckViolation { .. } => "23514",
+            Self::NumericValueOutOfRange { .. } => "22003",
             Self::DivisionByZero => "22012",
             Self::StatementTimeout => "57014",
             Self::LockNotAvailable { .. } => "55P03",

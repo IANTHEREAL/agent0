@@ -93,7 +93,15 @@ pub fn format_type(args: Vec<Value>) -> Result<Value> {
     let oid = match iter.next().unwrap_or(Value::Null) {
         Value::Int32(n) => n as i64,
         Value::Int64(n) => n,
-        Value::Text(s) => s.trim().parse::<i64>().unwrap_or(0),
+        Value::Text(s) => s.trim().parse::<i64>().map_err(|_| {
+            anyhow::anyhow!(
+                "{}",
+                crate::sql::error::SqlError::InvalidInputSyntax {
+                    type_name: "oid".into(),
+                    value: s.trim().to_string(),
+                }
+            )
+        })?,
         Value::Null => return Ok(Value::Null),
         _ => 0,
     };

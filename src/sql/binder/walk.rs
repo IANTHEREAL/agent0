@@ -34,9 +34,7 @@ impl Binder {
             for cte in &with.cte_tables {
                 let cte_name = names::normalize_ident(&cte.alias.name);
 
-                if with.recursive
-                    && Self::cte_body_references_name(&cte.query.body, &cte_name)
-                {
+                if with.recursive && Self::cte_body_references_name(&cte.query.body, &cte_name) {
                     // Recursive self-referencing CTE: name visible in own body.
                     // Add to scope BEFORE walking body → FROM <name> resolves
                     // to the CTE working table, not a real table.
@@ -199,9 +197,7 @@ impl Binder {
             | JoinOperator::RightSemi(c)
             | JoinOperator::LeftAnti(c)
             | JoinOperator::RightAnti(c) => c,
-            JoinOperator::CrossJoin | JoinOperator::CrossApply | JoinOperator::OuterApply => {
-                return
-            }
+            JoinOperator::CrossJoin | JoinOperator::CrossApply | JoinOperator::OuterApply => return,
         };
         match constraint {
             JoinConstraint::On(expr) => self.walk_expr(expr),
@@ -322,9 +318,7 @@ impl Binder {
             // ── Subquery-containing variants ───────────────────
             Expr::Subquery(query) => self.walk_query(query),
             Expr::Exists { subquery, .. } => self.walk_query(subquery),
-            Expr::InSubquery {
-                expr, subquery, ..
-            } => {
+            Expr::InSubquery { expr, subquery, .. } => {
                 self.walk_expr(expr);
                 self.walk_query(subquery);
             }

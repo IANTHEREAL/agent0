@@ -137,23 +137,17 @@ impl Binder {
                 Self::cte_body_references_name(left, cte_name)
                     || Self::cte_body_references_name(right, cte_name)
             }
-            sqlparser::ast::SetExpr::Query(q) => {
-                Self::cte_body_references_name(&q.body, cte_name)
-            }
+            sqlparser::ast::SetExpr::Query(q) => Self::cte_body_references_name(&q.body, cte_name),
             _ => false,
         }
     }
 
-    fn table_factor_has_name(
-        factor: &sqlparser::ast::TableFactor,
-        cte_name: &str,
-    ) -> bool {
+    fn table_factor_has_name(factor: &sqlparser::ast::TableFactor, cte_name: &str) -> bool {
         match factor {
             sqlparser::ast::TableFactor::Table { name, .. } => {
                 if let Some(last) = name.0.last() {
-                    name.0.len() == 1
-                        && names::normalize_ident(last) == cte_name
-                }  else {
+                    name.0.len() == 1 && names::normalize_ident(last) == cte_name
+                } else {
                     false
                 }
             }
@@ -186,11 +180,7 @@ pub(crate) fn extract_dependencies(sql: &str) -> Result<HashSet<RelationDep>> {
 /// Drop-in replacement for the old `view_references_any()` in `ddl.rs`.
 /// Cross-schema unqualified deps are a known limitation until a proper
 /// dependency catalog is implemented (see #666).
-pub(crate) fn view_references_any(
-    view_sql: &str,
-    view_schema: &str,
-    targets: &[String],
-) -> bool {
+pub(crate) fn view_references_any(view_sql: &str, view_schema: &str, targets: &[String]) -> bool {
     let deps = match extract_dependencies(view_sql) {
         Ok(d) => d,
         Err(_) => return false,
@@ -206,9 +196,7 @@ pub(crate) fn view_references_any(
 fn dep_matches_target(dep: &RelationDep, target: &str, view_schema: &str) -> bool {
     let (target_schema, target_name) = target.split_once('.').unwrap_or(("public", target));
     match dep {
-        RelationDep::Qualified { schema, name } => {
-            schema == target_schema && name == target_name
-        }
+        RelationDep::Qualified { schema, name } => schema == target_schema && name == target_name,
         RelationDep::Unqualified { name } => {
             if name != target_name {
                 return false;

@@ -2765,5 +2765,4 @@ mod tests {
         let out = rewrite_check_expr_column("age > 0", "age", "Years", Some('"')).unwrap();
         assert!(out.contains("\"Years\""));
     }
-
 }

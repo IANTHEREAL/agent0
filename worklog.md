@@ -105,3 +105,66 @@ Verified every `#[allow(dead_code)]` item against actual call sites. Major corre
 
 ### Verification
 - 1064 tests pass (27 copy_format tests including 16 new). Zero regressions.
+
+---
+
+# Issue #657: Error Masking Audit
+
+## PR 1: Comparison + Parse (branch: fix/657-error-masking-pr1-comparison-parse)
+**Commits**: `cc3e2c6`, `c383b76` | **PR**: #664
+
+### Changes
+- Added `NumericValueOutOfRange` to SqlError with SQLSTATE 22003
+- Added `sort_by_fallible` utility for fallible sort closures
+- Deleted dead NULLIF/GREATEST/LEAST match arms (expr/mod.rs:501-529)
+- Fixed 13 comparison sites: `compare_values().unwrap_or()` → `?`
+- Changed `compare_order_by_values` → `Result<Ordering>`
+- Fixed 5 `compare_order_by_values` callers
+- Fixed 3 direct `compare_values` sort-closure sites via `sort_by_fallible`
+- Fixed 6 parse sites: `parse().unwrap_or(0)` → proper error propagation
+- Fixed 2 numeric conversion sites
+- Fixed ORDER BY tie-breaker (#666): replaced `unwrap_or(0)` with `match` that skips unorderable columns
+- Added 10 new error path tests (jsonb/vector comparison errors, parse errors, overflow, coercion guard)
+
+### Verification
+- 1116 tests pass (1106 existing + 10 new), 19 files changed
+- `cargo clippy` clean (no new warnings in changed files)
+- Zero `compare_values().unwrap_or()` remaining in production code
+- CI lint (PR 3) compatible
+
+## PR 2: Type Inference Cascade (branch: fix/657-error-masking-pr2-type-inference-cascade)
+**Commit**: `d32f42c`
+
+### Changes
+- Merged `sql_datatype_to_internal` return type → `Result<DataType>` (removed internal `unwrap_or`)
+- Renamed `try_sql_datatype_to_internal` → `sql_datatype_to_internal_strict` (DDL validation path)
+- Changed `infer_expr_type` return: `DataType` → `Result<DataType, TypeError>`
+- Deleted redundant `try_infer_expr_type` and `infer_expr_type_join`
+- Fixed function arg inference: `collect::<Result<Vec<_>, _>>()?`
+- Fixed registry `SameAsArg`/`FirstNonNull`: `unwrap_or` → `?` (returns None)
+- Added `infer_column_types_from_rows()` helper — scans ALL rows for first non-NULL type
+- Replaced 7 first-row-only type inference blocks with `infer_column_types_from_rows()`
+- Added 11 INTENTIONAL markers to document deliberate Text fallbacks
+- Changed 4 function return types in operators.rs to propagate errors
+- Changed `collect_window_funcs_in_expr` → `Result<()>` with `?` on ~15 recursive calls
+- §4.5 (Custom closure signature) deferred — minimal benefit with existing INTENTIONAL markers
+
+### Verification
+- 1106 tests pass, 26 files changed, 371 insertions, 211 deletions
+
+## PR 3: CI Lint (branch: fix/657-error-masking-pr3-ci-lint)
+**Commit**: `a91b363`
+
+### Changes
+- Added `scripts/lint_error_masking.sh` — lint guard to prevent reintroduction of error masking
+- Three rules:
+  1. `unwrap_or(DataType::Text)` without `// INTENTIONAL:` marker (context-aware, 5-line lookback)
+  2. `compare_values()` with `unwrap_or` (should use `?` or `sort_by_fallible`)
+  3. `parse().unwrap_or(0)` without `// INTENTIONAL:` marker
+- Context-aware: checks preceding lines for INTENTIONAL markers and error-construction context
+- Excludes error-message construction sites (Err/anyhow/InvalidCast) — not error masking
+- RFC design used single-line grep; updated to multi-line context check for robustness
+
+### Verification
+- Lint correctly fails on unpatched master (catches all 3 categories)
+- Lint passes on combined PR 1 + PR 2 + PR 3 codebase
