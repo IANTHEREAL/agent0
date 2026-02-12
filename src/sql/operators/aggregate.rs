@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use sqlparser::ast::{Expr, OrderByExpr};
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::{compare_order_by_values, eval_expr};
 use crate::sql::expr::operators::sort_by_fallible;
+use crate::sql::expr::{compare_order_by_values, eval_expr};
 use crate::sql::value_key::{serialize_value_for_key, serialize_values_for_key};
 use crate::sql::Aggregator;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};

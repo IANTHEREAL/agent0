@@ -3,8 +3,8 @@ use async_trait::async_trait;
 use sqlparser::ast::OrderByExpr;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::{compare_order_by_values, eval_expr};
 use crate::sql::expr::operators::sort_by_fallible;
+use crate::sql::expr::{compare_order_by_values, eval_expr};
 use crate::sql::sequences;
 use crate::types::{Row, TableSchema, Value};
 
@@ -311,12 +311,18 @@ mod tests {
         let keys1 = vec![Value::Int32(1)];
         let keys2 = vec![Value::Int32(2)];
 
-        assert_eq!(sort.compare_keys(&keys1, &keys2).unwrap(), std::cmp::Ordering::Less);
+        assert_eq!(
+            sort.compare_keys(&keys1, &keys2).unwrap(),
+            std::cmp::Ordering::Less
+        );
         assert_eq!(
             sort.compare_keys(&keys2, &keys1).unwrap(),
             std::cmp::Ordering::Greater
         );
-        assert_eq!(sort.compare_keys(&keys1, &keys1).unwrap(), std::cmp::Ordering::Equal);
+        assert_eq!(
+            sort.compare_keys(&keys1, &keys1).unwrap(),
+            std::cmp::Ordering::Equal
+        );
     }
 
     #[test]
@@ -342,7 +348,10 @@ mod tests {
             sort.compare_keys(&keys1, &keys2).unwrap(),
             std::cmp::Ordering::Greater
         );
-        assert_eq!(sort.compare_keys(&keys2, &keys1).unwrap(), std::cmp::Ordering::Less);
+        assert_eq!(
+            sort.compare_keys(&keys2, &keys1).unwrap(),
+            std::cmp::Ordering::Less
+        );
     }
 
     #[test]

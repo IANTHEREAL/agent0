@@ -63,3 +63,15 @@ MULTI_MV1=0
 ?column?
 MULTI_MV2=0
 (1 row)
+?column?
+RC_VIEW=1
+(1 row)
+rc_count
+10
+(1 row)
+?column?
+LT_VIEW=0
+(1 row)
+?column?
+NW_VIEW=0
+(1 row)

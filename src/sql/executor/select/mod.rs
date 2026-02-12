@@ -686,7 +686,12 @@ impl Executor {
 
         if has_for_update || has_for_share {
             let planner = PhysicalPlanner::new(search_path.to_vec());
-            let estimated_rows = 1000;
+            let estimated_rows = crate::sql::stats::get_row_count_estimate(
+                self.tenant_keyspace(),
+                db_id,
+                schema.table_id,
+            )
+            .unwrap_or(1000);
 
             if has_skip_locked {
                 // SKIP LOCKED: scan all matching rows in ORDER BY order (no

@@ -615,11 +615,13 @@ fn test_compare_order_by_values_nan() {
     use std::cmp::Ordering;
 
     assert_eq!(
-        compare_order_by_values(&Value::Float64(f64::NAN), &Value::Float64(1.0), true, false).unwrap(),
+        compare_order_by_values(&Value::Float64(f64::NAN), &Value::Float64(1.0), true, false)
+            .unwrap(),
         Ordering::Greater
     );
     assert_eq!(
-        compare_order_by_values(&Value::Float64(1.0), &Value::Float64(f64::NAN), true, false).unwrap(),
+        compare_order_by_values(&Value::Float64(1.0), &Value::Float64(f64::NAN), true, false)
+            .unwrap(),
         Ordering::Less
     );
 
@@ -2194,5 +2196,152 @@ fn test_like_single_byte_escape_accepted() {
     assert_eq!(
         eval_expr(&parse_expr("'a%b' LIKE 'a\\%b' ESCAPE '\\'"), None, None).unwrap(),
         Value::Boolean(true)
+    );
+}
+
+// ── Error path tests for #657 (error masking elimination) ──────────
+//
+// After #657, compare_values() errors propagate via ? instead of being
+// silently swallowed by unwrap_or(0). These tests verify that:
+//   1. Truly incomparable types (jsonb, vector) produce errors that
+//      propagate through GREATEST/LEAST/IN/BETWEEN/CASE.
+//   2. Cross-type comparisons that CAN be coerced (Text vs Int) still work.
+//   3. Parse failures produce errors instead of silent zero.
+
+#[test]
+fn test_greatest_jsonb_vs_int_errors() {
+    // jsonb has no ordering operator — GREATEST must propagate the error
+    let err = eval_expr(
+        &parse_expr("GREATEST('{\"a\":1}'::jsonb, '{\"b\":2}'::jsonb)"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("ordering operator for type jsonb"),
+        "expected jsonb ordering error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_least_jsonb_errors() {
+    let err = eval_expr(
+        &parse_expr("LEAST('{\"a\":1}'::jsonb, '{\"b\":2}'::jsonb)"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("ordering operator for type jsonb"),
+        "expected jsonb ordering error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_nullif_numeric_vs_non_numeric_text_errors() {
+    // Numeric compared to non-numeric text should error
+    let err = eval_expr(&parse_expr("NULLIF(1.5::numeric, 'abc')"), None, None).unwrap_err();
+    assert!(
+        err.to_string().contains("Cannot compare numeric"),
+        "expected numeric comparison error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_in_list_jsonb_errors() {
+    let err = eval_expr(
+        &parse_expr("'{\"a\":1}'::jsonb IN ('{\"b\":2}'::jsonb)"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("ordering operator for type jsonb")
+            || err
+                .to_string()
+                .contains("comparison function for type json"),
+        "expected jsonb comparison error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_between_jsonb_errors() {
+    let err = eval_expr(
+        &parse_expr("'{\"a\":1}'::jsonb BETWEEN '{\"a\":0}'::jsonb AND '{\"a\":9}'::jsonb"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("ordering operator for type jsonb"),
+        "expected jsonb comparison error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_case_when_simple_jsonb_errors() {
+    let err = eval_expr(
+        &parse_expr("CASE '{\"a\":1}'::jsonb WHEN '{\"a\":2}'::jsonb THEN 'match' END"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("ordering operator for type jsonb"),
+        "expected jsonb comparison error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_interval_non_numeric_string_errors() {
+    let err = eval_expr(&parse_expr("INTERVAL 'abc' DAY"), None, None).unwrap_err();
+    assert!(
+        err.to_string().contains("invalid input syntax"),
+        "expected parse error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_compare_values_incompatible_types_error() {
+    // Json/Jsonb cannot be compared to scalars
+    assert!(compare_values(&Value::Json("{}".to_string()), &Value::Int32(1)).is_err());
+    assert!(compare_values(&Value::Jsonb("{}".to_string()), &Value::Int32(1)).is_err());
+    // Vector cannot be compared
+    assert!(compare_values(&Value::Vector(vec![1.0]), &Value::Int32(1)).is_err());
+}
+
+#[test]
+fn test_cross_type_coercion_still_works() {
+    // Text vs Int32 uses string coercion — must still work (not error)
+    assert!(eval_expr(&parse_expr("GREATEST('abc', 123)"), None, None).is_ok());
+    assert!(eval_expr(&parse_expr("LEAST('abc', 123)"), None, None).is_ok());
+    assert!(eval_expr(&parse_expr("NULLIF(123, 'abc')"), None, None).is_ok());
+    assert!(eval_expr(&parse_expr("1 IN ('a', 'b')"), None, None).is_ok());
+    assert!(eval_expr(&parse_expr("1 BETWEEN 'a' AND 'z'"), None, None).is_ok());
+}
+
+#[test]
+fn test_numeric_decimal_overflow_errors() {
+    // Decimal that overflows i64 in modulo operation
+    let err = eval_expr(
+        &parse_expr("99999999999999999999999::numeric % 1"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("numeric value out of range")
+            || msg.contains("out of range")
+            || msg.contains("number too large"),
+        "expected overflow error, got: {}",
+        msg
     );
 }

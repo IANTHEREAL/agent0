@@ -530,20 +530,23 @@ impl Executor {
                 keyed_rows.push((keys, row));
             }
 
-            crate::sql::expr::operators::sort_by_fallible(&mut keyed_rows, |(keys_a, _), (keys_b, _)| {
-                for (i, (_expr, asc, nulls_first)) in order_exprs.iter().enumerate() {
-                    let ordering = crate::sql::expr::compare_order_by_values(
-                        &keys_a[i],
-                        &keys_b[i],
-                        *asc,
-                        *nulls_first,
-                    )?;
-                    if ordering != std::cmp::Ordering::Equal {
-                        return Ok(ordering);
+            crate::sql::expr::operators::sort_by_fallible(
+                &mut keyed_rows,
+                |(keys_a, _), (keys_b, _)| {
+                    for (i, (_expr, asc, nulls_first)) in order_exprs.iter().enumerate() {
+                        let ordering = crate::sql::expr::compare_order_by_values(
+                            &keys_a[i],
+                            &keys_b[i],
+                            *asc,
+                            *nulls_first,
+                        )?;
+                        if ordering != std::cmp::Ordering::Equal {
+                            return Ok(ordering);
+                        }
                     }
-                }
-                Ok(std::cmp::Ordering::Equal)
-            })?;
+                    Ok(std::cmp::Ordering::Equal)
+                },
+            )?;
 
             combined_rows = keyed_rows.into_iter().map(|(_, row)| row).collect();
         }

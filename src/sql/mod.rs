@@ -1,6 +1,7 @@
 //! SQL parsing and execution
 
 mod alter_owner;
+pub(crate) mod binder;
 pub(crate) mod bytea;
 mod catalog_oids;
 mod default_privileges;

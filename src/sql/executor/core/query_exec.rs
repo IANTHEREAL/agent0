@@ -844,7 +844,10 @@ impl Executor {
                 SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
                 _ => continue,
             };
-            if matches!(infer_expr_type(expr, &empty_schema), Ok(DataType::TimestampTz)) {
+            if matches!(
+                infer_expr_type(expr, &empty_schema),
+                Ok(DataType::TimestampTz)
+            ) {
                 column_types[idx] = DataType::TimestampTz;
             }
         }
