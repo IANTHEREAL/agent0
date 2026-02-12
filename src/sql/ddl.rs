@@ -1287,7 +1287,10 @@ async fn resolve_view_deps(
                     let full = format!("{}.{}", schema, name);
                     if store.table_exists(txn, db_id, &full).await?
                         || store.get_view(txn, db_id, &full).await?.is_some()
-                        || store.get_materialized_view(txn, db_id, &full).await?.is_some()
+                        || store
+                            .get_materialized_view(txn, db_id, &full)
+                            .await?
+                            .is_some()
                     {
                         resolved.push(full);
                         found = true;
@@ -1667,9 +1670,7 @@ async fn drop_dependent_views(
             if pending.iter().any(|p| mv.deps.contains(p)) {
                 store.drop_materialized_view(txn, db_id, &full).await?;
                 for trigger in store.list_triggers_for_table(txn, db_id, &full).await? {
-                    let _ = store
-                        .drop_trigger(txn, db_id, &full, &trigger.name)
-                        .await?;
+                    let _ = store.drop_trigger(txn, db_id, &full, &trigger.name).await?;
                 }
                 drop_owned_sequences_for_table(store, txn, db_id, &full).await?;
                 store.drop_table(txn, db_id, &full).await?;

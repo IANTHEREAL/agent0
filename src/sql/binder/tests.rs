@@ -187,4 +187,3 @@ fn values_clause() {
         HashSet::new()
     );
 }
-

@@ -173,4 +173,3 @@ pub(crate) fn extract_dependencies(sql: &str) -> Result<HashSet<RelationDep>> {
     }
     Ok(binder.deps)
 }
-

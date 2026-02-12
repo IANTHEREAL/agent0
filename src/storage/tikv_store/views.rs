@@ -52,8 +52,8 @@ impl TikvStore {
         let key = self.key(&encode_view_key_v2(db_id, name));
         match txn.get(key).await? {
             Some(data) => {
-                let def: ViewDef = bincode::deserialize(&data)
-                    .context("Failed to deserialize view definition")?;
+                let def: ViewDef =
+                    bincode::deserialize(&data).context("Failed to deserialize view definition")?;
                 Ok(Some(def))
             }
             None => Ok(None),

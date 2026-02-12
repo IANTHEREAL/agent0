@@ -18,7 +18,7 @@ use crate::storage::TikvStore;
 use crate::types::TableSchema;
 use crate::types::{Row, TriggerDef};
 use anyhow::Result;
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 use futures::stream::{self, StreamExt};
 use std::collections::HashMap;
 use std::env;
@@ -47,6 +47,7 @@ const DEFAULT_ORPHAN_TIMEOUT_SEC: u64 = 300;
 pub(crate) struct TriggerWorkerConfig {
     pub enabled: bool,
     pub poll_interval_ms: u64,
+    pub idle_grace_ms: u64,
     pub gc_interval_sec: u64,
     pub done_retention_sec: u64,
     pub dlq_retention_days: u64,
@@ -58,9 +59,13 @@ pub(crate) struct TriggerWorkerConfig {
 
 impl Default for TriggerWorkerConfig {
     fn default() -> Self {
+        let poll_interval_ms = DEFAULT_POLL_INTERVAL_MS;
+        // Default idle grace: max(10 * poll_interval, 1000ms) for reasonable buffer.
+        let idle_grace_ms = poll_interval_ms.saturating_mul(10).max(1000);
         Self {
             enabled: true,
-            poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+            poll_interval_ms,
+            idle_grace_ms,
             gc_interval_sec: DEFAULT_GC_INTERVAL_SEC,
             done_retention_sec: DEFAULT_DONE_RETENTION_SEC,
             dlq_retention_days: DEFAULT_DLQ_RETENTION_DAYS,
@@ -93,6 +98,15 @@ impl TriggerWorkerConfig {
                 .ok()
                 .filter(|n| *n > 0)
                 .unwrap_or(cfg.poll_interval_ms);
+            // Recompute idle_grace if poll_interval was overridden.
+            cfg.idle_grace_ms = cfg.poll_interval_ms.saturating_mul(10).max(1000);
+        }
+        if let Ok(v) = env::var("PGTIKV_TRIGGER_IDLE_GRACE_MS") {
+            cfg.idle_grace_ms = v
+                .parse::<u64>()
+                .ok()
+                .filter(|n| *n > 0)
+                .unwrap_or(cfg.idle_grace_ms);
         }
         if let Ok(v) = env::var("PGTIKV_TRIGGER_GC_INTERVAL_SEC") {
             cfg.gc_interval_sec = v
@@ -177,8 +191,9 @@ impl KeyspaceQuota {
 
 pub(crate) struct TriggerWorker {
     worker_id: String,
-    active_keyspaces: DashSet<String>,
-    active_keyspaces_marked_at: DashMap<String, Instant>,
+    // Single authoritative source: keyspace is active iff it has an entry here.
+    // The Instant value is the timestamp when mark_active() was last called.
+    active_keyspaces: DashMap<String, Instant>,
     quotas: DashMap<String, Arc<KeyspaceQuota>>,
     keyspace_backoff: DashMap<String, KeyspaceBackoff>,
     config: TriggerWorkerConfig,
@@ -198,8 +213,7 @@ impl TriggerWorker {
     fn new() -> Self {
         Self {
             worker_id: format!("worker-{}", std::process::id()),
-            active_keyspaces: DashSet::new(),
-            active_keyspaces_marked_at: DashMap::new(),
+            active_keyspaces: DashMap::new(),
             quotas: DashMap::new(),
             keyspace_backoff: DashMap::new(),
             config: TriggerWorkerConfig::from_env(),
@@ -214,19 +228,33 @@ impl TriggerWorker {
     }
 
     pub(crate) fn mark_active(&self, keyspace: &str) {
-        self.active_keyspaces.insert(keyspace.to_string());
-        self.active_keyspaces_marked_at
+        self.active_keyspaces
             .insert(keyspace.to_string(), Instant::now());
         self.wake.notify_one();
     }
 
     pub(crate) fn take_active_keyspaces_snapshot(&self) -> Vec<String> {
-        self.active_keyspaces.iter().map(|r| r.clone()).collect()
+        self.active_keyspaces
+            .iter()
+            .map(|r| r.key().clone())
+            .collect()
     }
 
-    pub(crate) fn remove_active(&self, keyspace: &str) {
-        self.active_keyspaces.remove(keyspace);
-        self.active_keyspaces_marked_at.remove(keyspace);
+    /// Conditionally remove keyspace from active set only if the stored timestamp matches expected_at.
+    /// This prevents clobbering concurrent mark_active() calls (CAS-style operation).
+    pub(crate) fn remove_active_if_unchanged(&self, keyspace: &str, expected_at: Instant) -> bool {
+        use dashmap::mapref::entry::Entry;
+        match self.active_keyspaces.entry(keyspace.to_string()) {
+            Entry::Occupied(entry) => {
+                if *entry.get() == expected_at {
+                    entry.remove();
+                    true
+                } else {
+                    false
+                }
+            }
+            Entry::Vacant(_) => false,
+        }
     }
 
     pub(crate) fn get_quota(&self, keyspace: &str) -> Arc<KeyspaceQuota> {
@@ -348,6 +376,10 @@ impl TriggerWorker {
         let trigger_cache = handle.trigger_cache().clone();
         let stats_cache = handle.stats_cache().clone();
 
+        // Read the current activation timestamp before checking for events.
+        // This establishes the "expected" value for conditional removal.
+        let marked_at = self.active_keyspaces.get(keyspace).map(|v| *v);
+
         // Claim a fair batch (bounded per keyspace).
         let mut txn = store.begin().await?;
         let events = self
@@ -357,22 +389,19 @@ impl TriggerWorker {
             let _ = txn.rollback().await;
             // Nothing pending; stop polling this keyspace until new enqueue.
             //
-            // NOTE: trigger enqueue happens in-transaction and marks the keyspace active before the
-            // enclosing statement commits. The worker can observe the keyspace as active but not see
-            // the uncommitted queue keys yet; if we remove it immediately, the newly-committed event
-            // may be left pending indefinitely (until another enqueue re-activates the keyspace).
+            // Race mitigation (Phase 1):
+            // 1. Use configurable idle_grace derived from poll_interval (default: max(10*poll, 1s))
+            // 2. Only remove if stored timestamp matches the value we read before checking events
+            //    (prevents clobbering concurrent mark_active calls)
             //
-            // Mitigation: keep polling briefly after the last activation so we don't miss events
-            // that commit slightly after activation.
-            let idle_grace = Duration::from_secs(1);
-            let should_remove = self
-                .active_keyspaces_marked_at
-                .get(keyspace)
-                .map(|v| v.elapsed() >= idle_grace)
-                .unwrap_or(true);
-
-            if should_remove {
-                self.remove_active(keyspace);
+            // Root cause: enqueue marks active in-transaction before commit. Worker may poll and see
+            // zero events before the enqueue transaction commits, then remove the keyspace, causing
+            // the committed event to be invisible until next activation.
+            let idle_grace = Duration::from_millis(self.config.idle_grace_ms);
+            if let Some(marked_at_instant) = marked_at {
+                if marked_at_instant.elapsed() >= idle_grace {
+                    self.remove_active_if_unchanged(keyspace, marked_at_instant);
+                }
             }
             return Ok(());
         }
@@ -769,7 +798,10 @@ impl TriggerWorker {
     }
 
     fn list_known_keyspaces(&self) -> Vec<String> {
-        self.active_keyspaces.iter().map(|r| r.clone()).collect()
+        self.active_keyspaces
+            .iter()
+            .map(|r| r.key().clone())
+            .collect()
     }
 
     async fn gc_keyspace(&self, pool: &Arc<TikvClientPool>, keyspace: &str) -> Result<()> {
