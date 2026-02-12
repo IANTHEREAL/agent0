@@ -13,7 +13,7 @@ use crate::services::pd_client::PdClient;
 use crate::services::pg_client::PgClient;
 use crate::{
     tenant_state, AppState, DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USER, DEFAULT_PG_PORT,
-    KEYSPACE_PREFIX, TENANT_ID_LEN,
+    KEYSPACE_PREFIX, OBSERVABILITY_USER, TENANT_ID_LEN,
 };
 
 pub fn router() -> Router<AppState> {
@@ -31,6 +31,10 @@ pub fn router() -> Router<AppState> {
         .route(
             "/databases/:database_id/reset-password",
             post(reset_database_password),
+        )
+        .route(
+            "/databases/:database_id/observability",
+            get(get_database_observability),
         )
 }
 
@@ -614,4 +618,140 @@ pub async fn reset_database_password(
         admin_password: new_password,
         connection_string,
     }))
+}
+
+// ── GET /databases/:database_id/observability ─────────────────
+
+pub async fn get_database_observability(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+    Path(database_id): Path<String>,
+) -> Result<Json<TenantObservabilityResponse>, AppError> {
+    let tenant = db::get_tenant_for_customer(&state.db, &database_id, &auth.customer_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("Database not found"))?;
+
+    let obs_cred = db::get_credential(
+        &state.db,
+        &tenant.id,
+        "OBSERVABILITY",
+        state.config.credential_key.as_deref(),
+    )
+    .await?;
+
+    let obs_cred = match obs_cred {
+        Some(c) => c,
+        None => {
+            let admin_cred = db::get_credential(
+                &state.db,
+                &tenant.id,
+                "admin",
+                state.config.credential_key.as_deref(),
+            )
+            .await?
+            .ok_or_else(|| {
+                AppError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Cannot enable observability: admin credentials not stored. Run 'db9 db reset-password <id>' first.",
+                )
+            })?;
+
+            let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+            let obs_password = generate_password();
+
+            let created = pg
+                .create_user(
+                    &tenant.id,
+                    &admin_cred.username,
+                    &admin_cred.password_plain,
+                    OBSERVABILITY_USER,
+                    &obs_password,
+                    false,
+                )
+                .await;
+
+            if !created {
+                let rotated = pg
+                    .reset_password(
+                        &tenant.id,
+                        &admin_cred.username,
+                        &admin_cred.password_plain,
+                        OBSERVABILITY_USER,
+                        &obs_password,
+                    )
+                    .await;
+                if !rotated {
+                    return Err(AppError::bad_gateway(
+                        "Failed to bootstrap observability account",
+                    ));
+                }
+            }
+
+            db::upsert_credential(
+                &state.db,
+                &tenant.id,
+                "OBSERVABILITY",
+                OBSERVABILITY_USER,
+                &obs_password,
+                state.config.credential_key.as_deref(),
+            )
+            .await?;
+
+            db::get_credential(
+                &state.db,
+                &tenant.id,
+                "OBSERVABILITY",
+                state.config.credential_key.as_deref(),
+            )
+            .await?
+            .ok_or_else(|| {
+                AppError::internal("Failed to read back observer credential after bootstrap")
+            })?
+        }
+    };
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+
+    let summary_val = pg
+        .get_observability_summary(&tenant.id, &obs_cred.username, &obs_cred.password_plain)
+        .await
+        .map_err(|e| {
+            tracing::warn!("observability query failed for tenant {}: {e}", tenant.id);
+            AppError::new(
+                StatusCode::CONFLICT,
+                "Observability query failed: observer credential may be stale. Please retry or contact support.",
+            )
+        })?
+        .ok_or_else(|| AppError::bad_gateway("Failed to fetch observability summary"))?;
+
+    let summary = ObservabilitySummary {
+        window_seconds: summary_val["window_seconds"].as_i64().unwrap_or(0),
+        statement_count: summary_val["statement_count"].as_i64().unwrap_or(0),
+        txn_commit_count: summary_val["txn_commit_count"].as_i64().unwrap_or(0),
+        error_count: summary_val["error_count"].as_i64().unwrap_or(0),
+        qps: summary_val["qps"].as_f64().unwrap_or(0.0),
+        tps: summary_val["tps"].as_f64().unwrap_or(0.0),
+        latency_avg_ms: summary_val["latency_avg_ms"].as_f64().unwrap_or(0.0),
+        latency_p99_ms: summary_val["latency_p99_ms"].as_f64().unwrap_or(0.0),
+        active_connections: summary_val["active_connections"].as_i64().unwrap_or(0),
+    };
+
+    let samples_val = pg
+        .get_observability_samples(&tenant.id, &obs_cred.username, &obs_cred.password_plain)
+        .await;
+
+    let samples: Vec<QuerySample> = samples_val
+        .iter()
+        .map(|s| QuerySample {
+            query: s["query"].as_str().unwrap_or("").to_string(),
+            sample_count: s["sample_count"].as_i64().unwrap_or(0),
+            error_count: s["error_count"].as_i64().unwrap_or(0),
+            latency_avg_ms: s["latency_avg_ms"].as_f64().unwrap_or(0.0),
+            latency_p99_ms: s["latency_p99_ms"].as_f64().unwrap_or(0.0),
+            latency_max_ms: s["latency_max_ms"].as_f64().unwrap_or(0.0),
+            last_seen_ms_ago: s["last_seen_ms_ago"].as_i64().unwrap_or(0),
+        })
+        .collect();
+
+    Ok(Json(TenantObservabilityResponse { summary, samples }))
 }
