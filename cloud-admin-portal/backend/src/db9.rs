@@ -1086,6 +1086,152 @@ async fn cmd_token_revoke(api: &ApiClient, output: &OutputFormat, token_id: &str
     }
 }
 
+async fn cmd_db_sql(
+    api: &ApiClient,
+    output: &OutputFormat,
+    id: &str,
+    query: Option<&str>,
+    file: Option<&str>,
+) {
+    let sql = if let Some(q) = query {
+        q.to_string()
+    } else if let Some(f) = file {
+        std::fs::read_to_string(f).unwrap_or_else(|e| {
+            eprintln!("Failed to read file '{f}': {e}");
+            process::exit(1);
+        })
+    } else {
+        use std::io::Read;
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf).unwrap_or_else(|e| {
+            eprintln!("Failed to read stdin: {e}");
+            process::exit(1);
+        });
+        buf
+    };
+
+    if sql.trim().is_empty() {
+        eprintln!("No SQL provided. Use --query, --file, or pipe via stdin.");
+        process::exit(1);
+    }
+
+    let data = execute_sql(api, id, &sql).await;
+    print_sql_result(&data, output);
+}
+
+async fn cmd_db_users_list(api: &ApiClient, output: &OutputFormat, id: &str) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let data = api
+        .request(
+            "GET",
+            &format!("/customer/databases/{id}/users"),
+            None,
+            Some(&headers),
+        )
+        .await;
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        OutputFormat::Csv => {
+            let items = data.as_array().cloned().unwrap_or_default();
+            print_csv(
+                &items,
+                &[
+                    ("USERNAME", "name", 15),
+                    ("SUPERUSER", "is_superuser", 9),
+                    ("CAN_LOGIN", "can_login", 9),
+                ],
+            );
+        }
+        OutputFormat::Table => {
+            let items = data.as_array().cloned().unwrap_or_default();
+            print_table(
+                &items,
+                &[
+                    ("USERNAME", "name", 15),
+                    ("SUPERUSER", "is_superuser", 9),
+                    ("CAN_LOGIN", "can_login", 9),
+                ],
+            );
+        }
+    }
+}
+
+async fn cmd_db_users_create(
+    api: &ApiClient,
+    output: &OutputFormat,
+    id: &str,
+    username: &str,
+    password: &str,
+) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let body = serde_json::json!({
+        "username": username,
+        "password": password,
+    });
+
+    let data = api
+        .request(
+            "POST",
+            &format!("/customer/databases/{id}/users"),
+            Some(&body),
+            Some(&headers),
+        )
+        .await;
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => {
+            println!("User created successfully!");
+            if let Some(user) = data.get("username").and_then(|v| v.as_str()) {
+                println!("Username: {user}");
+            }
+        }
+    }
+}
+
+async fn cmd_db_users_delete(api: &ApiClient, output: &OutputFormat, id: &str, username: &str) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    let data = api
+        .request(
+            "DELETE",
+            &format!("/customer/databases/{id}/users/{username}"),
+            None,
+            Some(&headers),
+        )
+        .await;
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => println!("User '{username}' deleted."),
+    }
+}
+
+async fn cmd_db_seed(api: &ApiClient, output: &OutputFormat, id: &str, file: &str) {
+    let content = std::fs::read_to_string(file).unwrap_or_else(|e| {
+        eprintln!("Failed to read seed file '{file}': {e}");
+        process::exit(1);
+    });
+
+    let data = execute_sql(api, id, &content).await;
+    
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => {
+            println!("Seed executed successfully.");
+            if let Some(cmd) = data["command"].as_str() {
+                println!("Last command: {cmd}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
