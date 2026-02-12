@@ -110,6 +110,31 @@ enum DbAction {
         #[command(subcommand)]
         action: Option<InspectAction>,
     },
+    /// Execute SQL query against a database
+    Sql {
+        /// Database ID
+        id: String,
+        /// SQL query string
+        #[arg(long, short)]
+        query: Option<String>,
+        /// Path to SQL file
+        #[arg(long, short)]
+        file: Option<String>,
+    },
+    /// Manage database users
+    Users {
+        /// Database ID
+        id: String,
+        #[command(subcommand)]
+        action: UserAction,
+    },
+    /// Execute a seed SQL file
+    Seed {
+        /// Database ID
+        id: String,
+        /// Path to seed SQL file
+        file: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -126,6 +151,35 @@ enum InspectAction {
     Queries,
     /// Show combined summary + queries report
     Report,
+    /// List database schemas
+    Schemas,
+    /// List database tables
+    Tables,
+    /// List database indexes
+    Indexes,
+    /// Show slow queries sorted by p99 latency
+    SlowQueries,
+}
+
+#[derive(Subcommand)]
+enum UserAction {
+    /// List database users
+    List,
+    /// Create a new database user
+    Create {
+        /// Username
+        #[arg(long)]
+        username: String,
+        /// Password
+        #[arg(long)]
+        password: String,
+    },
+    /// Delete a database user
+    Delete {
+        /// Username to delete
+        #[arg(long)]
+        username: String,
+    },
 }
 
 // ── Config helpers ──────────────────────────────────────────────
@@ -250,7 +304,35 @@ async fn main() {
                 Some(InspectAction::Report) => {
                     cmd_db_inspect_report(&api, &cli.effective_output(), id).await
                 }
+                Some(InspectAction::Schemas) => {
+                    cmd_db_inspect_schemas(&api, &cli.effective_output(), id).await
+                }
+                Some(InspectAction::Tables) => {
+                    cmd_db_inspect_tables(&api, &cli.effective_output(), id).await
+                }
+                Some(InspectAction::Indexes) => {
+                    cmd_db_inspect_indexes(&api, &cli.effective_output(), id).await
+                }
+                Some(InspectAction::SlowQueries) => {
+                    cmd_db_inspect_slow_queries(&api, &cli.effective_output(), id).await
+                }
             },
+            DbAction::Sql { id, query, file } => {
+                cmd_db_sql(&api, &cli.effective_output(), id, query.as_deref(), file.as_deref())
+                    .await
+            }
+            DbAction::Users { id, action } => match action {
+                UserAction::List => cmd_db_users_list(&api, &cli.effective_output(), id).await,
+                UserAction::Create { username, password } => {
+                    cmd_db_users_create(&api, &cli.effective_output(), id, username, password).await
+                }
+                UserAction::Delete { username } => {
+                    cmd_db_users_delete(&api, &cli.effective_output(), id, username).await
+                }
+            },
+            DbAction::Seed { id, file } => {
+                cmd_db_seed(&api, &cli.effective_output(), id, file).await
+            }
         },
         Commands::Token { ref action } => match action {
             TokenAction::List => cmd_token_list(&api, &cli.effective_output()).await,
@@ -716,6 +798,218 @@ async fn cmd_db_inspect_report(api: &ApiClient, output: &OutputFormat, id: &str)
             print_inspect_summary(&data, id);
             println!();
             print_inspect_queries(&data);
+        }
+    }
+}
+
+async fn execute_sql(api: &ApiClient, id: &str, sql: &str) -> Value {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+    let body = serde_json::json!({ "query": sql });
+    api.request(
+        "POST",
+        &format!("/customer/databases/{id}/sql"),
+        Some(&body),
+        Some(&headers),
+    )
+    .await
+}
+
+fn print_sql_result(data: &Value, output: &OutputFormat) {
+    let columns = match data["columns"].as_array() {
+        Some(cols) if !cols.is_empty() => cols,
+        _ => {
+            println!("{}", data["command"].as_str().unwrap_or("OK"));
+            return;
+        }
+    };
+    let rows = data["rows"].as_array().map(|r| r.as_slice()).unwrap_or(&[]);
+
+    match output {
+        OutputFormat::Csv => {
+            let header: Vec<&str> = columns
+                .iter()
+                .filter_map(|c| c["name"].as_str())
+                .collect();
+            println!("{}", header.join(","));
+            for row in rows {
+                if let Some(vals) = row.as_array() {
+                    let line: Vec<String> = vals
+                        .iter()
+                        .map(|v| match v {
+                            Value::Null => "".to_string(),
+                            Value::String(s) => {
+                                if s.contains(',') || s.contains('"') || s.contains('\n') {
+                                    format!("\"{}\"", s.replace('"', "\"\""))
+                                } else {
+                                    s.clone()
+                                }
+                            }
+                            other => other.to_string(),
+                        })
+                        .collect();
+                    println!("{}", line.join(","));
+                }
+            }
+        }
+        _ => {
+            let col_names: Vec<String> = columns
+                .iter()
+                .map(|c| c["name"].as_str().unwrap_or("?").to_string())
+                .collect();
+
+            let widths: Vec<usize> = col_names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| {
+                    let max_val = rows
+                        .iter()
+                        .map(|row| {
+                            row.as_array()
+                                .and_then(|arr| arr.get(i))
+                                .map(|v| match v {
+                                    Value::Null => 4,
+                                    Value::String(s) => s.len(),
+                                    other => other.to_string().len(),
+                                })
+                                .unwrap_or(0)
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    name.len().max(max_val).max(4)
+                })
+                .collect();
+
+            let header: String = col_names
+                .iter()
+                .zip(&widths)
+                .map(|(name, w)| format!("{:<width$}", name, width = w))
+                .collect::<Vec<_>>()
+                .join("  ");
+            println!("{header}");
+
+            let sep: String = widths
+                .iter()
+                .map(|w| "─".repeat(*w))
+                .collect::<Vec<_>>()
+                .join("  ");
+            println!("{sep}");
+
+            for row in rows {
+                if let Some(vals) = row.as_array() {
+                    let line: String = vals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, v)| {
+                            let w = widths.get(i).copied().unwrap_or(4);
+                            let s = match v {
+                                Value::Null => "NULL".to_string(),
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            format!("{:<width$}", s, width = w)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("  ");
+                    println!("{line}");
+                }
+            }
+            println!("({} rows)", rows.len());
+        }
+    }
+}
+
+async fn cmd_db_inspect_schemas(api: &ApiClient, output: &OutputFormat, id: &str) {
+    let data = execute_sql(
+        api,
+        id,
+        "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog', 'information_schema') ORDER BY schema_name",
+    )
+    .await;
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => print_sql_result(&data, output),
+    }
+}
+
+async fn cmd_db_inspect_tables(api: &ApiClient, output: &OutputFormat, id: &str) {
+    let data = execute_sql(
+        api,
+        id,
+        "SELECT table_schema, table_name, table_type FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name",
+    )
+    .await;
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => print_sql_result(&data, output),
+    }
+}
+
+async fn cmd_db_inspect_indexes(api: &ApiClient, output: &OutputFormat, id: &str) {
+    let data = execute_sql(
+        api,
+        id,
+        "SELECT schemaname, tablename, indexname, indexdef FROM pg_indexes WHERE schemaname NOT IN ('pg_catalog', 'information_schema') ORDER BY schemaname, tablename, indexname",
+    )
+    .await;
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => print_sql_result(&data, output),
+    }
+}
+
+async fn cmd_db_inspect_slow_queries(api: &ApiClient, output: &OutputFormat, id: &str) {
+    let data = fetch_observability(api, id).await;
+
+    match output {
+        OutputFormat::Json => {
+            let mut samples = data["samples"].as_array().cloned().unwrap_or_default();
+            samples.sort_by(|a, b| {
+                let a_p99 = a["latency_p99_ms"].as_f64().unwrap_or(0.0);
+                let b_p99 = b["latency_p99_ms"].as_f64().unwrap_or(0.0);
+                b_p99.partial_cmp(&a_p99).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            print_json(&Value::Array(samples));
+        }
+        _ => {
+            let mut samples = data["samples"].as_array().cloned().unwrap_or_default();
+            samples.sort_by(|a, b| {
+                let a_p99 = a["latency_p99_ms"].as_f64().unwrap_or(0.0);
+                let b_p99 = b["latency_p99_ms"].as_f64().unwrap_or(0.0);
+                b_p99.partial_cmp(&a_p99).unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            if samples.is_empty() {
+                println!("No slow queries found.");
+                return;
+            }
+
+            println!("Slow Queries (sorted by P99 latency)\n");
+            println!(
+                "{:<45} {:>8} {:>8} {:>8} {:>6}",
+                "Query", "P99(ms)", "Avg(ms)", "Max(ms)", "Count"
+            );
+            println!("{}", "─".repeat(80));
+
+            for s in samples.iter().take(20) {
+                let query = s["query"].as_str().unwrap_or("-");
+                let truncated = if query.len() > 45 {
+                    format!("{}...", &query[..42])
+                } else {
+                    query.to_string()
+                };
+                println!(
+                    "{:<45} {:>8.1} {:>8.1} {:>8.1} {:>6}",
+                    truncated,
+                    s["latency_p99_ms"].as_f64().unwrap_or(0.0),
+                    s["latency_avg_ms"].as_f64().unwrap_or(0.0),
+                    s["latency_max_ms"].as_f64().unwrap_or(0.0),
+                    s["sample_count"].as_i64().unwrap_or(0),
+                );
+            }
         }
     }
 }
