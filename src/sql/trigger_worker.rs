@@ -596,7 +596,7 @@ pub(crate) async fn enqueue_after_triggers(
     }
 
     if queued_any {
-        worker.mark_active(keyspace);
+        executor.schedule_trigger_activation(keyspace);
     }
 
     Ok(())

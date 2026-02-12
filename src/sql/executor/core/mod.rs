@@ -68,9 +68,9 @@ use sqlparser::ast::{
     TransactionIsolationLevel, TransactionMode, Visit, Visitor,
 };
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tikv_client::Transaction;
 use tracing::debug;
@@ -82,6 +82,11 @@ pub struct Executor {
     observability: Arc<TenantObservability>,
     trigger_cache: Arc<TriggerBodyCache>,
     stats_cache: Arc<TableStatsCache>,
+    /// Keyspaces whose trigger workers need activation after the current
+    /// transaction commits.  Accumulated during DML execution (inside the
+    /// transaction) and flushed only on successful commit so that the trigger
+    /// worker never sees uncommitted events.
+    pending_trigger_activations: Mutex<HashSet<String>>,
 }
 
 impl Executor {
@@ -99,6 +104,7 @@ impl Executor {
             observability,
             trigger_cache,
             stats_cache,
+            pending_trigger_activations: Mutex::new(HashSet::new()),
         }
     }
 
@@ -124,5 +130,36 @@ impl Executor {
 
     pub fn stats_cache(&self) -> &Arc<TableStatsCache> {
         &self.stats_cache
+    }
+
+    /// Record a keyspace that needs trigger worker activation.
+    /// Called during DML execution (inside the transaction); the actual
+    /// `mark_active` is deferred until after commit.
+    pub(crate) fn schedule_trigger_activation(&self, keyspace: &str) {
+        self.pending_trigger_activations
+            .lock()
+            .unwrap()
+            .insert(keyspace.to_string());
+    }
+
+    /// Activate trigger workers for all accumulated keyspaces.
+    /// Must be called only after a successful commit.
+    pub(crate) fn flush_trigger_activations(&self) {
+        let keyspaces: Vec<String> = self
+            .pending_trigger_activations
+            .lock()
+            .unwrap()
+            .drain()
+            .collect();
+        for ks in keyspaces {
+            super::super::trigger_worker::trigger_worker().mark_active(&ks);
+        }
+    }
+
+    /// Discard pending activations without notifying trigger workers.
+    /// Called after rollback so that events that were never committed
+    /// don't cause unnecessary worker wake-ups.
+    pub(crate) fn clear_trigger_activations(&self) {
+        self.pending_trigger_activations.lock().unwrap().clear();
     }
 }

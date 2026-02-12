@@ -420,6 +420,11 @@ impl Executor {
                                 "COMMIT"
                             };
                             session.commit().await?;
+                            if tag == "COMMIT" {
+                                self.flush_trigger_activations();
+                            } else {
+                                self.clear_trigger_activations();
+                            }
                             results.push(ExecuteResult::TransactionEnd { tag });
                             continue;
                         }
@@ -447,6 +452,7 @@ impl Executor {
                             savepoint: None, ..
                         } => {
                             session.rollback().await?;
+                            self.clear_trigger_activations();
                             results.push(ExecuteResult::TransactionEnd { tag: "ROLLBACK" });
                             continue;
                         }
@@ -540,6 +546,11 @@ impl Executor {
                                     "COMMIT"
                                 };
                                 session.commit().await?;
+                                if tag == "COMMIT" {
+                                    self.flush_trigger_activations();
+                                } else {
+                                    self.clear_trigger_activations();
+                                }
                                 Ok(vec![ExecuteResult::TransactionEnd { tag }])
                             }
                             Statement::Savepoint { name } => {
@@ -563,6 +574,7 @@ impl Executor {
                                 savepoint: None, ..
                             } => {
                                 session.rollback().await?;
+                                self.clear_trigger_activations();
                                 Ok(vec![ExecuteResult::TransactionEnd { tag: "ROLLBACK" }])
                             }
 	                            Statement::SetRole { role_name, .. } => {
@@ -620,8 +632,10 @@ impl Executor {
                                     if is_autocommit {
                                         if result.is_ok() {
                                             session.commit().await?;
+                                            self.flush_trigger_activations();
                                         } else {
                                             session.rollback().await?;
+                                            self.clear_trigger_activations();
                                         }
                                     }
 
@@ -809,6 +823,7 @@ impl Executor {
                                         // transaction" state. To avoid leaving an open transaction in
                                         // an unknown partial state, abort it on statement timeout.
                                         session.rollback().await?;
+                                        self.clear_trigger_activations();
                                     }
 
                                     if is_autocommit {
@@ -816,8 +831,10 @@ impl Executor {
                                             Ok((notices, result)) => {
                                                 if is_observability_query {
                                                     session.rollback().await?;
+                                                    self.clear_trigger_activations();
                                                 } else {
                                                     session.commit().await?;
+                                                    self.flush_trigger_activations();
                                                 }
                                                 let mut stmt_results = notices;
                                                 stmt_results.push(result);
@@ -825,6 +842,7 @@ impl Executor {
                                             }
                                             Err(err) => {
                                                 session.rollback().await?;
+                                                self.clear_trigger_activations();
                                                 let should_retry = attempt + 1 < max_attempts
                                                     && is_retryable_tikv_error(&err);
                                                 if should_retry {

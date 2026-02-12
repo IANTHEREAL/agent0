@@ -1,4 +1,37 @@
-# Dead Code Detection — Worklog
+# Worklog
+
+## 2026-02-12 — Issue #651 Phase 1: Post-Commit Trigger Activation
+
+### Problem
+`mark_active()` was called **inside** the DML transaction (before commit). If the trigger worker scanned before the transaction committed, it found no events and could deactivate the keyspace, leaving committed events invisible.
+
+### Fix
+Deferred `mark_active()` to **after** successful commit using a `Mutex<HashSet<String>>` accumulator on `Executor`:
+
+1. **`src/sql/executor/core/mod.rs`** — Added `pending_trigger_activations` field and three methods:
+   - `schedule_trigger_activation(keyspace)` — accumulates during DML
+   - `flush_trigger_activations()` — calls `mark_active` after commit
+   - `clear_trigger_activations()` — discards on rollback
+
+2. **`src/sql/trigger_worker.rs`** — Replaced `worker.mark_active(keyspace)` with `executor.schedule_trigger_activation(keyspace)` in `enqueue_after_triggers`
+
+3. **`src/sql/executor/core/dispatch.rs`** — Added post-commit/rollback hooks at all 8 paths:
+   - Observability + regular user explicit COMMIT (with failed-txn→rollback handling)
+   - Observability + regular user explicit ROLLBACK
+   - SET ROLE autocommit success/failure
+   - Statement timeout abort
+   - DML autocommit: observability rollback, success commit, failure rollback
+
+### Design decisions
+- Used `Executor` (not Session) because `enqueue_after_triggers` already takes `&Executor`
+- `std::sync::Mutex` (not tokio) — lock held only for insert/drain/clear, never across await
+- Kept idle grace + CAS mitigation as defense-in-depth
+
+### Verification
+- `cargo check` / `cargo clippy` — no new warnings
+- `grep mark_active` — only called from `flush_trigger_activations` and internal trigger_worker methods
+
+---
 
 ## 2026-02-11
 
@@ -225,3 +258,61 @@ Move process-global caches (`COMPILED_BODY_CACHE`, `TABLE_STATS`) from `static L
 - `cargo test -p pg-tikv`: **1116 passed**, 0 failed
 - `cargo clippy -p pg-tikv`: no new warnings (only pre-existing vendored tikv-client warnings)
 - `cargo fmt -p pg-tikv --check`: clean
+
+---
+
+# Issue #662: Stale Trigger Body Cache After CREATE OR REPLACE FUNCTION
+
+## 2026-02-12
+
+### Problem
+After `CREATE OR REPLACE FUNCTION` modifies a trigger function body, the `TriggerBodyCache` still serves the old compiled body.
+
+### Design Decision
+DDL-side invalidation (cold path) over per-execution body hash checks (hot path). DDL is rare, trigger execution is frequent. Appropriate for greenfield project.
+
+### Implementation
+- Added `TriggerBodyCache::invalidate_db(db_id)` in `src/sql/triggers.rs`
+- Wired into `execute_create_function_cmd` (OR REPLACE) and `execute_drop_function_cmd` in `src/sql/executor/triggers.rs`
+
+### PR
+- PR #671: `fix/662-stale-trigger-body-cache` — squashed to single commit
+
+---
+
+# PR #583 Review + Merge: Trigger Worker Race Condition (#457)
+
+## 2026-02-12
+
+### Changes Reviewed
+- CAS-style `remove_active_if_unchanged()` prevents clobbering concurrent `mark_active()` calls
+- Consolidated `DashSet + DashMap` into single `DashMap<String, Instant>`
+- Configurable `idle_grace_ms` (default: `max(10 * poll_interval, 1000ms)`)
+
+### Merge Work
+- Rebased onto current master (including #650 cache refactor + #667/#668 binder changes)
+- Fixed pre-existing `cargo fmt` issues from #668 merge (5 files: binder/mod.rs, binder/tests.rs, ddl.rs, tikv_store/mod.rs, tikv_store/views.rs)
+- CI all green, squash-merged
+
+### Verification
+- All CI checks pass: lint, test, gorm-smoke, regression-gate, sqlalchemy-smoke
+
+---
+
+# PR #571 Review + Merge: Quarantine Corrupt Trigger Queue Entries (#22)
+
+## 2026-02-12
+
+### Changes Reviewed
+- `TriggerQueueTxn` trait for testable transaction abstraction
+- `quarantine_corrupt_trigger_queue_entry` — moves corrupt entries to DLQ with diagnostics (base64 preview, sha256, decode error)
+- `ClaimEventsResult` — tracks quarantine count for proper commit/rollback in `process_keyspace()`
+- `MemTxn` test mock + 2 thorough tests
+
+### Merge Work
+- Rebased onto latest master (including #583 CAS race fix + #650 cache refactor)
+- Resolved 3 conflicts: imports (kept `DashMap` + added `async_trait`), 2 × error handler (quarantine replaces error log)
+- `cargo check` clean, CI all green, squash-merged
+
+### Verification
+- All 7 CI checks pass
