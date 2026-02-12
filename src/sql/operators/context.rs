@@ -13,7 +13,7 @@ pub struct ExecutionContext<'a> {
     pub search_path: &'a [String],
     pub sequence_values: &'a mut HashMap<String, i64>,
     pub cte_tables: &'a HashMap<String, (TableSchema, Vec<Row>)>,
-    pub query_ctx: Option<&'a QueryContext>,
+    pub query_ctx: &'a QueryContext,
 }
 
 static EMPTY_CTE_MAP: std::sync::LazyLock<HashMap<String, (TableSchema, Vec<Row>)>> =
@@ -26,6 +26,7 @@ impl<'a> ExecutionContext<'a> {
         db_id: u64,
         search_path: &'a [String],
         sequence_values: &'a mut HashMap<String, i64>,
+        query_ctx: &'a QueryContext,
     ) -> Self {
         Self {
             txn,
@@ -34,7 +35,7 @@ impl<'a> ExecutionContext<'a> {
             search_path,
             sequence_values,
             cte_tables: &EMPTY_CTE_MAP,
-            query_ctx: None,
+            query_ctx,
         }
     }
 
@@ -45,6 +46,7 @@ impl<'a> ExecutionContext<'a> {
         search_path: &'a [String],
         sequence_values: &'a mut HashMap<String, i64>,
         cte_tables: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+        query_ctx: &'a QueryContext,
     ) -> Self {
         Self {
             txn,
@@ -53,12 +55,7 @@ impl<'a> ExecutionContext<'a> {
             search_path,
             sequence_values,
             cte_tables,
-            query_ctx: None,
+            query_ctx,
         }
-    }
-
-    pub fn with_query_ctx(mut self, query_ctx: &'a QueryContext) -> Self {
-        self.query_ctx = Some(query_ctx);
-        self
     }
 }

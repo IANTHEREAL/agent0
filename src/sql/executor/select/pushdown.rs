@@ -1,5 +1,6 @@
 use super::analysis::projection_has_window_function;
 use super::*;
+use crate::sql::query_context::QueryContext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct GenerateSeriesOffsetLimitPushdownPlan {
@@ -45,6 +46,7 @@ pub(super) fn generate_series_offset_limit_pushdown_eligible(
 }
 
 pub(super) fn normalize_query_offset_limit_fetch_expressions(query: &Query) -> Query {
+    let qc = QueryContext::from_task_locals();
     let value_to_usize = |v: Value| -> Option<usize> {
         match v {
             Value::Int64(n) if n >= 0 => usize::try_from(n).ok(),
@@ -61,7 +63,7 @@ pub(super) fn normalize_query_offset_limit_fetch_expressions(query: &Query) -> Q
     let mut q = query.clone();
 
     if let Some(offset) = q.offset.as_mut() {
-        if let Ok(v) = eval_expr(&offset.value, None, None) {
+        if let Ok(v) = eval_expr(&offset.value, None, None, &qc) {
             if let Some(n) = value_to_usize(v) {
                 offset.value = Expr::Value(SqlValue::Number(n.to_string(), false));
             }
@@ -69,7 +71,7 @@ pub(super) fn normalize_query_offset_limit_fetch_expressions(query: &Query) -> Q
     }
 
     if let Some(limit) = q.limit.as_mut() {
-        if let Ok(v) = eval_expr(limit, None, None) {
+        if let Ok(v) = eval_expr(limit, None, None, &qc) {
             if let Some(n) = value_to_usize(v) {
                 *limit = Expr::Value(SqlValue::Number(n.to_string(), false));
             }
@@ -78,7 +80,7 @@ pub(super) fn normalize_query_offset_limit_fetch_expressions(query: &Query) -> Q
 
     if let Some(fetch) = q.fetch.as_mut() {
         if let Some(quantity) = fetch.quantity.as_mut() {
-            if let Ok(v) = eval_expr(quantity, None, None) {
+            if let Ok(v) = eval_expr(quantity, None, None, &qc) {
                 if let Some(n) = value_to_usize(v) {
                     *quantity = Expr::Value(SqlValue::Number(n.to_string(), false));
                 }
@@ -101,6 +103,7 @@ pub(super) fn plan_generate_series_offset_limit_pushdown(
         };
     }
 
+    let qc = QueryContext::from_task_locals();
     let value_to_usize = |v: Value| -> Option<usize> {
         match v {
             Value::Int64(n) if n >= 0 => usize::try_from(n).ok(),
@@ -116,14 +119,14 @@ pub(super) fn plan_generate_series_offset_limit_pushdown(
 
     let mut offset = 0usize;
     if let Some(offset_expr) = &query.offset {
-        if let Ok(v) = eval_expr(&offset_expr.value, None, None) {
+        if let Ok(v) = eval_expr(&offset_expr.value, None, None, &qc) {
             offset = value_to_usize(v).unwrap_or(0);
         }
     }
 
     let mut limit_n = usize::MAX;
     if let Some(limit_expr) = &query.limit {
-        if let Ok(v) = eval_expr(limit_expr, None, None) {
+        if let Ok(v) = eval_expr(limit_expr, None, None, &qc) {
             limit_n = value_to_usize(v).unwrap_or(usize::MAX);
         }
     }
@@ -131,7 +134,7 @@ pub(super) fn plan_generate_series_offset_limit_pushdown(
     let mut fetch_n = usize::MAX;
     if let Some(fetch) = &query.fetch {
         if let Some(quantity) = &fetch.quantity {
-            if let Ok(v) = eval_expr(quantity, None, None) {
+            if let Ok(v) = eval_expr(quantity, None, None, &qc) {
                 fetch_n = value_to_usize(v).unwrap_or(1);
             }
         } else {

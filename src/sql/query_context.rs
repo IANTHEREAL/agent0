@@ -37,6 +37,29 @@ impl QueryContext {
             timezone,
         }
     }
+
+    /// Build a QueryContext from task-local storage.
+    ///
+    /// Use this for code paths that don't receive an explicit QueryContext
+    /// (planning phase, triggers, tests, etc.).  During normal query execution
+    /// the task-locals are always populated by the session layer, so the
+    /// returned context is correct.
+    pub fn from_task_locals() -> Self {
+        use crate::sql::expr::{get_connection_id_value, get_current_database_name};
+        use crate::sql::statement_time::{
+            statement_timestamp_millis_or_now, transaction_timestamp_millis,
+        };
+
+        let stmt_ts = statement_timestamp_millis_or_now();
+        let txn_ts = transaction_timestamp_millis().unwrap_or(stmt_ts);
+        Self::new(
+            get_connection_id_value(),
+            get_current_database_name().unwrap_or_else(|| Arc::from("postgres")),
+            stmt_ts,
+            txn_ts,
+            crate::session_context::current_timezone(),
+        )
+    }
 }
 
 #[cfg(test)]

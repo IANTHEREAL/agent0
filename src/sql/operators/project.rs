@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr};
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::eval_expr_with_query_ctx;
+use crate::sql::expr::eval_expr;
 use crate::sql::query_context::QueryContext;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
@@ -57,7 +57,7 @@ fn eval_srf(
     f: &Function,
     input: &Row,
     schema: &TableSchema,
-    query_ctx: Option<&QueryContext>,
+    query_ctx: &QueryContext,
 ) -> Result<Vec<Value>> {
     match kind {
         SrfKind::Unnest => {
@@ -66,7 +66,7 @@ fn eval_srf(
                 _ => None,
             });
             if let Some(arg_expr) = arg_expr {
-                match eval_expr_with_query_ctx(arg_expr, Some(input), Some(schema), query_ctx)? {
+                match eval_expr(arg_expr, Some(input), Some(schema), query_ctx)? {
                     Value::Array(arr) => Ok(arr),
                     Value::Null => Ok(Vec::new()),
                     other => Ok(vec![other]),
@@ -94,14 +94,14 @@ fn eval_srf(
                 ));
             };
 
-            let source_val = eval_expr_with_query_ctx(arg0, Some(input), Some(schema), query_ctx)?;
+            let source_val = eval_expr(arg0, Some(input), Some(schema), query_ctx)?;
             let source = match source_val {
                 Value::Text(s) => Some(s),
                 Value::Null => None,
                 v => Some(v.to_string()),
             };
 
-            let pattern_val = eval_expr_with_query_ctx(arg1, Some(input), Some(schema), query_ctx)?;
+            let pattern_val = eval_expr(arg1, Some(input), Some(schema), query_ctx)?;
             let pattern = match pattern_val {
                 Value::Text(s) => Some(s),
                 Value::Null => None,
@@ -111,8 +111,7 @@ fn eval_srf(
             match (source, pattern) {
                 (Some(source), Some(pattern)) => {
                     let flags = if let Some(arg2) = arg2 {
-                        match eval_expr_with_query_ctx(arg2, Some(input), Some(schema), query_ctx)?
-                        {
+                        match eval_expr(arg2, Some(input), Some(schema), query_ctx)? {
                             Value::Text(s) => s,
                             Value::Null => String::new(),
                             v => v.to_string(),
@@ -158,14 +157,14 @@ fn eval_srf(
                 return Err(anyhow!("regexp_matches requires at least 2 arguments"));
             };
 
-            let source_val = eval_expr_with_query_ctx(arg0, Some(input), Some(schema), query_ctx)?;
+            let source_val = eval_expr(arg0, Some(input), Some(schema), query_ctx)?;
             let source = match source_val {
                 Value::Text(s) => Some(s),
                 Value::Null => None,
                 v => Some(v.to_string()),
             };
 
-            let pattern_val = eval_expr_with_query_ctx(arg1, Some(input), Some(schema), query_ctx)?;
+            let pattern_val = eval_expr(arg1, Some(input), Some(schema), query_ctx)?;
             let pattern = match pattern_val {
                 Value::Text(s) => Some(s),
                 Value::Null => None,
@@ -175,8 +174,7 @@ fn eval_srf(
             match (source, pattern) {
                 (Some(source), Some(pattern)) => {
                     let flags = if let Some(arg2) = arg2 {
-                        match eval_expr_with_query_ctx(arg2, Some(input), Some(schema), query_ctx)?
-                        {
+                        match eval_expr(arg2, Some(input), Some(schema), query_ctx)? {
                             Value::Text(s) => s,
                             Value::Null => String::new(),
                             v => v.to_string(),
@@ -211,7 +209,7 @@ fn eval_srf(
             // JSONB_OBJECT_KEYS, JSONB_ARRAY_ELEMENTS, etc. — eval_expr already
             // returns the array; we just need to unpack it.
             let func_expr = Expr::Function(f.clone());
-            match eval_expr_with_query_ctx(&func_expr, Some(input), Some(schema), query_ctx)? {
+            match eval_expr(&func_expr, Some(input), Some(schema), query_ctx)? {
                 Value::Array(arr) => Ok(arr),
                 Value::Null => Ok(Vec::new()),
                 other => Ok(vec![other]),
@@ -284,12 +282,12 @@ impl ProjectOperator {
         }
     }
 
-    fn project_row(&self, input: &Row, query_ctx: Option<&QueryContext>) -> Result<Row> {
+    fn project_row(&self, input: &Row, query_ctx: &QueryContext) -> Result<Row> {
         let child_schema = self.child.schema();
         let mut values = Vec::with_capacity(self.expressions.len());
 
         for expr in &self.expressions {
-            let value = eval_expr_with_query_ctx(expr, Some(input), Some(child_schema), query_ctx)?;
+            let value = eval_expr(expr, Some(input), Some(child_schema), query_ctx)?;
             values.push(value);
         }
 
@@ -297,11 +295,7 @@ impl ProjectOperator {
     }
 
     /// Project a row that contains SRFs, returning a vector of expanded rows.
-    fn project_row_with_srf(
-        &self,
-        input: &Row,
-        query_ctx: Option<&QueryContext>,
-    ) -> Result<Vec<Row>> {
+    fn project_row_with_srf(&self, input: &Row, query_ctx: &QueryContext) -> Result<Vec<Row>> {
         let child_schema = self.child.schema();
 
         // First, evaluate all expressions and collect SRF outputs.
@@ -318,8 +312,7 @@ impl ProjectOperator {
                 srf_outputs.push((i, outputs));
                 base_values.push(Value::Null); // placeholder
             } else {
-                let value =
-                    eval_expr_with_query_ctx(expr, Some(input), Some(child_schema), query_ctx)?;
+                let value = eval_expr(expr, Some(input), Some(child_schema), query_ctx)?;
                 base_values.push(value);
             }
         }
@@ -543,7 +536,9 @@ mod tests {
             Value::Text("Alice".to_string()),
             Value::Int32(30),
         ]);
-        let result = project.project_row(&input, None).unwrap();
+        let result = project
+            .project_row(&input, &QueryContext::from_task_locals())
+            .unwrap();
 
         assert_eq!(result.values.len(), 1);
         assert_eq!(result.values[0], Value::Text("Alice".to_string()));
@@ -576,7 +571,9 @@ mod tests {
             Value::Text("Alice".to_string()),
             Value::Int32(30),
         ]);
-        let result = project.project_row(&input, None).unwrap();
+        let result = project
+            .project_row(&input, &QueryContext::from_task_locals())
+            .unwrap();
 
         assert_eq!(result.values.len(), 1);
         assert_eq!(result.values[0], Value::Int32(15));
@@ -600,7 +597,9 @@ mod tests {
         let project = ProjectOperator::new(child, expressions, output_names, output_types);
 
         let input = Row::new(vec![Value::Int32(1), Value::Null, Value::Int32(30)]);
-        let result = project.project_row(&input, None).unwrap();
+        let result = project
+            .project_row(&input, &QueryContext::from_task_locals())
+            .unwrap();
 
         assert_eq!(result.values.len(), 2);
         assert_eq!(result.values[0], Value::Int32(1));

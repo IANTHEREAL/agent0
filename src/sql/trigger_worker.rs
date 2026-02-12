@@ -14,6 +14,7 @@ use super::trigger_rewrite::substitute_row_references;
 use crate::observability;
 use crate::pool::TikvClientPool;
 use crate::sql::error::SqlError;
+use crate::sql::query_context::QueryContext;
 use crate::storage::TikvStore;
 use crate::types::TableSchema;
 use crate::types::{Row, TriggerDef};
@@ -1238,6 +1239,7 @@ impl TriggerWorker {
         stmt: &str,
         search_path: &[String],
     ) -> Result<bool> {
+        let qc = QueryContext::from_task_locals();
         let stmt = stmt.trim().trim_end_matches(';').trim();
         let upper = stmt.to_uppercase();
 
@@ -1284,7 +1286,7 @@ impl TriggerWorker {
                                         )
                                         .await?
                                     } else {
-                                        super::expr::eval_expr(&expr, None, None)?
+                                        super::expr::eval_expr(&expr, None, None, &qc)?
                                     };
 
                                     let coerced = super::value_coercion::coerce_value_for_column(

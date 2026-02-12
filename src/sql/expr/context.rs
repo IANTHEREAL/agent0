@@ -64,26 +64,16 @@ pub trait EvalContext {
 
     fn column_type(&self, expr: &Expr) -> Option<&DataType>;
 
-    fn query_context(&self) -> Option<&QueryContext> {
-        None
-    }
+    fn query_context(&self) -> &QueryContext;
 }
 
 pub struct SingleTableContext<'a> {
     row: Option<&'a Row>,
     schema: Option<&'a TableSchema>,
-    query_ctx: Option<&'a QueryContext>,
+    query_ctx: &'a QueryContext,
 }
 
 impl<'a> SingleTableContext<'a> {
-    pub fn new(row: Option<&'a Row>, schema: Option<&'a TableSchema>) -> Self {
-        Self {
-            row,
-            schema,
-            query_ctx: None,
-        }
-    }
-
     pub fn with_query_ctx(
         row: Option<&'a Row>,
         schema: Option<&'a TableSchema>,
@@ -92,16 +82,7 @@ impl<'a> SingleTableContext<'a> {
         Self {
             row,
             schema,
-            query_ctx: Some(query_ctx),
-        }
-    }
-
-    #[allow(dead_code)] // eval context API
-    pub fn empty() -> Self {
-        Self {
-            row: None,
-            schema: None,
-            query_ctx: None,
+            query_ctx,
         }
     }
 
@@ -253,7 +234,7 @@ impl EvalContext for SingleTableContext<'_> {
         }
     }
 
-    fn query_context(&self) -> Option<&QueryContext> {
+    fn query_context(&self) -> &QueryContext {
         self.query_ctx
     }
 }
@@ -263,7 +244,7 @@ pub struct JoinEvalContext<'a> {
     pub merged_column_offsets: Option<&'a HashMap<String, Vec<usize>>>,
     pub combined_row: &'a Row,
     pub combined_schema: &'a TableSchema,
-    pub query_ctx: Option<&'a QueryContext>,
+    pub query_ctx: &'a QueryContext,
 }
 
 impl<'a> JoinEvalContext<'a> {
@@ -272,13 +253,14 @@ impl<'a> JoinEvalContext<'a> {
         merged_column_offsets: Option<&'a HashMap<String, Vec<usize>>>,
         combined_row: &'a Row,
         combined_schema: &'a TableSchema,
+        query_ctx: &'a QueryContext,
     ) -> Self {
         Self {
             column_offsets,
             merged_column_offsets,
             combined_row,
             combined_schema,
-            query_ctx: None,
+            query_ctx,
         }
     }
 }
@@ -439,7 +421,7 @@ impl EvalContext for JoinEvalContext<'_> {
         }
     }
 
-    fn query_context(&self) -> Option<&QueryContext> {
+    fn query_context(&self) -> &QueryContext {
         self.query_ctx
     }
 }
@@ -449,6 +431,11 @@ mod tests {
     use super::*;
     use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
     use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn test_qc() -> QueryContext {
+        QueryContext::new(0, Arc::from("test"), 0, 0, Arc::from("UTC"))
+    }
 
     fn int_col(name: &str) -> ColumnDef {
         ColumnDef {
@@ -478,8 +465,9 @@ mod tests {
 
         let combined_row = Row::new(vec![Value::Int32(1), Value::Int32(2)]);
         let combined_schema = schema(vec![int_col("id"), int_col("id")]);
+        let qc = test_qc();
 
-        let ctx = JoinEvalContext::new(&column_offsets, None, &combined_row, &combined_schema);
+        let ctx = JoinEvalContext::new(&column_offsets, None, &combined_row, &combined_schema, &qc);
         let err = ctx.resolve_column("id").unwrap_err().to_string();
         assert!(err.contains("column reference \"id\" is ambiguous"));
     }
@@ -492,7 +480,8 @@ mod tests {
             ..Default::default()
         };
         let row = Row::new(vec![Value::Int32(5), Value::Int32(1)]);
-        let ctx = SingleTableContext::new(Some(&row), Some(&schema));
+        let qc = test_qc();
+        let ctx = SingleTableContext::with_query_ctx(Some(&row), Some(&schema), &qc);
         assert_eq!(
             ctx.resolve_column("foo").unwrap(),
             Value::Text("(5,1)".to_string())
@@ -507,7 +496,8 @@ mod tests {
             ..Default::default()
         };
         let row = Row::new(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)]);
-        let ctx = SingleTableContext::new(Some(&row), Some(&schema));
+        let qc = test_qc();
+        let ctx = SingleTableContext::with_query_ctx(Some(&row), Some(&schema), &qc);
         assert_eq!(
             ctx.resolve_column("foo").unwrap(),
             Value::Text("(1,2)".to_string())
@@ -522,7 +512,8 @@ mod tests {
             ..Default::default()
         };
         let row = Row::new(vec![Value::Int32(1), Value::Int32(999)]);
-        let ctx = SingleTableContext::new(Some(&row), Some(&schema));
+        let qc = test_qc();
+        let ctx = SingleTableContext::with_query_ctx(Some(&row), Some(&schema), &qc);
         assert_eq!(
             ctx.resolve_column("foo").unwrap(),
             Value::Text("(1)".to_string())
@@ -538,7 +529,8 @@ mod tests {
             ..Default::default()
         };
         let row = Row::new(vec![Value::Int32(1), Value::Int32(2)]);
-        let ctx = SingleTableContext::new(Some(&row), Some(&schema));
+        let qc = test_qc();
+        let ctx = SingleTableContext::with_query_ctx(Some(&row), Some(&schema), &qc);
         // Resolving by alias should work
         assert_eq!(
             ctx.resolve_column("bar").unwrap(),
@@ -560,7 +552,8 @@ mod tests {
             ..Default::default()
         };
         let row = Row::new(vec![Value::Int32(1), Value::Int32(2)]);
-        let ctx = SingleTableContext::new(Some(&row), Some(&schema));
+        let qc = test_qc();
+        let ctx = SingleTableContext::with_query_ctx(Some(&row), Some(&schema), &qc);
         let parts = vec![
             sqlparser::ast::Ident::new("bar"),
             sqlparser::ast::Ident::new("i"),

@@ -768,8 +768,10 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::query_context::QueryContext;
     use crate::types::{ColumnDef, IntervalValue};
     use sqlparser::ast::BinaryOperator;
+    use std::sync::Arc;
 
     fn test_col(name: &str, data_type: DataType) -> ColumnDef {
         ColumnDef {
@@ -848,7 +850,8 @@ mod tests {
             .timestamp_millis();
 
         let right_expr = value_to_sql_expr(&Value::Timestamp(ts1));
-        let right_val = crate::sql::expr::eval_expr(&right_expr, None, None).unwrap();
+        let qc = QueryContext::new(0, Arc::from("test"), 0, 0, Arc::from("UTC"));
+        let right_val = crate::sql::expr::eval_expr(&right_expr, None, None, &qc).unwrap();
 
         let diff = crate::sql::expr::eval_binary_op_public(
             Value::Timestamp(ts2),

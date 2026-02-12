@@ -8,6 +8,7 @@ use super::super::names::normalize_ident;
 use super::super::{parse_sql, ExecuteResult};
 use super::core::Executor;
 use crate::sql::error::SqlError;
+use crate::sql::query_context::QueryContext;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Ident, Query, Statement};
@@ -845,6 +846,8 @@ impl Executor {
     ) -> Result<(TableSchema, Vec<Row>)> {
         use super::super::expr::eval_expr;
 
+        let qc = QueryContext::from_task_locals();
+
         fn extract_expr(arg: &FunctionArg) -> Result<&Expr> {
             match arg {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
@@ -856,10 +859,10 @@ impl Executor {
             return Err(anyhow!("generate_series requires at least 2 arguments"));
         }
 
-        let start_val = eval_expr(extract_expr(&args[0])?, None, None)?;
-        let stop_val = eval_expr(extract_expr(&args[1])?, None, None)?;
+        let start_val = eval_expr(extract_expr(&args[0])?, None, None, &qc)?;
+        let stop_val = eval_expr(extract_expr(&args[1])?, None, None, &qc)?;
         let step_val = if args.len() >= 3 {
-            eval_expr(extract_expr(&args[2])?, None, None)?
+            eval_expr(extract_expr(&args[2])?, None, None, &qc)?
         } else {
             Value::Null
         };

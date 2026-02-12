@@ -12,6 +12,7 @@ use sqlparser::ast::Query;
 
 use super::expr::eval_expr;
 use super::value_key::serialize_values_for_key;
+use crate::sql::query_context::QueryContext;
 #[cfg(test)]
 use crate::types::TableSchema;
 use crate::types::{Row, Value};
@@ -38,13 +39,19 @@ pub fn distinct_on_rows_join_with_indices(
     merged_column_offsets: Option<&std::collections::HashMap<String, Vec<usize>>>,
 ) -> Result<(Vec<Row>, Vec<usize>)> {
     use super::expr::{eval_join_expr, JoinEvalContext};
+    let qc = QueryContext::from_task_locals();
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut result = Vec::new();
     let mut indices = Vec::new();
 
     for (idx, row) in rows.into_iter().enumerate() {
-        let ctx =
-            JoinEvalContext::new(column_offsets, merged_column_offsets, &row, combined_schema);
+        let ctx = JoinEvalContext::new(
+            column_offsets,
+            merged_column_offsets,
+            &row,
+            combined_schema,
+            &qc,
+        );
         let key_values: Vec<Value> = on_exprs
             .iter()
             .map(|expr| eval_join_expr(&ctx, expr))
@@ -71,14 +78,15 @@ pub fn apply_offset_limit_fetch(mut rows: Vec<Row>, query: &Query) -> Vec<Row> {
             _ => None,
         }
     };
+    let qc = QueryContext::from_task_locals();
     if let Some(offset) = &query.offset {
-        if let Ok(v) = eval_expr(&offset.value, None, None) {
+        if let Ok(v) = eval_expr(&offset.value, None, None, &qc) {
             let n = value_to_usize(v).unwrap_or(0);
             rows = rows.into_iter().skip(n).collect();
         }
     }
     if let Some(limit) = &query.limit {
-        if let Ok(v) = eval_expr(limit, None, None) {
+        if let Ok(v) = eval_expr(limit, None, None, &qc) {
             let n = value_to_usize(v).unwrap_or(usize::MAX);
             rows = rows.into_iter().take(n).collect();
         }
@@ -86,7 +94,7 @@ pub fn apply_offset_limit_fetch(mut rows: Vec<Row>, query: &Query) -> Vec<Row> {
 
     if let Some(fetch) = &query.fetch {
         if let Some(quantity) = &fetch.quantity {
-            if let Ok(v) = eval_expr(quantity, None, None) {
+            if let Ok(v) = eval_expr(quantity, None, None, &qc) {
                 let n = value_to_usize(v).unwrap_or(1);
                 rows = rows.into_iter().take(n).collect();
             }

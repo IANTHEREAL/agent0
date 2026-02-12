@@ -23,6 +23,7 @@ use super::super::sequences;
 use super::super::ExecuteResult;
 use super::core::Executor;
 use super::subquery::expr_contains_subquery;
+use crate::sql::query_context::QueryContext;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use sqlparser::ast::Ident;
 
@@ -527,6 +528,7 @@ pub(crate) fn eval_having_expr_for_operators(
     agg_exprs: &[AggregateExpr],
     group_by_count: usize,
 ) -> Result<Value> {
+    let qc = QueryContext::from_task_locals();
     match expr {
         Expr::BinaryOp { left, op, right } => {
             let left_val =
@@ -584,7 +586,7 @@ pub(crate) fn eval_having_expr_for_operators(
                     func_name
                 ));
             }
-            eval_expr(expr, Some(row), Some(schema))
+            eval_expr(expr, Some(row), Some(schema), &qc)
         }
         Expr::Identifier(id) => {
             if let Some(col_idx) = schema.columns.iter().position(|c| c.name == id.value) {
@@ -596,7 +598,7 @@ pub(crate) fn eval_having_expr_for_operators(
                 Err(anyhow!("Column {} not found", id.value))
             }
         }
-        Expr::Value(_) | Expr::TypedString { .. } => eval_expr(expr, Some(row), Some(schema)),
+        Expr::Value(_) | Expr::TypedString { .. } => eval_expr(expr, Some(row), Some(schema), &qc),
         Expr::Cast {
             expr: inner,
             data_type,
@@ -609,9 +611,9 @@ pub(crate) fn eval_having_expr_for_operators(
                 data_type: data_type.clone(),
                 format: format.clone(),
             };
-            eval_expr(&cast_expr, Some(row), Some(schema))
+            eval_expr(&cast_expr, Some(row), Some(schema), &qc)
         }
-        _ => eval_expr(expr, Some(row), Some(schema)),
+        _ => eval_expr(expr, Some(row), Some(schema), &qc),
     }
 }
 
@@ -656,8 +658,9 @@ pub(crate) fn find_matching_aggregate(f: &Function, agg_exprs: &[AggregateExpr])
 }
 
 pub fn extract_limit(query: &Query) -> Option<usize> {
+    let qc = QueryContext::from_task_locals();
     if let Some(limit_expr) = &query.limit {
-        if let Ok(v) = eval_expr(limit_expr, None, None) {
+        if let Ok(v) = eval_expr(limit_expr, None, None, &qc) {
             return match v {
                 Value::Int64(n) if n >= 0 => Some(n as usize),
                 Value::Int32(n) if n >= 0 => Some(n as usize),
@@ -673,7 +676,7 @@ pub fn extract_limit(query: &Query) -> Option<usize> {
     }
     if let Some(fetch) = &query.fetch {
         if let Some(quantity) = &fetch.quantity {
-            if let Ok(v) = eval_expr(quantity, None, None) {
+            if let Ok(v) = eval_expr(quantity, None, None, &qc) {
                 return match v {
                     Value::Int64(n) if n >= 0 => Some(n as usize),
                     Value::Int32(n) if n >= 0 => Some(n as usize),
@@ -694,8 +697,9 @@ pub fn extract_limit(query: &Query) -> Option<usize> {
 }
 
 pub fn extract_offset(query: &Query) -> usize {
+    let qc = QueryContext::from_task_locals();
     if let Some(offset) = &query.offset {
-        if let Ok(v) = eval_expr(&offset.value, None, None) {
+        if let Ok(v) = eval_expr(&offset.value, None, None, &qc) {
             return match v {
                 Value::Int64(n) if n >= 0 => n as usize,
                 Value::Int32(n) if n >= 0 => n as usize,
@@ -1525,6 +1529,7 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
         preloaded_source: Option<BoxedOperator>,
     ) -> Result<ExecuteResult> {
+        let qc = QueryContext::from_task_locals();
         let (mut group_by_exprs, mut group_by_names, mut group_by_types) =
             Self::extract_group_by_info(group_by, &schema)?;
         let (mut agg_exprs, mut agg_names, mut agg_types) =
@@ -1858,7 +1863,7 @@ impl Executor {
             for row in &rows {
                 let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
                 for expr in &projection_exprs {
-                    let val = eval_expr(expr, Some(row), Some(&agg_output_schema))?;
+                    let val = eval_expr(expr, Some(row), Some(&agg_output_schema), &qc)?;
                     values.push(val);
                 }
                 projected_rows.push(Row::new(values));
@@ -1911,6 +1916,7 @@ impl Executor {
         preloaded_rows: Option<Vec<Row>>,
     ) -> Result<ExecuteResult> {
         use super::select::order::expr_matches;
+        let qc = QueryContext::from_task_locals();
 
         // Collect the union of all group-by columns across all grouping sets.
         let all_group_cols: Vec<Expr> = {
@@ -1969,7 +1975,7 @@ impl Executor {
         } else if let Some(filter_expr) = filter {
             let mut out = Vec::new();
             for row in base_rows {
-                let val = eval_expr(filter_expr, Some(&row), Some(&schema))?;
+                let val = eval_expr(filter_expr, Some(&row), Some(&schema), &qc)?;
                 let val = coerce_text_literal_to_bool(filter_expr, val)?;
                 match val {
                     Value::Boolean(true) => out.push(row),
@@ -2206,6 +2212,7 @@ impl Executor {
                                     &Expr::Identifier(Ident::new(col.name.clone())),
                                     Some(row),
                                     Some(&agg_output_schema),
+                                    &qc,
                                 )?;
                                 values.push(val);
                             }
@@ -2256,7 +2263,7 @@ impl Executor {
                     } else {
                         rewrite_agg_refs_to_columns(col_expr, &agg_column_map, &gb_names)
                     };
-                    let val = eval_expr(&rewritten, Some(row), Some(&agg_output_schema))?;
+                    let val = eval_expr(&rewritten, Some(row), Some(&agg_output_schema), &qc)?;
                     values.push(val);
                 }
 
@@ -2328,6 +2335,7 @@ impl Executor {
         left_preloaded: Option<Vec<Row>>,
         right_preloaded: Option<Vec<Row>>,
     ) -> Result<ExecuteResult> {
+        let qc = QueryContext::from_task_locals();
         let mut combined_columns: Vec<ColumnDef> = Vec::new();
         for col in &left_schema.columns {
             combined_columns.push(ColumnDef {
@@ -2639,7 +2647,7 @@ impl Executor {
                             row.values.get(*idx).cloned().unwrap_or(Value::Null)
                         }
                         ProjectionSource::Expr(expr) => {
-                            eval_expr(expr, Some(&row), Some(&combined_schema))?
+                            eval_expr(expr, Some(&row), Some(&combined_schema), &qc)?
                         }
                     };
                     values.push(val);
@@ -2711,7 +2719,7 @@ impl Executor {
                         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
                         _ => continue,
                     };
-                    let val = eval_expr(expr, Some(&row), Some(&combined_schema))?;
+                    let val = eval_expr(expr, Some(&row), Some(&combined_schema), &qc)?;
                     values.push(val);
                 }
                 projected.push(Row::new(values));
@@ -2743,6 +2751,7 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
         preloaded_source: Option<BoxedOperator>,
     ) -> Result<ExecuteResult> {
+        let qc = QueryContext::from_task_locals();
         let planner = PhysicalPlanner::new(search_path.to_vec());
 
         let is_wildcard_only = projection.iter().all(|item| {
@@ -3203,7 +3212,7 @@ impl Executor {
             for row in raw_rows {
                 let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
                 for expr in &projection_exprs {
-                    values.push(eval_expr(expr, Some(&row), Some(&schema))?);
+                    values.push(eval_expr(expr, Some(&row), Some(&schema), &qc)?);
                 }
                 rows.push(Row::new(values));
             }
@@ -3899,6 +3908,7 @@ impl Executor {
         rows: Vec<Row>,
     ) -> Result<(Vec<String>, Vec<DataType>, Vec<Row>)> {
         use crate::types::ColumnDef;
+        let qc = QueryContext::from_task_locals();
 
         let mut window_columns: Vec<ColumnDef> = schema
             .columns
@@ -3983,7 +3993,7 @@ impl Executor {
         for row in rows {
             let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
             for expr in &projection_exprs {
-                values.push(eval_expr(expr, Some(&row), Some(&window_schema))?);
+                values.push(eval_expr(expr, Some(&row), Some(&window_schema), &qc)?);
             }
             projected_rows.push(Row::new(values));
         }

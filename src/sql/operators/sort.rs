@@ -104,7 +104,7 @@ impl SortOperator {
                 )
                 .await?
             } else {
-                eval_expr(&order_expr.expr, Some(row), Some(schema))?
+                eval_expr(&order_expr.expr, Some(row), Some(schema), ctx.query_ctx)?
             };
             keys.push(value);
         }

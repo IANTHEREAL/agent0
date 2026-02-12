@@ -11,20 +11,7 @@ use crate::types::Row;
 use crate::types::TableSchema;
 
 fn build_query_ctx_from_task_locals() -> QueryContext {
-    use crate::sql::expr::{get_connection_id_value, get_current_database_name};
-    use crate::sql::statement_time::{
-        statement_timestamp_millis_or_now, transaction_timestamp_millis,
-    };
-
-    let stmt_ts = statement_timestamp_millis_or_now();
-    let txn_ts = transaction_timestamp_millis().unwrap_or(stmt_ts);
-    QueryContext::new(
-        get_connection_id_value(),
-        get_current_database_name().unwrap_or_else(|| Arc::from("postgres")),
-        stmt_ts,
-        txn_ts,
-        crate::session_context::current_timezone(),
-    )
+    QueryContext::from_task_locals()
 }
 
 pub async fn execute_operator_tree(
@@ -36,8 +23,7 @@ pub async fn execute_operator_tree(
     sequence_values: &mut HashMap<String, i64>,
 ) -> Result<Vec<Row>> {
     let qc = build_query_ctx_from_task_locals();
-    let mut ctx =
-        ExecutionContext::new(txn, store, db_id, search_path, sequence_values).with_query_ctx(&qc);
+    let mut ctx = ExecutionContext::new(txn, store, db_id, search_path, sequence_values, &qc);
 
     operator.open(&mut ctx).await?;
 
@@ -61,9 +47,15 @@ pub async fn execute_operator_tree_with_ctes(
     cte_tables: &HashMap<String, (TableSchema, Vec<Row>)>,
 ) -> Result<Vec<Row>> {
     let qc = build_query_ctx_from_task_locals();
-    let mut ctx =
-        ExecutionContext::with_ctes(txn, store, db_id, search_path, sequence_values, cte_tables)
-            .with_query_ctx(&qc);
+    let mut ctx = ExecutionContext::with_ctes(
+        txn,
+        store,
+        db_id,
+        search_path,
+        sequence_values,
+        cte_tables,
+        &qc,
+    );
 
     operator.open(&mut ctx).await?;
 

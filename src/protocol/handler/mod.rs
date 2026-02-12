@@ -812,11 +812,12 @@ fn try_parse_fs9_mode_from_args(args: &[FunctionArg]) -> Option<crate::extension
         return None;
     }
 
+    let qc = crate::sql::query_context::QueryContext::from_task_locals();
     let path_expr = match &args[0] {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
         _ => return None,
     };
-    let path = match eval_expr(path_expr, None, None).ok()? {
+    let path = match eval_expr(path_expr, None, None, &qc).ok()? {
         Value::Text(s) => s,
         _ => return None,
     };
@@ -835,7 +836,7 @@ fn try_parse_fs9_mode_from_args(args: &[FunctionArg]) -> Option<crate::extension
                 ..
             } => {
                 let param_name = name.value.to_ascii_lowercase();
-                let val = eval_expr(e, None, None).ok()?;
+                let val = eval_expr(e, None, None, &qc).ok()?;
                 match param_name.as_str() {
                     "format" => match val {
                         Value::Text(s) => format = Some(s),

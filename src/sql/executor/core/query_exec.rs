@@ -1,6 +1,7 @@
 //! Query execution helpers
 
 use super::*;
+use crate::sql::query_context::QueryContext;
 
 impl Executor {
     pub(crate) async fn eval_expr_maybe_sequence(
@@ -13,6 +14,7 @@ impl Executor {
         row: Option<&Row>,
         schema: Option<&TableSchema>,
     ) -> Result<Value> {
+        let qc = QueryContext::from_task_locals();
         if sequences::expr_needs_async_eval(expr) {
             sequences::eval_expr_with_sequences(
                 &self.store,
@@ -26,7 +28,7 @@ impl Executor {
             )
             .await
         } else {
-            crate::sql::expr::eval_expr(expr, row, schema)
+            crate::sql::expr::eval_expr(expr, row, schema, &qc)
         }
     }
 

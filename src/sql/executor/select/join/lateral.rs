@@ -2,6 +2,7 @@ use super::super::*;
 use super::table_factor::extract_virtual_table_filter;
 use super::using_merge::{rewrite_for_using_join, UsingMergeColumn};
 use crate::sql::error::SqlError;
+use crate::sql::query_context::QueryContext;
 
 fn eval_bool_expr(
     expr: &Expr,
@@ -9,7 +10,8 @@ fn eval_bool_expr(
     schema: &TableSchema,
     err_msg: &'static str,
 ) -> Result<bool> {
-    let value = eval_expr(expr, Some(row), Some(schema))?;
+    let qc = QueryContext::from_task_locals();
+    let value = eval_expr(expr, Some(row), Some(schema), &qc)?;
     let value = coerce_text_literal_to_bool(expr, value)?;
     match value {
         Value::Boolean(b) => Ok(b),
@@ -64,6 +66,8 @@ impl Executor {
     ) -> Result<ExecuteResult> {
         use crate::sql::executor::subquery::substitute_outer_values_in_query;
         use crate::types::ColumnDef;
+
+        let qc = QueryContext::from_task_locals();
 
         let virtual_filter = resolved_selection
             .map(extract_virtual_table_filter)
@@ -523,7 +527,7 @@ impl Executor {
                         )
                         .await?
                     } else {
-                        eval_expr(expr, Some(&row), Some(&combined_schema))?
+                        eval_expr(expr, Some(&row), Some(&combined_schema), &qc)?
                     };
                     keys.push(value);
                 }
@@ -598,7 +602,7 @@ impl Executor {
                         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
                         _ => continue,
                     };
-                    let val = eval_expr(expr, Some(row), Some(&combined_schema))?;
+                    let val = eval_expr(expr, Some(row), Some(&combined_schema), &qc)?;
                     values.push(val);
                 }
                 projected.push(Row::new(values));

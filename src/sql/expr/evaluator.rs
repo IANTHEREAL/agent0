@@ -1243,7 +1243,9 @@ fn eval_overlay_with_context<C: EvalContext>(
 #[cfg(test)]
 mod tests {
     use super::super::eval_expr;
+    use crate::sql::query_context::QueryContext;
     use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue};
+    use std::sync::Arc;
 
     #[test]
     fn test_and_short_circuit_errors_on_case_text_branches() {
@@ -1269,10 +1271,15 @@ mod tests {
             right: Box::new(make_case()),
         };
 
-        let false_err = eval_expr(&false_and, None, None).unwrap_err().to_string();
+        let qc = QueryContext::new(0, Arc::from("test"), 0, 0, Arc::from("UTC"));
+        let false_err = eval_expr(&false_and, None, None, &qc)
+            .unwrap_err()
+            .to_string();
         assert_eq!(false_err, "AND requires boolean operands");
 
-        let true_err = eval_expr(&true_and, None, None).unwrap_err().to_string();
+        let true_err = eval_expr(&true_and, None, None, &qc)
+            .unwrap_err()
+            .to_string();
         assert_eq!(true_err, "AND requires boolean operands");
     }
 }

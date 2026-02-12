@@ -26,6 +26,7 @@ use super::operators::{
 use super::subquery::{expr_contains_subquery, substitute_outer_values};
 use crate::sql::error::SqlError;
 use crate::sql::information_schema::VirtualTableFilter;
+use crate::sql::query_context::QueryContext;
 #[allow(unused_imports)] // Re-exported for join sub-modules via glob import
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
@@ -109,6 +110,7 @@ impl Executor {
         query: &Query,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
+        let qc = QueryContext::from_task_locals();
         if let SetExpr::SetOperation {
             op,
             set_quantifier,
@@ -561,7 +563,7 @@ impl Executor {
                 if let Some(ref safe) = safe_parts {
                     let mut filtered = Vec::new();
                     for row in rows {
-                        let val = eval_expr(safe, Some(&row), Some(&schema))?;
+                        let val = eval_expr(safe, Some(&row), Some(&schema), &qc)?;
                         let val = coerce_text_literal_to_bool(safe, val)?;
                         if matches!(val, Value::Boolean(true)) {
                             filtered.push(row);

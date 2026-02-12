@@ -18,6 +18,7 @@ use super::names::normalize_ident;
 use super::plpgsql;
 use super::value_coercion::value_to_sql_expr;
 use super::ExecuteResult;
+use crate::sql::query_context::QueryContext;
 
 pub(crate) fn expr_uses_sequence_functions(expr: &Expr) -> bool {
     use core::ops::ControlFlow;
@@ -255,7 +256,8 @@ pub(crate) fn find_owned_sequence_full_name(
 }
 
 fn eval_i64(expr: &Expr) -> Result<i64> {
-    match eval_expr(expr, None, None)? {
+    let qc = QueryContext::from_task_locals();
+    match eval_expr(expr, None, None, &qc)? {
         crate::types::Value::Int32(n) => Ok(n as i64),
         crate::types::Value::Int64(n) => Ok(n),
         crate::types::Value::Float64(n) => Ok(n as i64),
@@ -663,8 +665,9 @@ pub(crate) async fn eval_expr_with_sequences(
     row: Option<&crate::types::Row>,
     schema: Option<&crate::types::TableSchema>,
 ) -> Result<crate::types::Value> {
+    let qc = QueryContext::from_task_locals();
     if !expr_needs_async_eval(expr) {
-        return eval_expr(expr, row, schema);
+        return eval_expr(expr, row, schema, &qc);
     }
     let rewritten = replace_sequence_functions(
         store,
@@ -677,7 +680,7 @@ pub(crate) async fn eval_expr_with_sequences(
         schema,
     )
     .await?;
-    eval_expr(&rewritten, row, schema)
+    eval_expr(&rewritten, row, schema, &qc)
 }
 
 pub(crate) async fn eval_expr_join_with_sequences(
@@ -716,6 +719,7 @@ pub(crate) fn replace_sequence_functions<'a>(
     schema: Option<&'a crate::types::TableSchema>,
 ) -> Pin<Box<dyn Future<Output = Result<Expr>> + Send + 'a>> {
     Box::pin(async move {
+        let qc = QueryContext::from_task_locals();
         match expr {
             Expr::Function(func) => {
                 let name = function_name_upper(func);
@@ -730,7 +734,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                             txn,
                             db_id,
                             search_path,
-                            eval_expr(arg0, row, schema)?,
+                            eval_expr(arg0, row, schema, &qc)?,
                         )
                         .await?;
                         let val = store.nextval_sequence(txn, db_id, &full_name).await?;
@@ -744,7 +748,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                             txn,
                             db_id,
                             search_path,
-                            eval_expr(arg0, row, schema)?,
+                            eval_expr(arg0, row, schema, &qc)?,
                         )
                         .await?;
                         if store.get_sequence(txn, db_id, &full_name).await?.is_none() {
@@ -770,10 +774,10 @@ pub(crate) fn replace_sequence_functions<'a>(
                             txn,
                             db_id,
                             search_path,
-                            eval_expr(arg0, row, schema)?,
+                            eval_expr(arg0, row, schema, &qc)?,
                         )
                         .await?;
-                        let val = eval_expr(arg1, row, schema)?;
+                        let val = eval_expr(arg1, row, schema, &qc)?;
                         let value_i64 = match val {
                             crate::types::Value::Int32(n) => n as i64,
                             crate::types::Value::Int64(n) => n,
@@ -788,7 +792,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         };
                         let is_called = if func.args.len() >= 3 {
                             let arg2 = extract_arg_expr(&func.args, 2)?;
-                            match eval_expr(arg2, row, schema)? {
+                            match eval_expr(arg2, row, schema, &qc)? {
                                 crate::types::Value::Boolean(b) => b,
                                 crate::types::Value::Text(s) => {
                                     matches!(
@@ -820,7 +824,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                                 )));
                             }
                         };
-                        let oid_val = eval_expr(arg0, row, schema)?;
+                        let oid_val = eval_expr(arg0, row, schema, &qc)?;
                         let Some(oid) = value_to_i64(&oid_val) else {
                             return Ok(value_to_sql_expr(&Value::Text("CREATE INDEX".to_string())));
                         };
@@ -870,7 +874,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                                         schema,
                                     )
                                     .await?;
-                                    if let Ok(val) = eval_expr(&resolved, row, schema) {
+                                    if let Ok(val) = eval_expr(&resolved, row, schema, &qc) {
                                         arg_values.push(val);
                                     }
                                     FunctionArg::Unnamed(FunctionArgExpr::Expr(resolved))

@@ -126,7 +126,7 @@ impl PhysicalOperator for HashAggregateOperator {
         for row in &input_rows {
             let mut group_key_values = Vec::new();
             for expr in &self.group_by_exprs {
-                let val = eval_expr(expr, Some(row), Some(input_schema))?;
+                let val = eval_expr(expr, Some(row), Some(input_schema), ctx.query_ctx)?;
                 group_key_values.push(val);
             }
 
@@ -170,14 +170,15 @@ impl PhysicalOperator for HashAggregateOperator {
 
             for (i, agg_expr) in self.aggregate_exprs.iter().enumerate() {
                 if let Some(ref filter_expr) = agg_expr.filter {
-                    let filter_val = eval_expr(filter_expr, Some(row), Some(input_schema))?;
+                    let filter_val =
+                        eval_expr(filter_expr, Some(row), Some(input_schema), ctx.query_ctx)?;
                     if !matches!(filter_val, Value::Boolean(true)) {
                         continue;
                     }
                 }
 
                 let val = if let Some(arg) = &agg_expr.arg {
-                    eval_expr(arg, Some(row), Some(input_schema))?
+                    eval_expr(arg, Some(row), Some(input_schema), ctx.query_ctx)?
                 } else {
                     Value::Int32(1)
                 };
@@ -193,7 +194,7 @@ impl PhysicalOperator for HashAggregateOperator {
                 if let Some(buf) = state.ordered_agg_buffers[i].as_mut() {
                     let mut keys = Vec::with_capacity(agg_expr.order_by.len());
                     for o in &agg_expr.order_by {
-                        let key = eval_expr(&o.expr, Some(row), Some(input_schema))?;
+                        let key = eval_expr(&o.expr, Some(row), Some(input_schema), ctx.query_ctx)?;
                         keys.push(key);
                     }
                     buf.push((keys, val));

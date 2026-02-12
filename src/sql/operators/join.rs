@@ -130,9 +130,18 @@ impl NestedLoopJoinOperator {
         Row::new(values)
     }
 
-    fn eval_condition(&self, combined_row: &Row) -> Result<bool> {
+    fn eval_condition(
+        &self,
+        combined_row: &Row,
+        query_ctx: &crate::sql::query_context::QueryContext,
+    ) -> Result<bool> {
         if let Some(cond) = &self.condition {
-            let result = eval_expr(cond, Some(combined_row), Some(&self.output_schema))?;
+            let result = eval_expr(
+                cond,
+                Some(combined_row),
+                Some(&self.output_schema),
+                query_ctx,
+            )?;
             match result {
                 Value::Boolean(b) => Ok(b),
                 Value::Null => Ok(false),
@@ -182,7 +191,7 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                 for left_row in &left_rows {
                     for right_row in &right_rows {
                         let combined = Self::concat_rows(left_row, right_row);
-                        if self.eval_condition(&combined)? {
+                        if self.eval_condition(&combined, ctx.query_ctx)? {
                             self.result_rows.push(combined);
                         }
                     }
@@ -193,7 +202,7 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                     let mut matched = false;
                     for right_row in &right_rows {
                         let combined = Self::concat_rows(left_row, right_row);
-                        if self.eval_condition(&combined)? {
+                        if self.eval_condition(&combined, ctx.query_ctx)? {
                             self.result_rows.push(combined);
                             matched = true;
                         }
@@ -210,7 +219,7 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                     let mut matched = false;
                     for left_row in &left_rows {
                         let combined = Self::concat_rows(left_row, right_row);
-                        if self.eval_condition(&combined)? {
+                        if self.eval_condition(&combined, ctx.query_ctx)? {
                             self.result_rows.push(combined);
                             matched = true;
                         }
@@ -229,7 +238,7 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                     let mut left_matched = false;
                     for (i, right_row) in right_rows.iter().enumerate() {
                         let combined = Self::concat_rows(left_row, right_row);
-                        if self.eval_condition(&combined)? {
+                        if self.eval_condition(&combined, ctx.query_ctx)? {
                             self.result_rows.push(combined);
                             left_matched = true;
                             right_matched[i] = true;

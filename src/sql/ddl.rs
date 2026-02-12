@@ -19,6 +19,7 @@ use super::sequences;
 use super::types::sql_datatype_to_internal_strict;
 use super::value_coercion::{coerce_value_for_column, infer_data_type};
 use super::{expr::eval_expr, ExecuteResult};
+use crate::sql::query_context::QueryContext;
 use crate::storage::TikvStore;
 use crate::txn::{txn_delete, txn_put};
 use crate::types::{
@@ -1825,6 +1826,7 @@ pub async fn execute_alter_table(
     name: &ObjectName,
     operation: &AlterTableOperation,
 ) -> Result<ExecuteResult> {
+    let qc = QueryContext::from_task_locals();
     let resolved =
         names::resolve_existing_table_name(store.as_ref(), txn, db_id, name, search_path)
             .await?
@@ -2193,7 +2195,7 @@ pub async fn execute_alter_table(
                         let mut row = crate::storage::deserialize_row(pair.value())?;
                         fill_row_defaults(&mut row, &schema)?;
 
-                        let result = eval_expr(expr, Some(&row), Some(&schema))?;
+                        let result = eval_expr(expr, Some(&row), Some(&schema), &qc)?;
                         match result {
                             Value::Boolean(true) | Value::Null => {}
                             Value::Boolean(false) => {
@@ -2668,7 +2670,7 @@ pub async fn execute_alter_table(
                             fill_row_defaults(&mut row, &schema)?;
 
                             let new_val = if let Some(using_expr) = &using {
-                                let result = eval_expr(using_expr, Some(&row), Some(&schema))?;
+                                let result = eval_expr(using_expr, Some(&row), Some(&schema), &qc)?;
                                 coerce_value_for_column(result, &target_col)?
                             } else {
                                 let old_val =

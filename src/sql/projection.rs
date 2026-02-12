@@ -8,6 +8,7 @@ use sqlparser::parser::Parser;
 use crate::types::{DataType, Row, TableSchema, Value};
 
 use super::expr::eval_expr;
+use crate::sql::query_context::QueryContext;
 
 /// Get the name of a SELECT item (column name or alias)
 pub fn get_select_item_name(item: &sqlparser::ast::SelectItem) -> String {
@@ -93,7 +94,8 @@ pub fn eval_default_expr(expr_str: &str) -> Result<Value> {
             if let Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) =
                 s.projection.into_iter().next()
             {
-                return eval_expr(&e, None, None);
+                let qc = QueryContext::from_task_locals();
+                return eval_expr(&e, None, None, &qc);
             }
         }
     }

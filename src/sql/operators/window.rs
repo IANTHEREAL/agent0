@@ -13,6 +13,7 @@ use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
 use crate::sql::expr::operators::sort_by_fallible;
 use crate::sql::expr::{compare_order_by_values, eval_expr};
 use crate::sql::pg_numeric::pg_numeric_div;
+use crate::sql::query_context::QueryContext;
 use crate::sql::value_key::serialize_values_for_key;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
@@ -143,6 +144,7 @@ impl WindowOperator {
         &self,
         rows: &[Row],
         schema: &TableSchema,
+        query_ctx: &QueryContext,
     ) -> Result<Vec<Vec<Value>>> {
         let num_funcs = self.window_functions.len();
         let mut results: Vec<Vec<Value>> = vec![vec![Value::Null; num_funcs]; rows.len()];
@@ -153,7 +155,7 @@ impl WindowOperator {
             for (row_idx, row) in rows.iter().enumerate() {
                 let mut key = Vec::new();
                 for expr in &wf.partition_by {
-                    key.push(eval_expr(expr, Some(row), Some(schema))?);
+                    key.push(eval_expr(expr, Some(row), Some(schema), query_ctx)?);
                 }
                 let key_bytes = serialize_values_for_key(&key)?;
                 partitions.entry(key_bytes).or_default().push(row_idx);
@@ -173,6 +175,7 @@ impl WindowOperator {
                                 &order_expr.expr,
                                 Some(&rows[row_idx]),
                                 Some(schema),
+                                query_ctx,
                             )?);
                         }
                         order_key_map.insert(row_idx, keys);
@@ -195,7 +198,8 @@ impl WindowOperator {
                 }
 
                 // Compute peer groups for RANGE/GROUPS frame mode support
-                let peer_groups = Self::compute_peer_groups(rows, schema, wf, &row_indices)?;
+                let peer_groups =
+                    Self::compute_peer_groups(rows, schema, wf, &row_indices, query_ctx)?;
 
                 // Compute function for this partition
                 match wf.func_name.as_str() {
@@ -204,7 +208,9 @@ impl WindowOperator {
                     "dense_rank" => {
                         self.compute_dense_rank(&peer_groups, &row_indices, wf_idx, &mut results)
                     }
-                    "ntile" => self.compute_ntile(wf, &row_indices, wf_idx, &mut results)?,
+                    "ntile" => {
+                        self.compute_ntile(wf, &row_indices, wf_idx, &mut results, query_ctx)?
+                    }
                     "percent_rank" => {
                         self.compute_percent_rank(&peer_groups, &row_indices, wf_idx, &mut results)
                     }
@@ -219,6 +225,7 @@ impl WindowOperator {
                         wf_idx,
                         &mut results,
                         &peer_groups,
+                        query_ctx,
                     )?,
                     "count" => self.compute_count(
                         rows,
@@ -228,6 +235,7 @@ impl WindowOperator {
                         wf_idx,
                         &mut results,
                         &peer_groups,
+                        query_ctx,
                     )?,
                     "avg" => self.compute_avg(
                         rows,
@@ -237,6 +245,7 @@ impl WindowOperator {
                         wf_idx,
                         &mut results,
                         &peer_groups,
+                        query_ctx,
                     )?,
                     "min" => self.compute_min(
                         rows,
@@ -246,6 +255,7 @@ impl WindowOperator {
                         wf_idx,
                         &mut results,
                         &peer_groups,
+                        query_ctx,
                     )?,
                     "max" => self.compute_max(
                         rows,
@@ -255,13 +265,26 @@ impl WindowOperator {
                         wf_idx,
                         &mut results,
                         &peer_groups,
+                        query_ctx,
                     )?,
-                    "lag" => {
-                        self.compute_lag(rows, schema, wf, &row_indices, wf_idx, &mut results)?
-                    }
-                    "lead" => {
-                        self.compute_lead(rows, schema, wf, &row_indices, wf_idx, &mut results)?
-                    }
+                    "lag" => self.compute_lag(
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        query_ctx,
+                    )?,
+                    "lead" => self.compute_lead(
+                        rows,
+                        schema,
+                        wf,
+                        &row_indices,
+                        wf_idx,
+                        &mut results,
+                        query_ctx,
+                    )?,
                     "first_value" => self.compute_first_value(
                         rows,
                         schema,
@@ -270,6 +293,7 @@ impl WindowOperator {
                         wf_idx,
                         &mut results,
                         &peer_groups,
+                        query_ctx,
                     )?,
                     "last_value" => self.compute_last_value(
                         rows,
@@ -279,6 +303,7 @@ impl WindowOperator {
                         wf_idx,
                         &mut results,
                         &peer_groups,
+                        query_ctx,
                     )?,
                     "nth_value" => self.compute_nth_value(
                         rows,
@@ -288,6 +313,7 @@ impl WindowOperator {
                         wf_idx,
                         &mut results,
                         &peer_groups,
+                        query_ctx,
                     )?,
                     _ => {
                         return Err(SqlError::Unsupported(format!(
@@ -346,10 +372,11 @@ impl WindowOperator {
         row_indices: &[usize],
         wf_idx: usize,
         results: &mut [Vec<Value>],
+        query_ctx: &QueryContext,
     ) -> Result<()> {
         let n = match &wf.arg_expr {
             Some(expr) => {
-                let val = eval_expr(expr, None, None)?;
+                let val = eval_expr(expr, None, None, query_ctx)?;
                 match val {
                     Value::Int32(v) if v > 0 => v as usize,
                     Value::Int64(v) if v > 0 => v as usize,
@@ -428,6 +455,7 @@ impl WindowOperator {
         schema: &TableSchema,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
+        query_ctx: &QueryContext,
     ) -> Result<Vec<(usize, usize)>> {
         if wf.order_by.is_empty() {
             // No ORDER BY: all rows are peers
@@ -440,7 +468,7 @@ impl WindowOperator {
             let current_values: Vec<Value> = wf
                 .order_by
                 .iter()
-                .map(|o| eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema)))
+                .map(|o| eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema), query_ctx))
                 .collect::<Result<Vec<Value>>>()?;
             if let Some(prev) = &prev_values {
                 if !order_by_values_are_peers(prev, &current_values, &wf.order_by)? {
@@ -470,6 +498,7 @@ impl WindowOperator {
         current_pos: usize,
         partition_size: usize,
         peer_groups: &[(usize, usize)],
+        query_ctx: &QueryContext,
     ) -> Result<(usize, usize)> {
         let frame = match &wf.window_frame {
             Some(f) => f,
@@ -493,7 +522,7 @@ impl WindowOperator {
             match bound {
                 WindowFrameBound::Preceding(None) => Ok(0), // UNBOUNDED PRECEDING
                 WindowFrameBound::Preceding(Some(n)) => {
-                    let offset = self.eval_frame_bound_offset(n)?;
+                    let offset = self.eval_frame_bound_offset(n, query_ctx)?;
                     match units {
                         WindowFrameUnits::Rows => Ok(current_pos.saturating_sub(offset)),
                         WindowFrameUnits::Groups => {
@@ -520,7 +549,7 @@ impl WindowOperator {
                     }
                 },
                 WindowFrameBound::Following(Some(n)) => {
-                    let offset = self.eval_frame_bound_offset(n)?;
+                    let offset = self.eval_frame_bound_offset(n, query_ctx)?;
                     match units {
                         WindowFrameUnits::Rows => {
                             Ok(current_pos.saturating_add(offset).min(partition_size))
@@ -545,7 +574,7 @@ impl WindowOperator {
             match bound {
                 WindowFrameBound::Preceding(None) => Ok(0),
                 WindowFrameBound::Preceding(Some(n)) => {
-                    let offset = self.eval_frame_bound_offset(n)?;
+                    let offset = self.eval_frame_bound_offset(n, query_ctx)?;
                     match units {
                         WindowFrameUnits::Rows => {
                             Ok(current_pos.saturating_add(1).saturating_sub(offset))
@@ -570,7 +599,7 @@ impl WindowOperator {
                     }
                 },
                 WindowFrameBound::Following(Some(n)) => {
-                    let offset = self.eval_frame_bound_offset(n)?;
+                    let offset = self.eval_frame_bound_offset(n, query_ctx)?;
                     match units {
                         WindowFrameUnits::Rows => Ok(current_pos
                             .saturating_add(1)
@@ -610,8 +639,8 @@ impl WindowOperator {
         Ok((start, end))
     }
 
-    fn eval_frame_bound_offset(&self, expr: &Expr) -> Result<usize> {
-        let val = eval_expr(expr, None, None)?;
+    fn eval_frame_bound_offset(&self, expr: &Expr, query_ctx: &QueryContext) -> Result<usize> {
+        let val = eval_expr(expr, None, None, query_ctx)?;
         match val {
             Value::Int32(n) if n >= 0 => Ok(n as usize),
             Value::Int64(n) if n >= 0 => Ok(n as usize),
@@ -623,11 +652,16 @@ impl WindowOperator {
     }
 
     /// Check if a row passes the FILTER (WHERE ...) clause for a window aggregate.
-    fn passes_filter(filter_expr: &Option<Expr>, row: &Row, schema: &TableSchema) -> Result<bool> {
+    fn passes_filter(
+        filter_expr: &Option<Expr>,
+        row: &Row,
+        schema: &TableSchema,
+        query_ctx: &QueryContext,
+    ) -> Result<bool> {
         match filter_expr {
             None => Ok(true),
             Some(expr) => {
-                let val = eval_expr(expr, Some(row), Some(schema))?;
+                let val = eval_expr(expr, Some(row), Some(schema), query_ctx)?;
                 Ok(matches!(val, Value::Boolean(true)))
             }
         }
@@ -642,18 +676,22 @@ impl WindowOperator {
         wf_idx: usize,
         results: &mut [Vec<Value>],
         peer_groups: &[(usize, usize)],
+        query_ctx: &QueryContext,
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
+            let (start, end) =
+                self.get_frame_bounds(wf, pos, partition_size, peer_groups, query_ctx)?;
             let mut sum = rust_decimal::Decimal::ZERO;
             let mut has_value = false;
             for i in start..end {
-                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema)? {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema, query_ctx)?
+                {
                     continue;
                 }
                 if let Some(expr) = &wf.arg_expr {
-                    let val = eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema))?;
+                    let val =
+                        eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema), query_ctx)?;
                     if let Some(n) = self.value_to_decimal(&val) {
                         sum += n;
                         has_value = true;
@@ -678,17 +716,21 @@ impl WindowOperator {
         wf_idx: usize,
         results: &mut [Vec<Value>],
         peer_groups: &[(usize, usize)],
+        query_ctx: &QueryContext,
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
+            let (start, end) =
+                self.get_frame_bounds(wf, pos, partition_size, peer_groups, query_ctx)?;
             let mut count = 0i64;
             for i in start..end.min(partition_size) {
-                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema)? {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema, query_ctx)?
+                {
                     continue;
                 }
                 if let Some(expr) = &wf.arg_expr {
-                    let val = eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema))?;
+                    let val =
+                        eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema), query_ctx)?;
                     if !matches!(val, Value::Null) {
                         count += 1;
                     }
@@ -711,18 +753,22 @@ impl WindowOperator {
         wf_idx: usize,
         results: &mut [Vec<Value>],
         peer_groups: &[(usize, usize)],
+        query_ctx: &QueryContext,
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
+            let (start, end) =
+                self.get_frame_bounds(wf, pos, partition_size, peer_groups, query_ctx)?;
             let mut sum = rust_decimal::Decimal::ZERO;
             let mut count = 0i64;
             for i in start..end {
-                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema)? {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema, query_ctx)?
+                {
                     continue;
                 }
                 if let Some(expr) = &wf.arg_expr {
-                    let val = eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema))?;
+                    let val =
+                        eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema), query_ctx)?;
                     if let Some(n) = self.value_to_decimal(&val) {
                         sum += n;
                         count += 1;
@@ -747,17 +793,21 @@ impl WindowOperator {
         wf_idx: usize,
         results: &mut [Vec<Value>],
         peer_groups: &[(usize, usize)],
+        query_ctx: &QueryContext,
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
+            let (start, end) =
+                self.get_frame_bounds(wf, pos, partition_size, peer_groups, query_ctx)?;
             let mut min_val: Option<Value> = None;
             for i in start..end {
-                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema)? {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema, query_ctx)?
+                {
                     continue;
                 }
                 if let Some(expr) = &wf.arg_expr {
-                    let val = eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema))?;
+                    let val =
+                        eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema), query_ctx)?;
                     if !matches!(val, Value::Null) {
                         min_val = Some(match min_val {
                             None => val,
@@ -789,17 +839,21 @@ impl WindowOperator {
         wf_idx: usize,
         results: &mut [Vec<Value>],
         peer_groups: &[(usize, usize)],
+        query_ctx: &QueryContext,
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
+            let (start, end) =
+                self.get_frame_bounds(wf, pos, partition_size, peer_groups, query_ctx)?;
             let mut max_val: Option<Value> = None;
             for i in start..end {
-                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema)? {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema, query_ctx)?
+                {
                     continue;
                 }
                 if let Some(expr) = &wf.arg_expr {
-                    let val = eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema))?;
+                    let val =
+                        eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema), query_ctx)?;
                     if !matches!(val, Value::Null) {
                         max_val = Some(match max_val {
                             None => val,
@@ -830,10 +884,11 @@ impl WindowOperator {
         row_indices: &[usize],
         wf_idx: usize,
         results: &mut [Vec<Value>],
+        query_ctx: &QueryContext,
     ) -> Result<()> {
         let offset = match wf.offset_expr.as_ref() {
             None => 1,
-            Some(expr) => match eval_expr(expr, None, None) {
+            Some(expr) => match eval_expr(expr, None, None, query_ctx) {
                 Ok(Value::Int32(n)) => {
                     if n < 0 {
                         return Err(anyhow!("LAG offset must be non-negative"));
@@ -851,14 +906,19 @@ impl WindowOperator {
         };
 
         let default_value = match &wf.default_value_expr {
-            Some(e) => eval_expr(e, None, None)?,
+            Some(e) => eval_expr(e, None, None, query_ctx)?,
             None => Value::Null,
         };
 
         for (pos, &row_idx) in row_indices.iter().enumerate() {
             results[row_idx][wf_idx] = if pos >= offset {
                 if let Some(expr) = &wf.arg_expr {
-                    eval_expr(expr, Some(&rows[row_indices[pos - offset]]), Some(schema))?
+                    eval_expr(
+                        expr,
+                        Some(&rows[row_indices[pos - offset]]),
+                        Some(schema),
+                        query_ctx,
+                    )?
                 } else {
                     Value::Null
                 }
@@ -877,10 +937,11 @@ impl WindowOperator {
         row_indices: &[usize],
         wf_idx: usize,
         results: &mut [Vec<Value>],
+        query_ctx: &QueryContext,
     ) -> Result<()> {
         let offset = match wf.offset_expr.as_ref() {
             None => 1,
-            Some(expr) => match eval_expr(expr, None, None) {
+            Some(expr) => match eval_expr(expr, None, None, query_ctx) {
                 Ok(Value::Int32(n)) => {
                     if n < 0 {
                         return Err(anyhow!("LEAD offset must be non-negative"));
@@ -898,7 +959,7 @@ impl WindowOperator {
         };
 
         let default_value = match &wf.default_value_expr {
-            Some(e) => eval_expr(e, None, None)?,
+            Some(e) => eval_expr(e, None, None, query_ctx)?,
             None => Value::Null,
         };
 
@@ -906,7 +967,12 @@ impl WindowOperator {
         for (pos, &row_idx) in row_indices.iter().enumerate() {
             results[row_idx][wf_idx] = if pos + offset < partition_size {
                 if let Some(expr) = &wf.arg_expr {
-                    eval_expr(expr, Some(&rows[row_indices[pos + offset]]), Some(schema))?
+                    eval_expr(
+                        expr,
+                        Some(&rows[row_indices[pos + offset]]),
+                        Some(schema),
+                        query_ctx,
+                    )?
                 } else {
                     Value::Null
                 }
@@ -926,13 +992,20 @@ impl WindowOperator {
         wf_idx: usize,
         results: &mut [Vec<Value>],
         peer_groups: &[(usize, usize)],
+        query_ctx: &QueryContext,
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
+            let (start, end) =
+                self.get_frame_bounds(wf, pos, partition_size, peer_groups, query_ctx)?;
             results[row_idx][wf_idx] = if start < end && start < partition_size {
                 if let Some(expr) = &wf.arg_expr {
-                    eval_expr(expr, Some(&rows[row_indices[start]]), Some(schema))?
+                    eval_expr(
+                        expr,
+                        Some(&rows[row_indices[start]]),
+                        Some(schema),
+                        query_ctx,
+                    )?
                 } else {
                     Value::Null
                 }
@@ -952,13 +1025,20 @@ impl WindowOperator {
         wf_idx: usize,
         results: &mut [Vec<Value>],
         peer_groups: &[(usize, usize)],
+        query_ctx: &QueryContext,
     ) -> Result<()> {
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
+            let (start, end) =
+                self.get_frame_bounds(wf, pos, partition_size, peer_groups, query_ctx)?;
             results[row_idx][wf_idx] = if start < end && end > 0 && end <= partition_size {
                 if let Some(expr) = &wf.arg_expr {
-                    eval_expr(expr, Some(&rows[row_indices[end - 1]]), Some(schema))?
+                    eval_expr(
+                        expr,
+                        Some(&rows[row_indices[end - 1]]),
+                        Some(schema),
+                        query_ctx,
+                    )?
                 } else {
                     Value::Null
                 }
@@ -978,11 +1058,12 @@ impl WindowOperator {
         wf_idx: usize,
         results: &mut [Vec<Value>],
         peer_groups: &[(usize, usize)],
+        query_ctx: &QueryContext,
     ) -> Result<()> {
         // NTH_VALUE(expr, n): the second argument is the 1-based position
         let n = match &wf.offset_expr {
             Some(expr) => {
-                let val = eval_expr(expr, None, None)?;
+                let val = eval_expr(expr, None, None, query_ctx)?;
                 match val {
                     Value::Int32(v) if v > 0 => v as usize,
                     Value::Int64(v) if v > 0 => v as usize,
@@ -999,11 +1080,17 @@ impl WindowOperator {
 
         let partition_size = row_indices.len();
         for (pos, &row_idx) in row_indices.iter().enumerate() {
-            let (start, end) = self.get_frame_bounds(wf, pos, partition_size, peer_groups)?;
+            let (start, end) =
+                self.get_frame_bounds(wf, pos, partition_size, peer_groups, query_ctx)?;
             let target_pos = start + n - 1; // convert 1-based to 0-based
             results[row_idx][wf_idx] = if target_pos < end && target_pos < partition_size {
                 if let Some(expr) = &wf.arg_expr {
-                    eval_expr(expr, Some(&rows[row_indices[target_pos]]), Some(schema))?
+                    eval_expr(
+                        expr,
+                        Some(&rows[row_indices[target_pos]]),
+                        Some(schema),
+                        query_ctx,
+                    )?
                 } else {
                     Value::Null
                 }
@@ -1038,7 +1125,8 @@ impl PhysicalOperator for WindowOperator {
         let input_schema = self.child.schema();
 
         // Compute window function values
-        let window_results = self.compute_window_functions(&input_rows, input_schema)?;
+        let window_results =
+            self.compute_window_functions(&input_rows, input_schema, ctx.query_ctx)?;
 
         // Build result rows: input columns + window function results
         self.result_rows.clear();
@@ -1300,7 +1388,9 @@ mod tests {
             Row::new(vec![Value::Int32(1), Value::Float64(-0.0)]),
             Row::new(vec![Value::Int32(2), Value::Float64(0.0)]),
         ];
-        let results = op.compute_window_functions(&rows, &schema).unwrap();
+        let results = op
+            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .unwrap();
         assert_eq!(results[0][0], Value::Int64(1));
         assert_eq!(results[1][0], Value::Int64(2));
 
@@ -1311,7 +1401,9 @@ mod tests {
             Row::new(vec![Value::Int32(1), Value::Float64(nan1)]),
             Row::new(vec![Value::Int32(2), Value::Float64(nan2)]),
         ];
-        let results = op.compute_window_functions(&rows, &schema).unwrap();
+        let results = op
+            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .unwrap();
         assert_eq!(results[0][0], Value::Int64(1));
         assert_eq!(results[1][0], Value::Int64(2));
     }
@@ -1349,7 +1441,9 @@ mod tests {
                 Value::Numeric(Decimal::from_str("1.00").unwrap()),
             ]),
         ];
-        let results = op.compute_window_functions(&rows, &schema).unwrap();
+        let results = op
+            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .unwrap();
         assert_eq!(results[0][0], Value::Int64(1));
         assert_eq!(results[1][0], Value::Int64(2));
     }
@@ -1407,7 +1501,9 @@ mod tests {
             Row::new(vec![Value::Int32(4), Value::Float64(2.0)]),
         ];
 
-        let results = op.compute_window_functions(&rows, &schema).unwrap();
+        let results = op
+            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .unwrap();
 
         // ORDER BY grp ASC sorts NaNs last; both NaNs are peers.
         assert_eq!(results[0][0], Value::Int64(3));
@@ -1485,7 +1581,9 @@ mod tests {
             Row::new(vec![Value::Text("B".to_string()), Value::Int32(5)]),
         ];
 
-        let results = op.compute_window_functions(&rows, &schema).unwrap();
+        let results = op
+            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .unwrap();
 
         // Partition A: row_number 1,2; Partition B: row_number 1,2,3
         assert_eq!(results[0][0], Value::Int64(1));
@@ -1528,7 +1626,9 @@ mod tests {
             Row::new(vec![Value::Int32(3), Value::Int32(30)]),
         ];
 
-        let results = op.compute_window_functions(&rows, &schema).unwrap();
+        let results = op
+            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .unwrap();
 
         // Running sum: 10, 30, 60
         assert_eq!(
@@ -1571,7 +1671,9 @@ mod tests {
             Row::new(vec![Value::Int32(3), Value::Int32(30)]),
         ];
 
-        let results = op.compute_window_functions(&rows, &schema).unwrap();
+        let results = op
+            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .unwrap();
 
         // Without ORDER BY, COUNT(*) OVER() returns total count for all rows
         assert_eq!(results[0][0], Value::Int64(3));

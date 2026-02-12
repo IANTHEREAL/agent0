@@ -1,5 +1,6 @@
 use super::super::*;
 use super::using_merge::{rewrite_for_using_join, UsingMergeColumn};
+use crate::sql::query_context::QueryContext;
 use sqlparser::ast::OrderByExpr;
 
 impl Executor {
@@ -16,6 +17,7 @@ impl Executor {
         table_aliases: &[(String, TableSchema)],
         merge_columns: &[UsingMergeColumn],
     ) -> Result<Option<ExecuteResult>> {
+        let qc = QueryContext::from_task_locals();
         let join_schema = running_op.schema().clone();
 
         let rewritten_projection: Vec<SelectItem> = resolved_projection
@@ -367,7 +369,7 @@ impl Executor {
         for row in &rows {
             let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
             for expr in &projection_exprs {
-                let val = eval_expr(expr, Some(row), Some(&agg_output_schema))?;
+                let val = eval_expr(expr, Some(row), Some(&agg_output_schema), &qc)?;
                 values.push(val);
             }
             projected_rows.push(Row::new(values));

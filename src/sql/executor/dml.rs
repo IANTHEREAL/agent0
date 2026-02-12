@@ -12,6 +12,7 @@ use super::super::triggers;
 use super::super::ExecuteResult;
 use super::core::Executor;
 use crate::sql::error::SqlError;
+use crate::sql::query_context::QueryContext;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
@@ -493,6 +494,7 @@ impl Executor {
         selection: &Option<Expr>,
         returning: &Option<Vec<SelectItem>>,
     ) -> Result<ExecuteResult> {
+        let qc = QueryContext::from_task_locals();
         let ctes_ctx: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let (resolved_target, table_alias) = match &from[0].relation {
             sqlparser::ast::TableFactor::Table { name, alias, .. } => {
@@ -621,6 +623,7 @@ impl Executor {
                             None,
                             &combined_row,
                             &combined_schema,
+                            &qc,
                         );
                         let value = self
                             .eval_expr_join_maybe_sequence(
@@ -721,6 +724,7 @@ impl Executor {
         selection: &Option<Expr>,
         returning: &Option<Vec<SelectItem>>,
     ) -> Result<ExecuteResult> {
+        let qc = QueryContext::from_task_locals();
         let ctes_ctx: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let resolved_target = match &table.relation {
             sqlparser::ast::TableFactor::Table { name, .. } => names::resolve_existing_table_name(
@@ -862,6 +866,7 @@ impl Executor {
                                 None,
                                 &combined_row,
                                 &combined_schema,
+                                &qc,
                             );
                             let value = self
                                 .eval_expr_join_maybe_sequence(
@@ -1052,15 +1057,17 @@ mod tests {
 
     #[test]
     fn value_to_expr_roundtrips_bytes() {
+        let qc = QueryContext::from_task_locals();
         let expr = value_to_expr(Value::Bytes(vec![0, 1, 2, 255]), None).unwrap();
-        let val = crate::sql::expr::eval_expr(&expr, None, None).unwrap();
+        let val = crate::sql::expr::eval_expr(&expr, None, None, &qc).unwrap();
         assert_eq!(val, Value::Bytes(vec![0, 1, 2, 255]));
     }
 
     #[test]
     fn value_to_expr_roundtrips_timestamp() {
+        let qc = QueryContext::from_task_locals();
         let expr = value_to_expr(Value::Timestamp(0), None).unwrap();
-        let val = crate::sql::expr::eval_expr(&expr, None, None).unwrap();
+        let val = crate::sql::expr::eval_expr(&expr, None, None, &qc).unwrap();
         assert_eq!(val, Value::Timestamp(0));
     }
 }

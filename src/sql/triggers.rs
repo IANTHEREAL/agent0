@@ -305,7 +305,9 @@ async fn execute_trigger_body_cached(
 ) -> Result<TriggerResult> {
     use super::expr::eval_expr;
     use super::sequences;
+    use crate::sql::query_context::QueryContext;
 
+    let qc = QueryContext::from_task_locals();
     let compiled = trigger_cache.get_or_compile(db_id, func_oid, body)?;
 
     if compiled.statements.is_empty() {
@@ -365,7 +367,7 @@ async fn execute_trigger_body_cached(
                                         )
                                         .await?
                                     } else {
-                                        eval_expr(&expr, None, None)?
+                                        eval_expr(&expr, None, None, &qc)?
                                     };
 
                                     let coerced = super::value_coercion::coerce_value_for_column(

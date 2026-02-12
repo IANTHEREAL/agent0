@@ -230,27 +230,15 @@ pub fn eval_join_expr(ctx: &JoinEvalContext, expr: &Expr) -> Result<Value> {
     })
 }
 
-pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -> Result<Value> {
-    stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
-        let ctx = SingleTableContext::new(row, schema);
-        evaluator::eval_expr_impl(&ctx, expr)
-    })
-}
-
-pub fn eval_expr_with_query_ctx(
+pub fn eval_expr(
     expr: &Expr,
     row: Option<&Row>,
     schema: Option<&TableSchema>,
-    query_ctx: Option<&super::query_context::QueryContext>,
+    query_ctx: &super::query_context::QueryContext,
 ) -> Result<Value> {
     stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
-        if let Some(qc) = query_ctx {
-            let ctx = SingleTableContext::with_query_ctx(row, schema, qc);
-            evaluator::eval_expr_impl(&ctx, expr)
-        } else {
-            let ctx = SingleTableContext::new(row, schema);
-            evaluator::eval_expr_impl(&ctx, expr)
-        }
+        let ctx = SingleTableContext::with_query_ctx(row, schema, query_ctx);
+        evaluator::eval_expr_impl(&ctx, expr)
     })
 }
 
@@ -726,26 +714,19 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                 // STATEMENT_TIMESTAMP() is the only function scoped to the
                 // current statement — it changes between statements inside a
                 // BEGIN/COMMIT block.
-                ctx.query_context()
-                    .map(|qc| qc.statement_timestamp_ms)
-                    .unwrap_or_else(super::statement_time::statement_timestamp_millis_or_now)
+                ctx.query_context().statement_timestamp_ms
             } else {
                 // NOW, CURRENT_TIMESTAMP, TRANSACTION_TIMESTAMP — all return
                 // the transaction start time per PostgreSQL semantics.  For
                 // implicit (autocommit) transactions this equals statement time.
-                ctx.query_context()
-                    .map(|qc| qc.transaction_timestamp_ms)
-                    .unwrap_or_else(super::statement_time::transaction_timestamp_millis_or_now)
+                ctx.query_context().transaction_timestamp_ms
             };
             let ts = crate::types::timestamp::truncate_timestamp_millis(ts, precision);
             Ok(Value::Timestamp(ts))
         }
         "CURRENT_DATE" => {
             // CURRENT_DATE uses transaction time per PostgreSQL semantics.
-            let ts = ctx
-                .query_context()
-                .map(|qc| qc.transaction_timestamp_ms)
-                .unwrap_or_else(super::statement_time::transaction_timestamp_millis_or_now);
+            let ts = ctx.query_context().transaction_timestamp_ms;
             let days = crate::types::date::timestamp_millis_to_date_days(ts)?;
             Ok(Value::Date(days))
         }
@@ -783,10 +764,7 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                 Some(Value::Date(days)) => crate::types::date::date_days_to_timestamp_millis(days)?,
                 // AGE(ts) subtracts from "current date", which is
                 // transaction-scoped per PostgreSQL semantics.
-                _ => ctx
-                    .query_context()
-                    .map(|qc| qc.transaction_timestamp_ms)
-                    .unwrap_or_else(super::statement_time::transaction_timestamp_millis_or_now),
+                _ => ctx.query_context().transaction_timestamp_ms,
             };
 
             let dt1 = Utc
@@ -839,17 +817,10 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
         "SET_CONFIG" => Ok(Value::Text(String::new())),
         // PG_IS_IN_RECOVERY, PG_ENCODING_TO_CHAR, HAS_SCHEMA_PRIVILEGE, HAS_TABLE_PRIVILEGE,
         // HAS_DATABASE_PRIVILEGE are handled by the registry (functions/pg_compat.rs)
-        "PG_BACKEND_PID" => Ok(Value::Int32(
-            ctx.query_context()
-                .map(|qc| qc.connection_id)
-                .unwrap_or_else(get_connection_id),
-        )),
+        "PG_BACKEND_PID" => Ok(Value::Int32(ctx.query_context().connection_id)),
         "VERSION" => Ok(Value::Text(VERSION_STRING.to_string())),
         "CURRENT_DATABASE" => Ok(Value::Text(
-            ctx.query_context()
-                .map(|qc| qc.database_name.as_ref().to_string())
-                .or_else(|| current_database_name().map(|n| n.as_ref().to_string()))
-                .unwrap_or_else(|| "postgres".to_string()),
+            ctx.query_context().database_name.as_ref().to_string(),
         )),
         "CURRENT_SCHEMA" => Ok(Value::Text("public".to_string())),
         "CURRENT_USER" | "SESSION_USER" | "USER" => Ok(Value::Text("postgres".to_string())),
