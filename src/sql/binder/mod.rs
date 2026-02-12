@@ -217,12 +217,23 @@ fn dep_matches_target(
             if name != target_name {
                 return false;
             }
-            // Unqualified name could resolve to any schema on the effective
-            // search path.  Match if target_schema is reachable.
+            // An unqualified name always resolves in the view's own schema.
+            if target_schema == view_schema {
+                return true;
+            }
+            // For cross-schema matches, check whether target_schema could
+            // plausibly resolve *before* view_schema on the search path.
+            // If view_schema appears first, the name resolves there instead.
             if search_path.is_empty() {
-                target_schema == view_schema || target_schema == "public"
+                target_schema == "public"
             } else {
-                search_path.iter().any(|s| s == target_schema)
+                let target_pos = search_path.iter().position(|s| s == target_schema);
+                let view_pos = search_path.iter().position(|s| s == view_schema);
+                match (target_pos, view_pos) {
+                    (Some(tp), Some(vp)) => tp < vp,
+                    (Some(_), None) => true,
+                    _ => false,
+                }
             }
         }
     }
