@@ -8,6 +8,7 @@ use sqlparser::parser::Parser;
 use crate::types::{DataType, Row, TableSchema, Value};
 
 use super::expr::eval_expr;
+use crate::sql::query_context::QueryContext;
 
 /// Get the name of a SELECT item (column name or alias)
 pub fn get_select_item_name(item: &sqlparser::ast::SelectItem) -> String {
@@ -93,7 +94,8 @@ pub fn eval_default_expr(expr_str: &str) -> Result<Value> {
             if let Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) =
                 s.projection.into_iter().next()
             {
-                return eval_expr(&e, None, None);
+                let qc = QueryContext::from_task_locals();
+                return eval_expr(&e, None, None, &qc);
             }
         }
     }
@@ -101,7 +103,10 @@ pub fn eval_default_expr(expr_str: &str) -> Result<Value> {
 }
 
 /// Infer the data type of an expression
-pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
+pub fn infer_expr_type(
+    expr: &Expr,
+    schema: &TableSchema,
+) -> Result<DataType, super::types::TypeError> {
     super::types::infer_expr_type(expr, schema)
 }
 
@@ -124,7 +129,7 @@ mod tests {
         let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
             panic!("expected unnamed expr");
         };
-        infer_expr_type(expr, &TableSchema::default())
+        infer_expr_type(expr, &TableSchema::default()).unwrap()
     }
 
     #[test]
@@ -182,7 +187,7 @@ mod tests {
             panic!("expected unnamed expr");
         };
 
-        assert_eq!(infer_expr_type(expr, &schema), DataType::Float64);
+        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Float64));
     }
 
     #[test]
@@ -221,7 +226,7 @@ mod tests {
             panic!("expected unnamed expr");
         };
 
-        assert_eq!(infer_expr_type(expr, &schema), DataType::Float64);
+        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Float64));
     }
 
     #[test]
@@ -260,7 +265,7 @@ mod tests {
             panic!("expected unnamed expr");
         };
 
-        assert_eq!(infer_expr_type(expr, &schema), DataType::Int64);
+        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Int64));
     }
 
     #[test]
@@ -301,10 +306,10 @@ mod tests {
 
         assert_eq!(
             infer_expr_type(expr, &schema),
-            DataType::Numeric {
+            Ok(DataType::Numeric {
                 precision: None,
                 scale: None
-            }
+            })
         );
     }
 
@@ -344,7 +349,7 @@ mod tests {
             panic!("expected unnamed expr");
         };
 
-        assert_eq!(infer_expr_type(expr, &schema), DataType::Int32);
+        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Int32));
     }
 
     #[test]
@@ -365,7 +370,7 @@ mod tests {
         let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
             panic!("expected unnamed expr");
         };
-        assert_eq!(infer_expr_type(expr, &schema), DataType::TimestampTz);
+        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::TimestampTz));
     }
 
     #[test]
@@ -386,7 +391,7 @@ mod tests {
         let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
             panic!("expected unnamed expr");
         };
-        assert_eq!(infer_expr_type(expr, &schema), DataType::Timestamp);
+        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Timestamp));
     }
 
     #[test]
@@ -404,7 +409,7 @@ mod tests {
         let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
             panic!("expected unnamed expr");
         };
-        assert_eq!(infer_expr_type(expr, &schema), DataType::Timestamp);
+        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Timestamp));
     }
 
     #[test]
@@ -422,7 +427,7 @@ mod tests {
         let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
             panic!("expected unnamed expr");
         };
-        assert_eq!(infer_expr_type(expr, &schema), DataType::Boolean);
+        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Boolean));
     }
 
     #[test]

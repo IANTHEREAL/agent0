@@ -33,12 +33,17 @@ impl NumericValue {
         }
     }
 
-    fn to_int64(&self) -> i64 {
+    fn to_int64(&self) -> Result<i64> {
         match self {
-            NumericValue::Int32(n) => *n as i64,
-            NumericValue::Int64(n) => *n,
-            NumericValue::Float64(n) => *n as i64,
-            NumericValue::Decimal(n) => n.to_i64().unwrap_or(0),
+            NumericValue::Int32(n) => Ok(*n as i64),
+            NumericValue::Int64(n) => Ok(*n),
+            NumericValue::Float64(n) => Ok(*n as i64),
+            NumericValue::Decimal(n) => n.to_i64().ok_or_else(|| {
+                SqlError::NumericValueOutOfRange {
+                    detail: format!("{} cannot be converted to bigint", n),
+                }
+                .into()
+            }),
         }
     }
 
@@ -53,12 +58,17 @@ impl NumericValue {
         }
     }
 
-    fn to_decimal(&self) -> Decimal {
+    fn to_decimal(&self) -> Result<Decimal> {
         match self {
-            NumericValue::Int32(n) => Decimal::from(*n),
-            NumericValue::Int64(n) => Decimal::from(*n),
-            NumericValue::Float64(n) => Decimal::try_from(*n).unwrap_or_default(),
-            NumericValue::Decimal(n) => *n,
+            NumericValue::Int32(n) => Ok(Decimal::from(*n)),
+            NumericValue::Int64(n) => Ok(Decimal::from(*n)),
+            NumericValue::Float64(n) => Decimal::try_from(*n).map_err(|_| {
+                SqlError::NumericValueOutOfRange {
+                    detail: format!("{} cannot be converted to numeric", n),
+                }
+                .into()
+            }),
+            NumericValue::Decimal(n) => Ok(*n),
         }
     }
 
@@ -86,8 +96,8 @@ impl NumericValue {
                 return Ok(v);
             }
             match target_prio {
-                2 => Ok(NumericValue::Int64(v.to_int64())),
-                3 => Ok(NumericValue::Decimal(v.to_decimal())),
+                2 => Ok(NumericValue::Int64(v.to_int64()?)),
+                3 => Ok(NumericValue::Decimal(v.to_decimal()?)),
                 4 => Ok(NumericValue::Float64(v.to_float64()?)),
                 _ => Ok(v),
             }

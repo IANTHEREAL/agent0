@@ -247,7 +247,7 @@ pub(crate) fn extract_gin_token_hashes_from_row(
             Some(other) => Err(anyhow!(
                 "GIN index '{}' requires ARRAY value, got {}",
                 index.name,
-                other.data_type().unwrap_or(DataType::Text)
+                other.type_display_name()
             )),
         },
         GinColumnType::Tsvector => match row.values.get(col_idx) {
@@ -257,7 +257,7 @@ pub(crate) fn extract_gin_token_hashes_from_row(
             Some(other) => Err(anyhow!(
                 "GIN index '{}' requires TSVECTOR value, got {}",
                 index.name,
-                other.data_type().unwrap_or(DataType::Text)
+                other.type_display_name()
             )),
         },
         GinColumnType::Jsonb => {
@@ -268,7 +268,7 @@ pub(crate) fn extract_gin_token_hashes_from_row(
                     return Err(anyhow!(
                         "GIN index '{}' requires JSON/JSONB value, got {}",
                         index.name,
-                        other.data_type().unwrap_or(DataType::Text)
+                        other.type_display_name()
                     ));
                 }
             };

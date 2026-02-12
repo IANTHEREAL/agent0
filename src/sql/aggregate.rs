@@ -7,6 +7,7 @@ use rust_decimal::Decimal;
 use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr};
 
 use crate::sql::expr::compare_values;
+use crate::sql::names::function_name_upper;
 use crate::sql::pg_numeric::pg_numeric_div;
 use crate::types::Value;
 
@@ -299,12 +300,7 @@ pub fn collect_having_agg_funcs(
 ) {
     match expr {
         Expr::Function(f) if f.over.is_none() => {
-            let func_name = f
-                .name
-                .0
-                .last()
-                .map(|i| i.value.to_uppercase())
-                .unwrap_or_default();
+            let func_name = function_name_upper(f);
             if matches!(
                 func_name.as_str(),
                 "COUNT"
@@ -320,12 +316,7 @@ pub fn collect_having_agg_funcs(
             ) {
                 let already_exists = agg_funcs.iter().any(|(_, existing)| {
                     if let AggExpr::Function(existing_f) = existing {
-                        let existing_name = existing_f
-                            .name
-                            .0
-                            .last()
-                            .map(|n| n.value.to_uppercase())
-                            .unwrap_or_default();
+                        let existing_name = function_name_upper(existing_f);
                         existing_name == func_name && args_match(f, existing_f)
                     } else {
                         false

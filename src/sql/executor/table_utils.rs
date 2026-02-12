@@ -9,6 +9,7 @@ use super::super::names::normalize_ident;
 use super::super::{parse_sql, ExecuteResult};
 use super::core::Executor;
 use crate::sql::error::SqlError;
+use crate::sql::query_context::QueryContext;
 use crate::types::{ColumnDef, DataType, MigrationRecord, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
@@ -803,6 +804,7 @@ impl Executor {
                 name: table_name.to_string(),
                 columns: vec![ColumnDef {
                     name: col_name,
+                    // INTENTIONAL: single-value type inference — NULL defaults to Text
                     data_type: result.data_type().unwrap_or(DataType::Text),
                     nullable: false,
                     primary_key: false,
@@ -872,15 +874,7 @@ impl Executor {
                             timezone: _,
                         } => {
                             let inferred_types = column_types.unwrap_or_else(|| {
-                                if let Some(first) = rows.first() {
-                                    first
-                                        .values
-                                        .iter()
-                                        .map(|v| v.data_type().unwrap_or(DataType::Text))
-                                        .collect()
-                                } else {
-                                    vec![DataType::Text; columns.len()]
-                                }
+                                crate::types::infer_column_types_from_rows(&rows, columns.len())
                             });
 
                             let schema = TableSchema {
@@ -891,6 +885,7 @@ impl Executor {
                                     .enumerate()
                                     .map(|(i, n)| ColumnDef {
                                         name: n.clone(),
+                                        // INTENTIONAL: index guard — unreachable when types match columns
                                         data_type: inferred_types
                                             .get(i)
                                             .cloned()
@@ -943,6 +938,7 @@ impl Executor {
                 name: table_name.to_string(),
                 columns: vec![ColumnDef {
                     name: col_name,
+                    // INTENTIONAL: single-value type inference — NULL defaults to Text
                     data_type: result.data_type().unwrap_or(DataType::Text),
                     nullable: false,
                     primary_key: false,
@@ -975,6 +971,8 @@ impl Executor {
     ) -> Result<(TableSchema, Vec<Row>)> {
         use super::super::expr::eval_expr;
 
+        let qc = QueryContext::from_task_locals();
+
         fn extract_expr(arg: &FunctionArg) -> Result<&Expr> {
             match arg {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
@@ -986,10 +984,10 @@ impl Executor {
             return Err(anyhow!("generate_series requires at least 2 arguments"));
         }
 
-        let start_val = eval_expr(extract_expr(&args[0])?, None, None)?;
-        let stop_val = eval_expr(extract_expr(&args[1])?, None, None)?;
+        let start_val = eval_expr(extract_expr(&args[0])?, None, None, &qc)?;
+        let stop_val = eval_expr(extract_expr(&args[1])?, None, None, &qc)?;
         let step_val = if args.len() >= 3 {
-            eval_expr(extract_expr(&args[2])?, None, None)?
+            eval_expr(extract_expr(&args[2])?, None, None, &qc)?
         } else {
             Value::Null
         };
@@ -1041,6 +1039,7 @@ impl Executor {
         args: &[FunctionArg],
     ) -> Result<(TableSchema, Vec<Row>)> {
         use super::super::expr::eval_expr;
+        use crate::sql::query_context::QueryContext;
 
         fn extract_expr(arg: &FunctionArg) -> Result<&Expr> {
             match arg {
@@ -1057,7 +1056,9 @@ impl Executor {
             ));
         }
 
-        let name = match eval_expr(extract_expr(&args[0])?, None, None)? {
+        let query_ctx = QueryContext::from_task_locals();
+
+        let name = match eval_expr(extract_expr(&args[0])?, None, None, &query_ctx)? {
             Value::Text(v) => v,
             _ => {
                 return Err(anyhow!(
@@ -1065,7 +1066,7 @@ impl Executor {
                 ));
             }
         };
-        let checksum = match eval_expr(extract_expr(&args[1])?, None, None)? {
+        let checksum = match eval_expr(extract_expr(&args[1])?, None, None, &query_ctx)? {
             Value::Text(v) => v,
             _ => {
                 return Err(anyhow!(
@@ -1073,7 +1074,7 @@ impl Executor {
                 ));
             }
         };
-        let sql_preview = match eval_expr(extract_expr(&args[2])?, None, None)? {
+        let sql_preview = match eval_expr(extract_expr(&args[2])?, None, None, &query_ctx)? {
             Value::Text(v) => v,
             _ => {
                 return Err(anyhow!(
@@ -1213,15 +1214,7 @@ impl Executor {
                     };
 
                     let inferred_types = column_types.unwrap_or_else(|| {
-                        if let Some(first) = rows.first() {
-                            first
-                                .values
-                                .iter()
-                                .map(|v| v.data_type().unwrap_or(DataType::Text))
-                                .collect()
-                        } else {
-                            vec![DataType::Text; column_names.len()]
-                        }
+                        crate::types::infer_column_types_from_rows(&rows, column_names.len())
                     });
 
                     let schema = TableSchema {
@@ -1232,6 +1225,7 @@ impl Executor {
                             .enumerate()
                             .map(|(i, n)| ColumnDef {
                                 name: n.clone(),
+                                // INTENTIONAL: index guard — unreachable when types match columns
                                 data_type: inferred_types.get(i).cloned().unwrap_or(DataType::Text),
                                 nullable: true,
                                 primary_key: false,

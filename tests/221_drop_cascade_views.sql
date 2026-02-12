@@ -196,3 +196,93 @@ SELECT 'MULTI_MV1=' || count(*) FROM pg_catalog.pg_views
   WHERE viewname = 'multi_mv1';
 SELECT 'MULTI_MV2=' || count(*) FROM pg_catalog.pg_views
   WHERE viewname = 'multi_mv2';
+
+-- ---------------------------------------------------------------
+-- Test 9: Recursive CTE self-reference must not cause false drop.
+-- Issue #643: WITH RECURSIVE t AS (... FROM t ...) — the FROM t
+-- is the CTE working table, not the real table.
+-- ---------------------------------------------------------------
+DROP VIEW IF EXISTS rc_v CASCADE;
+DROP TABLE IF EXISTS rc_t CASCADE;
+
+CREATE TABLE rc_t (n INT);
+INSERT INTO rc_t VALUES (1);
+CREATE VIEW rc_v AS WITH RECURSIVE rc_t AS (
+  SELECT 1 AS n UNION ALL SELECT n+1 FROM rc_t WHERE n<10
+) SELECT * FROM rc_t;
+
+-- The view uses the CTE, not the table — must survive CASCADE.
+DROP TABLE rc_t CASCADE;
+
+SELECT 'RC_VIEW=' || count(*) FROM pg_catalog.pg_views
+  WHERE viewname = 'rc_v';
+
+-- Verify it returns CTE data (1..10), not table data.
+SELECT count(*) AS rc_count FROM rc_v;
+
+-- Cleanup.
+DROP VIEW rc_v;
+
+-- ---------------------------------------------------------------
+-- Test 10: Later CTE definition must not shadow earlier CTE body.
+-- Issue #654: WITH a AS (SELECT * FROM t), t AS (SELECT 1) —
+-- CTE t is not yet visible when a's body is walked.
+-- ---------------------------------------------------------------
+DROP VIEW IF EXISTS lt_v CASCADE;
+DROP TABLE IF EXISTS lt_t CASCADE;
+
+CREATE TABLE lt_t (id INT);
+INSERT INTO lt_t VALUES (42);
+CREATE VIEW lt_v AS WITH a AS (SELECT * FROM lt_t), lt_t AS (SELECT 1 AS id) SELECT * FROM a;
+
+-- CTE a's body references the real table lt_t — view must be dropped.
+DROP TABLE lt_t CASCADE;
+
+SELECT 'LT_VIEW=' || count(*) FROM pg_catalog.pg_views
+  WHERE viewname = 'lt_v';
+
+-- ---------------------------------------------------------------
+-- Test 11: Nested WITH reusing CTE name.
+-- Issue #644: inner CTE `a` must not affect outer CTE `a`'s deps.
+-- ---------------------------------------------------------------
+DROP VIEW IF EXISTS nw_v CASCADE;
+DROP TABLE IF EXISTS nw_t CASCADE;
+
+CREATE TABLE nw_t (id INT);
+INSERT INTO nw_t VALUES (99);
+CREATE VIEW nw_v AS WITH a AS (SELECT * FROM nw_t)
+  SELECT * FROM (WITH a AS (SELECT 1 AS id) SELECT * FROM a) sub;
+
+-- Outer CTE a references real nw_t — view must be dropped.
+DROP TABLE nw_t CASCADE;
+
+SELECT 'NW_VIEW=' || count(*) FROM pg_catalog.pg_views
+  WHERE viewname = 'nw_v';
+
+-- ---------------------------------------------------------------
+-- Test 12: Cross-schema search_path dependency.
+-- Issue #653: deps are resolved at CREATE time using search_path
+-- and stored in ViewDef.deps, so cross-schema CASCADE works (#667).
+-- ---------------------------------------------------------------
+DROP VIEW IF EXISTS cs_view CASCADE;
+DROP TABLE IF EXISTS other_schema.cs_t CASCADE;
+DROP SCHEMA IF EXISTS other_schema CASCADE;
+
+CREATE SCHEMA other_schema;
+CREATE TABLE other_schema.cs_t (id INT);
+INSERT INTO other_schema.cs_t VALUES (1);
+
+-- Create the view in public schema with search_path that includes
+-- other_schema, so the unqualified `cs_t` resolves to `other_schema.cs_t`.
+SET search_path TO public, other_schema;
+CREATE VIEW cs_view AS SELECT * FROM cs_t;
+SET search_path TO public;
+
+-- The view depends on other_schema.cs_t via stored deps.
+DROP TABLE other_schema.cs_t CASCADE;
+
+SELECT 'CS_VIEW=' || count(*) FROM pg_catalog.pg_views
+  WHERE viewname = 'cs_view';
+
+-- Cleanup.
+DROP SCHEMA other_schema CASCADE;

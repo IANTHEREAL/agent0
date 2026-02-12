@@ -1,6 +1,7 @@
 //! Query execution helpers
 
 use super::*;
+use crate::sql::query_context::QueryContext;
 
 impl Executor {
     pub(crate) async fn eval_expr_maybe_sequence(
@@ -13,6 +14,7 @@ impl Executor {
         row: Option<&Row>,
         schema: Option<&TableSchema>,
     ) -> Result<Value> {
+        let qc = QueryContext::from_task_locals();
         if sequences::expr_needs_async_eval(expr) {
             sequences::eval_expr_with_sequences(
                 &self.store,
@@ -26,7 +28,7 @@ impl Executor {
             )
             .await
         } else {
-            crate::sql::expr::eval_expr(expr, row, schema)
+            crate::sql::expr::eval_expr(expr, row, schema, &qc)
         }
     }
 
@@ -75,7 +77,24 @@ impl Executor {
                 .from_alias
                 .as_deref()
                 .unwrap_or(schema.name.rsplit('.').next().unwrap_or(&schema.name));
-            let substituted = substitute_outer_values(expr, outer_alias, schema, row);
+
+            // Collect inner column names for bare-ref disambiguation.
+            let inner_columns = if let Expr::Subquery(ref q) = expr {
+                super::super::subquery::collect_inner_column_names(
+                    &self.store(),
+                    txn,
+                    db_id,
+                    search_path,
+                    q,
+                    ctes,
+                )
+                .await?
+            } else {
+                None
+            };
+
+            let substituted =
+                substitute_outer_values(expr, outer_alias, schema, row, inner_columns.as_ref());
             let resolved = self
                 .resolve_subqueries(
                     txn,
@@ -221,7 +240,15 @@ impl Executor {
                 Value::Int64(n) => n as f64,
                 Value::Float64(f) => f,
                 Value::Numeric(d) => d.to_f64().unwrap_or(0.0),
-                Value::Text(s) => s.parse::<f64>().unwrap_or(0.0),
+                Value::Text(s) => s.parse::<f64>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "{}",
+                        crate::sql::error::SqlError::InvalidInputSyntax {
+                            type_name: "double precision".into(),
+                            value: s.clone(),
+                        }
+                    )
+                })?,
                 _ => 0.0,
             }
             .max(0.0);
@@ -824,15 +851,8 @@ impl Executor {
         };
 
         let empty_schema = TableSchema::default();
-        let mut column_types: Vec<DataType> = rows
-            .first()
-            .map(|row| {
-                row.values
-                    .iter()
-                    .map(|v| v.data_type().unwrap_or(DataType::Text))
-                    .collect()
-            })
-            .unwrap_or_else(|| vec![DataType::Text; cols.len()]);
+        let mut column_types: Vec<DataType> =
+            crate::types::infer_column_types_from_rows(&rows, cols.len());
 
         // Refine timestamp-typed values that are actually `timestamptz` per SQL semantics.
         for (idx, item) in select.projection.iter().enumerate() {
@@ -843,7 +863,10 @@ impl Executor {
                 SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
                 _ => continue,
             };
-            if matches!(infer_expr_type(expr, &empty_schema), DataType::TimestampTz) {
+            if matches!(
+                infer_expr_type(expr, &empty_schema),
+                Ok(DataType::TimestampTz)
+            ) {
                 column_types[idx] = DataType::TimestampTz;
             }
         }

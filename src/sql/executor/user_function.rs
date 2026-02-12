@@ -11,6 +11,7 @@ use tikv_client::Transaction;
 
 use super::core::Executor;
 use crate::sql::expr::eval_expr;
+use crate::sql::query_context::QueryContext;
 
 impl Executor {
     pub(crate) fn try_execute_user_table_function<'a>(
@@ -102,6 +103,7 @@ impl Executor {
 }
 
 fn eval_function_args(args: &[FunctionArg]) -> Result<Vec<Value>> {
+    let qc = QueryContext::from_task_locals();
     let mut values = Vec::with_capacity(args.len());
     for arg in args {
         let expr = match arg {
@@ -120,7 +122,7 @@ fn eval_function_args(args: &[FunctionArg]) -> Result<Vec<Value>> {
                 )
             }
         };
-        let val = eval_expr(expr, None, None)?;
+        let val = eval_expr(expr, None, None, &qc)?;
         values.push(val);
     }
     Ok(values)
@@ -286,6 +288,7 @@ fn build_output_schema(
                 .as_ref()
                 .and_then(|cts| cts.get(i))
                 .cloned()
+                // INTENTIONAL: no RETURNS clause — default to Text (PG-compatible)
                 .unwrap_or(DataType::Text);
             ColumnDef {
                 name: name.clone(),

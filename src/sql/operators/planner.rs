@@ -28,6 +28,7 @@ use super::{
 };
 use crate::sql::expr::eval_expr;
 use crate::sql::planner::{choose_best_access_path_for_filter, ScanType};
+use crate::sql::query_context::QueryContext;
 use crate::sql::value_coercion::coerce_value_for_column;
 use crate::types::{TableSchema, Value};
 
@@ -50,10 +51,11 @@ fn collect_eq_predicates(expr: &Expr, out: &mut HashMap<String, Value>) -> Optio
                 Some(())
             }
             BinaryOperator::Eq => {
+                let qc = QueryContext::from_task_locals();
                 let (col, val) = if let Some(col) = extract_column_name(left) {
-                    (col, eval_expr(right, None, None).ok()?)
+                    (col, eval_expr(right, None, None, &qc).ok()?)
                 } else if let Some(col) = extract_column_name(right) {
-                    (col, eval_expr(left, None, None).ok()?)
+                    (col, eval_expr(left, None, None, &qc).ok()?)
                 } else {
                     return None;
                 };

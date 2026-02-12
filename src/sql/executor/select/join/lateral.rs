@@ -2,6 +2,7 @@ use super::super::*;
 use super::table_factor::extract_virtual_table_filter;
 use super::using_merge::{rewrite_for_using_join, UsingMergeColumn};
 use crate::sql::error::SqlError;
+use crate::sql::query_context::QueryContext;
 
 fn eval_bool_expr(
     expr: &Expr,
@@ -9,8 +10,9 @@ fn eval_bool_expr(
     schema: &TableSchema,
     err_msg: &'static str,
 ) -> Result<bool> {
-    let value = eval_expr(expr, Some(row), Some(schema))?;
-    let value = coerce_text_literal_to_bool(expr, value)?;
+    let qc = QueryContext::from_task_locals();
+    let value = eval_expr(expr, Some(row), Some(schema), &qc)?;
+    let value = crate::sql::types::cast::coerce_to_bool(value)?;
     match value {
         Value::Boolean(b) => Ok(b),
         Value::Null => Ok(false),
@@ -64,6 +66,8 @@ impl Executor {
     ) -> Result<ExecuteResult> {
         use crate::sql::executor::subquery::substitute_outer_values_in_query;
         use crate::types::ColumnDef;
+
+        let qc = QueryContext::from_task_locals();
 
         let virtual_filter = resolved_selection
             .map(extract_virtual_table_filter)
@@ -160,6 +164,7 @@ impl Executor {
                         &outer_alias,
                         &outer_schema,
                         &outer_row,
+                        None,
                     );
 
                     let result = self
@@ -189,15 +194,8 @@ impl Executor {
                         } else {
                             alias_cols.iter().map(|c| c.value.clone()).collect()
                         };
-                        let inferred_types: Vec<DataType> = if let Some(first) = sub_rows.first() {
-                            first
-                                .values
-                                .iter()
-                                .map(|v| v.data_type().unwrap_or(DataType::Text))
-                                .collect()
-                        } else {
-                            vec![DataType::Text; col_names.len()]
-                        };
+                        let inferred_types: Vec<DataType> =
+                            crate::types::infer_column_types_from_rows(&sub_rows, col_names.len());
                         lateral_schema = Some(TableSchema {
                             table_id: 0,
                             name: lateral_alias_name.clone(),
@@ -530,27 +528,30 @@ impl Executor {
                         )
                         .await?
                     } else {
-                        eval_expr(expr, Some(&row), Some(&combined_schema))?
+                        eval_expr(expr, Some(&row), Some(&combined_schema), &qc)?
                     };
                     keys.push(value);
                 }
                 keyed_rows.push((keys, row));
             }
 
-            keyed_rows.sort_by(|(keys_a, _), (keys_b, _)| {
-                for (i, (_expr, asc, nulls_first)) in order_exprs.iter().enumerate() {
-                    let ordering = crate::sql::expr::compare_order_by_values(
-                        &keys_a[i],
-                        &keys_b[i],
-                        *asc,
-                        *nulls_first,
-                    );
-                    if ordering != std::cmp::Ordering::Equal {
-                        return ordering;
+            crate::sql::expr::operators::sort_by_fallible(
+                &mut keyed_rows,
+                |(keys_a, _), (keys_b, _)| {
+                    for (i, (_expr, asc, nulls_first)) in order_exprs.iter().enumerate() {
+                        let ordering = crate::sql::expr::compare_order_by_values(
+                            &keys_a[i],
+                            &keys_b[i],
+                            *asc,
+                            *nulls_first,
+                        )?;
+                        if ordering != std::cmp::Ordering::Equal {
+                            return Ok(ordering);
+                        }
                     }
-                }
-                std::cmp::Ordering::Equal
-            });
+                    Ok(std::cmp::Ordering::Equal)
+                },
+            )?;
 
             combined_rows = keyed_rows.into_iter().map(|(_, row)| row).collect();
         }
@@ -585,15 +586,15 @@ impl Executor {
                 .iter()
                 .map(|item| get_select_item_name(item))
                 .collect();
-            let types: Vec<DataType> = rewritten_projection
-                .iter()
-                .map(|item| match item {
+            let mut types: Vec<DataType> = Vec::with_capacity(rewritten_projection.len());
+            for item in &rewritten_projection {
+                types.push(match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        infer_expr_type(expr, &combined_schema)
+                        infer_expr_type(expr, &combined_schema)?
                     }
                     _ => DataType::Text,
-                })
-                .collect();
+                });
+            }
             let mut projected = Vec::with_capacity(combined_rows.len());
             for row in &combined_rows {
                 let mut values = Vec::with_capacity(rewritten_projection.len());
@@ -602,7 +603,7 @@ impl Executor {
                         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
                         _ => continue,
                     };
-                    let val = eval_expr(expr, Some(row), Some(&combined_schema))?;
+                    let val = eval_expr(expr, Some(row), Some(&combined_schema), &qc)?;
                     values.push(val);
                 }
                 projected.push(Row::new(values));

@@ -16,6 +16,7 @@ use crate::types::{Row, TableSchema, Value};
 
 use crate::extensions::fs::{self, Fs9Mode};
 use crate::extensions::http::{self, HttpTableFunctionCall};
+use crate::sql::query_context::QueryContext;
 
 /// Result of executing an extension table function.
 /// Streaming mode returns an operator that yields rows lazily.
@@ -144,6 +145,8 @@ impl Executor {
             return Ok(None);
         }
 
+        let qc = QueryContext::from_task_locals();
+
         fn extract_expr_arg(arg: &FunctionArg) -> Result<&Expr> {
             match arg {
                 FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
@@ -169,21 +172,30 @@ impl Executor {
                 if args.len() != 1 {
                     return Err(anyhow!("http_get(url text) requires 1 argument"));
                 }
-                let url = expect_text(eval_expr(extract_expr_arg(&args[0])?, None, None)?, "url")?;
+                let url = expect_text(
+                    eval_expr(extract_expr_arg(&args[0])?, None, None, &qc)?,
+                    "url",
+                )?;
                 Some(HttpTableFunctionCall::Get { url })
             }
             "HTTP_HEAD" => {
                 if args.len() != 1 {
                     return Err(anyhow!("http_head(url text) requires 1 argument"));
                 }
-                let url = expect_text(eval_expr(extract_expr_arg(&args[0])?, None, None)?, "url")?;
+                let url = expect_text(
+                    eval_expr(extract_expr_arg(&args[0])?, None, None, &qc)?,
+                    "url",
+                )?;
                 Some(HttpTableFunctionCall::Head { url })
             }
             "HTTP_DELETE" => {
                 if args.len() != 1 {
                     return Err(anyhow!("http_delete(url text) requires 1 argument"));
                 }
-                let url = expect_text(eval_expr(extract_expr_arg(&args[0])?, None, None)?, "url")?;
+                let url = expect_text(
+                    eval_expr(extract_expr_arg(&args[0])?, None, None, &qc)?,
+                    "url",
+                )?;
                 Some(HttpTableFunctionCall::Delete { url })
             }
             "HTTP_POST" => {
@@ -192,11 +204,16 @@ impl Executor {
                         "http_post(url text, body text, content_type text) requires 3 arguments"
                     ));
                 }
-                let url = expect_text(eval_expr(extract_expr_arg(&args[0])?, None, None)?, "url")?;
-                let body =
-                    expect_text(eval_expr(extract_expr_arg(&args[1])?, None, None)?, "body")?;
+                let url = expect_text(
+                    eval_expr(extract_expr_arg(&args[0])?, None, None, &qc)?,
+                    "url",
+                )?;
+                let body = expect_text(
+                    eval_expr(extract_expr_arg(&args[1])?, None, None, &qc)?,
+                    "body",
+                )?;
                 let content_type = expect_text(
-                    eval_expr(extract_expr_arg(&args[2])?, None, None)?,
+                    eval_expr(extract_expr_arg(&args[2])?, None, None, &qc)?,
                     "content_type",
                 )?;
                 Some(HttpTableFunctionCall::Post {
@@ -211,11 +228,16 @@ impl Executor {
                         "http_put(url text, body text, content_type text) requires 3 arguments"
                     ));
                 }
-                let url = expect_text(eval_expr(extract_expr_arg(&args[0])?, None, None)?, "url")?;
-                let body =
-                    expect_text(eval_expr(extract_expr_arg(&args[1])?, None, None)?, "body")?;
+                let url = expect_text(
+                    eval_expr(extract_expr_arg(&args[0])?, None, None, &qc)?,
+                    "url",
+                )?;
+                let body = expect_text(
+                    eval_expr(extract_expr_arg(&args[1])?, None, None, &qc)?,
+                    "body",
+                )?;
                 let content_type = expect_text(
-                    eval_expr(extract_expr_arg(&args[2])?, None, None)?,
+                    eval_expr(extract_expr_arg(&args[2])?, None, None, &qc)?,
                     "content_type",
                 )?;
                 Some(HttpTableFunctionCall::Put {
@@ -257,7 +279,7 @@ impl Executor {
                 }
                 _ => return Err(anyhow!("fs9: first argument must be a path string")),
             };
-            let path = match eval_expr(path_expr, None, None)? {
+            let path = match eval_expr(path_expr, None, None, &qc)? {
                 Value::Text(s) => s,
                 Value::Null => return Err(anyhow!("fs9: path must not be NULL")),
                 _ => return Err(anyhow!("fs9: path must be TEXT")),
@@ -278,7 +300,7 @@ impl Executor {
                         ..
                     } => {
                         let param_name = name.value.to_ascii_lowercase();
-                        let val = eval_expr(e, None, None)?;
+                        let val = eval_expr(e, None, None, &qc)?;
                         match param_name.as_str() {
                             "format" => {
                                 format = Some(match val {

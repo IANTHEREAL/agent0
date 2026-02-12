@@ -3,8 +3,9 @@
 use crate::storage::TikvStore;
 use crate::types::{FunctionDef, Row, TableSchema, TriggerDef};
 use anyhow::Result;
+use dashmap::DashMap;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::Arc;
 use tikv_client::Transaction;
 
 use super::trigger_rewrite::substitute_row_references;
@@ -23,10 +24,40 @@ struct CompiledTriggerBody {
     statements: Vec<TriggerStatement>,
 }
 
-static COMPILED_BODY_CACHE: OnceLock<RwLock<HashMap<u32, CompiledTriggerBody>>> = OnceLock::new();
+/// Per-tenant cache for compiled trigger function bodies.
+///
+/// Owned by `TenantEntry` in the pool — when the reaper drops the entry,
+/// the cache is dropped automatically (no manual eviction needed).
+pub(crate) struct TriggerBodyCache {
+    inner: DashMap<(u64, u32), CompiledTriggerBody>, // (db_id, func_oid)
+}
 
-fn get_body_cache() -> &'static RwLock<HashMap<u32, CompiledTriggerBody>> {
-    COMPILED_BODY_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+impl TriggerBodyCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: DashMap::new(),
+        }
+    }
+
+    fn get_or_compile(&self, db_id: u64, func_oid: u32, body: &str) -> Result<CompiledTriggerBody> {
+        let key = (db_id, func_oid);
+        if let Some(compiled) = self.inner.get(&key) {
+            return Ok(compiled.clone());
+        }
+
+        let compiled = CompiledTriggerBody::compile(body)?;
+        self.inner.insert(key, compiled.clone());
+        Ok(compiled)
+    }
+
+    /// Remove all compiled trigger bodies for a database.
+    ///
+    /// Called on DDL that changes function definitions (CREATE OR REPLACE
+    /// FUNCTION, DROP FUNCTION). Invalidation is coarse-grained by db_id
+    /// because DDL is rare and entries are cheap to recompile on next use.
+    pub(crate) fn invalidate_db(&self, db_id: u64) {
+        self.inner.retain(|&(did, _), _| did != db_id);
+    }
 }
 
 impl CompiledTriggerBody {
@@ -108,25 +139,8 @@ impl CompiledTriggerBody {
     }
 }
 
-fn get_or_compile_body(func_oid: u32, body: &str) -> Result<CompiledTriggerBody> {
-    let cache = get_body_cache();
-
-    {
-        let guard = cache.read().expect("compiled body cache read lock");
-        if let Some(compiled) = guard.get(&func_oid) {
-            return Ok(compiled.clone());
-        }
-    }
-
-    let compiled = CompiledTriggerBody::compile(body)?;
-    {
-        let mut guard = cache.write().expect("compiled body cache write lock");
-        guard.insert(func_oid, compiled.clone());
-    }
-    Ok(compiled)
-}
-
 pub async fn prefetch_trigger_functions(
+    trigger_cache: &TriggerBodyCache,
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
@@ -147,7 +161,8 @@ pub async fn prefetch_trigger_functions(
             continue;
         }
         if let Some(func_def) = store.get_function(txn, db_id, &trigger.function).await? {
-            if let Ok(compiled) = get_or_compile_body(func_def.oid, &func_def.body) {
+            if let Ok(compiled) = trigger_cache.get_or_compile(db_id, func_def.oid, &func_def.body)
+            {
                 let _ = compiled;
             }
             func_cache.insert(trigger.function.clone(), func_def);
@@ -158,6 +173,7 @@ pub async fn prefetch_trigger_functions(
 }
 
 pub async fn apply_before_triggers_with_cache(
+    trigger_cache: &TriggerBodyCache,
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
@@ -191,6 +207,7 @@ pub async fn apply_before_triggers_with_cache(
         };
 
         let result = execute_trigger_function(
+            trigger_cache,
             store,
             txn,
             db_id,
@@ -250,6 +267,7 @@ fn validate_trigger_body(body: &str) -> Result<()> {
 }
 
 async fn execute_trigger_function(
+    trigger_cache: &TriggerBodyCache,
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
@@ -266,6 +284,7 @@ async fn execute_trigger_function(
     }
 
     execute_trigger_body_cached(
+        trigger_cache,
         store,
         txn,
         db_id,
@@ -281,6 +300,7 @@ async fn execute_trigger_function(
 }
 
 async fn execute_trigger_body_cached(
+    trigger_cache: &TriggerBodyCache,
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
@@ -294,8 +314,10 @@ async fn execute_trigger_body_cached(
 ) -> Result<TriggerResult> {
     use super::expr::eval_expr;
     use super::sequences;
+    use crate::sql::query_context::QueryContext;
 
-    let compiled = get_or_compile_body(func_oid, body)?;
+    let qc = QueryContext::from_task_locals();
+    let compiled = trigger_cache.get_or_compile(db_id, func_oid, body)?;
 
     if compiled.statements.is_empty() {
         return Ok(TriggerResult::Unchanged);
@@ -354,7 +376,7 @@ async fn execute_trigger_body_cached(
                                         )
                                         .await?
                                     } else {
-                                        eval_expr(&expr, None, None)?
+                                        eval_expr(&expr, None, None, &qc)?
                                     };
 
                                     let coerced = super::value_coercion::coerce_value_for_column(
@@ -634,5 +656,117 @@ mod tests {
             END;
         "#;
         assert!(validate_trigger_body(body).is_ok());
+    }
+
+    #[test]
+    fn test_trigger_body_cache_instance_isolation() {
+        let body_a = "BEGIN\n  NEW.x := 1;\n  RETURN NEW;\nEND;";
+        let body_b = "BEGIN\n  NEW.x := 999;\n  RETURN NEW;\nEND;";
+        let oid = 42u32;
+        let db_id = 1u64;
+
+        let cache_a = TriggerBodyCache::new();
+        let cache_b = TriggerBodyCache::new();
+
+        // Same (db_id, func_oid), different cache instances → independent entries
+        let a = cache_a.get_or_compile(db_id, oid, body_a).unwrap();
+        let b = cache_b.get_or_compile(db_id, oid, body_b).unwrap();
+
+        let a_expr = match &a.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        let b_expr = match &b.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(a_expr, "1");
+        assert_eq!(b_expr, "999");
+
+        // Re-fetch from cache_a returns the correct body
+        let a2 = cache_a.get_or_compile(db_id, oid, body_a).unwrap();
+        let a2_expr = match &a2.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(a2_expr, "1");
+    }
+
+    #[test]
+    fn test_trigger_body_cache_db_id_isolation() {
+        let cache = TriggerBodyCache::new();
+        let oid = 42u32;
+
+        let body_a = "BEGIN\n  NEW.x := 1;\n  RETURN NEW;\nEND;";
+        let body_b = "BEGIN\n  NEW.x := 50;\n  RETURN NEW;\nEND;";
+
+        let a = cache.get_or_compile(1, oid, body_a).unwrap();
+        let b = cache.get_or_compile(2, oid, body_b).unwrap();
+
+        let a_expr = match &a.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        let b_expr = match &b.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(a_expr, "1");
+        assert_eq!(b_expr, "50");
+    }
+
+    #[test]
+    fn test_invalidate_db_clears_stale_entries() {
+        // Simulates CREATE OR REPLACE FUNCTION: same (db_id, func_oid),
+        // DDL invalidates, next call recompiles with new body.
+        let cache = TriggerBodyCache::new();
+        let db_id = 1u64;
+        let oid = 10u32;
+
+        let body_v1 = "BEGIN\n  NEW.x := 1;\n  RETURN NEW;\nEND;";
+        let body_v2 = "BEGIN\n  NEW.x := 42;\n  RETURN NEW;\nEND;";
+
+        // Populate cache with v1
+        let v1 = cache.get_or_compile(db_id, oid, body_v1).unwrap();
+        let v1_expr = match &v1.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(v1_expr, "1");
+
+        // Without invalidation, cache returns stale v1
+        let stale = cache.get_or_compile(db_id, oid, body_v2).unwrap();
+        let stale_expr = match &stale.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(stale_expr, "1"); // stale!
+
+        // DDL invalidation clears entries for this db
+        cache.invalidate_db(db_id);
+
+        // Now the cache miss forces recompilation with v2
+        let v2 = cache.get_or_compile(db_id, oid, body_v2).unwrap();
+        let v2_expr = match &v2.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(v2_expr, "42");
+    }
+
+    #[test]
+    fn test_invalidate_db_does_not_affect_other_dbs() {
+        let cache = TriggerBodyCache::new();
+        let body = "BEGIN\n  NEW.x := 1;\n  RETURN NEW;\nEND;";
+
+        cache.get_or_compile(1, 10, body).unwrap();
+        cache.get_or_compile(2, 10, body).unwrap();
+
+        cache.invalidate_db(1);
+
+        // db_id=1 entry is gone (cache miss → recompile)
+        assert!(cache.inner.get(&(1u64, 10u32)).is_none());
+        // db_id=2 entry is still present
+        assert!(cache.inner.get(&(2u64, 10u32)).is_some());
     }
 }

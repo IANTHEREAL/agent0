@@ -1,5 +1,6 @@
 use super::super::*;
 use super::using_merge::{rewrite_for_using_join, UsingMergeColumn};
+use crate::sql::query_context::QueryContext;
 use sqlparser::ast::OrderByExpr;
 
 impl Executor {
@@ -16,6 +17,7 @@ impl Executor {
         table_aliases: &[(String, TableSchema)],
         merge_columns: &[UsingMergeColumn],
     ) -> Result<Option<ExecuteResult>> {
+        let qc = QueryContext::from_task_locals();
         let join_schema = running_op.schema().clone();
 
         let rewritten_projection: Vec<SelectItem> = resolved_projection
@@ -62,7 +64,7 @@ impl Executor {
                         .join("."),
                     _ => format!("{}", rewritten),
                 };
-                let data_type = infer_expr_type(&rewritten, &join_schema);
+                let data_type = infer_expr_type(&rewritten, &join_schema)?;
                 exprs.push(rewritten);
                 names.push(name);
                 types.push(data_type);
@@ -76,7 +78,7 @@ impl Executor {
             &mut group_by_names,
             &mut group_by_types,
             &join_schema,
-        );
+        )?;
 
         let (mut agg_exprs, mut agg_names, mut agg_types) =
             Executor::extract_aggregate_info(&rewritten_projection, &join_schema)?;
@@ -152,7 +154,7 @@ impl Executor {
                                 crate::sql::projection::infer_expr_type(
                                     arr.expr.as_ref(),
                                     &join_schema,
-                                ),
+                                )?,
                             )));
                         }
                     }
@@ -248,7 +250,7 @@ impl Executor {
                     &agg_exprs,
                     group_by_count,
                 )?;
-                let having_val = coerce_text_literal_to_bool(&rewritten_having, having_val)?;
+                let having_val = crate::sql::types::cast::coerce_to_bool(having_val)?;
                 match having_val {
                     Value::Boolean(true) => filtered_rows.push(row),
                     Value::Boolean(false) | Value::Null => {}
@@ -351,12 +353,12 @@ impl Executor {
                     let expr_str = format!("{}", expr).to_lowercase();
                     if let Some(gb_col) = group_by_expr_map.get(&expr_str) {
                         let rewritten = Expr::Identifier(Ident::new(gb_col.clone()));
-                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema));
+                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema)?);
                         projection_exprs.push(rewritten);
                     } else {
                         let rewritten =
                             rewrite_agg_refs_to_columns(expr, &agg_column_map, &group_by_names);
-                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema));
+                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema)?);
                         projection_exprs.push(rewritten);
                     }
                 }
@@ -367,7 +369,7 @@ impl Executor {
         for row in &rows {
             let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
             for expr in &projection_exprs {
-                let val = eval_expr(expr, Some(row), Some(&agg_output_schema))?;
+                let val = eval_expr(expr, Some(row), Some(&agg_output_schema), &qc)?;
                 values.push(val);
             }
             projected_rows.push(Row::new(values));
@@ -375,7 +377,7 @@ impl Executor {
 
         if !query.order_by.is_empty() {
             projected_rows =
-                self.apply_order_by_for_aggregate(projected_rows, &query.order_by, &columns);
+                self.apply_order_by_for_aggregate(projected_rows, &query.order_by, &columns)?;
         }
 
         let offset = extract_offset(query);

@@ -1,9 +1,7 @@
 //! DML operations (INSERT, UPDATE, DELETE) for the SQL executor
 
 use super::super::dml;
-use super::super::expr::{
-    coerce_text_literal_to_bool, validate_bool_expr_in_boolean_context, JoinEvalContext,
-};
+use super::super::expr::{validate_bool_expr_in_boolean_context, JoinEvalContext};
 use super::super::names;
 use super::super::names::normalize_ident;
 use super::super::trigger_queue::TriggerOp;
@@ -12,6 +10,7 @@ use super::super::triggers;
 use super::super::ExecuteResult;
 use super::core::Executor;
 use crate::sql::error::SqlError;
+use crate::sql::query_context::QueryContext;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
@@ -60,8 +59,8 @@ fn build_type_infer_schema_for_two_table_join(
     }
 }
 
-fn predicate_value_to_bool(expr: &Expr, value: Value) -> Result<bool> {
-    let value = coerce_text_literal_to_bool(expr, value)?;
+fn predicate_value_to_bool(_expr: &Expr, value: Value) -> Result<bool> {
+    let value = crate::sql::types::cast::coerce_to_bool(value)?;
     match value {
         Value::Boolean(b) => Ok(b),
         Value::Null => Ok(false),
@@ -92,7 +91,12 @@ fn value_to_expr(val: Value, _col_name: Option<&str>) -> Result<Expr> {
         }
         Value::Date(days) => {
             use chrono::NaiveDate;
-            let date = NaiveDate::from_num_days_from_ce_opt(days + 719163).unwrap_or_default();
+            let ce_days = (days as i64)
+                .checked_add(719163)
+                .and_then(|d| i32::try_from(d).ok());
+            let date = ce_days
+                .and_then(NaiveDate::from_num_days_from_ce_opt)
+                .ok_or_else(|| anyhow!("date value out of range: {}", days))?;
             Expr::Value(SqlValue::SingleQuotedString(
                 date.format("%Y-%m-%d").to_string(),
             ))
@@ -159,6 +163,7 @@ impl Executor {
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
         let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
         let trigger_func_cache_insert = triggers::prefetch_trigger_functions(
+            self.trigger_cache(),
             &self.store(),
             txn,
             db_id,
@@ -167,6 +172,7 @@ impl Executor {
         )
         .await?;
         let trigger_func_cache_update = triggers::prefetch_trigger_functions(
+            self.trigger_cache(),
             &self.store(),
             txn,
             db_id,
@@ -260,6 +266,7 @@ impl Executor {
             let row = Row::new(row_vals);
 
             let row = match triggers::apply_before_triggers_with_cache(
+                self.trigger_cache(),
                 &self.store(),
                 txn,
                 db_id,
@@ -373,6 +380,7 @@ impl Executor {
                     let updated_row = Row::new(updated_vals);
 
                     let updated_row = match triggers::apply_before_triggers_with_cache(
+                        self.trigger_cache(),
                         &self.store(),
                         txn,
                         db_id,
@@ -459,7 +467,8 @@ impl Executor {
         }
 
         if inserted > 0 {
-            crate::sql::stats::bump_row_count_estimate(db_id, schema.table_id, inserted as isize);
+            self.stats_cache()
+                .bump_estimate(db_id, schema.table_id, inserted as isize);
         }
 
         if returning.is_some() {
@@ -488,6 +497,7 @@ impl Executor {
         selection: &Option<Expr>,
         returning: &Option<Vec<SelectItem>>,
     ) -> Result<ExecuteResult> {
+        let qc = QueryContext::from_task_locals();
         let ctes_ctx: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let (resolved_target, table_alias) = match &from[0].relation {
             sqlparser::ast::TableFactor::Table { name, alias, .. } => {
@@ -616,6 +626,7 @@ impl Executor {
                             None,
                             &combined_row,
                             &combined_schema,
+                            &qc,
                         );
                         let value = self
                             .eval_expr_join_maybe_sequence(
@@ -716,6 +727,7 @@ impl Executor {
         selection: &Option<Expr>,
         returning: &Option<Vec<SelectItem>>,
     ) -> Result<ExecuteResult> {
+        let qc = QueryContext::from_task_locals();
         let ctes_ctx: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let resolved_target = match &table.relation {
             sqlparser::ast::TableFactor::Table { name, .. } => names::resolve_existing_table_name(
@@ -745,6 +757,7 @@ impl Executor {
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
         let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
         let trigger_func_cache_update = triggers::prefetch_trigger_functions(
+            self.trigger_cache(),
             &self.store(),
             txn,
             db_id,
@@ -856,6 +869,7 @@ impl Executor {
                                 None,
                                 &combined_row,
                                 &combined_schema,
+                                &qc,
                             );
                             let value = self
                                 .eval_expr_join_maybe_sequence(
@@ -956,6 +970,7 @@ impl Executor {
 
             let new_row = Row::new(new_vals);
             let new_row = match triggers::apply_before_triggers_with_cache(
+                self.trigger_cache(),
                 &self.store(),
                 txn,
                 db_id,
@@ -1045,15 +1060,23 @@ mod tests {
 
     #[test]
     fn value_to_expr_roundtrips_bytes() {
+        let qc = QueryContext::from_task_locals();
         let expr = value_to_expr(Value::Bytes(vec![0, 1, 2, 255]), None).unwrap();
-        let val = crate::sql::expr::eval_expr(&expr, None, None).unwrap();
+        let val = crate::sql::expr::eval_expr(&expr, None, None, &qc).unwrap();
         assert_eq!(val, Value::Bytes(vec![0, 1, 2, 255]));
     }
 
     #[test]
     fn value_to_expr_roundtrips_timestamp() {
+        let qc = QueryContext::from_task_locals();
         let expr = value_to_expr(Value::Timestamp(0), None).unwrap();
-        let val = crate::sql::expr::eval_expr(&expr, None, None).unwrap();
+        let val = crate::sql::expr::eval_expr(&expr, None, None, &qc).unwrap();
         assert_eq!(val, Value::Timestamp(0));
+    }
+
+    #[test]
+    fn value_to_expr_date_out_of_range() {
+        let result = value_to_expr(Value::Date(i32::MAX), None);
+        assert!(result.is_err(), "out-of-range date should return Err");
     }
 }

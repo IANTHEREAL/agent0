@@ -1,5 +1,5 @@
 use super::context::EvalContext;
-use super::operators::{parse_bool_pg, try_coerce_text_to_numeric};
+use super::operators::parse_bool_pg;
 use super::{
     cast_value, compare_values, eval_binary_op, eval_json_access, eval_value, interval_from_number,
     like_match, parse_interval_from_expr, parse_interval_string, parse_timestamp_string,
@@ -39,7 +39,7 @@ fn try_infer_expr_type_for_validation<C: EvalContext>(ctx: &C, expr: &Expr) -> R
 
     let empty_schema = TableSchema::default();
     let schema = ctx.schema().unwrap_or(&empty_schema);
-    crate::sql::types::try_infer_expr_type(expr, schema)
+    crate::sql::types::infer_expr_type(expr, schema)
         .map_err(|e| crate::sql::error::SqlError::from(e).into())
 }
 
@@ -178,7 +178,7 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(
             None => {
                 let empty_schema = TableSchema::default();
                 let schema = ctx.schema().unwrap_or(&empty_schema);
-                match crate::sql::types::try_infer_expr_type(expr, schema) {
+                match crate::sql::types::infer_expr_type(expr, schema) {
                     Ok(DataType::Boolean) => Ok(()),
                     Err(e) => Err(crate::sql::error::SqlError::from(e).into()),
                     _ => Err(anyhow!(err_msg)),
@@ -331,7 +331,7 @@ fn ensure_boolean_or_null_operand<C: EvalContext>(
         other => {
             let empty_schema = TableSchema::default();
             let schema = ctx.schema().unwrap_or(&empty_schema);
-            match crate::sql::types::try_infer_expr_type(other, schema) {
+            match crate::sql::types::infer_expr_type(other, schema) {
                 Ok(DataType::Boolean) => Ok(()),
                 Err(e) => Err(crate::sql::error::SqlError::from(e).into()),
                 _ => Err(anyhow!(err_msg)),
@@ -385,7 +385,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => {
                 let left_val = eval_expr_impl(ctx, left)?;
-                let left_val = super::coerce_text_literal_to_bool(left, left_val)?;
+                let left_val = crate::sql::types::cast::coerce_to_bool(left_val)?;
                 match &left_val {
                     Value::Boolean(false) => {
                         ensure_boolean_or_null_operand(
@@ -397,7 +397,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                     }
                     Value::Boolean(true) | Value::Null => {
                         let right_val = eval_expr_impl(ctx, right)?;
-                        let right_val = super::coerce_text_literal_to_bool(right, right_val)?;
+                        let right_val = crate::sql::types::cast::coerce_to_bool(right_val)?;
                         eval_binary_op(left_val, op, right_val)
                     }
                     _ => Err(anyhow!("AND requires boolean operands")),
@@ -405,7 +405,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             }
             BinaryOperator::Or => {
                 let left_val = eval_expr_impl(ctx, left)?;
-                let left_val = super::coerce_text_literal_to_bool(left, left_val)?;
+                let left_val = crate::sql::types::cast::coerce_to_bool(left_val)?;
                 match &left_val {
                     Value::Boolean(true) => {
                         ensure_boolean_or_null_operand(ctx, right, "OR requires boolean operands")?;
@@ -413,7 +413,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                     }
                     Value::Boolean(false) | Value::Null => {
                         let right_val = eval_expr_impl(ctx, right)?;
-                        let right_val = super::coerce_text_literal_to_bool(right, right_val)?;
+                        let right_val = crate::sql::types::cast::coerce_to_bool(right_val)?;
                         eval_binary_op(left_val, op, right_val)
                     }
                     _ => Err(anyhow!("OR requires boolean operands")),
@@ -440,7 +440,9 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                     Value::Float64(f) => Ok(Value::Float64(-f)),
                     Value::Numeric(d) => Ok(Value::Numeric(-d)),
                     Value::Text(s) => {
-                        let parsed = try_coerce_text_to_numeric(Value::Text(s.clone()));
+                        let parsed = crate::sql::types::cast::coerce_text_to_numeric(Value::Text(
+                            s.clone(),
+                        ))?;
                         match parsed {
                             Value::Int32(i) => i
                                 .checked_neg()
@@ -451,18 +453,13 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                                 .map(Value::Int64)
                                 .ok_or_else(|| anyhow!("bigint out of range")),
                             Value::Float64(f) => Ok(Value::Float64(-f)),
-                            Value::Text(_) => Err(SqlError::InvalidInputSyntax {
-                                type_name: "numeric".into(),
-                                value: s,
-                            }
-                            .into()),
                             other => Err(anyhow!("Cannot negate {:?}", other)),
                         }
                     }
                     other => Err(anyhow!("Cannot negate {:?}", other)),
                 },
                 sqlparser::ast::UnaryOperator::Not => {
-                    let val = super::coerce_text_literal_to_bool(expr, val)?;
+                    let val = crate::sql::types::cast::coerce_to_bool(val)?;
                     match val {
                         Value::Boolean(b) => Ok(Value::Boolean(!b)),
                         Value::Null => Ok(Value::Null),
@@ -485,7 +482,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
         }
         Expr::IsTrue(expr) => {
             let val = eval_expr_impl(ctx, expr)?;
-            let val = super::coerce_text_literal_to_bool(expr, val)?;
+            let val = crate::sql::types::cast::coerce_to_bool(val)?;
             match val {
                 Value::Boolean(b) => Ok(Value::Boolean(b)),
                 Value::Null => Ok(Value::Boolean(false)),
@@ -494,7 +491,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
         }
         Expr::IsNotTrue(expr) => {
             let val = eval_expr_impl(ctx, expr)?;
-            let val = super::coerce_text_literal_to_bool(expr, val)?;
+            let val = crate::sql::types::cast::coerce_to_bool(val)?;
             match val {
                 Value::Boolean(true) => Ok(Value::Boolean(false)),
                 Value::Boolean(false) | Value::Null => Ok(Value::Boolean(true)),
@@ -503,7 +500,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
         }
         Expr::IsFalse(expr) => {
             let val = eval_expr_impl(ctx, expr)?;
-            let val = super::coerce_text_literal_to_bool(expr, val)?;
+            let val = crate::sql::types::cast::coerce_to_bool(val)?;
             match val {
                 Value::Boolean(b) => Ok(Value::Boolean(!b)),
                 Value::Null => Ok(Value::Boolean(false)),
@@ -512,7 +509,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
         }
         Expr::IsNotFalse(expr) => {
             let val = eval_expr_impl(ctx, expr)?;
-            let val = super::coerce_text_literal_to_bool(expr, val)?;
+            let val = crate::sql::types::cast::coerce_to_bool(val)?;
             match val {
                 Value::Boolean(false) => Ok(Value::Boolean(false)),
                 Value::Boolean(true) | Value::Null => Ok(Value::Boolean(true)),
@@ -544,7 +541,7 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                     has_null = true;
                     continue;
                 }
-                if compare_values(&val, &item_val).unwrap_or(1) == 0 {
+                if compare_values(&val, &item_val)? == 0 {
                     found = true;
                     break;
                 }
@@ -572,8 +569,8 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
             {
                 return Ok(Value::Null);
             }
-            let ge_low = compare_values(&val, &low_val).unwrap_or(-1) >= 0;
-            let le_high = compare_values(&val, &high_val).unwrap_or(1) <= 0;
+            let ge_low = compare_values(&val, &low_val)? >= 0;
+            let le_high = compare_values(&val, &high_val)? <= 0;
             let in_range = ge_low && le_high;
             Ok(Value::Boolean(if *negated { !in_range } else { in_range }))
         }
@@ -653,14 +650,14 @@ pub fn eval_expr_impl<C: EvalContext>(ctx: &C, expr: &Expr) -> Result<Value> {
                     if matches!(cond_val, Value::Null) {
                         continue;
                     }
-                    if compare_values(&op_val, &cond_val).unwrap_or(1) == 0 {
+                    if compare_values(&op_val, &cond_val)? == 0 {
                         return eval_expr_impl(ctx, &results[i]);
                     }
                 }
             } else {
                 for (i, cond) in conditions.iter().enumerate() {
                     let cond_val = eval_expr_impl(ctx, cond)?;
-                    let cond_val = super::coerce_text_literal_to_bool(cond, cond_val)?;
+                    let cond_val = crate::sql::types::cast::coerce_to_bool(cond_val)?;
                     let cond_true = match cond_val {
                         Value::Boolean(b) => b,
                         Value::Null => false,
@@ -1108,7 +1105,7 @@ fn eval_json_access_with_context<C: EvalContext>(
         let mut found = false;
         for item in list {
             let item_val = eval_expr_impl(ctx, item)?;
-            if super::compare_values(&json_result, &item_val).unwrap_or(1) == 0 {
+            if super::compare_values(&json_result, &item_val)? == 0 {
                 found = true;
                 break;
             }
@@ -1243,10 +1240,16 @@ fn eval_overlay_with_context<C: EvalContext>(
 #[cfg(test)]
 mod tests {
     use super::super::eval_expr;
+    use crate::sql::query_context::QueryContext;
     use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue};
+    use std::sync::Arc;
 
     #[test]
-    fn test_and_short_circuit_errors_on_case_text_branches() {
+    fn test_and_short_circuit_validates_case_text_branches() {
+        // CASE with string literal branches in boolean context:
+        // - FALSE AND: short-circuits but validates right side; validation rejects
+        //   string literal results in CASE branches (is_string_literal_expr check).
+        // - TRUE AND: evaluates right side; implicit cast coerces text 'true' to bool.
         let make_case = || Expr::Case {
             operand: None,
             conditions: vec![Expr::Value(SqlValue::Boolean(true))],
@@ -1269,10 +1272,17 @@ mod tests {
             right: Box::new(make_case()),
         };
 
-        let false_err = eval_expr(&false_and, None, None).unwrap_err().to_string();
+        let qc = QueryContext::new(0, Arc::from("test"), 0, 0, Arc::from("UTC"));
+        // FALSE AND CASE: short-circuit validation rejects string literal result branches
+        let false_err = eval_expr(&false_and, None, None, &qc)
+            .unwrap_err()
+            .to_string();
         assert_eq!(false_err, "AND requires boolean operands");
 
-        let true_err = eval_expr(&true_and, None, None).unwrap_err().to_string();
-        assert_eq!(true_err, "AND requires boolean operands");
+        // TRUE AND CASE: evaluates right side; text 'true' implicitly cast to Boolean(true)
+        assert_eq!(
+            eval_expr(&true_and, None, None, &qc).unwrap(),
+            crate::types::Value::Boolean(true)
+        );
     }
 }

@@ -1,6 +1,7 @@
 //! SQL parsing and execution
 
 mod alter_owner;
+pub(crate) mod binder;
 pub(crate) mod bytea;
 mod catalog_oids;
 mod default_privileges;
@@ -42,7 +43,7 @@ mod timezone;
 mod trigger_queue;
 mod trigger_rewrite;
 pub(crate) mod trigger_worker;
-mod triggers;
+pub(crate) mod triggers;
 pub mod types;
 mod udt;
 pub(crate) mod wildcard;

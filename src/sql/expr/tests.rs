@@ -1,11 +1,18 @@
 use super::super::statement_time;
 use super::*;
+use crate::sql::query_context::QueryContext;
 use crate::types::ColumnDef;
 use rust_decimal::Decimal;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use std::collections::HashMap;
 use std::str::FromStr;
+use std::sync::Arc;
+
+fn teval(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -> Result<Value> {
+    let qc = QueryContext::from_task_locals();
+    eval_expr(expr, row, schema, &qc)
+}
 
 fn parse_expr(sql: &str) -> Expr {
     let full_sql = format!("SELECT {}", sql);
@@ -23,7 +30,7 @@ fn parse_expr(sql: &str) -> Expr {
 
 #[test]
 fn test_version_includes_pg_tikv() {
-    let v = eval_expr(&parse_expr("version()"), None, None).unwrap();
+    let v = teval(&parse_expr("version()"), None, None).unwrap();
     let Value::Text(s) = v else {
         panic!("version() must return text");
     };
@@ -70,7 +77,8 @@ fn test_eval_expr_join_function_resolves_qualified_column() {
     column_offsets.insert("b.name".to_string(), 1);
     column_offsets.insert("name".to_string(), 0);
 
-    let ctx = JoinEvalContext::new(&column_offsets, None, &combined_row, &combined_schema);
+    let qc = QueryContext::from_task_locals();
+    let ctx = JoinEvalContext::new(&column_offsets, None, &combined_row, &combined_schema, &qc);
 
     let val = eval_join_expr(&ctx, &expr).unwrap();
     assert_eq!(val, Value::Text("bob".to_string()));
@@ -108,7 +116,7 @@ fn test_pg_get_indexdef_uses_qualified_indexdef_column() {
     let expected = "CREATE INDEX ix_t_a ON public.ix_t USING btree (a)";
     let row = Row::new(vec![Value::Int64(42), Value::Text(expected.to_string())]);
 
-    let val = eval_expr(&expr, Some(&row), Some(&schema)).unwrap();
+    let val = teval(&expr, Some(&row), Some(&schema)).unwrap();
     assert_eq!(val, Value::Text(expected.to_string()));
 }
 
@@ -144,46 +152,43 @@ fn test_pg_get_constraintdef_uses_qualified_constraintdef_column() {
     let expected = "PRIMARY KEY (id)";
     let row = Row::new(vec![Value::Int64(50001), Value::Text(expected.to_string())]);
 
-    let val = eval_expr(&expr, Some(&row), Some(&schema)).unwrap();
+    let val = teval(&expr, Some(&row), Some(&schema)).unwrap();
     assert_eq!(val, Value::Text(expected.to_string()));
 }
 
 #[test]
 fn test_eval_literal_values() {
     assert_eq!(
-        eval_expr(&parse_expr("42"), None, None).unwrap(),
+        teval(&parse_expr("42"), None, None).unwrap(),
         Value::Int32(42)
     );
     assert_eq!(
-        eval_expr(&parse_expr("3.14"), None, None).unwrap(),
+        teval(&parse_expr("3.14"), None, None).unwrap(),
         Value::Numeric(Decimal::from_str("3.14").unwrap())
     );
     assert_eq!(
-        eval_expr(&parse_expr("'hello'"), None, None).unwrap(),
+        teval(&parse_expr("'hello'"), None, None).unwrap(),
         Value::Text("hello".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("$$hello$$"), None, None).unwrap(),
+        teval(&parse_expr("$$hello$$"), None, None).unwrap(),
         Value::Text("hello".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("$tag$hello$tag$"), None, None).unwrap(),
+        teval(&parse_expr("$tag$hello$tag$"), None, None).unwrap(),
         Value::Text("hello".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("$$ $1 $$"), None, None).unwrap(),
+        teval(&parse_expr("$$ $1 $$"), None, None).unwrap(),
         Value::Text(" $1 ".to_string())
     );
+    assert_eq!(teval(&parse_expr("NULL"), None, None).unwrap(), Value::Null);
     assert_eq!(
-        eval_expr(&parse_expr("NULL"), None, None).unwrap(),
-        Value::Null
-    );
-    assert_eq!(
-        eval_expr(&parse_expr("true"), None, None).unwrap(),
+        teval(&parse_expr("true"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("false"), None, None).unwrap(),
+        teval(&parse_expr("false"), None, None).unwrap(),
         Value::Boolean(false)
     );
 }
@@ -191,14 +196,14 @@ fn test_eval_literal_values() {
 #[test]
 fn test_at_time_zone_timestamp_to_timestamptz() {
     let expr = parse_expr("TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'UTC'");
-    let val = eval_expr(&expr, None, None).unwrap();
+    let val = teval(&expr, None, None).unwrap();
     assert_eq!(val, parse_timestamp_string("2024-01-15 10:00:00").unwrap());
 }
 
 #[test]
 fn test_at_time_zone_timestamp_to_timestamptz_with_offset() {
     let expr = parse_expr("TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'Asia/Shanghai'");
-    let val = eval_expr(&expr, None, None).unwrap();
+    let val = teval(&expr, None, None).unwrap();
     assert_eq!(val, parse_timestamp_string("2024-01-15 02:00:00").unwrap());
 }
 
@@ -207,37 +212,37 @@ fn test_at_time_zone_chain_conversion() {
     let expr = parse_expr(
         "TIMESTAMP '2024-01-15 10:00:00' AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York'",
     );
-    let val = eval_expr(&expr, None, None).unwrap();
+    let val = teval(&expr, None, None).unwrap();
     assert_eq!(val, parse_timestamp_string("2024-01-15 05:00:00").unwrap());
 }
 
 #[test]
 fn test_at_time_zone_timestamptz_to_timestamp() {
     let expr = parse_expr("TIMESTAMPTZ '2024-01-15T10:00:00Z' AT TIME ZONE 'America/New_York'");
-    let val = eval_expr(&expr, None, None).unwrap();
+    let val = teval(&expr, None, None).unwrap();
     assert_eq!(val, parse_timestamp_string("2024-01-15 05:00:00").unwrap());
 }
 
 #[test]
 fn test_eval_arithmetic() {
     assert_eq!(
-        eval_expr(&parse_expr("1 + 2"), None, None).unwrap(),
+        teval(&parse_expr("1 + 2"), None, None).unwrap(),
         Value::Int32(3)
     );
     assert_eq!(
-        eval_expr(&parse_expr("10 - 4"), None, None).unwrap(),
+        teval(&parse_expr("10 - 4"), None, None).unwrap(),
         Value::Int32(6)
     );
     assert_eq!(
-        eval_expr(&parse_expr("3 * 5"), None, None).unwrap(),
+        teval(&parse_expr("3 * 5"), None, None).unwrap(),
         Value::Int32(15)
     );
     assert_eq!(
-        eval_expr(&parse_expr("20 / 4"), None, None).unwrap(),
+        teval(&parse_expr("20 / 4"), None, None).unwrap(),
         Value::Int32(5)
     );
     assert_eq!(
-        eval_expr(&parse_expr("17 % 5"), None, None).unwrap(),
+        teval(&parse_expr("17 % 5"), None, None).unwrap(),
         Value::Int32(2)
     );
 }
@@ -245,27 +250,27 @@ fn test_eval_arithmetic() {
 #[test]
 fn test_eval_comparison() {
     assert_eq!(
-        eval_expr(&parse_expr("5 > 3"), None, None).unwrap(),
+        teval(&parse_expr("5 > 3"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("5 < 3"), None, None).unwrap(),
+        teval(&parse_expr("5 < 3"), None, None).unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(&parse_expr("5 = 5"), None, None).unwrap(),
+        teval(&parse_expr("5 = 5"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("5 <> 3"), None, None).unwrap(),
+        teval(&parse_expr("5 <> 3"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("5 >= 5"), None, None).unwrap(),
+        teval(&parse_expr("5 >= 5"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("5 <= 6"), None, None).unwrap(),
+        teval(&parse_expr("5 <= 6"), None, None).unwrap(),
         Value::Boolean(true)
     );
 }
@@ -273,27 +278,27 @@ fn test_eval_comparison() {
 #[test]
 fn test_eval_logical() {
     assert_eq!(
-        eval_expr(&parse_expr("true AND true"), None, None).unwrap(),
+        teval(&parse_expr("true AND true"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("true AND false"), None, None).unwrap(),
+        teval(&parse_expr("true AND false"), None, None).unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(&parse_expr("true OR false"), None, None).unwrap(),
+        teval(&parse_expr("true OR false"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("false OR false"), None, None).unwrap(),
+        teval(&parse_expr("false OR false"), None, None).unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(&parse_expr("NOT true"), None, None).unwrap(),
+        teval(&parse_expr("NOT true"), None, None).unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(&parse_expr("NOT false"), None, None).unwrap(),
+        teval(&parse_expr("NOT false"), None, None).unwrap(),
         Value::Boolean(true)
     );
 }
@@ -301,29 +306,29 @@ fn test_eval_logical() {
 #[test]
 fn test_eval_logical_null_semantics_and_short_circuit() {
     assert_eq!(
-        eval_expr(&parse_expr("CAST(NULL AS BOOLEAN) AND TRUE"), None, None).unwrap(),
+        teval(&parse_expr("CAST(NULL AS BOOLEAN) AND TRUE"), None, None).unwrap(),
         Value::Null
     );
     assert_eq!(
-        eval_expr(&parse_expr("FALSE AND CAST(NULL AS BOOLEAN)"), None, None).unwrap(),
+        teval(&parse_expr("FALSE AND CAST(NULL AS BOOLEAN)"), None, None).unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(&parse_expr("CAST(NULL AS BOOLEAN) OR TRUE"), None, None).unwrap(),
+        teval(&parse_expr("CAST(NULL AS BOOLEAN) OR TRUE"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("NOT CAST(NULL AS BOOLEAN)"), None, None).unwrap(),
+        teval(&parse_expr("NOT CAST(NULL AS BOOLEAN)"), None, None).unwrap(),
         Value::Null
     );
 
     // Short-circuit: RHS must not be evaluated when LHS determines result
     assert_eq!(
-        eval_expr(&parse_expr("FALSE AND (1 / 0 = 0)"), None, None).unwrap(),
+        teval(&parse_expr("FALSE AND (1 / 0 = 0)"), None, None).unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(&parse_expr("TRUE OR (1 / 0 = 0)"), None, None).unwrap(),
+        teval(&parse_expr("TRUE OR (1 / 0 = 0)"), None, None).unwrap(),
         Value::Boolean(true)
     );
 }
@@ -331,15 +336,15 @@ fn test_eval_logical_null_semantics_and_short_circuit() {
 #[test]
 fn test_eval_logical_short_circuit_does_not_hide_type_errors() {
     // Short-circuit must not mask RHS type errors.
-    assert!(eval_expr(&parse_expr("TRUE OR 42"), None, None).is_err());
-    assert!(eval_expr(&parse_expr("FALSE AND 1 / 0"), None, None).is_err());
-    assert!(eval_expr(&parse_expr("TRUE OR (FALSE AND 42)"), None, None).is_err());
-    assert!(eval_expr(&parse_expr("FALSE AND (TRUE OR 42)"), None, None).is_err());
-    assert!(eval_expr(&parse_expr("TRUE OR (1 LIKE 'a%')"), None, None)
+    assert!(teval(&parse_expr("TRUE OR 42"), None, None).is_err());
+    assert!(teval(&parse_expr("FALSE AND 1 / 0"), None, None).is_err());
+    assert!(teval(&parse_expr("TRUE OR (FALSE AND 42)"), None, None).is_err());
+    assert!(teval(&parse_expr("FALSE AND (TRUE OR 42)"), None, None).is_err());
+    assert!(teval(&parse_expr("TRUE OR (1 LIKE 'a%')"), None, None)
         .unwrap_err()
         .to_string()
         .contains("LIKE requires text operands"));
-    assert!(eval_expr(
+    assert!(teval(
         &parse_expr("TRUE OR (CASE WHEN 1 LIKE 'a%' THEN TRUE ELSE FALSE END)"),
         None,
         None
@@ -347,24 +352,22 @@ fn test_eval_logical_short_circuit_does_not_hide_type_errors() {
     .unwrap_err()
     .to_string()
     .contains("LIKE requires text operands"));
-    assert!(
-        eval_expr(&parse_expr("FALSE AND (1 ILIKE 'a%')"), None, None)
-            .unwrap_err()
-            .to_string()
-            .contains("ILIKE requires text operands")
-    );
-    assert!(eval_expr(&parse_expr("TRUE OR (1 && 2)"), None, None)
+    assert!(teval(&parse_expr("FALSE AND (1 ILIKE 'a%')"), None, None)
+        .unwrap_err()
+        .to_string()
+        .contains("ILIKE requires text operands"));
+    assert!(teval(&parse_expr("TRUE OR (1 && 2)"), None, None)
         .unwrap_err()
         .to_string()
         .contains("&& operator requires array operands"));
 
     // Explicit NULL is allowed as a boolean operand.
     assert_eq!(
-        eval_expr(&parse_expr("FALSE AND NULL"), None, None).unwrap(),
+        teval(&parse_expr("FALSE AND NULL"), None, None).unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(&parse_expr("TRUE OR NULL"), None, None).unwrap(),
+        teval(&parse_expr("TRUE OR NULL"), None, None).unwrap(),
         Value::Boolean(true)
     );
 }
@@ -372,11 +375,11 @@ fn test_eval_logical_short_circuit_does_not_hide_type_errors() {
 #[test]
 fn test_eval_nested() {
     assert_eq!(
-        eval_expr(&parse_expr("(1 + 2) * 3"), None, None).unwrap(),
+        teval(&parse_expr("(1 + 2) * 3"), None, None).unwrap(),
         Value::Int32(9)
     );
     assert_eq!(
-        eval_expr(&parse_expr("10 / (2 + 3)"), None, None).unwrap(),
+        teval(&parse_expr("10 / (2 + 3)"), None, None).unwrap(),
         Value::Int32(2)
     );
 }
@@ -384,40 +387,41 @@ fn test_eval_nested() {
 #[test]
 fn test_eval_unary_minus() {
     assert_eq!(
-        eval_expr(&parse_expr("-5"), None, None).unwrap(),
+        teval(&parse_expr("-5"), None, None).unwrap(),
         Value::Int32(-5)
     );
     assert_eq!(
-        eval_expr(&parse_expr("-3.14"), None, None).unwrap(),
+        teval(&parse_expr("-3.14"), None, None).unwrap(),
         Value::Numeric(Decimal::from_str("-3.14").unwrap())
     );
+    // coerce_text_to_numeric tries Int64 first, so text '10' → Int64(10) → -Int64(10)
     assert_eq!(
-        eval_expr(&parse_expr("-'10'"), None, None).unwrap(),
-        Value::Int32(-10)
+        teval(&parse_expr("-'10'"), None, None).unwrap(),
+        Value::Int64(-10)
     );
     assert_eq!(
-        eval_expr(&parse_expr("-'1.5'"), None, None).unwrap(),
+        teval(&parse_expr("-'1.5'"), None, None).unwrap(),
         Value::Float64(-1.5)
     );
-    assert!(eval_expr(&parse_expr("-'nope'"), None, None).is_err());
+    assert!(teval(&parse_expr("-'nope'"), None, None).is_err());
 }
 
 #[test]
 fn test_eval_is_null() {
     assert_eq!(
-        eval_expr(&parse_expr("NULL IS NULL"), None, None).unwrap(),
+        teval(&parse_expr("NULL IS NULL"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("5 IS NULL"), None, None).unwrap(),
+        teval(&parse_expr("5 IS NULL"), None, None).unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(&parse_expr("NULL IS NOT NULL"), None, None).unwrap(),
+        teval(&parse_expr("NULL IS NOT NULL"), None, None).unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(&parse_expr("5 IS NOT NULL"), None, None).unwrap(),
+        teval(&parse_expr("5 IS NOT NULL"), None, None).unwrap(),
         Value::Boolean(true)
     );
 }
@@ -425,19 +429,19 @@ fn test_eval_is_null() {
 #[test]
 fn test_eval_in_list() {
     assert_eq!(
-        eval_expr(&parse_expr("5 IN (1, 3, 5, 7)"), None, None).unwrap(),
+        teval(&parse_expr("5 IN (1, 3, 5, 7)"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("4 IN (1, 3, 5, 7)"), None, None).unwrap(),
+        teval(&parse_expr("4 IN (1, 3, 5, 7)"), None, None).unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(&parse_expr("4 NOT IN (1, 3, 5, 7)"), None, None).unwrap(),
+        teval(&parse_expr("4 NOT IN (1, 3, 5, 7)"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("'a' IN ('a', 'b', 'c')"), None, None).unwrap(),
+        teval(&parse_expr("'a' IN ('a', 'b', 'c')"), None, None).unwrap(),
         Value::Boolean(true)
     );
 }
@@ -445,19 +449,19 @@ fn test_eval_in_list() {
 #[test]
 fn test_eval_between() {
     assert_eq!(
-        eval_expr(&parse_expr("5 BETWEEN 1 AND 10"), None, None).unwrap(),
+        teval(&parse_expr("5 BETWEEN 1 AND 10"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("15 BETWEEN 1 AND 10"), None, None).unwrap(),
+        teval(&parse_expr("15 BETWEEN 1 AND 10"), None, None).unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(&parse_expr("5 NOT BETWEEN 10 AND 20"), None, None).unwrap(),
+        teval(&parse_expr("5 NOT BETWEEN 10 AND 20"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("1 BETWEEN 1 AND 1"), None, None).unwrap(),
+        teval(&parse_expr("1 BETWEEN 1 AND 1"), None, None).unwrap(),
         Value::Boolean(true)
     );
 }
@@ -537,7 +541,7 @@ fn test_compare_values() {
 #[test]
 fn test_float_nan_comparisons() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("CAST('NaN' AS DOUBLE PRECISION) = 1"),
             None,
             None
@@ -546,7 +550,7 @@ fn test_float_nan_comparisons() {
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("CAST('NaN' AS DOUBLE PRECISION) = CAST('NaN' AS DOUBLE PRECISION)"),
             None,
             None
@@ -555,7 +559,7 @@ fn test_float_nan_comparisons() {
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("CAST('NaN' AS DOUBLE PRECISION) > 1"),
             None,
             None
@@ -591,21 +595,21 @@ fn test_compare_order_by_values_nulls() {
 
     // ASC defaults to NULLS LAST.
     assert_eq!(
-        compare_order_by_values(&Value::Null, &Value::Date(0), true, false),
+        compare_order_by_values(&Value::Null, &Value::Date(0), true, false).unwrap(),
         Ordering::Greater
     );
     assert_eq!(
-        compare_order_by_values(&Value::Date(0), &Value::Null, true, false),
+        compare_order_by_values(&Value::Date(0), &Value::Null, true, false).unwrap(),
         Ordering::Less
     );
 
     // DESC defaults to NULLS FIRST.
     assert_eq!(
-        compare_order_by_values(&Value::Null, &Value::Date(0), false, true),
+        compare_order_by_values(&Value::Null, &Value::Date(0), false, true).unwrap(),
         Ordering::Less
     );
     assert_eq!(
-        compare_order_by_values(&Value::Date(0), &Value::Null, false, true),
+        compare_order_by_values(&Value::Date(0), &Value::Null, false, true).unwrap(),
         Ordering::Greater
     );
 }
@@ -615,11 +619,13 @@ fn test_compare_order_by_values_nan() {
     use std::cmp::Ordering;
 
     assert_eq!(
-        compare_order_by_values(&Value::Float64(f64::NAN), &Value::Float64(1.0), true, false),
+        compare_order_by_values(&Value::Float64(f64::NAN), &Value::Float64(1.0), true, false)
+            .unwrap(),
         Ordering::Greater
     );
     assert_eq!(
-        compare_order_by_values(&Value::Float64(1.0), &Value::Float64(f64::NAN), true, false),
+        compare_order_by_values(&Value::Float64(1.0), &Value::Float64(f64::NAN), true, false)
+            .unwrap(),
         Ordering::Less
     );
 
@@ -630,7 +636,8 @@ fn test_compare_order_by_values_nan() {
             &Value::Float64(1.0),
             false,
             false
-        ),
+        )
+        .unwrap(),
         Ordering::Less
     );
 }
@@ -638,7 +645,7 @@ fn test_compare_order_by_values_nan() {
 #[test]
 fn test_jsonb_exists_function() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("JSONB_EXISTS('{\"a\": 1, \"b\": 2}'::jsonb, 'a')"),
             None,
             None
@@ -647,7 +654,7 @@ fn test_jsonb_exists_function() {
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("JSONB_EXISTS('{\"a\": 1}'::jsonb, 'c')"),
             None,
             None
@@ -656,7 +663,7 @@ fn test_jsonb_exists_function() {
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("JSONB_EXISTS('[\"a\", \"b\"]'::jsonb, 'b')"),
             None,
             None
@@ -669,7 +676,7 @@ fn test_jsonb_exists_function() {
 #[test]
 fn test_to_char_format_tokens() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("TO_CHAR(TIMESTAMP '2024-01-15 14:30:45', 'YYYY-MM')"),
             None,
             None
@@ -678,7 +685,7 @@ fn test_to_char_format_tokens() {
         Value::Text("2024-01".to_string())
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("TO_CHAR(DATE '2024-01-15', 'YYYY-MM')"),
             None,
             None
@@ -687,7 +694,7 @@ fn test_to_char_format_tokens() {
         Value::Text("2024-01".to_string())
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("TO_CHAR(TIMESTAMP '2024-01-15 14:30:45', 'YYYY-MM-DD HH24:MI:SS')"),
             None,
             None
@@ -700,43 +707,43 @@ fn test_to_char_format_tokens() {
 #[test]
 fn test_null_comparison_three_valued_logic() {
     assert_eq!(
-        eval_expr(&parse_expr("NULL = 5"), None, None).unwrap(),
+        teval(&parse_expr("NULL = 5"), None, None).unwrap(),
         Value::Null
     );
     assert_eq!(
-        eval_expr(&parse_expr("5 = NULL"), None, None).unwrap(),
+        teval(&parse_expr("5 = NULL"), None, None).unwrap(),
         Value::Null
     );
     assert_eq!(
-        eval_expr(&parse_expr("NULL >= 0"), None, None).unwrap(),
+        teval(&parse_expr("NULL >= 0"), None, None).unwrap(),
         Value::Null
     );
     assert_eq!(
-        eval_expr(&parse_expr("NULL < 10"), None, None).unwrap(),
+        teval(&parse_expr("NULL < 10"), None, None).unwrap(),
         Value::Null
     );
     assert_eq!(
-        eval_expr(&parse_expr("NULL <> 5"), None, None).unwrap(),
+        teval(&parse_expr("NULL <> 5"), None, None).unwrap(),
         Value::Null
     );
 }
 
 #[test]
 fn test_division_by_zero() {
-    assert!(eval_expr(&parse_expr("5 / 0"), None, None).is_err());
-    assert!(eval_expr(&parse_expr("5 % 0"), None, None).is_err());
+    assert!(teval(&parse_expr("5 / 0"), None, None).is_err());
+    assert!(teval(&parse_expr("5 % 0"), None, None).is_err());
 }
 
 #[test]
 fn test_function_args_do_not_drop_errors() {
-    assert!(eval_expr(&parse_expr("COALESCE(5 / 0, 1)"), None, None).is_err());
-    assert!(eval_expr(&parse_expr("COALESCE(NULL, 5 / 0, 1)"), None, None).is_err());
+    assert!(teval(&parse_expr("COALESCE(5 / 0, 1)"), None, None).is_err());
+    assert!(teval(&parse_expr("COALESCE(NULL, 5 / 0, 1)"), None, None).is_err());
     assert_eq!(
-        eval_expr(&parse_expr("COALESCE(1, 5 / 0)"), None, None).unwrap(),
+        teval(&parse_expr("COALESCE(1, 5 / 0)"), None, None).unwrap(),
         Value::Int32(1)
     );
-    assert!(eval_expr(&parse_expr("NULLIF(5 / 0, 1)"), None, None).is_err());
-    assert!(eval_expr(&parse_expr("GREATEST(1, 5 / 0)"), None, None).is_err());
+    assert!(teval(&parse_expr("NULLIF(5 / 0, 1)"), None, None).is_err());
+    assert!(teval(&parse_expr("GREATEST(1, 5 / 0)"), None, None).is_err());
 }
 
 #[test]
@@ -759,7 +766,7 @@ fn test_function_column_references_use_row_context() {
     );
     let row = Row::new(vec![Value::Null]);
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("COALESCE(nickname, 'NULL')"),
             Some(&row),
             Some(&schema),
@@ -770,7 +777,7 @@ fn test_function_column_references_use_row_context() {
 
     let row_with_value = Row::new(vec![Value::Text("hi".to_string())]);
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("COALESCE(nickname, 'NULL')"),
             Some(&row_with_value),
             Some(&schema)
@@ -782,18 +789,18 @@ fn test_function_column_references_use_row_context() {
 
 #[test]
 fn test_mixed_type_arithmetic() {
-    let result = eval_expr(&parse_expr("1 + 2.5"), None, None).unwrap();
+    let result = teval(&parse_expr("1 + 2.5"), None, None).unwrap();
     assert_eq!(result, Value::Numeric(Decimal::from_str("3.5").unwrap()));
 }
 
 #[test]
 fn test_string_concat() {
     assert_eq!(
-        eval_expr(&parse_expr("'Hello' || ' ' || 'World'"), None, None).unwrap(),
+        teval(&parse_expr("'Hello' || ' ' || 'World'"), None, None).unwrap(),
         Value::Text("Hello World".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("'Count: ' || 42"), None, None).unwrap(),
+        teval(&parse_expr("'Count: ' || 42"), None, None).unwrap(),
         Value::Text("Count: 42".to_string())
     );
 }
@@ -801,7 +808,7 @@ fn test_string_concat() {
 #[test]
 fn test_case_when() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("CASE WHEN 1 = 1 THEN 'yes' ELSE 'no' END"),
             None,
             None
@@ -810,7 +817,7 @@ fn test_case_when() {
         Value::Text("yes".to_string())
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("CASE WHEN 1 = 2 THEN 'yes' ELSE 'no' END"),
             None,
             None
@@ -819,7 +826,7 @@ fn test_case_when() {
         Value::Text("no".to_string())
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("CASE WHEN 'true' THEN 'yes' ELSE 'no' END"),
             None,
             None
@@ -828,7 +835,7 @@ fn test_case_when() {
         Value::Text("yes".to_string())
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("CASE WHEN 'false' THEN 'yes' ELSE 'no' END"),
             None,
             None
@@ -836,14 +843,14 @@ fn test_case_when() {
         .unwrap(),
         Value::Text("no".to_string())
     );
-    assert!(eval_expr(
+    assert!(teval(
         &parse_expr("CASE WHEN 'nope' THEN 'yes' ELSE 'no' END"),
         None,
         None
     )
     .is_err());
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END"),
             None,
             None
@@ -856,31 +863,31 @@ fn test_case_when() {
 #[test]
 fn test_string_functions() {
     assert_eq!(
-        eval_expr(&parse_expr("UPPER('hello')"), None, None).unwrap(),
+        teval(&parse_expr("UPPER('hello')"), None, None).unwrap(),
         Value::Text("HELLO".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("LOWER('HELLO')"), None, None).unwrap(),
+        teval(&parse_expr("LOWER('HELLO')"), None, None).unwrap(),
         Value::Text("hello".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("LENGTH('hello')"), None, None).unwrap(),
+        teval(&parse_expr("LENGTH('hello')"), None, None).unwrap(),
         Value::Int32(5)
     );
     assert_eq!(
-        eval_expr(&parse_expr("CONCAT('a', 'b', 'c')"), None, None).unwrap(),
+        teval(&parse_expr("CONCAT('a', 'b', 'c')"), None, None).unwrap(),
         Value::Text("abc".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("LEFT('hello', 2)"), None, None).unwrap(),
+        teval(&parse_expr("LEFT('hello', 2)"), None, None).unwrap(),
         Value::Text("he".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("RIGHT('hello', 2)"), None, None).unwrap(),
+        teval(&parse_expr("RIGHT('hello', 2)"), None, None).unwrap(),
         Value::Text("lo".to_string())
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("REPLACE('hello world', 'world', 'there')"),
             None,
             None
@@ -889,11 +896,11 @@ fn test_string_functions() {
         Value::Text("hello there".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("REVERSE('hello')"), None, None).unwrap(),
+        teval(&parse_expr("REVERSE('hello')"), None, None).unwrap(),
         Value::Text("olleh".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("REPEAT('ab', 3)"), None, None).unwrap(),
+        teval(&parse_expr("REPEAT('ab', 3)"), None, None).unwrap(),
         Value::Text("ababab".to_string())
     );
 }
@@ -901,33 +908,33 @@ fn test_string_functions() {
 #[test]
 fn test_math_functions() {
     assert_eq!(
-        eval_expr(&parse_expr("ABS(-5)"), None, None).unwrap(),
+        teval(&parse_expr("ABS(-5)"), None, None).unwrap(),
         Value::Int32(5)
     );
     assert_eq!(
-        eval_expr(&parse_expr("CEIL(4.3)"), None, None).unwrap(),
+        teval(&parse_expr("CEIL(4.3)"), None, None).unwrap(),
         Value::Float64(5.0)
     );
     assert_eq!(
-        eval_expr(&parse_expr("FLOOR(4.7)"), None, None).unwrap(),
+        teval(&parse_expr("FLOOR(4.7)"), None, None).unwrap(),
         Value::Float64(4.0)
     );
-    let round_result = eval_expr(&parse_expr("ROUND(4.567, 2)"), None, None).unwrap();
+    let round_result = teval(&parse_expr("ROUND(4.567, 2)"), None, None).unwrap();
     assert!(matches!(round_result, Value::Float64(f) if (f - 4.57).abs() < 0.001));
     assert_eq!(
-        eval_expr(&parse_expr("SQRT(16)"), None, None).unwrap(),
+        teval(&parse_expr("SQRT(16)"), None, None).unwrap(),
         Value::Float64(4.0)
     );
     assert_eq!(
-        eval_expr(&parse_expr("POWER(2, 10)"), None, None).unwrap(),
+        teval(&parse_expr("POWER(2, 10)"), None, None).unwrap(),
         Value::Float64(1024.0)
     );
     assert_eq!(
-        eval_expr(&parse_expr("MOD(17, 5)"), None, None).unwrap(),
+        teval(&parse_expr("MOD(17, 5)"), None, None).unwrap(),
         Value::Int32(2)
     );
     assert_eq!(
-        eval_expr(&parse_expr("SIGN(-5)"), None, None).unwrap(),
+        teval(&parse_expr("SIGN(-5)"), None, None).unwrap(),
         Value::Int32(-1)
     );
 }
@@ -935,11 +942,11 @@ fn test_math_functions() {
 #[test]
 fn test_coalesce_nullif() {
     assert_eq!(
-        eval_expr(&parse_expr("COALESCE(NULL, NULL, 'default')"), None, None).unwrap(),
+        teval(&parse_expr("COALESCE(NULL, NULL, 'default')"), None, None).unwrap(),
         Value::Text("default".to_string())
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("COALESCE('first', NULL, 'default')"),
             None,
             None
@@ -948,11 +955,11 @@ fn test_coalesce_nullif() {
         Value::Text("first".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("NULLIF(5, 5)"), None, None).unwrap(),
+        teval(&parse_expr("NULLIF(5, 5)"), None, None).unwrap(),
         Value::Null
     );
     assert_eq!(
-        eval_expr(&parse_expr("NULLIF(5, 3)"), None, None).unwrap(),
+        teval(&parse_expr("NULLIF(5, 3)"), None, None).unwrap(),
         Value::Int32(5)
     );
 }
@@ -960,11 +967,11 @@ fn test_coalesce_nullif() {
 #[test]
 fn test_greatest_least() {
     assert_eq!(
-        eval_expr(&parse_expr("GREATEST(1, 5, 3)"), None, None).unwrap(),
+        teval(&parse_expr("GREATEST(1, 5, 3)"), None, None).unwrap(),
         Value::Int32(5)
     );
     assert_eq!(
-        eval_expr(&parse_expr("LEAST(1, 5, 3)"), None, None).unwrap(),
+        teval(&parse_expr("LEAST(1, 5, 3)"), None, None).unwrap(),
         Value::Int32(1)
     );
 }
@@ -972,31 +979,31 @@ fn test_greatest_least() {
 #[test]
 fn test_like_pattern() {
     assert_eq!(
-        eval_expr(&parse_expr("'hello' LIKE 'h%'"), None, None).unwrap(),
+        teval(&parse_expr("'hello' LIKE 'h%'"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("'hello' LIKE '%llo'"), None, None).unwrap(),
+        teval(&parse_expr("'hello' LIKE '%llo'"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("'hello' LIKE 'h_llo'"), None, None).unwrap(),
+        teval(&parse_expr("'hello' LIKE 'h_llo'"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("'hello' LIKE 'world'"), None, None).unwrap(),
+        teval(&parse_expr("'hello' LIKE 'world'"), None, None).unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(&parse_expr("'hello' NOT LIKE 'world'"), None, None).unwrap(),
+        teval(&parse_expr("'hello' NOT LIKE 'world'"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("'hello' LIKE '%.%'"), None, None).unwrap(),
+        teval(&parse_expr("'hello' LIKE '%.%'"), None, None).unwrap(),
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(&parse_expr("'a.b' LIKE '%.%'"), None, None).unwrap(),
+        teval(&parse_expr("'a.b' LIKE '%.%'"), None, None).unwrap(),
         Value::Boolean(true)
     );
 }
@@ -1004,33 +1011,33 @@ fn test_like_pattern() {
 #[test]
 fn test_like_null_semantics() {
     assert_eq!(
-        eval_expr(&parse_expr("CAST(NULL AS TEXT) LIKE 'a%'"), None, None).unwrap(),
+        teval(&parse_expr("CAST(NULL AS TEXT) LIKE 'a%'"), None, None).unwrap(),
         Value::Null
     );
     assert_eq!(
-        eval_expr(&parse_expr("'a' LIKE CAST(NULL AS TEXT)"), None, None).unwrap(),
+        teval(&parse_expr("'a' LIKE CAST(NULL AS TEXT)"), None, None).unwrap(),
         Value::Null
     );
     assert_eq!(
-        eval_expr(&parse_expr("CAST(NULL AS TEXT) ILIKE 'a%'"), None, None).unwrap(),
+        teval(&parse_expr("CAST(NULL AS TEXT) ILIKE 'a%'"), None, None).unwrap(),
         Value::Null
     );
     assert_eq!(
-        eval_expr(&parse_expr("'a' ILIKE CAST(NULL AS TEXT)"), None, None).unwrap(),
+        teval(&parse_expr("'a' ILIKE CAST(NULL AS TEXT)"), None, None).unwrap(),
         Value::Null
     );
-    assert!(eval_expr(&parse_expr("1 LIKE NULL"), None, None).is_err());
-    assert!(eval_expr(&parse_expr("NULL LIKE 1"), None, None).is_err());
+    assert!(teval(&parse_expr("1 LIKE NULL"), None, None).is_err());
+    assert!(teval(&parse_expr("NULL LIKE 1"), None, None).is_err());
 }
 
 #[test]
 fn test_ilike_pattern() {
     assert_eq!(
-        eval_expr(&parse_expr("'Hello' ILIKE 'h%'"), None, None).unwrap(),
+        teval(&parse_expr("'Hello' ILIKE 'h%'"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("'HELLO' ILIKE '%llo'"), None, None).unwrap(),
+        teval(&parse_expr("'HELLO' ILIKE '%llo'"), None, None).unwrap(),
         Value::Boolean(true)
     );
 }
@@ -1039,7 +1046,7 @@ fn test_ilike_pattern() {
 fn test_similar_to_trailing_escape() {
     // Issue #545: Pattern ending with escape character should not match
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("'123A_' SIMILAR TO '%A_' ESCAPE '_'"),
             None,
             None
@@ -1050,7 +1057,7 @@ fn test_similar_to_trailing_escape() {
 
     // Escaped underscore followed by literal underscore should match
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("'123A_' SIMILAR TO '%A__' ESCAPE '_'"),
             None,
             None
@@ -1063,27 +1070,27 @@ fn test_similar_to_trailing_escape() {
 #[test]
 fn test_cast() {
     assert_eq!(
-        eval_expr(&parse_expr("CAST(123 AS TEXT)"), None, None).unwrap(),
+        teval(&parse_expr("CAST(123 AS TEXT)"), None, None).unwrap(),
         Value::Text("123".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("CAST('456' AS INTEGER)"), None, None).unwrap(),
+        teval(&parse_expr("CAST('456' AS INTEGER)"), None, None).unwrap(),
         Value::Int32(456)
     );
     assert_eq!(
-        eval_expr(&parse_expr("CAST(3.14 AS INTEGER)"), None, None).unwrap(),
+        teval(&parse_expr("CAST(3.14 AS INTEGER)"), None, None).unwrap(),
         Value::Int32(3)
     );
     assert_eq!(
-        eval_expr(&parse_expr("'123'::int8"), None, None).unwrap(),
+        teval(&parse_expr("'123'::int8"), None, None).unwrap(),
         Value::Int64(123)
     );
     assert_eq!(
-        eval_expr(&parse_expr("'456'::bigint"), None, None).unwrap(),
+        teval(&parse_expr("'456'::bigint"), None, None).unwrap(),
         Value::Int64(456)
     );
     assert_eq!(
-        eval_expr(&parse_expr("123::text"), None, None).unwrap(),
+        teval(&parse_expr("123::text"), None, None).unwrap(),
         Value::Text("123".to_string())
     );
 }
@@ -1091,7 +1098,7 @@ fn test_cast() {
 #[test]
 fn test_trim() {
     assert_eq!(
-        eval_expr(&parse_expr("TRIM('  hello  ')"), None, None).unwrap(),
+        teval(&parse_expr("TRIM('  hello  ')"), None, None).unwrap(),
         Value::Text("hello".to_string())
     );
 }
@@ -1099,11 +1106,11 @@ fn test_trim() {
 #[test]
 fn test_position() {
     assert_eq!(
-        eval_expr(&parse_expr("POSITION('lo' IN 'hello')"), None, None).unwrap(),
+        teval(&parse_expr("POSITION('lo' IN 'hello')"), None, None).unwrap(),
         Value::Int32(4)
     );
     assert_eq!(
-        eval_expr(&parse_expr("POSITION('xyz' IN 'hello')"), None, None).unwrap(),
+        teval(&parse_expr("POSITION('xyz' IN 'hello')"), None, None).unwrap(),
         Value::Int32(0)
     );
 }
@@ -1111,11 +1118,11 @@ fn test_position() {
 #[test]
 fn test_substring() {
     assert_eq!(
-        eval_expr(&parse_expr("SUBSTRING('hello' FROM 2 FOR 3)"), None, None).unwrap(),
+        teval(&parse_expr("SUBSTRING('hello' FROM 2 FOR 3)"), None, None).unwrap(),
         Value::Text("ell".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("SUBSTRING('hello' FROM 2)"), None, None).unwrap(),
+        teval(&parse_expr("SUBSTRING('hello' FROM 2)"), None, None).unwrap(),
         Value::Text("ello".to_string())
     );
 }
@@ -1154,34 +1161,34 @@ fn test_interval_parsing() {
 #[test]
 fn test_interval_expression() {
     use crate::types::IntervalValue;
-    let result = eval_expr(&parse_expr("INTERVAL '1 day'"), None, None).unwrap();
+    let result = teval(&parse_expr("INTERVAL '1 day'"), None, None).unwrap();
     assert_eq!(
         result,
         Value::Interval(IntervalValue::from_millis(24 * 60 * 60 * 1000))
     );
 
-    let result = eval_expr(&parse_expr("INTERVAL '2' DAY"), None, None).unwrap();
+    let result = teval(&parse_expr("INTERVAL '2' DAY"), None, None).unwrap();
     assert_eq!(
         result,
         Value::Interval(IntervalValue::from_millis(2 * 24 * 60 * 60 * 1000))
     );
 
-    let result = eval_expr(&parse_expr("INTERVAL '3' HOUR"), None, None).unwrap();
+    let result = teval(&parse_expr("INTERVAL '3' HOUR"), None, None).unwrap();
     assert_eq!(
         result,
         Value::Interval(IntervalValue::from_millis(3 * 60 * 60 * 1000))
     );
 
-    let result = eval_expr(&parse_expr("INTERVAL '1' MONTH"), None, None).unwrap();
+    let result = teval(&parse_expr("INTERVAL '1' MONTH"), None, None).unwrap();
     assert_eq!(result, Value::Interval(IntervalValue::from_months(1)));
 }
 
 #[test]
 fn test_interval_expression_month_out_of_range_errors() {
-    let err = eval_expr(&parse_expr("INTERVAL '2147483648' MONTH"), None, None).unwrap_err();
+    let err = teval(&parse_expr("INTERVAL '2147483648' MONTH"), None, None).unwrap_err();
     assert!(err.to_string().contains("Interval out of range"));
 
-    let err = eval_expr(&parse_expr("INTERVAL '214748365' YEAR"), None, None).unwrap_err();
+    let err = teval(&parse_expr("INTERVAL '214748365' YEAR"), None, None).unwrap_err();
     assert!(err.to_string().contains("Interval out of range"));
 }
 
@@ -1249,14 +1256,14 @@ fn test_timestamp_cast_accepts_postgres_timestamptz_offsets() {
 
 #[test]
 fn test_now_plus_interval() {
-    let result = eval_expr(&parse_expr("NOW() + INTERVAL '1 DAY'"), None, None).unwrap();
+    let result = teval(&parse_expr("NOW() + INTERVAL '1 DAY'"), None, None).unwrap();
     assert!(matches!(result, Value::Timestamp(_)));
 }
 
 #[test]
 fn test_string_concat_to_interval() {
     use crate::types::IntervalValue;
-    let result = eval_expr(&parse_expr("('1' || ' day')::interval"), None, None).unwrap();
+    let result = teval(&parse_expr("('1' || ' day')::interval"), None, None).unwrap();
     assert_eq!(
         result,
         Value::Interval(IntervalValue::from_millis(24 * 60 * 60 * 1000))
@@ -1265,7 +1272,7 @@ fn test_string_concat_to_interval() {
 
 #[test]
 fn test_complex_datetime_expression() {
-    let result = eval_expr(
+    let result = teval(
         &parse_expr("now()::timestamp + ('1' || ' day')::interval"),
         None,
         None,
@@ -1277,7 +1284,7 @@ fn test_complex_datetime_expression() {
 #[test]
 fn test_int8_cast_from_int() {
     assert_eq!(
-        eval_expr(&parse_expr("42::int8"), None, None).unwrap(),
+        teval(&parse_expr("42::int8"), None, None).unwrap(),
         Value::Int64(42)
     );
 }
@@ -1285,20 +1292,20 @@ fn test_int8_cast_from_int() {
 #[test]
 fn test_int8_cast_from_text() {
     assert_eq!(
-        eval_expr(&parse_expr("'999'::int8"), None, None).unwrap(),
+        teval(&parse_expr("'999'::int8"), None, None).unwrap(),
         Value::Int64(999)
     );
 }
 
 #[test]
 fn test_gen_random_uuid() {
-    let result = eval_expr(&parse_expr("gen_random_uuid()"), None, None).unwrap();
+    let result = teval(&parse_expr("gen_random_uuid()"), None, None).unwrap();
     assert!(matches!(result, Value::Uuid(_)));
 }
 
 #[test]
 fn test_uuid_cast_from_text() {
-    let result = eval_expr(
+    let result = teval(
         &parse_expr("'550e8400-e29b-41d4-a716-446655440000'::uuid"),
         None,
         None,
@@ -1315,7 +1322,7 @@ fn test_uuid_cast_from_text() {
 #[test]
 fn test_bytea_send_functions() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("int8send(72623859790382856::bigint)"),
             None,
             None
@@ -1324,13 +1331,13 @@ fn test_bytea_send_functions() {
         Value::Bytes(vec![1, 2, 3, 4, 5, 6, 7, 8])
     );
     assert_eq!(
-        eval_expr(&parse_expr("int4send(16909060)"), None, None).unwrap(),
+        teval(&parse_expr("int4send(16909060)"), None, None).unwrap(),
         Value::Bytes(vec![1, 2, 3, 4])
     );
 
     let uuid = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("uuid_send('550e8400-e29b-41d4-a716-446655440000'::uuid)"),
             None,
             None
@@ -1343,19 +1350,19 @@ fn test_bytea_send_functions() {
 #[test]
 fn test_set_bit_get_bit_bytea() {
     assert_eq!(
-        eval_expr(&parse_expr(r"set_bit('\x00'::bytea, 0, 1)"), None, None).unwrap(),
+        teval(&parse_expr(r"set_bit('\x00'::bytea, 0, 1)"), None, None).unwrap(),
         Value::Bytes(vec![0x80])
     );
     assert_eq!(
-        eval_expr(&parse_expr(r"set_bit('\x00'::bytea, 7, 1)"), None, None).unwrap(),
+        teval(&parse_expr(r"set_bit('\x00'::bytea, 7, 1)"), None, None).unwrap(),
         Value::Bytes(vec![0x01])
     );
     assert_eq!(
-        eval_expr(&parse_expr(r"get_bit('\x80'::bytea, 0)"), None, None).unwrap(),
+        teval(&parse_expr(r"get_bit('\x80'::bytea, 0)"), None, None).unwrap(),
         Value::Int32(1)
     );
     assert_eq!(
-        eval_expr(&parse_expr(r"get_bit('\x80'::bytea, 7)"), None, None).unwrap(),
+        teval(&parse_expr(r"get_bit('\x80'::bytea, 7)"), None, None).unwrap(),
         Value::Int32(0)
     );
 }
@@ -1377,7 +1384,7 @@ fn test_uuidv7_expression_components() {
         'hex'
     )::uuid"#;
 
-    let result = eval_expr(&parse_expr(expr), None, None).unwrap();
+    let result = teval(&parse_expr(expr), None, None).unwrap();
     let Value::Uuid(bytes) = result else {
         panic!("expected UUID result");
     };
@@ -1397,7 +1404,7 @@ fn test_uuidv7_expression_components() {
 #[test]
 fn test_encode_decode_escape() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr(r"encode('\x48656c6c6f'::bytea, 'escape')"),
             None,
             None
@@ -1407,26 +1414,26 @@ fn test_encode_decode_escape() {
     );
 
     assert_eq!(
-        eval_expr(&parse_expr("decode('Hello', 'escape')"), None, None).unwrap(),
+        teval(&parse_expr("decode('Hello', 'escape')"), None, None).unwrap(),
         Value::Bytes(b"Hello".to_vec())
     );
 
     assert_eq!(
-        eval_expr(&parse_expr(r"decode('\000', 'escape')"), None, None).unwrap(),
+        teval(&parse_expr(r"decode('\000', 'escape')"), None, None).unwrap(),
         Value::Bytes(vec![0])
     );
 }
 
 #[test]
 fn test_decode_escape_invalid_sequence_errors() {
-    assert!(eval_expr(&parse_expr(r"decode('\8', 'escape')"), None, None).is_err());
-    assert!(eval_expr(&parse_expr(r"decode('\999', 'escape')"), None, None).is_err());
+    assert!(teval(&parse_expr(r"decode('\8', 'escape')"), None, None).is_err());
+    assert!(teval(&parse_expr(r"decode('\999', 'escape')"), None, None).is_err());
 }
 
 #[test]
 fn test_json_arrow_object_key() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr(r#"'{"name": "Alice", "age": 30}' -> 'name'"#),
             None,
             None
@@ -1439,7 +1446,7 @@ fn test_json_arrow_object_key() {
 #[test]
 fn test_json_long_arrow_object_key() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr(r#"'{"name": "Alice", "age": 30}' ->> 'name'"#),
             None,
             None
@@ -1452,11 +1459,11 @@ fn test_json_long_arrow_object_key() {
 #[test]
 fn test_json_arrow_array_index() {
     assert_eq!(
-        eval_expr(&parse_expr(r#"'[1, 2, 3]' -> 0"#), None, None).unwrap(),
+        teval(&parse_expr(r#"'[1, 2, 3]' -> 0"#), None, None).unwrap(),
         Value::Jsonb("1".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr(r#"'["a", "b", "c"]' -> 1"#), None, None).unwrap(),
+        teval(&parse_expr(r#"'["a", "b", "c"]' -> 1"#), None, None).unwrap(),
         Value::Jsonb("\"b\"".to_string())
     );
 }
@@ -1464,14 +1471,14 @@ fn test_json_arrow_array_index() {
 #[test]
 fn test_json_long_arrow_array_index() {
     assert_eq!(
-        eval_expr(&parse_expr(r#"'["a", "b", "c"]' ->> 1"#), None, None).unwrap(),
+        teval(&parse_expr(r#"'["a", "b", "c"]' ->> 1"#), None, None).unwrap(),
         Value::Text("b".to_string())
     );
 }
 
 #[test]
 fn test_json_nested_access() {
-    let intermediate = eval_expr(
+    let intermediate = teval(
         &parse_expr(r#"'{"user": {"name": "Bob"}}' -> 'user'"#),
         None,
         None,
@@ -1480,12 +1487,12 @@ fn test_json_nested_access() {
     assert_eq!(intermediate, Value::Jsonb("{\"name\":\"Bob\"}".to_string()));
 
     assert_eq!(
-        eval_expr(&parse_expr(r#"'{"name": "Bob"}' ->> 'name'"#), None, None).unwrap(),
+        teval(&parse_expr(r#"'{"name": "Bob"}' ->> 'name'"#), None, None).unwrap(),
         Value::Text("Bob".to_string())
     );
 
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr(r#"'{"user": {"name": "Bob"}}' -> 'user' ->> 'name'"#),
             None,
             None
@@ -1498,7 +1505,7 @@ fn test_json_nested_access() {
 #[test]
 fn test_json_null_key() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr(r#"'{"name": "Alice"}' -> 'missing'"#),
             None,
             None
@@ -1511,7 +1518,7 @@ fn test_json_null_key() {
 #[test]
 fn test_json_number_extraction() {
     assert_eq!(
-        eval_expr(&parse_expr(r#"'{"count": 42}' ->> 'count'"#), None, None).unwrap(),
+        teval(&parse_expr(r#"'{"count": 42}' ->> 'count'"#), None, None).unwrap(),
         Value::Text("42".to_string())
     );
 }
@@ -1519,11 +1526,11 @@ fn test_json_number_extraction() {
 #[test]
 fn test_array_literal() {
     assert_eq!(
-        eval_expr(&parse_expr("ARRAY[1, 2, 3]"), None, None).unwrap(),
+        teval(&parse_expr("ARRAY[1, 2, 3]"), None, None).unwrap(),
         Value::Array(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)])
     );
     assert_eq!(
-        eval_expr(&parse_expr("ARRAY['a', 'b', 'c']"), None, None).unwrap(),
+        teval(&parse_expr("ARRAY['a', 'b', 'c']"), None, None).unwrap(),
         Value::Array(vec![
             Value::Text("a".to_string()),
             Value::Text("b".to_string()),
@@ -1535,11 +1542,11 @@ fn test_array_literal() {
 #[test]
 fn test_array_subquery_preserves_array_dimensions() {
     assert_eq!(
-        eval_expr(&parse_expr("ARRAY(SELECT ARRAY[1, 2])"), None, None).unwrap(),
+        teval(&parse_expr("ARRAY(SELECT ARRAY[1, 2])"), None, None).unwrap(),
         Value::Array(vec![Value::Array(vec![Value::Int32(1), Value::Int32(2)])])
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("ARRAY(SELECT string_to_array('a,b', ','))"),
             None,
             None
@@ -1555,7 +1562,7 @@ fn test_array_subquery_preserves_array_dimensions() {
 #[test]
 fn test_array_subquery_flattens_set_returning_projection() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr(r#"ARRAY(SELECT jsonb_array_elements_text('["a","b"]'))"#),
             None,
             None
@@ -1571,7 +1578,7 @@ fn test_array_subquery_flattens_set_returning_projection() {
 #[test]
 fn test_array_subquery_flattens_set_returning_projection_nested_query() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr(r#"ARRAY((SELECT jsonb_array_elements_text('["a","b"]')))"#),
             None,
             None
@@ -1587,15 +1594,15 @@ fn test_array_subquery_flattens_set_returning_projection_nested_query() {
 #[test]
 fn test_array_indexing() {
     assert_eq!(
-        eval_expr(&parse_expr("(ARRAY[10, 20, 30])[2]"), None, None).unwrap(),
+        teval(&parse_expr("(ARRAY[10, 20, 30])[2]"), None, None).unwrap(),
         Value::Int32(20)
     );
     assert_eq!(
-        eval_expr(&parse_expr("(ARRAY['a', 'b', 'c'])[1]"), None, None).unwrap(),
+        teval(&parse_expr("(ARRAY['a', 'b', 'c'])[1]"), None, None).unwrap(),
         Value::Text("a".to_string())
     );
     assert_eq!(
-        eval_expr(&parse_expr("(ARRAY[1, 2, 3])[5]"), None, None).unwrap(),
+        teval(&parse_expr("(ARRAY[1, 2, 3])[5]"), None, None).unwrap(),
         Value::Null
     );
 }
@@ -1603,7 +1610,7 @@ fn test_array_indexing() {
 #[test]
 fn test_array_length() {
     assert_eq!(
-        eval_expr(&parse_expr("array_length(ARRAY[1, 2, 3], 1)"), None, None).unwrap(),
+        teval(&parse_expr("array_length(ARRAY[1, 2, 3], 1)"), None, None).unwrap(),
         Value::Int32(3)
     );
 }
@@ -1611,7 +1618,7 @@ fn test_array_length() {
 #[test]
 fn test_array_position() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("array_position(ARRAY['a', 'b', 'c'], 'b')"),
             None,
             None
@@ -1620,7 +1627,7 @@ fn test_array_position() {
         Value::Int32(2)
     );
     assert_eq!(
-        eval_expr(&parse_expr("array_position(ARRAY[1, 2, 3], 5)"), None, None).unwrap(),
+        teval(&parse_expr("array_position(ARRAY[1, 2, 3], 5)"), None, None).unwrap(),
         Value::Null
     );
 }
@@ -1628,7 +1635,7 @@ fn test_array_position() {
 #[test]
 fn test_array_cat() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr("array_cat(ARRAY[1, 2], ARRAY[3, 4])"),
             None,
             None
@@ -1646,11 +1653,11 @@ fn test_array_cat() {
 #[test]
 fn test_array_append_prepend() {
     assert_eq!(
-        eval_expr(&parse_expr("array_append(ARRAY[1, 2], 3)"), None, None).unwrap(),
+        teval(&parse_expr("array_append(ARRAY[1, 2], 3)"), None, None).unwrap(),
         Value::Array(vec![Value::Int32(1), Value::Int32(2), Value::Int32(3)])
     );
     assert_eq!(
-        eval_expr(&parse_expr("array_prepend(0, ARRAY[1, 2])"), None, None).unwrap(),
+        teval(&parse_expr("array_prepend(0, ARRAY[1, 2])"), None, None).unwrap(),
         Value::Array(vec![Value::Int32(0), Value::Int32(1), Value::Int32(2)])
     );
 }
@@ -1658,7 +1665,7 @@ fn test_array_append_prepend() {
 #[test]
 fn test_cardinality() {
     assert_eq!(
-        eval_expr(&parse_expr("cardinality(ARRAY[1, 2, 3, 4])"), None, None).unwrap(),
+        teval(&parse_expr("cardinality(ARRAY[1, 2, 3, 4])"), None, None).unwrap(),
         Value::Int32(4)
     );
 }
@@ -1666,7 +1673,7 @@ fn test_cardinality() {
 #[test]
 fn test_json_cast() {
     assert_eq!(
-        eval_expr(&parse_expr(r#"'{"a": 1}'::json ->> 'a'"#), None, None).unwrap(),
+        teval(&parse_expr(r#"'{"a": 1}'::json ->> 'a'"#), None, None).unwrap(),
         Value::Text("1".to_string())
     );
 }
@@ -1674,7 +1681,7 @@ fn test_json_cast() {
 #[test]
 fn test_jsonb_cast() {
     assert_eq!(
-        eval_expr(&parse_expr(r#"'{"b": 2}'::jsonb ->> 'b'"#), None, None).unwrap(),
+        teval(&parse_expr(r#"'{"b": 2}'::jsonb ->> 'b'"#), None, None).unwrap(),
         Value::Text("2".to_string())
     );
 }
@@ -1696,7 +1703,7 @@ fn test_jsonb_comparison_blocked() {
 #[test]
 fn test_json_contains_at_arrow() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr(r#"'{"a":1,"b":2}'::jsonb @> '{"a":1}'::jsonb"#),
             None,
             None
@@ -1705,7 +1712,7 @@ fn test_json_contains_at_arrow() {
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr(r#"'{"a":1}'::jsonb @> '{"a":1,"b":2}'::jsonb"#),
             None,
             None
@@ -1714,7 +1721,7 @@ fn test_json_contains_at_arrow() {
         Value::Boolean(false)
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr(r#"'{"a":1}'::jsonb @> '{"a":1.0}'::jsonb"#),
             None,
             None
@@ -1723,7 +1730,7 @@ fn test_json_contains_at_arrow() {
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr(r#"'[{"a":1,"b":2}]'::jsonb @> '[{"a":1}]'::jsonb"#),
             None,
             None
@@ -1736,7 +1743,7 @@ fn test_json_contains_at_arrow() {
 #[test]
 fn test_json_contained_by_arrow_at() {
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr(r#"'{"a":1}'::jsonb <@ '{"a":1,"b":2}'::jsonb"#),
             None,
             None
@@ -1745,7 +1752,7 @@ fn test_json_contained_by_arrow_at() {
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(
+        teval(
             &parse_expr(r#"'{"a":1,"b":2}'::jsonb <@ '{"a":1}'::jsonb"#),
             None,
             None
@@ -1852,29 +1859,29 @@ fn test_extract_vector() {
 #[test]
 fn test_format_width_and_identifier_quoting() {
     assert_eq!(
-        eval_expr(&parse_expr("FORMAT('%10s', 'test')"), None, None).unwrap(),
+        teval(&parse_expr("FORMAT('%10s', 'test')"), None, None).unwrap(),
         Value::Text("      test".to_string())
     );
 
     assert_eq!(
-        eval_expr(&parse_expr("FORMAT('%I', 'column_name')"), None, None).unwrap(),
+        teval(&parse_expr("FORMAT('%I', 'column_name')"), None, None).unwrap(),
         Value::Text("column_name".to_string())
     );
 
     assert_eq!(
-        eval_expr(&parse_expr("FORMAT('%I', 'column name')"), None, None).unwrap(),
+        teval(&parse_expr("FORMAT('%I', 'column name')"), None, None).unwrap(),
         Value::Text("\"column name\"".to_string())
     );
 
     assert_eq!(
-        eval_expr(&parse_expr("FORMAT('%L', 'value''s')"), None, None).unwrap(),
+        teval(&parse_expr("FORMAT('%L', 'value''s')"), None, None).unwrap(),
         Value::Text("'value''s'".to_string())
     );
 }
 
 #[test]
 fn test_format_rejects_precision_like_postgres() {
-    let err = eval_expr(&parse_expr("FORMAT('%.3s', 'hello')"), None, None).unwrap_err();
+    let err = teval(&parse_expr("FORMAT('%.3s', 'hello')"), None, None).unwrap_err();
     assert!(
         err.to_string()
             .contains("unrecognized format() type specifier \".\""),
@@ -1886,12 +1893,12 @@ fn test_format_rejects_precision_like_postgres() {
 #[test]
 fn test_quote_ident_and_pg_typeof_array() {
     assert_eq!(
-        eval_expr(&parse_expr("QUOTE_IDENT('column')"), None, None).unwrap(),
+        teval(&parse_expr("QUOTE_IDENT('column')"), None, None).unwrap(),
         Value::Text("\"column\"".to_string())
     );
 
     assert_eq!(
-        eval_expr(&parse_expr("PG_TYPEOF(ARRAY[1,2,3])"), None, None).unwrap(),
+        teval(&parse_expr("PG_TYPEOF(ARRAY[1,2,3])"), None, None).unwrap(),
         Value::Text("integer[]".to_string())
     );
 }
@@ -1899,7 +1906,7 @@ fn test_quote_ident_and_pg_typeof_array() {
 #[test]
 fn test_pg_encoding_to_char_reports_utf8() {
     let expr = parse_expr("pg_encoding_to_char(6)");
-    let val = eval_expr(&expr, None, None).unwrap();
+    let val = teval(&expr, None, None).unwrap();
     assert_eq!(val, Value::Text("UTF8".to_string()));
 }
 
@@ -1907,7 +1914,7 @@ fn test_pg_encoding_to_char_reports_utf8() {
 async fn test_current_database_reads_task_local_context() {
     let expr = parse_expr("current_database()");
     let val = with_query_context(123, Arc::from("mydb"), async {
-        eval_expr(&expr, None, None).unwrap()
+        teval(&expr, None, None).unwrap()
     })
     .await;
     assert_eq!(val, Value::Text("mydb".to_string()));
@@ -1919,7 +1926,7 @@ async fn test_current_timestamp_precision_truncates_to_second() {
     let stmt = txn + 1000; // statement is later; CURRENT_TIMESTAMP should use txn
     let expr = parse_expr("CURRENT_TIMESTAMP(0)");
     let val =
-        statement_time::with_timestamps(stmt, txn, async { eval_expr(&expr, None, None).unwrap() })
+        statement_time::with_timestamps(stmt, txn, async { teval(&expr, None, None).unwrap() })
             .await;
     assert_eq!(val, Value::Timestamp(1_700_000_001_000));
 }
@@ -1930,7 +1937,7 @@ async fn test_current_date_uses_transaction_timestamp() {
     let stmt = txn + 1000;
     let expr = parse_expr("CURRENT_DATE");
     let val =
-        statement_time::with_timestamps(stmt, txn, async { eval_expr(&expr, None, None).unwrap() })
+        statement_time::with_timestamps(stmt, txn, async { teval(&expr, None, None).unwrap() })
             .await;
     let expected_days = crate::types::date::timestamp_millis_to_date_days(txn).unwrap();
     assert_eq!(val, Value::Date(expected_days));
@@ -1944,7 +1951,7 @@ fn test_current_date_reads_from_query_context() {
     let txn_ts = 1_700_000_001_234_i64;
     let qc = QueryContext::new(1, Arc::from("db"), stmt_ts, txn_ts, Arc::from("UTC"));
     let expr = parse_expr("CURRENT_DATE");
-    let val = eval_expr_with_query_ctx(&expr, None, None, Some(&qc)).unwrap();
+    let val = eval_expr(&expr, None, None, &qc).unwrap();
     let expected_days = crate::types::date::timestamp_millis_to_date_days(txn_ts).unwrap();
     assert_eq!(val, Value::Date(expected_days));
 }
@@ -1959,7 +1966,7 @@ async fn test_age_single_arg_uses_transaction_timestamp() {
     let stmt = txn + 5000;
     let expr = parse_expr("AGE(CURRENT_TIMESTAMP)");
     let val =
-        statement_time::with_timestamps(stmt, txn, async { eval_expr(&expr, None, None).unwrap() })
+        statement_time::with_timestamps(stmt, txn, async { teval(&expr, None, None).unwrap() })
             .await;
     match val {
         Value::Interval(iv) => {
@@ -1976,7 +1983,7 @@ async fn test_now_precision_matches_current_timestamp_precision() {
     let stmt = txn + 1000;
     let expr = parse_expr("NOW(0) = CURRENT_TIMESTAMP(0)");
     let val =
-        statement_time::with_timestamps(stmt, txn, async { eval_expr(&expr, None, None).unwrap() })
+        statement_time::with_timestamps(stmt, txn, async { teval(&expr, None, None).unwrap() })
             .await;
     assert_eq!(val, Value::Boolean(true));
 }
@@ -1987,7 +1994,7 @@ async fn test_current_timestamp_equals_date_trunc_second_within_statement() {
     let stmt = txn + 1000;
     let expr = parse_expr("CURRENT_TIMESTAMP(0) = DATE_TRUNC('second', CURRENT_TIMESTAMP)");
     let val =
-        statement_time::with_timestamps(stmt, txn, async { eval_expr(&expr, None, None).unwrap() })
+        statement_time::with_timestamps(stmt, txn, async { teval(&expr, None, None).unwrap() })
             .await;
     assert_eq!(val, Value::Boolean(true));
 }
@@ -1995,14 +2002,14 @@ async fn test_current_timestamp_equals_date_trunc_second_within_statement() {
 #[test]
 fn test_date_trunc_second_handles_negative_timestamps() {
     let expr = parse_expr("DATE_TRUNC('second', TIMESTAMP '1969-12-31 23:59:58.766')");
-    let val = eval_expr(&expr, None, None).unwrap();
+    let val = teval(&expr, None, None).unwrap();
     assert_eq!(val, parse_timestamp_string("1969-12-31 23:59:58").unwrap());
 }
 
 #[test]
 fn test_cast_timestamp_to_text_formats_timestamp() {
     let expr = parse_expr("TIMESTAMP '2024-01-15 10:30:00'::text");
-    let val = eval_expr(&expr, None, None).unwrap();
+    let val = teval(&expr, None, None).unwrap();
     assert_eq!(val, Value::Text("2024-01-15 10:30:00".to_string()));
 }
 
@@ -2012,7 +2019,7 @@ async fn test_cast_timestamptz_to_text_includes_offset() {
 
     let expr = parse_expr("TIMESTAMPTZ '2024-01-15T10:00:00Z'::text");
     let val = crate::session_context::with_timezone(Arc::from("America/Los_Angeles"), async {
-        eval_expr(&expr, None, None).unwrap()
+        teval(&expr, None, None).unwrap()
     })
     .await;
     assert_eq!(val, Value::Text("2024-01-15 02:00:00-08".to_string()));
@@ -2032,7 +2039,7 @@ fn test_pg_backend_pid_reads_from_query_context() {
         Arc::from("UTC"),
     );
     let expr = parse_expr("pg_backend_pid()");
-    let val = eval_expr_with_query_ctx(&expr, None, None, Some(&qc)).unwrap();
+    let val = eval_expr(&expr, None, None, &qc).unwrap();
     assert_eq!(val, Value::Int32(999));
 }
 
@@ -2048,7 +2055,7 @@ fn test_current_database_reads_from_query_context() {
         Arc::from("UTC"),
     );
     let expr = parse_expr("current_database()");
-    let val = eval_expr_with_query_ctx(&expr, None, None, Some(&qc)).unwrap();
+    let val = eval_expr(&expr, None, None, &qc).unwrap();
     assert_eq!(val, Value::Text("context_db".to_string()));
 }
 
@@ -2060,7 +2067,7 @@ fn test_now_reads_transaction_timestamp_from_query_context() {
     let txn_ts = 1_700_000_001_234_i64;
     let qc = QueryContext::new(1, Arc::from("db"), stmt_ts, txn_ts, Arc::from("UTC"));
     let expr = parse_expr("NOW(0)");
-    let val = eval_expr_with_query_ctx(&expr, None, None, Some(&qc)).unwrap();
+    let val = eval_expr(&expr, None, None, &qc).unwrap();
     // NOW() uses transaction time per PostgreSQL semantics
     assert_eq!(val, Value::Timestamp(1_700_000_001_000));
 }
@@ -2073,7 +2080,7 @@ fn test_current_timestamp_reads_transaction_timestamp_from_query_context() {
     let txn_ts = 1_700_000_001_500_i64;
     let qc = QueryContext::new(1, Arc::from("db"), stmt_ts, txn_ts, Arc::from("UTC"));
     let expr = parse_expr("CURRENT_TIMESTAMP(3)");
-    let val = eval_expr_with_query_ctx(&expr, None, None, Some(&qc)).unwrap();
+    let val = eval_expr(&expr, None, None, &qc).unwrap();
     // CURRENT_TIMESTAMP uses transaction time per PostgreSQL semantics
     assert_eq!(val, Value::Timestamp(1_700_000_001_500));
 }
@@ -2094,8 +2101,8 @@ async fn test_query_context_overrides_task_local() {
     let db_expr = parse_expr("current_database()");
 
     let (pid, db) = with_query_context(123, Arc::from("task_local_db"), async {
-        let pid = eval_expr_with_query_ctx(&pid_expr, None, None, Some(&qc)).unwrap();
-        let db = eval_expr_with_query_ctx(&db_expr, None, None, Some(&qc)).unwrap();
+        let pid = eval_expr(&pid_expr, None, None, &qc).unwrap();
+        let db = eval_expr(&db_expr, None, None, &qc).unwrap();
         (pid, db)
     })
     .await;
@@ -2112,7 +2119,7 @@ fn test_transaction_timestamp_reads_from_query_context() {
     let txn_ts = 1_700_000_000_000_i64;
     let qc = QueryContext::new(1, Arc::from("db"), stmt_ts, txn_ts, Arc::from("UTC"));
     let expr = parse_expr("TRANSACTION_TIMESTAMP(0)");
-    let val = eval_expr_with_query_ctx(&expr, None, None, Some(&qc)).unwrap();
+    let val = eval_expr(&expr, None, None, &qc).unwrap();
     assert_eq!(val, Value::Timestamp(txn_ts));
 }
 
@@ -2122,7 +2129,7 @@ async fn test_transaction_timestamp_reads_task_local_without_query_ctx() {
     let txn = 1_700_000_000_000_i64;
     let expr = parse_expr("TRANSACTION_TIMESTAMP(0)");
     let val =
-        statement_time::with_timestamps(stmt, txn, async { eval_expr(&expr, None, None).unwrap() })
+        statement_time::with_timestamps(stmt, txn, async { teval(&expr, None, None).unwrap() })
             .await;
     assert_eq!(
         val,
@@ -2139,8 +2146,8 @@ async fn test_transaction_timestamp_differs_from_statement_timestamp() {
     let stmt_expr = parse_expr("STATEMENT_TIMESTAMP(0)");
     let (txn_val, stmt_val) = statement_time::with_timestamps(stmt, txn, async {
         (
-            eval_expr(&txn_expr, None, None).unwrap(),
-            eval_expr(&stmt_expr, None, None).unwrap(),
+            teval(&txn_expr, None, None).unwrap(),
+            teval(&stmt_expr, None, None).unwrap(),
         )
     })
     .await;
@@ -2160,10 +2167,10 @@ async fn test_now_equals_transaction_timestamp_not_statement_timestamp() {
     let txn = 1_700_000_000_000_i64;
     let (now_val, ct_val, tt_val, st_val) = statement_time::with_timestamps(stmt, txn, async {
         (
-            eval_expr(&parse_expr("NOW(0)"), None, None).unwrap(),
-            eval_expr(&parse_expr("CURRENT_TIMESTAMP(0)"), None, None).unwrap(),
-            eval_expr(&parse_expr("TRANSACTION_TIMESTAMP(0)"), None, None).unwrap(),
-            eval_expr(&parse_expr("STATEMENT_TIMESTAMP(0)"), None, None).unwrap(),
+            teval(&parse_expr("NOW(0)"), None, None).unwrap(),
+            teval(&parse_expr("CURRENT_TIMESTAMP(0)"), None, None).unwrap(),
+            teval(&parse_expr("TRANSACTION_TIMESTAMP(0)"), None, None).unwrap(),
+            teval(&parse_expr("STATEMENT_TIMESTAMP(0)"), None, None).unwrap(),
         )
     })
     .await;
@@ -2179,7 +2186,8 @@ async fn test_now_equals_transaction_timestamp_not_statement_timestamp() {
 fn test_eval_expr_without_query_context_falls_back() {
     let expr = parse_expr("pg_backend_pid()");
     set_connection_id(42);
-    let val = eval_expr_with_query_ctx(&expr, None, None, None).unwrap();
+    let qc = QueryContext::from_task_locals();
+    let val = eval_expr(&expr, None, None, &qc).unwrap();
     assert_eq!(val, Value::Int32(42));
 }
 
@@ -2187,11 +2195,171 @@ fn test_eval_expr_without_query_context_falls_back() {
 fn test_like_single_byte_escape_accepted() {
     // ASCII (1 byte) should work fine
     assert_eq!(
-        eval_expr(&parse_expr("'a_b' LIKE 'a\\_b' ESCAPE '\\'"), None, None).unwrap(),
+        teval(&parse_expr("'a_b' LIKE 'a\\_b' ESCAPE '\\'"), None, None).unwrap(),
         Value::Boolean(true)
     );
     assert_eq!(
-        eval_expr(&parse_expr("'a%b' LIKE 'a\\%b' ESCAPE '\\'"), None, None).unwrap(),
+        teval(&parse_expr("'a%b' LIKE 'a\\%b' ESCAPE '\\'"), None, None).unwrap(),
         Value::Boolean(true)
+    );
+}
+
+// ── Error path tests for #657 (error masking elimination) ──────────
+//
+// After #657, compare_values() errors propagate via ? instead of being
+// silently swallowed by unwrap_or(0). These tests verify that:
+//   1. Truly incomparable types (jsonb, vector) produce errors that
+//      propagate through GREATEST/LEAST/IN/BETWEEN/CASE.
+//   2. Cross-type comparisons that CAN be coerced (Text vs Int) still work.
+//   3. Parse failures produce errors instead of silent zero.
+
+#[test]
+fn test_greatest_jsonb_vs_int_errors() {
+    // jsonb has no ordering operator — GREATEST must propagate the error
+    let err = teval(
+        &parse_expr("GREATEST('{\"a\":1}'::jsonb, '{\"b\":2}'::jsonb)"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("ordering operator for type jsonb"),
+        "expected jsonb ordering error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_least_jsonb_errors() {
+    let err = teval(
+        &parse_expr("LEAST('{\"a\":1}'::jsonb, '{\"b\":2}'::jsonb)"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("ordering operator for type jsonb"),
+        "expected jsonb ordering error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_nullif_numeric_vs_non_numeric_text_errors() {
+    // Numeric compared to non-numeric text should error (implicit cast fails)
+    let err = teval(&parse_expr("NULLIF(1.5::numeric, 'abc')"), None, None).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid input syntax") || msg.contains("Cannot compare"),
+        "expected cast/comparison error, got: {}",
+        msg
+    );
+}
+
+#[test]
+fn test_in_list_jsonb_errors() {
+    let err = teval(
+        &parse_expr("'{\"a\":1}'::jsonb IN ('{\"b\":2}'::jsonb)"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("ordering operator for type jsonb")
+            || err
+                .to_string()
+                .contains("comparison function for type json"),
+        "expected jsonb comparison error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_between_jsonb_errors() {
+    let err = teval(
+        &parse_expr("'{\"a\":1}'::jsonb BETWEEN '{\"a\":0}'::jsonb AND '{\"a\":9}'::jsonb"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("ordering operator for type jsonb"),
+        "expected jsonb comparison error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_case_when_simple_jsonb_errors() {
+    let err = teval(
+        &parse_expr("CASE '{\"a\":1}'::jsonb WHEN '{\"a\":2}'::jsonb THEN 'match' END"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("ordering operator for type jsonb"),
+        "expected jsonb comparison error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_interval_non_numeric_string_errors() {
+    let err = teval(&parse_expr("INTERVAL 'abc' DAY"), None, None).unwrap_err();
+    assert!(
+        err.to_string().contains("invalid input syntax"),
+        "expected parse error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn test_compare_values_incompatible_types_error() {
+    // Json/Jsonb cannot be compared to scalars
+    assert!(compare_values(&Value::Json("{}".to_string()), &Value::Int32(1)).is_err());
+    assert!(compare_values(&Value::Jsonb("{}".to_string()), &Value::Int32(1)).is_err());
+    // Vector cannot be compared
+    assert!(compare_values(&Value::Vector(vec![1.0]), &Value::Int32(1)).is_err());
+}
+
+#[test]
+fn test_cross_type_coercion_still_works() {
+    // Text vs Int32: non-parseable text now errors (matches PG semantics).
+    // Old behavior fell back to string comparison; new behavior uses implicit cast.
+    assert!(teval(&parse_expr("GREATEST('abc', 123)"), None, None).is_err());
+    assert!(teval(&parse_expr("LEAST('abc', 123)"), None, None).is_err());
+    assert!(teval(&parse_expr("NULLIF(123, 'abc')"), None, None).is_err());
+    assert!(teval(&parse_expr("1 IN ('a', 'b')"), None, None).is_err());
+    assert!(teval(&parse_expr("1 BETWEEN 'a' AND 'z'"), None, None).is_err());
+
+    // Valid text-to-numeric coercion still works in comparison;
+    // GREATEST/LEAST return the original value (not coerced)
+    assert_eq!(
+        teval(&parse_expr("GREATEST('42', 123)"), None, None).unwrap(),
+        Value::Int32(123) // 123 > 42 → returns the original Int32(123)
+    );
+    assert_eq!(
+        teval(&parse_expr("LEAST('42', 123)"), None, None).unwrap(),
+        Value::Text("42".into()) // 42 < 123 → returns the original Text("42")
+    );
+}
+
+#[test]
+fn test_numeric_decimal_overflow_errors() {
+    // Decimal that overflows i64 in modulo operation
+    let err = teval(
+        &parse_expr("99999999999999999999999::numeric % 1"),
+        None,
+        None,
+    )
+    .unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("numeric value out of range")
+            || msg.contains("out of range")
+            || msg.contains("number too large"),
+        "expected overflow error, got: {}",
+        msg
     );
 }

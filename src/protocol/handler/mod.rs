@@ -889,11 +889,12 @@ fn try_parse_fs9_mode_from_args(args: &[FunctionArg]) -> Option<crate::extension
         return None;
     }
 
+    let qc = crate::sql::query_context::QueryContext::from_task_locals();
     let path_expr = match &args[0] {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
         _ => return None,
     };
-    let path = match eval_expr(path_expr, None, None).ok()? {
+    let path = match eval_expr(path_expr, None, None, &qc).ok()? {
         Value::Text(s) => s,
         _ => return None,
     };
@@ -912,7 +913,7 @@ fn try_parse_fs9_mode_from_args(args: &[FunctionArg]) -> Option<crate::extension
                 ..
             } => {
                 let param_name = name.value.to_ascii_lowercase();
-                let val = eval_expr(e, None, None).ok()?;
+                let val = eval_expr(e, None, None, &qc).ok()?;
                 match param_name.as_str() {
                     "format" => match val {
                         Value::Text(s) => format = Some(s),
@@ -1266,6 +1267,7 @@ fn infer_values_output_columns(values: &Values) -> Option<Vec<InferredColumn>> {
             .enumerate()
             .map(|(idx, expr)| InferredColumn {
                 name: format!("column{}", idx + 1),
+                // INTENTIONAL: wire protocol encoding — Text OID is universally safe
                 data_type: inferrer.infer(expr).unwrap_or(DataType::Text),
             })
             .collect(),
@@ -1579,12 +1581,14 @@ async fn infer_select_output_columns_with_txn(
             SelectItem::UnnamedExpr(expr) => {
                 out_cols.push(InferredColumn {
                     name: select_item_output_name(item),
+                    // INTENTIONAL: wire protocol encoding — Text OID is universally safe
                     data_type: inferrer.infer(expr).unwrap_or(DataType::Text),
                 });
             }
             SelectItem::ExprWithAlias { expr, alias } => {
                 out_cols.push(InferredColumn {
                     name: alias.value.clone(),
+                    // INTENTIONAL: wire protocol encoding — Text OID is universally safe
                     data_type: inferrer.infer(expr).unwrap_or(DataType::Text),
                 });
             }

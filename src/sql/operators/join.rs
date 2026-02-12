@@ -1,11 +1,11 @@
-use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use sqlparser::ast::{Expr, JoinOperator};
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::{eval_expr, parse_bool_pg};
-use crate::types::{ColumnDef, Row, TableSchema, Value};
+use crate::sql::expr::eval_expr;
+use crate::sql::types::cast::{cast, CastContext};
+use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JoinType {
@@ -130,19 +130,27 @@ impl NestedLoopJoinOperator {
         Row::new(values)
     }
 
-    fn eval_condition(&self, combined_row: &Row) -> Result<bool> {
+    fn eval_condition(
+        &self,
+        combined_row: &Row,
+        query_ctx: &crate::sql::query_context::QueryContext,
+    ) -> Result<bool> {
         if let Some(cond) = &self.condition {
-            let result = eval_expr(cond, Some(combined_row), Some(&self.output_schema))?;
+            let result = eval_expr(
+                cond,
+                Some(combined_row),
+                Some(&self.output_schema),
+                query_ctx,
+            )?;
             match result {
                 Value::Boolean(b) => Ok(b),
                 Value::Null => Ok(false),
-                Value::Text(s) => parse_bool_pg(&s).ok_or_else(|| {
-                    SqlError::InvalidInputSyntax {
-                        type_name: "boolean".into(),
-                        value: s.clone(),
+                Value::Text(s) => {
+                    match cast(Value::Text(s), &DataType::Boolean, CastContext::Implicit)? {
+                        Value::Boolean(b) => Ok(b),
+                        _ => unreachable!("cast to Boolean always produces Boolean"),
                     }
-                    .into()
-                }),
+                }
                 _ => Err(anyhow!("Join condition must evaluate to boolean")),
             }
         } else {
@@ -182,7 +190,7 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                 for left_row in &left_rows {
                     for right_row in &right_rows {
                         let combined = Self::concat_rows(left_row, right_row);
-                        if self.eval_condition(&combined)? {
+                        if self.eval_condition(&combined, ctx.query_ctx)? {
                             self.result_rows.push(combined);
                         }
                     }
@@ -193,7 +201,7 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                     let mut matched = false;
                     for right_row in &right_rows {
                         let combined = Self::concat_rows(left_row, right_row);
-                        if self.eval_condition(&combined)? {
+                        if self.eval_condition(&combined, ctx.query_ctx)? {
                             self.result_rows.push(combined);
                             matched = true;
                         }
@@ -210,7 +218,7 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                     let mut matched = false;
                     for left_row in &left_rows {
                         let combined = Self::concat_rows(left_row, right_row);
-                        if self.eval_condition(&combined)? {
+                        if self.eval_condition(&combined, ctx.query_ctx)? {
                             self.result_rows.push(combined);
                             matched = true;
                         }
@@ -229,7 +237,7 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                     let mut left_matched = false;
                     for (i, right_row) in right_rows.iter().enumerate() {
                         let combined = Self::concat_rows(left_row, right_row);
-                        if self.eval_condition(&combined)? {
+                        if self.eval_condition(&combined, ctx.query_ctx)? {
                             self.result_rows.push(combined);
                             left_matched = true;
                             right_matched[i] = true;

@@ -13,7 +13,7 @@ use super::super::projection::{get_select_item_name, infer_expr_type};
 use super::super::sequences;
 use super::super::wildcard::build_join_wildcard_plan;
 use super::super::{
-    expr::{coerce_text_literal_to_bool, eval_expr, validate_bool_expr_in_boolean_context},
+    expr::{eval_expr, validate_bool_expr_in_boolean_context},
     ExecuteResult,
 };
 use super::core::Executor;
@@ -26,6 +26,7 @@ use super::operators::{
 use super::subquery::{expr_contains_subquery, substitute_outer_values};
 use crate::sql::error::SqlError;
 use crate::sql::information_schema::VirtualTableFilter;
+use crate::sql::query_context::QueryContext;
 #[allow(unused_imports)] // Re-exported for join sub-modules via glob import
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
@@ -109,6 +110,7 @@ impl Executor {
         query: &Query,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
+        let qc = QueryContext::from_task_locals();
         if let SetExpr::SetOperation {
             op,
             set_quantifier,
@@ -140,7 +142,7 @@ impl Executor {
             {
                 let mut rows = rows;
                 if !query.order_by.is_empty() {
-                    rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns);
+                    rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns)?;
                 }
                 rows = apply_offset_limit_fetch(rows, query);
                 return Ok(ExecuteResult::Select {
@@ -204,7 +206,7 @@ impl Executor {
             let mut rows = rows;
 
             if !query.order_by.is_empty() {
-                rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns);
+                rows = self.apply_order_by_for_aggregate(rows, &query.order_by, &columns)?;
             }
             rows = apply_offset_limit_fetch(rows, query);
 
@@ -542,6 +544,7 @@ impl Executor {
                 search_path,
                 &select.projection,
                 &outer_alias,
+                &schema,
                 ctes,
             )
             .await?;
@@ -574,8 +577,8 @@ impl Executor {
                 if let Some(ref safe) = safe_parts {
                     let mut filtered = Vec::new();
                     for row in rows {
-                        let val = eval_expr(safe, Some(&row), Some(&schema))?;
-                        let val = coerce_text_literal_to_bool(safe, val)?;
+                        let val = eval_expr(safe, Some(&row), Some(&schema), &qc)?;
+                        let val = crate::sql::types::cast::coerce_to_bool(val)?;
                         if matches!(val, Value::Boolean(true)) {
                             filtered.push(row);
                         }
@@ -624,8 +627,13 @@ impl Executor {
                 for row in base_rows {
                     let eval_expr_input = if has_subqueries {
                         // Substitute outer values and resolve any remaining subqueries.
-                        let substituted =
-                            substitute_outer_values(async_filter, &outer_alias, &schema, &row);
+                        let substituted = substitute_outer_values(
+                            async_filter,
+                            &outer_alias,
+                            &schema,
+                            &row,
+                            None,
+                        );
                         self.resolve_subqueries(
                             txn,
                             db_id,
@@ -650,7 +658,7 @@ impl Executor {
                             Some(&schema),
                         )
                         .await?;
-                    let val = coerce_text_literal_to_bool(&eval_expr_input, val)?;
+                    let val = crate::sql::types::cast::coerce_to_bool(val)?;
                     if matches!(val, Value::Boolean(true)) {
                         out.push(row);
                     }
@@ -700,7 +708,10 @@ impl Executor {
 
         if has_for_update || has_for_share {
             let planner = PhysicalPlanner::new(search_path.to_vec());
-            let estimated_rows = 1000;
+            let estimated_rows = self
+                .stats_cache()
+                .get_estimate(db_id, schema.table_id)
+                .unwrap_or(1000);
 
             if has_skip_locked {
                 // SKIP LOCKED: scan all matching rows in ORDER BY order (no

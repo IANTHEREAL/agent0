@@ -3,6 +3,7 @@ use super::super::using_merge::{
     build_coalesce_for_merge, rewrite_for_using_join, UsingMergeColumn,
 };
 use super::TableInfo;
+use crate::sql::query_context::QueryContext;
 use crate::sql::wildcard::JoinWildcardPlan;
 
 pub(super) fn project_join_output(
@@ -16,6 +17,7 @@ pub(super) fn project_join_output(
     tables: &[TableInfo],
     source_offsets: &[usize],
 ) -> Result<(Vec<String>, Vec<DataType>, Vec<Row>)> {
+    let qc = QueryContext::from_task_locals();
     let has_unqualified_wildcard = resolved_projection
         .iter()
         .any(|p| matches!(p, SelectItem::Wildcard(_)));
@@ -97,13 +99,13 @@ pub(super) fn project_join_output(
                         let original_name = get_select_item_name(item);
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(original_name);
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(alias.value.clone());
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                 }
@@ -118,7 +120,7 @@ pub(super) fn project_join_output(
                             row.values.get(*idx).cloned().unwrap_or(Value::Null)
                         }
                         ProjectionSource::Expr(expr) => {
-                            eval_expr(expr, Some(&row), Some(final_schema))?
+                            eval_expr(expr, Some(&row), Some(final_schema), &qc)?
                         }
                         ProjectionSource::CoalesceColumn(indices) => {
                             let mut out = Value::Null;
@@ -158,6 +160,7 @@ pub(super) fn project_join_output(
                         }
                     }
                     SelectItem::QualifiedWildcard(obj, _) => {
+                        // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                         let qualifier = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                         let mut matched = false;
                         for (idx, c) in final_schema.columns.iter().enumerate() {
@@ -184,13 +187,13 @@ pub(super) fn project_join_output(
                         let original_name = get_select_item_name(item);
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(original_name);
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(alias.value.clone());
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                 }
@@ -205,7 +208,7 @@ pub(super) fn project_join_output(
                             row.values.get(*idx).cloned().unwrap_or(Value::Null)
                         }
                         ProjectionSource::Expr(expr) => {
-                            eval_expr(expr, Some(&row), Some(final_schema))?
+                            eval_expr(expr, Some(&row), Some(final_schema), &qc)?
                         }
                         ProjectionSource::CoalesceColumn(indices) => {
                             let mut out = Value::Null;
@@ -288,6 +291,7 @@ pub(super) fn project_join_output(
                         }
                     }
                     SelectItem::QualifiedWildcard(obj, _) => {
+                        // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                         let qualifier = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                         let mut matched = false;
                         for (idx, c) in final_schema.columns.iter().enumerate() {
@@ -314,13 +318,13 @@ pub(super) fn project_join_output(
                         let original_name = get_select_item_name(item);
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(original_name);
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(alias.value.clone());
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                 }
@@ -335,7 +339,7 @@ pub(super) fn project_join_output(
                             row.values.get(*idx).cloned().unwrap_or(Value::Null)
                         }
                         ProjectionSource::Expr(expr) => {
-                            eval_expr(expr, Some(&row), Some(final_schema))?
+                            eval_expr(expr, Some(&row), Some(final_schema), &qc)?
                         }
                         ProjectionSource::CoalesceColumn(indices) => {
                             let mut out = Value::Null;
@@ -364,6 +368,7 @@ pub(super) fn project_join_output(
             for item in resolved_projection {
                 match item {
                     SelectItem::QualifiedWildcard(obj, _) => {
+                        // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                         let qualifier = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                         let (table_idx, table) = tables
                             .iter()
@@ -404,13 +409,13 @@ pub(super) fn project_join_output(
                         let original_name = get_select_item_name(item);
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(original_name);
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
                         let rewritten = rewrite_for_using_join(expr, table_aliases, merge_columns)?;
                         cols.push(alias.value.clone());
-                        types.push(infer_expr_type(&rewritten, final_schema));
+                        types.push(infer_expr_type(&rewritten, final_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                     SelectItem::Wildcard(_) => {
@@ -430,7 +435,7 @@ pub(super) fn project_join_output(
                             row.values.get(*idx).cloned().unwrap_or(Value::Null)
                         }
                         ProjectionSource::Expr(expr) => {
-                            eval_expr(expr, Some(&row), Some(final_schema))?
+                            eval_expr(expr, Some(&row), Some(final_schema), &qc)?
                         }
                         ProjectionSource::CoalesceColumn(indices) => {
                             let mut out = Value::Null;
@@ -497,15 +502,15 @@ pub(super) fn project_join_output(
                 .map(|item| get_select_item_name(item))
                 .collect();
 
-            let types: Vec<DataType> = rewritten_projection
-                .iter()
-                .map(|item| match item {
+            let mut types: Vec<DataType> = Vec::with_capacity(rewritten_projection.len());
+            for item in &rewritten_projection {
+                types.push(match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        infer_expr_type(expr, final_schema)
+                        infer_expr_type(expr, final_schema)?
                     }
                     _ => DataType::Text,
-                })
-                .collect();
+                });
+            }
 
             fn unnest_arg_expr<'a>(expr: &'a Expr) -> Option<&'a Expr> {
                 match expr {
@@ -538,17 +543,18 @@ pub(super) fn project_join_output(
                     };
 
                     if let Some(arg_expr) = unnest_arg_expr(expr) {
-                        let outputs = match eval_expr(arg_expr, Some(&row), Some(final_schema))? {
-                            Value::Array(arr) => arr,
-                            Value::Null => Vec::new(),
-                            other => vec![other],
-                        };
+                        let outputs =
+                            match eval_expr(arg_expr, Some(&row), Some(final_schema), &qc)? {
+                                Value::Array(arr) => arr,
+                                Value::Null => Vec::new(),
+                                other => vec![other],
+                            };
                         srf_outputs.push((row_values.len(), outputs));
                         row_values.push(Value::Null);
                         continue;
                     }
 
-                    let val = eval_expr(expr, Some(&row), Some(final_schema))?;
+                    let val = eval_expr(expr, Some(&row), Some(final_schema), &qc)?;
                     row_values.push(val);
                 }
 

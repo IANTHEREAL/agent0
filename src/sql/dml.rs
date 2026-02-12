@@ -14,6 +14,7 @@ use super::index_helpers;
 use super::projection::{eval_default_expr, infer_expr_type};
 use super::sequences;
 use super::value_coercion::coerce_value_for_column;
+use crate::sql::query_context::QueryContext;
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
@@ -119,6 +120,7 @@ pub(crate) fn eval_upsert_expr(
     schema: &TableSchema,
     target_column: Option<&ColumnDef>,
 ) -> Result<Value> {
+    let qc = QueryContext::from_task_locals();
     match expr {
         Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
             let prefix = parts[0].value.to_uppercase();
@@ -157,7 +159,7 @@ pub(crate) fn eval_upsert_expr(
         Expr::Nested(inner) => {
             eval_upsert_expr(inner, existing_row, excluded_row, schema, target_column)
         }
-        _ => eval_expr(expr, Some(existing_row), Some(schema)),
+        _ => eval_expr(expr, Some(existing_row), Some(schema), &qc),
     }
 }
 
@@ -199,8 +201,10 @@ pub fn build_returning_types(
     if let Some(items) = returning {
         for item in items {
             match item {
-                SelectItem::UnnamedExpr(expr) => types.push(infer_expr_type(expr, schema)),
-                SelectItem::ExprWithAlias { expr, .. } => types.push(infer_expr_type(expr, schema)),
+                SelectItem::UnnamedExpr(expr) => types.push(infer_expr_type(expr, schema)?),
+                SelectItem::ExprWithAlias { expr, .. } => {
+                    types.push(infer_expr_type(expr, schema)?)
+                }
                 SelectItem::Wildcard(_) => {
                     types.extend(schema.columns.iter().map(|c| c.data_type.clone()));
                 }
@@ -223,6 +227,7 @@ pub async fn eval_returning_row(
     row: &Row,
     schema: &TableSchema,
 ) -> Result<Option<Row>> {
+    let qc = QueryContext::from_task_locals();
     if let Some(items) = returning {
         let mut vals = Vec::new();
         for item in items {
@@ -241,7 +246,7 @@ pub async fn eval_returning_row(
                         )
                         .await?
                     } else {
-                        eval_expr(e, Some(row), Some(schema))?
+                        eval_expr(e, Some(row), Some(schema), &qc)?
                     });
                 }
                 SelectItem::Wildcard(_) => vals.extend(row.values.clone()),
@@ -1212,6 +1217,7 @@ pub async fn prepare_insert_row(
     columns: &[Ident],
     exprs: &[Expr],
 ) -> Result<(Vec<Value>, Vec<usize>)> {
+    let qc = QueryContext::from_task_locals();
     let mut row_vals = vec![Value::Null; schema.columns.len()];
     let mut indices = Vec::new();
 
@@ -1241,7 +1247,7 @@ pub async fn prepare_insert_row(
                     )
                     .await?
                 } else {
-                    eval_expr(e, None, None)?
+                    eval_expr(e, None, None, &qc)?
                 };
                 indices.push(i);
             }
@@ -1275,7 +1281,7 @@ pub async fn prepare_insert_row(
                     )
                     .await?
                 } else {
-                    eval_expr(&exprs[i], None, None)?
+                    eval_expr(&exprs[i], None, None, &qc)?
                 };
                 indices.push(idx);
             }
@@ -1293,6 +1299,7 @@ async fn eval_default_expr_maybe_sequence(
     search_path: &[String],
     expr_str: &str,
 ) -> Result<Value> {
+    let qc = QueryContext::from_task_locals();
     let sql = format!("SELECT {}", expr_str);
     let dialect = PostgreSqlDialect {};
     let ast = Parser::parse_sql(&dialect, &sql)
@@ -1316,7 +1323,7 @@ async fn eval_default_expr_maybe_sequence(
                     )
                     .await
                 } else {
-                    eval_expr(&e, None, None)
+                    eval_expr(&e, None, None, &qc)
                 };
             }
         }
@@ -1434,6 +1441,7 @@ pub fn coerce_row_values_allow_null(schema: &TableSchema, row_vals: &mut Vec<Val
 }
 
 pub fn validate_check_constraints(schema: &TableSchema, row: &Row) -> Result<()> {
+    let qc = QueryContext::from_task_locals();
     let dialect = PostgreSqlDialect {};
     for check in &schema.check_constraints {
         let expr = Parser::new(&dialect)
@@ -1441,7 +1449,7 @@ pub fn validate_check_constraints(schema: &TableSchema, row: &Row) -> Result<()>
             .and_then(|mut p| p.parse_expr())
             .map_err(|e| anyhow!("Invalid CHECK expression '{}': {}", check.expr, e))?;
 
-        let result = eval_expr(&expr, Some(row), Some(schema))?;
+        let result = eval_expr(&expr, Some(row), Some(schema), &qc)?;
 
         match result {
             Value::Boolean(true) => {}
@@ -1572,6 +1580,7 @@ pub async fn compute_update_values(
     indices: &[usize],
     eval_row: Option<(&Row, &TableSchema)>,
 ) -> Result<Vec<Value>> {
+    let qc = QueryContext::from_task_locals();
     let mut vals = old_row.values.clone();
     for (i, a) in assignments.iter().enumerate() {
         let (eval_row, eval_schema) = if let Some((combined_row, combined_schema)) = eval_row {
@@ -1593,7 +1602,7 @@ pub async fn compute_update_values(
             )
             .await?
         } else {
-            eval_expr(&a.value, Some(eval_row), Some(eval_schema))?
+            eval_expr(&a.value, Some(eval_row), Some(eval_schema), &qc)?
         };
         let col = &schema.columns[indices[i]];
         let coerced = coerce_value_for_column(raw_val, col)?;

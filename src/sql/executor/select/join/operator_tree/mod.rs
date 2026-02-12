@@ -991,6 +991,7 @@ impl Executor {
                                     &outer_alias,
                                     &outer_schema,
                                     &row,
+                                    ctes,
                                 )
                                 .await?;
                             if inferred_type.is_none() {
@@ -1006,6 +1007,7 @@ impl Executor {
                             .columns
                             .push(crate::types::ColumnDef {
                                 name: computed_col.clone(),
+                                // INTENTIONAL: all-NULL subquery column defaults to Text (PG-compatible)
                                 data_type: inferred_type.unwrap_or(DataType::Text),
                                 nullable: true,
                                 primary_key: false,
@@ -1231,6 +1233,7 @@ impl Executor {
             // expanded from `tables` rather than `table_aliases`.
             for item in &resolved_projection {
                 if let SelectItem::QualifiedWildcard(obj, _) = item {
+                    // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                     let qualifier = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                     if inner_alias_targets.contains_key(&qualifier.to_lowercase()) {
                         return Err(SqlError::Unsupported(format!(
@@ -1719,6 +1722,7 @@ impl Executor {
                     }
                 }
                 SelectItem::QualifiedWildcard(obj, _) => {
+                    // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                     let qualifier = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                     let (table_idx, table) = tables
                         .iter()

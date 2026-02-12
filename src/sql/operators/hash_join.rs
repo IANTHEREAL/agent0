@@ -546,10 +546,14 @@ impl HashJoinOperator {
         Row::new(values)
     }
 
-    fn check_filter(&self, row: &Row) -> Result<bool> {
+    fn check_filter(
+        &self,
+        row: &Row,
+        query_ctx: &crate::sql::query_context::QueryContext,
+    ) -> Result<bool> {
         match &self.filter {
             None => Ok(true),
-            Some(expr) => match eval_expr(expr, Some(row), Some(&self.output_schema))? {
+            Some(expr) => match eval_expr(expr, Some(row), Some(&self.output_schema), query_ctx)? {
                 Value::Boolean(b) => Ok(b),
                 Value::Null => Ok(false),
                 _ => Err(anyhow!("JOIN filter must be boolean")),
@@ -632,10 +636,11 @@ impl PhysicalOperator for HashJoinOperator {
         let filter = self.filter.as_ref();
         let output_schema = &self.output_schema;
 
+        let query_ctx = ctx.query_ctx;
         let check_filter = |row: &Row| -> Result<bool> {
             match filter {
                 None => Ok(true),
-                Some(expr) => match eval_expr(expr, Some(row), Some(output_schema))? {
+                Some(expr) => match eval_expr(expr, Some(row), Some(output_schema), query_ctx)? {
                     Value::Boolean(b) => Ok(b),
                     Value::Null => Ok(false),
                     _ => Err(anyhow!("JOIN filter must be boolean")),

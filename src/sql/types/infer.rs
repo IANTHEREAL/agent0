@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr};
 
+use crate::sql::names::function_name_upper;
 use crate::types::DataType;
 
 use super::coercion::{binary_op_result_type, unify_types};
@@ -99,8 +100,10 @@ impl<'a> TypeInferrer<'a> {
 
             Expr::Value(val) => Ok(self.infer_value(val)),
 
-            Expr::Cast { data_type, .. } => Ok(super::sql_datatype_to_internal(data_type)),
-            Expr::TypedString { data_type, .. } => Ok(super::sql_datatype_to_internal(data_type)),
+            Expr::Cast { data_type, .. } => super::sql_datatype_to_internal(data_type)
+                .map_err(|e| TypeError::UnsupportedExpression(e.to_string())),
+            Expr::TypedString { data_type, .. } => super::sql_datatype_to_internal(data_type)
+                .map_err(|e| TypeError::UnsupportedExpression(e.to_string())),
 
             Expr::Function(f) => self.infer_function(f),
 
@@ -216,6 +219,7 @@ impl<'a> TypeInferrer<'a> {
                 Ok(DataType::Array(Box::new(inner_type)))
             }
 
+            // INTENTIONAL: conservative default for unhandled expression types
             _ => Ok(DataType::Text),
         }
     }
@@ -248,28 +252,21 @@ impl<'a> TypeInferrer<'a> {
     }
 
     fn infer_function(&mut self, f: &Function) -> Result<DataType, TypeError> {
-        let func_name = f
-            .name
-            .0
-            .last()
-            .map(|n| n.value.to_uppercase())
-            .unwrap_or_default();
+        let func_name = function_name_upper(f);
 
         let arg_types: Vec<DataType> = f
             .args
             .iter()
             .filter_map(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
-                    Some(self.infer(expr).unwrap_or(DataType::Text))
-                }
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(self.infer(expr)),
                 FunctionArg::Named {
                     arg: FunctionArgExpr::Expr(expr),
                     ..
-                } => Some(self.infer(expr).unwrap_or(DataType::Text)),
-                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Some(DataType::Int64),
+                } => Some(self.infer(expr)),
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Some(Ok(DataType::Int64)),
                 _ => None,
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Special handling for window functions
         // Window functions SUM/AVG always return Numeric for consistency
@@ -296,7 +293,7 @@ impl<'a> TypeInferrer<'a> {
             return Ok(return_type);
         }
 
-        // Unknown function - return conservative default
+        // INTENTIONAL: registry doesn't include UDFs — Text is safe fallback
         Ok(DataType::Text)
     }
 

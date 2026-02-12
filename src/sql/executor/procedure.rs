@@ -729,11 +729,12 @@ impl Executor {
             .ok_or_else(|| anyhow!("Materialized view '{}' does not exist", view_name_for_error))?;
             let view_full_name = resolved.full;
 
-            let query_str: String = self
+            let query_str = self
                 .store()
                 .get_materialized_view(txn, db_id, &view_full_name)
                 .await?
-                .ok_or_else(|| anyhow!("Materialized view '{}' does not exist", view_full_name))?;
+                .ok_or_else(|| anyhow!("Materialized view '{}' does not exist", view_full_name))?
+                .query;
 
             let ast = parse_sql(&query_str)?;
             let query = match ast.into_iter().next() {

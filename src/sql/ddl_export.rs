@@ -245,15 +245,13 @@ pub async fn export_all_ddl(
     }
 
     let mut matviews = store.list_materialized_views(txn, db_id).await?;
-    matviews.sort();
-    for name in matviews {
-        if let Some(query) = store.get_materialized_view(txn, db_id, &name).await? {
-            rows.push(DdlExportRow {
-                object_type: "materialized_view".to_string(),
-                object_name: name.clone(),
-                ddl_sql: matview_to_ddl(&name, &query),
-            });
-        }
+    matviews.sort_by(|a, b| a.full_name().cmp(&b.full_name()));
+    for matview in matviews {
+        rows.push(DdlExportRow {
+            object_type: "materialized_view".to_string(),
+            object_name: matview.full_name(),
+            ddl_sql: matview_to_ddl(&matview.full_name(), &matview.query),
+        });
     }
 
     let mut triggers = store.list_triggers(txn, db_id).await?;

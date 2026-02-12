@@ -419,28 +419,38 @@ impl DynamicPgHandler {
             let _ = self.connection_guard.set(tenant_obs.connection_open());
         }
 
-        let store = if let Some(pool) = &self.client_pool {
+        let (store, trigger_cache, stats_cache) = if let Some(pool) = &self.client_pool {
             let handle = pool
                 .acquire(Some(effective_keyspace.clone()))
                 .await
                 .map_err(|e| format!("Failed to get client from pool: {}", e))?;
             let s = handle.store().clone();
+            let tc = handle.trigger_cache().clone();
+            let sc = handle.stats_cache().clone();
             let _ = self.tenant_handle.set(handle);
-            s
+            (s, tc, sc)
         } else {
+            use crate::sql::stats::TableStatsCache;
+            use crate::sql::triggers::TriggerBodyCache;
             let s = TikvStore::new_with_keyspace(
                 self.pd_endpoints.clone(),
                 Some(effective_keyspace.clone()),
             )
             .await
             .map_err(|e| format!("Failed to connect to TiKV: {}", e))?;
-            Arc::new(s)
+            (
+                Arc::new(s),
+                Arc::new(TriggerBodyCache::new()),
+                Arc::new(TableStatsCache::new()),
+            )
         };
 
         let executor = Arc::new(Executor::new(
             store.clone(),
             effective_keyspace.clone(),
             tenant_obs.clone(),
+            trigger_cache,
+            stats_cache,
         ));
 
         let database_name = database.trim();

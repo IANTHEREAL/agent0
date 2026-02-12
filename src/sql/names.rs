@@ -1,7 +1,15 @@
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{Ident, ObjectName};
+use sqlparser::ast::{Function, Ident, ObjectName};
 use tikv_client::Transaction;
+
+pub(crate) fn function_name_upper(func: &Function) -> String {
+    func.name
+        .0
+        .last()
+        .map(|n| n.value.to_uppercase())
+        .unwrap_or_default()
+}
 
 pub fn normalize_ident(ident: &Ident) -> String {
     if ident.quote_style.is_some() {

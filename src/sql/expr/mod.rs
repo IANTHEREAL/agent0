@@ -5,9 +5,9 @@ mod context;
 mod evaluator;
 pub mod functions;
 mod numeric;
-mod operators;
+pub(crate) mod operators;
 
-pub(crate) use boolean::{coerce_text_literal_to_bool, validate_bool_expr_in_boolean_context};
+pub(crate) use boolean::validate_bool_expr_in_boolean_context;
 pub use context::EvalContext;
 pub use context::{JoinEvalContext, SingleTableContext};
 
@@ -230,34 +230,30 @@ pub fn eval_join_expr(ctx: &JoinEvalContext, expr: &Expr) -> Result<Value> {
     })
 }
 
-pub fn eval_expr(expr: &Expr, row: Option<&Row>, schema: Option<&TableSchema>) -> Result<Value> {
-    stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
-        let ctx = SingleTableContext::new(row, schema);
-        evaluator::eval_expr_impl(&ctx, expr)
-    })
-}
-
-pub fn eval_expr_with_query_ctx(
+pub fn eval_expr(
     expr: &Expr,
     row: Option<&Row>,
     schema: Option<&TableSchema>,
-    query_ctx: Option<&super::query_context::QueryContext>,
+    query_ctx: &super::query_context::QueryContext,
 ) -> Result<Value> {
     stacker::maybe_grow(32 * 1024, 1024 * 1024, || {
-        if let Some(qc) = query_ctx {
-            let ctx = SingleTableContext::with_query_ctx(row, schema, qc);
-            evaluator::eval_expr_impl(&ctx, expr)
-        } else {
-            let ctx = SingleTableContext::new(row, schema);
-            evaluator::eval_expr_impl(&ctx, expr)
-        }
+        let ctx = SingleTableContext::with_query_ctx(row, schema, query_ctx);
+        evaluator::eval_expr_impl(&ctx, expr)
     })
 }
 
 #[inline(never)]
 fn parse_interval_from_expr(s: &str, interval: &sqlparser::ast::Interval) -> Result<Value> {
     if let Some(field) = &interval.leading_field {
-        let num: i64 = s.trim().parse().unwrap_or(0);
+        let num: i64 = s.trim().parse().map_err(|_| {
+            anyhow::anyhow!(
+                "{}",
+                SqlError::InvalidInputSyntax {
+                    type_name: "integer".into(),
+                    value: s.trim().to_string(),
+                }
+            )
+        })?;
         return interval_from_field(num, field);
     }
     parse_interval_string(s)
@@ -498,35 +494,7 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
     }
 
     match func_name_upper.as_str() {
-        "NULLIF" => {
-            if args.len() >= 2 && compare_values(&args[0], &args[1]).unwrap_or(1) == 0 {
-                Ok(Value::Null)
-            } else {
-                Ok(args.into_iter().next().unwrap_or(Value::Null))
-            }
-        }
-        "GREATEST" => {
-            let mut max = Value::Null;
-            for val in args {
-                if matches!(max, Value::Null) {
-                    max = val;
-                } else if compare_values(&val, &max).unwrap_or(0) > 0 {
-                    max = val;
-                }
-            }
-            Ok(max)
-        }
-        "LEAST" => {
-            let mut min = Value::Null;
-            for val in args {
-                if matches!(min, Value::Null) {
-                    min = val;
-                } else if compare_values(&val, &min).unwrap_or(0) < 0 {
-                    min = val;
-                }
-            }
-            Ok(min)
-        }
+        // NULLIF, GREATEST, LEAST are handled by the registry (functions/misc.rs)
         // String functions UPPER, LOWER, LENGTH, CHAR_LENGTH, CHARACTER_LENGTH, OCTET_LENGTH, BIT_LENGTH
         // are handled by the registry (functions/string.rs)
         "GET_BIT" => eval_get_bit_from_args(args),
@@ -612,10 +580,26 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                 if !digits.is_empty() {
                     if matches!(chars.peek(), Some('$')) {
                         chars.next();
-                        let pos = digits.parse::<usize>().unwrap_or(1);
+                        let pos = digits.parse::<usize>().map_err(|_| {
+                            anyhow!(
+                                "{}",
+                                SqlError::InvalidInputSyntax {
+                                    type_name: "integer".into(),
+                                    value: digits.clone(),
+                                }
+                            )
+                        })?;
                         arg_pos = Some(pos.saturating_sub(1));
                     } else {
-                        width = Some(digits.parse::<usize>().unwrap_or(0));
+                        width = Some(digits.parse::<usize>().map_err(|_| {
+                            anyhow!(
+                                "{}",
+                                SqlError::InvalidInputSyntax {
+                                    type_name: "integer".into(),
+                                    value: digits.clone(),
+                                }
+                            )
+                        })?);
                     }
                 }
 
@@ -636,7 +620,15 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                         }
                     }
                     if !width_digits.is_empty() {
-                        width = Some(width_digits.parse::<usize>().unwrap_or(0));
+                        width = Some(width_digits.parse::<usize>().map_err(|_| {
+                            anyhow!(
+                                "{}",
+                                SqlError::InvalidInputSyntax {
+                                    type_name: "integer".into(),
+                                    value: width_digits.clone(),
+                                }
+                            )
+                        })?);
                     }
                 }
 
@@ -722,26 +714,19 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                 // STATEMENT_TIMESTAMP() is the only function scoped to the
                 // current statement — it changes between statements inside a
                 // BEGIN/COMMIT block.
-                ctx.query_context()
-                    .map(|qc| qc.statement_timestamp_ms)
-                    .unwrap_or_else(super::statement_time::statement_timestamp_millis_or_now)
+                ctx.query_context().statement_timestamp_ms
             } else {
                 // NOW, CURRENT_TIMESTAMP, TRANSACTION_TIMESTAMP — all return
                 // the transaction start time per PostgreSQL semantics.  For
                 // implicit (autocommit) transactions this equals statement time.
-                ctx.query_context()
-                    .map(|qc| qc.transaction_timestamp_ms)
-                    .unwrap_or_else(super::statement_time::transaction_timestamp_millis_or_now)
+                ctx.query_context().transaction_timestamp_ms
             };
             let ts = crate::types::timestamp::truncate_timestamp_millis(ts, precision);
             Ok(Value::Timestamp(ts))
         }
         "CURRENT_DATE" => {
             // CURRENT_DATE uses transaction time per PostgreSQL semantics.
-            let ts = ctx
-                .query_context()
-                .map(|qc| qc.transaction_timestamp_ms)
-                .unwrap_or_else(super::statement_time::transaction_timestamp_millis_or_now);
+            let ts = ctx.query_context().transaction_timestamp_ms;
             let days = crate::types::date::timestamp_millis_to_date_days(ts)?;
             Ok(Value::Date(days))
         }
@@ -779,10 +764,7 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                 Some(Value::Date(days)) => crate::types::date::date_days_to_timestamp_millis(days)?,
                 // AGE(ts) subtracts from "current date", which is
                 // transaction-scoped per PostgreSQL semantics.
-                _ => ctx
-                    .query_context()
-                    .map(|qc| qc.transaction_timestamp_ms)
-                    .unwrap_or_else(super::statement_time::transaction_timestamp_millis_or_now),
+                _ => ctx.query_context().transaction_timestamp_ms,
             };
 
             let dt1 = Utc
@@ -835,17 +817,10 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
         "SET_CONFIG" => Ok(Value::Text(String::new())),
         // PG_IS_IN_RECOVERY, PG_ENCODING_TO_CHAR, HAS_SCHEMA_PRIVILEGE, HAS_TABLE_PRIVILEGE,
         // HAS_DATABASE_PRIVILEGE are handled by the registry (functions/pg_compat.rs)
-        "PG_BACKEND_PID" => Ok(Value::Int32(
-            ctx.query_context()
-                .map(|qc| qc.connection_id)
-                .unwrap_or_else(get_connection_id),
-        )),
+        "PG_BACKEND_PID" => Ok(Value::Int32(ctx.query_context().connection_id)),
         "VERSION" => Ok(Value::Text(VERSION_STRING.to_string())),
         "CURRENT_DATABASE" => Ok(Value::Text(
-            ctx.query_context()
-                .map(|qc| qc.database_name.as_ref().to_string())
-                .or_else(|| current_database_name().map(|n| n.as_ref().to_string()))
-                .unwrap_or_else(|| "postgres".to_string()),
+            ctx.query_context().database_name.as_ref().to_string(),
         )),
         "CURRENT_SCHEMA" => Ok(Value::Text("public".to_string())),
         "CURRENT_USER" | "SESSION_USER" | "USER" => Ok(Value::Text("postgres".to_string())),
@@ -878,7 +853,15 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
             let oid = match iter.next().unwrap_or(Value::Null) {
                 Value::Int32(n) => n as i64,
                 Value::Int64(n) => n,
-                Value::Text(s) => s.trim().parse::<i64>().unwrap_or(0),
+                Value::Text(s) => s.trim().parse::<i64>().map_err(|_| {
+                    anyhow!(
+                        "{}",
+                        SqlError::InvalidInputSyntax {
+                            type_name: "oid".into(),
+                            value: s.trim().to_string(),
+                        }
+                    )
+                })?,
                 Value::Null => return Ok(Value::Null),
                 _ => 0,
             };
@@ -1076,33 +1059,6 @@ fn similar_to_match(s: &str, pattern: &str, escape_char: Option<char>) -> Result
     Ok(re.is_match(s))
 }
 
-fn round_half_away_from_zero(n: f64) -> f64 {
-    if n >= 0.0 {
-        (n + 0.5).floor()
-    } else {
-        (n - 0.5).ceil()
-    }
-}
-
-fn cast_to_bytea(v: Value) -> Result<Value> {
-    match v {
-        Value::Null => Ok(Value::Null),
-        Value::Bytes(_) => Ok(v),
-        Value::Text(s) => {
-            if let Some(rest) = s.strip_prefix("\\x") {
-                let bytes = hex::decode(rest).map_err(|e| SqlError::InvalidInputSyntax {
-                    type_name: "bytea".into(),
-                    value: e.to_string(),
-                })?;
-                Ok(Value::Bytes(bytes))
-            } else {
-                Ok(Value::Bytes(s.into_bytes()))
-            }
-        }
-        other => Ok(Value::Bytes(other.to_string().into_bytes())),
-    }
-}
-
 fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value> {
     use sqlparser::ast::DataType as SqlType;
 
@@ -1176,159 +1132,8 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
     // --- Phase 2: normalise the SqlType to internal DataType via the single
     //     source of truth in mapping.rs, then dispatch on (Value, DataType). ---
 
-    let target = crate::sql::types::try_sql_datatype_to_internal(data_type)?;
-    cast_value_to_type(val, &target)
-}
-
-/// Cast a value to an internal DataType (normalised from SqlType).
-fn cast_value_to_type(val: Value, target: &DataType) -> Result<Value> {
-    match (val, target) {
-        // --- To Boolean ---
-        (Value::Text(s), DataType::Boolean) => match s.trim().to_lowercase().as_str() {
-            "true" | "t" | "yes" | "y" | "1" => Ok(Value::Boolean(true)),
-            "false" | "f" | "no" | "n" | "0" => Ok(Value::Boolean(false)),
-            _ => Err(SqlError::InvalidInputSyntax {
-                type_name: "boolean".into(),
-                value: s.clone(),
-            }
-            .into()),
-        },
-        (Value::Int32(n), DataType::Boolean) => Ok(Value::Boolean(n != 0)),
-        (Value::Int64(n), DataType::Boolean) => Ok(Value::Boolean(n != 0)),
-        (Value::Float64(n), DataType::Boolean) => Ok(Value::Boolean(n != 0.0)),
-        (Value::Numeric(d), DataType::Boolean) => Ok(Value::Boolean(!d.is_zero())),
-
-        // --- To Int32 ---
-        (Value::Text(s), DataType::Int32) => {
-            s.trim().parse::<i32>().map(Value::Int32).map_err(|_| {
-                SqlError::InvalidInputSyntax {
-                    type_name: "integer".into(),
-                    value: s.clone(),
-                }
-                .into()
-            })
-        }
-        (Value::Int64(n), DataType::Int32) => i32::try_from(n)
-            .map(Value::Int32)
-            .map_err(|_| anyhow!("integer out of range")),
-        (Value::Float64(n), DataType::Int32) => {
-            let rounded = round_half_away_from_zero(n);
-            if n.is_nan() || rounded < (i32::MIN as f64) || rounded > (i32::MAX as f64) {
-                return Err(anyhow!("integer out of range"));
-            }
-            Ok(Value::Int32(rounded as i32))
-        }
-        (Value::Numeric(d), DataType::Int32) => {
-            use rust_decimal::prelude::ToPrimitive;
-            use rust_decimal::RoundingStrategy;
-            d.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
-                .to_i32()
-                .map(Value::Int32)
-                .ok_or_else(|| anyhow!("numeric value out of range for integer"))
-        }
-        (Value::Boolean(b), DataType::Int32) => Ok(Value::Int32(if b { 1 } else { 0 })),
-
-        // --- To Int64 ---
-        (Value::Text(s), DataType::Int64) => {
-            s.trim().parse::<i64>().map(Value::Int64).map_err(|_| {
-                SqlError::InvalidInputSyntax {
-                    type_name: "bigint".into(),
-                    value: s.clone(),
-                }
-                .into()
-            })
-        }
-        (Value::Int32(n), DataType::Int64) => Ok(Value::Int64(n as i64)),
-        (Value::Float64(n), DataType::Int64) => {
-            let rounded = round_half_away_from_zero(n);
-            if n.is_nan() || rounded < (i64::MIN as f64) || rounded > (i64::MAX as f64) {
-                return Err(anyhow!("bigint out of range"));
-            }
-            Ok(Value::Int64(rounded as i64))
-        }
-        (Value::Numeric(d), DataType::Int64) => {
-            use rust_decimal::prelude::ToPrimitive;
-            use rust_decimal::RoundingStrategy;
-            d.round_dp_with_strategy(0, RoundingStrategy::MidpointAwayFromZero)
-                .to_i64()
-                .map(Value::Int64)
-                .ok_or_else(|| anyhow!("numeric value out of range for bigint"))
-        }
-
-        // --- To Float64 ---
-        (Value::Text(s), DataType::Float64) => {
-            s.trim().parse::<f64>().map(Value::Float64).map_err(|_| {
-                SqlError::InvalidInputSyntax {
-                    type_name: "double precision".into(),
-                    value: s.clone(),
-                }
-                .into()
-            })
-        }
-        (Value::Int32(n), DataType::Float64) => Ok(Value::Float64(n as f64)),
-        (Value::Int64(n), DataType::Float64) => Ok(Value::Float64(n as f64)),
-        (Value::Numeric(d), DataType::Float64) => {
-            use rust_decimal::prelude::ToPrimitive;
-            d.to_f64()
-                .map(Value::Float64)
-                .ok_or_else(|| anyhow!("numeric value out of range for double precision"))
-        }
-
-        // --- To Text (all remaining text-like types: Char, Nvarchar, Clob, etc.) ---
-        (v, DataType::Text) => Ok(Value::Text(v.to_string())),
-
-        // --- To Bytes ---
-        (v, DataType::Bytes) => cast_to_bytea(v),
-
-        // --- Temporal ---
-        (Value::Text(s), DataType::Interval) => parse_interval_string(&s),
-        (Value::Text(s), DataType::Date) => {
-            crate::types::date::parse_date_days(&s).map(Value::Date)
-        }
-        (Value::Timestamp(ts), DataType::Date) => {
-            crate::types::date::timestamp_millis_to_date_days(ts).map(Value::Date)
-        }
-        (Value::Date(days), DataType::Date) => Ok(Value::Date(days)),
-        (Value::Text(s), DataType::Timestamp) => parse_timestamp_string(&s),
-        (Value::Date(days), DataType::Timestamp) => {
-            crate::types::date::date_days_to_timestamp_millis(days).map(Value::Timestamp)
-        }
-        (Value::Text(s), DataType::Time) => {
-            use crate::sql::value_coercion::parse_time_string;
-            parse_time_string(&s)
-                .map(Value::Time)
-                .ok_or_else(|| anyhow!("Invalid time format: {}", s))
-        }
-        (Value::Time(micros), DataType::Time) => Ok(Value::Time(micros)),
-
-        // --- UUID ---
-        (Value::Text(s), DataType::Uuid) => {
-            let uuid =
-                uuid::Uuid::parse_str(s.trim()).map_err(|e| anyhow!("Invalid UUID: {}", e))?;
-            Ok(Value::Uuid(*uuid.as_bytes()))
-        }
-        (Value::Uuid(bytes), DataType::Uuid) => Ok(Value::Uuid(bytes)),
-
-        // --- JSON (via SqlType::JSON, not Custom) ---
-        (v, DataType::Json) => {
-            let s = match &v {
-                Value::Text(s) => s.clone(),
-                Value::Json(s) => s.clone(),
-                Value::Jsonb(s) => s.clone(),
-                other => other.to_string(),
-            };
-            serde_json::from_str::<serde_json::Value>(&s).map_err(|e| {
-                SqlError::InvalidInputSyntax {
-                    type_name: "json".into(),
-                    value: e.to_string(),
-                }
-            })?;
-            Ok(Value::Json(s))
-        }
-
-        // --- Identity / pass-through for same-type casts ---
-        (v, _) => Ok(v),
-    }
+    let target = crate::sql::types::sql_datatype_to_internal_strict(data_type)?;
+    crate::sql::types::cast::cast(val, &target, crate::sql::types::CastContext::Explicit)
 }
 
 /// Cast to NUMERIC with precision/scale from the raw SqlType.
@@ -1379,7 +1184,7 @@ fn cast_to_numeric(val: Value, info: &sqlparser::ast::ExactNumberInfo) -> Result
         }
         other => {
             return Err(SqlError::InvalidCast {
-                from: other.data_type().unwrap_or(DataType::Text),
+                from: other.type_display_name(),
                 to: DataType::Numeric {
                     precision: None,
                     scale: None,
@@ -1414,7 +1219,7 @@ fn cast_custom_type(val: Value, name: &sqlparser::ast::ObjectName) -> Result<Val
                 })?;
                 Ok(Value::Json(s))
             }
-            "BYTEA" => cast_to_bytea(val),
+            "BYTEA" => crate::sql::types::cast::cast_to_bytea(val),
             "JSONB" => {
                 let s = match &val {
                     Value::Text(s) => s.clone(),
@@ -1433,7 +1238,7 @@ fn cast_custom_type(val: Value, name: &sqlparser::ast::ObjectName) -> Result<Val
                 Value::Text(s) => parse_vector_literal(s).map(Value::Vector),
                 Value::Vector(_) => Ok(val),
                 _ => Err(SqlError::InvalidCast {
-                    from: val.data_type().unwrap_or(DataType::Text),
+                    from: val.type_display_name(),
                     to: DataType::Vector(0),
                 }
                 .into()),
@@ -1454,7 +1259,7 @@ fn cast_custom_type(val: Value, name: &sqlparser::ast::ObjectName) -> Result<Val
     }
 }
 
-pub(super) fn parse_interval_string(s: &str) -> Result<Value> {
+pub(crate) fn parse_interval_string(s: &str) -> Result<Value> {
     use crate::types::IntervalValue;
     let s = s.trim().to_lowercase();
     let mut total_months: i32 = 0;
@@ -1489,7 +1294,7 @@ pub(super) fn parse_interval_string(s: &str) -> Result<Value> {
     Ok(Value::Interval(IntervalValue::new(total_months, total_ms)))
 }
 
-pub(super) fn parse_timestamp_string(s: &str) -> Result<Value> {
+pub(crate) fn parse_timestamp_string(s: &str) -> Result<Value> {
     let trimmed = s.trim();
 
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(trimmed) {
@@ -1886,7 +1691,7 @@ pub fn compare_order_by_values(
     right: &Value,
     asc: bool,
     nulls_first: bool,
-) -> std::cmp::Ordering {
+) -> anyhow::Result<std::cmp::Ordering> {
     operators::compare_order_by_values(left, right, asc, nulls_first)
 }
 
@@ -1908,10 +1713,14 @@ pub(super) fn eval_json_access(
                     return Err(anyhow!("@> on arrays requires array operand on right"));
                 };
                 for r in right_arr {
-                    if !left_arr
-                        .iter()
-                        .any(|l| compare_values(l, r).unwrap_or(1) == 0)
-                    {
+                    let mut found = false;
+                    for l in left_arr.iter() {
+                        if compare_values(l, r)? == 0 {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
                         return Ok(Value::Boolean(false));
                     }
                 }
@@ -1922,10 +1731,14 @@ pub(super) fn eval_json_access(
                     return Err(anyhow!("<@ on arrays requires array operand on right"));
                 };
                 for l in left_arr {
-                    if !right_arr
-                        .iter()
-                        .any(|r| compare_values(l, r).unwrap_or(1) == 0)
-                    {
+                    let mut found = false;
+                    for r in right_arr.iter() {
+                        if compare_values(l, r)? == 0 {
+                            found = true;
+                            break;
+                        }
+                    }
+                    if !found {
                         return Ok(Value::Boolean(false));
                     }
                 }

@@ -100,10 +100,15 @@ impl DistinctOnOperator {
         }
     }
 
-    fn compute_key(&self, row: &Row, schema: &TableSchema) -> Result<Vec<u8>> {
+    fn compute_key(
+        &self,
+        row: &Row,
+        schema: &TableSchema,
+        query_ctx: &crate::sql::query_context::QueryContext,
+    ) -> Result<Vec<u8>> {
         let mut key_values = Vec::new();
         for expr in &self.on_exprs {
-            key_values.push(eval_expr(expr, Some(row), Some(schema))?);
+            key_values.push(eval_expr(expr, Some(row), Some(schema), query_ctx)?);
         }
         serialize_values_for_key(&key_values)
     }
@@ -129,7 +134,7 @@ impl PhysicalOperator for DistinctOnOperator {
 
         let schema = self.child.schema().clone();
         while let Some(row) = self.child.next(ctx).await? {
-            let key = self.compute_key(&row, &schema)?;
+            let key = self.compute_key(&row, &schema, ctx.query_ctx)?;
             if self.seen.insert(key) {
                 return Ok(Some(row));
             }

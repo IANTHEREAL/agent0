@@ -38,7 +38,7 @@ pub enum SqlError {
     InvalidInputSyntax { type_name: String, value: String },
 
     #[error("cannot cast type {from} to {to}")]
-    InvalidCast { from: DataType, to: DataType },
+    InvalidCast { from: String, to: DataType },
 
     // Constraint violations
     #[error("{message}")]
@@ -57,6 +57,9 @@ pub enum SqlError {
         constraint: String,
         detail: String,
     },
+
+    #[error("numeric value out of range{}", if .detail.is_empty() { String::new() } else { format!(": {}", .detail) })]
+    NumericValueOutOfRange { detail: String },
 
     // Runtime errors
     #[error("Division by zero")]
@@ -101,6 +104,7 @@ impl SqlError {
             Self::UniqueViolation { .. } => "23505",
             Self::NotNullViolation { .. } => "23502",
             Self::CheckViolation { .. } => "23514",
+            Self::NumericValueOutOfRange { .. } => "22003",
             Self::DivisionByZero => "22012",
             Self::StatementTimeout => "57014",
             Self::LockNotAvailable { .. } => "55P03",
@@ -152,7 +156,7 @@ mod tests {
         );
         assert_eq!(
             SqlError::InvalidCast {
-                from: DataType::Text,
+                from: "text".to_string(),
                 to: DataType::Int32
             }
             .sqlstate(),

@@ -261,6 +261,12 @@ pub enum Value {
 }
 
 impl Value {
+    pub fn type_display_name(&self) -> String {
+        self.data_type()
+            .map(|dt| dt.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
     pub fn data_type(&self) -> Option<DataType> {
         match self {
             Value::Null => None,
@@ -276,6 +282,7 @@ impl Value {
             Value::Array(elems) => {
                 let elem_type = elems.first().and_then(|v| v.data_type());
                 Some(DataType::Array(Box::new(
+                    // INTENTIONAL: empty array defaults element type to Text (PG-compatible)
                     elem_type.unwrap_or(DataType::Text),
                 )))
             }
@@ -596,6 +603,19 @@ impl Row {
     }
 }
 
+/// Infer column types by scanning all rows, returning the first non-NULL type per column.
+/// Falls back to Text for columns that are NULL in all rows (PostgreSQL-compatible).
+pub fn infer_column_types_from_rows(rows: &[Row], col_count: usize) -> Vec<DataType> {
+    (0..col_count)
+        .map(|col_idx| {
+            rows.iter()
+                .find_map(|row| row.values.get(col_idx).and_then(|v| v.data_type()))
+                // INTENTIONAL: all-NULL column defaults to Text (PostgreSQL-compatible)
+                .unwrap_or(DataType::Text)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum UserTypeKind {
     Enum { labels: Vec<String> },
@@ -679,14 +699,31 @@ pub struct TriggerDef {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViewDef {
-    #[serde(default)]
     pub oid: u32,
     pub schema: String,
     pub name: String,
     pub query: String,
+    /// Fully-qualified names of relations this view depends on.
+    /// Resolved at CREATE time using the active search_path.
+    pub deps: Vec<String>,
 }
 
 impl ViewDef {
+    pub fn full_name(&self) -> String {
+        format!("{}.{}", self.schema, self.name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatViewDef {
+    pub schema: String,
+    pub name: String,
+    pub query: String,
+    /// Fully-qualified names of relations this materialized view depends on.
+    pub deps: Vec<String>,
+}
+
+impl MatViewDef {
     pub fn full_name(&self) -> String {
         format!("{}.{}", self.schema, self.name)
     }

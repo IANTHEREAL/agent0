@@ -8,7 +8,9 @@ use sqlparser::ast::{
 };
 use tikv_client::Transaction;
 
-use super::super::expr::{coerce_text_literal_to_bool, compare_values, eval_expr};
+use super::super::expr::operators::sort_by_fallible;
+use super::super::expr::{compare_values, eval_expr};
+use super::super::names::function_name_upper;
 use super::super::operators::{
     execute_operator_tree, execute_operator_tree_with_ctes, AggregateExpr, BoxedOperator,
     DistinctOnOperator, DistinctOperator, FilterOperator, HashAggregateOperator, HashJoinConfig,
@@ -22,6 +24,7 @@ use super::super::sequences;
 use super::super::ExecuteResult;
 use super::core::Executor;
 use super::subquery::expr_contains_subquery;
+use crate::sql::query_context::QueryContext;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use sqlparser::ast::Ident;
 
@@ -526,6 +529,7 @@ pub(crate) fn eval_having_expr_for_operators(
     agg_exprs: &[AggregateExpr],
     group_by_count: usize,
 ) -> Result<Value> {
+    let qc = QueryContext::from_task_locals();
     match expr {
         Expr::BinaryOp { left, op, right } => {
             let left_val =
@@ -559,12 +563,7 @@ pub(crate) fn eval_having_expr_for_operators(
             eval_having_expr_for_operators(inner, row, schema, agg_exprs, group_by_count)
         }
         Expr::Function(f) => {
-            let func_name = f
-                .name
-                .0
-                .last()
-                .map(|i| i.value.to_uppercase())
-                .unwrap_or_default();
+            let func_name = function_name_upper(f);
 
             if matches!(
                 func_name.as_str(),
@@ -583,7 +582,7 @@ pub(crate) fn eval_having_expr_for_operators(
                     func_name
                 ));
             }
-            eval_expr(expr, Some(row), Some(schema))
+            eval_expr(expr, Some(row), Some(schema), &qc)
         }
         Expr::Identifier(id) => {
             if let Some(col_idx) = schema.columns.iter().position(|c| c.name == id.value) {
@@ -595,7 +594,7 @@ pub(crate) fn eval_having_expr_for_operators(
                 Err(anyhow!("Column {} not found", id.value))
             }
         }
-        Expr::Value(_) | Expr::TypedString { .. } => eval_expr(expr, Some(row), Some(schema)),
+        Expr::Value(_) | Expr::TypedString { .. } => eval_expr(expr, Some(row), Some(schema), &qc),
         Expr::Cast {
             expr: inner,
             data_type,
@@ -608,19 +607,14 @@ pub(crate) fn eval_having_expr_for_operators(
                 data_type: data_type.clone(),
                 format: format.clone(),
             };
-            eval_expr(&cast_expr, Some(row), Some(schema))
+            eval_expr(&cast_expr, Some(row), Some(schema), &qc)
         }
-        _ => eval_expr(expr, Some(row), Some(schema)),
+        _ => eval_expr(expr, Some(row), Some(schema), &qc),
     }
 }
 
 pub(crate) fn find_matching_aggregate(f: &Function, agg_exprs: &[AggregateExpr]) -> Option<usize> {
-    let func_name = f
-        .name
-        .0
-        .last()
-        .map(|i| i.value.to_uppercase())
-        .unwrap_or_default();
+    let func_name = function_name_upper(f);
 
     let f_arg = f.args.first().and_then(|arg| match arg {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
@@ -655,8 +649,9 @@ pub(crate) fn find_matching_aggregate(f: &Function, agg_exprs: &[AggregateExpr])
 }
 
 pub fn extract_limit(query: &Query) -> Option<usize> {
+    let qc = QueryContext::from_task_locals();
     if let Some(limit_expr) = &query.limit {
-        if let Ok(v) = eval_expr(limit_expr, None, None) {
+        if let Ok(v) = eval_expr(limit_expr, None, None, &qc) {
             return match v {
                 Value::Int64(n) if n >= 0 => Some(n as usize),
                 Value::Int32(n) if n >= 0 => Some(n as usize),
@@ -672,7 +667,7 @@ pub fn extract_limit(query: &Query) -> Option<usize> {
     }
     if let Some(fetch) = &query.fetch {
         if let Some(quantity) = &fetch.quantity {
-            if let Ok(v) = eval_expr(quantity, None, None) {
+            if let Ok(v) = eval_expr(quantity, None, None, &qc) {
                 return match v {
                     Value::Int64(n) if n >= 0 => Some(n as usize),
                     Value::Int32(n) if n >= 0 => Some(n as usize),
@@ -693,8 +688,9 @@ pub fn extract_limit(query: &Query) -> Option<usize> {
 }
 
 pub fn extract_offset(query: &Query) -> usize {
+    let qc = QueryContext::from_task_locals();
     if let Some(offset) = &query.offset {
-        if let Ok(v) = eval_expr(&offset.value, None, None) {
+        if let Ok(v) = eval_expr(&offset.value, None, None, &qc) {
             return match v {
                 Value::Int64(n) if n >= 0 => n as usize,
                 Value::Int32(n) if n >= 0 => n as usize,
@@ -726,12 +722,7 @@ static AGGREGATE_FUNC_NAMES: &[&str] = &[
 ];
 
 pub(crate) fn is_aggregate_func(f: &Function) -> bool {
-    let name = f
-        .name
-        .0
-        .last()
-        .map(|n| n.value.to_uppercase())
-        .unwrap_or_default();
+    let name = function_name_upper(f);
     AGGREGATE_FUNC_NAMES.contains(&name.as_str())
 }
 
@@ -846,12 +837,7 @@ fn collect_nested_aggregates_inner<'a>(expr: &'a Expr, out: &mut Vec<NestedAggre
 }
 
 pub(crate) fn agg_func_signature(f: &Function) -> String {
-    let name = f
-        .name
-        .0
-        .last()
-        .map(|n| n.value.to_uppercase())
-        .unwrap_or_default();
+    let name = function_name_upper(f);
     let distinct_prefix = if f.distinct { "DISTINCT " } else { "" };
     let args_str: Vec<String> = f
         .args
@@ -1034,9 +1020,9 @@ impl Executor {
         group_by_names: &mut Vec<String>,
         group_by_types: &mut Vec<DataType>,
         schema: &TableSchema,
-    ) {
+    ) -> Result<()> {
         if group_by_exprs.is_empty() {
-            return;
+            return Ok(());
         }
 
         let mut group_by_set: std::collections::HashSet<String> = group_by_exprs
@@ -1099,9 +1085,10 @@ impl Executor {
                 Expr::Identifier(ident) => ident.value.clone(),
                 _ => def_name.clone(),
             });
-            group_by_types.push(infer_expr_type(&def_expr, schema));
+            group_by_types.push(infer_expr_type(&def_expr, schema)?);
             group_by_exprs.push(def_expr);
         }
+        Ok(())
     }
 
     fn validate_projection_columns(expr: &Expr, schema: &TableSchema) -> Result<()> {
@@ -1217,7 +1204,7 @@ impl Executor {
         // Use try_infer so column-not-found / type errors surface correctly
         // instead of being masked behind a Text default.
         let try_infer = |a: &Expr| -> Result<DataType> {
-            crate::sql::types::try_infer_expr_type(a, schema).map_err(|e| SqlError::from(e).into())
+            crate::sql::types::infer_expr_type(a, schema).map_err(|e| SqlError::from(e).into())
         };
 
         match func_name {
@@ -1332,12 +1319,7 @@ impl Executor {
         agg_types: &mut Vec<DataType>,
         seen_sigs: &mut std::collections::HashSet<String>,
     ) -> Result<()> {
-        let func_name = f
-            .name
-            .0
-            .last()
-            .map(|n| n.value.to_uppercase())
-            .unwrap_or_default();
+        let func_name = function_name_upper(f);
 
         let sig = agg_func_signature(f);
         if seen_sigs.contains(&sig) {
@@ -1428,7 +1410,7 @@ impl Executor {
                     agg_types.push(DataType::Array(Box::new(infer_expr_type(
                         arr.expr.as_ref(),
                         schema,
-                    ))));
+                    )?)));
                 }
                 continue;
             }
@@ -1464,7 +1446,7 @@ impl Executor {
                             agg_types.push(DataType::Array(Box::new(infer_expr_type(
                                 arr.expr.as_ref(),
                                 schema,
-                            ))));
+                            )?)));
                         }
                     }
                 }
@@ -1477,7 +1459,7 @@ impl Executor {
     pub(crate) fn extract_group_by_info(
         group_by: &GroupByExpr,
         schema: &TableSchema,
-    ) -> (Vec<Expr>, Vec<String>, Vec<DataType>) {
+    ) -> Result<(Vec<Expr>, Vec<String>, Vec<DataType>)> {
         let exprs = match group_by {
             GroupByExpr::Expressions(exprs) => exprs.clone(),
             GroupByExpr::All => Vec::new(),
@@ -1498,12 +1480,12 @@ impl Executor {
                     .unwrap_or_else(|| format!("{}", expr)),
                 _ => format!("{}", expr),
             };
-            let data_type = infer_expr_type(expr, schema);
+            let data_type = infer_expr_type(expr, schema)?;
             names.push(name);
             types.push(data_type);
         }
 
-        (exprs, names, types)
+        Ok((exprs, names, types))
     }
 
     pub(crate) async fn execute_aggregate_with_operators(
@@ -1523,8 +1505,9 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
         preloaded_source: Option<BoxedOperator>,
     ) -> Result<ExecuteResult> {
+        let qc = QueryContext::from_task_locals();
         let (mut group_by_exprs, mut group_by_names, mut group_by_types) =
-            Self::extract_group_by_info(group_by, &schema);
+            Self::extract_group_by_info(group_by, &schema)?;
         let (mut agg_exprs, mut agg_names, mut agg_types) =
             Self::extract_aggregate_info(projection, &schema)?;
 
@@ -1534,7 +1517,7 @@ impl Executor {
             &mut group_by_names,
             &mut group_by_types,
             &schema,
-        );
+        )?;
 
         if let Some(having_expr) = having {
             let mut seen_sigs: std::collections::HashSet<String> = agg_exprs
@@ -1597,7 +1580,7 @@ impl Executor {
                             agg_types.push(DataType::Array(Box::new(infer_expr_type(
                                 arr.expr.as_ref(),
                                 &schema,
-                            ))));
+                            )?)));
                         }
                     }
                 }
@@ -1713,7 +1696,7 @@ impl Executor {
                     &agg_exprs,
                     group_by_count,
                 )?;
-                let having_val = coerce_text_literal_to_bool(having_expr, having_val)?;
+                let having_val = crate::sql::types::cast::coerce_to_bool(having_val)?;
                 match having_val {
                     Value::Boolean(true) => filtered_rows.push(row),
                     Value::Boolean(false) | Value::Null => {}
@@ -1815,12 +1798,12 @@ impl Executor {
                     let expr_str = format!("{}", expr).to_lowercase();
                     if let Some(gb_col) = group_by_expr_map.get(&expr_str) {
                         let rewritten = Expr::Identifier(Ident::new(gb_col.clone()));
-                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema));
+                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema)?);
                         projection_exprs.push(rewritten);
                     } else {
                         let rewritten =
                             rewrite_agg_refs_to_columns(expr, &agg_column_map, &group_by_names);
-                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema));
+                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema)?);
                         projection_exprs.push(rewritten);
                     }
                 }
@@ -1856,7 +1839,7 @@ impl Executor {
             for row in &rows {
                 let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
                 for expr in &projection_exprs {
-                    let val = eval_expr(expr, Some(row), Some(&agg_output_schema))?;
+                    let val = eval_expr(expr, Some(row), Some(&agg_output_schema), &qc)?;
                     values.push(val);
                 }
                 projected_rows.push(Row::new(values));
@@ -1864,7 +1847,8 @@ impl Executor {
         }
 
         if !order_by.is_empty() {
-            projected_rows = self.apply_order_by_for_aggregate(projected_rows, order_by, &columns);
+            projected_rows =
+                self.apply_order_by_for_aggregate(projected_rows, order_by, &columns)?;
         }
 
         if offset > 0 {
@@ -1908,6 +1892,7 @@ impl Executor {
         preloaded_rows: Option<Vec<Row>>,
     ) -> Result<ExecuteResult> {
         use super::select::order::expr_matches;
+        let qc = QueryContext::from_task_locals();
 
         // Collect the union of all group-by columns across all grouping sets.
         let all_group_cols: Vec<Expr> = {
@@ -1966,8 +1951,8 @@ impl Executor {
         } else if let Some(filter_expr) = filter {
             let mut out = Vec::new();
             for row in base_rows {
-                let val = eval_expr(filter_expr, Some(&row), Some(&schema))?;
-                let val = coerce_text_literal_to_bool(filter_expr, val)?;
+                let val = eval_expr(filter_expr, Some(&row), Some(&schema), &qc)?;
+                let val = crate::sql::types::cast::coerce_to_bool(val)?;
                 match val {
                     Value::Boolean(true) => out.push(row),
                     Value::Boolean(false) | Value::Null => {}
@@ -1995,7 +1980,7 @@ impl Executor {
                         .unwrap_or_else(|| format!("{}", expr)),
                     _ => format!("{}", expr),
                 };
-                let data_type = infer_expr_type(expr, &schema);
+                let data_type = infer_expr_type(expr, &schema)?;
                 gb_exprs.push(expr.clone());
                 gb_names.push(name);
                 gb_types.push(data_type);
@@ -2064,7 +2049,7 @@ impl Executor {
                         _ => format!("{}", gc_expr),
                     };
                     if !existing_cols.contains(&name.to_lowercase()) {
-                        let dt = infer_expr_type(gc_expr, &schema);
+                        let dt = infer_expr_type(gc_expr, &schema)?;
                         extra_cols.push((name, dt));
                     }
                 }
@@ -2108,7 +2093,7 @@ impl Executor {
                         &agg_exprs,
                         gb_count,
                     )?;
-                    let having_val = coerce_text_literal_to_bool(having_expr, having_val)?;
+                    let having_val = crate::sql::types::cast::coerce_to_bool(having_val)?;
                     match having_val {
                         Value::Boolean(true) => filtered.push(row),
                         Value::Boolean(false) | Value::Null => {}
@@ -2203,6 +2188,7 @@ impl Executor {
                                     &Expr::Identifier(Ident::new(col.name.clone())),
                                     Some(row),
                                     Some(&agg_output_schema),
+                                    &qc,
                                 )?;
                                 values.push(val);
                             }
@@ -2212,12 +2198,7 @@ impl Executor {
 
                     // Handle GROUPING() introspection function
                     if let Expr::Function(func) = col_expr {
-                        let func_name = func
-                            .name
-                            .0
-                            .last()
-                            .map(|i| i.value.to_uppercase())
-                            .unwrap_or_default();
+                        let func_name = function_name_upper(func);
                         if func_name == "GROUPING" && func.args.len() == 1 {
                             let arg_expr = match &func.args[0] {
                                 FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
@@ -2253,7 +2234,7 @@ impl Executor {
                     } else {
                         rewrite_agg_refs_to_columns(col_expr, &agg_column_map, &gb_names)
                     };
-                    let val = eval_expr(&rewritten, Some(row), Some(&agg_output_schema))?;
+                    let val = eval_expr(&rewritten, Some(row), Some(&agg_output_schema), &qc)?;
                     values.push(val);
                 }
 
@@ -2276,7 +2257,7 @@ impl Executor {
                     columns.push(get_select_item_name(item));
                     let dt = match item {
                         SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                            infer_expr_type(expr, &schema)
+                            infer_expr_type(expr, &schema)?
                         }
                         _ => DataType::Text,
                     };
@@ -2288,7 +2269,7 @@ impl Executor {
         // ORDER BY, OFFSET, LIMIT
         if !order_by.is_empty() {
             all_result_rows =
-                self.apply_order_by_for_aggregate(all_result_rows, order_by, &columns);
+                self.apply_order_by_for_aggregate(all_result_rows, order_by, &columns)?;
         }
         if offset > 0 {
             all_result_rows = all_result_rows.into_iter().skip(offset).collect();
@@ -2325,6 +2306,7 @@ impl Executor {
         left_preloaded: Option<Vec<Row>>,
         right_preloaded: Option<Vec<Row>>,
     ) -> Result<ExecuteResult> {
+        let qc = QueryContext::from_task_locals();
         let mut combined_columns: Vec<ColumnDef> = Vec::new();
         for col in &left_schema.columns {
             combined_columns.push(ColumnDef {
@@ -2577,6 +2559,7 @@ impl Executor {
                         }
                     }
                     SelectItem::QualifiedWildcard(obj, _) => {
+                        // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                         let qualifier = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                         let mut matched = false;
                         for (idx, c) in combined_schema.columns.iter().enumerate() {
@@ -2609,7 +2592,7 @@ impl Executor {
                             &right_schema,
                         )?;
                         cols.push(original_name);
-                        types.push(infer_expr_type(&rewritten, &combined_schema));
+                        types.push(infer_expr_type(&rewritten, &combined_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -2621,7 +2604,7 @@ impl Executor {
                             &right_schema,
                         )?;
                         cols.push(alias.value.clone());
-                        types.push(infer_expr_type(&rewritten, &combined_schema));
+                        types.push(infer_expr_type(&rewritten, &combined_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                 }
@@ -2636,7 +2619,7 @@ impl Executor {
                             row.values.get(*idx).cloned().unwrap_or(Value::Null)
                         }
                         ProjectionSource::Expr(expr) => {
-                            eval_expr(expr, Some(&row), Some(&combined_schema))?
+                            eval_expr(expr, Some(&row), Some(&combined_schema), &qc)?
                         }
                     };
                     values.push(val);
@@ -2690,15 +2673,15 @@ impl Executor {
                 .map(|item| get_select_item_name(item))
                 .collect();
 
-            let types: Vec<DataType> = rewritten_projection
-                .iter()
-                .map(|item| match item {
+            let mut types: Vec<DataType> = Vec::with_capacity(rewritten_projection.len());
+            for item in &rewritten_projection {
+                types.push(match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        infer_expr_type(expr, &combined_schema)
+                        infer_expr_type(expr, &combined_schema)?
                     }
                     _ => DataType::Text,
-                })
-                .collect();
+                });
+            }
 
             let mut projected = Vec::with_capacity(rows.len());
             for row in rows {
@@ -2708,7 +2691,7 @@ impl Executor {
                         SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => e,
                         _ => continue,
                     };
-                    let val = eval_expr(expr, Some(&row), Some(&combined_schema))?;
+                    let val = eval_expr(expr, Some(&row), Some(&combined_schema), &qc)?;
                     values.push(val);
                 }
                 projected.push(Row::new(values));
@@ -2740,6 +2723,7 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
         preloaded_source: Option<BoxedOperator>,
     ) -> Result<ExecuteResult> {
+        let qc = QueryContext::from_task_locals();
         let planner = PhysicalPlanner::new(search_path.to_vec());
 
         let is_wildcard_only = projection.iter().all(|item| {
@@ -2767,13 +2751,13 @@ impl Executor {
                 SelectItem::UnnamedExpr(expr) => {
                     Self::validate_projection_columns(expr, &schema)?;
                     columns.push(get_select_item_name(item));
-                    column_types.push(infer_expr_type(expr, &schema));
+                    column_types.push(infer_expr_type(expr, &schema)?);
                     projection_exprs.push(expr.clone());
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     Self::validate_projection_columns(expr, &schema)?;
                     columns.push(alias.value.clone());
-                    column_types.push(infer_expr_type(expr, &schema));
+                    column_types.push(infer_expr_type(expr, &schema)?);
                     projection_exprs.push(expr.clone());
                 }
             }
@@ -2907,6 +2891,7 @@ impl Executor {
                                     .get(&expr_name)
                                     .map(|v| v.as_slice())
                                     .unwrap_or(&[]);
+                                // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                                 if let Some(idx) =
                                     resolve_unique_index(idxs, "expression", &parts.last().map(|p| p.value.as_str()).unwrap_or_default())?
                                 {
@@ -2957,7 +2942,10 @@ impl Executor {
                     .collect()
             };
 
-        let estimated_rows = 1000;
+        let estimated_rows = self
+            .stats_cache()
+            .get_estimate(db_id, schema.table_id)
+            .unwrap_or(1000);
         let mut preloaded_source = preloaded_source;
 
         let is_distinct = matches!(distinct, Some(Distinct::Distinct));
@@ -3197,7 +3185,7 @@ impl Executor {
             for row in raw_rows {
                 let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
                 for expr in &projection_exprs {
-                    values.push(eval_expr(expr, Some(&row), Some(&schema))?);
+                    values.push(eval_expr(expr, Some(&row), Some(&schema), &qc)?);
                 }
                 rows.push(Row::new(values));
             }
@@ -3206,12 +3194,12 @@ impl Executor {
         // Sort using precomputed keys from pre-projection rows.
         let rows = if let (Some(keys), Some(ref ppo)) = (sort_keys, &pre_proj_order) {
             let mut keyed: Vec<(Vec<Value>, Row)> = keys.into_iter().zip(rows).collect();
-            keyed.sort_by(|(ka, _), (kb, _)| {
+            sort_by_fallible(&mut keyed, |(ka, _), (kb, _)| {
                 for (idx, o) in ppo.iter().enumerate() {
                     let asc = o.asc.unwrap_or(true);
                     let va = &ka[idx];
                     let vb = &kb[idx];
-                    let cmp_val = compare_values(va, vb).unwrap_or(0);
+                    let cmp_val = compare_values(va, vb)?;
                     let ord = match cmp_val {
                         x if x < 0 => std::cmp::Ordering::Less,
                         x if x > 0 => std::cmp::Ordering::Greater,
@@ -3219,11 +3207,11 @@ impl Executor {
                     };
                     let ord = if asc { ord } else { ord.reverse() };
                     if ord != std::cmp::Ordering::Equal {
-                        return ord;
+                        return Ok(ord);
                     }
                 }
-                std::cmp::Ordering::Equal
-            });
+                Ok(std::cmp::Ordering::Equal)
+            })?;
             let mut sorted: Vec<Row> = keyed.into_iter().map(|(_, row)| row).collect();
             if offset > 0 {
                 sorted = sorted.into_iter().skip(offset).collect();
@@ -3267,7 +3255,10 @@ impl Executor {
             op
         } else {
             let planner = PhysicalPlanner::new(search_path.to_vec());
-            let estimated_rows = 1000;
+            let estimated_rows = self
+                .stats_cache()
+                .get_estimate(db_id, schema.table_id)
+                .unwrap_or(1000);
             planner.plan_simple_select(
                 db_id,
                 schema.clone(),
@@ -3291,7 +3282,7 @@ impl Executor {
         let projection = &resolved_projection;
 
         let (window_funcs, window_sig_to_column) =
-            Self::extract_window_function_exprs(projection, &schema);
+            Self::extract_window_function_exprs(projection, &schema)?;
 
         let window_operator = Box::new(WindowOperator::new(scan_operator, window_funcs.clone()));
 
@@ -3579,7 +3570,7 @@ impl Executor {
     pub(crate) fn extract_window_function_exprs(
         projection: &[SelectItem],
         schema: &TableSchema,
-    ) -> (Vec<WindowFunctionExpr>, HashMap<String, String>) {
+    ) -> Result<(Vec<WindowFunctionExpr>, HashMap<String, String>)> {
         use sqlparser::ast::WindowType;
 
         fn collect_window_funcs_in_expr(
@@ -3587,7 +3578,7 @@ impl Executor {
             schema: &TableSchema,
             out: &mut Vec<WindowFunctionExpr>,
             sig_to_col: &mut HashMap<String, String>,
-        ) {
+        ) -> Result<()> {
             match expr {
                 Expr::Function(f) if f.over.is_some() => {
                     if let Some(WindowType::WindowSpec(spec)) = &f.over {
@@ -3623,7 +3614,7 @@ impl Executor {
                                     format!("__window_{}_{}", out.len(), collision_suffix);
                             }
                             let output_type =
-                                Executor::infer_window_func_type(&func_name, &arg_expr, schema);
+                                Executor::infer_window_func_type(&func_name, &arg_expr, schema)?;
 
                             let filter_expr = f.filter.as_ref().map(|flt| *flt.clone());
 
@@ -3644,8 +3635,8 @@ impl Executor {
                     }
                 }
                 Expr::BinaryOp { left, right, .. } => {
-                    collect_window_funcs_in_expr(left, schema, out, sig_to_col);
-                    collect_window_funcs_in_expr(right, schema, out, sig_to_col);
+                    collect_window_funcs_in_expr(left, schema, out, sig_to_col)?;
+                    collect_window_funcs_in_expr(right, schema, out, sig_to_col)?;
                 }
                 Expr::UnaryOp { expr: inner, .. }
                 | Expr::Nested(inner)
@@ -3657,7 +3648,7 @@ impl Executor {
                 | Expr::IsFalse(inner)
                 | Expr::IsNotTrue(inner)
                 | Expr::IsNotFalse(inner) => {
-                    collect_window_funcs_in_expr(inner, schema, out, sig_to_col);
+                    collect_window_funcs_in_expr(inner, schema, out, sig_to_col)?;
                 }
                 Expr::Case {
                     operand,
@@ -3666,16 +3657,16 @@ impl Executor {
                     else_result,
                 } => {
                     if let Some(op) = operand.as_ref() {
-                        collect_window_funcs_in_expr(op, schema, out, sig_to_col);
+                        collect_window_funcs_in_expr(op, schema, out, sig_to_col)?;
                     }
                     for cond in conditions {
-                        collect_window_funcs_in_expr(cond, schema, out, sig_to_col);
+                        collect_window_funcs_in_expr(cond, schema, out, sig_to_col)?;
                     }
                     for res in results {
-                        collect_window_funcs_in_expr(res, schema, out, sig_to_col);
+                        collect_window_funcs_in_expr(res, schema, out, sig_to_col)?;
                     }
                     if let Some(el) = else_result.as_ref() {
-                        collect_window_funcs_in_expr(el, schema, out, sig_to_col);
+                        collect_window_funcs_in_expr(el, schema, out, sig_to_col)?;
                     }
                 }
                 Expr::Function(f) => {
@@ -3686,28 +3677,29 @@ impl Executor {
                             ..
                         } = arg
                         {
-                            collect_window_funcs_in_expr(e, schema, out, sig_to_col);
+                            collect_window_funcs_in_expr(e, schema, out, sig_to_col)?;
                         }
                     }
                 }
                 Expr::InList { expr: e, list, .. } => {
-                    collect_window_funcs_in_expr(e, schema, out, sig_to_col);
+                    collect_window_funcs_in_expr(e, schema, out, sig_to_col)?;
                     for item in list {
-                        collect_window_funcs_in_expr(item, schema, out, sig_to_col);
+                        collect_window_funcs_in_expr(item, schema, out, sig_to_col)?;
                     }
                 }
                 Expr::Between {
                     expr, low, high, ..
                 } => {
-                    collect_window_funcs_in_expr(expr, schema, out, sig_to_col);
-                    collect_window_funcs_in_expr(low, schema, out, sig_to_col);
-                    collect_window_funcs_in_expr(high, schema, out, sig_to_col);
+                    collect_window_funcs_in_expr(expr, schema, out, sig_to_col)?;
+                    collect_window_funcs_in_expr(low, schema, out, sig_to_col)?;
+                    collect_window_funcs_in_expr(high, schema, out, sig_to_col)?;
                 }
                 // Ignore nested query scopes; window functions inside subqueries are handled when
                 // executing that query block.
                 Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {}
                 _ => {}
             }
+            Ok(())
         }
 
         let mut result = Vec::new();
@@ -3717,11 +3709,11 @@ impl Executor {
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
                 _ => None,
             } {
-                collect_window_funcs_in_expr(expr, schema, &mut result, &mut sig_to_col);
+                collect_window_funcs_in_expr(expr, schema, &mut result, &mut sig_to_col)?;
             }
         }
 
-        (result, sig_to_col)
+        Ok((result, sig_to_col))
     }
 
     pub(crate) fn rewrite_window_refs(expr: &Expr, sig_to_col: &HashMap<String, String>) -> Expr {
@@ -3862,8 +3854,8 @@ impl Executor {
         func_name: &str,
         arg_expr: &Option<Expr>,
         schema: &TableSchema,
-    ) -> DataType {
-        match func_name {
+    ) -> Result<DataType> {
+        Ok(match func_name {
             "row_number" | "rank" | "dense_rank" | "ntile" | "count" => DataType::Int64,
             "percent_rank" | "cume_dist" => DataType::Float64,
             "sum" | "avg" => DataType::Numeric {
@@ -3872,13 +3864,13 @@ impl Executor {
             },
             "min" | "max" | "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
                 if let Some(expr) = arg_expr {
-                    infer_expr_type(expr, schema)
+                    infer_expr_type(expr, schema)?
                 } else {
                     DataType::Int64
                 }
             }
             _ => DataType::Int64,
-        }
+        })
     }
 
     pub(crate) fn project_window_results(
@@ -3889,6 +3881,7 @@ impl Executor {
         rows: Vec<Row>,
     ) -> Result<(Vec<String>, Vec<DataType>, Vec<Row>)> {
         use crate::types::ColumnDef;
+        let qc = QueryContext::from_task_locals();
 
         let mut window_columns: Vec<ColumnDef> = schema
             .columns
@@ -3957,13 +3950,13 @@ impl Executor {
                     };
                     columns.push(col_name);
                     let rewritten = Self::rewrite_window_refs(expr, window_sig_to_column);
-                    column_types.push(infer_expr_type(&rewritten, &window_schema));
+                    column_types.push(infer_expr_type(&rewritten, &window_schema)?);
                     projection_exprs.push(rewritten);
                 }
                 SelectItem::ExprWithAlias { expr, .. } => {
                     columns.push(get_select_item_name(item));
                     let rewritten = Self::rewrite_window_refs(expr, window_sig_to_column);
-                    column_types.push(infer_expr_type(&rewritten, &window_schema));
+                    column_types.push(infer_expr_type(&rewritten, &window_schema)?);
                     projection_exprs.push(rewritten);
                 }
             }
@@ -3973,7 +3966,7 @@ impl Executor {
         for row in rows {
             let mut values: Vec<Value> = Vec::with_capacity(projection_exprs.len());
             for expr in &projection_exprs {
-                values.push(eval_expr(expr, Some(&row), Some(&window_schema))?);
+                values.push(eval_expr(expr, Some(&row), Some(&window_schema), &qc)?);
             }
             projected_rows.push(Row::new(values));
         }
@@ -4065,7 +4058,8 @@ mod tests {
             &mut group_by_names,
             &mut group_by_types,
             &schema,
-        );
+        )
+        .unwrap();
 
         assert!(group_by_exprs
             .iter()
@@ -4085,7 +4079,8 @@ mod tests {
             &mut group_by_names,
             &mut group_by_types,
             &schema,
-        );
+        )
+        .unwrap();
         assert_eq!(group_by_exprs.len(), original_len);
     }
 

@@ -1,5 +1,6 @@
 //! Index evaluation helpers for partial and expression indexes.
 
+use crate::sql::query_context::QueryContext;
 use crate::types::{DataType, IndexDef, Row, TableSchema, Value};
 use anyhow::Result;
 use sqlparser::ast::Expr;
@@ -17,7 +18,7 @@ pub fn is_index_materializable(index: &IndexDef) -> bool {
 /// Validate that a WHERE predicate expression for a partial index type-checks
 /// and produces a boolean result. PostgreSQL performs this validation at DDL time.
 pub fn validate_index_predicate(predicate: &Expr, schema: &TableSchema) -> Result<()> {
-    match super::types::try_infer_expr_type(predicate, schema) {
+    match super::types::infer_expr_type(predicate, schema) {
         Ok(DataType::Boolean) => Ok(()),
         Ok(actual_type) => Err(anyhow::anyhow!(
             "argument of WHERE must be type boolean, not type {}",
@@ -61,7 +62,8 @@ pub fn eval_index_predicate(index: &IndexDef, schema: &TableSchema, row: &Row) -
         ),
     };
 
-    let value = super::expr::eval_expr(&expr, Some(row), Some(schema))?;
+    let qc = QueryContext::from_task_locals();
+    let value = super::expr::eval_expr(&expr, Some(row), Some(schema), &qc)?;
     match value {
         Value::Boolean(b) => Ok(b),
         Value::Null => Ok(false),
@@ -88,6 +90,7 @@ pub fn get_index_values_with_expressions(
         }
     }
 
+    let qc = QueryContext::from_task_locals();
     for expr_str in &index.expressions {
         let sql = format!("SELECT {}", expr_str);
         if let Ok(stmts) = super::parse_sql(&sql) {
@@ -96,7 +99,7 @@ pub fn get_index_values_with_expressions(
                     if let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) =
                         select.projection.into_iter().next()
                     {
-                        let value = super::expr::eval_expr(&expr, Some(row), Some(schema))?;
+                        let value = super::expr::eval_expr(&expr, Some(row), Some(schema), &qc)?;
                         values.push(value);
                         continue;
                     }
