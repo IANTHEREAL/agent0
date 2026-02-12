@@ -330,6 +330,26 @@ fn register_builtin_functions(r: &mut FunctionRegistry) {
         FunctionSignature::fixed(DataType::Text).with_args(1, Some(2)),
     );
     r.register(
+        "BTRIM",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(2)),
+    );
+    r.register(
+        "OVERLAY",
+        FunctionSignature::fixed(DataType::Text).with_args(3, Some(4)),
+    );
+    r.register(
+        "TIMEZONE",
+        FunctionSignature::custom(|args| {
+            // AT TIME ZONE: result depends on input type
+            match args.get(1) {
+                Some(DataType::TimestampTz) => DataType::Timestamp,
+                Some(DataType::Timestamp) => DataType::TimestampTz,
+                _ => DataType::TimestampTz,
+            }
+        })
+        .with_args(2, Some(2)),
+    );
+    r.register(
         "LTRIM",
         FunctionSignature::fixed(DataType::Text).with_args(1, Some(2)),
     );

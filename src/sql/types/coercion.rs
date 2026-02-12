@@ -151,7 +151,7 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
                 _ => None,
             }
         }
-        "Multiply" | "Divide" | "Modulo" | "*" | "/" | "%" => {
+        "Multiply" | "Divide" | "Modulo" | "PGExp" | "*" | "/" | "%" | "^" => {
             if is_numeric(left) && is_numeric(right) {
                 common_type(left, right)
             } else if matches!(
@@ -187,6 +187,10 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
         | "!~" | "!~*" => Some(DataType::Boolean),
 
         // Array overlap operator
+        // Full-text search match
+        "TsMatch" | "@@" => Some(DataType::Boolean),
+
+        // Array overlap
         "PGOverlap" => Some(DataType::Boolean),
         "&&" if matches!(left, DataType::Array(_)) => Some(DataType::Boolean),
 

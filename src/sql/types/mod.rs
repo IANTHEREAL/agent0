@@ -7,12 +7,12 @@
 //! - Compatibility API: Drop-in replacement for old `infer_expr_type`
 
 pub(crate) mod cast;
-mod coercion;
+pub(crate) mod coercion;
 mod context;
 mod error;
 mod infer;
-mod mapping;
-mod registry;
+pub(crate) mod mapping;
+pub(crate) mod registry;
 
 pub use context::TypeContext;
 pub use error::TypeError;
