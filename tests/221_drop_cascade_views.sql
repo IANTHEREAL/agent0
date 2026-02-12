@@ -261,6 +261,28 @@ SELECT 'NW_VIEW=' || count(*) FROM pg_catalog.pg_views
 
 -- ---------------------------------------------------------------
 -- Test 12: Cross-schema search_path dependency.
--- Issue #653: SKIPPED — requires a dependency catalog (pg_depend)
--- to resolve unqualified names across schemas.  Tracked in #666.
+-- Issue #653: deps are resolved at CREATE time using search_path
+-- and stored in ViewDef.deps, so cross-schema CASCADE works (#667).
 -- ---------------------------------------------------------------
+DROP VIEW IF EXISTS cs_view CASCADE;
+DROP TABLE IF EXISTS other_schema.cs_t CASCADE;
+DROP SCHEMA IF EXISTS other_schema CASCADE;
+
+CREATE SCHEMA other_schema;
+CREATE TABLE other_schema.cs_t (id INT);
+INSERT INTO other_schema.cs_t VALUES (1);
+
+-- Create the view in public schema with search_path that includes
+-- other_schema, so the unqualified `cs_t` resolves to `other_schema.cs_t`.
+SET search_path TO public, other_schema;
+CREATE VIEW cs_view AS SELECT * FROM cs_t;
+SET search_path TO public;
+
+-- The view depends on other_schema.cs_t via stored deps.
+DROP TABLE other_schema.cs_t CASCADE;
+
+SELECT 'CS_VIEW=' || count(*) FROM pg_catalog.pg_views
+  WHERE viewname = 'cs_view';
+
+-- Cleanup.
+DROP SCHEMA other_schema CASCADE;

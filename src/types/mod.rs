@@ -684,14 +684,31 @@ pub struct TriggerDef {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ViewDef {
-    #[serde(default)]
     pub oid: u32,
     pub schema: String,
     pub name: String,
     pub query: String,
+    /// Fully-qualified names of relations this view depends on.
+    /// Resolved at CREATE time using the active search_path.
+    pub deps: Vec<String>,
 }
 
 impl ViewDef {
+    pub fn full_name(&self) -> String {
+        format!("{}.{}", self.schema, self.name)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MatViewDef {
+    pub schema: String,
+    pub name: String,
+    pub query: String,
+    /// Fully-qualified names of relations this materialized view depends on.
+    pub deps: Vec<String>,
+}
+
+impl MatViewDef {
     pub fn full_name(&self) -> String {
         format!("{}.{}", self.schema, self.name)
     }

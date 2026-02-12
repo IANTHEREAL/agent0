@@ -4,7 +4,7 @@ use crate::extensions::InstalledExtension;
 use crate::txn::{txn_delete, txn_put};
 use crate::types::{
     DataType, DatabaseDef, FunctionDef, Row, SequenceBacking, SequenceDef, SequenceState,
-    TableSchema, TriggerDef, UserTypeDef, Value, ViewDef,
+    MatViewDef, TableSchema, TriggerDef, UserTypeDef, Value, ViewDef,
 };
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};

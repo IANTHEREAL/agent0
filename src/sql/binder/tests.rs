@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use super::{dep_matches_target, extract_dependencies, RelationDep};
+use super::{extract_dependencies, RelationDep};
 
 /// Helper: create an Unqualified dep.
 fn u(name: &str) -> RelationDep {
@@ -188,33 +188,3 @@ fn values_clause() {
     );
 }
 
-// ── dep_matches_target tests ───────────────────────────────────────────
-
-#[test]
-fn qualified_match() {
-    assert!(dep_matches_target(&q("public", "t"), "public.t", "public"));
-}
-
-#[test]
-fn qualified_no_match() {
-    assert!(!dep_matches_target(&q("s1", "t"), "public.t", "public"));
-}
-
-#[test]
-fn unqualified_same_schema() {
-    assert!(dep_matches_target(&u("t"), "public.t", "public"));
-}
-
-#[test]
-fn unqualified_different_schema() {
-    // Without a dependency catalog, unqualified names only match the
-    // view's own schema (or public).  Cross-schema deps are a known
-    // limitation tracked in #666.
-    assert!(!dep_matches_target(&u("t"), "s1.t", "s2"));
-}
-
-#[test]
-fn unqualified_public_fallback() {
-    // Unqualified names always match public schema targets.
-    assert!(dep_matches_target(&u("t"), "public.t", "s1"));
-}
