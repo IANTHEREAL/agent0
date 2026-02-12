@@ -1188,7 +1188,7 @@ fn cast_value(val: Value, data_type: &sqlparser::ast::DataType) -> Result<Value>
     // --- Phase 2: normalise the SqlType to internal DataType via the single
     //     source of truth in mapping.rs, then dispatch on (Value, DataType). ---
 
-    let target = crate::sql::types::try_sql_datatype_to_internal(data_type)?;
+    let target = crate::sql::types::sql_datatype_to_internal_strict(data_type)?;
     cast_value_to_type(val, &target)
 }
 

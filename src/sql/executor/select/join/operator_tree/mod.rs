@@ -1006,6 +1006,7 @@ impl Executor {
                             .columns
                             .push(crate::types::ColumnDef {
                                 name: computed_col.clone(),
+                                // INTENTIONAL: all-NULL subquery column defaults to Text (PG-compatible)
                                 data_type: inferred_type.unwrap_or(DataType::Text),
                                 nullable: true,
                                 primary_key: false,

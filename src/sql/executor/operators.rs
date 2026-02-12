@@ -1035,9 +1035,9 @@ impl Executor {
         group_by_names: &mut Vec<String>,
         group_by_types: &mut Vec<DataType>,
         schema: &TableSchema,
-    ) {
+    ) -> Result<()> {
         if group_by_exprs.is_empty() {
-            return;
+            return Ok(());
         }
 
         let mut group_by_set: std::collections::HashSet<String> = group_by_exprs
@@ -1100,9 +1100,10 @@ impl Executor {
                 Expr::Identifier(ident) => ident.value.clone(),
                 _ => def_name.clone(),
             });
-            group_by_types.push(infer_expr_type(&def_expr, schema));
+            group_by_types.push(infer_expr_type(&def_expr, schema)?);
             group_by_exprs.push(def_expr);
         }
+        Ok(())
     }
 
     fn validate_projection_columns(expr: &Expr, schema: &TableSchema) -> Result<()> {
@@ -1218,7 +1219,7 @@ impl Executor {
         // Use try_infer so column-not-found / type errors surface correctly
         // instead of being masked behind a Text default.
         let try_infer = |a: &Expr| -> Result<DataType> {
-            crate::sql::types::try_infer_expr_type(a, schema).map_err(|e| SqlError::from(e).into())
+            crate::sql::types::infer_expr_type(a, schema).map_err(|e| SqlError::from(e).into())
         };
 
         match func_name {
@@ -1429,7 +1430,7 @@ impl Executor {
                     agg_types.push(DataType::Array(Box::new(infer_expr_type(
                         arr.expr.as_ref(),
                         schema,
-                    ))));
+                    )?)));
                 }
                 continue;
             }
@@ -1465,7 +1466,7 @@ impl Executor {
                             agg_types.push(DataType::Array(Box::new(infer_expr_type(
                                 arr.expr.as_ref(),
                                 schema,
-                            ))));
+                            )?)));
                         }
                     }
                 }
@@ -1478,7 +1479,7 @@ impl Executor {
     pub(crate) fn extract_group_by_info(
         group_by: &GroupByExpr,
         schema: &TableSchema,
-    ) -> (Vec<Expr>, Vec<String>, Vec<DataType>) {
+    ) -> Result<(Vec<Expr>, Vec<String>, Vec<DataType>)> {
         let exprs = match group_by {
             GroupByExpr::Expressions(exprs) => exprs.clone(),
             GroupByExpr::All => Vec::new(),
@@ -1499,12 +1500,12 @@ impl Executor {
                     .unwrap_or_else(|| format!("{}", expr)),
                 _ => format!("{}", expr),
             };
-            let data_type = infer_expr_type(expr, schema);
+            let data_type = infer_expr_type(expr, schema)?;
             names.push(name);
             types.push(data_type);
         }
 
-        (exprs, names, types)
+        Ok((exprs, names, types))
     }
 
     pub(crate) async fn execute_aggregate_with_operators(
@@ -1525,7 +1526,7 @@ impl Executor {
         preloaded_source: Option<BoxedOperator>,
     ) -> Result<ExecuteResult> {
         let (mut group_by_exprs, mut group_by_names, mut group_by_types) =
-            Self::extract_group_by_info(group_by, &schema);
+            Self::extract_group_by_info(group_by, &schema)?;
         let (mut agg_exprs, mut agg_names, mut agg_types) =
             Self::extract_aggregate_info(projection, &schema)?;
 
@@ -1535,7 +1536,7 @@ impl Executor {
             &mut group_by_names,
             &mut group_by_types,
             &schema,
-        );
+        )?;
 
         if let Some(having_expr) = having {
             let mut seen_sigs: std::collections::HashSet<String> = agg_exprs
@@ -1598,7 +1599,7 @@ impl Executor {
                             agg_types.push(DataType::Array(Box::new(infer_expr_type(
                                 arr.expr.as_ref(),
                                 &schema,
-                            ))));
+                            )?)));
                         }
                     }
                 }
@@ -1816,12 +1817,12 @@ impl Executor {
                     let expr_str = format!("{}", expr).to_lowercase();
                     if let Some(gb_col) = group_by_expr_map.get(&expr_str) {
                         let rewritten = Expr::Identifier(Ident::new(gb_col.clone()));
-                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema));
+                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema)?);
                         projection_exprs.push(rewritten);
                     } else {
                         let rewritten =
                             rewrite_agg_refs_to_columns(expr, &agg_column_map, &group_by_names);
-                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema));
+                        column_types.push(infer_expr_type(&rewritten, &agg_output_schema)?);
                         projection_exprs.push(rewritten);
                     }
                 }
@@ -1997,7 +1998,7 @@ impl Executor {
                         .unwrap_or_else(|| format!("{}", expr)),
                     _ => format!("{}", expr),
                 };
-                let data_type = infer_expr_type(expr, &schema);
+                let data_type = infer_expr_type(expr, &schema)?;
                 gb_exprs.push(expr.clone());
                 gb_names.push(name);
                 gb_types.push(data_type);
@@ -2066,7 +2067,7 @@ impl Executor {
                         _ => format!("{}", gc_expr),
                     };
                     if !existing_cols.contains(&name.to_lowercase()) {
-                        let dt = infer_expr_type(gc_expr, &schema);
+                        let dt = infer_expr_type(gc_expr, &schema)?;
                         extra_cols.push((name, dt));
                     }
                 }
@@ -2278,7 +2279,7 @@ impl Executor {
                     columns.push(get_select_item_name(item));
                     let dt = match item {
                         SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                            infer_expr_type(expr, &schema)
+                            infer_expr_type(expr, &schema)?
                         }
                         _ => DataType::Text,
                     };
@@ -2611,7 +2612,7 @@ impl Executor {
                             &right_schema,
                         )?;
                         cols.push(original_name);
-                        types.push(infer_expr_type(&rewritten, &combined_schema));
+                        types.push(infer_expr_type(&rewritten, &combined_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                     SelectItem::ExprWithAlias { expr, alias } => {
@@ -2623,7 +2624,7 @@ impl Executor {
                             &right_schema,
                         )?;
                         cols.push(alias.value.clone());
-                        types.push(infer_expr_type(&rewritten, &combined_schema));
+                        types.push(infer_expr_type(&rewritten, &combined_schema)?);
                         sources.push(ProjectionSource::Expr(rewritten));
                     }
                 }
@@ -2692,15 +2693,15 @@ impl Executor {
                 .map(|item| get_select_item_name(item))
                 .collect();
 
-            let types: Vec<DataType> = rewritten_projection
-                .iter()
-                .map(|item| match item {
+            let mut types: Vec<DataType> = Vec::with_capacity(rewritten_projection.len());
+            for item in &rewritten_projection {
+                types.push(match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                        infer_expr_type(expr, &combined_schema)
+                        infer_expr_type(expr, &combined_schema)?
                     }
                     _ => DataType::Text,
-                })
-                .collect();
+                });
+            }
 
             let mut projected = Vec::with_capacity(rows.len());
             for row in rows {
@@ -2769,13 +2770,13 @@ impl Executor {
                 SelectItem::UnnamedExpr(expr) => {
                     Self::validate_projection_columns(expr, &schema)?;
                     columns.push(get_select_item_name(item));
-                    column_types.push(infer_expr_type(expr, &schema));
+                    column_types.push(infer_expr_type(expr, &schema)?);
                     projection_exprs.push(expr.clone());
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
                     Self::validate_projection_columns(expr, &schema)?;
                     columns.push(alias.value.clone());
-                    column_types.push(infer_expr_type(expr, &schema));
+                    column_types.push(infer_expr_type(expr, &schema)?);
                     projection_exprs.push(expr.clone());
                 }
             }
@@ -3299,7 +3300,7 @@ impl Executor {
         let projection = &resolved_projection;
 
         let (window_funcs, window_sig_to_column) =
-            Self::extract_window_function_exprs(projection, &schema);
+            Self::extract_window_function_exprs(projection, &schema)?;
 
         let window_operator = Box::new(WindowOperator::new(scan_operator, window_funcs.clone()));
 
@@ -3587,7 +3588,7 @@ impl Executor {
     pub(crate) fn extract_window_function_exprs(
         projection: &[SelectItem],
         schema: &TableSchema,
-    ) -> (Vec<WindowFunctionExpr>, HashMap<String, String>) {
+    ) -> Result<(Vec<WindowFunctionExpr>, HashMap<String, String>)> {
         use sqlparser::ast::WindowType;
 
         fn collect_window_funcs_in_expr(
@@ -3595,7 +3596,7 @@ impl Executor {
             schema: &TableSchema,
             out: &mut Vec<WindowFunctionExpr>,
             sig_to_col: &mut HashMap<String, String>,
-        ) {
+        ) -> Result<()> {
             match expr {
                 Expr::Function(f) if f.over.is_some() => {
                     if let Some(WindowType::WindowSpec(spec)) = &f.over {
@@ -3631,7 +3632,7 @@ impl Executor {
                                     format!("__window_{}_{}", out.len(), collision_suffix);
                             }
                             let output_type =
-                                Executor::infer_window_func_type(&func_name, &arg_expr, schema);
+                                Executor::infer_window_func_type(&func_name, &arg_expr, schema)?;
 
                             let filter_expr = f.filter.as_ref().map(|flt| *flt.clone());
 
@@ -3652,8 +3653,8 @@ impl Executor {
                     }
                 }
                 Expr::BinaryOp { left, right, .. } => {
-                    collect_window_funcs_in_expr(left, schema, out, sig_to_col);
-                    collect_window_funcs_in_expr(right, schema, out, sig_to_col);
+                    collect_window_funcs_in_expr(left, schema, out, sig_to_col)?;
+                    collect_window_funcs_in_expr(right, schema, out, sig_to_col)?;
                 }
                 Expr::UnaryOp { expr: inner, .. }
                 | Expr::Nested(inner)
@@ -3665,7 +3666,7 @@ impl Executor {
                 | Expr::IsFalse(inner)
                 | Expr::IsNotTrue(inner)
                 | Expr::IsNotFalse(inner) => {
-                    collect_window_funcs_in_expr(inner, schema, out, sig_to_col);
+                    collect_window_funcs_in_expr(inner, schema, out, sig_to_col)?;
                 }
                 Expr::Case {
                     operand,
@@ -3674,16 +3675,16 @@ impl Executor {
                     else_result,
                 } => {
                     if let Some(op) = operand.as_ref() {
-                        collect_window_funcs_in_expr(op, schema, out, sig_to_col);
+                        collect_window_funcs_in_expr(op, schema, out, sig_to_col)?;
                     }
                     for cond in conditions {
-                        collect_window_funcs_in_expr(cond, schema, out, sig_to_col);
+                        collect_window_funcs_in_expr(cond, schema, out, sig_to_col)?;
                     }
                     for res in results {
-                        collect_window_funcs_in_expr(res, schema, out, sig_to_col);
+                        collect_window_funcs_in_expr(res, schema, out, sig_to_col)?;
                     }
                     if let Some(el) = else_result.as_ref() {
-                        collect_window_funcs_in_expr(el, schema, out, sig_to_col);
+                        collect_window_funcs_in_expr(el, schema, out, sig_to_col)?;
                     }
                 }
                 Expr::Function(f) => {
@@ -3694,28 +3695,29 @@ impl Executor {
                             ..
                         } = arg
                         {
-                            collect_window_funcs_in_expr(e, schema, out, sig_to_col);
+                            collect_window_funcs_in_expr(e, schema, out, sig_to_col)?;
                         }
                     }
                 }
                 Expr::InList { expr: e, list, .. } => {
-                    collect_window_funcs_in_expr(e, schema, out, sig_to_col);
+                    collect_window_funcs_in_expr(e, schema, out, sig_to_col)?;
                     for item in list {
-                        collect_window_funcs_in_expr(item, schema, out, sig_to_col);
+                        collect_window_funcs_in_expr(item, schema, out, sig_to_col)?;
                     }
                 }
                 Expr::Between {
                     expr, low, high, ..
                 } => {
-                    collect_window_funcs_in_expr(expr, schema, out, sig_to_col);
-                    collect_window_funcs_in_expr(low, schema, out, sig_to_col);
-                    collect_window_funcs_in_expr(high, schema, out, sig_to_col);
+                    collect_window_funcs_in_expr(expr, schema, out, sig_to_col)?;
+                    collect_window_funcs_in_expr(low, schema, out, sig_to_col)?;
+                    collect_window_funcs_in_expr(high, schema, out, sig_to_col)?;
                 }
                 // Ignore nested query scopes; window functions inside subqueries are handled when
                 // executing that query block.
                 Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {}
                 _ => {}
             }
+            Ok(())
         }
 
         let mut result = Vec::new();
@@ -3725,11 +3727,11 @@ impl Executor {
                 SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => Some(e),
                 _ => None,
             } {
-                collect_window_funcs_in_expr(expr, schema, &mut result, &mut sig_to_col);
+                collect_window_funcs_in_expr(expr, schema, &mut result, &mut sig_to_col)?;
             }
         }
 
-        (result, sig_to_col)
+        Ok((result, sig_to_col))
     }
 
     pub(crate) fn rewrite_window_refs(expr: &Expr, sig_to_col: &HashMap<String, String>) -> Expr {
@@ -3870,8 +3872,8 @@ impl Executor {
         func_name: &str,
         arg_expr: &Option<Expr>,
         schema: &TableSchema,
-    ) -> DataType {
-        match func_name {
+    ) -> Result<DataType> {
+        Ok(match func_name {
             "row_number" | "rank" | "dense_rank" | "ntile" | "count" => DataType::Int64,
             "percent_rank" | "cume_dist" => DataType::Float64,
             "sum" | "avg" => DataType::Numeric {
@@ -3880,13 +3882,13 @@ impl Executor {
             },
             "min" | "max" | "lag" | "lead" | "first_value" | "last_value" | "nth_value" => {
                 if let Some(expr) = arg_expr {
-                    infer_expr_type(expr, schema)
+                    infer_expr_type(expr, schema)?
                 } else {
                     DataType::Int64
                 }
             }
             _ => DataType::Int64,
-        }
+        })
     }
 
     pub(crate) fn project_window_results(
@@ -3965,13 +3967,13 @@ impl Executor {
                     };
                     columns.push(col_name);
                     let rewritten = Self::rewrite_window_refs(expr, window_sig_to_column);
-                    column_types.push(infer_expr_type(&rewritten, &window_schema));
+                    column_types.push(infer_expr_type(&rewritten, &window_schema)?);
                     projection_exprs.push(rewritten);
                 }
                 SelectItem::ExprWithAlias { expr, .. } => {
                     columns.push(get_select_item_name(item));
                     let rewritten = Self::rewrite_window_refs(expr, window_sig_to_column);
-                    column_types.push(infer_expr_type(&rewritten, &window_schema));
+                    column_types.push(infer_expr_type(&rewritten, &window_schema)?);
                     projection_exprs.push(rewritten);
                 }
             }
@@ -4073,7 +4075,8 @@ mod tests {
             &mut group_by_names,
             &mut group_by_types,
             &schema,
-        );
+        )
+        .unwrap();
 
         assert!(group_by_exprs
             .iter()
@@ -4093,7 +4096,8 @@ mod tests {
             &mut group_by_names,
             &mut group_by_types,
             &schema,
-        );
+        )
+        .unwrap();
         assert_eq!(group_by_exprs.len(), original_len);
     }
 

@@ -17,7 +17,7 @@ pub fn is_index_materializable(index: &IndexDef) -> bool {
 /// Validate that a WHERE predicate expression for a partial index type-checks
 /// and produces a boolean result. PostgreSQL performs this validation at DDL time.
 pub fn validate_index_predicate(predicate: &Expr, schema: &TableSchema) -> Result<()> {
-    match super::types::try_infer_expr_type(predicate, schema) {
+    match super::types::infer_expr_type(predicate, schema) {
         Ok(DataType::Boolean) => Ok(()),
         Ok(actual_type) => Err(anyhow::anyhow!(
             "argument of WHERE must be type boolean, not type {}",

@@ -6,7 +6,7 @@ use tikv_client::Transaction;
 
 use super::names;
 use super::names::normalize_ident;
-use super::types::try_sql_datatype_to_internal;
+use super::types::sql_datatype_to_internal_strict;
 use super::ExecuteResult;
 use crate::storage::TikvStore;
 use crate::types::{UserTypeDef, UserTypeKind};
@@ -45,7 +45,7 @@ pub async fn execute_create_type(
                         field_name
                     ));
                 }
-                let field_type = try_sql_datatype_to_internal(&attr.data_type)?;
+                let field_type = sql_datatype_to_internal_strict(&attr.data_type)?;
                 fields.push((field_name, field_type));
             }
             UserTypeKind::Composite { fields }

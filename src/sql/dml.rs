@@ -199,8 +199,10 @@ pub fn build_returning_types(
     if let Some(items) = returning {
         for item in items {
             match item {
-                SelectItem::UnnamedExpr(expr) => types.push(infer_expr_type(expr, schema)),
-                SelectItem::ExprWithAlias { expr, .. } => types.push(infer_expr_type(expr, schema)),
+                SelectItem::UnnamedExpr(expr) => types.push(infer_expr_type(expr, schema)?),
+                SelectItem::ExprWithAlias { expr, .. } => {
+                    types.push(infer_expr_type(expr, schema)?)
+                }
                 SelectItem::Wildcard(_) => {
                     types.extend(schema.columns.iter().map(|c| c.data_type.clone()));
                 }

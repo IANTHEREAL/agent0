@@ -63,14 +63,8 @@ impl Executor {
                             };
                             let inferred_types: Vec<DataType> = if let Some(types) = column_types {
                                 types
-                            } else if let Some(first_row) = rows.first() {
-                                first_row
-                                    .values
-                                    .iter()
-                                    .map(|v| v.data_type().unwrap_or(DataType::Text))
-                                    .collect()
                             } else {
-                                vec![DataType::Text; col_names.len()]
+                                crate::types::infer_column_types_from_rows(&rows, col_names.len())
                             };
                             let schema = TableSchema {
                                 table_id: 0,
@@ -80,6 +74,7 @@ impl Executor {
                                     .enumerate()
                                     .map(|(idx, n)| ColumnDef {
                                         name: n.clone(),
+                                        // INTENTIONAL: index guard — unreachable when types match columns
                                         data_type: inferred_types
                                             .get(idx)
                                             .cloned()
@@ -189,14 +184,8 @@ impl Executor {
         };
         let inferred_types: Vec<DataType> = if let Some(types) = base_types {
             types
-        } else if let Some(first_row) = all_rows.first() {
-            first_row
-                .values
-                .iter()
-                .map(|v| v.data_type().unwrap_or(DataType::Text))
-                .collect()
         } else {
-            vec![DataType::Text; col_names.len()]
+            crate::types::infer_column_types_from_rows(&all_rows, col_names.len())
         };
         let schema = TableSchema {
             table_id: 0,
@@ -206,6 +195,7 @@ impl Executor {
                 .enumerate()
                 .map(|(idx, n)| ColumnDef {
                     name: n.clone(),
+                    // INTENTIONAL: index guard — unreachable when types match columns
                     data_type: inferred_types.get(idx).cloned().unwrap_or(DataType::Text),
                     nullable: true,
                     primary_key: false,

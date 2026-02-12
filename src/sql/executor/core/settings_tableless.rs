@@ -290,7 +290,7 @@ pub(super) fn try_execute_current_setting_select(
 
     let mut output_type = DataType::Text;
     if let Some(cast_to) = cast_to {
-        if let Ok(t) = crate::sql::types::try_sql_datatype_to_internal(cast_to) {
+        if let Ok(t) = crate::sql::types::sql_datatype_to_internal_strict(cast_to) {
             output_type = t;
         } else {
             return Ok(None);

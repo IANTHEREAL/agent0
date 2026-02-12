@@ -276,6 +276,7 @@ impl Value {
             Value::Array(elems) => {
                 let elem_type = elems.first().and_then(|v| v.data_type());
                 Some(DataType::Array(Box::new(
+                    // INTENTIONAL: empty array defaults element type to Text (PG-compatible)
                     elem_type.unwrap_or(DataType::Text),
                 )))
             }
@@ -585,6 +586,19 @@ impl Row {
     pub fn new(values: Vec<Value>) -> Self {
         Self { values }
     }
+}
+
+/// Infer column types by scanning all rows, returning the first non-NULL type per column.
+/// Falls back to Text for columns that are NULL in all rows (PostgreSQL-compatible).
+pub fn infer_column_types_from_rows(rows: &[Row], col_count: usize) -> Vec<DataType> {
+    (0..col_count)
+        .map(|col_idx| {
+            rows.iter()
+                .find_map(|row| row.values.get(col_idx).and_then(|v| v.data_type()))
+                // INTENTIONAL: all-NULL column defaults to Text (PostgreSQL-compatible)
+                .unwrap_or(DataType::Text)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -17,7 +17,7 @@ pub use context::TypeContext;
 pub use error::TypeError;
 pub use infer::TypeInferrer;
 
-pub(crate) use mapping::{sql_datatype_to_internal, try_sql_datatype_to_internal};
+pub(crate) use mapping::{sql_datatype_to_internal, sql_datatype_to_internal_strict};
 
 // Re-exports for tests
 #[cfg(test)]
@@ -28,29 +28,10 @@ pub(crate) use registry::global_registry;
 use crate::types::{DataType, TableSchema};
 use sqlparser::ast::Expr;
 
-pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> DataType {
-    let ctx = TypeContext::single(schema);
-    let mut inferrer = TypeInferrer::new(ctx);
-    inferrer.infer(expr).unwrap_or(DataType::Text)
-}
-
-pub fn try_infer_expr_type(expr: &Expr, schema: &TableSchema) -> Result<DataType, TypeError> {
+pub fn infer_expr_type(expr: &Expr, schema: &TableSchema) -> Result<DataType, TypeError> {
     let ctx = TypeContext::single(schema);
     let mut inferrer = TypeInferrer::new(ctx);
     inferrer.infer(expr)
-}
-
-#[allow(dead_code)] // type inference module, partially integrated
-pub fn infer_expr_type_join(
-    expr: &Expr,
-    left_alias: &str,
-    left: &TableSchema,
-    right_alias: &str,
-    right: &TableSchema,
-) -> DataType {
-    let ctx = TypeContext::join(left_alias, left, right_alias, right);
-    let mut inferrer = TypeInferrer::new(ctx);
-    inferrer.infer(expr).unwrap_or(DataType::Text)
 }
 
 #[cfg(test)]

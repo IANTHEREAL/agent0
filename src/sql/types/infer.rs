@@ -99,8 +99,10 @@ impl<'a> TypeInferrer<'a> {
 
             Expr::Value(val) => Ok(self.infer_value(val)),
 
-            Expr::Cast { data_type, .. } => Ok(super::sql_datatype_to_internal(data_type)),
-            Expr::TypedString { data_type, .. } => Ok(super::sql_datatype_to_internal(data_type)),
+            Expr::Cast { data_type, .. } => super::sql_datatype_to_internal(data_type)
+                .map_err(|e| TypeError::UnsupportedExpression(e.to_string())),
+            Expr::TypedString { data_type, .. } => super::sql_datatype_to_internal(data_type)
+                .map_err(|e| TypeError::UnsupportedExpression(e.to_string())),
 
             Expr::Function(f) => self.infer_function(f),
 
@@ -216,6 +218,7 @@ impl<'a> TypeInferrer<'a> {
                 Ok(DataType::Array(Box::new(inner_type)))
             }
 
+            // INTENTIONAL: conservative default for unhandled expression types
             _ => Ok(DataType::Text),
         }
     }
@@ -259,17 +262,15 @@ impl<'a> TypeInferrer<'a> {
             .args
             .iter()
             .filter_map(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => {
-                    Some(self.infer(expr).unwrap_or(DataType::Text))
-                }
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => Some(self.infer(expr)),
                 FunctionArg::Named {
                     arg: FunctionArgExpr::Expr(expr),
                     ..
-                } => Some(self.infer(expr).unwrap_or(DataType::Text)),
-                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Some(DataType::Int64),
+                } => Some(self.infer(expr)),
+                FunctionArg::Unnamed(FunctionArgExpr::Wildcard) => Some(Ok(DataType::Int64)),
                 _ => None,
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         // Special handling for window functions
         // Window functions SUM/AVG always return Numeric for consistency
@@ -296,7 +297,7 @@ impl<'a> TypeInferrer<'a> {
             return Ok(return_type);
         }
 
-        // Unknown function - return conservative default
+        // INTENTIONAL: registry doesn't include UDFs — Text is safe fallback
         Ok(DataType::Text)
     }
 

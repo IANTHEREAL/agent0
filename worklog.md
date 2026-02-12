@@ -111,7 +111,7 @@ Verified every `#[allow(dead_code)]` item against actual call sites. Major corre
 # Issue #657: Error Masking Audit
 
 ## PR 1: Comparison + Parse (branch: fix/657-error-masking-pr1-comparison-parse)
-**Commits**: `cc3e2c6`, `c383b76` | **PR**: #664
+**Commits**: `cc3e2c6`, `c383b76` | **PR**: #664 (MERGED)
 
 ### Changes
 - Added `NumericValueOutOfRange` to SqlError with SQLSTATE 22003
