@@ -2958,8 +2958,11 @@ impl Executor {
             };
 
         let estimated_rows = crate::sql::stats::get_row_count_estimate(
-            self.tenant_keyspace(), db_id, schema.table_id,
-        ).unwrap_or(1000);
+            self.tenant_keyspace(),
+            db_id,
+            schema.table_id,
+        )
+        .unwrap_or(1000);
         let mut preloaded_source = preloaded_source;
 
         let is_distinct = matches!(distinct, Some(Distinct::Distinct));
@@ -3270,8 +3273,11 @@ impl Executor {
         } else {
             let planner = PhysicalPlanner::new(search_path.to_vec());
             let estimated_rows = crate::sql::stats::get_row_count_estimate(
-                self.tenant_keyspace(), db_id, schema.table_id,
-            ).unwrap_or(1000);
+                self.tenant_keyspace(),
+                db_id,
+                schema.table_id,
+            )
+            .unwrap_or(1000);
             planner.plan_simple_select(
                 db_id,
                 schema.clone(),

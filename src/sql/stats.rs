@@ -90,4 +90,19 @@ mod tests {
         evict_keyspace_stats("evict_test");
         assert_eq!(get_row_count_estimate("evict_test", 1, 1), None);
     }
+
+    #[test]
+    fn test_evict_does_not_affect_other_keyspaces() {
+        update_row_count_estimate("evict_iso_a", 1, 1, 100);
+        update_row_count_estimate("evict_iso_b", 1, 1, 200);
+
+        // Evict only keyspace A
+        evict_keyspace_stats("evict_iso_a");
+
+        // Keyspace A is gone
+        assert_eq!(get_row_count_estimate("evict_iso_a", 1, 1), None);
+
+        // Keyspace B is unaffected
+        assert_eq!(get_row_count_estimate("evict_iso_b", 1, 1), Some(200));
+    }
 }

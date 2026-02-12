@@ -24,7 +24,8 @@ struct CompiledTriggerBody {
     statements: Vec<TriggerStatement>,
 }
 
-static COMPILED_BODY_CACHE: LazyLock<DashMap<String, HashMap<u32, CompiledTriggerBody>>> =
+#[allow(clippy::type_complexity)] // Key is (keyspace → (db_id, func_oid))
+static COMPILED_BODY_CACHE: LazyLock<DashMap<String, HashMap<(u64, u32), CompiledTriggerBody>>> =
     LazyLock::new(DashMap::new);
 
 #[allow(dead_code)] // API ready for pool lifecycle wiring
@@ -111,9 +112,15 @@ impl CompiledTriggerBody {
     }
 }
 
-fn get_or_compile_body(keyspace: &str, func_oid: u32, body: &str) -> Result<CompiledTriggerBody> {
+fn get_or_compile_body(
+    keyspace: &str,
+    db_id: u64,
+    func_oid: u32,
+    body: &str,
+) -> Result<CompiledTriggerBody> {
+    let key = (db_id, func_oid);
     if let Some(inner) = COMPILED_BODY_CACHE.get(keyspace) {
-        if let Some(compiled) = inner.get(&func_oid) {
+        if let Some(compiled) = inner.get(&key) {
             return Ok(compiled.clone());
         }
     }
@@ -122,7 +129,7 @@ fn get_or_compile_body(keyspace: &str, func_oid: u32, body: &str) -> Result<Comp
     COMPILED_BODY_CACHE
         .entry(keyspace.to_string())
         .or_default()
-        .insert(func_oid, compiled.clone());
+        .insert(key, compiled.clone());
     Ok(compiled)
 }
 
@@ -148,7 +155,8 @@ pub async fn prefetch_trigger_functions(
             continue;
         }
         if let Some(func_def) = store.get_function(txn, db_id, &trigger.function).await? {
-            if let Ok(compiled) = get_or_compile_body(keyspace, func_def.oid, &func_def.body) {
+            if let Ok(compiled) = get_or_compile_body(keyspace, db_id, func_def.oid, &func_def.body)
+            {
                 let _ = compiled;
             }
             func_cache.insert(trigger.function.clone(), func_def);
@@ -301,7 +309,7 @@ async fn execute_trigger_body_cached(
     use super::expr::eval_expr;
     use super::sequences;
 
-    let compiled = get_or_compile_body(keyspace, func_oid, body)?;
+    let compiled = get_or_compile_body(keyspace, db_id, func_oid, body)?;
 
     if compiled.statements.is_empty() {
         return Ok(TriggerResult::Unchanged);
@@ -647,10 +655,11 @@ mod tests {
         let body_a = "BEGIN\n  NEW.x := 1;\n  RETURN NEW;\nEND;";
         let body_b = "BEGIN\n  NEW.x := 999;\n  RETURN NEW;\nEND;";
         let oid = 42u32;
+        let db_id = 1u64;
 
         // Same func_oid, different keyspaces → independent entries
-        let a = get_or_compile_body("tenant_iso_a", oid, body_a).unwrap();
-        let b = get_or_compile_body("tenant_iso_b", oid, body_b).unwrap();
+        let a = get_or_compile_body("tenant_iso_a", db_id, oid, body_a).unwrap();
+        let b = get_or_compile_body("tenant_iso_b", db_id, oid, body_b).unwrap();
 
         // Verify the compiled bodies differ in their assignment expression
         let a_expr = match &a.statements[0] {
@@ -665,23 +674,63 @@ mod tests {
         assert_eq!(b_expr, "999");
 
         // Re-fetch from cache returns the correct tenant's body, not the other's
-        let a2 = get_or_compile_body("tenant_iso_a", oid, body_a).unwrap();
+        let a2 = get_or_compile_body("tenant_iso_a", db_id, oid, body_a).unwrap();
         let a2_expr = match &a2.statements[0] {
             TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
             other => panic!("expected Assignment, got {:?}", other),
         };
         assert_eq!(a2_expr, "1");
+
+        // Same keyspace, same func_oid, different db_id → independent entries
+        let body_c = "BEGIN\n  NEW.x := 50;\n  RETURN NEW;\nEND;";
+        let c = get_or_compile_body("tenant_iso_a", 2u64, oid, body_c).unwrap();
+        let c_expr = match &c.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(c_expr, "50");
+
+        // Original db_id=1 entry is still intact
+        let a3 = get_or_compile_body("tenant_iso_a", db_id, oid, body_a).unwrap();
+        let a3_expr = match &a3.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(a3_expr, "1");
     }
 
     #[test]
     fn test_evict_compiled_bodies() {
         let body = "BEGIN\n  RETURN NEW;\nEND;";
-        let _ = get_or_compile_body("evict_trig", 1, body).unwrap();
+        let _ = get_or_compile_body("evict_trig", 1, 1, body).unwrap();
 
         evict_compiled_bodies("evict_trig");
 
         // After eviction, re-compile succeeds (cache miss → fresh compile)
-        let result = get_or_compile_body("evict_trig", 1, body);
+        let result = get_or_compile_body("evict_trig", 1, 1, body);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_evict_does_not_affect_other_keyspaces() {
+        let body_a = "BEGIN\n  NEW.x := 10;\n  RETURN NEW;\nEND;";
+        let body_b = "BEGIN\n  NEW.x := 20;\n  RETURN NEW;\nEND;";
+
+        let _ = get_or_compile_body("evict_iso_a", 1, 1, body_a).unwrap();
+        let _ = get_or_compile_body("evict_iso_b", 1, 1, body_b).unwrap();
+
+        // Evict only keyspace A
+        evict_compiled_bodies("evict_iso_a");
+
+        // Keyspace B is unaffected — cache hit returns the original compiled body
+        let b = get_or_compile_body("evict_iso_b", 1, 1, body_b).unwrap();
+        let b_expr = match &b.statements[0] {
+            TriggerStatement::Assignment { expr_str, .. } => expr_str.clone(),
+            other => panic!("expected Assignment, got {:?}", other),
+        };
+        assert_eq!(b_expr, "20");
+
+        // Keyspace A was evicted — re-inserting works
+        assert!(COMPILED_BODY_CACHE.get("evict_iso_a").is_none());
     }
 }

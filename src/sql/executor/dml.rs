@@ -463,7 +463,12 @@ impl Executor {
         }
 
         if inserted > 0 {
-            crate::sql::stats::bump_row_count_estimate(self.tenant_keyspace(), db_id, schema.table_id, inserted as isize);
+            crate::sql::stats::bump_row_count_estimate(
+                self.tenant_keyspace(),
+                db_id,
+                schema.table_id,
+                inserted as isize,
+            );
         }
 
         if returning.is_some() {
