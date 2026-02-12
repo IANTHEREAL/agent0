@@ -310,8 +310,7 @@ impl Executor {
                             .as_ref()
                             .map(|a| a.name.value.clone())
                             .unwrap_or_else(|| obj_name.clone());
-                        let (schema, rows) =
-                            self.execute_record_migration(txn, func_args).await?;
+                        let (schema, rows) = self.execute_record_migration(txn, func_args).await?;
                         (schema.name.clone(), als, schema, rows, true, true)
                     } else {
                         return Err(anyhow!(

@@ -2,8 +2,8 @@
 //!
 //! Extracted from join.rs during Phase 2 refactoring (B.2a).
 
-use super::super::information_schema::VirtualTableFilter;
 use super::super::ddl_export;
+use super::super::information_schema::VirtualTableFilter;
 use super::super::names;
 use super::super::names::normalize_ident;
 use super::super::{parse_sql, ExecuteResult};
@@ -1061,9 +1061,7 @@ impl Executor {
         let name = match eval_expr(extract_expr(&args[0])?, None, None, &query_ctx)? {
             Value::Text(v) => v,
             _ => {
-                return Err(anyhow!(
-                    "_pgtikv_sys_record_migration name must be TEXT"
-                ));
+                return Err(anyhow!("_pgtikv_sys_record_migration name must be TEXT"));
             }
         };
         let checksum = match eval_expr(extract_expr(&args[1])?, None, None, &query_ctx)? {

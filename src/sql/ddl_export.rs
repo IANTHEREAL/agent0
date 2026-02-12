@@ -194,7 +194,9 @@ pub async fn export_all_ddl(
     let mut rows: Vec<DdlExportRow> = Vec::new();
 
     let mut types = store.list_types(txn, db_id).await?;
-    types.sort_by(|a, b| (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str())));
+    types.sort_by(|a, b| {
+        (a.schema.as_str(), a.name.as_str()).cmp(&(b.schema.as_str(), b.name.as_str()))
+    });
     for def in types {
         let object_name = format!("{}.{}", def.schema, def.name);
         rows.push(DdlExportRow {
@@ -255,7 +257,9 @@ pub async fn export_all_ddl(
     }
 
     let mut triggers = store.list_triggers(txn, db_id).await?;
-    triggers.sort_by(|a, b| (a.table.as_str(), a.name.as_str()).cmp(&(b.table.as_str(), b.name.as_str())));
+    triggers.sort_by(|a, b| {
+        (a.table.as_str(), a.name.as_str()).cmp(&(b.table.as_str(), b.name.as_str()))
+    });
     for trigger in triggers {
         rows.push(DdlExportRow {
             object_type: "trigger".to_string(),
@@ -338,7 +342,9 @@ mod tests {
         assert!(ddl.contains("email TEXT NOT NULL DEFAULT 'x@example.com' UNIQUE"));
         assert!(ddl.contains("CONSTRAINT users_pkey PRIMARY KEY (id)"));
         assert!(ddl.contains("CONSTRAINT users_email_chk CHECK (email <> '')"));
-        assert!(ddl.contains("CONSTRAINT users_org_fk FOREIGN KEY (id) REFERENCES public.orgs (id)"));
+        assert!(
+            ddl.contains("CONSTRAINT users_org_fk FOREIGN KEY (id) REFERENCES public.orgs (id)")
+        );
     }
 
     #[test]
@@ -389,10 +395,7 @@ mod tests {
 
     #[test]
     fn procedure_to_ddl_parses_stored_definition() {
-        let ddl = procedure_to_ddl(
-            "public.p",
-            "PARAMS:a int, b text\nBODY:SELECT a;SELECT b;",
-        );
+        let ddl = procedure_to_ddl("public.p", "PARAMS:a int, b text\nBODY:SELECT a;SELECT b;");
         assert!(ddl.starts_with("CREATE OR REPLACE PROCEDURE public.p(a int, b text)"));
         assert!(ddl.contains("SELECT a;SELECT b;"));
     }
