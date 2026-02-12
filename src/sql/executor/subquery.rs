@@ -1,15 +1,17 @@
 //! Subquery resolution for the SQL executor
 
-use super::super::names::normalize_ident;
+use super::super::names::{self, normalize_ident};
 use super::super::value_coercion::value_to_sql_expr;
 use super::super::ExecuteResult;
 use super::core::Executor;
+use crate::storage::TikvStore;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr, Value as SqlValue,
+    Expr, FunctionArg, FunctionArgExpr, Ident, Query, SelectItem, SetExpr, Value as SqlValue,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use tikv_client::Transaction;
 
 pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
@@ -30,6 +32,279 @@ pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
         }
     });
     found
+}
+
+/// Check if a query contains bare (unqualified) identifier references matching
+/// any column in the outer schema.  This is a conservative over-detection: it may
+/// flag uncorrelated subqueries as correlated (performance, not correctness).
+fn query_has_bare_outer_reference(query: &Query, outer_schema: &TableSchema) -> bool {
+    use core::ops::ControlFlow;
+    use sqlparser::ast::{Visit, Visitor};
+
+    struct BareRefVisitor<'a> {
+        outer_schema: &'a TableSchema,
+        found: bool,
+        query_depth: usize,
+    }
+
+    impl<'a> Visitor for BareRefVisitor<'a> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+            self.query_depth += 1;
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<Self::Break> {
+            self.query_depth -= 1;
+            ControlFlow::Continue(())
+        }
+
+        fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+            if self.found {
+                return ControlFlow::Break(());
+            }
+            // Only check at the query's immediate level (depth 1 because the
+            // visit enters the Query node first).
+            if self.query_depth != 1 {
+                return ControlFlow::Continue(());
+            }
+            if let Expr::Identifier(ident) = expr {
+                let name = normalize_ident(ident);
+                if self
+                    .outer_schema
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&name))
+                {
+                    self.found = true;
+                    return ControlFlow::Break(());
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut visitor = BareRefVisitor {
+        outer_schema,
+        found: false,
+        query_depth: 0,
+    };
+    let _ = query.visit(&mut visitor);
+    visitor.found
+}
+
+/// Extract table names (not aliases) from a query's top-level FROM clause
+/// for schema lookup.
+fn collect_from_table_names(query: &Query) -> Vec<(Option<String>, String)> {
+    let select = match &*query.body {
+        SetExpr::Select(s) => s,
+        _ => return Vec::new(),
+    };
+
+    fn collect_factor(
+        factor: &sqlparser::ast::TableFactor,
+        out: &mut Vec<(Option<String>, String)>,
+    ) {
+        match factor {
+            sqlparser::ast::TableFactor::Table { name, .. } => {
+                let parts: Vec<String> = name.0.iter().map(normalize_ident).collect();
+                match parts.as_slice() {
+                    [single] => out.push((None, single.clone())),
+                    [schema, obj] => out.push((Some(schema.clone()), obj.clone())),
+                    _ => {} // skip unsupported multi-part names
+                }
+            }
+            sqlparser::ast::TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
+                collect_factor(&table_with_joins.relation, out);
+                for join in &table_with_joins.joins {
+                    collect_factor(&join.relation, out);
+                }
+            }
+            // Derived tables, functions, UNNEST, etc. — we cannot resolve their
+            // column sets without executing them; skip.
+            _ => {}
+        }
+    }
+
+    let mut names = Vec::new();
+    for twj in &select.from {
+        collect_factor(&twj.relation, &mut names);
+        for join in &twj.joins {
+            collect_factor(&join.relation, &mut names);
+        }
+    }
+    names
+}
+
+/// Return true if the FROM clause contains any entry whose columns cannot be
+/// determined by schema lookup alone (derived tables, table functions, etc.).
+fn has_unresolvable_from(from: &[sqlparser::ast::TableWithJoins]) -> bool {
+    fn is_plain_table(factor: &sqlparser::ast::TableFactor) -> bool {
+        match factor {
+            sqlparser::ast::TableFactor::Table { args: None, .. } => true,
+            sqlparser::ast::TableFactor::NestedJoin {
+                table_with_joins, ..
+            } => {
+                is_plain_table(&table_with_joins.relation)
+                    && table_with_joins
+                        .joins
+                        .iter()
+                        .all(|j| is_plain_table(&j.relation))
+            }
+            _ => false,
+        }
+    }
+
+    for twj in from {
+        if !is_plain_table(&twj.relation) {
+            return true;
+        }
+        for join in &twj.joins {
+            if !is_plain_table(&join.relation) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Resolve FROM-clause table names to their column name sets.
+/// Returns `None` if any FROM entry cannot be resolved (derived tables, views,
+/// unrecognised names), signalling that bare-identifier qualification should be
+/// skipped for this subquery (conservative fallback).
+pub(crate) async fn collect_inner_column_names(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    query: &Query,
+    ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+) -> Result<Option<HashSet<String>>> {
+    let select = match &*query.body {
+        SetExpr::Select(s) => s,
+        _ => return Ok(None),
+    };
+
+    if has_unresolvable_from(&select.from) {
+        return Ok(None);
+    }
+
+    let table_names = collect_from_table_names(query);
+    let mut columns = HashSet::new();
+
+    for (schema_opt, table_name) in &table_names {
+        // Check CTEs first.
+        let cte_key = table_name.to_lowercase();
+        if let Some((cte_schema, _)) = ctes.get(&cte_key) {
+            for col in &cte_schema.columns {
+                columns.insert(col.name.to_lowercase());
+            }
+            continue;
+        }
+
+        // Resolve via store with search_path.
+        let obj_name = match schema_opt {
+            Some(schema) => {
+                sqlparser::ast::ObjectName(vec![Ident::new(schema), Ident::new(table_name)])
+            }
+            None => sqlparser::ast::ObjectName(vec![Ident::new(table_name)]),
+        };
+
+        if let Some(resolved) =
+            names::resolve_existing_table_name(store.as_ref(), txn, db_id, &obj_name, search_path)
+                .await?
+        {
+            if let Some(table_schema) = store.get_schema(txn, db_id, &resolved.full).await? {
+                for col in &table_schema.columns {
+                    columns.insert(col.name.to_lowercase());
+                }
+                continue;
+            }
+        }
+
+        // Unresolvable (could be a view, or doesn't exist).
+        return Ok(None);
+    }
+
+    Ok(Some(columns))
+}
+
+/// Qualify bare identifiers in a subquery that match outer-schema columns and
+/// are NOT shadowed by the subquery's own inner-scope columns.
+///
+/// Rewrites `Expr::Identifier("col")` → `Expr::CompoundIdentifier(["outer_alias", "col"])`
+/// so that the existing qualified-reference substitution handles them.
+///
+/// Only touches expressions at the subquery's immediate level; nested
+/// subqueries are left untouched (they need their own inner-column sets).
+pub(crate) fn qualify_bare_outer_refs_in_query(
+    query: &Query,
+    outer_alias: &str,
+    outer_schema: &TableSchema,
+    inner_columns: &HashSet<String>,
+) -> Query {
+    use core::ops::ControlFlow;
+    use sqlparser::ast::{VisitMut, VisitorMut};
+
+    struct QualifyVisitor<'a> {
+        outer_alias: &'a str,
+        outer_schema: &'a TableSchema,
+        inner_columns: &'a HashSet<String>,
+        query_depth: usize,
+    }
+
+    impl<'a> VisitorMut for QualifyVisitor<'a> {
+        type Break = ();
+
+        fn pre_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+            self.query_depth += 1;
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_query(&mut self, _query: &mut Query) -> ControlFlow<Self::Break> {
+            self.query_depth -= 1;
+            ControlFlow::Continue(())
+        }
+
+        fn post_visit_expr(&mut self, expr: &mut Expr) -> ControlFlow<Self::Break> {
+            // Only qualify at the immediate query level (depth 1: we entered
+            // the query node).  Deeper levels are nested subqueries.
+            if self.query_depth != 1 {
+                return ControlFlow::Continue(());
+            }
+            if let Expr::Identifier(ref ident) = expr {
+                let name = normalize_ident(ident);
+                // Skip if this column exists in inner scope.
+                if self.inner_columns.contains(&name.to_lowercase()) {
+                    return ControlFlow::Continue(());
+                }
+                // Qualify if it matches an outer column.
+                if self
+                    .outer_schema
+                    .columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(&name))
+                {
+                    *expr =
+                        Expr::CompoundIdentifier(vec![Ident::new(self.outer_alias), ident.clone()]);
+                }
+            }
+            ControlFlow::Continue(())
+        }
+    }
+
+    let mut out = query.clone();
+    let mut visitor = QualifyVisitor {
+        outer_alias,
+        outer_schema,
+        inner_columns,
+        query_depth: 0,
+    };
+    let _ = out.visit(&mut visitor);
+    out
 }
 
 impl Executor {
@@ -399,13 +674,14 @@ impl Executor {
         search_path: &[String],
         projection: &[SelectItem],
         outer_alias: &str,
+        outer_schema: &TableSchema,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<Vec<SelectItem>> {
         let mut resolved = Vec::with_capacity(projection.len());
         for item in projection {
             let resolved_item = match item {
                 SelectItem::UnnamedExpr(e) => {
-                    if self.expr_is_correlated_subquery(e, outer_alias) {
+                    if self.expr_is_correlated_subquery(e, outer_alias, outer_schema) {
                         SelectItem::UnnamedExpr(e.clone())
                     } else {
                         SelectItem::UnnamedExpr(
@@ -423,7 +699,7 @@ impl Executor {
                     }
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
-                    if self.expr_is_correlated_subquery(expr, outer_alias) {
+                    if self.expr_is_correlated_subquery(expr, outer_alias, outer_schema) {
                         SelectItem::ExprWithAlias {
                             expr: expr.clone(),
                             alias: alias.clone(),
@@ -452,9 +728,17 @@ impl Executor {
         Ok(resolved)
     }
 
-    pub(crate) fn expr_is_correlated_subquery(&self, expr: &Expr, outer_alias: &str) -> bool {
+    pub(crate) fn expr_is_correlated_subquery(
+        &self,
+        expr: &Expr,
+        outer_alias: &str,
+        outer_schema: &TableSchema,
+    ) -> bool {
         match expr {
-            Expr::Subquery(q) => query_has_outer_reference(q, outer_alias),
+            Expr::Subquery(q) => {
+                query_has_outer_reference(q, outer_alias)
+                    || query_has_bare_outer_reference(q, outer_schema)
+            }
             _ => false,
         }
     }
@@ -469,10 +753,30 @@ impl Executor {
         outer_alias: &'a str,
         outer_schema: &'a TableSchema,
         outer_row: &'a Row,
+        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
         Box::pin(async move {
-            let substituted_query =
-                substitute_outer_values_in_query(subquery, outer_alias, outer_schema, outer_row);
+            // Qualify bare outer references before substitution.
+            let qualified_query = if let Some(inner_columns) =
+                collect_inner_column_names(&self.store(), txn, db_id, search_path, subquery, ctes)
+                    .await?
+            {
+                qualify_bare_outer_refs_in_query(
+                    subquery,
+                    outer_alias,
+                    outer_schema,
+                    &inner_columns,
+                )
+            } else {
+                subquery.clone()
+            };
+
+            let substituted_query = substitute_outer_values_in_query(
+                &qualified_query,
+                outer_alias,
+                outer_schema,
+                outer_row,
+            );
             let result = self
                 .execute_query(txn, db_id, sequence_values, search_path, &substituted_query)
                 .await?;
@@ -2223,5 +2527,114 @@ ORDER BY qs_o.id;
             other => panic!("expected substituted JOIN ... ON, got {other:?}"),
         };
         assert!(!expr_has_outer_reference(substituted_on_expr, "qs_o"));
+    }
+
+    fn make_col(name: &str) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type: DataType::Int32,
+            nullable: false,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        }
+    }
+
+    fn make_schema(cols: &[&str]) -> TableSchema {
+        TableSchema {
+            columns: cols.iter().map(|c| make_col(c)).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_query_has_bare_outer_reference_detects_matching_column() {
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "SELECT a + c FROM t_inner";
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
+            panic!("expected query");
+        };
+
+        let outer_schema = make_schema(&["a", "b"]);
+        assert!(query_has_bare_outer_reference(query, &outer_schema));
+    }
+
+    #[test]
+    fn test_query_has_bare_outer_reference_ignores_non_matching() {
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "SELECT c + d FROM t_inner";
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
+            panic!("expected query");
+        };
+
+        let outer_schema = make_schema(&["a"]);
+        assert!(!query_has_bare_outer_reference(query, &outer_schema));
+    }
+
+    #[test]
+    fn test_qualify_bare_outer_refs_in_query() {
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "SELECT a + c FROM t_inner WHERE d > a";
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
+            panic!("expected query");
+        };
+
+        let outer_schema = make_schema(&["a", "b"]);
+        let inner_columns: HashSet<String> = ["c", "d"].iter().map(|s| s.to_string()).collect();
+
+        let qualified =
+            qualify_bare_outer_refs_in_query(query, "t_outer", &outer_schema, &inner_columns);
+
+        // After qualification, `a` should become `t_outer.a` (a CompoundIdentifier).
+        // `c` and `d` are in inner_columns so should remain bare.
+        let qualified_sql = qualified.to_string();
+        assert!(
+            qualified_sql.contains("t_outer.a"),
+            "expected t_outer.a in: {qualified_sql}"
+        );
+        assert!(
+            !qualified_sql.contains("t_outer.c"),
+            "c should not be qualified: {qualified_sql}"
+        );
+        assert!(
+            !qualified_sql.contains("t_outer.d"),
+            "d should not be qualified: {qualified_sql}"
+        );
+    }
+
+    #[test]
+    fn test_qualify_bare_outer_refs_inner_shadow_prevents_qualification() {
+        use sqlparser::dialect::PostgreSqlDialect;
+        use sqlparser::parser::Parser;
+
+        let sql = "SELECT a FROM t_both";
+        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).unwrap();
+        let sqlparser::ast::Statement::Query(query) = &stmts[0] else {
+            panic!("expected query");
+        };
+
+        let outer_schema = make_schema(&["a"]);
+        // Inner table also has column "a" — it should shadow the outer.
+        let inner_columns: HashSet<String> = ["a"].iter().map(|s| s.to_string()).collect();
+
+        let qualified =
+            qualify_bare_outer_refs_in_query(query, "t_outer", &outer_schema, &inner_columns);
+        let qualified_sql = qualified.to_string();
+
+        // `a` exists in inner scope, so it must NOT be qualified.
+        assert!(
+            !qualified_sql.contains("t_outer.a"),
+            "inner-scope `a` should not be qualified: {qualified_sql}"
+        );
     }
 }

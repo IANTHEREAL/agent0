@@ -528,6 +528,7 @@ impl Executor {
                 search_path,
                 &select.projection,
                 &outer_alias,
+                &schema,
                 ctes,
             )
             .await?;

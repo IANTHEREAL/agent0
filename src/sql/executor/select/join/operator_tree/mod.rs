@@ -991,6 +991,7 @@ impl Executor {
                                     &outer_alias,
                                     &outer_schema,
                                     &row,
+                                    ctes,
                                 )
                                 .await?;
                             if inferred_type.is_none() {

@@ -68,14 +68,42 @@ impl Executor {
         schema: &TableSchema,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<Value> {
-        use super::super::subquery::{expr_contains_subquery, substitute_outer_values};
+        use super::super::subquery::{
+            expr_contains_subquery, qualify_bare_outer_refs_in_query, substitute_outer_values,
+        };
 
         if expr_contains_subquery(expr) {
             let outer_alias = schema
                 .from_alias
                 .as_deref()
                 .unwrap_or(schema.name.rsplit('.').next().unwrap_or(&schema.name));
-            let substituted = substitute_outer_values(expr, outer_alias, schema, row);
+
+            // Qualify bare outer references in subqueries before substitution.
+            let qualified_expr = if let Expr::Subquery(ref q) = expr {
+                if let Some(inner_columns) = super::super::subquery::collect_inner_column_names(
+                    &self.store(),
+                    txn,
+                    db_id,
+                    search_path,
+                    q,
+                    ctes,
+                )
+                .await?
+                {
+                    Expr::Subquery(Box::new(qualify_bare_outer_refs_in_query(
+                        q,
+                        outer_alias,
+                        schema,
+                        &inner_columns,
+                    )))
+                } else {
+                    expr.clone()
+                }
+            } else {
+                expr.clone()
+            };
+
+            let substituted = substitute_outer_values(&qualified_expr, outer_alias, schema, row);
             let resolved = self
                 .resolve_subqueries(
                     txn,
