@@ -379,3 +379,284 @@ async fn reset_password_with_credential_but_no_pgclient() {
         .to_lowercase()
         .contains("reset password"));
 }
+
+#[tokio::test]
+async fn test_sql_no_auth() {
+    let (app, _state) = setup().await;
+    let (status, _body) = post_json(
+        app,
+        "/customer/databases/nonexistent123/sql",
+        &json!({"query": "SELECT 1"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_sql_db_not_found() {
+    let (_app, state) = setup().await;
+    let email = format!("sql404-{}@example.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "SecurePass1!").await;
+
+    let app = api::router().with_state(state.clone());
+    let (status, body) = post_json_auth(
+        app,
+        "/customer/databases/nonexistent123/sql",
+        &json!({"query": "SELECT 1"}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["message"]
+        .as_str()
+        .map(|msg| msg.to_lowercase().contains("not found"))
+        .unwrap_or(false));
+}
+
+#[tokio::test]
+async fn test_sql_with_tenant_but_no_pgclient() {
+    let (_app, state) = setup().await;
+    let email = format!("sqlpg-{}@example.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "SecurePass1!").await;
+    let customer_id = get_customer_id(&state, &token).await;
+    let tenant_id = seed_customer_tenant(&state, &customer_id).await;
+    db::upsert_credential(&state.db, &tenant_id, "admin", "admin", "oldpass123", None)
+        .await
+        .unwrap();
+
+    let app = api::router().with_state(state.clone());
+    let uri = format!("/customer/databases/{tenant_id}/sql");
+    let (status, _body) = post_json_auth(app, &uri, &json!({"query": "SELECT 1"}), &token).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_users_list_no_auth() {
+    let (app, _state) = setup().await;
+    let (status, _body) = get_json(app, "/customer/databases/nonexistent123/users").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_users_list_db_not_found() {
+    let (_app, state) = setup().await;
+    let email = format!("users404-{}@example.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "SecurePass1!").await;
+
+    let app = api::router().with_state(state.clone());
+    let (status, body) = get_json_auth(app, "/customer/databases/nonexistent123/users", &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["message"]
+        .as_str()
+        .map(|msg| msg.to_lowercase().contains("not found"))
+        .unwrap_or(false));
+}
+
+#[tokio::test]
+async fn test_users_create_no_auth() {
+    let (app, _state) = setup().await;
+    let (status, _body) = post_json(
+        app,
+        "/customer/databases/nonexistent123/users",
+        &json!({"username": "testuser", "password": "Secret123!"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_users_delete_no_auth() {
+    let (app, _state) = setup().await;
+    let (status, _body) = delete_json_auth(
+        app,
+        "/customer/databases/nonexistent123/users/testuser",
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_dump_no_auth() {
+    let (app, _state) = setup().await;
+    let (status, _body) = post_json(
+        app,
+        "/customer/databases/nonexistent123/dump",
+        &json!({"ddl_only": true}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_dump_db_not_found() {
+    let (_app, state) = setup().await;
+    let email = format!("dump404-{}@example.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "SecurePass1!").await;
+
+    let app = api::router().with_state(state.clone());
+    let (status, body) = post_json_auth(
+        app,
+        "/customer/databases/nonexistent123/dump",
+        &json!({"ddl_only": true}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["message"]
+        .as_str()
+        .map(|msg| msg.to_lowercase().contains("not found"))
+        .unwrap_or(false));
+}
+
+#[tokio::test]
+async fn test_dump_with_tenant_but_no_pgclient() {
+    let (_app, state) = setup().await;
+    let email = format!("dumppg-{}@example.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "SecurePass1!").await;
+    let customer_id = get_customer_id(&state, &token).await;
+    let tenant_id = seed_customer_tenant(&state, &customer_id).await;
+    db::upsert_credential(&state.db, &tenant_id, "admin", "admin", "oldpass123", None)
+        .await
+        .unwrap();
+
+    let app = api::router().with_state(state.clone());
+    let uri = format!("/customer/databases/{tenant_id}/dump");
+    let (status, _body) = post_json_auth(app, &uri, &json!({"ddl_only": true}), &token).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
+
+#[tokio::test]
+async fn test_schema_no_auth() {
+    let (app, _state) = setup().await;
+    let (status, _body) = get_json(app, "/customer/databases/nonexistent123/schema").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_schema_db_not_found() {
+    let (_app, state) = setup().await;
+    let email = format!("schema404-{}@example.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "SecurePass1!").await;
+
+    let app = api::router().with_state(state.clone());
+    let (status, body) = get_json_auth(app, "/customer/databases/nonexistent123/schema", &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["message"]
+        .as_str()
+        .map(|msg| msg.to_lowercase().contains("not found"))
+        .unwrap_or(false));
+}
+
+#[tokio::test]
+async fn test_migrations_list_no_auth() {
+    let (app, _state) = setup().await;
+    let (status, _body) = get_json(app, "/customer/databases/nonexistent123/migrations").await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_migrations_list_db_not_found() {
+    let (_app, state) = setup().await;
+    let email = format!("miglist404-{}@example.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "SecurePass1!").await;
+
+    let app = api::router().with_state(state.clone());
+    let (status, body) = get_json_auth(app, "/customer/databases/nonexistent123/migrations", &token).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["message"]
+        .as_str()
+        .map(|msg| msg.to_lowercase().contains("not found"))
+        .unwrap_or(false));
+}
+
+#[tokio::test]
+async fn test_migrations_apply_no_auth() {
+    let (app, _state) = setup().await;
+    let (status, _body) = post_json(
+        app,
+        "/customer/databases/nonexistent123/migrations",
+        &json!({
+            "name": "202602120001_init",
+            "sql": "SELECT 1",
+            "checksum": "abc123"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_migrations_apply_db_not_found() {
+    let (_app, state) = setup().await;
+    let email = format!("migapply404-{}@example.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "SecurePass1!").await;
+
+    let app = api::router().with_state(state.clone());
+    let (status, body) = post_json_auth(
+        app,
+        "/customer/databases/nonexistent123/migrations",
+        &json!({
+            "name": "202602120001_init",
+            "sql": "SELECT 1",
+            "checksum": "abc123"
+        }),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["message"]
+        .as_str()
+        .map(|msg| msg.to_lowercase().contains("not found"))
+        .unwrap_or(false));
+}
+
+#[tokio::test]
+async fn test_branch_no_auth() {
+    let (app, _state) = setup().await;
+    let (status, _body) = post_json(
+        app,
+        "/customer/databases/nonexistent123/branch",
+        &json!({"name": "feature-branch"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn test_branch_db_not_found() {
+    let (_app, state) = setup().await;
+    let email = format!("branch404-{}@example.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "SecurePass1!").await;
+
+    let app = api::router().with_state(state.clone());
+    let (status, body) = post_json_auth(
+        app,
+        "/customer/databases/nonexistent123/branch",
+        &json!({"name": "feature-branch"}),
+        &token,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["message"]
+        .as_str()
+        .map(|msg| msg.to_lowercase().contains("not found"))
+        .unwrap_or(false));
+}
+
+#[tokio::test]
+async fn test_branch_with_tenant_but_no_pgclient() {
+    let (_app, state) = setup().await;
+    let email = format!("branchpg-{}@example.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "SecurePass1!").await;
+    let customer_id = get_customer_id(&state, &token).await;
+    let tenant_id = seed_customer_tenant(&state, &customer_id).await;
+    db::upsert_credential(&state.db, &tenant_id, "admin", "admin", "oldpass123", None)
+        .await
+        .unwrap();
+
+    let app = api::router().with_state(state.clone());
+    let uri = format!("/customer/databases/{tenant_id}/branch");
+    let (status, _body) = post_json_auth(app, &uri, &json!({"name": "feature-branch"}), &token).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+}
