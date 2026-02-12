@@ -1312,7 +1312,7 @@ pub async fn execute_drop_view(
 
         // CASCADE: drop views that depend on this view.
         if cascade {
-            let dropped = drop_dependent_views(store, txn, db_id, &resolved.full, search_path).await?;
+            let dropped = drop_dependent_views(store, txn, db_id, &resolved.full).await?;
             cascade_dropped.extend(dropped);
         }
 
@@ -1415,7 +1415,7 @@ pub async fn execute_drop_materialized_view(
 
         // CASCADE: drop views/matviews that depend on this materialized view.
         if cascade {
-            let dropped = drop_dependent_views(store, txn, db_id, &resolved.full, search_path).await?;
+            let dropped = drop_dependent_views(store, txn, db_id, &resolved.full).await?;
             cascade_dropped.extend(dropped);
         }
 
@@ -1506,7 +1506,7 @@ pub async fn execute_drop_table(
 
         // CASCADE: drop views that depend on this table.
         if cascade {
-            let _dropped = drop_dependent_views(store, txn, db_id, &resolved.full, search_path).await?;
+            let _dropped = drop_dependent_views(store, txn, db_id, &resolved.full).await?;
         }
 
         for trigger in store
@@ -1585,7 +1585,6 @@ async fn drop_dependent_views(
     txn: &mut Transaction,
     db_id: u64,
     target_name: &str,
-    search_path: &[String],
 ) -> Result<HashSet<String>> {
     let mut dropped = HashSet::new();
     // Names pending dependency resolution; starts with the dropped object.
@@ -1603,7 +1602,7 @@ async fn drop_dependent_views(
             if full == target_name {
                 continue;
             }
-            if super::binder::view_references_any(&view.query, &view.schema, search_path, &pending) {
+            if super::binder::view_references_any(&view.query, &view.schema, &pending) {
                 store.drop_view(txn, db_id, &full).await?;
                 dropped.insert(full.clone());
                 next_pending.push(full);
@@ -1619,7 +1618,7 @@ async fn drop_dependent_views(
             }
             if let Some(query) = store.get_materialized_view(txn, db_id, mv_name).await? {
                 let mv_schema = mv_name.split_once('.').map(|(s, _)| s).unwrap_or("public");
-                if super::binder::view_references_any(&query, mv_schema, search_path, &pending) {
+                if super::binder::view_references_any(&query, mv_schema, &pending) {
                     store.drop_materialized_view(txn, db_id, mv_name).await?;
                     for trigger in store.list_triggers_for_table(txn, db_id, mv_name).await? {
                         let _ = store

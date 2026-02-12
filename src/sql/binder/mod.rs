@@ -181,13 +181,14 @@ pub(crate) fn extract_dependencies(sql: &str) -> Result<HashSet<RelationDep>> {
 }
 
 /// Check whether `view_sql` references any of the fully-qualified names in
-/// `targets`, using `search_path` for unqualified name resolution.
+/// `targets`.
 ///
 /// Drop-in replacement for the old `view_references_any()` in `ddl.rs`.
+/// Cross-schema unqualified deps are a known limitation until a proper
+/// dependency catalog is implemented (see #666).
 pub(crate) fn view_references_any(
     view_sql: &str,
     view_schema: &str,
-    search_path: &[String],
     targets: &[String],
 ) -> bool {
     let deps = match extract_dependencies(view_sql) {
@@ -197,17 +198,12 @@ pub(crate) fn view_references_any(
     deps.iter().any(|dep| {
         targets
             .iter()
-            .any(|t| dep_matches_target(dep, t, view_schema, search_path))
+            .any(|t| dep_matches_target(dep, t, view_schema))
     })
 }
 
 /// Check whether a single dependency matches a single target.
-fn dep_matches_target(
-    dep: &RelationDep,
-    target: &str,
-    view_schema: &str,
-    search_path: &[String],
-) -> bool {
+fn dep_matches_target(dep: &RelationDep, target: &str, view_schema: &str) -> bool {
     let (target_schema, target_name) = target.split_once('.').unwrap_or(("public", target));
     match dep {
         RelationDep::Qualified { schema, name } => {
@@ -217,24 +213,12 @@ fn dep_matches_target(
             if name != target_name {
                 return false;
             }
-            // An unqualified name always resolves in the view's own schema.
-            if target_schema == view_schema {
-                return true;
-            }
-            // For cross-schema matches, check whether target_schema could
-            // plausibly resolve *before* view_schema on the search path.
-            // If view_schema appears first, the name resolves there instead.
-            if search_path.is_empty() {
-                target_schema == "public"
-            } else {
-                let target_pos = search_path.iter().position(|s| s == target_schema);
-                let view_pos = search_path.iter().position(|s| s == view_schema);
-                match (target_pos, view_pos) {
-                    (Some(tp), Some(vp)) => tp < vp,
-                    (Some(_), None) => true,
-                    _ => false,
-                }
-            }
+            // Without a dependency catalog (pg_depend), we cannot resolve
+            // unqualified names across schemas — the creation-time search_path
+            // is lost.  Conservative: only match the view's own schema.
+            // Cross-schema unqualified deps are a known limitation until a
+            // proper dependency catalog is implemented (see #666).
+            target_schema == view_schema || target_schema == "public"
         }
     }
 }

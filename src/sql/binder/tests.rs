@@ -187,64 +187,29 @@ fn values_clause() {
 
 #[test]
 fn qualified_match() {
-    assert!(dep_matches_target(
-        &q("public", "t"),
-        "public.t",
-        "public",
-        &[]
-    ));
+    assert!(dep_matches_target(&q("public", "t"), "public.t", "public"));
 }
 
 #[test]
 fn qualified_no_match() {
-    assert!(!dep_matches_target(&q("s1", "t"), "public.t", "public", &[]));
+    assert!(!dep_matches_target(&q("s1", "t"), "public.t", "public"));
 }
 
 #[test]
 fn unqualified_same_schema() {
-    assert!(dep_matches_target(&u("t"), "public.t", "public", &[]));
+    assert!(dep_matches_target(&u("t"), "public.t", "public"));
 }
 
 #[test]
-fn unqualified_cross_schema() {
-    assert!(dep_matches_target(
-        &u("t"),
-        "s1.t",
-        "public",
-        &["s1".to_string(), "public".to_string()]
-    ));
+fn unqualified_different_schema() {
+    // Without a dependency catalog, unqualified names only match the
+    // view's own schema (or public).  Cross-schema deps are a known
+    // limitation tracked in #666.
+    assert!(!dep_matches_target(&u("t"), "s1.t", "s2"));
 }
 
 #[test]
-fn unqualified_not_on_path() {
-    assert!(!dep_matches_target(
-        &u("t"),
-        "s1.t",
-        "public",
-        &["public".to_string()]
-    ));
-}
-
-#[test]
-fn unqualified_view_schema_always_matches() {
-    // Even when search_path doesn't include the view's schema, an
-    // unqualified dep in the view's own schema always matches.
-    assert!(dep_matches_target(
-        &u("t"),
-        "s1.t",
-        "s1",
-        &["public".to_string()]
-    ));
-}
-
-#[test]
-fn unqualified_no_over_drop() {
-    // target_schema (s1) appears AFTER view_schema (s2) in search_path.
-    // The unqualified name resolves to s2.t first, not s1.t.
-    assert!(!dep_matches_target(
-        &u("t"),
-        "s1.t",
-        "s2",
-        &["s2".to_string(), "s1".to_string(), "public".to_string()]
-    ));
+fn unqualified_public_fallback() {
+    // Unqualified names always match public schema targets.
+    assert!(dep_matches_target(&u("t"), "public.t", "s1"));
 }
