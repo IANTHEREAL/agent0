@@ -593,18 +593,24 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                     if matches!(chars.peek(), Some('$')) {
                         chars.next();
                         let pos = digits.parse::<usize>().map_err(|_| {
-                            anyhow!("{}", SqlError::InvalidInputSyntax {
-                                type_name: "integer".into(),
-                                value: digits.clone(),
-                            })
+                            anyhow!(
+                                "{}",
+                                SqlError::InvalidInputSyntax {
+                                    type_name: "integer".into(),
+                                    value: digits.clone(),
+                                }
+                            )
                         })?;
                         arg_pos = Some(pos.saturating_sub(1));
                     } else {
                         width = Some(digits.parse::<usize>().map_err(|_| {
-                            anyhow!("{}", SqlError::InvalidInputSyntax {
-                                type_name: "integer".into(),
-                                value: digits.clone(),
-                            })
+                            anyhow!(
+                                "{}",
+                                SqlError::InvalidInputSyntax {
+                                    type_name: "integer".into(),
+                                    value: digits.clone(),
+                                }
+                            )
                         })?);
                     }
                 }
@@ -627,10 +633,13 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                     }
                     if !width_digits.is_empty() {
                         width = Some(width_digits.parse::<usize>().map_err(|_| {
-                            anyhow!("{}", SqlError::InvalidInputSyntax {
-                                type_name: "integer".into(),
-                                value: width_digits.clone(),
-                            })
+                            anyhow!(
+                                "{}",
+                                SqlError::InvalidInputSyntax {
+                                    type_name: "integer".into(),
+                                    value: width_digits.clone(),
+                                }
+                            )
                         })?);
                     }
                 }
@@ -874,10 +883,13 @@ fn eval_function<C: EvalContext>(ctx: &C, func: &sqlparser::ast::Function) -> Re
                 Value::Int32(n) => n as i64,
                 Value::Int64(n) => n,
                 Value::Text(s) => s.trim().parse::<i64>().map_err(|_| {
-                    anyhow!("{}", SqlError::InvalidInputSyntax {
-                        type_name: "oid".into(),
-                        value: s.trim().to_string(),
-                    })
+                    anyhow!(
+                        "{}",
+                        SqlError::InvalidInputSyntax {
+                            type_name: "oid".into(),
+                            value: s.trim().to_string(),
+                        }
+                    )
                 })?,
                 Value::Null => return Ok(Value::Null),
                 _ => 0,

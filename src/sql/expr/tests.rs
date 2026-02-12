@@ -615,11 +615,13 @@ fn test_compare_order_by_values_nan() {
     use std::cmp::Ordering;
 
     assert_eq!(
-        compare_order_by_values(&Value::Float64(f64::NAN), &Value::Float64(1.0), true, false).unwrap(),
+        compare_order_by_values(&Value::Float64(f64::NAN), &Value::Float64(1.0), true, false)
+            .unwrap(),
         Ordering::Greater
     );
     assert_eq!(
-        compare_order_by_values(&Value::Float64(1.0), &Value::Float64(f64::NAN), true, false).unwrap(),
+        compare_order_by_values(&Value::Float64(1.0), &Value::Float64(f64::NAN), true, false)
+            .unwrap(),
         Ordering::Less
     );
 
@@ -2240,12 +2242,7 @@ fn test_least_jsonb_errors() {
 #[test]
 fn test_nullif_numeric_vs_non_numeric_text_errors() {
     // Numeric compared to non-numeric text should error
-    let err = eval_expr(
-        &parse_expr("NULLIF(1.5::numeric, 'abc')"),
-        None,
-        None,
-    )
-    .unwrap_err();
+    let err = eval_expr(&parse_expr("NULLIF(1.5::numeric, 'abc')"), None, None).unwrap_err();
     assert!(
         err.to_string().contains("Cannot compare numeric"),
         "expected numeric comparison error, got: {}",
@@ -2263,7 +2260,9 @@ fn test_in_list_jsonb_errors() {
     .unwrap_err();
     assert!(
         err.to_string().contains("ordering operator for type jsonb")
-            || err.to_string().contains("comparison function for type json"),
+            || err
+                .to_string()
+                .contains("comparison function for type json"),
         "expected jsonb comparison error, got: {}",
         err
     );

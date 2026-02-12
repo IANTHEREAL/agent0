@@ -8,8 +8,8 @@ use sqlparser::ast::{
 };
 use tikv_client::Transaction;
 
-use super::super::expr::{coerce_text_literal_to_bool, compare_values, eval_expr};
 use super::super::expr::operators::sort_by_fallible;
+use super::super::expr::{coerce_text_literal_to_bool, compare_values, eval_expr};
 use super::super::operators::{
     execute_operator_tree, execute_operator_tree_with_ctes, AggregateExpr, BoxedOperator,
     DistinctOnOperator, DistinctOperator, FilterOperator, HashAggregateOperator, HashJoinConfig,
@@ -1865,7 +1865,8 @@ impl Executor {
         }
 
         if !order_by.is_empty() {
-            projected_rows = self.apply_order_by_for_aggregate(projected_rows, order_by, &columns)?;
+            projected_rows =
+                self.apply_order_by_for_aggregate(projected_rows, order_by, &columns)?;
         }
 
         if offset > 0 {
