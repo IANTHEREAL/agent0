@@ -159,7 +159,7 @@ impl Executor {
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
         let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
         let trigger_func_cache_insert = triggers::prefetch_trigger_functions(
-            self.tenant_keyspace(),
+            self.trigger_cache(),
             &self.store(),
             txn,
             db_id,
@@ -168,7 +168,7 @@ impl Executor {
         )
         .await?;
         let trigger_func_cache_update = triggers::prefetch_trigger_functions(
-            self.tenant_keyspace(),
+            self.trigger_cache(),
             &self.store(),
             txn,
             db_id,
@@ -262,7 +262,7 @@ impl Executor {
             let row = Row::new(row_vals);
 
             let row = match triggers::apply_before_triggers_with_cache(
-                self.tenant_keyspace(),
+                self.trigger_cache(),
                 &self.store(),
                 txn,
                 db_id,
@@ -376,7 +376,7 @@ impl Executor {
                     let updated_row = Row::new(updated_vals);
 
                     let updated_row = match triggers::apply_before_triggers_with_cache(
-                        self.tenant_keyspace(),
+                        self.trigger_cache(),
                         &self.store(),
                         txn,
                         db_id,
@@ -463,12 +463,8 @@ impl Executor {
         }
 
         if inserted > 0 {
-            crate::sql::stats::bump_row_count_estimate(
-                self.tenant_keyspace(),
-                db_id,
-                schema.table_id,
-                inserted as isize,
-            );
+            self.stats_cache()
+                .bump_estimate(db_id, schema.table_id, inserted as isize);
         }
 
         if returning.is_some() {
@@ -754,7 +750,7 @@ impl Executor {
         let enum_cache = dml::build_enum_label_cache(&self.store(), txn, db_id, &schema).await?;
         let trigger_defs = self.store().list_triggers_for_table(txn, db_id, &t).await?;
         let trigger_func_cache_update = triggers::prefetch_trigger_functions(
-            self.tenant_keyspace(),
+            self.trigger_cache(),
             &self.store(),
             txn,
             db_id,
@@ -966,7 +962,7 @@ impl Executor {
 
             let new_row = Row::new(new_vals);
             let new_row = match triggers::apply_before_triggers_with_cache(
-                self.tenant_keyspace(),
+                self.trigger_cache(),
                 &self.store(),
                 txn,
                 db_id,

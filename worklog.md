@@ -168,3 +168,60 @@ Verified every `#[allow(dead_code)]` item against actual call sites. Major corre
 ### Verification
 - Lint correctly fails on unpatched master (catches all 3 categories)
 - Lint passes on combined PR 1 + PR 2 + PR 3 codebase
+
+---
+
+# Refactor: Ownership-Based Cache Lifecycle (#650 follow-up)
+
+## 2026-02-12
+
+### Objective
+Move process-global caches (`COMPILED_BODY_CACHE`, `TABLE_STATS`) from `static LazyLock<DashMap<String, HashMap<K, V>>>` into per-tenant `DashMap<K, V>` owned by `TenantEntry`. When the reaper drops a `TenantEntry`, its caches are dropped automatically via Rust's `Drop`. No manual eviction API needed.
+
+### Context
+- Issue #650 identified process-global caches as cross-tenant leakage risk
+- PR #660 fixed isolation by adding keyspace as outer key + manual evict APIs
+- This refactor: structural improvement — move caches into per-tenant ownership
+
+### Plan
+- New structs: `TriggerBodyCache`, `TableStatsCache`
+- Ownership chain: `TenantEntry` → `Arc<TriggerBodyCache>` + `Arc<TableStatsCache>`
+- ~10 files affected
+- Delete global statics + eviction APIs
+
+### Implementation (Local)
+
+**Files changed (10):**
+
+1. `src/sql/stats.rs` — Replaced `static TABLE_STATS: LazyLock<DashMap<String, HashMap<...>>>` with `TableStatsCache` struct containing `DashMap<(u64, u64), usize>`. Methods: `update_estimate`, `bump_estimate`, `get_estimate`. Deleted `evict_keyspace_stats()`. Tests rewritten to use instances.
+
+2. `src/sql/triggers.rs` — Replaced `static COMPILED_BODY_CACHE: LazyLock<DashMap<String, HashMap<...>>>` with `TriggerBodyCache` struct containing `DashMap<(u64, u32), CompiledTriggerBody>`. Changed `prefetch_trigger_functions`, `apply_before_triggers_with_cache`, `execute_trigger_function`, `execute_trigger_body_cached` to take `&TriggerBodyCache` instead of `keyspace: &str`. Deleted `evict_compiled_bodies()`. Tests rewritten to use instances.
+
+3. `src/sql/mod.rs` — Changed `mod triggers` to `pub(crate) mod triggers` for cross-module visibility.
+
+4. `src/pool.rs` — Added `trigger_cache: Arc<TriggerBodyCache>` and `stats_cache: Arc<TableStatsCache>` to `TenantEntry`. Created in `TenantEntry::new()`. Added `trigger_cache()` and `stats_cache()` accessors to `TenantHandle`. Updated test helper.
+
+5. `src/sql/executor/core/mod.rs` — Added `trigger_cache: Arc<TriggerBodyCache>` and `stats_cache: Arc<TableStatsCache>` to `Executor`. Extended `Executor::new()`. Added accessor methods.
+
+6. `src/protocol/handler/dynamic.rs` — Extracts caches from `TenantHandle` and passes to `Executor::new()`. Non-pool path creates fresh cache instances.
+
+7. `src/sql/trigger_worker.rs` — Changed `process_keyspace()` from `pool.get_client()` to `pool.acquire()` for cache access + reaper protection. Passes caches to `Executor::new()`.
+
+8. `src/sql/executor/dml.rs` — 7 call sites updated: 3× `prefetch_trigger_functions` → `self.trigger_cache()`, 3× `apply_before_triggers_with_cache` → `self.trigger_cache()`, 1× `bump_row_count_estimate` → `self.stats_cache().bump_estimate()`.
+
+9. `src/sql/executor/core/scan.rs` — `update_row_count_estimate` → `self.stats_cache().update_estimate()`.
+
+10. `src/sql/executor/operators.rs` + `src/sql/executor/select/mod.rs` — 3× `get_row_count_estimate` → `self.stats_cache().get_estimate()`.
+
+**What got deleted:**
+- `static COMPILED_BODY_CACHE` (global)
+- `static TABLE_STATS` (global)
+- `evict_compiled_bodies()` function
+- `evict_keyspace_stats()` function
+- All `#[allow(dead_code)]` annotations for eviction APIs
+- `keyspace: &str` parameter from 5 trigger functions
+
+### Verification
+- `cargo test -p pg-tikv`: **1116 passed**, 0 failed
+- `cargo clippy -p pg-tikv`: no new warnings (only pre-existing vendored tikv-client warnings)
+- `cargo fmt -p pg-tikv --check`: clean

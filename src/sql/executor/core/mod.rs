@@ -48,6 +48,8 @@ use super::super::query;
 use super::super::rbac;
 use super::super::sequences;
 use super::super::statement_time;
+use super::super::stats::TableStatsCache;
+use super::super::triggers::TriggerBodyCache;
 use super::super::udt;
 use super::super::value_coercion::parse_value_for_copy;
 use super::super::{parse_sql, ExecuteResult, ExecuteResults, InFailedSqlTransaction, Session};
@@ -78,6 +80,8 @@ pub struct Executor {
     auth_manager: AuthManager,
     tenant_keyspace: String,
     observability: Arc<TenantObservability>,
+    trigger_cache: Arc<TriggerBodyCache>,
+    stats_cache: Arc<TableStatsCache>,
 }
 
 impl Executor {
@@ -85,12 +89,16 @@ impl Executor {
         store: Arc<TikvStore>,
         tenant_keyspace: String,
         observability: Arc<TenantObservability>,
+        trigger_cache: Arc<TriggerBodyCache>,
+        stats_cache: Arc<TableStatsCache>,
     ) -> Self {
         Self {
             store,
             auth_manager: AuthManager::new(),
             tenant_keyspace,
             observability,
+            trigger_cache,
+            stats_cache,
         }
     }
 
@@ -108,5 +116,13 @@ impl Executor {
 
     pub fn auth_manager(&self) -> &AuthManager {
         &self.auth_manager
+    }
+
+    pub fn trigger_cache(&self) -> &Arc<TriggerBodyCache> {
+        &self.trigger_cache
+    }
+
+    pub fn stats_cache(&self) -> &Arc<TableStatsCache> {
+        &self.stats_cache
     }
 }
