@@ -4,6 +4,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use rand::Rng;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 
 use crate::auth::CustomerAuth;
 use crate::db;
@@ -50,6 +51,13 @@ pub fn router() -> Router<AppState> {
             "/databases/:database_id/users/:username",
             delete(delete_database_user),
         )
+        .route("/databases/:database_id/dump", post(dump_database))
+        .route("/databases/:database_id/schema", get(get_database_schema))
+        .route(
+            "/databases/:database_id/migrations",
+            post(apply_database_migration).get(list_database_migrations),
+        )
+        .route("/databases/:database_id/branch", post(branch_database))
 }
 
 // ── Helper functions ────────────────────────────────────────────
@@ -88,6 +96,62 @@ fn parse_region_from_tags(tags: &Option<String>) -> Option<String> {
     tags.as_ref()
         .and_then(|t| serde_json::from_str::<Vec<String>>(t).ok())
         .and_then(|v| v.into_iter().next())
+}
+
+fn escape_identifier(identifier: &str) -> String {
+    identifier.replace('"', "\"\"")
+}
+
+fn escape_sql_literal(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn sql_literal_from_json(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Null => "NULL".to_string(),
+        serde_json::Value::Bool(v) => {
+            if *v {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        serde_json::Value::Number(v) => v.to_string(),
+        serde_json::Value::String(v) => format!("'{}'", escape_sql_literal(v)),
+        serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            format!("'{}'", escape_sql_literal(&value.to_string()))
+        }
+    }
+}
+
+fn sql_result_column_index(result: &SqlResult, name: &str) -> Result<usize, AppError> {
+    result
+        .columns
+        .iter()
+        .position(|c| c.name == name)
+        .ok_or_else(|| {
+            AppError::internal(format!(
+                "Missing expected column '{}' in SQL result",
+                name
+            ))
+        })
+}
+
+fn row_string_at(
+    row: &[serde_json::Value],
+    idx: usize,
+    field_name: &str,
+) -> Result<String, AppError> {
+    row.get(idx)
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .ok_or_else(|| AppError::internal(format!("Invalid '{}' value in SQL result", field_name)))
+}
+
+fn row_optional_string_at(row: &[serde_json::Value], idx: usize) -> Option<String> {
+    row.get(idx)
+        .and_then(|v| if v.is_null() { None } else { v.as_str() })
+        .map(|v| v.to_string())
 }
 
 async fn get_customer_tenant_and_admin_credential(
@@ -799,6 +863,442 @@ pub async fn get_database_observability(
         .collect();
 
     Ok(Json(TenantObservabilityResponse { summary, samples }))
+}
+
+pub async fn dump_database(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+    Path(database_id): Path<String>,
+    Json(req): Json<DumpRequest>,
+) -> Result<Json<DumpResponse>, AppError> {
+    let (tenant, cred) =
+        get_customer_tenant_and_admin_credential(&state, &auth.customer_id, &database_id).await?;
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+    let ddl_result = pg
+        .run_sql_structured(
+            &tenant.id,
+            &cred.username,
+            &cred.password_plain,
+            "SELECT * FROM _pgtikv_sys_export_ddl() ORDER BY object_type",
+        )
+        .await
+        .map_err(|e| AppError::bad_gateway(format!("Failed to export DDL: {e}")))?;
+
+    let ddl_sql_idx = sql_result_column_index(&ddl_result, "ddl_sql")?;
+    let mut ddl_statements = Vec::new();
+    for row in &ddl_result.rows {
+        if let Some(stmt) = row.get(ddl_sql_idx).and_then(|v| v.as_str()) {
+            let trimmed = stmt.trim();
+            if !trimmed.is_empty() {
+                ddl_statements.push(trimmed.to_string());
+            }
+        }
+    }
+
+    let object_count = ddl_statements.len();
+    let mut sections = Vec::new();
+    if !ddl_statements.is_empty() {
+        sections.push(ddl_statements.join(";\n\n"));
+    }
+
+    if !req.ddl_only {
+        let table_result = pg
+            .run_sql_structured(
+                &tenant.id,
+                &cred.username,
+                &cred.password_plain,
+                "SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'BASE TABLE' AND table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name",
+            )
+            .await
+            .map_err(|e| AppError::bad_gateway(format!("Failed to enumerate tables: {e}")))?;
+
+        let table_schema_idx = sql_result_column_index(&table_result, "table_schema")?;
+        let table_name_idx = sql_result_column_index(&table_result, "table_name")?;
+
+        let mut insert_statements = Vec::new();
+        for row in &table_result.rows {
+            let table_schema = row_string_at(row, table_schema_idx, "table_schema")?;
+            let table_name = row_string_at(row, table_name_idx, "table_name")?;
+            let qualified_table = format!(
+                "\"{}\".\"{}\"",
+                escape_identifier(&table_schema),
+                escape_identifier(&table_name)
+            );
+            let select_sql = format!("SELECT * FROM {qualified_table}");
+
+            let table_data = pg
+                .run_sql_structured(&tenant.id, &cred.username, &cred.password_plain, &select_sql)
+                .await
+                .map_err(|e| {
+                    AppError::bad_gateway(format!(
+                        "Failed to export rows from {}.{}: {e}",
+                        table_schema, table_name
+                    ))
+                })?;
+
+            if table_data.columns.is_empty() || table_data.rows.is_empty() {
+                continue;
+            }
+
+            let column_list = table_data
+                .columns
+                .iter()
+                .map(|c| format!("\"{}\"", escape_identifier(&c.name)))
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            for data_row in &table_data.rows {
+                let value_list = data_row
+                    .iter()
+                    .map(sql_literal_from_json)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                insert_statements.push(format!(
+                    "INSERT INTO {qualified_table} ({column_list}) VALUES ({value_list});"
+                ));
+            }
+        }
+
+        if !insert_statements.is_empty() {
+            sections.push(insert_statements.join("\n"));
+        }
+    }
+
+    let sql = sections.join("\n\n");
+    Ok(Json(DumpResponse { sql, object_count }))
+}
+
+pub async fn get_database_schema(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+    Path(database_id): Path<String>,
+) -> Result<Json<SchemaResponse>, AppError> {
+    let (tenant, cred) =
+        get_customer_tenant_and_admin_credential(&state, &auth.customer_id, &database_id).await?;
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+
+    let columns_result = pg
+        .run_sql_structured(
+            &tenant.id,
+            &cred.username,
+            &cred.password_plain,
+            "SELECT table_schema, table_name, column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name, ordinal_position",
+        )
+        .await
+        .map_err(|e| AppError::bad_gateway(format!("Failed to load schema columns: {e}")))?;
+
+    let table_schema_idx = sql_result_column_index(&columns_result, "table_schema")?;
+    let table_name_idx = sql_result_column_index(&columns_result, "table_name")?;
+    let column_name_idx = sql_result_column_index(&columns_result, "column_name")?;
+    let data_type_idx = sql_result_column_index(&columns_result, "data_type")?;
+    let is_nullable_idx = sql_result_column_index(&columns_result, "is_nullable")?;
+    let column_default_idx = sql_result_column_index(&columns_result, "column_default")?;
+
+    let mut grouped: BTreeMap<(String, String), Vec<ColumnMetadata>> = BTreeMap::new();
+    for row in &columns_result.rows {
+        let schema = row_string_at(row, table_schema_idx, "table_schema")?;
+        let table = row_string_at(row, table_name_idx, "table_name")?;
+        let column_name = row_string_at(row, column_name_idx, "column_name")?;
+        let data_type = row_string_at(row, data_type_idx, "data_type")?;
+        let nullable = row
+            .get(is_nullable_idx)
+            .and_then(|v| v.as_str())
+            .map(|v| v.eq_ignore_ascii_case("YES"))
+            .unwrap_or(false);
+        let default_value = row_optional_string_at(row, column_default_idx);
+
+        grouped
+            .entry((schema, table))
+            .or_default()
+            .push(ColumnMetadata {
+                name: column_name,
+                data_type,
+                nullable,
+                default_value,
+            });
+    }
+
+    let tables = grouped
+        .into_iter()
+        .map(|((schema, name), columns)| TableMetadata {
+            name,
+            schema,
+            columns,
+        })
+        .collect::<Vec<_>>();
+
+    let views_result = pg
+        .run_sql_structured(
+            &tenant.id,
+            &cred.username,
+            &cred.password_plain,
+            "SELECT table_schema, table_name FROM information_schema.tables WHERE table_type = 'VIEW' AND table_schema NOT IN ('pg_catalog', 'information_schema') ORDER BY table_schema, table_name",
+        )
+        .await
+        .map_err(|e| AppError::bad_gateway(format!("Failed to load views: {e}")))?;
+
+    let view_schema_idx = sql_result_column_index(&views_result, "table_schema")?;
+    let view_name_idx = sql_result_column_index(&views_result, "table_name")?;
+    let mut views = Vec::new();
+    for row in &views_result.rows {
+        views.push(ViewMetadata {
+            schema: row_string_at(row, view_schema_idx, "table_schema")?,
+            name: row_string_at(row, view_name_idx, "table_name")?,
+        });
+    }
+
+    Ok(Json(SchemaResponse { tables, views }))
+}
+
+pub async fn apply_database_migration(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+    Path(database_id): Path<String>,
+    Json(req): Json<MigrationApplyRequest>,
+) -> Result<Json<MigrationApplyResponse>, AppError> {
+    if req.name.trim().is_empty() || req.sql.trim().is_empty() || req.checksum.trim().is_empty() {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "'name', 'sql', and 'checksum' are required",
+        ));
+    }
+
+    let (tenant, cred) =
+        get_customer_tenant_and_admin_credential(&state, &auth.customer_id, &database_id).await?;
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+    let migrations_result = pg
+        .run_sql_structured(
+            &tenant.id,
+            &cred.username,
+            &cred.password_plain,
+            "SELECT * FROM _pgtikv_sys_migrations()",
+        )
+        .await
+        .map_err(|e| AppError::bad_gateway(format!("Failed to list migrations: {e}")))?;
+
+    let name_idx = sql_result_column_index(&migrations_result, "name")?;
+    let checksum_idx = sql_result_column_index(&migrations_result, "checksum")?;
+
+    let existing = migrations_result.rows.iter().find_map(|row| {
+        let migration_name = row.get(name_idx)?.as_str()?;
+        if migration_name == req.name {
+            row.get(checksum_idx)
+                .and_then(|v| v.as_str())
+                .map(|checksum| checksum.to_string())
+        } else {
+            None
+        }
+    });
+
+    if let Some(existing_checksum) = existing {
+        if existing_checksum == req.checksum {
+            return Ok(Json(MigrationApplyResponse {
+                status: "already_applied".to_string(),
+                name: req.name,
+            }));
+        }
+
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            format!("Migration '{}' exists with different checksum", req.name),
+        ));
+    }
+
+    pg.run_sql_structured(&tenant.id, &cred.username, &cred.password_plain, req.sql.trim())
+        .await
+        .map_err(|e| AppError::bad_gateway(format!("Failed to apply migration SQL: {e}")))?;
+
+    Ok(Json(MigrationApplyResponse {
+        status: "applied".to_string(),
+        name: req.name,
+    }))
+}
+
+pub async fn list_database_migrations(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+    Path(database_id): Path<String>,
+) -> Result<Json<Vec<MigrationMetadata>>, AppError> {
+    let (tenant, cred) =
+        get_customer_tenant_and_admin_credential(&state, &auth.customer_id, &database_id).await?;
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+    let result = pg
+        .run_sql_structured(
+            &tenant.id,
+            &cred.username,
+            &cred.password_plain,
+            "SELECT * FROM _pgtikv_sys_migrations()",
+        )
+        .await
+        .map_err(|e| AppError::bad_gateway(format!("Failed to list migrations: {e}")))?;
+
+    let name_idx = sql_result_column_index(&result, "name")?;
+    let applied_at_idx = sql_result_column_index(&result, "applied_at")?;
+    let checksum_idx = sql_result_column_index(&result, "checksum")?;
+    let sql_preview_idx = sql_result_column_index(&result, "sql_preview")?;
+
+    let mut migrations = Vec::new();
+    for row in &result.rows {
+        migrations.push(MigrationMetadata {
+            name: row_string_at(row, name_idx, "name")?,
+            applied_at: row_string_at(row, applied_at_idx, "applied_at")?,
+            checksum: row_string_at(row, checksum_idx, "checksum")?,
+            sql_preview: row_string_at(row, sql_preview_idx, "sql_preview")?,
+        });
+    }
+
+    Ok(Json(migrations))
+}
+
+pub async fn branch_database(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+    Path(database_id): Path<String>,
+    Json(req): Json<BranchRequest>,
+) -> Result<(StatusCode, Json<DatabaseResponse>), AppError> {
+    if req.name.trim().is_empty() {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "Branch name cannot be empty",
+        ));
+    }
+
+    let (source_tenant, source_cred) =
+        get_customer_tenant_and_admin_credential(&state, &auth.customer_id, &database_id).await?;
+
+    let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
+    let export_result = pg
+        .run_sql_structured(
+            &source_tenant.id,
+            &source_cred.username,
+            &source_cred.password_plain,
+            "SELECT * FROM _pgtikv_sys_export_ddl() ORDER BY object_type",
+        )
+        .await
+        .map_err(|e| AppError::bad_gateway(format!("Failed to export source schema: {e}")))?;
+
+    let ddl_sql_idx = sql_result_column_index(&export_result, "ddl_sql")?;
+    let ddl_script = export_result
+        .rows
+        .iter()
+        .filter_map(|row| row.get(ddl_sql_idx).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(";\n\n");
+
+    let tenant_id = generate_tenant_id();
+    let keyspace = make_keyspace(&tenant_id);
+    let admin_user = DEFAULT_ADMIN_USER.to_string();
+    let password = generate_password();
+
+    if db::get_tenant_by_id(&state.db, &tenant_id).await?.is_some() {
+        return Err(AppError::conflict("ID collision, please retry"));
+    }
+
+    let now = chrono::Utc::now().to_rfc3339();
+    db::insert_tenant(
+        &state.db,
+        &tenant_id,
+        &keyspace,
+        tenant_state::CREATING,
+        &now,
+    )
+    .await?;
+
+    let pd = PdClient::new(&state.config.pd_endpoints, &state.http_client);
+    if !pd.create_keyspace(&keyspace).await {
+        db::update_tenant_state(
+            &state.db,
+            &tenant_id,
+            tenant_state::CREATE_FAILED,
+            Some("Failed to create keyspace in PD"),
+        )
+        .await?;
+        return Err(AppError::internal("Failed to create branch database"));
+    }
+
+    if !pg
+        .bootstrap_admin_password(&tenant_id, &admin_user, DEFAULT_ADMIN_PASSWORD, &password)
+        .await
+    {
+        db::update_tenant_state(
+            &state.db,
+            &tenant_id,
+            tenant_state::CREATE_FAILED,
+            Some("Keyspace created but password bootstrap failed"),
+        )
+        .await?;
+        return Err(AppError::internal(
+            "Failed to initialize branch database. Please retry.",
+        ));
+    }
+
+    if !ddl_script.is_empty() {
+        if let Err(err) = pg
+            .run_sql_structured(&tenant_id, &admin_user, &password, &ddl_script)
+            .await
+        {
+            db::update_tenant_state(
+                &state.db,
+                &tenant_id,
+                tenant_state::CREATE_FAILED,
+                Some("Schema bootstrap failed"),
+            )
+            .await?;
+            return Err(AppError::bad_gateway(format!(
+                "Failed to apply branch schema: {err}"
+            )));
+        }
+    }
+
+    db::update_tenant_state(&state.db, &tenant_id, tenant_state::ACTIVE, None).await?;
+    db::set_tenant_customer_id(&state.db, &tenant_id, &auth.customer_id).await?;
+
+    db::upsert_credential(
+        &state.db,
+        &tenant_id,
+        "admin",
+        &admin_user,
+        &password,
+        state.config.credential_key.as_deref(),
+    )
+    .await
+    .ok();
+
+    let source_region = parse_region_from_tags(&source_tenant.tags);
+    let tags_json = source_region
+        .as_ref()
+        .map(|r| serde_json::to_string(&vec![r]).unwrap_or_else(|_| "[]".into()));
+    let notes = format!("{} [branch-of:{}]", req.name.trim(), database_id);
+    db::update_tenant_metadata(&state.db, &tenant_id, Some(&notes), tags_json.as_deref()).await?;
+
+    let endpoints = state.config.parse_public_endpoints();
+    let (host, port) = endpoints
+        .first()
+        .cloned()
+        .unwrap_or_else(|| ("127.0.0.1".into(), DEFAULT_PG_PORT));
+    let connection_string =
+        build_connection_string(&tenant_id, &admin_user, &password, &host, port);
+
+    Ok((
+        StatusCode::CREATED,
+        Json(DatabaseResponse {
+            id: tenant_id,
+            name: req.name,
+            state: tenant_state::ACTIVE.to_string(),
+            region: source_region,
+            endpoints: None,
+            admin_user: Some(admin_user),
+            admin_password: Some(password),
+            created_at: now,
+            connection_string: Some(connection_string),
+        }),
+    ))
 }
 
 pub async fn execute_database_sql_structured(

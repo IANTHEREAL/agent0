@@ -340,6 +340,24 @@ pub struct CreateDatabaseRequest {
     pub region: Option<String>,
 }
 
+#[derive(Deserialize)]
+pub struct DumpRequest {
+    #[serde(default)]
+    pub ddl_only: bool,
+}
+
+#[derive(Deserialize)]
+pub struct MigrationApplyRequest {
+    pub name: String,
+    pub sql: String,
+    pub checksum: String,
+}
+
+#[derive(Deserialize)]
+pub struct BranchRequest {
+    pub name: String,
+}
+
 #[derive(Serialize)]
 pub struct CustomerResponse {
     pub id: String,
@@ -379,6 +397,55 @@ pub struct TokenResponse {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DumpResponse {
+    pub sql: String,
+    pub object_count: usize,
+}
+
+#[derive(Serialize)]
+pub struct SchemaResponse {
+    pub tables: Vec<TableMetadata>,
+    pub views: Vec<ViewMetadata>,
+}
+
+#[derive(Serialize)]
+pub struct TableMetadata {
+    pub name: String,
+    pub schema: String,
+    pub columns: Vec<ColumnMetadata>,
+}
+
+#[derive(Serialize)]
+pub struct ColumnMetadata {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub data_type: String,
+    pub nullable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_value: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct ViewMetadata {
+    pub name: String,
+    pub schema: String,
+}
+
+#[derive(Serialize)]
+pub struct MigrationApplyResponse {
+    pub status: String,
+    pub name: String,
+}
+
+#[derive(Serialize)]
+pub struct MigrationMetadata {
+    pub name: String,
+    pub checksum: String,
+    pub applied_at: String,
+    pub sql_preview: String,
 }
 
 // ── Customer DB row types ───────────────────────────────────────
