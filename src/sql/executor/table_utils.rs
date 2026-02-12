@@ -9,8 +9,9 @@ use super::super::names::normalize_ident;
 use super::super::{parse_sql, ExecuteResult};
 use super::core::Executor;
 use crate::sql::error::SqlError;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::types::{ColumnDef, DataType, MigrationRecord, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
+use chrono::Utc;
 use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Ident, Query, Statement};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -1031,6 +1032,112 @@ impl Executor {
         };
 
         let rows: Vec<Row> = values.into_iter().map(|v| Row::new(vec![v])).collect();
+        Ok((schema, rows))
+    }
+
+    pub(crate) async fn execute_record_migration(
+        &self,
+        txn: &mut Transaction,
+        args: &[FunctionArg],
+    ) -> Result<(TableSchema, Vec<Row>)> {
+        use super::super::expr::eval_expr;
+
+        fn extract_expr(arg: &FunctionArg) -> Result<&Expr> {
+            match arg {
+                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Ok(e),
+                _ => Err(anyhow!(
+                    "_pgtikv_sys_record_migration requires expression arguments"
+                )),
+            }
+        }
+
+        if args.len() != 3 {
+            return Err(anyhow!(
+                "_pgtikv_sys_record_migration requires exactly 3 arguments"
+            ));
+        }
+
+        let name = match eval_expr(extract_expr(&args[0])?, None, None)? {
+            Value::Text(v) => v,
+            _ => {
+                return Err(anyhow!(
+                    "_pgtikv_sys_record_migration name must be TEXT"
+                ));
+            }
+        };
+        let checksum = match eval_expr(extract_expr(&args[1])?, None, None)? {
+            Value::Text(v) => v,
+            _ => {
+                return Err(anyhow!(
+                    "_pgtikv_sys_record_migration checksum must be TEXT"
+                ));
+            }
+        };
+        let sql_preview = match eval_expr(extract_expr(&args[2])?, None, None)? {
+            Value::Text(v) => v,
+            _ => {
+                return Err(anyhow!(
+                    "_pgtikv_sys_record_migration sql_preview must be TEXT"
+                ));
+            }
+        };
+
+        let applied_at = Utc::now().to_rfc3339();
+        let record = MigrationRecord {
+            name: name.clone(),
+            applied_at: applied_at.clone(),
+            checksum,
+            sql_preview,
+        };
+        self.store().record_migration(txn, record).await?;
+
+        let schema = TableSchema {
+            table_id: 0,
+            name: "_pgtikv_sys_record_migration".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "applied_at".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+                ColumnDef {
+                    name: "status".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    is_serial: false,
+                    default_expr: None,
+                },
+            ],
+            pk_constraint_name: None,
+            pk_indices: vec![],
+            indexes: vec![],
+            version: 1,
+            check_constraints: vec![],
+            foreign_keys: vec![],
+            owner: String::new(),
+            from_alias: None,
+        };
+
+        let rows = vec![Row::new(vec![
+            Value::Text(name),
+            Value::Text(applied_at),
+            Value::Text("recorded".to_string()),
+        ])];
         Ok((schema, rows))
     }
 

@@ -302,6 +302,20 @@ impl Executor {
                     } else {
                         return Err(anyhow!("generate_series requires at least 2 arguments"));
                     }
+                } else if tbl_upper == "_PGTIKV_SYS_RECORD_MIGRATION" {
+                    if let Some(func_args) = args {
+                        let als = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| obj_name.clone());
+                        let (schema, rows) =
+                            self.execute_record_migration(txn, func_args).await?;
+                        (schema.name.clone(), als, schema, rows, true, true)
+                    } else {
+                        return Err(anyhow!(
+                            "_pgtikv_sys_record_migration requires exactly 3 arguments"
+                        ));
+                    }
                 } else {
                     if let Some(func_args) = args {
                         if let Some(result) = self

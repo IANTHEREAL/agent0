@@ -1111,6 +1111,22 @@ pub async fn apply_database_migration(
         .await
         .map_err(|e| AppError::bad_gateway(format!("Failed to apply migration SQL: {e}")))?;
 
+    // Record the migration after successful SQL execution
+    let preview = if req.sql.len() > 200 {
+        &req.sql[..200]
+    } else {
+        &req.sql
+    };
+    let record_sql = format!(
+        "SELECT * FROM _pgtikv_sys_record_migration('{}', '{}', '{}')",
+        req.name.replace('\'', "''"),
+        req.checksum.replace('\'', "''"),
+        preview.replace('\'', "''"),
+    );
+    pg.run_sql_structured(&tenant.id, &cred.username, &cred.password_plain, &record_sql)
+        .await
+        .map_err(|e| AppError::bad_gateway(format!("Failed to record migration: {e}")))?;
+
     Ok(Json(MigrationApplyResponse {
         status: "applied".to_string(),
         name: req.name,

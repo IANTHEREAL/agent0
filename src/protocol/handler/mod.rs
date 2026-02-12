@@ -779,6 +779,83 @@ fn base_table_name(full: &str) -> &str {
     full.rsplit('.').next().unwrap_or(full)
 }
 
+fn infer_system_table_function_schema(func_name: &str) -> Option<TableSchema> {
+    fn col(name: &str, data_type: DataType) -> ColumnDef {
+        ColumnDef {
+            name: name.to_string(),
+            data_type,
+            nullable: false,
+            primary_key: false,
+            unique: false,
+            is_serial: false,
+            default_expr: None,
+        }
+    }
+
+    let columns = match func_name.to_ascii_uppercase().as_str() {
+        "_PGTIKV_SYS_EXPORT_DDL" => vec![
+            col("object_type", DataType::Text),
+            col("object_name", DataType::Text),
+            col("ddl_sql", DataType::Text),
+        ],
+        "_PGTIKV_SYS_MIGRATIONS" => vec![
+            col("name", DataType::Text),
+            col("applied_at", DataType::Text),
+            col("checksum", DataType::Text),
+            col("sql_preview", DataType::Text),
+        ],
+        "_PGTIKV_SYS_RECORD_MIGRATION" => vec![
+            col("name", DataType::Text),
+            col("applied_at", DataType::Text),
+            col("status", DataType::Text),
+        ],
+        "_PGTIKV_SYS_OBSERVABILITY" => vec![
+            col("window_seconds", DataType::Int64),
+            col("statement_count", DataType::Int64),
+            col("txn_commit_count", DataType::Int64),
+            col("error_count", DataType::Int64),
+            col("qps", DataType::Float64),
+            col("tps", DataType::Float64),
+            col("latency_avg_ms", DataType::Float64),
+            col("latency_p99_ms", DataType::Float64),
+            col("active_connections", DataType::Int64),
+        ],
+        "_PGTIKV_SYS_QUERY_SAMPLES" => vec![
+            col("query", DataType::Text),
+            col("sample_count", DataType::Int64),
+            col("error_count", DataType::Int64),
+            col("latency_avg_ms", DataType::Float64),
+            col("latency_p99_ms", DataType::Float64),
+            col("latency_max_ms", DataType::Float64),
+            col("last_seen_ms_ago", DataType::Int64),
+        ],
+        "_PGTIKV_SYS_TRIGGER_QUEUE_STATS" => vec![
+            col("keyspace", DataType::Text),
+            col("pending", DataType::Int64),
+            col("processing", DataType::Int64),
+            col("failed", DataType::Int64),
+            col("dlq_count", DataType::Int64),
+            col("avg_latency_ms", DataType::Float64),
+            col("events_per_min", DataType::Int64),
+        ],
+        _ => return None,
+    };
+
+    Some(TableSchema {
+        table_id: 0,
+        name: func_name.to_string(),
+        columns,
+        pk_constraint_name: None,
+        pk_indices: vec![],
+        indexes: vec![],
+        version: 1,
+        check_constraints: vec![],
+        foreign_keys: vec![],
+        owner: String::new(),
+        from_alias: None,
+    })
+}
+
 async fn infer_extension_table_function_schema(
     search_path: &[String],
     schema_opt: Option<&str>,
@@ -1337,6 +1414,9 @@ async fn collect_sources_from_table_factor(
             let mut schema = if let Some(args) = args {
                 if obj_name_norm.eq_ignore_ascii_case("generate_series") {
                     infer_generate_series_schema(args, &alias_name, alias.as_ref())?
+                } else if let Some(sys_schema) = infer_system_table_function_schema(&obj_name_norm)
+                {
+                    sys_schema
                 } else {
                     infer_extension_table_function_schema(
                         search_path,
