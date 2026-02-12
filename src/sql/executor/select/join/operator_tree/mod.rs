@@ -1233,6 +1233,7 @@ impl Executor {
             // expanded from `tables` rather than `table_aliases`.
             for item in &resolved_projection {
                 if let SelectItem::QualifiedWildcard(obj, _) = item {
+                    // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                     let qualifier = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                     if inner_alias_targets.contains_key(&qualifier.to_lowercase()) {
                         return Err(SqlError::Unsupported(format!(
@@ -1721,6 +1722,7 @@ impl Executor {
                     }
                 }
                 SelectItem::QualifiedWildcard(obj, _) => {
+                    // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                     let qualifier = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                     let (table_idx, table) = tables
                         .iter()

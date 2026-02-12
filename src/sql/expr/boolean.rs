@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue};
 
 use crate::sql::error::SqlError;
-use crate::types::{DataType, TableSchema, Value};
+use crate::types::{DataType, TableSchema};
 
 fn unwrap_nested_expr(expr: &Expr) -> &Expr {
     let mut current = expr;
@@ -21,24 +21,6 @@ fn string_literal_expr(expr: &Expr) -> Option<&str> {
         ) => Some(s.as_str()),
         _ => None,
     }
-}
-
-pub(crate) fn coerce_text_literal_to_bool(expr: &Expr, value: Value) -> Result<Value> {
-    let Value::Text(s) = value else {
-        return Ok(value);
-    };
-
-    if string_literal_expr(expr).is_none() {
-        return Ok(Value::Text(s));
-    }
-
-    super::parse_bool_pg(&s).map(Value::Boolean).ok_or_else(|| {
-        SqlError::InvalidInputSyntax {
-            type_name: "boolean".into(),
-            value: s.clone(),
-        }
-        .into()
-    })
 }
 
 fn resolve_column_type<'a>(schema: &'a TableSchema, expr: &Expr) -> Option<&'a DataType> {
@@ -325,25 +307,6 @@ mod tests {
         assert!(err
             .to_string()
             .contains("invalid input syntax for type boolean"));
-    }
-
-    #[test]
-    fn test_coerce_text_literal_to_bool_only_for_literals() {
-        let schema = test_schema();
-
-        let lit_expr = Expr::Value(SqlValue::SingleQuotedString("true".to_string()));
-        assert_eq!(
-            coerce_text_literal_to_bool(&lit_expr, Value::Text("true".to_string())).unwrap(),
-            Value::Boolean(true)
-        );
-
-        let ident_expr = Expr::Identifier(Ident::new("t"));
-        validate_bool_expr_in_boolean_context(&ident_expr, &schema, "boolean required")
-            .unwrap_err();
-        assert_eq!(
-            coerce_text_literal_to_bool(&ident_expr, Value::Text("true".to_string())).unwrap(),
-            Value::Text("true".to_string())
-        );
     }
 
     #[test]

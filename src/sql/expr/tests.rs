@@ -394,9 +394,10 @@ fn test_eval_unary_minus() {
         teval(&parse_expr("-3.14"), None, None).unwrap(),
         Value::Numeric(Decimal::from_str("-3.14").unwrap())
     );
+    // coerce_text_to_numeric tries Int64 first, so text '10' → Int64(10) → -Int64(10)
     assert_eq!(
         teval(&parse_expr("-'10'"), None, None).unwrap(),
-        Value::Int32(-10)
+        Value::Int64(-10)
     );
     assert_eq!(
         teval(&parse_expr("-'1.5'"), None, None).unwrap(),
@@ -2245,12 +2246,13 @@ fn test_least_jsonb_errors() {
 
 #[test]
 fn test_nullif_numeric_vs_non_numeric_text_errors() {
-    // Numeric compared to non-numeric text should error
+    // Numeric compared to non-numeric text should error (implicit cast fails)
     let err = teval(&parse_expr("NULLIF(1.5::numeric, 'abc')"), None, None).unwrap_err();
+    let msg = err.to_string();
     assert!(
-        err.to_string().contains("Cannot compare numeric"),
-        "expected numeric comparison error, got: {}",
-        err
+        msg.contains("invalid input syntax") || msg.contains("Cannot compare"),
+        "expected cast/comparison error, got: {}",
+        msg
     );
 }
 
@@ -2323,12 +2325,24 @@ fn test_compare_values_incompatible_types_error() {
 
 #[test]
 fn test_cross_type_coercion_still_works() {
-    // Text vs Int32 uses string coercion — must still work (not error)
-    assert!(teval(&parse_expr("GREATEST('abc', 123)"), None, None).is_ok());
-    assert!(teval(&parse_expr("LEAST('abc', 123)"), None, None).is_ok());
-    assert!(teval(&parse_expr("NULLIF(123, 'abc')"), None, None).is_ok());
-    assert!(teval(&parse_expr("1 IN ('a', 'b')"), None, None).is_ok());
-    assert!(teval(&parse_expr("1 BETWEEN 'a' AND 'z'"), None, None).is_ok());
+    // Text vs Int32: non-parseable text now errors (matches PG semantics).
+    // Old behavior fell back to string comparison; new behavior uses implicit cast.
+    assert!(teval(&parse_expr("GREATEST('abc', 123)"), None, None).is_err());
+    assert!(teval(&parse_expr("LEAST('abc', 123)"), None, None).is_err());
+    assert!(teval(&parse_expr("NULLIF(123, 'abc')"), None, None).is_err());
+    assert!(teval(&parse_expr("1 IN ('a', 'b')"), None, None).is_err());
+    assert!(teval(&parse_expr("1 BETWEEN 'a' AND 'z'"), None, None).is_err());
+
+    // Valid text-to-numeric coercion still works in comparison;
+    // GREATEST/LEAST return the original value (not coerced)
+    assert_eq!(
+        teval(&parse_expr("GREATEST('42', 123)"), None, None).unwrap(),
+        Value::Int32(123) // 123 > 42 → returns the original Int32(123)
+    );
+    assert_eq!(
+        teval(&parse_expr("LEAST('42', 123)"), None, None).unwrap(),
+        Value::Text("42".into()) // 42 < 123 → returns the original Text("42")
+    );
 }
 
 #[test]

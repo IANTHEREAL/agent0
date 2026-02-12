@@ -880,6 +880,7 @@ pub fn query_has_outer_reference(query: &Query, outer_alias: &str) -> bool {
 
         match factor {
             sqlparser::ast::TableFactor::Table { name, alias, .. } => {
+                // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                 let exposed = alias
                     .as_ref()
                     .map(|a| normalize_ident(&a.name))
@@ -892,6 +893,7 @@ pub fn query_has_outer_reference(query: &Query, outer_alias: &str) -> bool {
                 .map(|a| normalize_ident(&a.name))
                 .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
             sqlparser::ast::TableFactor::Function { name, alias, .. } => {
+                // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                 let exposed = alias
                     .as_ref()
                     .map(|a| normalize_ident(&a.name))
@@ -1311,6 +1313,7 @@ pub fn substitute_outer_values(
                         // treating the second-to-last identifier as the table/alias.
                         let table_part = normalize_ident(&parts[parts.len() - 2]);
                         if table_part.eq_ignore_ascii_case(self.outer_alias) {
+                            // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                             let col_name = parts.last().map(normalize_ident).unwrap_or_default();
                             let qualified = format!("{}.{}", table_part, col_name);
                             let col_idx = self
@@ -1394,6 +1397,7 @@ pub fn substitute_outer_values_in_query(
 
         match factor {
             sqlparser::ast::TableFactor::Table { name, alias, .. } => {
+                // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                 let exposed = alias
                     .as_ref()
                     .map(|a| normalize_ident(&a.name))
@@ -1406,6 +1410,7 @@ pub fn substitute_outer_values_in_query(
                 .map(|a| normalize_ident(&a.name))
                 .is_some_and(|a| a.eq_ignore_ascii_case(outer_alias)),
             sqlparser::ast::TableFactor::Function { name, alias, .. } => {
+                // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                 let exposed = alias
                     .as_ref()
                     .map(|a| normalize_ident(&a.name))

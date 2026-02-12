@@ -12,7 +12,7 @@ fn eval_bool_expr(
 ) -> Result<bool> {
     let qc = QueryContext::from_task_locals();
     let value = eval_expr(expr, Some(row), Some(schema), &qc)?;
-    let value = coerce_text_literal_to_bool(expr, value)?;
+    let value = crate::sql::types::cast::coerce_to_bool(value)?;
     match value {
         Value::Boolean(b) => Ok(b),
         Value::Null => Ok(false),

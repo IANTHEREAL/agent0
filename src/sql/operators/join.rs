@@ -1,11 +1,11 @@
-use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use sqlparser::ast::{Expr, JoinOperator};
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::{eval_expr, parse_bool_pg};
-use crate::types::{ColumnDef, Row, TableSchema, Value};
+use crate::sql::expr::eval_expr;
+use crate::sql::types::cast::{cast, CastContext};
+use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JoinType {
@@ -145,13 +145,12 @@ impl NestedLoopJoinOperator {
             match result {
                 Value::Boolean(b) => Ok(b),
                 Value::Null => Ok(false),
-                Value::Text(s) => parse_bool_pg(&s).ok_or_else(|| {
-                    SqlError::InvalidInputSyntax {
-                        type_name: "boolean".into(),
-                        value: s.clone(),
+                Value::Text(s) => {
+                    match cast(Value::Text(s), &DataType::Boolean, CastContext::Implicit)? {
+                        Value::Boolean(b) => Ok(b),
+                        _ => unreachable!("cast to Boolean always produces Boolean"),
                     }
-                    .into()
-                }),
+                }
                 _ => Err(anyhow!("Join condition must evaluate to boolean")),
             }
         } else {

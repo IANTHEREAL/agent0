@@ -160,6 +160,7 @@ pub(super) fn project_join_output(
                         }
                     }
                     SelectItem::QualifiedWildcard(obj, _) => {
+                        // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                         let qualifier = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                         let mut matched = false;
                         for (idx, c) in final_schema.columns.iter().enumerate() {
@@ -290,6 +291,7 @@ pub(super) fn project_join_output(
                         }
                     }
                     SelectItem::QualifiedWildcard(obj, _) => {
+                        // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                         let qualifier = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                         let mut matched = false;
                         for (idx, c) in final_schema.columns.iter().enumerate() {
@@ -366,6 +368,7 @@ pub(super) fn project_join_output(
             for item in resolved_projection {
                 match item {
                     SelectItem::QualifiedWildcard(obj, _) => {
+                        // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                         let qualifier = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                         let (table_idx, table) = tables
                             .iter()

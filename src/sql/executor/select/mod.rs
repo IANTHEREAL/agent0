@@ -13,7 +13,7 @@ use super::super::projection::{get_select_item_name, infer_expr_type};
 use super::super::sequences;
 use super::super::wildcard::build_join_wildcard_plan;
 use super::super::{
-    expr::{coerce_text_literal_to_bool, eval_expr, validate_bool_expr_in_boolean_context},
+    expr::{eval_expr, validate_bool_expr_in_boolean_context},
     ExecuteResult,
 };
 use super::core::Executor;
@@ -564,7 +564,7 @@ impl Executor {
                     let mut filtered = Vec::new();
                     for row in rows {
                         let val = eval_expr(safe, Some(&row), Some(&schema), &qc)?;
-                        let val = coerce_text_literal_to_bool(safe, val)?;
+                        let val = crate::sql::types::cast::coerce_to_bool(val)?;
                         if matches!(val, Value::Boolean(true)) {
                             filtered.push(row);
                         }
@@ -639,7 +639,7 @@ impl Executor {
                             Some(&schema),
                         )
                         .await?;
-                    let val = coerce_text_literal_to_bool(&eval_expr_input, val)?;
+                    let val = crate::sql::types::cast::coerce_to_bool(val)?;
                     if matches!(val, Value::Boolean(true)) {
                         out.push(row);
                     }

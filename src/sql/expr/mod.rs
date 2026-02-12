@@ -7,7 +7,7 @@ pub mod functions;
 mod numeric;
 pub(crate) mod operators;
 
-pub(crate) use boolean::{coerce_text_literal_to_bool, validate_bool_expr_in_boolean_context};
+pub(crate) use boolean::validate_bool_expr_in_boolean_context;
 pub use context::EvalContext;
 pub use context::{JoinEvalContext, SingleTableContext};
 
@@ -1184,7 +1184,7 @@ fn cast_to_numeric(val: Value, info: &sqlparser::ast::ExactNumberInfo) -> Result
         }
         other => {
             return Err(SqlError::InvalidCast {
-                from: other.data_type().unwrap_or(DataType::Text),
+                from: other.type_display_name(),
                 to: DataType::Numeric {
                     precision: None,
                     scale: None,
@@ -1238,7 +1238,7 @@ fn cast_custom_type(val: Value, name: &sqlparser::ast::ObjectName) -> Result<Val
                 Value::Text(s) => parse_vector_literal(s).map(Value::Vector),
                 Value::Vector(_) => Ok(val),
                 _ => Err(SqlError::InvalidCast {
-                    from: val.data_type().unwrap_or(DataType::Text),
+                    from: val.type_display_name(),
                     to: DataType::Vector(0),
                 }
                 .into()),

@@ -38,7 +38,7 @@ pub enum SqlError {
     InvalidInputSyntax { type_name: String, value: String },
 
     #[error("cannot cast type {from} to {to}")]
-    InvalidCast { from: DataType, to: DataType },
+    InvalidCast { from: String, to: DataType },
 
     // Constraint violations
     #[error("{message}")]
@@ -156,7 +156,7 @@ mod tests {
         );
         assert_eq!(
             SqlError::InvalidCast {
-                from: DataType::Text,
+                from: "text".to_string(),
                 to: DataType::Int32
             }
             .sqlstate(),

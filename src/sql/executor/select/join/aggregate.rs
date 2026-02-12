@@ -250,7 +250,7 @@ impl Executor {
                     &agg_exprs,
                     group_by_count,
                 )?;
-                let having_val = coerce_text_literal_to_bool(&rewritten_having, having_val)?;
+                let having_val = crate::sql::types::cast::coerce_to_bool(having_val)?;
                 match having_val {
                     Value::Boolean(true) => filtered_rows.push(row),
                     Value::Boolean(false) | Value::Null => {}

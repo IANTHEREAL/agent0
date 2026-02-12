@@ -261,6 +261,12 @@ pub enum Value {
 }
 
 impl Value {
+    pub fn type_display_name(&self) -> String {
+        self.data_type()
+            .map(|dt| dt.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
     pub fn data_type(&self) -> Option<DataType> {
         match self {
             Value::Null => None,

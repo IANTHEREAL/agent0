@@ -14,7 +14,7 @@ use tikv_client::Transaction;
 use super::catalog_oids;
 use super::expr::{eval_expr, eval_join_expr, JoinEvalContext};
 use super::names;
-use super::names::normalize_ident;
+use super::names::{function_name_upper, normalize_ident};
 use super::plpgsql;
 use super::value_coercion::value_to_sql_expr;
 use super::ExecuteResult;
@@ -512,14 +512,6 @@ pub(crate) async fn execute_drop_sequence(
     Ok(ExecuteResult::CommandComplete {
         tag: "DROP SEQUENCE",
     })
-}
-
-fn function_name_upper(func: &Function) -> String {
-    func.name
-        .0
-        .last()
-        .map(|n| n.value.to_uppercase())
-        .unwrap_or_default()
 }
 
 fn extract_arg_expr<'a>(args: &'a [FunctionArg], idx: usize) -> Result<&'a Expr> {

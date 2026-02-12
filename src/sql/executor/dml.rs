@@ -1,9 +1,7 @@
 //! DML operations (INSERT, UPDATE, DELETE) for the SQL executor
 
 use super::super::dml;
-use super::super::expr::{
-    coerce_text_literal_to_bool, validate_bool_expr_in_boolean_context, JoinEvalContext,
-};
+use super::super::expr::{validate_bool_expr_in_boolean_context, JoinEvalContext};
 use super::super::names;
 use super::super::names::normalize_ident;
 use super::super::trigger_queue::TriggerOp;
@@ -61,8 +59,8 @@ fn build_type_infer_schema_for_two_table_join(
     }
 }
 
-fn predicate_value_to_bool(expr: &Expr, value: Value) -> Result<bool> {
-    let value = coerce_text_literal_to_bool(expr, value)?;
+fn predicate_value_to_bool(_expr: &Expr, value: Value) -> Result<bool> {
+    let value = crate::sql::types::cast::coerce_to_bool(value)?;
     match value {
         Value::Boolean(b) => Ok(b),
         Value::Null => Ok(false),
@@ -93,7 +91,12 @@ fn value_to_expr(val: Value, _col_name: Option<&str>) -> Result<Expr> {
         }
         Value::Date(days) => {
             use chrono::NaiveDate;
-            let date = NaiveDate::from_num_days_from_ce_opt(days + 719163).unwrap_or_default();
+            let ce_days = (days as i64)
+                .checked_add(719163)
+                .and_then(|d| i32::try_from(d).ok());
+            let date = ce_days
+                .and_then(NaiveDate::from_num_days_from_ce_opt)
+                .ok_or_else(|| anyhow!("date value out of range: {}", days))?;
             Expr::Value(SqlValue::SingleQuotedString(
                 date.format("%Y-%m-%d").to_string(),
             ))
@@ -1069,5 +1072,11 @@ mod tests {
         let expr = value_to_expr(Value::Timestamp(0), None).unwrap();
         let val = crate::sql::expr::eval_expr(&expr, None, None, &qc).unwrap();
         assert_eq!(val, Value::Timestamp(0));
+    }
+
+    #[test]
+    fn value_to_expr_date_out_of_range() {
+        let result = value_to_expr(Value::Date(i32::MAX), None);
+        assert!(result.is_err(), "out-of-range date should return Err");
     }
 }

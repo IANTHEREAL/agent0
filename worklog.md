@@ -356,3 +356,43 @@ Unify `cast_value_to_type()` (explicit casts) and `coerce_value_for_column()` (a
 - `cargo check`: 0 errors, no new warnings
 - `cargo test`: **1140 passed** (1121 existing + 19 new), 0 failed
 - `cargo fmt` / `cargo clippy` / `lint_error_masking.sh`: all clean
+
+---
+
+# Issue #652 PR 2 — Wire CastContext::Implicit into Comparison & JOIN Coercion
+
+## 2026-02-12
+
+### Objective
+Centralize all implicit coercion through `cast(..., CastContext::Implicit)`, replacing scattered inline coercion logic in compare_values(), arithmetic ops, boolean coercion, and join conditions.
+
+### Status: Step 2 (Implementation) — Launched
+
+### Key Changes
+- Add `comparison_target_type()`, `coerce_pair()`, `coerce_text_to_numeric()` to cast.rs
+- Remove `#[allow(dead_code)]` from `CastContext::Implicit`
+- Refactor `compare_values()` (240 lines → coerce_pair + compare_same_type)
+- Replace `try_coerce_text_to_numeric()` with cast-based helper in arithmetic ops + evaluator
+- Replace `coerce_text_literal_to_bool` / `parse_bool_pg` runtime callers with implicit cast
+- Update Text→Bool in cast.rs to support "on"/"off" for PG compat
+- Delete ~180 lines of cross-type match arms
+
+---
+
+# Issue #649: Silent Error Masking Cleanup
+
+## 2026-02-12
+
+### Objective
+Address remaining dangerous `unwrap_or_default()` / `unwrap_or(DataType::Text)` patterns identified through comprehensive audit of ~150 occurrences.
+
+### Plan (4 parts)
+1. **Fix dangerous date conversion** — `dml.rs:94` `unwrap_or_default()` silently produces `0001-01-01` for out-of-range dates → proper error propagation
+2. **Improve InvalidCast error messages** — Change `from: DataType` → `from: String` so `Value::Null` reports "unknown" instead of misleading "text"
+3. **Centralize `function_name_upper()`** — Move from `sequences.rs` (private) to `names.rs` (pub(crate)), replace 8 inline duplicates
+4. **Document intentional patterns** — Add `// INTENTIONAL:` comments to ~12 verified-safe sites
+
+### Pantheon Exploration
+- Exploration ID: 019c51d8-8954-7894-bf76-cb24f8168ca9
+- Branch: innocent-dog-2afe2 (019c51d8-89b9-7380-be8e-fc6499847f78)
+- Status: In progress

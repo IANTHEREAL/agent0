@@ -12,9 +12,7 @@
 use crate::sql::error::SqlError;
 use crate::types::Value;
 use anyhow::{anyhow, Result};
-use rust_decimal::Decimal;
 use sqlparser::ast::BinaryOperator;
-use std::str::FromStr;
 
 use super::numeric;
 
@@ -399,24 +397,6 @@ pub(super) fn days_in_month(year: i32, month: u32) -> u32 {
     }
 }
 
-pub(super) fn try_coerce_text_to_numeric(v: Value) -> Value {
-    match &v {
-        Value::Text(s) => {
-            if let Ok(i) = s.trim().parse::<i64>() {
-                if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
-                    return Value::Int32(i as i32);
-                }
-                return Value::Int64(i);
-            }
-            if let Ok(f) = s.trim().parse::<f64>() {
-                return Value::Float64(f);
-            }
-            v
-        }
-        _ => v,
-    }
-}
-
 pub(super) fn parse_bool_pg(s: &str) -> Option<bool> {
     let s = s.trim();
     if s.eq_ignore_ascii_case("true")
@@ -441,8 +421,8 @@ pub(super) fn parse_bool_pg(s: &str) -> Option<bool> {
 }
 
 pub(super) fn add_values(left: Value, right: Value) -> Result<Value> {
-    let left = try_coerce_text_to_numeric(left);
-    let right = try_coerce_text_to_numeric(right);
+    let left = crate::sql::types::cast::coerce_text_to_numeric(left)?;
+    let right = crate::sql::types::cast::coerce_text_to_numeric(right)?;
 
     if let (Some(l), Some(r)) = (
         numeric::NumericValue::from_value(&left),
@@ -490,8 +470,8 @@ pub(super) fn sub_values(left: Value, right: Value) -> Result<Value> {
         return jsonb_subtract(left, right);
     }
 
-    let left = try_coerce_text_to_numeric(left);
-    let right = try_coerce_text_to_numeric(right);
+    let left = crate::sql::types::cast::coerce_text_to_numeric(left)?;
+    let right = crate::sql::types::cast::coerce_text_to_numeric(right)?;
 
     if let (Some(l), Some(r)) = (
         numeric::NumericValue::from_value(&left),
@@ -581,8 +561,8 @@ fn jsonb_subtract(left: Value, right: Value) -> Result<Value> {
 }
 
 fn mul_values(left: Value, right: Value) -> Result<Value> {
-    let left = try_coerce_text_to_numeric(left);
-    let right = try_coerce_text_to_numeric(right);
+    let left = crate::sql::types::cast::coerce_text_to_numeric(left)?;
+    let right = crate::sql::types::cast::coerce_text_to_numeric(right)?;
 
     if let (Some(l), Some(r)) = (
         numeric::NumericValue::from_value(&left),
@@ -692,8 +672,8 @@ fn mul_values(left: Value, right: Value) -> Result<Value> {
 }
 
 fn div_values(left: Value, right: Value) -> Result<Value> {
-    let left = try_coerce_text_to_numeric(left);
-    let right = try_coerce_text_to_numeric(right);
+    let left = crate::sql::types::cast::coerce_text_to_numeric(left)?;
+    let right = crate::sql::types::cast::coerce_text_to_numeric(right)?;
 
     if let (Some(l), Some(r)) = (
         numeric::NumericValue::from_value(&left),
@@ -716,138 +696,73 @@ fn mod_values(left: Value, right: Value) -> Result<Value> {
     Err(SqlError::Unsupported("Unsupported types for modulo".into()).into())
 }
 
-/// Compare two values. Returns:
-/// - 0: equal
-/// - 1: left > right
-/// - -1: left < right
-pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
-    fn compare_text_pg(left: &str, right: &str) -> std::cmp::Ordering {
-        // Approximate PostgreSQL's default collation behavior for ASCII:
-        // compare case-insensitively first, then order lowercase before uppercase.
-        let left_fold = left.to_ascii_lowercase();
-        let right_fold = right.to_ascii_lowercase();
-        match left_fold.cmp(&right_fold) {
-            std::cmp::Ordering::Equal => {}
-            other => return other,
-        }
-
-        for (l, r) in left
-            .as_bytes()
-            .iter()
-            .copied()
-            .zip(right.as_bytes().iter().copied())
-        {
-            if l == r {
-                continue;
-            }
-
-            let l_fold = l.to_ascii_lowercase();
-            let r_fold = r.to_ascii_lowercase();
-            if l_fold != r_fold {
-                return l_fold.cmp(&r_fold);
-            }
-
-            let l_is_upper = l.is_ascii_uppercase();
-            let r_is_upper = r.is_ascii_uppercase();
-            if l_is_upper != r_is_upper {
-                return if l_is_upper {
-                    std::cmp::Ordering::Greater
-                } else {
-                    std::cmp::Ordering::Less
-                };
-            }
-
-            return l.cmp(&r);
-        }
-
-        left.len().cmp(&right.len())
+fn compare_text_pg(left: &str, right: &str) -> std::cmp::Ordering {
+    // Approximate PostgreSQL's default collation behavior for ASCII:
+    // compare case-insensitively first, then order lowercase before uppercase.
+    let left_fold = left.to_ascii_lowercase();
+    let right_fold = right.to_ascii_lowercase();
+    match left_fold.cmp(&right_fold) {
+        std::cmp::Ordering::Equal => {}
+        other => return other,
     }
 
-    fn compare_float64_pg(left: f64, right: f64) -> std::cmp::Ordering {
-        match (left.is_nan(), right.is_nan()) {
-            (true, true) => std::cmp::Ordering::Equal,
-            (true, false) => std::cmp::Ordering::Greater,
-            (false, true) => std::cmp::Ordering::Less,
-            (false, false) => left
-                .partial_cmp(&right)
-                .expect("non-NaN floats must be comparable"),
+    for (l, r) in left
+        .as_bytes()
+        .iter()
+        .copied()
+        .zip(right.as_bytes().iter().copied())
+    {
+        if l == r {
+            continue;
         }
+
+        let l_fold = l.to_ascii_lowercase();
+        let r_fold = r.to_ascii_lowercase();
+        if l_fold != r_fold {
+            return l_fold.cmp(&r_fold);
+        }
+
+        let l_is_upper = l.is_ascii_uppercase();
+        let r_is_upper = r.is_ascii_uppercase();
+        if l_is_upper != r_is_upper {
+            return if l_is_upper {
+                std::cmp::Ordering::Greater
+            } else {
+                std::cmp::Ordering::Less
+            };
+        }
+
+        return l.cmp(&r);
     }
 
+    left.len().cmp(&right.len())
+}
+
+fn compare_float64_pg(left: f64, right: f64) -> std::cmp::Ordering {
+    match (left.is_nan(), right.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => left
+            .partial_cmp(&right)
+            .expect("non-NaN floats must be comparable"),
+    }
+}
+
+/// Compare two values of the same type. Returns -1, 0, or 1.
+fn compare_same_type(left: &Value, right: &Value) -> Result<i8> {
     match (left, right) {
         (Value::Int32(l), Value::Int32(r)) => Ok(l.cmp(r) as i8),
         (Value::Int64(l), Value::Int64(r)) => Ok(l.cmp(r) as i8),
-        (Value::Int32(l), Value::Int64(r)) => Ok((*l as i64).cmp(r) as i8),
-        (Value::Int64(l), Value::Int32(r)) => Ok(l.cmp(&(*r as i64)) as i8),
         (Value::Float64(l), Value::Float64(r)) => Ok(compare_float64_pg(*l, *r) as i8),
         (Value::Text(l), Value::Text(r)) => Ok(compare_text_pg(l, r) as i8),
         (Value::Boolean(l), Value::Boolean(r)) => Ok(l.cmp(r) as i8),
-        (Value::Boolean(l), Value::Text(t)) => match parse_bool_pg(t) {
-            Some(r) => Ok(l.cmp(&r) as i8),
-            None => Err(SqlError::InvalidInputSyntax {
-                type_name: "boolean".into(),
-                value: t.clone(),
-            }
-            .into()),
-        },
-        (Value::Text(t), Value::Boolean(r)) => match parse_bool_pg(t) {
-            Some(l) => Ok(l.cmp(r) as i8),
-            None => Err(SqlError::InvalidInputSyntax {
-                type_name: "boolean".into(),
-                value: t.clone(),
-            }
-            .into()),
-        },
         (Value::Timestamp(l), Value::Timestamp(r)) => Ok(l.cmp(r) as i8),
         (Value::Date(l), Value::Date(r)) => Ok(l.cmp(r) as i8),
-        (Value::Date(l), Value::Timestamp(r)) => {
-            let l_ts = crate::types::date::date_days_to_timestamp_millis(*l)?;
-            Ok(l_ts.cmp(r) as i8)
-        }
-        (Value::Timestamp(l), Value::Date(r)) => {
-            let r_ts = crate::types::date::date_days_to_timestamp_millis(*r)?;
-            Ok(l.cmp(&r_ts) as i8)
-        }
-        (Value::Timestamp(l), Value::Text(r)) => match super::parse_timestamp_string(r)? {
-            Value::Timestamp(r_ts) => Ok(l.cmp(&r_ts) as i8),
-            _ => Err(anyhow!("Cannot compare")),
-        },
-        (Value::Text(l), Value::Timestamp(r)) => match super::parse_timestamp_string(l)? {
-            Value::Timestamp(l_ts) => Ok(l_ts.cmp(r) as i8),
-            _ => Err(anyhow!("Cannot compare")),
-        },
-        (Value::Date(l), Value::Text(r)) => {
-            let r_days = crate::types::date::parse_date_days(r)?;
-            Ok(l.cmp(&r_days) as i8)
-        }
-        (Value::Text(l), Value::Date(r)) => {
-            let l_days = crate::types::date::parse_date_days(l)?;
-            Ok(l_days.cmp(r) as i8)
-        }
         (Value::Uuid(l), Value::Uuid(r)) => Ok(l.cmp(r) as i8),
-        (Value::Uuid(l), Value::Text(t)) => {
-            if let Ok(r) = uuid::Uuid::parse_str(t) {
-                Ok(l.cmp(r.as_bytes()) as i8)
-            } else {
-                Err(SqlError::InvalidInputSyntax {
-                    type_name: "uuid".into(),
-                    value: t.clone(),
-                }
-                .into())
-            }
-        }
-        (Value::Text(t), Value::Uuid(r)) => {
-            if let Ok(l) = uuid::Uuid::parse_str(t) {
-                Ok(l.as_bytes().cmp(r) as i8)
-            } else {
-                Err(SqlError::InvalidInputSyntax {
-                    type_name: "uuid".into(),
-                    value: t.clone(),
-                }
-                .into())
-            }
-        }
         (Value::Bytes(l), Value::Bytes(r)) => Ok(l.cmp(r) as i8),
+        (Value::Numeric(l), Value::Numeric(r)) => Ok(l.cmp(r) as i8),
+        (Value::Time(l), Value::Time(r)) => Ok(l.cmp(r) as i8),
         (Value::Array(l), Value::Array(r)) => {
             let min_len = l.len().min(r.len());
             for i in 0..min_len {
@@ -858,105 +773,54 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
             }
             Ok(l.len().cmp(&r.len()) as i8)
         }
-        (Value::Null, Value::Null) => Ok(0),
-        (Value::Null, _) => Ok(-1),
-        (_, Value::Null) => Ok(1),
-        (Value::Text(t), Value::Int32(i)) => {
-            if let Ok(n) = t.parse::<i32>() {
-                Ok(n.cmp(i) as i8)
-            } else {
-                Ok(t.cmp(&i.to_string()) as i8)
-            }
-        }
-        (Value::Int32(i), Value::Text(t)) => {
-            if let Ok(n) = t.parse::<i32>() {
-                Ok(i.cmp(&n) as i8)
-            } else {
-                Ok(i.to_string().cmp(t) as i8)
-            }
-        }
-        (Value::Text(t), Value::Int64(i)) => {
-            if let Ok(n) = t.parse::<i64>() {
-                Ok(n.cmp(i) as i8)
-            } else {
-                Ok(t.cmp(&i.to_string()) as i8)
-            }
-        }
-        (Value::Int64(i), Value::Text(t)) => {
-            if let Ok(n) = t.parse::<i64>() {
-                Ok(i.cmp(&n) as i8)
-            } else {
-                Ok(i.to_string().cmp(t) as i8)
-            }
-        }
-        (Value::Text(t), Value::Float64(f)) => {
-            if let Ok(n) = t.parse::<f64>() {
-                Ok(compare_float64_pg(n, *f) as i8)
-            } else {
-                Err(anyhow!("Cannot compare"))
-            }
-        }
-        (Value::Float64(f), Value::Text(t)) => {
-            if let Ok(n) = t.parse::<f64>() {
-                Ok(compare_float64_pg(*f, n) as i8)
-            } else {
-                Err(anyhow!("Cannot compare"))
-            }
-        }
-        (Value::Int32(i), Value::Float64(f)) => Ok(compare_float64_pg(*i as f64, *f) as i8),
-        (Value::Float64(f), Value::Int32(i)) => Ok(compare_float64_pg(*f, *i as f64) as i8),
-        (Value::Int64(i), Value::Float64(f)) => Ok(compare_float64_pg(*i as f64, *f) as i8),
-        (Value::Float64(f), Value::Int64(i)) => Ok(compare_float64_pg(*f, *i as f64) as i8),
-        (Value::Numeric(l), Value::Numeric(r)) => Ok(l.cmp(r) as i8),
-        (Value::Numeric(d), Value::Int32(i)) => Ok(d.cmp(&Decimal::from(*i)) as i8),
-        (Value::Int32(i), Value::Numeric(d)) => Ok(Decimal::from(*i).cmp(d) as i8),
-        (Value::Numeric(d), Value::Int64(i)) => Ok(d.cmp(&Decimal::from(*i)) as i8),
-        (Value::Int64(i), Value::Numeric(d)) => Ok(Decimal::from(*i).cmp(d) as i8),
-        (Value::Numeric(d), Value::Float64(f)) => {
-            if let Some(fd) = Decimal::try_from(*f).ok() {
-                Ok(d.cmp(&fd) as i8)
-            } else {
-                use rust_decimal::prelude::ToPrimitive;
-                Ok(compare_float64_pg(d.to_f64().unwrap_or(f64::NAN), *f) as i8)
-            }
-        }
-        (Value::Float64(f), Value::Numeric(d)) => {
-            if let Some(fd) = Decimal::try_from(*f).ok() {
-                Ok(fd.cmp(d) as i8)
-            } else {
-                use rust_decimal::prelude::ToPrimitive;
-                Ok(compare_float64_pg(*f, d.to_f64().unwrap_or(f64::NAN)) as i8)
-            }
-        }
-        (Value::Numeric(d), Value::Text(t)) => {
-            if let Ok(td) = Decimal::from_str(t) {
-                Ok(d.cmp(&td) as i8)
-            } else {
-                Err(anyhow!("Cannot compare numeric with non-numeric string"))
-            }
-        }
-        (Value::Text(t), Value::Numeric(d)) => {
-            if let Ok(td) = Decimal::from_str(t) {
-                Ok(td.cmp(d) as i8)
-            } else {
-                Err(anyhow!("Cannot compare numeric with non-numeric string"))
-            }
-        }
-        (Value::Json(_), _) | (_, Value::Json(_)) => Err(anyhow!(
-            "could not identify a comparison function for type json"
-        )),
-        (Value::Jsonb(_), _) | (_, Value::Jsonb(_)) => Err(anyhow!(
-            "could not identify an ordering operator for type jsonb"
-        )),
-        (Value::Vector(_), _) | (_, Value::Vector(_)) => Err(anyhow!(
-            "Vectors cannot be directly compared. Use vector distance functions instead."
-        )),
-        _ => Err(anyhow!(
-            "Cannot compare distinct types: {:?} vs {:?}",
-            left,
-            right
-        )),
+        _ => Err(anyhow!("Cannot compare values: {:?} vs {:?}", left, right)),
     }
+}
+
+/// Compare two values. Returns:
+/// - 0: equal
+/// - 1: left > right
+/// - -1: left < right
+pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
+    // Phase 1: Incomparable types (early error)
+    match (left, right) {
+        (Value::Json(_), _) | (_, Value::Json(_)) => {
+            return Err(anyhow!(
+                "could not identify a comparison function for type json"
+            ))
+        }
+        (Value::Jsonb(_), _) | (_, Value::Jsonb(_)) => {
+            return Err(anyhow!(
+                "could not identify an ordering operator for type jsonb"
+            ))
+        }
+        (Value::Vector(_), _) | (_, Value::Vector(_)) => {
+            return Err(anyhow!(
+                "Vectors cannot be directly compared. Use vector distance functions instead."
+            ))
+        }
+        _ => {}
+    }
+
+    // Phase 2: Null handling (PG null sort semantics)
+    match (left, right) {
+        (Value::Null, Value::Null) => return Ok(0),
+        (Value::Null, _) => return Ok(-1),
+        (_, Value::Null) => return Ok(1),
+        _ => {}
+    }
+
+    // Phase 3: Same-type fast path (no cloning)
+    // For Numeric, ignore scale differences — Decimal::cmp is scale-independent.
+    if left.data_type() == right.data_type()
+        || matches!((left, right), (Value::Numeric(_), Value::Numeric(_)))
+    {
+        return compare_same_type(left, right);
+    }
+
+    // Phase 4: Cross-type coercion via implicit cast, then same-type compare
+    let (cl, cr) = crate::sql::types::cast::coerce_pair(left.clone(), right.clone())?;
+    compare_same_type(&cl, &cr)
 }
 
 /// ORDER BY comparator with PostgreSQL-like NULLS FIRST/LAST semantics.
@@ -1107,5 +971,24 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("out of range"));
+    }
+
+    #[test]
+    fn test_compare_numeric_different_scales() {
+        use rust_decimal::Decimal;
+        use std::str::FromStr;
+
+        // 10.45 (scale=2) vs 10.4 (scale=1) — must not be equal
+        let a = Value::Numeric(Decimal::from_str("10.45").unwrap());
+        let b = Value::Numeric(Decimal::from_str("10.4").unwrap());
+        assert_eq!(compare_values(&a, &b).unwrap(), 1); // 10.45 > 10.4
+
+        // Equal values with different scales
+        let c = Value::Numeric(Decimal::from_str("10.40").unwrap()); // scale=2
+        let d = Value::Numeric(Decimal::from_str("10.4").unwrap()); // scale=1
+        assert_eq!(compare_values(&c, &d).unwrap(), 0); // 10.40 == 10.4
+
+        // Reverse direction
+        assert_eq!(compare_values(&b, &a).unwrap(), -1); // 10.4 < 10.45
     }
 }

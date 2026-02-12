@@ -9,7 +9,8 @@ use sqlparser::ast::{
 use tikv_client::Transaction;
 
 use super::super::expr::operators::sort_by_fallible;
-use super::super::expr::{coerce_text_literal_to_bool, compare_values, eval_expr};
+use super::super::expr::{compare_values, eval_expr};
+use super::super::names::function_name_upper;
 use super::super::operators::{
     execute_operator_tree, execute_operator_tree_with_ctes, AggregateExpr, BoxedOperator,
     DistinctOnOperator, DistinctOperator, FilterOperator, HashAggregateOperator, HashJoinConfig,
@@ -562,12 +563,7 @@ pub(crate) fn eval_having_expr_for_operators(
             eval_having_expr_for_operators(inner, row, schema, agg_exprs, group_by_count)
         }
         Expr::Function(f) => {
-            let func_name = f
-                .name
-                .0
-                .last()
-                .map(|i| i.value.to_uppercase())
-                .unwrap_or_default();
+            let func_name = function_name_upper(f);
 
             if matches!(
                 func_name.as_str(),
@@ -618,12 +614,7 @@ pub(crate) fn eval_having_expr_for_operators(
 }
 
 pub(crate) fn find_matching_aggregate(f: &Function, agg_exprs: &[AggregateExpr]) -> Option<usize> {
-    let func_name = f
-        .name
-        .0
-        .last()
-        .map(|i| i.value.to_uppercase())
-        .unwrap_or_default();
+    let func_name = function_name_upper(f);
 
     let f_arg = f.args.first().and_then(|arg| match arg {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
@@ -731,12 +722,7 @@ static AGGREGATE_FUNC_NAMES: &[&str] = &[
 ];
 
 pub(crate) fn is_aggregate_func(f: &Function) -> bool {
-    let name = f
-        .name
-        .0
-        .last()
-        .map(|n| n.value.to_uppercase())
-        .unwrap_or_default();
+    let name = function_name_upper(f);
     AGGREGATE_FUNC_NAMES.contains(&name.as_str())
 }
 
@@ -851,12 +837,7 @@ fn collect_nested_aggregates_inner<'a>(expr: &'a Expr, out: &mut Vec<NestedAggre
 }
 
 pub(crate) fn agg_func_signature(f: &Function) -> String {
-    let name = f
-        .name
-        .0
-        .last()
-        .map(|n| n.value.to_uppercase())
-        .unwrap_or_default();
+    let name = function_name_upper(f);
     let distinct_prefix = if f.distinct { "DISTINCT " } else { "" };
     let args_str: Vec<String> = f
         .args
@@ -1338,12 +1319,7 @@ impl Executor {
         agg_types: &mut Vec<DataType>,
         seen_sigs: &mut std::collections::HashSet<String>,
     ) -> Result<()> {
-        let func_name = f
-            .name
-            .0
-            .last()
-            .map(|n| n.value.to_uppercase())
-            .unwrap_or_default();
+        let func_name = function_name_upper(f);
 
         let sig = agg_func_signature(f);
         if seen_sigs.contains(&sig) {
@@ -1720,7 +1696,7 @@ impl Executor {
                     &agg_exprs,
                     group_by_count,
                 )?;
-                let having_val = coerce_text_literal_to_bool(having_expr, having_val)?;
+                let having_val = crate::sql::types::cast::coerce_to_bool(having_val)?;
                 match having_val {
                     Value::Boolean(true) => filtered_rows.push(row),
                     Value::Boolean(false) | Value::Null => {}
@@ -1976,7 +1952,7 @@ impl Executor {
             let mut out = Vec::new();
             for row in base_rows {
                 let val = eval_expr(filter_expr, Some(&row), Some(&schema), &qc)?;
-                let val = coerce_text_literal_to_bool(filter_expr, val)?;
+                let val = crate::sql::types::cast::coerce_to_bool(val)?;
                 match val {
                     Value::Boolean(true) => out.push(row),
                     Value::Boolean(false) | Value::Null => {}
@@ -2117,7 +2093,7 @@ impl Executor {
                         &agg_exprs,
                         gb_count,
                     )?;
-                    let having_val = coerce_text_literal_to_bool(having_expr, having_val)?;
+                    let having_val = crate::sql::types::cast::coerce_to_bool(having_val)?;
                     match having_val {
                         Value::Boolean(true) => filtered.push(row),
                         Value::Boolean(false) | Value::Null => {}
@@ -2222,12 +2198,7 @@ impl Executor {
 
                     // Handle GROUPING() introspection function
                     if let Expr::Function(func) = col_expr {
-                        let func_name = func
-                            .name
-                            .0
-                            .last()
-                            .map(|i| i.value.to_uppercase())
-                            .unwrap_or_default();
+                        let func_name = function_name_upper(func);
                         if func_name == "GROUPING" && func.args.len() == 1 {
                             let arg_expr = match &func.args[0] {
                                 FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
@@ -2588,6 +2559,7 @@ impl Executor {
                         }
                     }
                     SelectItem::QualifiedWildcard(obj, _) => {
+                        // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                         let qualifier = obj.0.last().map(|i| i.value.clone()).unwrap_or_default();
                         let mut matched = false;
                         for (idx, c) in combined_schema.columns.iter().enumerate() {
@@ -2919,6 +2891,7 @@ impl Executor {
                                     .get(&expr_name)
                                     .map(|v| v.as_slice())
                                     .unwrap_or(&[]);
+                                // INTENTIONAL: sqlparser guarantees non-empty ObjectName from parsed SQL
                                 if let Some(idx) =
                                     resolve_unique_index(idxs, "expression", &parts.last().map(|p| p.value.as_str()).unwrap_or_default())?
                                 {

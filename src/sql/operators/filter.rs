@@ -3,11 +3,10 @@ use async_trait::async_trait;
 use sqlparser::ast::Expr;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::{
-    coerce_text_literal_to_bool, eval_expr, validate_bool_expr_in_boolean_context,
-};
+use crate::sql::expr::{eval_expr, validate_bool_expr_in_boolean_context};
 use crate::sql::query_context::QueryContext;
-use crate::types::{Row, TableSchema, Value};
+use crate::sql::types::cast::{cast, CastContext};
+use crate::types::{DataType, Row, TableSchema, Value};
 
 #[derive(Debug)]
 pub struct FilterOperator {
@@ -32,7 +31,10 @@ impl FilterOperator {
             Some(self.child.schema()),
             query_ctx,
         )?;
-        let result = coerce_text_literal_to_bool(&self.predicate, result)?;
+        let result = match result {
+            Value::Text(s) => cast(Value::Text(s), &DataType::Boolean, CastContext::Implicit)?,
+            other => other,
+        };
         match result {
             Value::Boolean(b) => Ok(b),
             Value::Null => Ok(false),

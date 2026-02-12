@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr, Query, SelectItem, SetExpr};
 
+use crate::sql::names::function_name_upper;
 use crate::types::DataType;
 
 use super::coercion::{binary_op_result_type, unify_types};
@@ -251,12 +252,7 @@ impl<'a> TypeInferrer<'a> {
     }
 
     fn infer_function(&mut self, f: &Function) -> Result<DataType, TypeError> {
-        let func_name = f
-            .name
-            .0
-            .last()
-            .map(|n| n.value.to_uppercase())
-            .unwrap_or_default();
+        let func_name = function_name_upper(f);
 
         let arg_types: Vec<DataType> = f
             .args
