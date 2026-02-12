@@ -38,7 +38,10 @@ fn schema_qualified() {
 #[test]
 fn cte_shadow_simple() {
     // CTE `t` shadows any real table `t` in the main query.
-    assert_eq!(deps("WITH t AS (SELECT 42) SELECT * FROM t"), HashSet::new());
+    assert_eq!(
+        deps("WITH t AS (SELECT 42) SELECT * FROM t"),
+        HashSet::new()
+    );
 }
 
 #[test]
@@ -77,7 +80,9 @@ fn nested_with_reuse() {
     // #644: Each Query gets its own scope. Inner CTE `a` doesn't affect
     // outer CTE `a`'s body walk. Outer `a` references real table `t`.
     assert_eq!(
-        deps("WITH a AS (SELECT * FROM t) SELECT * FROM (WITH a AS (SELECT 1) SELECT * FROM a) sub"),
+        deps(
+            "WITH a AS (SELECT * FROM t) SELECT * FROM (WITH a AS (SELECT 1) SELECT * FROM a) sub"
+        ),
         HashSet::from([u("t")])
     );
 }
