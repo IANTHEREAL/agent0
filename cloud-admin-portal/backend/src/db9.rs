@@ -68,6 +68,13 @@ enum DbAction {
     ResetPassword { id: String },
     /// Show connection info for a database
     Connect { id: String },
+    /// Inspect database observability metrics
+    Inspect {
+        /// Database ID
+        id: String,
+        #[command(subcommand)]
+        action: Option<InspectAction>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -76,6 +83,14 @@ enum TokenAction {
     List,
     /// Revoke a token
     Revoke { token_id: String },
+}
+
+#[derive(Subcommand)]
+enum InspectAction {
+    /// Show query samples and performance
+    Queries,
+    /// Show combined summary + queries report
+    Report,
 }
 
 // ── Config helpers ──────────────────────────────────────────────
@@ -193,6 +208,15 @@ async fn main() {
             DbAction::Delete { id } => cmd_db_delete(&api, cli.json, &id).await,
             DbAction::ResetPassword { id } => cmd_db_reset_password(&api, cli.json, &id).await,
             DbAction::Connect { id } => cmd_db_connect(&api, cli.json, &id).await,
+            DbAction::Inspect { id, action } => match action {
+                None => cmd_db_inspect(&api, cli.json, &id).await,
+                Some(InspectAction::Queries) => {
+                    cmd_db_inspect_queries(&api, cli.json, &id).await
+                }
+                Some(InspectAction::Report) => {
+                    cmd_db_inspect_report(&api, cli.json, &id).await
+                }
+            },
         },
         Commands::Token { action } => match action {
             TokenAction::List => cmd_token_list(&api, cli.json).await,
@@ -523,6 +547,147 @@ async fn cmd_db_connect(api: &ApiClient, json: bool, id: &str) {
         println!("\npsql Command:");
         println!("  psql \"{conn}\"");
     }
+}
+
+fn format_duration_ago(ms: i64) -> String {
+    if ms < 1000 {
+        format!("{}ms ago", ms)
+    } else if ms < 60_000 {
+        format!("{}s ago", ms / 1000)
+    } else if ms < 3_600_000 {
+        format!("{}m ago", ms / 60_000)
+    } else {
+        format!("{}h ago", ms / 3_600_000)
+    }
+}
+
+fn print_inspect_summary(data: &Value, id: &str) {
+    let summary = &data["summary"];
+    let window = summary["window_seconds"].as_i64().unwrap_or(0);
+    println!("Database: {id}");
+    println!("Window: {window} seconds\n");
+    println!(" {:<20} Value", "Metric");
+    println!("{}", "─".repeat(37));
+    println!(
+        " {:<20} {:.1}",
+        "QPS",
+        summary["qps"].as_f64().unwrap_or(0.0)
+    );
+    println!(
+        " {:<20} {:.1}",
+        "TPS",
+        summary["tps"].as_f64().unwrap_or(0.0)
+    );
+    println!(
+        " {:<20} {:.1} ms",
+        "Latency (avg)",
+        summary["latency_avg_ms"].as_f64().unwrap_or(0.0)
+    );
+    println!(
+        " {:<20} {:.1} ms",
+        "Latency (p99)",
+        summary["latency_p99_ms"].as_f64().unwrap_or(0.0)
+    );
+    println!(
+        " {:<20} {}",
+        "Active Connections",
+        summary["active_connections"].as_i64().unwrap_or(0)
+    );
+    println!(
+        " {:<20} {}",
+        "Statements",
+        summary["statement_count"].as_i64().unwrap_or(0)
+    );
+    println!(
+        " {:<20} {}",
+        "Commits",
+        summary["txn_commit_count"].as_i64().unwrap_or(0)
+    );
+    println!(
+        " {:<20} {}",
+        "Errors",
+        summary["error_count"].as_i64().unwrap_or(0)
+    );
+}
+
+fn print_inspect_queries(data: &Value) {
+    let window = data["summary"]["window_seconds"].as_i64().unwrap_or(0);
+    println!("Query Samples (last {}s)\n", window);
+
+    let samples = match data["samples"].as_array() {
+        Some(arr) if !arr.is_empty() => arr,
+        _ => {
+            println!("No query samples in the current window.");
+            return;
+        }
+    };
+
+    println!(
+        "{:<45} {:>6} {:>6} {:>8} {:>8} {:>8} {:>10}",
+        "Query", "Count", "Errors", "Avg(ms)", "P99(ms)", "Max(ms)", "Last Seen"
+    );
+    println!("{}", "─".repeat(97));
+
+    for s in samples {
+        let query = s["query"].as_str().unwrap_or("-");
+        let truncated = if query.len() > 45 {
+            format!("{}...", &query[..42])
+        } else {
+            query.to_string()
+        };
+        let last_seen = format_duration_ago(s["last_seen_ms_ago"].as_i64().unwrap_or(0));
+        println!(
+            "{:<45} {:>6} {:>6} {:>8.1} {:>8.1} {:>8.1} {:>10}",
+            truncated,
+            s["sample_count"].as_i64().unwrap_or(0),
+            s["error_count"].as_i64().unwrap_or(0),
+            s["latency_avg_ms"].as_f64().unwrap_or(0.0),
+            s["latency_p99_ms"].as_f64().unwrap_or(0.0),
+            s["latency_max_ms"].as_f64().unwrap_or(0.0),
+            last_seen,
+        );
+    }
+}
+
+async fn fetch_observability(api: &ApiClient, id: &str) -> Value {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+    api.request(
+        "GET",
+        &format!("/customer/databases/{id}/observability"),
+        None,
+        Some(&headers),
+    )
+    .await
+}
+
+async fn cmd_db_inspect(api: &ApiClient, json: bool, id: &str) {
+    let data = fetch_observability(api, id).await;
+    if json {
+        print_json(&data["summary"]);
+        return;
+    }
+    print_inspect_summary(&data, id);
+}
+
+async fn cmd_db_inspect_queries(api: &ApiClient, json: bool, id: &str) {
+    let data = fetch_observability(api, id).await;
+    if json {
+        print_json(&data["samples"]);
+        return;
+    }
+    print_inspect_queries(&data);
+}
+
+async fn cmd_db_inspect_report(api: &ApiClient, json: bool, id: &str) {
+    let data = fetch_observability(api, id).await;
+    if json {
+        print_json(&data);
+        return;
+    }
+    print_inspect_summary(&data, id);
+    println!();
+    print_inspect_queries(&data);
 }
 
 async fn cmd_token_list(api: &ApiClient, json: bool) {
