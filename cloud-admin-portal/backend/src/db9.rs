@@ -8,7 +8,7 @@ use pgtikv_admin::cli_common::{
 };
 use serde_json::Value;
 
-const DEFAULT_API_URL: &str = "http://localhost:8090/api";
+const DEFAULT_API_URL: &str = "https://db9.shared.aws.tidbcloud.com/api";
 
 // ── Output format enum ──────────────────────────────────────────
 
