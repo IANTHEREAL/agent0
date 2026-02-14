@@ -43,6 +43,10 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// Skip TLS certificate verification (env: DB9_INSECURE)
+    #[arg(long, global = true, env = "DB9_INSECURE")]
+    insecure: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -381,7 +385,7 @@ fn prompt_password(prompt: &str) -> String {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let api = ApiClient::new(&cli.api_url, None);
+    let api = ApiClient::new_with_options(&cli.api_url, None, cli.insecure);
 
     match cli.command {
         Commands::Register => cmd_register(&api, &cli.effective_output()).await,

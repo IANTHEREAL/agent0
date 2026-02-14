@@ -62,7 +62,36 @@ async fn main() {
     tracing::info!("Database ready: {}", config.database_url);
 
     // ── Shared state ─────────────────────────────────────────────
-    let http_client = reqwest::Client::new();
+    let http_client = match (
+        std::env::var("TIKV_CA_PATH"),
+        std::env::var("TIKV_CERT_PATH"),
+        std::env::var("TIKV_KEY_PATH"),
+    ) {
+        (Ok(ca_path), Ok(cert_path), Ok(key_path)) => {
+            tracing::info!(
+                "Building HTTP client with mTLS: ca={}, cert={}, key={}",
+                ca_path,
+                cert_path,
+                key_path
+            );
+            let ca_pem = std::fs::read(&ca_path).expect("Failed to read CA cert");
+            let cert_pem = std::fs::read(&cert_path).expect("Failed to read client cert");
+            let key_pem = std::fs::read(&key_path).expect("Failed to read client key");
+
+            let ca = reqwest::Certificate::from_pem(&ca_pem).expect("Failed to parse CA cert");
+            let mut identity_pem = cert_pem;
+            identity_pem.extend_from_slice(&key_pem);
+            let identity =
+                reqwest::Identity::from_pem(&identity_pem).expect("Failed to parse client identity");
+
+            reqwest::Client::builder()
+                .add_root_certificate(ca)
+                .identity(identity)
+                .build()
+                .expect("Failed to build mTLS HTTP client")
+        }
+        _ => reqwest::Client::new(),
+    };
     let sessions = Arc::new(SessionManager::new(config.session_ttl_hours));
     let config = Arc::new(config);
 

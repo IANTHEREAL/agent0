@@ -13,10 +13,25 @@ pub struct ApiClient {
 
 impl ApiClient {
     pub fn new(base_url: &str, api_key: Option<&str>) -> Self {
+        let insecure = std::env::var("DB9_INSECURE")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false);
+        Self::new_with_options(base_url, api_key, insecure)
+    }
+
+    pub fn new_with_options(base_url: &str, api_key: Option<&str>, insecure: bool) -> Self {
+        let client = if insecure {
+            reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .expect("Failed to build HTTP client")
+        } else {
+            reqwest::Client::new()
+        };
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.map(|s| s.to_string()),
-            client: reqwest::Client::new(),
+            client,
         }
     }
 

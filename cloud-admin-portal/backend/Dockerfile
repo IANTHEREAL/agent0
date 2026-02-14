@@ -1,18 +1,32 @@
-FROM rust:1.83-bookworm AS builder
+# Cross-compile from x86_64 to arm64 (EKS nodes are arm64)
+FROM --platform=linux/amd64 rust:1.85-bookworm AS builder
+
+RUN dpkg --add-architecture arm64 && \
+    apt-get update && apt-get install -y \
+    gcc-aarch64-linux-gnu g++-aarch64-linux-gnu \
+    libc6-dev-arm64-cross \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add aarch64-unknown-linux-gnu
+
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
+    CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc \
+    CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 
 WORKDIR /app
 
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
 
-RUN cargo build --release
+RUN cargo build --release --target aarch64-unknown-linux-gnu
 
-FROM debian:bookworm-slim
+FROM --platform=linux/arm64 debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /app/target/release/pgtikv-admin /usr/local/bin/pgtikv-admin
-COPY --from=builder /app/target/release/pgtikv-ctl /usr/local/bin/pgtikv-ctl
+COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/pgtikv-admin /usr/local/bin/pgtikv-admin
+COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/pgtikv-ctl /usr/local/bin/pgtikv-ctl
+COPY --from=builder /app/target/aarch64-unknown-linux-gnu/release/db9 /usr/local/bin/db9
 
 EXPOSE 8090
 

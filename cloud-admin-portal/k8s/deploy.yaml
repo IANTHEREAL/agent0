@@ -1,0 +1,175 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: cloud-admin-portal
+---
+# Self-signed TLS certificate for HTTPS
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: cloud-admin-portal-tls
+  namespace: cloud-admin-portal
+spec:
+  secretName: cloud-admin-portal-tls
+  issuerRef:
+    name: selfsigned-issuer
+    kind: ClusterIssuer
+  dnsNames:
+    - k8s-ingressn-nginxing-8baa8b5b3f-7a87dd8feffa0a38.elb.us-west-2.amazonaws.com
+  duration: 8760h # 1 year
+---
+# Backend - pgtikv-admin API server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloud-admin-backend
+  namespace: cloud-admin-portal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloud-admin-backend
+  template:
+    metadata:
+      labels:
+        app: cloud-admin-backend
+    spec:
+      containers:
+      - name: backend
+        image: 093162653901.dkr.ecr.us-west-2.amazonaws.com/cloud-admin-portal-backend:latest
+        ports:
+        - containerPort: 8090
+        env:
+        - name: PGTIKV_PD_ENDPOINTS
+          value: "https://serverless-cluster-pd.tidb-serverless.svc.cluster.local:2379"
+        - name: PGTIKV_PG_HOST
+          value: "pg-tikv.tipg.svc.cluster.local"
+        - name: PGTIKV_PG_PORT
+          value: "5433"
+        - name: PGTIKV_PG_PUBLIC_ENDPOINTS
+          value: "ada8ce61eaa27432b991e46c35c80215-8c2de783592e99b2.elb.us-west-2.amazonaws.com:5433"
+        - name: PGTIKV_API_HOST
+          value: "0.0.0.0"
+        - name: PGTIKV_API_PORT
+          value: "8090"
+        - name: PGTIKV_DATABASE_URL
+          value: "sqlite:///data/portal.db?mode=rwc"
+        - name: PGTIKV_CORS_ORIGINS
+          value: "https://k8s-ingressn-nginxing-8baa8b5b3f-7a87dd8feffa0a38.elb.us-west-2.amazonaws.com"
+        - name: PGTIKV_RECONCILER_ENABLED
+          value: "true"
+        - name: PGTIKV_RECONCILER_SYNC_KEYSPACES
+          value: "false"
+        - name: TIKV_CA_PATH
+          value: "/tls/ca.crt"
+        - name: TIKV_CERT_PATH
+          value: "/tls/tls.crt"
+        - name: TIKV_KEY_PATH
+          value: "/tls/tls.key"
+        - name: RUST_LOG
+          value: "info"
+        volumeMounts:
+        - name: tikv-tls
+          mountPath: /tls
+          readOnly: true
+        - name: data
+          mountPath: /data
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+      volumes:
+      - name: tikv-tls
+        secret:
+          secretName: serverless-cluster-cluster-client-secret
+      - name: data
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloud-admin-backend
+  namespace: cloud-admin-portal
+spec:
+  selector:
+    app: cloud-admin-backend
+  ports:
+  - port: 8090
+    targetPort: 8090
+---
+# Frontend - React SPA served by nginx
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloud-admin-frontend
+  namespace: cloud-admin-portal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloud-admin-frontend
+  template:
+    metadata:
+      labels:
+        app: cloud-admin-frontend
+    spec:
+      containers:
+      - name: frontend
+        image: 093162653901.dkr.ecr.us-west-2.amazonaws.com/cloud-admin-portal-frontend:latest
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloud-admin-frontend
+  namespace: cloud-admin-portal
+spec:
+  selector:
+    app: cloud-admin-frontend
+  ports:
+  - port: 80
+    targetPort: 80
+---
+# Ingress - HTTPS with self-signed cert
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cloud-admin-portal
+  namespace: cloud-admin-portal
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - k8s-ingressn-nginxing-8baa8b5b3f-7a87dd8feffa0a38.elb.us-west-2.amazonaws.com
+    secretName: cloud-admin-portal-tls
+  rules:
+  - host: k8s-ingressn-nginxing-8baa8b5b3f-7a87dd8feffa0a38.elb.us-west-2.amazonaws.com
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: cloud-admin-backend
+            port:
+              number: 8090
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: cloud-admin-frontend
+            port:
+              number: 80
