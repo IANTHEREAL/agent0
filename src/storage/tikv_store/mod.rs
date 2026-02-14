@@ -132,13 +132,23 @@ impl TikvStore {
         keyspace: Option<String>,
     ) -> Result<Self> {
         info!("Connecting to TiKV at {:?}", pd_endpoints);
-        let config = match &keyspace {
+        let mut config = match &keyspace {
             Some(ks) => {
                 info!("Using TiKV Keyspace: {}", ks);
                 Config::default().with_keyspace(ks)
             }
             None => Config::default(),
         };
+
+        // Enable TLS for PD/TiKV connection if cert files are provided
+        if let (Ok(ca), Ok(cert), Ok(key)) = (
+            std::env::var("TIKV_CA_PATH"),
+            std::env::var("TIKV_CERT_PATH"),
+            std::env::var("TIKV_KEY_PATH"),
+        ) {
+            info!("TiKV TLS enabled: ca={}, cert={}, key={}", ca, cert, key);
+            config = config.with_security(ca, cert, key);
+        }
         let client = TransactionClient::new_with_config(pd_endpoints, config)
             .await
             .context("Failed to connect to TiKV")?;

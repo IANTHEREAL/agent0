@@ -28,6 +28,16 @@ const DEFAULT_PG_LISTEN_ADDR: &str = "127.0.0.1";
 /// Lightweight PD health check — just verifies PD is reachable without
 /// creating any TiKV client or keyspace connection.
 async fn check_pd_health(pd_endpoint: &str) -> Result<()> {
+    // Skip HTTP health check when TLS is configured (PD requires mTLS);
+    // the tikv-client will verify connectivity when it connects.
+    if std::env::var("TIKV_CA_PATH").is_ok() {
+        info!(
+            "PD health check skipped (TLS mode; tikv-client will verify connectivity to {})",
+            pd_endpoint
+        );
+        return Ok(());
+    }
+
     let url = format!("http://{}/pd/api/v1/health", pd_endpoint);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
