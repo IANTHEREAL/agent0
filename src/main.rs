@@ -1,4 +1,5 @@
 mod auth;
+mod cli;
 mod extensions;
 mod observability;
 mod pool;
@@ -55,6 +56,24 @@ async fn check_pd_health(pd_endpoint: &str) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    // Parse CLI args first (before tokio runtime, so --help/--version work without async)
+    let args: Vec<String> = std::env::args().collect();
+    let cli_args = match cli::parse_args(&args) {
+        Ok(cli::CliAction::ShowHelp) => {
+            cli::print_help();
+            std::process::exit(0);
+        }
+        Ok(cli::CliAction::ShowVersion) => {
+            cli::print_version();
+            std::process::exit(0);
+        }
+        Ok(cli::CliAction::Run(cli_args)) => cli_args,
+        Err(msg) => {
+            eprintln!("Error: {}\nTry 'pg-tikv --help' for usage information.", msg);
+            std::process::exit(1);
+        }
+    };
+
     let stack_mb: usize = env::var("PGTIKV_TOKIO_STACK_MB")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -65,10 +84,10 @@ fn main() -> Result<()> {
         .thread_stack_size(stack_mb * 1024 * 1024)
         .build()
         .unwrap()
-        .block_on(async_main())
+        .block_on(async_main(cli_args))
 }
 
-async fn async_main() -> Result<()> {
+async fn async_main(cli_args: cli::CliArgs) -> Result<()> {
     let subscriber = fmt::Subscriber::builder()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -77,21 +96,26 @@ async fn async_main() -> Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    let pd_endpoints =
-        env::var("PD_ENDPOINTS").unwrap_or_else(|_| DEFAULT_PD_ENDPOINTS.to_string());
-    let pg_port: u16 = env::var("PG_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_PG_PORT);
-    let pg_listen_addr = env::var("PG_LISTEN_ADDR")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_PG_LISTEN_ADDR.to_string());
-    let default_keyspace = env::var("PG_KEYSPACE").ok();
+    let pd_endpoints = cli_args.pd_endpoints.unwrap_or_else(|| {
+        env::var("PD_ENDPOINTS").unwrap_or_else(|_| DEFAULT_PD_ENDPOINTS.to_string())
+    });
+    let pg_port: u16 = cli_args.port.unwrap_or_else(|| {
+        env::var("PG_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(DEFAULT_PG_PORT)
+    });
+    let pg_listen_addr = cli_args.host.unwrap_or_else(|| {
+        env::var("PG_LISTEN_ADDR")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| DEFAULT_PG_LISTEN_ADDR.to_string())
+    });
+    let default_keyspace = cli_args.keyspace.or_else(|| env::var("PG_KEYSPACE").ok());
 
-    let tls_cert = env::var("PG_TLS_CERT").ok();
-    let tls_key = env::var("PG_TLS_KEY").ok();
+    let tls_cert = cli_args.tls_cert.or_else(|| env::var("PG_TLS_CERT").ok());
+    let tls_key = cli_args.tls_key.or_else(|| env::var("PG_TLS_KEY").ok());
 
     info!("pg-tikv starting up...");
     info!("PD endpoints: {}", pd_endpoints);
