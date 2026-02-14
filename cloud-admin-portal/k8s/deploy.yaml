@@ -3,7 +3,7 @@ kind: Namespace
 metadata:
   name: cloud-admin-portal
 ---
-# Self-signed TLS certificate for HTTPS
+# Let's Encrypt TLS certificate (DNS-01 via Route53)
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
@@ -12,11 +12,10 @@ metadata:
 spec:
   secretName: cloud-admin-portal-tls
   issuerRef:
-    name: selfsigned-issuer
+    name: letsencrypt
     kind: ClusterIssuer
   dnsNames:
-    - k8s-ingressn-nginxing-8baa8b5b3f-7a87dd8feffa0a38.elb.us-west-2.amazonaws.com
-  duration: 8760h # 1 year
+    - db9.shared.aws.tidbcloud.com
 ---
 # Backend - pgtikv-admin API server
 apiVersion: apps/v1
@@ -55,7 +54,7 @@ spec:
         - name: PGTIKV_DATABASE_URL
           value: "sqlite:///data/portal.db?mode=rwc"
         - name: PGTIKV_CORS_ORIGINS
-          value: "https://k8s-ingressn-nginxing-8baa8b5b3f-7a87dd8feffa0a38.elb.us-west-2.amazonaws.com"
+          value: "https://db9.shared.aws.tidbcloud.com"
         - name: PGTIKV_RECONCILER_ENABLED
           value: "true"
         - name: PGTIKV_RECONCILER_SYNC_KEYSPACES
@@ -141,7 +140,7 @@ spec:
   - port: 80
     targetPort: 80
 ---
-# Ingress - HTTPS with self-signed cert
+# Ingress - HTTPS with Let's Encrypt cert
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
@@ -153,10 +152,10 @@ spec:
   ingressClassName: nginx
   tls:
   - hosts:
-    - k8s-ingressn-nginxing-8baa8b5b3f-7a87dd8feffa0a38.elb.us-west-2.amazonaws.com
+    - db9.shared.aws.tidbcloud.com
     secretName: cloud-admin-portal-tls
   rules:
-  - host: k8s-ingressn-nginxing-8baa8b5b3f-7a87dd8feffa0a38.elb.us-west-2.amazonaws.com
+  - host: db9.shared.aws.tidbcloud.com
     http:
       paths:
       - path: /api
