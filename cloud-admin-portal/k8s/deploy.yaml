@@ -46,7 +46,7 @@ spec:
         - name: PGTIKV_PG_PORT
           value: "5433"
         - name: PGTIKV_PG_PUBLIC_ENDPOINTS
-          value: "ada8ce61eaa27432b991e46c35c80215-8c2de783592e99b2.elb.us-west-2.amazonaws.com:5433"
+          value: "pg.shared.aws.tidbcloud.com:5433"
         - name: PGTIKV_API_HOST
           value: "0.0.0.0"
         - name: PGTIKV_API_PORT

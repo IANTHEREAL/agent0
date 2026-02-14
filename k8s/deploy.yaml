@@ -3,6 +3,20 @@ kind: Namespace
 metadata:
   name: tipg
 ---
+# Let's Encrypt TLS certificate for PostgreSQL client connections
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: pg-tikv-server-tls
+  namespace: tipg
+spec:
+  secretName: pg-tikv-server-tls
+  issuerRef:
+    name: letsencrypt
+    kind: ClusterIssuer
+  dnsNames:
+    - pg.shared.aws.tidbcloud.com
+---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -36,9 +50,16 @@ spec:
           value: "/tls/tls.crt"
         - name: TIKV_KEY_PATH
           value: "/tls/tls.key"
+        - name: PG_TLS_CERT
+          value: "/pg-tls/tls.crt"
+        - name: PG_TLS_KEY
+          value: "/pg-tls/tls.key"
         volumeMounts:
         - name: tikv-tls
           mountPath: /tls
+          readOnly: true
+        - name: pg-tls
+          mountPath: /pg-tls
           readOnly: true
         resources:
           requests:
@@ -51,6 +72,9 @@ spec:
       - name: tikv-tls
         secret:
           secretName: serverless-cluster-cluster-client-secret
+      - name: pg-tls
+        secret:
+          secretName: pg-tikv-server-tls
 ---
 apiVersion: v1
 kind: Service
