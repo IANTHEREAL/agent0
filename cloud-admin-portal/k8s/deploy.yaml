@@ -140,6 +140,47 @@ spec:
   - port: 80
     targetPort: 80
 ---
+# Landing page - db9 marketing site
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloud-admin-landing
+  namespace: cloud-admin-portal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloud-admin-landing
+  template:
+    metadata:
+      labels:
+        app: cloud-admin-landing
+    spec:
+      containers:
+      - name: landing
+        image: 093162653901.dkr.ecr.us-west-2.amazonaws.com/cloud-admin-portal-landing:latest
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloud-admin-landing
+  namespace: cloud-admin-portal
+spec:
+  selector:
+    app: cloud-admin-landing
+  ports:
+  - port: 80
+    targetPort: 80
+---
 # Ingress - HTTPS with Let's Encrypt cert
 apiVersion: networking.k8s.io/v1
 kind: Ingress
@@ -169,6 +210,6 @@ spec:
         pathType: Prefix
         backend:
           service:
-            name: cloud-admin-frontend
+            name: cloud-admin-landing
             port:
               number: 80
