@@ -23,6 +23,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/register", post(register))
         .route("/anonymous-register", post(anonymous_register))
+        .route("/anonymous-refresh", post(anonymous_refresh))
         .route("/login", post(login))
         .route("/claim", post(claim_account))
         .route("/me", get(me))
@@ -271,11 +272,76 @@ pub async fn anonymous_register(
 
     db::create_customer_token(&state.db, &token_id, &id, &token_hash, "default", &expires_at).await?;
 
+    let mut secret_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut secret_bytes);
+    let anonymous_secret = secret_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    let secret_hash_bytes = Sha256::digest(anonymous_secret.as_bytes());
+    let secret_hash = secret_hash_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    db::store_anonymous_secret(&state.db, &id, &secret_hash).await?;
+
     Ok(Json(AnonymousRegisterResponse {
         token,
         expires_at,
         is_anonymous: true,
+        anonymous_id: id,
+        anonymous_secret,
     }))
+}
+
+pub async fn anonymous_refresh(
+    State(state): State<AppState>,
+    Json(req): Json<AnonymousRefreshRequest>,
+) -> Result<Json<AnonymousRefreshResponse>, AppError> {
+    let secret_hash_bytes = Sha256::digest(req.anonymous_secret.as_bytes());
+    let secret_hash = secret_hash_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    let customer = db::get_anonymous_customer_by_id_and_secret(
+        &state.db,
+        &req.anonymous_id,
+        &secret_hash,
+    )
+    .await?
+    .ok_or_else(|| AppError::unauthorized("Invalid anonymous credentials"))?;
+
+    use rand::RngCore;
+    let mut token_bytes = [0u8; 64];
+    rand::thread_rng().fill_bytes(&mut token_bytes);
+    let token = token_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    let hash_bytes = Sha256::digest(token.as_bytes());
+    let token_hash = hash_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    let expires_at = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
+    let token_id = uuid::Uuid::new_v4().to_string();
+
+    db::create_customer_token(
+        &state.db,
+        &token_id,
+        &customer.id,
+        &token_hash,
+        "default",
+        &expires_at,
+    )
+    .await?;
+
+    Ok(Json(AnonymousRefreshResponse { token, expires_at }))
 }
 
 // ── POST /login ──────────────────────────────────────────────────

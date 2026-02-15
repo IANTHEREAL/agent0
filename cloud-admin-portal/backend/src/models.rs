@@ -377,6 +377,20 @@ pub struct AnonymousRegisterResponse {
     pub token: String,
     pub expires_at: String,
     pub is_anonymous: bool,
+    pub anonymous_id: String,
+    pub anonymous_secret: String,
+}
+
+#[derive(Deserialize)]
+pub struct AnonymousRefreshRequest {
+    pub anonymous_id: String,
+    pub anonymous_secret: String,
+}
+
+#[derive(Serialize)]
+pub struct AnonymousRefreshResponse {
+    pub token: String,
+    pub expires_at: String,
 }
 
 #[derive(Deserialize)]

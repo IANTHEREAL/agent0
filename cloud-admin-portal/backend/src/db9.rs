@@ -376,6 +376,41 @@ fn save_anonymous_flag(is_anonymous: bool) -> Result<(), String> {
     Ok(())
 }
 
+fn save_anonymous_credentials(anonymous_id: &str, anonymous_secret: &str) -> Result<(), String> {
+    let dir = ensure_config_dir();
+    let cred_path = dir.join("credentials");
+    let existing = std::fs::read_to_string(&cred_path).unwrap_or_default();
+    let mut parsed: toml::Table = existing.parse().unwrap_or_default();
+    parsed.insert(
+        "anonymous_id".to_string(),
+        toml::Value::String(anonymous_id.to_string()),
+    );
+    parsed.insert(
+        "anonymous_secret".to_string(),
+        toml::Value::String(anonymous_secret.to_string()),
+    );
+    let content = toml::to_string(&parsed)
+        .map_err(|e| format!("Failed to serialize credentials: {e}"))?;
+    std::fs::write(&cred_path, content).map_err(|e| format!("Failed to save credentials: {e}"))?;
+    Ok(())
+}
+
+fn clear_anonymous_credentials() -> Result<(), String> {
+    let cred_path = config_dir().join("credentials");
+    if !cred_path.exists() {
+        return Ok(());
+    }
+    let existing = std::fs::read_to_string(&cred_path).unwrap_or_default();
+    let mut parsed: toml::Table = existing.parse().unwrap_or_default();
+    parsed.remove("anonymous_id");
+    parsed.remove("anonymous_secret");
+    parsed.remove("is_anonymous");
+    let content = toml::to_string(&parsed)
+        .map_err(|e| format!("Failed to serialize credentials: {e}"))?;
+    std::fs::write(&cred_path, content).map_err(|e| format!("Failed to save credentials: {e}"))?;
+    Ok(())
+}
+
 fn require_token() -> String {
     match load_token() {
         Ok(t) => t,
@@ -611,7 +646,7 @@ async fn cmd_claim(api: &ApiClient, output: &OutputFormat) {
         .request("POST", "/customer/claim", Some(&body), Some(&headers))
         .await;
 
-    if let Err(e) = save_anonymous_flag(false) {
+    if let Err(e) = clear_anonymous_credentials() {
         eprintln!("Warning: account claimed but failed to update local credentials: {e}");
     }
 
@@ -703,6 +738,12 @@ async fn cmd_db_create(api: &ApiClient, output: &OutputFormat, name: &str, regio
                 process::exit(1);
             }
             save_anonymous_flag(true).ok();
+            if let (Some(aid), Some(asec)) = (
+                data["anonymous_id"].as_str(),
+                data["anonymous_secret"].as_str(),
+            ) {
+                save_anonymous_credentials(aid, asec).ok();
+            }
             eprintln!("Anonymous account created. You can claim it later with 'db9 claim'.");
             token.to_string()
         }

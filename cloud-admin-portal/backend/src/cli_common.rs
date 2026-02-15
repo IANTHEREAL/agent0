@@ -55,6 +55,15 @@ fn clear_credentials() {
     }
 }
 
+fn load_anonymous_credentials() -> Option<(String, String)> {
+    let p = credentials_path()?;
+    let content = std::fs::read_to_string(p).ok()?;
+    let parsed: toml::Table = content.parse().ok()?;
+    let id = parsed.get("anonymous_id")?.as_str()?.to_string();
+    let secret = parsed.get("anonymous_secret")?.as_str()?.to_string();
+    Some((id, secret))
+}
+
 fn prompt_line(label: &str) -> String {
     eprint!("{label}");
     io::stderr().flush().ok();
@@ -176,22 +185,27 @@ impl ApiClient {
             Ok(val) => val,
             Err((status, detail)) => {
                 if status == 401 && self.auto_reauth {
-                    clear_credentials();
+                    let new_token = if let Some((anon_id, anon_secret)) =
+                        load_anonymous_credentials()
+                    {
+                        self.anonymous_refresh(&anon_id, &anon_secret).await
+                    } else {
+                        clear_credentials();
 
-                    eprintln!("\nSession expired or invalid token.");
-                    eprintln!("Please re-authenticate to continue.\n");
+                        eprintln!("\nSession expired or invalid token.");
+                        eprintln!("Please re-authenticate to continue.\n");
 
-                    let choice = prompt_line("[L] Login  [R] Register a new account: ");
-                    let new_token = match choice.to_ascii_lowercase().as_str() {
-                        "r" => self.interactive_register().await,
-                        _ => self.interactive_login().await,
+                        let choice = prompt_line("[L] Login  [R] Register a new account: ");
+                        match choice.to_ascii_lowercase().as_str() {
+                            "r" => self.interactive_register().await,
+                            _ => self.interactive_login().await,
+                        }
                     };
 
                     if let Err(e) = save_credentials(&new_token) {
                         eprintln!("{e}");
                         process::exit(1);
                     }
-                    eprintln!("Re-authenticated successfully. Retrying...\n");
 
                     let mut retry_headers = extra_headers.cloned().unwrap_or_default();
                     retry_headers
@@ -290,6 +304,30 @@ impl ApiClient {
             },
             Err((status, detail)) => {
                 eprintln!("Login after registration failed ({}): {detail}", status);
+                process::exit(1);
+            }
+        }
+    }
+
+    async fn anonymous_refresh(&self, anonymous_id: &str, anonymous_secret: &str) -> String {
+        let body = serde_json::json!({
+            "anonymous_id": anonymous_id,
+            "anonymous_secret": anonymous_secret,
+        });
+
+        match self
+            .send_request("POST", "/customer/anonymous-refresh", Some(&body), None)
+            .await
+        {
+            Ok(data) => match data["token"].as_str() {
+                Some(t) => t.to_string(),
+                None => {
+                    eprintln!("Failed to refresh anonymous session");
+                    process::exit(1);
+                }
+            },
+            Err((status, detail)) => {
+                eprintln!("Anonymous refresh failed ({}): {detail}", status);
                 process::exit(1);
             }
         }
