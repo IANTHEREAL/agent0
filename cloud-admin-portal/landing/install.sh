@@ -84,9 +84,10 @@ main() {
   success "db9 installed successfully! ($(${INSTALL_DIR}/db9 --version 2>/dev/null || echo 'db9'))"
   printf "\n"
   printf "  Get started:\n"
-  printf "    ${DIM}\$${RESET} db9 register\n"
-  printf "    ${DIM}\$${RESET} db9 login\n"
   printf "    ${DIM}\$${RESET} db9 db create --name myapp\n"
+  printf "\n"
+  printf "  ${DIM}No account needed — an anonymous account is created automatically.${RESET}\n"
+  printf "  ${DIM}Claim it later with: db9 claim${RESET}\n"
   printf "\n"
 }
 
