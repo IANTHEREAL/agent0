@@ -4,16 +4,17 @@
 **Commit:** 0fd997f
 **Branch:** master
 
-Web-based admin interface and CLI for pg-tikv multi-tenant database. React 18 frontend + Rust backend (axum 0.7).
+Web-based admin interface, CLI, and landing page for pg-tikv multi-tenant database. React 18 frontend + Rust backend (axum 0.7) + db9 CLI + landing page.
 
 ## Commands
 
 ```bash
 # Rust backend (from backend/)
-cd backend && cargo build --release     # Build both binaries
+cd backend && cargo build --release     # Build all binaries (pgtikv-admin, pgtikv-ctl, db9)
 cd backend && cargo check               # Type check only
 ./backend/target/release/pgtikv-admin   # Run server (default: SQLite, port 8090)
-./backend/target/release/pgtikv-ctl     # CLI tool
+./backend/target/release/pgtikv-ctl     # CLI tool (internal)
+./backend/target/release/db9            # CLI tool (user-facing, default API: https://db9.shared.aws.tidbcloud.com/api)
 
 # Frontend (from frontend/)
 cd frontend && npm install
@@ -27,6 +28,16 @@ cd frontend && npm run build            # Production build (tsc + vite)
 # Production
 ./scripts/build.sh                      # Build backend (release) + frontend + Docker images
 ./scripts/deploy.sh start|stop|restart|status|logs
+
+# Landing page
+cd landing && docker buildx build --platform linux/arm64 \
+  -t 093162653901.dkr.ecr.us-west-2.amazonaws.com/cloud-admin-portal-landing:latest --push .
+kubectl rollout restart deployment cloud-admin-landing -n cloud-admin-portal
+
+# db9 CLI multi-platform build (via GitHub Actions)
+# Workflow: .github/workflows/release-db9.yml
+# Download artifacts: gh run download <run-id> -D landing/releases/
+# Then flatten and rebuild landing image
 ```
 
 ## Structure
@@ -54,11 +65,14 @@ cloud-admin-portal/
 │   │   ├── crypto.rs        # AES-256-GCM credential encryption (aes-gcm)
 │   │   ├── session.rs       # In-memory RwLock<HashMap> session manager
 │   │   ├── main.rs          # pgtikv-admin server binary
-│   │   └── cli.rs           # pgtikv-ctl CLI binary (clap)
+│   │   ├── cli.rs           # pgtikv-ctl CLI binary (clap)
+│   │   ├── db9.rs           # db9 CLI binary (user-facing, default API: production)
+│   │   └── cli_common.rs    # Shared CLI utilities (ApiClient, output formatting)
 │   ├── app/                 # [DEAD] Legacy Python backend — only .pyc artifacts remain
 │   ├── Cargo.toml
-│   └── Dockerfile           # Multi-stage: rust:1.83-bookworm → debian:bookworm-slim
-├── frontend/                # React TypeScript frontend
+│   ├── Dockerfile           # Multi-stage: rust:1.83-bookworm → debian:bookworm-slim
+│   └── Dockerfile.release   # Multi-platform db9 binary builder (linux + macOS cross)
+├── frontend/                # React TypeScript frontend (internal only, not exposed)
 │   └── src/
 │       ├── api/             # API client + React Query hooks
 │       │   ├── client.ts    # Base fetch wrapper with session injection
@@ -77,7 +91,19 @@ cloud-admin-portal/
 │       ├── pages/           # TenantsPage, TenantDetailPage, SqlEditorPage
 │       ├── types/           # TypeScript interfaces (index.ts)
 │       └── App.tsx          # Routes: / → /tenants, /tenants/:id, /tenants/:id/sql
-├── deploy/                  # Docker Compose + nginx
+├── landing/                 # db9 landing page + binary hosting
+│   ├── index.html           # Single-page dark-themed site (inline CSS/JS)
+│   ├── install.sh           # Multi-platform install script (curl/wget)
+│   ├── nginx.conf           # /install → text/plain, /releases/ → binary download
+│   ├── Dockerfile           # nginx:alpine with static files + binaries
+│   └── releases/            # db9 binaries (not in git, built by CI)
+│       ├── db9-linux-amd64
+│       ├── db9-linux-arm64
+│       ├── db9-darwin-amd64
+│       └── db9-darwin-arm64
+├── k8s/
+│   └── deploy.yaml          # Backend + Frontend + Landing deployments, Ingress
+├── deploy/                  # Docker Compose + nginx (local dev)
 │   ├── docker-compose.yml   # nginx + backend + frontend-builder
 │   ├── docker-compose.dev.yml
 │   ├── nginx/nginx.conf     # Reverse proxy: static SPA + /api → backend:8090
@@ -98,7 +124,14 @@ cloud-admin-portal/
 | Change PD client | `backend/src/services/pd_client.rs` |
 | Change pg-tikv client | `backend/src/services/pg_client.rs` |
 | Change reconciler | `backend/src/services/reconciler.rs` |
-| Change CLI commands | `backend/src/cli.rs` |
+| Change CLI commands (internal) | `backend/src/cli.rs` |
+| Change db9 CLI commands | `backend/src/db9.rs` |
+| Change shared CLI utilities | `backend/src/cli_common.rs` |
+| Change landing page | `landing/index.html` |
+| Change install script | `landing/install.sh` |
+| Change landing nginx config | `landing/nginx.conf` |
+| Change K8s deployment | `k8s/deploy.yaml` |
+| Change db9 CI build | `.github/workflows/release-db9.yml` |
 | Add credential encryption | `backend/src/crypto.rs` |
 | Change frontend types | `frontend/src/types/index.ts` |
 | Change frontend API hooks | `frontend/src/api/tenants.ts` or `users.ts` |
@@ -194,12 +227,13 @@ When `PGTIKV_CREDENTIAL_KEY` is set (base64-encoded 32-byte key):
 - `PgClient`: pg-tikv connection via `tokio-postgres` (user management, SQL execution, observability)
 - `Reconciler`: Background tokio task — recovers stuck tenants + optional keyspace sync
 
-### Two Binaries
+### Three Binaries
 
 | Binary | Entry | Purpose |
 |--------|-------|---------|
 | `pgtikv-admin` | `src/main.rs` | HTTP API server (axum, tokio) |
-| `pgtikv-ctl` | `src/cli.rs` | CLI tool (clap, reqwest) |
+| `pgtikv-ctl` | `src/cli.rs` | CLI tool, internal (clap, reqwest) |
+| `db9` | `src/db9.rs` | CLI tool, user-facing (default API: `https://db9.shared.aws.tidbcloud.com/api`) |
 
 ### AppState
 
@@ -231,8 +265,9 @@ pub struct AppState {
 | `PGTIKV_SESSION_TTL_HOURS` | `1` | Session expiry |
 | `PGTIKV_AUDIT_RETENTION_DAYS` | `90` | Audit log retention |
 | `PGTIKV_CREDENTIAL_KEY` | (empty) | Base64 AES-256 key for credential encryption |
-| `PGTIKV_API_URL` | `http://localhost:8090/api` | CLI: API base URL |
-| `PGTIKV_API_KEY` | (empty) | CLI: API key |
+| `PGTIKV_API_URL` | `http://localhost:8090/api` | pgtikv-ctl CLI: API base URL |
+| `PGTIKV_API_KEY` | (empty) | pgtikv-ctl CLI: API key |
+| `DB9_API_URL` | `https://db9.shared.aws.tidbcloud.com/api` | db9 CLI: API base URL (override via env or `--api-url`) |
 | `VITE_API_URL` | `/api` | Frontend API base URL |
 
 ## Anti-Patterns
@@ -245,6 +280,41 @@ pub struct AppState {
 - **No `unwrap()`/`expect()` in handlers** — use `?` or proper `AppError` construction.
 - **No sqlx compile-time macros** (`query!`, `query_as!`) — incompatible with AnyPool.
 - **No Python tests**: Legacy pytest tests under `backend/tests/` reference dead FastAPI code — ignore them.
+
+## Deployment (Production)
+
+### URLs
+- **Landing page**: `https://db9.shared.aws.tidbcloud.com/`
+- **API**: `https://db9.shared.aws.tidbcloud.com/api`
+- **Install script**: `https://db9.shared.aws.tidbcloud.com/install`
+- **Binary downloads**: `https://db9.shared.aws.tidbcloud.com/releases/db9-{os}-{arch}`
+- **Frontend**: not exposed externally (no `/app` route in ingress)
+
+### Ingress Routes (k8s/deploy.yaml)
+| Path | Service | Port |
+|------|---------|------|
+| `/api` | cloud-admin-backend | 8090 |
+| `/` | cloud-admin-landing | 80 |
+
+### Docker Images (ECR: 093162653901, us-west-2)
+| Image | Purpose |
+|-------|---------|
+| `cloud-admin-portal-backend:latest` | Rust API server (arm64) |
+| `cloud-admin-portal-frontend:latest` | React SPA (arm64, internal only) |
+| `cloud-admin-portal-landing:latest` | nginx + landing page + db9 binaries (arm64) |
+
+### db9 CLI Build Pipeline
+1. Push to `backend/src/db9.rs`, `backend/src/cli_common.rs`, `backend/Cargo.toml`, or `.github/workflows/release-db9.yml`
+2. GitHub Actions builds 4 platforms natively (ubuntu-latest, ubuntu-24.04-arm, macos-14, macos-latest)
+3. Download artifacts: `gh run download <run-id>` into `landing/releases/`
+4. Flatten dirs: each artifact downloads as `db9-xxx/db9-xxx`, move to `db9-xxx`
+5. Rebuild landing image and redeploy
+
+### Landing Page
+- **Slogan**: "Postgres but for agents"
+- **Theme**: dark (#0a0a0a), red accent (#dc150b), Inter + JetBrains Mono fonts
+- **Sections**: Header, Hero, Install (curl only), Terminal Demo, Features (9), Commands (8), CTA, Footer
+- No GitHub links, no Dashboard links (private project)
 
 ## URLs (Development)
 
