@@ -408,6 +408,12 @@ impl AuthManager {
             return Ok(true);
         }
 
+        match privilege {
+            Privilege::CreateDB if user.can_create_db => return Ok(true),
+            Privilege::CreateRole if user.can_create_role => return Ok(true),
+            _ => {}
+        }
+
         if user.has_privilege(privilege, object) {
             return Ok(true);
         }
@@ -416,6 +422,11 @@ impl AuthManager {
             if let Some(role) = self.get_role(txn, role_name).await? {
                 if role.is_superuser {
                     return Ok(true);
+                }
+                match privilege {
+                    Privilege::CreateDB if role.can_create_db => return Ok(true),
+                    Privilege::CreateRole if role.can_create_role => return Ok(true),
+                    _ => {}
                 }
                 for granted in &role.privileges {
                     if User::privilege_matches(&granted.privilege, privilege)

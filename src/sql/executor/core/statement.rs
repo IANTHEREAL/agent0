@@ -2,10 +2,64 @@
 
 use super::catalog_prefetch::build_catalog_snapshot_for_statement;
 use super::*;
+use crate::auth::{Privilege, PrivilegeObject};
 use crate::sql::analyzer::types::AnalyzedStatement;
 use crate::sql::analyzer::Analyzer;
 
 impl Executor {
+    async fn require_privilege(
+        &self,
+        txn: &mut Transaction,
+        current_role: Option<&str>,
+        privilege: Privilege,
+        object: PrivilegeObject,
+        object_type: &str,
+        object_name: String,
+    ) -> Result<()> {
+        let Some(username) = current_role else {
+            // Internal execution path (trigger worker, internal plumbing).
+            // Until we have explicit security context propagation for internal
+            // statements, bypass RBAC checks when no user is provided.
+            return Ok(());
+        };
+
+        let ok = self
+            .auth_manager
+            .check_privilege(txn, username, &privilege, &object)
+            .await?;
+        if !ok {
+            return Err(SqlError::PermissionDenied {
+                object_type: object_type.to_string(),
+                object_name,
+            }
+            .into());
+        }
+        Ok(())
+    }
+
+    async fn require_table_privilege(
+        &self,
+        txn: &mut Transaction,
+        current_role: Option<&str>,
+        privilege: Privilege,
+        table_full_name: &str,
+    ) -> Result<()> {
+        let (schema, name) = names::parse_full_name(table_full_name)
+            .unwrap_or(("public".to_string(), table_full_name.to_string()));
+        self.require_privilege(
+            txn,
+            current_role,
+            privilege,
+            PrivilegeObject::Table {
+                schema: schema.clone(),
+                name: name.clone(),
+            },
+            "table",
+            format!("{}.{}", schema, name),
+        )
+        .await
+    }
+
     /// Execute a parsed SQL statement on a given transaction
     pub(crate) async fn execute_statement_on_txn(
         &self,
@@ -27,6 +81,15 @@ impl Executor {
                 ..
             } => {
                 let resolved = names::resolve_ddl_object_name(name, search_path)?;
+                self.require_privilege(
+                    txn,
+                    current_role,
+                    Privilege::CreateTable,
+                    PrivilegeObject::Schema(resolved.schema.clone()),
+                    "schema",
+                    resolved.schema.clone(),
+                )
+                .await?;
                 let table_full_name = resolved.full.clone();
                 let already_exists = *if_not_exists
                     && self
@@ -95,6 +158,24 @@ impl Executor {
                 let index_name = name
                     .as_ref()
                     .ok_or_else(|| anyhow!("Index name required"))?;
+                let resolved = names::resolve_existing_table_name(
+                    self.store.as_ref(),
+                    txn,
+                    db_id,
+                    table_name,
+                    search_path,
+                )
+                .await?
+                .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
+                self.require_privilege(
+                    txn,
+                    current_role,
+                    Privilege::CreateTable,
+                    PrivilegeObject::Schema(resolved.schema.clone()),
+                    "schema",
+                    resolved.schema.clone(),
+                )
+                .await?;
                 self.execute_create_index(
                     txn,
                     db_id,
@@ -119,6 +200,44 @@ impl Executor {
                 use sqlparser::ast::ObjectType;
                 match object_type {
                     ObjectType::Table => {
+                        for name in names {
+                            let resolved = names::resolve_existing_table_name(
+                                self.store.as_ref(),
+                                txn,
+                                db_id,
+                                name,
+                                search_path,
+                            )
+                            .await?;
+                            if let Some(resolved) = resolved {
+                                self.require_privilege(
+                                    txn,
+                                    current_role,
+                                    Privilege::DropTable,
+                                    PrivilegeObject::Table {
+                                        schema: resolved.schema.clone(),
+                                        name: resolved.name.clone(),
+                                    },
+                                    "table",
+                                    resolved.full.clone(),
+                                )
+                                .await?;
+                            } else if !*if_exists {
+                                let resolved = names::resolve_ddl_object_name(name, search_path)?;
+                                self.require_privilege(
+                                    txn,
+                                    current_role,
+                                    Privilege::DropTable,
+                                    PrivilegeObject::Table {
+                                        schema: resolved.schema.clone(),
+                                        name: resolved.name.clone(),
+                                    },
+                                    "table",
+                                    resolved.full.clone(),
+                                )
+                                .await?;
+                            }
+                        }
                         ddl::execute_drop_table(
                             &self.store,
                             txn,
@@ -131,6 +250,44 @@ impl Executor {
                         .await
                     }
                     ObjectType::View => {
+                        for name in names {
+                            let resolved = names::resolve_existing_view_name(
+                                self.store.as_ref(),
+                                txn,
+                                db_id,
+                                name,
+                                search_path,
+                            )
+                            .await?;
+                            if let Some(resolved) = resolved {
+                                self.require_privilege(
+                                    txn,
+                                    current_role,
+                                    Privilege::DropTable,
+                                    PrivilegeObject::Table {
+                                        schema: resolved.schema.clone(),
+                                        name: resolved.name.clone(),
+                                    },
+                                    "view",
+                                    resolved.full.clone(),
+                                )
+                                .await?;
+                            } else if !*if_exists {
+                                let resolved = names::resolve_ddl_object_name(name, search_path)?;
+                                self.require_privilege(
+                                    txn,
+                                    current_role,
+                                    Privilege::DropTable,
+                                    PrivilegeObject::Table {
+                                        schema: resolved.schema.clone(),
+                                        name: resolved.name.clone(),
+                                    },
+                                    "view",
+                                    resolved.full.clone(),
+                                )
+                                .await?;
+                            }
+                        }
                         ddl::execute_drop_view(
                             &self.store,
                             txn,
@@ -143,13 +300,40 @@ impl Executor {
                         .await
                     }
                     ObjectType::Index => {
+                        self.require_privilege(
+                            txn,
+                            current_role,
+                            Privilege::SuperUser,
+                            PrivilegeObject::Global,
+                            "index",
+                            "index".to_string(),
+                        )
+                        .await?;
                         self.execute_drop_index(txn, db_id, search_path, names, *if_exists)
                             .await
                     }
                     ObjectType::Role => {
+                        self.require_privilege(
+                            txn,
+                            current_role,
+                            Privilege::CreateRole,
+                            PrivilegeObject::Global,
+                            "role",
+                            "role".to_string(),
+                        )
+                        .await?;
                         rbac::execute_drop_role(&self.auth_manager, txn, names, *if_exists).await
                     }
                     ObjectType::Sequence => {
+                        self.require_privilege(
+                            txn,
+                            current_role,
+                            Privilege::SuperUser,
+                            PrivilegeObject::Global,
+                            "sequence",
+                            "sequence".to_string(),
+                        )
+                        .await?;
                         sequences::execute_drop_sequence(
                             &self.store,
                             txn,
@@ -161,6 +345,15 @@ impl Executor {
                         .await
                     }
                     ObjectType::Schema => {
+                        self.require_privilege(
+                            txn,
+                            current_role,
+                            Privilege::SuperUser,
+                            PrivilegeObject::Global,
+                            "schema",
+                            "schema".to_string(),
+                        )
+                        .await?;
                         self.execute_drop_schema(
                             txn,
                             db_id,
@@ -179,11 +372,42 @@ impl Executor {
                 }
             }
             Statement::Truncate { table_name, .. } => {
+                let resolved = names::resolve_existing_table_name(
+                    self.store.as_ref(),
+                    txn,
+                    db_id,
+                    table_name,
+                    search_path,
+                )
+                .await?
+                .ok_or_else(|| anyhow!("Table '{}' does not exist", table_name))?;
+                self.require_privilege(
+                    txn,
+                    current_role,
+                    Privilege::Truncate,
+                    PrivilegeObject::Table {
+                        schema: resolved.schema.clone(),
+                        name: resolved.name.clone(),
+                    },
+                    "table",
+                    resolved.full.clone(),
+                )
+                .await?;
                 ddl::execute_truncate(&self.store, txn, db_id, search_path, table_name).await
             }
             Statement::AlterTable {
                 name, operations, ..
             } => {
+                let resolved = names::resolve_ddl_object_name(name, search_path)?;
+                self.require_privilege(
+                    txn,
+                    current_role,
+                    Privilege::SuperUser,
+                    PrivilegeObject::Global,
+                    "table",
+                    resolved.full.clone(),
+                )
+                .await?;
                 for op in operations {
                     self.execute_alter_table(txn, db_id, search_path, name, op)
                         .await?;
@@ -209,6 +433,25 @@ impl Executor {
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 match analyzed {
                     AnalyzedStatement::Insert(ins) => {
+                        self.require_table_privilege(
+                            txn,
+                            current_role,
+                            Privilege::Insert,
+                            &ins.table_name,
+                        )
+                        .await?;
+                        if matches!(
+                            ins.on_conflict,
+                            Some(crate::sql::analyzer::types::AnalyzedOnConflict::DoUpdate { .. })
+                        ) {
+                            self.require_table_privilege(
+                                txn,
+                                current_role,
+                                Privilege::Update,
+                                &ins.table_name,
+                            )
+                            .await?;
+                        }
                         self.execute_analyzed_insert(txn, db_id, sequence_values, search_path, &ins)
                             .await
                     }
@@ -231,6 +474,13 @@ impl Executor {
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 match analyzed {
                     AnalyzedStatement::Delete(del) => {
+                        self.require_table_privilege(
+                            txn,
+                            current_role,
+                            Privilege::Delete,
+                            &del.table_name,
+                        )
+                        .await?;
                         self.execute_analyzed_delete(txn, db_id, sequence_values, search_path, &del)
                             .await
                     }
@@ -253,6 +503,13 @@ impl Executor {
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 match analyzed {
                     AnalyzedStatement::Update(upd) => {
+                        self.require_table_privilege(
+                            txn,
+                            current_role,
+                            Privilege::Update,
+                            &upd.table_name,
+                        )
+                        .await?;
                         self.execute_analyzed_update(txn, db_id, sequence_values, search_path, &upd)
                             .await
                     }
@@ -281,6 +538,15 @@ impl Executor {
                 schema_name,
                 if_not_exists,
             } => {
+                self.require_privilege(
+                    txn,
+                    current_role,
+                    Privilege::SuperUser,
+                    PrivilegeObject::Global,
+                    "schema",
+                    "schema".to_string(),
+                )
+                .await?;
                 use sqlparser::ast::SchemaName;
                 let schema_obj = match schema_name {
                     SchemaName::Simple(name) => name,
@@ -326,6 +592,16 @@ impl Executor {
                 sequence_options,
                 ..
             } => {
+                let resolved = names::resolve_ddl_object_name(name, search_path)?;
+                self.require_privilege(
+                    txn,
+                    current_role,
+                    Privilege::CreateTable,
+                    PrivilegeObject::Schema(resolved.schema.clone()),
+                    "schema",
+                    resolved.schema.clone(),
+                )
+                .await?;
                 sequences::execute_create_sequence(
                     &self.store,
                     txn,
@@ -345,6 +621,16 @@ impl Executor {
                 ..
             } => {
                 if *materialized {
+                    let resolved = names::resolve_ddl_object_name(name, search_path)?;
+                    self.require_privilege(
+                        txn,
+                        current_role,
+                        Privilege::CreateTable,
+                        PrivilegeObject::Schema(resolved.schema.clone()),
+                        "schema",
+                        resolved.schema.clone(),
+                    )
+                    .await?;
                     self.execute_create_materialized_view(
                         txn,
                         db_id,
@@ -357,6 +643,15 @@ impl Executor {
                     .await
                 } else {
                     let resolved = names::resolve_ddl_object_name(name, search_path)?;
+                    self.require_privilege(
+                        txn,
+                        current_role,
+                        Privilege::CreateTable,
+                        PrivilegeObject::Schema(resolved.schema.clone()),
+                        "schema",
+                        resolved.schema.clone(),
+                    )
+                    .await?;
                     let view_full_name = resolved.full.clone();
                     let existed = self
                         .store
@@ -408,6 +703,15 @@ impl Executor {
                 create_role,
                 ..
             } => {
+                self.require_privilege(
+                    txn,
+                    current_role,
+                    Privilege::CreateRole,
+                    PrivilegeObject::Global,
+                    "role",
+                    "role".to_string(),
+                )
+                .await?;
                 rbac::execute_create_role(
                     &self.auth_manager,
                     txn,
@@ -422,6 +726,15 @@ impl Executor {
                 .await
             }
             Statement::AlterRole { name, operation } => {
+                self.require_privilege(
+                    txn,
+                    current_role,
+                    Privilege::CreateRole,
+                    PrivilegeObject::Global,
+                    "role",
+                    name.value.clone(),
+                )
+                .await?;
                 rbac::execute_alter_role(&self.store, &self.auth_manager, txn, name, operation)
                     .await
             }
@@ -432,6 +745,15 @@ impl Executor {
                 with_grant_option,
                 ..
             } => {
+                self.require_privilege(
+                    txn,
+                    current_role,
+                    Privilege::SuperUser,
+                    PrivilegeObject::Global,
+                    "privilege",
+                    "privilege".to_string(),
+                )
+                .await?;
                 rbac::execute_grant(
                     &self.store,
                     &self.auth_manager,
@@ -450,6 +772,15 @@ impl Executor {
                 grantees,
                 ..
             } => {
+                self.require_privilege(
+                    txn,
+                    current_role,
+                    Privilege::SuperUser,
+                    PrivilegeObject::Global,
+                    "privilege",
+                    "privilege".to_string(),
+                )
+                .await?;
                 rbac::execute_revoke(
                     &self.store,
                     &self.auth_manager,
