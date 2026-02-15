@@ -402,8 +402,6 @@ def normalize_output(
         line = normalize_pg_array_literal(line)
         if mode == PsqlOutputMode.ALIGNED:
             line = normalize_psql_aligned_line(line)
-        if line.strip() == "testdb":
-            line = line.replace("testdb", "postgres")
         lines.append(line)
     return lines
 

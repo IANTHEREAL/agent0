@@ -591,6 +591,29 @@ fn analyze_table_not_found() {
 }
 
 #[test]
+fn analyze_current_user_in_from_without_parentheses() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT * FROM CURRENT_USER AS t(u)");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    let select = expect_select(&result);
+    assert_eq!(select.from.len(), 1);
+    match &select.from[0].kind {
+        AnalyzedTableRefKind::Function {
+            func,
+            args,
+            output_columns,
+        } => {
+            assert_eq!(func.name, "CURRENT_USER");
+            assert!(args.is_empty());
+            assert_eq!(output_columns, &[("u".to_string(), DataType::Text)]);
+        }
+        other => panic!("expected Function table ref, got {:?}", other),
+    }
+}
+
+#[test]
 fn analyze_group_by() {
     let catalog = test_catalog();
     let mut analyzer = Analyzer::new(&catalog);

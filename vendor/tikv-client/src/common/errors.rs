@@ -131,8 +131,12 @@ impl Error {
             Error::PessimisticLockError { inner, .. } => inner.is_lock_conflict(),
             // ExtractedErrors / MultipleKeyErrors: if every sub-error is a
             // lock conflict, treat the batch as a lock conflict.
-            Error::ExtractedErrors(errs) => !errs.is_empty() && errs.iter().all(|e| e.is_lock_conflict()),
-            Error::MultipleKeyErrors(errs) => !errs.is_empty() && errs.iter().all(|e| e.is_lock_conflict()),
+            Error::ExtractedErrors(errs) => {
+                !errs.is_empty() && errs.iter().all(|e| e.is_lock_conflict())
+            }
+            Error::MultipleKeyErrors(errs) => {
+                !errs.is_empty() && errs.iter().all(|e| e.is_lock_conflict())
+            }
             _ => false,
         }
     }

@@ -517,6 +517,70 @@ impl<'a> Analyzer<'a> {
                 args: None,
                 ..
             } => {
+                // PostgreSQL SQL value functions have special syntax and can appear in FROM
+                // without trailing parentheses (e.g. `FROM CURRENT_USER`).
+                //
+                // Treat these as scalar table functions (single-row, single-column relation).
+                // Quoted identifiers should remain resolvable as real tables.
+                if name.0.len() == 1 {
+                    let ident = &name.0[0];
+                    if ident.quote_style.is_none()
+                        && (ident.value.eq_ignore_ascii_case("current_user")
+                            || ident.value.eq_ignore_ascii_case("session_user")
+                            || ident.value.eq_ignore_ascii_case("user")
+                            || ident.value.eq_ignore_ascii_case("current_schema"))
+                    {
+                        let obj_name = ident.value.to_lowercase();
+                        let alias_str = alias
+                            .as_ref()
+                            .map(|a| a.name.value.clone())
+                            .unwrap_or_else(|| obj_name.clone());
+
+                        let mut output_cols: Vec<(String, DataType, bool)> =
+                            vec![(obj_name.clone(), DataType::Text, false)];
+
+                        // Apply alias column list (renames output columns).
+                        if let Some(ta) = alias {
+                            if !ta.columns.is_empty() {
+                                if ta.columns.len() != output_cols.len() {
+                                    return Err(AnalyzerError::Unsupported(format!(
+                                        "table function alias column count mismatch: expected {}, got {}",
+                                        output_cols.len(),
+                                        ta.columns.len()
+                                    )));
+                                }
+                                for (i, ident) in ta.columns.iter().enumerate() {
+                                    output_cols[i].0 = crate::sql::names::normalize_ident(ident);
+                                }
+                            }
+                        }
+
+                        self.scopes
+                            .current_mut()
+                            .add_table(&alias_str, &output_cols);
+
+                        let output_columns: Vec<(String, DataType)> = output_cols
+                            .iter()
+                            .map(|(n, dt, _)| (n.clone(), dt.clone()))
+                            .collect();
+
+                        let func = ResolvedFunction {
+                            name: obj_name.to_ascii_uppercase(),
+                            kind: FunctionKind::Builtin,
+                            return_type: DataType::Text,
+                        };
+
+                        return Ok(AnalyzedTableRef {
+                            kind: AnalyzedTableRefKind::Function {
+                                func,
+                                args: vec![],
+                                output_columns,
+                            },
+                            alias: Some(alias_str),
+                        });
+                    }
+                }
+
                 // Split ObjectName into (optional schema, object name).
                 let (schema_opt, obj_name) = split_object_name(name)
                     .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;

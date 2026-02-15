@@ -4,7 +4,6 @@
 
 use super::super::ddl_export;
 use super::super::information_schema::VirtualTableFilter;
-use super::super::names;
 use super::super::{parse_sql, ExecuteResult};
 use super::core::Executor;
 use crate::sql::error::SqlError;
@@ -106,7 +105,7 @@ impl Executor {
     ) -> Result<(TableSchema, Vec<Row>)> {
         let t_lower = table_name.to_lowercase();
 
-        // Check if this is a known scalar function (with or without parentheses)
+        // Normalize for virtual tables (some accept optional trailing `()` legacy syntax).
         let t_upper = table_name.trim_end_matches("()").to_uppercase();
         if t_upper == "_PGTIKV_SYS_OBSERVABILITY" || t_upper.ends_with("._PGTIKV_SYS_OBSERVABILITY")
         {
@@ -784,44 +783,6 @@ impl Executor {
 
             return Ok((schema, rows));
         }
-        if matches!(
-            t_upper.as_str(),
-            "CURRENT_SCHEMA" | "CURRENT_DATABASE" | "CURRENT_USER" | "SESSION_USER" | "USER"
-        ) {
-            let result = match t_upper.as_str() {
-                "CURRENT_SCHEMA" => Value::Text(names::default_schema(search_path).to_string()),
-                "CURRENT_DATABASE" => Value::Text("testdb".to_string()),
-                "CURRENT_USER" | "SESSION_USER" | "USER" => Value::Text("postgres".to_string()),
-                _ => unreachable!(),
-            };
-
-            // Create a single-column, single-row result
-            let col_name = t_upper.to_lowercase();
-            let schema = TableSchema {
-                table_id: 0,
-                name: table_name.to_string(),
-                columns: vec![ColumnDef {
-                    name: col_name,
-                    // INTENTIONAL: single-value type inference — NULL defaults to Text
-                    data_type: result.data_type().unwrap_or(DataType::Text),
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                }],
-                pk_constraint_name: None,
-                pk_indices: vec![],
-                indexes: vec![],
-                version: 1,
-                check_constraints: vec![],
-                foreign_keys: vec![],
-                owner: String::new(),
-                from_alias: None,
-            };
-            let rows = vec![Row::new(vec![result])];
-            return Ok((schema, rows));
-        }
 
         if let Some((schema, rows)) = ctes.get(&t_lower) {
             return Ok((schema.clone(), rows.clone()));
@@ -918,44 +879,6 @@ impl Executor {
             }
         }
 
-        // Handle function calls in FROM clause (e.g., SELECT * FROM current_schema())
-        if table_name.ends_with("()") || table_name.contains("(") && table_name.contains(")") {
-            // Parse as a function call
-            let func_name = table_name.trim_end_matches("()").to_uppercase();
-            let result = match func_name.as_str() {
-                "CURRENT_SCHEMA" => Value::Text(names::default_schema(search_path).to_string()),
-                "CURRENT_DATABASE" => Value::Text("testdb".to_string()),
-                "CURRENT_USER" | "SESSION_USER" | "USER" => Value::Text("postgres".to_string()),
-                _ => return Err(anyhow!("Function '{}' not found", func_name)),
-            };
-
-            // Create a single-column, single-row result
-            let col_name = func_name.to_lowercase();
-            let schema = TableSchema {
-                table_id: 0,
-                name: table_name.to_string(),
-                columns: vec![ColumnDef {
-                    name: col_name,
-                    // INTENTIONAL: single-value type inference — NULL defaults to Text
-                    data_type: result.data_type().unwrap_or(DataType::Text),
-                    nullable: false,
-                    primary_key: false,
-                    unique: false,
-                    is_serial: false,
-                    default_expr: None,
-                }],
-                pk_constraint_name: None,
-                pk_indices: vec![],
-                indexes: vec![],
-                version: 1,
-                check_constraints: vec![],
-                foreign_keys: vec![],
-                owner: String::new(),
-                from_alias: None,
-            };
-            let rows = vec![Row::new(vec![result])];
-            return Ok((schema, rows));
-        }
         Err(SqlError::RelationNotFound(table_name.to_string()).into())
     }
 

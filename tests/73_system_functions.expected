@@ -8,13 +8,33 @@
  postgres
 (1 row)
 
+ u
+-
+ postgres
+(1 row)
+
+ u
+-
+ postgres
+(1 row)
+
  current_database 
 ------------------
- testdb
+ postgres
+(1 row)
+
+ db
+-
+ postgres
 (1 row)
 
  current_schema 
 ----------------
+ public
+(1 row)
+
+ schema_name
+-
  public
 (1 row)
 
@@ -185,4 +205,3 @@ NOTICE:  table "sys_test" does not exist, skipping
 ----------------------------------
  System functions tests completed
 (1 row)
-

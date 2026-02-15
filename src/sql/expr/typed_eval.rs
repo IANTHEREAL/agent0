@@ -801,11 +801,11 @@ mod tests {
 
     fn test_qctx() -> QueryContext {
         QueryContext::new(
-            1,                   // connection_id
-            Arc::from("testdb"), // database_name
-            1_700_000_000_000,   // statement_timestamp_ms
-            1_700_000_000_000,   // transaction_timestamp_ms
-            Arc::from("UTC"),    // timezone
+            1,                     // connection_id
+            Arc::from("postgres"), // database_name
+            1_700_000_000_000,     // statement_timestamp_ms
+            1_700_000_000_000,     // transaction_timestamp_ms
+            Arc::from("UTC"),      // timezone
         )
     }
 
@@ -2028,7 +2028,7 @@ mod tests {
         let row = empty_row();
         let qctx = QueryContext::new(
             1,
-            Arc::from("testdb"),
+            Arc::from("postgres"),
             1_700_000_000_000, // statement ts
             1_700_000_000_000, // transaction ts
             Arc::from("UTC"),
@@ -2055,7 +2055,7 @@ mod tests {
         let row = empty_row();
         let qctx = QueryContext::new(
             42, // connection_id = 42
-            Arc::from("testdb"),
+            Arc::from("postgres"),
             1_700_000_000_000,
             1_700_000_000_000,
             Arc::from("UTC"),

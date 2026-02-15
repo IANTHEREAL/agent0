@@ -964,9 +964,7 @@ impl<PdC: PdClient> Transaction<PdC> {
         let plan = PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
             .resolve_lock(Backoff::no_backoff(), self.keyspace)
             .preserve_shard()
-            .retry_multi_region_preserve_results(
-                self.options.retry_options.region_backoff.clone(),
-            )
+            .retry_multi_region_preserve_results(self.options.retry_options.region_backoff.clone())
             .merge(CollectWithShard)
             .plan();
         let pairs = plan.execute().await;
@@ -978,12 +976,8 @@ impl<PdC: PdClient> Transaction<PdC> {
                     success_keys,
                 } if !success_keys.is_empty() => {
                     let keys = success_keys.into_iter().map(Key::from);
-                    self.pessimistic_lock_rollback(
-                        keys,
-                        self.timestamp.clone(),
-                        for_update_ts,
-                    )
-                    .await?;
+                    self.pessimistic_lock_rollback(keys, self.timestamp.clone(), for_update_ts)
+                        .await?;
                     Err(*inner)
                 }
                 _ => Err(err),
