@@ -159,6 +159,10 @@ pub async fn create_tables(pool: &AnyPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await
         .ok();
+    sqlx::query("ALTER TABLE customers ADD COLUMN anonymous_secret_hash TEXT")
+        .execute(pool)
+        .await
+        .ok();
 
     let indexes = [
         "CREATE INDEX IF NOT EXISTS idx_tenants_state ON tenants(state)",
@@ -855,7 +859,7 @@ pub async fn claim_anonymous_customer(
     password_hash: &str,
 ) -> Result<bool, sqlx::Error> {
     let sql = adapt_sql(
-        "UPDATE customers SET email = $1, password_hash = $2, is_anonymous = 0, database_limit = NULL WHERE id = $3 AND is_anonymous = 1",
+        "UPDATE customers SET email = $1, password_hash = $2, is_anonymous = 0, database_limit = NULL, anonymous_secret_hash = NULL WHERE id = $3 AND is_anonymous = 1",
         pool,
     );
     let result = sqlx::query(&sql)
@@ -865,6 +869,40 @@ pub async fn claim_anonymous_customer(
         .execute(pool)
         .await?;
     Ok(result.rows_affected() > 0)
+}
+
+pub async fn store_anonymous_secret(
+    pool: &AnyPool,
+    customer_id: &str,
+    secret_hash: &str,
+) -> Result<(), sqlx::Error> {
+    let sql = adapt_sql(
+        "UPDATE customers SET anonymous_secret_hash = $1 WHERE id = $2 AND is_anonymous = 1",
+        pool,
+    );
+    sqlx::query(&sql)
+        .bind(secret_hash)
+        .bind(customer_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_anonymous_customer_by_id_and_secret(
+    pool: &AnyPool,
+    customer_id: &str,
+    secret_hash: &str,
+) -> Result<Option<CustomerRow>, sqlx::Error> {
+    let sql = adapt_sql(
+        "SELECT * FROM customers WHERE id = $1 AND anonymous_secret_hash = $2 AND is_anonymous = 1",
+        pool,
+    );
+    let row = sqlx::query(&sql)
+        .bind(customer_id)
+        .bind(secret_hash)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.as_ref().map(row_to_customer))
 }
 
 pub async fn get_tenant_for_customer(
@@ -1040,9 +1078,10 @@ mod tests {
 
     #[test]
     fn test_claim_anonymous_customer_sql_has_correct_placeholders() {
-        let sql = "UPDATE customers SET email = $1, password_hash = $2, is_anonymous = 0, database_limit = NULL WHERE id = $3 AND is_anonymous = 1";
+        let sql = "UPDATE customers SET email = $1, password_hash = $2, is_anonymous = 0, database_limit = NULL, anonymous_secret_hash = NULL WHERE id = $3 AND is_anonymous = 1";
         assert!(sql.contains("is_anonymous = 0"));
         assert!(sql.contains("database_limit = NULL"));
+        assert!(sql.contains("anonymous_secret_hash = NULL"));
         assert!(sql.contains("is_anonymous = 1"));
         assert_eq!(sql.matches('$').count(), 3);
     }
