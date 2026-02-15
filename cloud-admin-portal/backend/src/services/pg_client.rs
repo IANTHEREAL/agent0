@@ -1,7 +1,7 @@
 use crate::models::{ColumnInfo, SqlResult, UserResponse};
 use serde_json::Value;
+use tokio_postgres::types::Type;
 use tokio_postgres::NoTls;
-use tokio_postgres::{types::Type, Row};
 
 pub struct PgClient {
     host: String,
@@ -154,61 +154,19 @@ fn column_type_name(column_type: &Type) -> String {
     }
 }
 
-fn row_value_to_json(row: &Row, idx: usize) -> Value {
-    let ty = row.columns()[idx].type_();
+fn text_to_json(val: Option<&str>, ty: &Type) -> Value {
+    let s = match val {
+        Some(v) => v,
+        None => return Value::Null,
+    };
     match *ty {
-        Type::BOOL => row
-            .try_get::<_, Option<bool>>(idx)
-            .ok()
-            .flatten()
-            .map_or(Value::Null, Value::from),
-        Type::INT2 => row
-            .try_get::<_, Option<i16>>(idx)
-            .ok()
-            .flatten()
-            .map_or(Value::Null, Value::from),
-        Type::INT4 => row
-            .try_get::<_, Option<i32>>(idx)
-            .ok()
-            .flatten()
-            .map_or(Value::Null, Value::from),
-        Type::INT8 => row
-            .try_get::<_, Option<i64>>(idx)
-            .ok()
-            .flatten()
-            .map_or(Value::Null, Value::from),
-        Type::FLOAT4 => row
-            .try_get::<_, Option<f32>>(idx)
-            .ok()
-            .flatten()
-            .map_or(Value::Null, Value::from),
-        Type::FLOAT8 => row
-            .try_get::<_, Option<f64>>(idx)
-            .ok()
-            .flatten()
-            .map_or(Value::Null, Value::from),
-        Type::TEXT | Type::VARCHAR | Type::BPCHAR | Type::NAME | Type::UNKNOWN => row
-            .try_get::<_, Option<String>>(idx)
-            .ok()
-            .flatten()
-            .map_or(Value::Null, Value::from),
-        Type::BYTEA => row
-            .try_get::<_, Option<Vec<u8>>>(idx)
-            .ok()
-            .flatten()
-            .map_or(Value::Null, |v| {
-                Value::from(
-                    v.iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect::<Vec<_>>()
-                        .join(""),
-                )
-            }),
-        _ => row
-            .try_get::<_, Option<String>>(idx)
-            .ok()
-            .flatten()
-            .map_or(Value::Null, Value::from),
+        Type::BOOL => Value::from(s.eq_ignore_ascii_case("t") || s.eq_ignore_ascii_case("true")),
+        Type::INT2 | Type::INT4 => s.parse::<i64>().map_or(Value::from(s.to_string()), Value::from),
+        Type::INT8 => s.parse::<i64>().map_or(Value::from(s.to_string()), Value::from),
+        Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
+            s.parse::<f64>().map_or(Value::from(s.to_string()), Value::from)
+        }
+        _ => Value::from(s.to_string()),
     }
 }
 
@@ -413,6 +371,10 @@ impl PgClient {
         Ok(output)
     }
 
+    /// Execute SQL and return structured results.
+    ///
+    /// Uses prepare() for column type metadata and simple_query() for data
+    /// retrieval (text format) to avoid binary encoding mismatches with pg-tikv.
     pub async fn run_sql_structured(
         &self,
         keyspace: &str,
@@ -433,66 +395,68 @@ impl PgClient {
             command: "UNKNOWN".to_string(),
         };
 
-        for statement in statements {
-            let command = detect_command(&statement);
-            if query_like_statement(&statement) {
-                let rows = client
-                    .query(&statement, &[])
+        for statement in &statements {
+            let command = detect_command(statement);
+
+            if query_like_statement(statement) {
+                let col_types = match client.prepare(statement).await {
+                    Ok(stmt) => stmt
+                        .columns()
+                        .iter()
+                        .map(|c| (c.name().to_string(), c.type_().clone()))
+                        .collect::<Vec<_>>(),
+                    Err(e) => return Err(e.to_string()),
+                };
+
+                let messages = client
+                    .simple_query(statement)
                     .await
                     .map_err(|e| e.to_string())?;
 
-                let columns = if let Some(first_row) = rows.first() {
-                    first_row
-                        .columns()
-                        .iter()
-                        .map(|c| ColumnInfo {
-                            name: c.name().to_string(),
-                            data_type: column_type_name(c.type_()),
-                        })
-                        .collect()
-                } else {
-                    let stmt = client
-                        .prepare(&statement)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    stmt.columns()
-                        .iter()
-                        .map(|c| ColumnInfo {
-                            name: c.name().to_string(),
-                            data_type: column_type_name(c.type_()),
-                        })
-                        .collect()
-                };
-
-                let out_rows = rows
+                let columns: Vec<ColumnInfo> = col_types
                     .iter()
-                    .map(|row| {
-                        (0..row.len())
-                            .map(|idx| row_value_to_json(row, idx))
-                            .collect::<Vec<_>>()
+                    .map(|(name, ty)| ColumnInfo {
+                        name: name.clone(),
+                        data_type: column_type_name(ty),
                     })
-                    .collect::<Vec<_>>();
+                    .collect();
+
+                let mut out_rows: Vec<Vec<Value>> = Vec::new();
+                for msg in messages {
+                    if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
+                        let vals: Vec<Value> = (0..col_types.len())
+                            .map(|i| text_to_json(row.get(i), &col_types[i].1))
+                            .collect();
+                        out_rows.push(vals);
+                    }
+                }
 
                 last_result = SqlResult {
-                    columns,
                     row_count: out_rows.len(),
+                    columns,
                     rows: out_rows,
                     command,
                 };
-                continue;
+            } else {
+                let messages = client
+                    .simple_query(statement)
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                let mut affected: u64 = 0;
+                for msg in messages {
+                    if let tokio_postgres::SimpleQueryMessage::CommandComplete(n) = msg {
+                        affected = n;
+                    }
+                }
+
+                last_result = SqlResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    row_count: affected as usize,
+                    command,
+                };
             }
-
-            let affected = client
-                .execute(&statement, &[])
-                .await
-                .map_err(|e| e.to_string())?;
-
-            last_result = SqlResult {
-                columns: Vec::new(),
-                rows: Vec::new(),
-                row_count: affected as usize,
-                command,
-            };
         }
 
         Ok(last_result)
