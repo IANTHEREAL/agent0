@@ -1,9 +1,14 @@
+use std::sync::OnceLock;
+
 use sqlx::any::AnyPoolOptions;
 use sqlx::{AnyPool, Row};
 
 use crate::crypto;
 use crate::models::{CredentialRow, CustomerRow, CustomerTokenRow, TenantRow};
 use crate::tenant_state;
+
+/// Global flag set once during `connect()` — true when the backend is SQLite.
+static IS_SQLITE: OnceLock<bool> = OnceLock::new();
 
 fn encrypt_password(password: &str, key: Option<&str>) -> String {
     match key {
@@ -28,9 +33,10 @@ fn decrypt_password(stored: &str, key: Option<&str>) -> String {
 pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
     sqlx::any::install_default_drivers();
 
-    let is_sqlite = url.starts_with("sqlite");
+    let sqlite = url.starts_with("sqlite");
+    IS_SQLITE.set(sqlite).ok();
 
-    if is_sqlite {
+    if sqlite {
         if let Some(path) = url.strip_prefix("sqlite://") {
             let path = path.split('?').next().unwrap_or(path);
             if let Some(parent) = std::path::Path::new(path).parent() {
@@ -39,13 +45,13 @@ pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
         }
     }
 
-    let max_conns = if is_sqlite { 5 } else { 20 };
+    let max_conns = if sqlite { 5 } else { 20 };
     let pool = AnyPoolOptions::new()
         .max_connections(max_conns)
         .connect(url)
         .await?;
 
-    if is_sqlite {
+    if sqlite {
         sqlx::query("PRAGMA journal_mode=WAL")
             .execute(&pool)
             .await
@@ -63,10 +69,8 @@ pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
     Ok(pool)
 }
 
-fn is_sqlite(pool: &AnyPool) -> bool {
-    // Detect SQLite by checking the connection URL pattern
-    // AnyPool doesn't expose the backend kind directly in newer sqlx
-    format!("{:?}", pool).contains("Sqlite") || format!("{:?}", pool).contains("sqlite")
+fn is_sqlite(_pool: &AnyPool) -> bool {
+    IS_SQLITE.get().copied().unwrap_or(false)
 }
 
 pub fn adapt_sql(sql: &str, pool: &AnyPool) -> String {
@@ -598,7 +602,7 @@ pub async fn query_audit_logs(
         idx += 1;
     }
     if let Some(s) = success {
-        sql.push_str(&format!(" AND success = ${idx}"));
+        sql.push_str(&format!(" AND success = CAST(${idx} AS INTEGER)"));
         binds.push((s as i32).to_string());
         idx += 1;
     }
