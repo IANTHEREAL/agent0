@@ -1335,6 +1335,36 @@ fn analyze_union_unifies_types() {
     let query = parse_query("SELECT id FROM users UNION ALL SELECT score FROM users");
     let result = analyzer.analyze_query(&query).unwrap();
     assert_eq!(result.output_schema[0].1, DataType::Float64);
+
+    let AnalyzedQueryBody::SetOperation { left, right, .. } = &result.body else {
+        panic!("expected SetOperation body");
+    };
+    assert_eq!(left.output_schema[0].1, DataType::Float64);
+    assert_eq!(right.output_schema[0].1, DataType::Float64);
+
+    // Left arm should be wrapped with a coercing projection (CAST) since it
+    // originally produced Int32.
+    let AnalyzedQueryBody::Select(left_select) = &left.body else {
+        panic!("expected wrapped SELECT for left arm");
+    };
+    assert_eq!(left_select.projection.len(), 1);
+    assert!(matches!(
+        left_select.projection[0].expr.kind,
+        TypedExprKind::Cast { .. }
+    ));
+    assert!(matches!(
+        left_select.from[0].kind,
+        AnalyzedTableRefKind::Subquery(_)
+    ));
+}
+
+#[test]
+fn analyze_union_incompatible_types_rejected() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT true UNION SELECT 1");
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(err, AnalyzerError::TypesCannotBeMatched { .. }));
 }
 
 // ── DML statement analysis ──────────────────────────────────

@@ -94,6 +94,17 @@ impl<'a> Analyzer<'a> {
                 let output_schema =
                     self.unify_set_operation_schemas(&left_query, &right_query, set_op_kind)?;
 
+                // Coerce both arms to the unified output schema by wrapping each arm
+                // in a projection that inserts implicit casts where needed.
+                //
+                // This matches PostgreSQL planning semantics: each arm is evaluated
+                // independently (including its own ORDER BY/LIMIT), then coerced
+                // before the set operation combines rows.
+                let left_query =
+                    self.wrap_set_op_arm_with_coercion(left_query, &output_schema, "__setop_l");
+                let right_query =
+                    self.wrap_set_op_arm_with_coercion(right_query, &output_schema, "__setop_r");
+
                 // Add output columns to scope for ORDER BY resolution.
                 // Set operation ORDER BY references output column names, not FROM columns.
                 for (name, dt) in &output_schema {
@@ -166,6 +177,10 @@ impl<'a> Analyzer<'a> {
                 // Validate column counts match and unify types.
                 let output_schema =
                     self.unify_set_operation_schemas(&left_query, &right_query, set_op_kind)?;
+                let left_query =
+                    self.wrap_set_op_arm_with_coercion(left_query, &output_schema, "__setop_l");
+                let right_query =
+                    self.wrap_set_op_arm_with_coercion(right_query, &output_schema, "__setop_r");
                 Ok(AnalyzedQuery {
                     ctes: vec![],
                     body: AnalyzedQueryBody::SetOperation {
@@ -1020,6 +1035,92 @@ impl<'a> Analyzer<'a> {
                 }
             })
             .collect()
+    }
+
+    /// Wrap a set operation arm in a coercing projection if needed.
+    ///
+    /// For each output column, if the arm's type differs from the unified output
+    /// type, we wrap the arm as:
+    ///
+    /// ```sql
+    /// SELECT CAST(col_i AS unified_i) AS name_i, ...
+    /// FROM (<arm>) AS <subquery_alias>
+    /// ```
+    ///
+    /// This preserves the arm's own ORDER BY/LIMIT/OFFSET semantics.
+    fn wrap_set_op_arm_with_coercion(
+        &self,
+        arm: AnalyzedQuery,
+        unified_schema: &[(String, DataType)],
+        subquery_alias: &str,
+    ) -> AnalyzedQuery {
+        let arm_output_schema = arm.output_schema.clone();
+        let needs_wrap = arm
+            .output_schema
+            .iter()
+            .zip(unified_schema.iter())
+            .any(|((_, arm_ty), (_, unified_ty))| arm_ty != unified_ty);
+
+        if !needs_wrap {
+            return arm;
+        }
+
+        let from = vec![AnalyzedTableRef {
+            kind: AnalyzedTableRefKind::Subquery(Box::new(arm)),
+            alias: Some(subquery_alias.to_string()),
+        }];
+
+        let projection: Vec<AnalyzedProjection> = unified_schema
+            .iter()
+            .enumerate()
+            .map(|(idx, (out_name, unified_ty))| {
+                // The input type is the arm's output type at this position.
+                let (input_name, input_ty) = &arm_output_schema[idx];
+
+                let col_ref = TypedExpr::new(
+                    TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: idx,
+                        column_name: input_name.clone(),
+                    },
+                    input_ty.clone(),
+                );
+
+                let expr = if col_ref.data_type == *unified_ty {
+                    col_ref
+                } else {
+                    TypedExpr::new(
+                        TypedExprKind::Cast {
+                            expr: Box::new(col_ref),
+                            target_type: unified_ty.clone(),
+                            cast_context: CastContext::Implicit,
+                        },
+                        unified_ty.clone(),
+                    )
+                };
+
+                AnalyzedProjection {
+                    expr,
+                    output_name: out_name.clone(),
+                }
+            })
+            .collect();
+
+        AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection,
+                from,
+                where_clause: None,
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: unified_schema.to_vec(),
+        }
     }
 
     // ── GROUP BY ────────────────────────────────────────────
