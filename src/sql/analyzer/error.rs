@@ -70,6 +70,9 @@ pub enum AnalyzerError {
     /// Aggregate function used in wrong context (e.g. WHERE clause).
     AggregateNotAllowed { function: String, context: String },
 
+    /// Non-aggregated column appears in aggregate query without GROUP BY coverage.
+    UngroupedColumn { name: String },
+
     /// Window function used in wrong context.
     WindowNotAllowed { function: String, context: String },
 
@@ -176,6 +179,11 @@ impl fmt::Display for AnalyzerError {
                     function, context,
                 )
             }
+            Self::UngroupedColumn { name } => write!(
+                f,
+                "column \"{}\" must appear in the GROUP BY clause or be used in an aggregate function",
+                name
+            ),
             Self::WindowNotAllowed { function, context } => {
                 write!(
                     f,

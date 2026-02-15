@@ -625,6 +625,34 @@ fn analyze_group_by() {
 }
 
 #[test]
+fn analyze_group_by_rejects_ungrouped_select_column() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT age, name FROM users GROUP BY age");
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(err, AnalyzerError::UngroupedColumn { ref name } if name == "name"));
+}
+
+#[test]
+fn analyze_group_by_allows_expression_of_grouped_column() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT age + 1, COUNT(id) FROM users GROUP BY age");
+    let result = analyzer.analyze_query(&query).unwrap();
+    assert_eq!(expect_select(&result).group_by.len(), 1);
+    assert_eq!(result.output_schema.len(), 2);
+}
+
+#[test]
+fn analyze_aggregate_without_group_by_rejects_plain_column() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT age, COUNT(id) FROM users");
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(err, AnalyzerError::UngroupedColumn { ref name } if name == "age"));
+}
+
+#[test]
 fn analyze_order_by() {
     let catalog = test_catalog();
     let mut analyzer = Analyzer::new(&catalog);
