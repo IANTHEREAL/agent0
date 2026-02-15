@@ -35,8 +35,45 @@ fn ensure_config_dir() -> std::path::PathBuf {
 fn save_credentials(token: &str) -> Result<(), String> {
     let dir = ensure_config_dir();
     let cred_path = dir.join("credentials");
-    let content = format!("token = \"{token}\"\n");
-    std::fs::write(&cred_path, content).map_err(|e| format!("Failed to save credentials: {e}"))?;
+    let existing = std::fs::read_to_string(&cred_path).unwrap_or_default();
+    let mut parsed: toml::Table = existing.parse().unwrap_or_default();
+    parsed.insert("token".to_string(), toml::Value::String(token.to_string()));
+    let content =
+        toml::to_string(&parsed).map_err(|e| format!("Failed to serialize credentials: {e}"))?;
+    std::fs::write(&cred_path, &content)
+        .map_err(|e| format!("Failed to save credentials: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&cred_path, perms)
+            .map_err(|e| format!("Failed to set file permissions: {e}"))?;
+    }
+    Ok(())
+}
+
+fn save_anonymous_credentials(
+    token: &str,
+    anonymous_id: &str,
+    anonymous_secret: &str,
+) -> Result<(), String> {
+    let dir = ensure_config_dir();
+    let cred_path = dir.join("credentials");
+    let mut parsed = toml::Table::new();
+    parsed.insert("token".to_string(), toml::Value::String(token.to_string()));
+    parsed.insert("is_anonymous".to_string(), toml::Value::Boolean(true));
+    parsed.insert(
+        "anonymous_id".to_string(),
+        toml::Value::String(anonymous_id.to_string()),
+    );
+    parsed.insert(
+        "anonymous_secret".to_string(),
+        toml::Value::String(anonymous_secret.to_string()),
+    );
+    let content =
+        toml::to_string(&parsed).map_err(|e| format!("Failed to serialize credentials: {e}"))?;
+    std::fs::write(&cred_path, &content)
+        .map_err(|e| format!("Failed to save credentials: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -188,24 +225,42 @@ impl ApiClient {
                     let new_token = if let Some((anon_id, anon_secret)) =
                         load_anonymous_credentials()
                     {
-                        self.anonymous_refresh(&anon_id, &anon_secret).await
+                        let token = self.anonymous_refresh(&anon_id, &anon_secret).await;
+                        if let Err(e) = save_credentials(&token) {
+                            eprintln!("{e}");
+                            process::exit(1);
+                        }
+                        token
                     } else {
                         clear_credentials();
 
                         eprintln!("\nSession expired or invalid token.");
                         eprintln!("Please re-authenticate to continue.\n");
 
-                        let choice = prompt_line("[L] Login  [R] Register a new account: ");
+                        let choice = prompt_line(
+                            "[A] Continue anonymously (default)  [L] Login  [R] Register: ",
+                        );
                         match choice.to_ascii_lowercase().as_str() {
-                            "r" => self.interactive_register().await,
-                            _ => self.interactive_login().await,
+                            "l" => {
+                                let token = self.interactive_login().await;
+                                if let Err(e) = save_credentials(&token) {
+                                    eprintln!("{e}");
+                                    process::exit(1);
+                                }
+                                token
+                            }
+                            "r" => {
+                                let token = self.interactive_register().await;
+                                if let Err(e) = save_credentials(&token) {
+                                    eprintln!("{e}");
+                                    process::exit(1);
+                                }
+                                token
+                            }
+                            _ => self.interactive_anonymous().await,
                         }
                     };
 
-                    if let Err(e) = save_credentials(&new_token) {
-                        eprintln!("{e}");
-                        process::exit(1);
-                    }
 
                     let mut retry_headers = extra_headers.cloned().unwrap_or_default();
                     retry_headers
@@ -304,6 +359,44 @@ impl ApiClient {
             },
             Err((status, detail)) => {
                 eprintln!("Login after registration failed ({}): {detail}", status);
+                process::exit(1);
+            }
+        }
+    }
+
+    async fn interactive_anonymous(&self) -> String {
+        match self
+            .send_request(
+                "POST",
+                "/customer/anonymous-register",
+                None::<&Value>,
+                None,
+            )
+            .await
+        {
+            Ok(data) => {
+                let token = data["token"].as_str().unwrap_or_else(|| {
+                    eprintln!("Failed to create anonymous account");
+                    process::exit(1);
+                });
+                let anon_id = data["anonymous_id"].as_str().unwrap_or("");
+                let anon_secret = data["anonymous_secret"].as_str().unwrap_or("");
+
+                if !anon_id.is_empty() && !anon_secret.is_empty() {
+                    if let Err(e) = save_anonymous_credentials(token, anon_id, anon_secret) {
+                        eprintln!("{e}");
+                        process::exit(1);
+                    }
+                } else if let Err(e) = save_credentials(token) {
+                    eprintln!("{e}");
+                    process::exit(1);
+                }
+
+                eprintln!("Anonymous account created. You can claim it later with 'db9 claim'.");
+                token.to_string()
+            }
+            Err((status, detail)) => {
+                eprintln!("Anonymous registration failed ({}): {detail}", status);
                 process::exit(1);
             }
         }
