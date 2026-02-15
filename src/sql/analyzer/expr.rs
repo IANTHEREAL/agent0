@@ -17,7 +17,7 @@ use std::str::FromStr;
 use crate::sql::names::function_name_upper;
 use crate::sql::types::cast::CastContext;
 use crate::sql::types::coercion::{
-    binary_op_result_type, common_type, comparison_target_type, unify_types,
+    binary_op_result_type, common_type, comparison_target_type, is_numeric, unify_types,
 };
 use crate::sql::types::mapping::sql_datatype_to_internal;
 use crate::sql::types::registry::global_registry;
@@ -885,6 +885,37 @@ impl<'a> Analyzer<'a> {
             l = TypedExpr::null(r.data_type.clone());
         } else if r.is_null_constant() && !l.is_null_constant() {
             r = TypedExpr::null(l.data_type.clone());
+        }
+
+        // PostgreSQL UNKNOWN literal rule (partial):
+        //
+        // String literals are untyped (UNKNOWN) in PostgreSQL and can be coerced
+        // to match a numeric operator context. In tipg, string literals are
+        // initially typed as TEXT, which would otherwise reject `TEXT + INT`.
+        //
+        // We only apply this for *literal* text constants (not TEXT columns, and
+        // not explicitly typed TEXT via `::text`), matching the desired contract:
+        //
+        //   SELECT '100' + 50  -> OK (coerce literal to INT)
+        //   SELECT '100'::text + 50 -> ERROR
+        //   SELECT text_col + 50 -> ERROR
+        if matches!(
+            typed_op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::Exp
+        ) {
+            if is_numeric(&r.data_type) && matches!(l.kind, TypedExprKind::Constant(Value::Text(_)))
+            {
+                l = self.coerce_if_needed(l, &r.data_type);
+            } else if is_numeric(&l.data_type)
+                && matches!(r.kind, TypedExprKind::Constant(Value::Text(_)))
+            {
+                r = self.coerce_if_needed(r, &l.data_type);
+            }
         }
 
         // Use our BinaryOp Display impl (outputs "+", "-", "=", etc.)

@@ -882,6 +882,72 @@ fn analyze_comparison_prefers_non_text_target_on_left_literal() {
 }
 
 #[test]
+fn analyze_arithmetic_coerces_text_literal_to_numeric() {
+    // PostgreSQL UNKNOWN literal behavior: '100' is coerced to the numeric operator context.
+    let expr = analyze_expr_with_users("'100' + 50").unwrap();
+    assert_eq!(expr.data_type, DataType::Int32);
+    match &expr.kind {
+        TypedExprKind::BinaryOp { left, op, right } => {
+            assert_eq!(*op, BinaryOp::Add);
+            assert_eq!(left.data_type, DataType::Int32);
+            assert_eq!(right.data_type, DataType::Int32);
+            assert!(matches!(
+                &left.kind,
+                TypedExprKind::Cast {
+                    target_type: DataType::Int32,
+                    cast_context: crate::sql::types::CastContext::Implicit,
+                    ..
+                }
+            ));
+        }
+        _ => panic!("expected BinaryOp"),
+    }
+}
+
+#[test]
+fn analyze_arithmetic_coerces_text_literal_on_right_side() {
+    let expr = analyze_expr_with_users("50 + '100'").unwrap();
+    assert_eq!(expr.data_type, DataType::Int32);
+    match &expr.kind {
+        TypedExprKind::BinaryOp { left, op, right } => {
+            assert_eq!(*op, BinaryOp::Add);
+            assert_eq!(left.data_type, DataType::Int32);
+            assert_eq!(right.data_type, DataType::Int32);
+            assert!(matches!(
+                &right.kind,
+                TypedExprKind::Cast {
+                    target_type: DataType::Int32,
+                    cast_context: crate::sql::types::CastContext::Implicit,
+                    ..
+                }
+            ));
+        }
+        _ => panic!("expected BinaryOp"),
+    }
+}
+
+#[test]
+fn analyze_arithmetic_rejects_explicit_text_literal_plus_int() {
+    // Explicit typing prevents UNKNOWN-literal coercion.
+    let err = analyze_expr_with_users("'100'::text + 50").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, left: DataType::Text, right: DataType::Int32 }
+            if operator == "+"
+    ));
+}
+
+#[test]
+fn analyze_arithmetic_rejects_text_column_plus_int() {
+    let err = analyze_expr_with_users("name + 50").unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::OperatorTypeMismatch { ref operator, left: DataType::Text, right: DataType::Int32 }
+            if operator == "+"
+    ));
+}
+
+#[test]
 fn analyze_no_cast_when_types_match() {
     // age (Int32) + 1 (Int32) → no cast needed
     let expr = analyze_expr_with_users("age + 1").unwrap();
