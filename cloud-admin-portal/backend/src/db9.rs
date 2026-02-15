@@ -64,6 +64,8 @@ enum Commands {
     Register,
     /// Login to your account
     Login,
+    /// Claim anonymous account with email and password
+    Claim,
     /// Logout (remove stored credentials)
     Logout,
     /// Database management
@@ -330,8 +332,13 @@ fn load_token() -> Result<String, String> {
 fn save_token(token: &str) -> Result<(), String> {
     let dir = ensure_config_dir();
     let cred_path = dir.join("credentials");
-    let content = format!("token = \"{token}\"\n");
-    std::fs::write(&cred_path, content).map_err(|e| format!("Failed to save credentials: {e}"))?;
+    let existing = std::fs::read_to_string(&cred_path).unwrap_or_default();
+    let mut parsed: toml::Table = existing.parse().unwrap_or_default();
+    parsed.insert("token".to_string(), toml::Value::String(token.to_string()));
+    let content = toml::to_string(&parsed)
+        .map_err(|e| format!("Failed to serialize credentials: {e}"))?;
+    std::fs::write(&cred_path, &content)
+        .map_err(|e| format!("Failed to save credentials: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -339,6 +346,22 @@ fn save_token(token: &str) -> Result<(), String> {
         std::fs::set_permissions(&cred_path, perms)
             .map_err(|e| format!("Failed to set file permissions: {e}"))?;
     }
+    Ok(())
+}
+
+fn save_anonymous_flag(is_anonymous: bool) -> Result<(), String> {
+    let dir = ensure_config_dir();
+    let cred_path = dir.join("credentials");
+    let existing = std::fs::read_to_string(&cred_path).unwrap_or_default();
+    let mut parsed: toml::Table = existing.parse().unwrap_or_default();
+    if is_anonymous {
+        parsed.insert("is_anonymous".to_string(), toml::Value::Boolean(true));
+    } else {
+        parsed.remove("is_anonymous");
+    }
+    let content = toml::to_string(&parsed)
+        .map_err(|e| format!("Failed to serialize credentials: {e}"))?;
+    std::fs::write(&cred_path, content).map_err(|e| format!("Failed to save credentials: {e}"))?;
     Ok(())
 }
 
@@ -386,6 +409,7 @@ async fn main() {
     match cli.command {
         Commands::Register => cmd_register(&api, &cli.effective_output()).await,
         Commands::Login => cmd_login(&api, &cli.effective_output()).await,
+        Commands::Claim => cmd_claim(&api, &cli.effective_output()).await,
         Commands::Logout => cmd_logout(),
         Commands::Completion { shell } => cmd_completion(shell),
         Commands::Db { ref action } => match action {
@@ -553,6 +577,41 @@ async fn cmd_login(api: &ApiClient, output: &OutputFormat) {
     }
 }
 
+async fn cmd_claim(api: &ApiClient, output: &OutputFormat) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+    let email = prompt_email();
+    let password = prompt_password("Password: ");
+    let confirm = prompt_password("Confirm password: ");
+
+    if password != confirm {
+        eprintln!("Passwords do not match.");
+        process::exit(1);
+    }
+
+    let body = serde_json::json!({
+        "email": email,
+        "password": password,
+    });
+    let data = api
+        .request("POST", "/customer/claim", Some(&body), Some(&headers))
+        .await;
+
+    if let Err(e) = save_anonymous_flag(false) {
+        eprintln!("Warning: account claimed but failed to update local credentials: {e}");
+    }
+
+    match output {
+        OutputFormat::Json => print_json(&data),
+        _ => {
+            println!(
+                "Account claimed successfully: {}",
+                data["email"].as_str().unwrap_or("(unknown)")
+            );
+        }
+    }
+}
+
 fn cmd_logout() {
     let cred_path = config_dir().join("credentials");
     if cred_path.exists() {
@@ -565,7 +624,31 @@ fn cmd_logout() {
 }
 
 async fn cmd_db_create(api: &ApiClient, output: &OutputFormat, name: &str, region: Option<&str>) {
-    let token = require_token();
+    let token = match load_token() {
+        Ok(t) => t,
+        Err(_) => {
+            eprintln!("No account found. Creating anonymous account...");
+            let data = api
+                .request(
+                    "POST",
+                    "/customer/anonymous-register",
+                    None::<&serde_json::Value>,
+                    None,
+                )
+                .await;
+            let token = data["token"].as_str().unwrap_or_else(|| {
+                eprintln!("Failed to create anonymous account");
+                process::exit(1);
+            });
+            if let Err(e) = save_token(token) {
+                eprintln!("{e}");
+                process::exit(1);
+            }
+            save_anonymous_flag(true).ok();
+            eprintln!("Anonymous account created. You can claim it later with 'db9 claim'.");
+            token.to_string()
+        }
+    };
     let headers = make_auth_headers(&token);
 
     let mut body = serde_json::json!({ "name": name });
@@ -2176,5 +2259,102 @@ mod tests {
         assert!(result.contains("    email: str"));
         assert!(result.contains("    bio: Optional[str]"));
         assert!(result.contains("    metadata: Optional[dict]"));
+    }
+
+    #[test]
+    fn test_save_anonymous_flag_set_true() {
+        let temp_dir = std::env::temp_dir().join(format!("db9-anon-test-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cred_path = temp_dir.join("credentials");
+
+        std::fs::write(&cred_path, "token = \"mytoken\"\n").unwrap();
+
+        let existing = std::fs::read_to_string(&cred_path).unwrap_or_default();
+        let mut parsed: toml::Table = existing.parse().unwrap();
+        parsed.insert("is_anonymous".to_string(), toml::Value::Boolean(true));
+        let content = toml::to_string(&parsed).unwrap();
+        std::fs::write(&cred_path, &content).unwrap();
+
+        let read_back = std::fs::read_to_string(&cred_path).unwrap();
+        let re_parsed: toml::Table = read_back.parse().unwrap();
+        assert_eq!(re_parsed.get("token").and_then(|v| v.as_str()), Some("mytoken"));
+        assert_eq!(
+            re_parsed.get("is_anonymous").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn test_save_anonymous_flag_set_false_removes_key() {
+        let temp_dir = std::env::temp_dir().join(format!("db9-anon-rm-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cred_path = temp_dir.join("credentials");
+
+        std::fs::write(&cred_path, "token = \"mytoken\"\nis_anonymous = true\n").unwrap();
+
+        let existing = std::fs::read_to_string(&cred_path).unwrap_or_default();
+        let mut parsed: toml::Table = existing.parse().unwrap();
+        parsed.remove("is_anonymous");
+        let content = toml::to_string(&parsed).unwrap();
+        std::fs::write(&cred_path, &content).unwrap();
+
+        let read_back = std::fs::read_to_string(&cred_path).unwrap();
+        let re_parsed: toml::Table = read_back.parse().unwrap();
+        assert_eq!(re_parsed.get("token").and_then(|v| v.as_str()), Some("mytoken"));
+        assert!(re_parsed.get("is_anonymous").is_none());
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn test_save_token_preserves_existing_fields() {
+        let temp_dir = std::env::temp_dir().join(format!("db9-preserve-{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let cred_path = temp_dir.join("credentials");
+
+        std::fs::write(&cred_path, "is_anonymous = true\n").unwrap();
+
+        let existing = std::fs::read_to_string(&cred_path).unwrap_or_default();
+        let mut parsed: toml::Table = existing.parse().unwrap();
+        parsed.insert(
+            "token".to_string(),
+            toml::Value::String("new-token".to_string()),
+        );
+        let content = toml::to_string(&parsed).unwrap();
+        std::fs::write(&cred_path, &content).unwrap();
+
+        let read_back = std::fs::read_to_string(&cred_path).unwrap();
+        let re_parsed: toml::Table = read_back.parse().unwrap();
+        assert_eq!(
+            re_parsed.get("token").and_then(|v| v.as_str()),
+            Some("new-token")
+        );
+        assert_eq!(
+            re_parsed.get("is_anonymous").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[test]
+    fn test_toml_credentials_roundtrip_with_anonymous() {
+        let content = "token = \"abc123\"\nis_anonymous = true\n";
+        let parsed: toml::Table = content.parse().unwrap();
+        assert_eq!(parsed.get("token").and_then(|v| v.as_str()), Some("abc123"));
+        assert_eq!(
+            parsed.get("is_anonymous").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn test_toml_credentials_without_anonymous() {
+        let content = "token = \"abc123\"\n";
+        let parsed: toml::Table = content.parse().unwrap();
+        assert_eq!(parsed.get("token").and_then(|v| v.as_str()), Some("abc123"));
+        assert!(parsed.get("is_anonymous").is_none());
     }
 }
