@@ -113,6 +113,56 @@ pub fn common_type(a: &DataType, b: &DataType) -> Option<DataType> {
     }
 }
 
+/// Determine the coercion target for comparison operators.
+///
+/// Unlike `common_type`, comparison prefers the non-text typed side for
+/// `Text/Name` mixed comparisons, matching PostgreSQL semantics where
+/// `'42' = 42` coerces text to integer.
+pub fn comparison_target_type(a: &DataType, b: &DataType) -> Option<DataType> {
+    if a == b {
+        return Some(a.clone());
+    }
+
+    // Both numeric -> higher-precedence numeric wins.
+    if is_numeric(a) && is_numeric(b) {
+        return common_type(a, b);
+    }
+
+    match (a, b) {
+        // Text-like vs typed side -> typed side wins.
+        (DataType::Text, other) | (DataType::Name, other)
+            if *other != DataType::Text && *other != DataType::Name =>
+        {
+            Some(other.clone())
+        }
+        (other, DataType::Text) | (other, DataType::Name)
+            if *other != DataType::Text && *other != DataType::Name =>
+        {
+            Some(other.clone())
+        }
+
+        // Temporal promotions.
+        (DataType::Date, DataType::Timestamp) | (DataType::Timestamp, DataType::Date) => {
+            Some(DataType::Timestamp)
+        }
+        (DataType::Date, DataType::TimestampTz) | (DataType::TimestampTz, DataType::Date) => {
+            Some(DataType::TimestampTz)
+        }
+        (DataType::Timestamp, DataType::TimestampTz)
+        | (DataType::TimestampTz, DataType::Timestamp) => Some(DataType::TimestampTz),
+
+        // JSON cross-type comparisons are unsupported.
+        (DataType::Json, DataType::Jsonb)
+        | (DataType::Jsonb, DataType::Json)
+        | (DataType::Json, _)
+        | (_, DataType::Json)
+        | (DataType::Jsonb, _)
+        | (_, DataType::Jsonb) => None,
+
+        _ => None,
+    }
+}
+
 pub fn unify_types(types: &[DataType]) -> Option<DataType> {
     if types.is_empty() {
         return None;

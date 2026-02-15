@@ -735,6 +735,50 @@ fn analyze_implicit_cast_int_eq_float() {
 }
 
 #[test]
+fn analyze_comparison_prefers_non_text_target_on_right_literal() {
+    // age (Int32) > '9' (Text) -> right side should be implicitly cast to Int32
+    let expr = analyze_expr_with_users("age > '9'").unwrap();
+    assert_eq!(expr.data_type, DataType::Boolean);
+    match &expr.kind {
+        TypedExprKind::BinaryOp { left, right, .. } => {
+            assert_eq!(left.data_type, DataType::Int32);
+            assert_eq!(right.data_type, DataType::Int32);
+            assert!(matches!(
+                &right.kind,
+                TypedExprKind::Cast {
+                    target_type: DataType::Int32,
+                    cast_context: crate::sql::types::CastContext::Implicit,
+                    ..
+                }
+            ));
+        }
+        _ => panic!("expected BinaryOp"),
+    }
+}
+
+#[test]
+fn analyze_comparison_prefers_non_text_target_on_left_literal() {
+    // '9' (Text) < age (Int32) -> left side should be implicitly cast to Int32
+    let expr = analyze_expr_with_users("'9' < age").unwrap();
+    assert_eq!(expr.data_type, DataType::Boolean);
+    match &expr.kind {
+        TypedExprKind::BinaryOp { left, right, .. } => {
+            assert_eq!(left.data_type, DataType::Int32);
+            assert_eq!(right.data_type, DataType::Int32);
+            assert!(matches!(
+                &left.kind,
+                TypedExprKind::Cast {
+                    target_type: DataType::Int32,
+                    cast_context: crate::sql::types::CastContext::Implicit,
+                    ..
+                }
+            ));
+        }
+        _ => panic!("expected BinaryOp"),
+    }
+}
+
+#[test]
 fn analyze_no_cast_when_types_match() {
     // age (Int32) + 1 (Int32) → no cast needed
     let expr = analyze_expr_with_users("age + 1").unwrap();
