@@ -24,6 +24,7 @@ pub fn router() -> Router<AppState> {
         .route("/register", post(register))
         .route("/anonymous-register", post(anonymous_register))
         .route("/anonymous-refresh", post(anonymous_refresh))
+        .route("/anonymous-secret", post(get_anonymous_secret))
         .route("/login", post(login))
         .route("/claim", post(claim_account))
         .route("/me", get(me))
@@ -342,6 +343,43 @@ pub async fn anonymous_refresh(
     .await?;
 
     Ok(Json(AnonymousRefreshResponse { token, expires_at }))
+}
+
+pub async fn get_anonymous_secret(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+) -> Result<Json<AnonymousSecretResponse>, AppError> {
+    let customer = db::get_customer_by_id(&state.db, &auth.customer_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("Customer not found"))?;
+
+    if !customer.is_anonymous {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "Only anonymous accounts can request a secret",
+        ));
+    }
+
+    use rand::RngCore;
+    let mut secret_bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut secret_bytes);
+    let anonymous_secret = secret_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    let secret_hash_bytes = Sha256::digest(anonymous_secret.as_bytes());
+    let secret_hash = secret_hash_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    db::store_anonymous_secret(&state.db, &auth.customer_id, &secret_hash).await?;
+
+    Ok(Json(AnonymousSecretResponse {
+        anonymous_id: auth.customer_id,
+        anonymous_secret,
+    }))
 }
 
 // ── POST /login ──────────────────────────────────────────────────

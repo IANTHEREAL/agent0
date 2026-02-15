@@ -445,12 +445,56 @@ fn prompt_password(prompt: &str) -> String {
     })
 }
 
+async fn migrate_anonymous_secret_if_needed(api: &ApiClient) {
+    let cred_path = config_dir().join("credentials");
+    let content = match std::fs::read_to_string(&cred_path) {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    let parsed: toml::Table = match content.parse() {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+
+    let is_anon = parsed
+        .get("is_anonymous")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let has_secret = parsed.get("anonymous_secret").is_some();
+    let has_token = parsed.get("token").is_some();
+
+    if !is_anon || has_secret || !has_token {
+        return;
+    }
+
+    let token = parsed.get("token").and_then(|v| v.as_str()).unwrap();
+    let headers = make_auth_headers(token);
+
+    let data = api
+        .request(
+            "POST",
+            "/customer/anonymous-secret",
+            None::<&serde_json::Value>,
+            Some(&headers),
+        )
+        .await;
+
+    if let (Some(aid), Some(asec)) = (
+        data["anonymous_id"].as_str(),
+        data["anonymous_secret"].as_str(),
+    ) {
+        save_anonymous_credentials(aid, asec).ok();
+    }
+}
+
 // ── Main ────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
     let api = ApiClient::new_with_options(&cli.api_url, None, cli.insecure).with_auto_reauth();
+
+    migrate_anonymous_secret_if_needed(&api).await;
 
     match cli.command {
         Commands::Register => cmd_register(&api, &cli.effective_output()).await,

@@ -393,6 +393,12 @@ pub struct AnonymousRefreshResponse {
     pub expires_at: String,
 }
 
+#[derive(Serialize)]
+pub struct AnonymousSecretResponse {
+    pub anonymous_id: String,
+    pub anonymous_secret: String,
+}
+
 #[derive(Deserialize)]
 pub struct ClaimRequest {
     pub email: String,
