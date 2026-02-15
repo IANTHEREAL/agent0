@@ -854,6 +854,125 @@ mod tests {
         );
     }
 
+    // ── Context-dependent builtins ──────────────────────────
+
+    #[test]
+    fn typed_builtin_timestamps_use_query_context() {
+        let row = empty_row();
+        let qctx = QueryContext::new(
+            42,
+            Arc::from("mydb"),
+            1_700_000_000_111,
+            1_700_000_000_222,
+            Arc::from("UTC"),
+        );
+
+        let now = func_call("NOW", vec![], DataType::TimestampTz);
+        assert_eq!(
+            eval_typed_expr(&now, &row, &qctx).unwrap(),
+            Value::Timestamp(1_700_000_000_222)
+        );
+
+        let current_ts = func_call("CURRENT_TIMESTAMP", vec![], DataType::TimestampTz);
+        assert_eq!(
+            eval_typed_expr(&current_ts, &row, &qctx).unwrap(),
+            Value::Timestamp(1_700_000_000_222)
+        );
+
+        let statement_ts = func_call("STATEMENT_TIMESTAMP", vec![], DataType::TimestampTz);
+        assert_eq!(
+            eval_typed_expr(&statement_ts, &row, &qctx).unwrap(),
+            Value::Timestamp(1_700_000_000_111)
+        );
+
+        let transaction_ts = func_call("TRANSACTION_TIMESTAMP", vec![], DataType::TimestampTz);
+        assert_eq!(
+            eval_typed_expr(&transaction_ts, &row, &qctx).unwrap(),
+            Value::Timestamp(1_700_000_000_222)
+        );
+    }
+
+    #[test]
+    fn typed_builtin_current_date_uses_query_context() {
+        let row = empty_row();
+        let qctx = QueryContext::new(
+            1,
+            Arc::from("postgres"),
+            1_700_000_000_000,
+            1_700_000_000_123,
+            Arc::from("UTC"),
+        );
+
+        let expr = func_call("CURRENT_DATE", vec![], DataType::Date);
+        let expected =
+            crate::types::date::timestamp_millis_to_date_days(qctx.transaction_timestamp_ms)
+                .unwrap();
+        assert_eq!(
+            eval_typed_expr(&expr, &row, &qctx).unwrap(),
+            Value::Date(expected)
+        );
+    }
+
+    #[test]
+    fn typed_builtin_pg_backend_pid_uses_query_context() {
+        let row = empty_row();
+        let qctx = QueryContext::new(
+            99,
+            Arc::from("postgres"),
+            1_700_000_000_000,
+            1_700_000_000_000,
+            Arc::from("UTC"),
+        );
+
+        let expr = func_call("PG_BACKEND_PID", vec![], DataType::Int32);
+        assert_eq!(
+            eval_typed_expr(&expr, &row, &qctx).unwrap(),
+            Value::Int32(99)
+        );
+    }
+
+    #[test]
+    fn typed_builtin_current_database_uses_query_context() {
+        let row = empty_row();
+        let qctx = QueryContext::new(
+            1,
+            Arc::from("mydb"),
+            1_700_000_000_000,
+            1_700_000_000_000,
+            Arc::from("UTC"),
+        );
+
+        let expr = func_call("CURRENT_DATABASE", vec![], DataType::Text);
+        assert_eq!(
+            eval_typed_expr(&expr, &row, &qctx).unwrap(),
+            Value::Text("mydb".to_string())
+        );
+    }
+
+    #[test]
+    fn typed_builtin_version_works() {
+        let row = empty_row();
+        let qctx = test_qctx();
+
+        let expr = func_call("VERSION", vec![], DataType::Text);
+        assert_eq!(
+            eval_typed_expr(&expr, &row, &qctx).unwrap(),
+            Value::Text(crate::sql::expr::VERSION_STRING.to_string())
+        );
+    }
+
+    #[test]
+    fn typed_builtin_unknown_function_errors() {
+        let row = empty_row();
+        let qctx = test_qctx();
+
+        let expr = func_call("definitely_not_a_real_function", vec![], DataType::Int32);
+        let err = eval_typed_expr(&expr, &row, &qctx).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unknown function: definitely_not_a_real_function"));
+    }
+
     // ── ColumnRef ───────────────────────────────────────────
 
     #[test]
