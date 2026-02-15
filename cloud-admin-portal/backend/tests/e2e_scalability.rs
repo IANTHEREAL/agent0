@@ -33,6 +33,9 @@ async fn setup() -> (Router, AppState) {
         session_ttl_hours: 1,
         audit_retention_days: 90,
         credential_key: None,
+        fs9_meta_url: None,
+        fs9_meta_key: None,
+        fs9_jwt_secret: None,
     };
 
     let state = AppState {
@@ -40,6 +43,7 @@ async fn setup() -> (Router, AppState) {
         config: Arc::new(config),
         sessions: Arc::new(SessionManager::new(1)),
         http_client: reqwest::Client::new(),
+        fs9_client: None,
     };
 
     let app = api::router().with_state(state.clone());

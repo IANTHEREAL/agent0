@@ -38,6 +38,7 @@ sha2 = "0.10"
 toml = "0.8"
 rpassword = "7"
 dirs = "5"
+atty = "0.2"
 
 [dev-dependencies]
 tower = { version = "0.4", features = ["util"] }

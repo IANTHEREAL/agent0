@@ -211,6 +211,19 @@ impl ApiClient {
         }
     }
 
+    /// Non-fatal variant of `request` — returns errors as `Err` instead of
+    /// calling `process::exit`.  Used by the interactive shell so a single bad
+    /// query does not kill the REPL.
+    pub async fn try_request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        extra_headers: Option<&HashMap<String, String>>,
+    ) -> Result<Value, (u16, String)> {
+        self.send_request(method, path, body, extra_headers).await
+    }
+
     pub async fn request(
         &self,
         method: &str,
