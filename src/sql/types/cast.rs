@@ -5,6 +5,7 @@
 //! - `Assignment`: INSERT/UPDATE column coercion — medium
 //! - `Implicit`: Comparison coercion — strictest
 
+use super::coercion::comparison_target_type;
 use crate::sql::error::SqlError;
 use crate::types::{DataType, Value};
 use anyhow::{anyhow, Result};
@@ -60,7 +61,10 @@ fn value_is_compatible_with_column_type(value: &Value, column_type: &DataType) -
         (Value::Int32(_), DataType::Int32) => true,
         (Value::Int64(_), DataType::Int64) => true,
         (Value::Float64(_), DataType::Float64) => true,
-        (Value::Text(_), DataType::Text | DataType::Name | DataType::Varchar(_) | DataType::UserDefined(_)) => true,
+        (
+            Value::Text(_),
+            DataType::Text | DataType::Name | DataType::Varchar(_) | DataType::UserDefined(_),
+        ) => true,
         (Value::Bytes(_), DataType::Bytes) => true,
         (Value::Timestamp(_), DataType::Timestamp | DataType::TimestampTz) => true,
         (Value::Interval(_), DataType::Interval) => true,
@@ -505,57 +509,6 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 }
             }
         },
-    }
-}
-
-/// Determine the common target type for comparing two different types.
-///
-/// For comparisons, non-Text type wins (Text coerces to the typed side),
-/// matching PostgreSQL semantics where `'42' = 42` casts the text to int.
-fn comparison_target_type(a: &DataType, b: &DataType) -> Option<DataType> {
-    use super::coercion::{common_type, is_numeric};
-
-    if a == b {
-        return Some(a.clone());
-    }
-
-    // Both numeric → higher-precedence numeric wins
-    if is_numeric(a) && is_numeric(b) {
-        return common_type(a, b);
-    }
-
-    // Text vs non-Text typed → non-Text side wins
-    match (a, b) {
-        (DataType::Text, other) | (DataType::Name, other) | (DataType::Varchar(_), other)
-            if !matches!(other, DataType::Text | DataType::Name | DataType::Varchar(_)) =>
-        {
-            Some(other.clone())
-        }
-        (other, DataType::Text) | (other, DataType::Name) | (other, DataType::Varchar(_))
-            if !matches!(other, DataType::Text | DataType::Name | DataType::Varchar(_)) =>
-        {
-            Some(other.clone())
-        }
-
-        // Temporal promotions
-        (DataType::Date, DataType::Timestamp) | (DataType::Timestamp, DataType::Date) => {
-            Some(DataType::Timestamp)
-        }
-        (DataType::Date, DataType::TimestampTz) | (DataType::TimestampTz, DataType::Date) => {
-            Some(DataType::TimestampTz)
-        }
-        (DataType::Timestamp, DataType::TimestampTz)
-        | (DataType::TimestampTz, DataType::Timestamp) => Some(DataType::TimestampTz),
-
-        // JSON comparisons not supported
-        (DataType::Json, DataType::Jsonb)
-        | (DataType::Jsonb, DataType::Json)
-        | (DataType::Json, _)
-        | (_, DataType::Json)
-        | (DataType::Jsonb, _)
-        | (_, DataType::Jsonb) => None,
-
-        _ => None,
     }
 }
 

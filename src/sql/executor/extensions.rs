@@ -367,8 +367,14 @@ impl Executor {
                 header,
             } = &mode
             {
-                if let Some((mut schema, receiver)) =
-                    fs::start_file_stream(self.tenant_keyspace(), path, format.as_deref(), *delimiter, *header).await?
+                if let Some((mut schema, receiver)) = fs::start_file_stream(
+                    self.tenant_keyspace(),
+                    path,
+                    format.as_deref(),
+                    *delimiter,
+                    *header,
+                )
+                .await?
                 {
                     apply_table_function_alias(&mut schema, alias)?;
                     let operator: BoxedOperator = Box::new(

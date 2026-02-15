@@ -751,7 +751,7 @@ mod tests {
         assert_eq!(settings.show_value("application_name").as_deref(), Some(""));
         assert_eq!(
             settings.show_value("search_path").as_deref(),
-            Some("public")
+            Some("public, extensions")
         );
         assert_eq!(
             settings.show_value("statement_timeout").as_deref(),

@@ -625,6 +625,34 @@ fn analyze_group_by() {
 }
 
 #[test]
+fn analyze_group_by_rejects_ungrouped_select_column() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT age, name FROM users GROUP BY age");
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(err, AnalyzerError::UngroupedColumn { ref name } if name == "name"));
+}
+
+#[test]
+fn analyze_group_by_allows_expression_of_grouped_column() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT age + 1, COUNT(id) FROM users GROUP BY age");
+    let result = analyzer.analyze_query(&query).unwrap();
+    assert_eq!(expect_select(&result).group_by.len(), 1);
+    assert_eq!(result.output_schema.len(), 2);
+}
+
+#[test]
+fn analyze_aggregate_without_group_by_rejects_plain_column() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("SELECT age, COUNT(id) FROM users");
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(err, AnalyzerError::UngroupedColumn { ref name } if name == "age"));
+}
+
+#[test]
 fn analyze_order_by() {
     let catalog = test_catalog();
     let mut analyzer = Analyzer::new(&catalog);
@@ -725,6 +753,50 @@ fn analyze_implicit_cast_int_eq_float() {
             assert!(matches!(
                 &left.kind,
                 TypedExprKind::Cast {
+                    cast_context: crate::sql::types::CastContext::Implicit,
+                    ..
+                }
+            ));
+        }
+        _ => panic!("expected BinaryOp"),
+    }
+}
+
+#[test]
+fn analyze_comparison_prefers_non_text_target_on_right_literal() {
+    // age (Int32) > '9' (Text) -> right side should be implicitly cast to Int32
+    let expr = analyze_expr_with_users("age > '9'").unwrap();
+    assert_eq!(expr.data_type, DataType::Boolean);
+    match &expr.kind {
+        TypedExprKind::BinaryOp { left, right, .. } => {
+            assert_eq!(left.data_type, DataType::Int32);
+            assert_eq!(right.data_type, DataType::Int32);
+            assert!(matches!(
+                &right.kind,
+                TypedExprKind::Cast {
+                    target_type: DataType::Int32,
+                    cast_context: crate::sql::types::CastContext::Implicit,
+                    ..
+                }
+            ));
+        }
+        _ => panic!("expected BinaryOp"),
+    }
+}
+
+#[test]
+fn analyze_comparison_prefers_non_text_target_on_left_literal() {
+    // '9' (Text) < age (Int32) -> left side should be implicitly cast to Int32
+    let expr = analyze_expr_with_users("'9' < age").unwrap();
+    assert_eq!(expr.data_type, DataType::Boolean);
+    match &expr.kind {
+        TypedExprKind::BinaryOp { left, right, .. } => {
+            assert_eq!(left.data_type, DataType::Int32);
+            assert_eq!(right.data_type, DataType::Int32);
+            assert!(matches!(
+                &left.kind,
+                TypedExprKind::Cast {
+                    target_type: DataType::Int32,
                     cast_context: crate::sql::types::CastContext::Implicit,
                     ..
                 }

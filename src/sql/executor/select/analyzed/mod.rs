@@ -61,9 +61,16 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
         // Build CatalogSnapshot (async: fetches table schemas from store).
-        let catalog =
-            build_catalog_snapshot(self.store().as_ref(), txn, db_id, search_path, self.tenant_keyspace(), query, ctes)
-                .await?;
+        let catalog = build_catalog_snapshot(
+            self.store().as_ref(),
+            txn,
+            db_id,
+            search_path,
+            self.tenant_keyspace(),
+            query,
+            ctes,
+        )
+        .await?;
 
         // Run the Analyzer (sync: name resolution + type checking).
         let mut analyzer = Analyzer::new(&catalog);

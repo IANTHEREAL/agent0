@@ -16,7 +16,9 @@ use std::str::FromStr;
 
 use crate::sql::names::function_name_upper;
 use crate::sql::types::cast::CastContext;
-use crate::sql::types::coercion::{binary_op_result_type, common_type, unify_types};
+use crate::sql::types::coercion::{
+    binary_op_result_type, common_type, comparison_target_type, unify_types,
+};
 use crate::sql::types::mapping::sql_datatype_to_internal;
 use crate::sql::types::registry::global_registry;
 use crate::types::{DataType, Value};
@@ -907,10 +909,21 @@ impl<'a> Analyzer<'a> {
                 right: r.data_type.clone(),
             })?;
 
-        // Insert implicit casts when operand types differ and a common type exists.
-        // This is the core value proposition: the evaluator sees uniform types.
+        // Insert implicit casts when operand types differ and a target type exists.
+        // Comparisons use comparison_target_type (non-Text side wins) while
+        // arithmetic/other operators continue to use common_type.
         if l.data_type != r.data_type {
-            if let Some(target) = common_type(&l.data_type, &r.data_type) {
+            let target_type = match typed_op {
+                BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq => comparison_target_type(&l.data_type, &r.data_type),
+                _ => common_type(&l.data_type, &r.data_type),
+            };
+
+            if let Some(target) = target_type {
                 l = self.coerce_if_needed(l, &target);
                 r = self.coerce_if_needed(r, &target);
             }

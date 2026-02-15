@@ -104,7 +104,16 @@ async fn build_catalog_snapshot_inner(
     }
 
     // 4. Prefetch dynamic schemas for table-valued functions in FROM.
-    prefetch_table_function_schemas(store, txn, db_id, search_path, tenant_keyspace, query, &mut snapshot).await?;
+    prefetch_table_function_schemas(
+        store,
+        txn,
+        db_id,
+        search_path,
+        tenant_keyspace,
+        query,
+        &mut snapshot,
+    )
+    .await?;
 
     Ok(snapshot)
 }
