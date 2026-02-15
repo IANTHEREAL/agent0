@@ -584,21 +584,15 @@ fn eval_bitwise_op(
 
 /// Evaluate a shift operation (<< or >>).
 ///
-/// Clamps the shift amount to 0..63 to prevent panics (matching PostgreSQL
-/// behavior where excessive shifts produce 0). Preserves input type.
+/// Validates the shift amount to prevent panics or masking semantics.
+///
+/// PostgreSQL treats shift counts as bounded by the underlying integer width
+/// (int4: 0..31, int8: 0..63). Out-of-range shift counts should error.
 fn eval_shift_op(left: Value, right: Value, op_name: &str, is_left: bool) -> Result<Value> {
     if left == Value::Null || right == Value::Null {
         return Ok(Value::Null);
     }
-    let is_i32 = matches!(&left, Value::Int32(_));
-    let l = value_to_i64(&left).ok_or_else(|| {
-        anyhow!(
-            "bitwise {} not supported for type {}",
-            op_name,
-            left.type_display_name()
-        )
-    })?;
-    let r = value_to_i64(&right).ok_or_else(|| {
+    let shift = value_to_i64(&right).ok_or_else(|| {
         anyhow!(
             "bitwise {} not supported for type {}",
             op_name,
@@ -606,19 +600,42 @@ fn eval_shift_op(left: Value, right: Value, op_name: &str, is_left: bool) -> Res
         )
     })?;
 
-    // Clamp shift amount: negative or >= 64 → 0 (PostgreSQL behavior)
-    let result = if r < 0 || r >= 64 {
-        0i64
-    } else if is_left {
-        l.wrapping_shl(r as u32)
-    } else {
-        l.wrapping_shr(r as u32)
-    };
-
-    if is_i32 {
-        Ok(Value::Int32(result as i32))
-    } else {
-        Ok(Value::Int64(result))
+    match left {
+        Value::Int32(l) => {
+            if shift < 0 || shift >= 32 {
+                return Err(SqlError::NumericValueOutOfRange {
+                    detail: format!("shift count {} out of range for integer", shift),
+                }
+                .into());
+            }
+            let s = shift as u32;
+            let result = if is_left {
+                l.checked_shl(s).unwrap()
+            } else {
+                l.checked_shr(s).unwrap()
+            };
+            Ok(Value::Int32(result))
+        }
+        Value::Int64(l) => {
+            if shift < 0 || shift >= 64 {
+                return Err(SqlError::NumericValueOutOfRange {
+                    detail: format!("shift count {} out of range for bigint", shift),
+                }
+                .into());
+            }
+            let s = shift as u32;
+            let result = if is_left {
+                l.checked_shl(s).unwrap()
+            } else {
+                l.checked_shr(s).unwrap()
+            };
+            Ok(Value::Int64(result))
+        }
+        other => Err(anyhow!(
+            "bitwise {} not supported for type {}",
+            op_name,
+            other.type_display_name()
+        )),
     }
 }
 
@@ -1921,11 +1938,11 @@ mod tests {
     }
 
     #[test]
-    fn test_shift_excessive_amount_returns_zero() {
+    fn test_shift_excessive_amount_errors() {
         let row = empty_row();
         let qctx = test_qctx();
 
-        // Shift left by 64 → 0 (PostgreSQL behavior)
+        // Int8 shift count is 0..63
         let shl_64 = TypedExpr::new(
             TypedExprKind::BinaryOp {
                 left: Box::new(const_expr(Value::Int64(1), DataType::Int64)),
@@ -1934,12 +1951,28 @@ mod tests {
             },
             DataType::Int64,
         );
-        assert_eq!(
-            eval_typed_expr(&shl_64, &row, &qctx).unwrap(),
-            Value::Int64(0)
-        );
+        let err = eval_typed_expr(&shl_64, &row, &qctx).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<SqlError>(),
+            Some(SqlError::NumericValueOutOfRange { .. })
+        ));
 
-        // Shift right by 100 → 0
+        // Int4 shift count is 0..31
+        let shl_32 = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(const_expr(Value::Int32(1), DataType::Int32)),
+                op: BinaryOp::ShiftLeft,
+                right: Box::new(const_expr(Value::Int32(32), DataType::Int32)),
+            },
+            DataType::Int32,
+        );
+        let err = eval_typed_expr(&shl_32, &row, &qctx).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<SqlError>(),
+            Some(SqlError::NumericValueOutOfRange { .. })
+        ));
+
+        // Shift right by a huge amount should also error.
         let shr_100 = TypedExpr::new(
             TypedExprKind::BinaryOp {
                 left: Box::new(const_expr(Value::Int64(42), DataType::Int64)),
@@ -1948,14 +1981,15 @@ mod tests {
             },
             DataType::Int64,
         );
-        assert_eq!(
-            eval_typed_expr(&shr_100, &row, &qctx).unwrap(),
-            Value::Int64(0)
-        );
+        let err = eval_typed_expr(&shr_100, &row, &qctx).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<SqlError>(),
+            Some(SqlError::NumericValueOutOfRange { .. })
+        ));
     }
 
     #[test]
-    fn test_shift_negative_amount_returns_zero() {
+    fn test_shift_negative_amount_errors() {
         let row = empty_row();
         let qctx = test_qctx();
         let shl_neg = TypedExpr::new(
@@ -1966,9 +2000,44 @@ mod tests {
             },
             DataType::Int64,
         );
+        let err = eval_typed_expr(&shl_neg, &row, &qctx).unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<SqlError>(),
+            Some(SqlError::NumericValueOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn test_shift_upper_bound_ok() {
+        let row = empty_row();
+        let qctx = test_qctx();
+
+        // int4: 1 << 31
+        let shl_31 = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(const_expr(Value::Int32(1), DataType::Int32)),
+                op: BinaryOp::ShiftLeft,
+                right: Box::new(const_expr(Value::Int32(31), DataType::Int32)),
+            },
+            DataType::Int32,
+        );
         assert_eq!(
-            eval_typed_expr(&shl_neg, &row, &qctx).unwrap(),
-            Value::Int64(0)
+            eval_typed_expr(&shl_31, &row, &qctx).unwrap(),
+            Value::Int32(1_i32 << 31)
+        );
+
+        // int8: 1 << 63
+        let shl_63 = TypedExpr::new(
+            TypedExprKind::BinaryOp {
+                left: Box::new(const_expr(Value::Int64(1), DataType::Int64)),
+                op: BinaryOp::ShiftLeft,
+                right: Box::new(const_expr(Value::Int64(63), DataType::Int64)),
+            },
+            DataType::Int64,
+        );
+        assert_eq!(
+            eval_typed_expr(&shl_63, &row, &qctx).unwrap(),
+            Value::Int64(1_i64 << 63)
         );
     }
 
