@@ -203,6 +203,10 @@ fn is_ip_forbidden(ip: IpAddr) -> bool {
 }
 
 async fn validate_url(url: &Url) -> Result<()> {
+    validate_url_with_policy(url, allow_insecure_http()).await
+}
+
+async fn validate_url_with_policy(url: &Url, allow_insecure: bool) -> Result<()> {
     let scheme = url.scheme();
     let is_https = scheme == "https";
     let is_http = scheme == "http";
@@ -211,7 +215,7 @@ async fn validate_url(url: &Url) -> Result<()> {
         return Err(anyhow!("http: only http and https schemes are allowed"));
     }
 
-    if is_http && !allow_insecure_http() {
+    if is_http && !allow_insecure {
         return Err(anyhow!(
             "http: insecure http requests are disabled (set PGTIKV_HTTP_ALLOW_INSECURE=true to enable)"
         ));
@@ -225,10 +229,8 @@ async fn validate_url(url: &Url) -> Result<()> {
         .port_or_known_default()
         .ok_or_else(|| anyhow!("http: url port is missing"))?;
 
-    let insecure = allow_insecure_http();
-
     let default_port = if is_https { 443 } else { 80 };
-    if port != default_port && !insecure {
+    if port != default_port && !allow_insecure {
         return Err(anyhow!(
             "http: only port {} is allowed for {} scheme",
             default_port,
@@ -242,7 +244,7 @@ async fn validate_url(url: &Url) -> Result<()> {
     let host_lower = host.to_ascii_lowercase();
 
     // In insecure mode, allow localhost and private IPs for local development.
-    if insecure {
+    if allow_insecure {
         return Ok(());
     }
 
@@ -460,13 +462,13 @@ mod tests {
     #[tokio::test]
     async fn test_validate_url_https_allowed() {
         let url = Url::parse("https://example.com/api").unwrap();
-        assert!(validate_url(&url).await.is_ok());
+        assert!(validate_url_with_policy(&url, false).await.is_ok());
     }
 
     #[tokio::test]
     async fn test_validate_url_https_port_443_only() {
         let url = Url::parse("https://example.com:8443/api").unwrap();
-        let result = validate_url(&url).await;
+        let result = validate_url_with_policy(&url, false).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("only port 443"));
     }
@@ -474,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_url_http_blocked_by_default() {
         let url = Url::parse("http://example.com/api").unwrap();
-        let result = validate_url(&url).await;
+        let result = validate_url_with_policy(&url, false).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -485,7 +487,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_url_invalid_scheme() {
         let url = Url::parse("ftp://example.com/file").unwrap();
-        let result = validate_url(&url).await;
+        let result = validate_url_with_policy(&url, false).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -496,7 +498,7 @@ mod tests {
     #[tokio::test]
     async fn test_validate_url_userinfo_not_allowed() {
         let url = Url::parse("https://user:pass@example.com/api").unwrap();
-        let result = validate_url(&url).await;
+        let result = validate_url_with_policy(&url, false).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("userinfo"));
     }
@@ -504,11 +506,17 @@ mod tests {
     #[tokio::test]
     async fn test_validate_url_localhost_blocked() {
         let url = Url::parse("https://localhost/api").unwrap();
-        let result = validate_url(&url).await;
+        let result = validate_url_with_policy(&url, false).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
             .to_string()
             .contains("host is not allowed"));
+    }
+
+    #[tokio::test]
+    async fn test_validate_url_http_allowed_in_insecure_mode() {
+        let url = Url::parse("http://example.com:8080/api").unwrap();
+        assert!(validate_url_with_policy(&url, true).await.is_ok());
     }
 }
