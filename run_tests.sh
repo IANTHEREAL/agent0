@@ -7,6 +7,30 @@ PG_PORT=${PG_PORT:-15433}
 PG_USER=${PG_USER:-admin}
 PG_PASSWORD=${PG_PASSWORD:-admin}
 
+# ORM selection — normalize env var to 0/1
+_raw_prisma=${WITH_PRISMA:-0}
+case "$_raw_prisma" in
+    1|true|yes|on)  INCLUDE_PRISMA=1 ;;
+    0|false|no|off) INCLUDE_PRISMA=0 ;;
+    *) echo "ERROR: invalid WITH_PRISMA value '$_raw_prisma' (expected 1/true/yes/on or 0/false/no/off)"; exit 1 ;;
+esac
+
+# Extract script-only flags from args; pass the rest to integration_test.py.
+INTEGRATION_ARGS=()
+for arg in "$@"; do
+    case "$arg" in
+        --with-prisma)
+            INCLUDE_PRISMA=1
+            ;;
+        --skip-prisma)
+            INCLUDE_PRISMA=0
+            ;;
+        *)
+            INTEGRATION_ARGS+=("$arg")
+            ;;
+    esac
+done
+
 # Report file
 REPORT_DIR="$SCRIPT_DIR/test-reports"
 REPORT_TIMESTAMP=$(date +%Y%m%d-%H%M%S)
@@ -88,6 +112,7 @@ cat >> "$REPORT_FILE" << EOF
 | PD Endpoint | 127.0.0.1:$PD_PORT |
 | pg-tikv Port | $PG_PORT |
 | User | $PG_USER |
+| Prisma | $([ "$INCLUDE_PRISMA" -eq 1 ] && echo "enabled" || echo "skipped") |
 
 EOF
 
@@ -136,7 +161,7 @@ echo ""
 
 echo "[4/5] Running integration tests..."
 INTEGRATION_START=$(date +%s)
-INTEGRATION_OUTPUT=$(uv run "$SCRIPT_DIR/scripts/integration_test.py" --dsn "$PG_DSN" "$SCRIPT_DIR/tests/" "$@" 2>&1) || INTEGRATION_EXIT=$?
+INTEGRATION_OUTPUT=$(uv run "$SCRIPT_DIR/scripts/integration_test.py" --dsn "$PG_DSN" "$SCRIPT_DIR/tests/" "${INTEGRATION_ARGS[@]}" 2>&1) || INTEGRATION_EXIT=$?
 INTEGRATION_END=$(date +%s)
 INTEGRATION_TIME=$((INTEGRATION_END - INTEGRATION_START))
 echo "$INTEGRATION_OUTPUT"
@@ -171,19 +196,28 @@ if [ ! -d "node_modules" ]; then
     echo "Installing dependencies..."
     npm install --silent
 fi
-if [ -f "schema.prisma" ] || [ -f "prisma/schema.prisma" ]; then
-    if [ ! -d "node_modules/.prisma" ]; then
-        echo "Generating Prisma client..."
-        npx prisma generate --no-hints
+
+ORM_SUITES=(typeorm/ sequelize/ knex/ drizzle/ pg-client/)
+if [ "$INCLUDE_PRISMA" -eq 1 ]; then
+    if [ -d "prisma/" ] && compgen -G "prisma/*.test.ts" > /dev/null 2>&1; then
+        ORM_SUITES+=(prisma/)
+        if [ -f "schema.prisma" ] || [ -f "prisma/schema.prisma" ]; then
+            if [ ! -d "node_modules/.prisma" ]; then
+                echo "Generating Prisma client..."
+                npx prisma generate --no-hints
+            fi
+        else
+            echo "Prisma schema not found; skipping prisma generate"
+        fi
+    else
+        echo "WARNING: --with-prisma requested but orm-tests/prisma/ suite not found; skipping."
     fi
 else
-    echo "Prisma schema not found; skipping prisma generate"
+    echo "Prisma tests are skipped by default; use --with-prisma or WITH_PRISMA=1 to include them."
 fi
 
 ORM_START=$(date +%s)
-# Skip Prisma tests due to known boolean parsing bug in Prisma Query Engine
-# Prisma cannot parse standard PostgreSQL 't'/'f' boolean text format
-ORM_OUTPUT=$(PG_DSN="$PG_DSN" timeout 300 npm test -- typeorm/ sequelize/ knex/ drizzle/ pg-client/ 2>&1) || ORM_EXIT=$?
+ORM_OUTPUT=$(PG_DSN="$PG_DSN" timeout 300 npm test -- "${ORM_SUITES[@]}" 2>&1) || ORM_EXIT=$?
 ORM_END=$(date +%s)
 ORM_TIME=$((ORM_END - ORM_START))
 echo "$ORM_OUTPUT"
@@ -200,6 +234,7 @@ cat >> "$REPORT_FILE" << EOF
 
 - **Duration**: ${ORM_TIME}s
 - **Status**: $([ $ORM_EXIT -eq 0 ] && echo '✅ PASSED' || echo '❌ FAILED')
+- **Suites**: ${ORM_SUITES[*]}
 - **Passed**: $ORM_PASSED
 - **Failed**: $ORM_FAILED
 - **Skipped**: $ORM_SKIPPED
