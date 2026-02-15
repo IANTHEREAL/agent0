@@ -199,7 +199,9 @@ pub fn parse_value_for_copy(val: &str, data_type: &DataType) -> Result<Value> {
                 value: unescaped.clone(),
             })
         }),
-        DataType::Text | DataType::Name | DataType::UserDefined(_) => Ok(Value::Text(unescaped)),
+        DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::UserDefined(_) => {
+            Ok(Value::Text(unescaped))
+        }
         DataType::Array(_) => parse_pg_array(trimmed).map(Value::Array).map_err(|_| {
             anyhow::Error::from(SqlError::InvalidInputSyntax {
                 type_name: "array".into(),
