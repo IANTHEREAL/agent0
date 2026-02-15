@@ -15,13 +15,13 @@ use tokio::sync::Semaphore;
 
 /// Check if insecure HTTP (non-HTTPS) requests are allowed.
 /// Controlled by `PGTIKV_HTTP_ALLOW_INSECURE` environment variable.
-/// Default: true (both HTTP and HTTPS allowed).
+/// Default: false (HTTPS-only, locked down ports/hosts).
 fn allow_insecure_http() -> bool {
     static ALLOW_INSECURE: OnceLock<bool> = OnceLock::new();
     *ALLOW_INSECURE.get_or_init(|| {
         std::env::var("PGTIKV_HTTP_ALLOW_INSECURE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(true)
+            .unwrap_or(false)
     })
 }
 
