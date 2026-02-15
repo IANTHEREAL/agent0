@@ -52,7 +52,7 @@ impl PdClient {
 
     pub async fn disable_keyspace(&self, name: &str) -> bool {
         let url = format!("{}/pd/api/v2/keyspaces/{name}/state", self.base_url);
-        let body = json!({ "action": "DISABLE" });
+        let body = json!({ "state": "DISABLED" });
         match self.client.put(&url).json(&body).send().await {
             Ok(resp) => {
                 let status = resp.status();

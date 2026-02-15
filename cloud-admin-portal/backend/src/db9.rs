@@ -86,6 +86,8 @@ enum Commands {
         #[command(subcommand)]
         action: MigrationAction,
     },
+    /// Guided setup: register, login, and create your first database
+    Init,
     /// Generate shell completion scripts
     Completion {
         /// Shell to generate for
@@ -108,7 +110,12 @@ enum DbAction {
     /// Get database status and details
     Status { id: String },
     /// Delete a database
-    Delete { id: String },
+    Delete {
+        id: String,
+        /// Skip confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Reset database admin password
     ResetPassword { id: String },
     /// Show connection info for a database
@@ -387,6 +394,7 @@ async fn main() {
         Commands::Register => cmd_register(&api, &cli.effective_output()).await,
         Commands::Login => cmd_login(&api, &cli.effective_output()).await,
         Commands::Logout => cmd_logout(),
+        Commands::Init => cmd_init(&api, &cli.effective_output()).await,
         Commands::Completion { shell } => cmd_completion(shell),
         Commands::Db { ref action } => match action {
             DbAction::Create { name, region } => {
@@ -394,7 +402,9 @@ async fn main() {
             }
             DbAction::List => cmd_db_list(&api, &cli.effective_output()).await,
             DbAction::Status { id } => cmd_db_status(&api, &cli.effective_output(), id).await,
-            DbAction::Delete { id } => cmd_db_delete(&api, &cli.effective_output(), id).await,
+            DbAction::Delete { id, yes } => {
+                    cmd_db_delete(&api, &cli.effective_output(), id, *yes).await
+                }
             DbAction::ResetPassword { id } => {
                 cmd_db_reset_password(&api, &cli.effective_output(), id).await
             }
@@ -564,6 +574,50 @@ fn cmd_logout() {
     println!("Logged out successfully.");
 }
 
+async fn cmd_init(api: &ApiClient, output: &OutputFormat) {
+    println!("Welcome to db9! Let's get you set up.\n");
+
+    if load_token().is_ok() {
+        println!("You're already logged in.\n");
+    } else {
+        print!("Do you have an account? [y/N] ");
+        io::stdout().flush().ok();
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer).ok();
+        let has_account = answer.trim().eq_ignore_ascii_case("y");
+
+        if has_account {
+            println!("\n--- Login ---");
+            cmd_login(api, output).await;
+        } else {
+            println!("\n--- Register ---");
+            cmd_register(api, output).await;
+            println!("\n--- Login ---");
+            cmd_login(api, output).await;
+        }
+    }
+
+    print!("\nCreate your first database? [Y/n] ");
+    io::stdout().flush().ok();
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer).ok();
+    let answer = answer.trim();
+    if answer.is_empty() || answer.eq_ignore_ascii_case("y") {
+        print!("Database name: ");
+        io::stdout().flush().ok();
+        let mut name = String::new();
+        io::stdin().read_line(&mut name).ok();
+        let name = name.trim();
+        if name.is_empty() {
+            eprintln!("Database name cannot be empty.");
+            process::exit(1);
+        }
+        cmd_db_create(api, output, name, None).await;
+    }
+
+    println!("\nYou're all set! Run 'db9 --help' to see all available commands.");
+}
+
 async fn cmd_db_create(api: &ApiClient, output: &OutputFormat, name: &str, region: Option<&str>) {
     let token = require_token();
     let headers = make_auth_headers(&token);
@@ -701,11 +755,11 @@ async fn cmd_db_status(api: &ApiClient, output: &OutputFormat, id: &str) {
     }
 }
 
-async fn cmd_db_delete(api: &ApiClient, output: &OutputFormat, id: &str) {
+async fn cmd_db_delete(api: &ApiClient, output: &OutputFormat, id: &str, skip_confirm: bool) {
     let token = require_token();
     let headers = make_auth_headers(&token);
 
-    if !matches!(output, OutputFormat::Json) {
+    if !skip_confirm && !matches!(output, OutputFormat::Json) {
         print!("Are you sure you want to delete database {id}? This cannot be undone. [y/N] ");
         io::stdout().flush().ok();
         let mut answer = String::new();
@@ -957,6 +1011,11 @@ async fn execute_sql(api: &ApiClient, id: &str, sql: &str) -> Value {
 }
 
 fn print_sql_result(data: &Value, output: &OutputFormat) {
+    if matches!(output, OutputFormat::Json) {
+        print_json(data);
+        return;
+    }
+
     let columns = match data["columns"].as_array() {
         Some(cols) if !cols.is_empty() => cols,
         _ => {
@@ -1055,7 +1114,8 @@ fn print_sql_result(data: &Value, output: &OutputFormat) {
                     println!("{line}");
                 }
             }
-            println!("({} rows)", rows.len());
+            let n = rows.len();
+            println!("({} {})", n, if n == 1 { "row" } else { "rows" });
         }
     }
 }
