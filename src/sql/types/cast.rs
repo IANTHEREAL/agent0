@@ -61,7 +61,10 @@ fn value_is_compatible_with_column_type(value: &Value, column_type: &DataType) -
         (Value::Int32(_), DataType::Int32) => true,
         (Value::Int64(_), DataType::Int64) => true,
         (Value::Float64(_), DataType::Float64) => true,
-        (Value::Text(_), DataType::Text | DataType::Name | DataType::Varchar(_) | DataType::UserDefined(_)) => true,
+        (
+            Value::Text(_),
+            DataType::Text | DataType::Name | DataType::Varchar(_) | DataType::UserDefined(_),
+        ) => true,
         (Value::Bytes(_), DataType::Bytes) => true,
         (Value::Timestamp(_), DataType::Timestamp | DataType::TimestampTz) => true,
         (Value::Interval(_), DataType::Interval) => true,
