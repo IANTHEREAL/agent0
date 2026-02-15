@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
-use sqlparser::ast::Assignment;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tikv_client::Transaction;
@@ -14,7 +13,7 @@ use super::projection::eval_default_expr;
 use super::sequences;
 use super::value_coercion::coerce_value_for_column;
 use crate::storage::TikvStore;
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::types::{DataType, Row, TableSchema, Value};
 
 pub type EnumLabelCache = HashMap<String, HashSet<String>>;
 
@@ -1297,136 +1296,10 @@ pub async fn validate_foreign_keys(
     Ok(())
 }
 
-pub struct UpdateColumnInfo {
-    pub indices: Vec<usize>,
-}
-
-pub fn validate_update_columns(
-    schema: &TableSchema,
-    assignments: &[Assignment],
-) -> Result<UpdateColumnInfo> {
-    let mut indices = Vec::new();
-    for a in assignments {
-        let c = a.id.last().unwrap().value.clone();
-        let idx = schema
-            .column_index(&c)
-            .ok_or_else(|| anyhow!("Col not found"))?;
-        indices.push(idx);
-    }
-    Ok(UpdateColumnInfo { indices })
-}
-
-pub async fn compute_update_values(
-    store: &Arc<TikvStore>,
-    txn: &mut Transaction,
-    db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
-    search_path: &[String],
-    schema: &TableSchema,
-    old_row: &Row,
-    assignments: &[Assignment],
-    indices: &[usize],
-    eval_row: Option<(&Row, &TableSchema)>,
-) -> Result<Vec<Value>> {
-    let mut vals = old_row.values.clone();
-    for (i, a) in assignments.iter().enumerate() {
-        let (eval_row, eval_schema) = if let Some((combined_row, combined_schema)) = eval_row {
-            (combined_row, combined_schema)
-        } else {
-            (old_row, schema)
-        };
-
-        let raw_val = if sequences::expr_needs_async_eval(&a.value) {
-            sequences::eval_expr_with_sequences(
-                store,
-                txn,
-                db_id,
-                sequence_values,
-                search_path,
-                &a.value,
-                Some(eval_row),
-                Some(eval_schema),
-            )
-            .await?
-        } else {
-            let alias = eval_schema
-                .name
-                .rsplit('.')
-                .next()
-                .unwrap_or(&eval_schema.name);
-            super::expr::bridge::eval_ast_expr_with_row(&a.value, eval_row, eval_schema, alias)?
-        };
-        let col = &schema.columns[indices[i]];
-        let coerced = coerce_value_for_column(raw_val, col)?;
-        vals[indices[i]] = coerced;
-    }
-    Ok(vals)
-}
-
-pub fn build_update_join_context<'a>(
-    main_schema: &'a TableSchema,
-    main_alias: &str,
-    from_schema: &'a TableSchema,
-    from_alias: &str,
-    main_row: &'a Row,
-    from_row: &'a Row,
-) -> (TableSchema, Row, HashMap<String, usize>) {
-    let mut combined_col_defs: Vec<ColumnDef> = main_schema.columns.clone();
-    combined_col_defs.extend(from_schema.columns.clone());
-
-    let combined_schema = TableSchema {
-        name: "joined".to_string(),
-        table_id: 0,
-        columns: combined_col_defs,
-        version: 1,
-        pk_constraint_name: None,
-        pk_indices: vec![],
-        indexes: vec![],
-        check_constraints: vec![],
-        foreign_keys: vec![],
-        owner: String::new(),
-        from_alias: None,
-    };
-
-    let mut column_offsets: HashMap<String, usize> = HashMap::new();
-    let mut ambiguous_unqualified: HashSet<String> = HashSet::new();
-    for (i, col) in main_schema.columns.iter().enumerate() {
-        column_offsets.insert(format!("{}.{}", main_alias, col.name), i);
-        column_offsets.insert(col.name.clone(), i);
-    }
-    let offset = main_schema.columns.len();
-    for (i, col) in from_schema.columns.iter().enumerate() {
-        let col_offset = offset + i;
-        column_offsets.insert(format!("{}.{}", from_alias, col.name), col_offset);
-        if col.name.contains('.') {
-            column_offsets.insert(col.name.clone(), col_offset);
-            continue;
-        }
-        if ambiguous_unqualified.contains(&col.name) {
-            continue;
-        }
-        match column_offsets.get(&col.name) {
-            Some(&prev) if prev != col_offset => {
-                column_offsets.remove(&col.name);
-                ambiguous_unqualified.insert(col.name.clone());
-            }
-            Some(_) => {}
-            None => {
-                column_offsets.insert(col.name.clone(), col_offset);
-            }
-        }
-    }
-
-    let mut combined_values = main_row.values.clone();
-    combined_values.extend(from_row.values.clone());
-    let combined_row = Row::new(combined_values);
-
-    (combined_schema, combined_row, column_offsets)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ColumnDef;
 
     fn enum_schema() -> TableSchema {
         TableSchema {
