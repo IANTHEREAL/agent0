@@ -94,6 +94,14 @@ enum Commands {
     },
     /// Guided setup: register, login, and create your first database
     Init,
+    /// Launch interactive filesystem shell for a database
+    Sh {
+        /// Database ID (omit to auto-select or choose interactively)
+        id: Option<String>,
+        /// Execute a shell command and exit
+        #[arg(short = 'c')]
+        command: Option<String>,
+    },
     /// Generate shell completion scripts
     Completion {
         /// Shell to generate for
@@ -502,6 +510,9 @@ async fn main() {
         Commands::Claim => cmd_claim(&api, &cli.effective_output()).await,
         Commands::Logout => cmd_logout(),
         Commands::Init => cmd_init(&api, &cli.effective_output()).await,
+        Commands::Sh { ref id, ref command } => {
+            cmd_sh(&api, &cli.api_url, id.as_deref(), command.as_deref()).await
+        }
         Commands::Completion { shell } => cmd_completion(shell),
         Commands::Db { ref action } => match action {
             DbAction::Create { name, region } => {
@@ -606,6 +617,112 @@ async fn main() {
 fn cmd_completion(shell: clap_complete::Shell) {
     let mut cmd = Cli::command();
     clap_complete::generate(shell, &mut cmd, "db9", &mut io::stdout());
+}
+
+async fn cmd_sh(api: &ApiClient, api_url: &str, id: Option<&str>, command: Option<&str>) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    // Resolve database ID
+    let db_id = if let Some(id) = id {
+        id.to_string()
+    } else {
+        let data = api
+            .request("GET", "/customer/databases", None, Some(&headers))
+            .await;
+        let databases = data.as_array().cloned().unwrap_or_default();
+
+        match databases.len() {
+            0 => {
+                eprintln!("No databases found. Create one with 'db9 db create --name <name>'.");
+                process::exit(1);
+            }
+            1 => {
+                let id = databases[0]["id"].as_str().unwrap_or_else(|| {
+                    eprintln!("Failed to read database ID.");
+                    process::exit(1);
+                });
+                let name = databases[0]["name"].as_str().unwrap_or("(unnamed)");
+                eprintln!("Using database: {} ({})", name, id);
+                id.to_string()
+            }
+            _ => {
+                eprintln!("Select a database:");
+                for (i, db) in databases.iter().enumerate() {
+                    let id = db["id"].as_str().unwrap_or("?");
+                    let name = db["name"].as_str().unwrap_or("(unnamed)");
+                    let state = db["state"].as_str().unwrap_or("?");
+                    eprintln!("  [{}] {} ({}) - {}", i + 1, name, id, state);
+                }
+                eprint!("Enter number: ");
+                io::stderr().flush().ok();
+                let mut input = String::new();
+                io::stdin().read_line(&mut input).unwrap_or_else(|e| {
+                    eprintln!("Failed to read input: {e}");
+                    process::exit(1);
+                });
+                let choice: usize = input.trim().parse().unwrap_or_else(|_| {
+                    eprintln!("Invalid selection.");
+                    process::exit(1);
+                });
+                if choice < 1 || choice > databases.len() {
+                    eprintln!("Selection out of range.");
+                    process::exit(1);
+                }
+                let db = &databases[choice - 1];
+                db["id"]
+                    .as_str()
+                    .unwrap_or_else(|| {
+                        eprintln!("Failed to read database ID.");
+                        process::exit(1);
+                    })
+                    .to_string()
+            }
+        }
+    };
+
+    // Derive fs9 URL: strip /api suffix, append /fs9/<db_id>
+    let base_url = api_url.strip_suffix("/api").unwrap_or(api_url);
+    let fs9_url = format!("{base_url}/fs9/{db_id}");
+
+    // Build sh9 command
+    let mut cmd = std::process::Command::new("sh9");
+    cmd.arg("--server").arg(&fs9_url);
+    cmd.arg("--token").arg(&token);
+    if let Some(c) = command {
+        cmd.arg("-c").arg(c);
+    }
+
+    // On Unix, exec replaces the process
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let err = cmd.exec();
+        if err.kind() == io::ErrorKind::NotFound {
+            eprintln!("sh9 not found. Install it with:");
+            eprintln!("  curl -fsSL https://db9.shared.aws.tidbcloud.com/install-sh9 | sh");
+            process::exit(1);
+        }
+        eprintln!("Failed to exec sh9: {err}");
+        process::exit(1);
+    }
+
+    // On non-Unix, spawn and wait
+    #[cfg(not(unix))]
+    {
+        let status = cmd.status().unwrap_or_else(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                eprintln!("sh9 not found. Install it with:");
+                eprintln!("  curl -fsSL https://db9.shared.aws.tidbcloud.com/install-sh9 | sh");
+                process::exit(1);
+            }
+            eprintln!("Failed to run sh9: {e}");
+            process::exit(1);
+        });
+        if !status.success() {
+            process::exit(status.code().unwrap_or(1));
+        }
+    }
 }
 
 async fn cmd_register(api: &ApiClient, output: &OutputFormat) {

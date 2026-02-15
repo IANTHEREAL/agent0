@@ -1,3 +1,4 @@
+pub mod fs9_client;
 pub mod pd_client;
 pub mod pg_client;
 pub mod reconciler;

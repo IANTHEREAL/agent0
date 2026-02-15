@@ -598,6 +598,69 @@ pub async fn create_database(
         return Err(AppError::internal("Failed to create database"));
     }
 
+    // ── FS9 integration (best-effort) ────────────────────────────
+    if let Some(ref fs9) = state.fs9_client {
+        let fs_keyspace = format!("tipg_fs_{}", tenant_id);
+
+        // Create filesystem keyspace in PD
+        if !pd.create_keyspace(&fs_keyspace).await {
+            tracing::warn!(
+                tenant_id,
+                fs_keyspace,
+                "Failed to create fs keyspace in PD (non-fatal)"
+            );
+        }
+
+        // Create fs9 namespace
+        if let Err(e) = fs9.create_namespace(&tenant_id).await {
+            tracing::warn!(tenant_id, error = %e, "Failed to create fs9 namespace (non-fatal)");
+        } else {
+            // Create pagefs mount backed by TiKV
+            let pd_endpoints: Vec<String> = state
+                .config
+                .pd_endpoints
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .collect();
+            let ca_path = std::env::var("TIKV_CA_PATH").ok();
+            let cert_path = std::env::var("TIKV_CERT_PATH").ok();
+            let key_path = std::env::var("TIKV_KEY_PATH").ok();
+
+            if let Err(e) = fs9
+                .create_mount(
+                    &tenant_id,
+                    &pd_endpoints,
+                    &fs_keyspace,
+                    ca_path.as_deref(),
+                    cert_path.as_deref(),
+                    key_path.as_deref(),
+                )
+                .await
+            {
+                tracing::warn!(tenant_id, error = %e, "Failed to create fs9 mount (non-fatal)");
+            }
+
+            // Generate and store fs9 token
+            match fs9.generate_token(&auth.customer_id, &tenant_id).await {
+                Ok(token) => {
+                    db::upsert_credential(
+                        &state.db,
+                        &tenant_id,
+                        "fs9_token",
+                        &auth.customer_id,
+                        &token,
+                        state.config.credential_key.as_deref(),
+                    )
+                    .await
+                    .ok();
+                }
+                Err(e) => {
+                    tracing::warn!(tenant_id, error = %e, "Failed to generate fs9 token (non-fatal)");
+                }
+            }
+        }
+    }
+
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
     if !pg
         .bootstrap_admin_password(&tenant_id, &admin_user, DEFAULT_ADMIN_PASSWORD, &password)

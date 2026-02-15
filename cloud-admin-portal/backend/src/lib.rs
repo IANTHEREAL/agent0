@@ -30,6 +30,7 @@ use std::sync::Arc;
 use sqlx::AnyPool;
 
 use config::Config;
+use services::fs9_client::Fs9Client;
 use session::SessionManager;
 
 #[derive(Clone)]
@@ -38,4 +39,5 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub sessions: Arc<SessionManager>,
     pub http_client: reqwest::Client,
+    pub fs9_client: Option<Arc<Fs9Client>>,
 }

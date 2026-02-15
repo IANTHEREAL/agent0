@@ -95,11 +95,27 @@ async fn main() {
     let sessions = Arc::new(SessionManager::new(config.session_ttl_hours));
     let config = Arc::new(config);
 
+    let fs9_client = match (&config.fs9_meta_url, &config.fs9_meta_key) {
+        (Some(url), Some(key)) => {
+            tracing::info!("FS9 integration enabled: {}", url);
+            Some(Arc::new(pgtikv_admin::services::fs9_client::Fs9Client::new(
+                url.clone(),
+                key.clone(),
+                http_client.clone(),
+            )))
+        }
+        _ => {
+            tracing::info!("FS9 integration disabled (FS9_META_URL or FS9_META_KEY not set)");
+            None
+        }
+    };
+
     let state = AppState {
         db: pool.clone(),
         config: config.clone(),
         sessions,
         http_client: http_client.clone(),
+        fs9_client,
     };
 
     // ── Reconciler ───────────────────────────────────────────────
