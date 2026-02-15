@@ -8,7 +8,7 @@ use crate::sql::table_functions::table_function_key;
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, Row, TableSchema, ViewDef};
 use anyhow::Result;
-use sqlparser::ast::{Query, TableFactor, Visit, Visitor};
+use sqlparser::ast::{ObjectName, Query, Statement, TableFactor, Visit, Visitor};
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use tikv_client::Transaction;
@@ -39,6 +39,75 @@ pub(crate) async fn build_catalog_snapshot(
         &mut expanding_views,
     )
     .await
+}
+
+/// Build a `CatalogSnapshot` for a DML statement (INSERT, UPDATE, DELETE).
+///
+/// Extracts all table names referenced in the statement and pre-fetches their
+/// schemas. For queries, delegates to `build_catalog_snapshot`.
+pub(crate) async fn build_catalog_snapshot_for_statement(
+    store: &TikvStore,
+    txn: &mut Transaction,
+    db_id: u64,
+    search_path: &[String],
+    tenant_keyspace: &str,
+    stmt: &Statement,
+) -> Result<CatalogSnapshot> {
+    let table_names = extract_dml_table_names(stmt);
+    let empty_ctes: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
+
+    let mut snapshot = CatalogSnapshot::new(search_path.to_vec(), db_id);
+
+    for raw_name in &table_names {
+        let lower = raw_name.to_lowercase();
+        if snapshot.has_table(&lower) || snapshot.has_table(raw_name) {
+            continue;
+        }
+
+        if let Some((schema_name, resolved_full, table_schema)) =
+            try_resolve_table(store, txn, db_id, search_path, raw_name).await?
+        {
+            snapshot.add_table(&schema_name, resolved_full.clone(), table_schema.clone());
+            snapshot.add_table(raw_name, resolved_full, table_schema);
+        } else if let Some(virtual_schema) =
+            crate::sql::information_schema::get_information_schema_schema(raw_name)
+        {
+            snapshot.add_table(raw_name, raw_name.to_string(), virtual_schema);
+        }
+    }
+
+    // For INSERT ... SELECT, also build snapshot for the subquery.
+    if let Statement::Insert {
+        source: Some(query),
+        ..
+    } = stmt
+    {
+        let sub_snapshot = build_catalog_snapshot(
+            store,
+            txn,
+            db_id,
+            search_path,
+            tenant_keyspace,
+            query,
+            &empty_ctes,
+        )
+        .await?;
+        snapshot.merge_from(&sub_snapshot);
+    }
+
+    Ok(snapshot)
+}
+
+/// Extract all table names referenced in a DML statement.
+///
+/// Uses the sqlparser Visitor to walk the entire statement AST, capturing
+/// table references from FROM, USING, WHERE, SET, VALUES, and subqueries.
+fn extract_dml_table_names(stmt: &Statement) -> HashSet<String> {
+    let mut collector = TableNameCollector {
+        names: HashSet::new(),
+    };
+    let _ = stmt.visit(&mut collector);
+    collector.names
 }
 
 /// Inner implementation with cycle detection for recursive view expansion.
@@ -130,7 +199,12 @@ fn extract_table_names(query: &Query) -> HashSet<String> {
     collector.names
 }
 
-/// Visitor that collects table names from `TableFactor::Table` nodes.
+/// Visitor that collects table names from all relation `ObjectName` nodes.
+///
+/// Uses `pre_visit_relation` instead of `pre_visit_table_factor` because
+/// DML target tables (INSERT INTO t, UPDATE t, DELETE FROM t) are stored as
+/// bare `ObjectName` in the AST, not wrapped in `TableFactor::Table`.
+/// `pre_visit_relation` visits ALL relation references uniformly.
 struct TableNameCollector {
     names: HashSet<String>,
 }
@@ -138,13 +212,10 @@ struct TableNameCollector {
 impl Visitor for TableNameCollector {
     type Break = ();
 
-    fn pre_visit_table_factor(&mut self, table_factor: &TableFactor) -> ControlFlow<()> {
-        if let TableFactor::Table { name, .. } = table_factor {
-            // ObjectName → "schema.table" or just "table"
-            let parts: Vec<String> = name.0.iter().map(names::normalize_ident).collect();
-            let full_name = parts.join(".");
-            self.names.insert(full_name);
-        }
+    fn pre_visit_relation(&mut self, relation: &ObjectName) -> ControlFlow<()> {
+        let parts: Vec<String> = relation.0.iter().map(names::normalize_ident).collect();
+        let full_name = parts.join(".");
+        self.names.insert(full_name);
         ControlFlow::Continue(())
     }
 }
@@ -561,4 +632,186 @@ async fn try_resolve_table(
     }
 
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    fn parse_stmt(sql: &str) -> Statement {
+        let dialect = PostgreSqlDialect {};
+        let mut stmts = Parser::parse_sql(&dialect, sql).unwrap();
+        stmts.remove(0)
+    }
+
+    fn parse_query(sql: &str) -> Query {
+        match parse_stmt(sql) {
+            Statement::Query(q) => *q,
+            other => panic!("expected Query, got {:?}", other),
+        }
+    }
+
+    // ── extract_dml_table_names (Bug A regression tests) ──────────
+
+    #[test]
+    fn test_insert_target_table_is_collected() {
+        let stmt = parse_stmt("INSERT INTO users(id, name) VALUES (1, 'alice')");
+        let names = extract_dml_table_names(&stmt);
+        assert!(
+            names.contains("users"),
+            "INSERT target 'users' not found in {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_insert_schema_qualified_target() {
+        let stmt = parse_stmt("INSERT INTO public.users(id) VALUES (1)");
+        let names = extract_dml_table_names(&stmt);
+        assert!(
+            names.contains("public.users"),
+            "INSERT target 'public.users' not found in {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_insert_select_collects_both_tables() {
+        let stmt = parse_stmt("INSERT INTO target SELECT * FROM source");
+        let names = extract_dml_table_names(&stmt);
+        assert!(
+            names.contains("target"),
+            "missing INSERT target in {:?}",
+            names
+        );
+        assert!(
+            names.contains("source"),
+            "missing SELECT source in {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_update_target_table_is_collected() {
+        let stmt = parse_stmt("UPDATE orders SET status = 'done' WHERE id = 1");
+        let names = extract_dml_table_names(&stmt);
+        assert!(
+            names.contains("orders"),
+            "UPDATE target 'orders' not found in {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_update_from_collects_both_tables() {
+        let stmt = parse_stmt(
+            "UPDATE orders SET total = s.amount FROM summaries s WHERE orders.id = s.order_id",
+        );
+        let names = extract_dml_table_names(&stmt);
+        assert!(
+            names.contains("orders"),
+            "missing UPDATE target in {:?}",
+            names
+        );
+        assert!(
+            names.contains("summaries"),
+            "missing FROM table in {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_delete_target_table_is_collected() {
+        let stmt = parse_stmt("DELETE FROM logs WHERE created_at < '2020-01-01'");
+        let names = extract_dml_table_names(&stmt);
+        assert!(
+            names.contains("logs"),
+            "DELETE target 'logs' not found in {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_delete_using_collects_both_tables() {
+        let stmt =
+            parse_stmt("DELETE FROM orders USING customers WHERE orders.cust_id = customers.id");
+        let names = extract_dml_table_names(&stmt);
+        assert!(
+            names.contains("orders"),
+            "missing DELETE target in {:?}",
+            names
+        );
+        assert!(
+            names.contains("customers"),
+            "missing USING table in {:?}",
+            names
+        );
+    }
+
+    // ── extract_table_names (SELECT queries) ──────────────────────
+
+    #[test]
+    fn test_select_from_single_table() {
+        let query = parse_query("SELECT * FROM users");
+        let names = extract_table_names(&query);
+        assert!(names.contains("users"), "missing table in {:?}", names);
+    }
+
+    #[test]
+    fn test_select_join_collects_both_tables() {
+        let query = parse_query("SELECT * FROM orders o JOIN customers c ON o.cust_id = c.id");
+        let names = extract_table_names(&query);
+        assert!(
+            names.contains("orders"),
+            "missing left table in {:?}",
+            names
+        );
+        assert!(
+            names.contains("customers"),
+            "missing right table in {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_select_subquery_collects_inner_table() {
+        let query = parse_query("SELECT * FROM (SELECT id FROM items) sub");
+        let names = extract_table_names(&query);
+        assert!(
+            names.contains("items"),
+            "missing subquery table in {:?}",
+            names
+        );
+    }
+
+    // ── INSERT with ON CONFLICT (test 119 scenario) ──────────────
+
+    #[test]
+    fn test_insert_on_conflict_collects_target() {
+        let stmt = parse_stmt(
+            "INSERT INTO t_child(id, parent_id) VALUES (1, 1) \
+             ON CONFLICT (id) DO UPDATE SET parent_id = EXCLUDED.parent_id + 1",
+        );
+        let names = extract_dml_table_names(&stmt);
+        assert!(
+            names.contains("t_child"),
+            "INSERT ON CONFLICT target not found in {:?}",
+            names
+        );
+    }
+
+    // ── INSERT with type coercion (test 155 scenario) ─────────────
+
+    #[test]
+    fn test_insert_with_cast_collects_target() {
+        let stmt = parse_stmt("INSERT INTO t_int(id, i) VALUES (1, '{\"a\":1}'::jsonb)");
+        let names = extract_dml_table_names(&stmt);
+        assert!(
+            names.contains("t_int"),
+            "INSERT with CAST target not found in {:?}",
+            names
+        );
+    }
 }

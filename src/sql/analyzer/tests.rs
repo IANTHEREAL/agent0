@@ -1164,3 +1164,424 @@ fn analyze_union_unifies_types() {
     let result = analyzer.analyze_query(&query).unwrap();
     assert_eq!(result.output_schema[0].1, DataType::Float64);
 }
+
+// ── DML statement analysis ──────────────────────────────────
+
+fn parse_statement(sql: &str) -> sqlparser::ast::Statement {
+    let dialect = PostgreSqlDialect {};
+    Parser::parse_sql(&dialect, sql)
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap()
+}
+
+#[test]
+fn analyze_insert_values() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("INSERT INTO users (id, name) VALUES (1, 'alice')");
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Insert(ins) => {
+            assert_eq!(ins.table_name, "public.users");
+            assert_eq!(ins.target_columns, vec![0, 1]); // id=0, name=1
+            match &ins.source {
+                AnalyzedInsertSource::Values(rows) => {
+                    assert_eq!(rows.len(), 1);
+                    assert_eq!(rows[0].len(), 2);
+                }
+                _ => panic!("expected Values source"),
+            }
+            assert!(ins.on_conflict.is_none());
+            assert!(ins.returning.is_none());
+        }
+        _ => panic!("expected AnalyzedStatement::Insert"),
+    }
+}
+
+#[test]
+fn analyze_insert_default_values() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("INSERT INTO users DEFAULT VALUES");
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Insert(ins) => {
+            assert!(matches!(ins.source, AnalyzedInsertSource::DefaultValues));
+        }
+        _ => panic!("expected AnalyzedStatement::Insert"),
+    }
+}
+
+#[test]
+fn analyze_insert_column_not_found() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("INSERT INTO users (id, nonexistent) VALUES (1, 'x')");
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(matches!(err, AnalyzerError::DmlColumnNotFound { .. }));
+}
+
+#[test]
+fn analyze_insert_column_count_mismatch() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("INSERT INTO users (id, name) VALUES (1, 'a', 'extra')");
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(matches!(
+        err,
+        AnalyzerError::InsertColumnCountMismatch {
+            columns: 2,
+            values: 3
+        }
+    ));
+}
+
+#[test]
+fn analyze_delete_simple() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("DELETE FROM users WHERE id = 1");
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Delete(del) => {
+            assert_eq!(del.table_name, "public.users");
+            assert!(del.where_clause.is_some());
+            assert!(del.using.is_empty());
+            assert!(del.returning.is_none());
+        }
+        _ => panic!("expected AnalyzedStatement::Delete"),
+    }
+}
+
+#[test]
+fn analyze_delete_no_where() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("DELETE FROM users");
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Delete(del) => {
+            assert!(del.where_clause.is_none());
+        }
+        _ => panic!("expected AnalyzedStatement::Delete"),
+    }
+}
+
+#[test]
+fn analyze_delete_where_not_boolean() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("DELETE FROM users WHERE name");
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(matches!(err, AnalyzerError::DmlWhereNotBoolean { .. }));
+}
+
+#[test]
+fn analyze_update_simple() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("UPDATE users SET name = 'bob' WHERE id = 1");
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Update(upd) => {
+            assert_eq!(upd.table_name, "public.users");
+            assert_eq!(upd.assignments.len(), 1);
+            assert_eq!(upd.assignments[0].0, 1); // name is column index 1
+            assert!(upd.where_clause.is_some());
+            assert!(upd.from.is_empty());
+            assert!(upd.returning.is_none());
+        }
+        _ => panic!("expected AnalyzedStatement::Update"),
+    }
+}
+
+#[test]
+fn analyze_update_column_not_found() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("UPDATE users SET nonexistent = 'x' WHERE id = 1");
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(matches!(err, AnalyzerError::DmlColumnNotFound { .. }));
+}
+
+#[test]
+fn analyze_update_where_not_boolean() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("UPDATE users SET name = 'bob' WHERE name");
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(matches!(err, AnalyzerError::DmlWhereNotBoolean { .. }));
+}
+
+#[test]
+fn analyze_update_multiple_assignments() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("UPDATE users SET name = 'bob', age = 30 WHERE id = 1");
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Update(upd) => {
+            assert_eq!(upd.assignments.len(), 2);
+            // name=col 1, age=col 2
+            let col_indices: Vec<usize> = upd.assignments.iter().map(|(i, _)| *i).collect();
+            assert!(col_indices.contains(&1)); // name
+            assert!(col_indices.contains(&2)); // age
+        }
+        _ => panic!("expected AnalyzedStatement::Update"),
+    }
+}
+
+#[test]
+fn analyze_update_set_default_assignment() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("UPDATE users SET age = DEFAULT WHERE id = 1");
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Update(upd) => {
+            assert_eq!(upd.assignments.len(), 1);
+            assert_eq!(upd.assignments[0].0, 2); // age
+            assert!(matches!(upd.assignments[0].1.kind, TypedExprKind::Default));
+            assert_eq!(upd.assignments[0].1.data_type, DataType::Int32);
+        }
+        _ => panic!("expected AnalyzedStatement::Update"),
+    }
+}
+
+#[test]
+fn analyze_insert_on_conflict_do_nothing() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt =
+        parse_statement("INSERT INTO users (id, name) VALUES (1, 'alice') ON CONFLICT DO NOTHING");
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Insert(ins) => {
+            assert!(matches!(
+                ins.on_conflict,
+                Some(AnalyzedOnConflict::DoNothing)
+            ));
+        }
+        _ => panic!("expected AnalyzedStatement::Insert"),
+    }
+}
+
+#[test]
+fn analyze_table_not_found_in_dml() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("DELETE FROM nonexistent WHERE id = 1");
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(matches!(err, AnalyzerError::TableNotFound(_)));
+}
+
+// ── ON CONFLICT DO UPDATE analysis (test 119 scenarios) ────
+
+#[test]
+fn analyze_insert_on_conflict_do_update() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement(
+        "INSERT INTO users (id, name) VALUES (1, 'alice') \
+         ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name",
+    );
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Insert(ins) => {
+            match &ins.on_conflict {
+                Some(AnalyzedOnConflict::DoUpdate { assignments, .. }) => {
+                    assert_eq!(assignments.len(), 1, "expected 1 assignment");
+                    // column index 1 = "name" (0=id, 1=name)
+                    assert_eq!(assignments[0].0, 1);
+                }
+                other => panic!("expected DoUpdate, got {:?}", other),
+            }
+        }
+        _ => panic!("expected AnalyzedStatement::Insert"),
+    }
+}
+
+#[test]
+fn analyze_insert_on_conflict_do_update_excluded_plus_expr() {
+    // Mirrors test 119 Case 1: SET parent_id = EXCLUDED.parent_id + 1
+    let catalog = MockCatalog::builder()
+        .table(
+            "t_child",
+            vec![
+                ("id", DataType::Int32, false),
+                ("parent_id", DataType::Int32, true),
+            ],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement(
+        "INSERT INTO t_child(id, parent_id) VALUES (1, 1) \
+         ON CONFLICT (id) DO UPDATE SET parent_id = EXCLUDED.parent_id + 1",
+    );
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Insert(ins) => {
+            // MockCatalog resolves unqualified names as "public.<name>"
+            assert!(ins.table_name.ends_with("t_child"));
+            match &ins.on_conflict {
+                Some(AnalyzedOnConflict::DoUpdate { assignments, .. }) => {
+                    assert_eq!(assignments.len(), 1);
+                    // column index 1 = "parent_id" (0=id, 1=parent_id)
+                    assert_eq!(assignments[0].0, 1);
+                    // The RHS should be a BinaryOp (EXCLUDED.parent_id + 1)
+                    assert!(
+                        matches!(assignments[0].1.kind, TypedExprKind::BinaryOp { .. }),
+                        "expected BinaryOp, got {:?}",
+                        assignments[0].1.kind
+                    );
+                }
+                other => panic!("expected DoUpdate, got {:?}", other),
+            }
+        }
+        _ => panic!("expected AnalyzedStatement::Insert"),
+    }
+}
+
+#[test]
+fn analyze_insert_on_conflict_do_update_set_default() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement(
+        "INSERT INTO users (id, name, age) VALUES (1, 'alice', 10) \
+         ON CONFLICT (id) DO UPDATE SET age = DEFAULT",
+    );
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Insert(ins) => match &ins.on_conflict {
+            Some(AnalyzedOnConflict::DoUpdate { assignments, .. }) => {
+                assert_eq!(assignments.len(), 1);
+                assert_eq!(assignments[0].0, 2); // age
+                assert!(matches!(assignments[0].1.kind, TypedExprKind::Default));
+                assert_eq!(assignments[0].1.data_type, DataType::Int32);
+            }
+            other => panic!("expected DoUpdate, got {:?}", other),
+        },
+        _ => panic!("expected AnalyzedStatement::Insert"),
+    }
+}
+
+#[test]
+fn analyze_insert_on_conflict_do_update_target_table_qualified_column() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement(
+        "INSERT INTO users (id, name, age) VALUES (1, 'alice', 10) \
+         ON CONFLICT (id) DO UPDATE SET age = users.age + 1",
+    );
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Insert(ins) => match &ins.on_conflict {
+            Some(AnalyzedOnConflict::DoUpdate { assignments, .. }) => {
+                assert_eq!(assignments.len(), 1);
+                assert_eq!(assignments[0].0, 2); // age
+                assert!(
+                    matches!(assignments[0].1.kind, TypedExprKind::BinaryOp { .. }),
+                    "expected BinaryOp, got {:?}",
+                    assignments[0].1.kind
+                );
+            }
+            other => panic!("expected DoUpdate, got {:?}", other),
+        },
+        _ => panic!("expected AnalyzedStatement::Insert"),
+    }
+}
+
+#[test]
+fn analyze_insert_returning_schema_qualified_target_column() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement(
+        "INSERT INTO users (id, name, age) VALUES (1, 'alice', 10) \
+         RETURNING public.users.id",
+    );
+    let result = analyzer.analyze_statement(&stmt).unwrap();
+    match result {
+        AnalyzedStatement::Insert(ins) => {
+            let returning = ins.returning.expect("expected RETURNING projection");
+            assert_eq!(returning.len(), 1);
+            assert_eq!(returning[0].output_name, "id");
+            assert_eq!(returning[0].expr.data_type, DataType::Int32);
+            assert!(
+                matches!(returning[0].expr.kind, TypedExprKind::ColumnRef { .. }),
+                "expected ColumnRef, got {:?}",
+                returning[0].expr.kind
+            );
+        }
+        _ => panic!("expected AnalyzedStatement::Insert"),
+    }
+}
+
+// ── Type coercion at analysis time (test 155 scenarios) ────
+
+#[test]
+fn analyze_insert_jsonb_into_int_column_errors() {
+    // Mirrors test 155: INSERT INTO t_int(id, i) VALUES (1, '{"a":1}'::jsonb)
+    // The Analyzer correctly rejects JSONB→INT at analysis time — this is the
+    // "cannot cast type JSONB to INT" error that test 155 expects.
+    let catalog = MockCatalog::builder()
+        .table(
+            "t_int",
+            vec![("id", DataType::Int32, false), ("i", DataType::Int32, true)],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("INSERT INTO t_int(id, i) VALUES (1, '{\"a\":1}'::jsonb)");
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::AssignmentTypeMismatch { .. }),
+        "expected AssignmentTypeMismatch, got {:?}",
+        err
+    );
+}
+
+#[test]
+fn analyze_update_jsonb_into_int_column_errors() {
+    // Mirrors test 155: UPDATE t_int SET i = ('{"a":1}'::jsonb) WHERE id = 1
+    // The Analyzer correctly rejects JSONB→INT at analysis time.
+    let catalog = MockCatalog::builder()
+        .table(
+            "t_int",
+            vec![("id", DataType::Int32, false), ("i", DataType::Int32, true)],
+        )
+        .build();
+    let mut analyzer = Analyzer::new(&catalog);
+    let stmt = parse_statement("UPDATE t_int SET i = ('{\"a\":1}'::jsonb) WHERE id = 1");
+    let err = analyzer.analyze_statement(&stmt).unwrap_err();
+    assert!(
+        matches!(err, AnalyzerError::AssignmentTypeMismatch { .. }),
+        "expected AssignmentTypeMismatch, got {:?}",
+        err
+    );
+}
+
+// ── ConflictBehavior derivation (Smell 1 verification) ─────
+
+#[test]
+fn conflict_behavior_from_analyzed_on_conflict() {
+    use crate::sql::dml::ConflictBehavior;
+
+    // None → Error
+    let none: Option<AnalyzedOnConflict> = None;
+    let behavior = match &none {
+        Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
+        Some(AnalyzedOnConflict::DoUpdate { .. }) => ConflictBehavior::DoUpdate,
+        None => ConflictBehavior::Error,
+    };
+    assert_eq!(behavior, ConflictBehavior::Error);
+
+    // DoNothing → DoNothing
+    let do_nothing = Some(AnalyzedOnConflict::DoNothing);
+    let behavior = match &do_nothing {
+        Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
+        Some(AnalyzedOnConflict::DoUpdate { .. }) => ConflictBehavior::DoUpdate,
+        None => ConflictBehavior::Error,
+    };
+    assert_eq!(behavior, ConflictBehavior::DoNothing);
+}

@@ -111,8 +111,8 @@ impl Executor {
     /// Execute a subquery (no locks). Computes its own `QueryPlan` internally.
     ///
     /// Used for recursive execution: subqueries in FROM, correlated subqueries,
-    /// set-operation branches, etc.
-    async fn execute_subquery(
+    /// set-operation branches, INSERT...SELECT, etc.
+    pub(crate) async fn execute_subquery(
         &self,
         txn: &mut Transaction,
         db_id: u64,

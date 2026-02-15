@@ -503,7 +503,8 @@ pub(super) fn collect_aggregates_from_expr(expr: &TypedExpr, analysis: &mut Aggr
         | TypedExprKind::ArraySubquery(_)
         | TypedExprKind::Exists { .. }
         | TypedExprKind::InSubquery { .. }
-        | TypedExprKind::AnyAll { .. } => {}
+        | TypedExprKind::AnyAll { .. }
+        | TypedExprKind::Default => {}
     }
 }
 

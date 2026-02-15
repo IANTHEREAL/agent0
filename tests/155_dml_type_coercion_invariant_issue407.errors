@@ -1,2 +1,2 @@
-cannot cast type JSONB to INT
+is of type INT but expression is of type JSONB
 

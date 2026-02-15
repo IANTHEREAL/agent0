@@ -58,6 +58,13 @@ INSERT INTO insert_test (id, name, value) VALUES (9, 'upsert_add', 100)
 ON CONFLICT (id) DO UPDATE SET value = insert_test.value + EXCLUDED.value
 RETURNING *;
 
+INSERT INTO insert_test (id, name, value) VALUES (13, 'default_reset_seed', 1300);
+INSERT INTO insert_test (id, name, value) VALUES (13, 'default_reset', 9999)
+ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, value = DEFAULT
+RETURNING id, name, value;
+
+SELECT id, name, value FROM insert_test WHERE id = 13;
+
 DROP TABLE insert_source;
 DROP TABLE insert_test;
 

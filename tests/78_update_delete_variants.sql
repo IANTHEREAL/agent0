@@ -54,6 +54,9 @@ SELECT * FROM orders ORDER BY id;
 
 DELETE FROM orders WHERE customer_id = (SELECT id FROM customers WHERE name = 'Bob') RETURNING id;
 
+UPDATE customers SET credit = DEFAULT WHERE id = 1 RETURNING id, credit;
+SELECT id, credit FROM customers WHERE id = 1;
+
 DROP TABLE orders;
 DROP TABLE customers;
 

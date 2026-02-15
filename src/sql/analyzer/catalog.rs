@@ -146,6 +146,25 @@ impl CatalogSnapshot {
         self.types.insert(name.to_lowercase(), udt);
     }
 
+    /// Check if a table name is already in the snapshot.
+    pub fn has_table(&self, name: &str) -> bool {
+        self.tables.contains_key(&name.to_lowercase())
+    }
+
+    /// Merge tables from another snapshot into this one (for DML + subquery).
+    pub fn merge_from(&mut self, other: &CatalogSnapshot) {
+        for (key, (qualified, schema)) in &other.tables {
+            self.tables
+                .entry(key.clone())
+                .or_insert_with(|| (qualified.clone(), schema.clone()));
+        }
+        for (key, schema) in &other.table_functions {
+            self.table_functions
+                .entry(key.clone())
+                .or_insert_with(|| schema.clone());
+        }
+    }
+
     /// Resolve a name against the search path, returning the first matching key.
     ///
     /// If `schema` is provided, only `schema.name` is tried (PostgreSQL semantics:

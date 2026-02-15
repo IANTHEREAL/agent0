@@ -79,6 +79,22 @@ pub enum AnalyzerError {
     /// Set operation (UNION/INTERSECT/EXCEPT) column count mismatch.
     SetOperationColumnMismatch { left: usize, right: usize },
 
+    /// DML: column not found in target table.
+    DmlColumnNotFound { column: String, table: String },
+
+    /// DML: INSERT column count mismatch (columns vs values).
+    InsertColumnCountMismatch { columns: usize, values: usize },
+
+    /// DML: assignment type mismatch (SET col = expr).
+    AssignmentTypeMismatch {
+        column: String,
+        expected: DataType,
+        found: DataType,
+    },
+
+    /// DML: WHERE clause in DML is not boolean.
+    DmlWhereNotBoolean { found: DataType },
+
     /// Unsupported SQL feature.
     Unsupported(String),
 
@@ -196,6 +212,34 @@ impl fmt::Display for AnalyzerError {
                 "each UNION/INTERSECT/EXCEPT query must have the same number of columns ({} vs {})",
                 left, right,
             ),
+            Self::DmlColumnNotFound { column, table } => {
+                write!(
+                    f,
+                    "column \"{}\" of relation \"{}\" does not exist",
+                    column, table,
+                )
+            }
+            Self::InsertColumnCountMismatch { columns, values } => write!(
+                f,
+                "INSERT has more target columns than expressions ({} columns, {} values)",
+                columns, values,
+            ),
+            Self::AssignmentTypeMismatch {
+                column,
+                expected,
+                found,
+            } => write!(
+                f,
+                "column \"{}\" is of type {} but expression is of type {}",
+                column, expected, found,
+            ),
+            Self::DmlWhereNotBoolean { found } => {
+                write!(
+                    f,
+                    "argument of WHERE must be type boolean, not type {}",
+                    found,
+                )
+            }
             Self::Unsupported(msg) => write!(f, "{}", msg),
             Self::Internal(msg) => write!(f, "internal error: {}", msg),
         }

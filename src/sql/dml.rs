@@ -3,20 +3,34 @@ use std::sync::Arc;
 
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{Assignment, Expr, Ident, OnConflictAction, OnInsert, SelectItem};
+use sqlparser::ast::Assignment;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use tikv_client::Transaction;
 
 use super::gin::extract_gin_token_hashes_from_row;
 use super::index_helpers;
-use super::projection::{eval_default_expr, infer_expr_type};
+use super::projection::eval_default_expr;
 use super::sequences;
 use super::value_coercion::coerce_value_for_column;
 use crate::storage::TikvStore;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
 pub type EnumLabelCache = HashMap<String, HashSet<String>>;
+
+/// How `execute_insert_row` should handle unique-key conflicts.
+///
+/// Replaces the previous `&Option<OnInsert>` parameter, removing the dependency
+/// on raw sqlparser AST types from the typed execution path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictBehavior {
+    /// No ON CONFLICT — unique violations produce an error.
+    Error,
+    /// ON CONFLICT DO NOTHING — skip the conflicting row.
+    DoNothing,
+    /// ON CONFLICT DO UPDATE — return the conflicting row for caller-side update.
+    DoUpdate,
+}
 
 pub enum InsertRowResult {
     Inserted(Row),
@@ -111,123 +125,6 @@ fn validate_enum_values(schema: &TableSchema, row: &Row, cache: &EnumLabelCache)
     Ok(())
 }
 
-pub(crate) fn eval_upsert_expr(
-    expr: &Expr,
-    existing_row: &Row,
-    excluded_row: &Row,
-    schema: &TableSchema,
-    target_column: Option<&ColumnDef>,
-) -> Result<Value> {
-    // Handle DEFAULT keyword before passing to Analyzer (not a standard SQL expression)
-    if let Expr::Identifier(ident) = expr {
-        if ident.value.eq_ignore_ascii_case("DEFAULT") {
-            if let Some(col) = target_column {
-                if let Some(default_expr) = &col.default_expr {
-                    return eval_default_expr(default_expr);
-                }
-            }
-            return Ok(Value::Null);
-        }
-    }
-    super::expr::bridge::eval_upsert_ast_expr(expr, existing_row, excluded_row, schema)
-}
-
-pub fn build_returning_columns(
-    returning: &Option<Vec<SelectItem>>,
-    schema: &TableSchema,
-) -> Result<Vec<String>> {
-    let mut ret_cols = Vec::new();
-    if let Some(items) = returning {
-        for item in items {
-            match item {
-                SelectItem::UnnamedExpr(Expr::Identifier(id)) => ret_cols.push(id.value.clone()),
-                SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
-                    ret_cols.push(
-                        parts
-                            .last()
-                            .map(|p| p.value.clone())
-                            .unwrap_or_else(|| "col".to_string()),
-                    );
-                }
-                SelectItem::ExprWithAlias { alias, .. } => ret_cols.push(alias.value.clone()),
-                SelectItem::Wildcard(_) => {
-                    for c in &schema.columns {
-                        ret_cols.push(c.name.clone());
-                    }
-                }
-                _ => return Err(SqlError::Unsupported("Unsupported RETURNING".into()).into()),
-            }
-        }
-    }
-    Ok(ret_cols)
-}
-
-pub fn build_returning_types(
-    returning: &Option<Vec<SelectItem>>,
-    schema: &TableSchema,
-) -> Result<Vec<DataType>> {
-    let mut types = Vec::new();
-    if let Some(items) = returning {
-        for item in items {
-            match item {
-                SelectItem::UnnamedExpr(expr) => types.push(infer_expr_type(expr, schema)?),
-                SelectItem::ExprWithAlias { expr, .. } => {
-                    types.push(infer_expr_type(expr, schema)?)
-                }
-                SelectItem::Wildcard(_) => {
-                    types.extend(schema.columns.iter().map(|c| c.data_type.clone()));
-                }
-                SelectItem::QualifiedWildcard(_, _) => {
-                    types.extend(schema.columns.iter().map(|c| c.data_type.clone()));
-                }
-            }
-        }
-    }
-    Ok(types)
-}
-
-pub async fn eval_returning_row(
-    store: &Arc<TikvStore>,
-    txn: &mut Transaction,
-    db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
-    search_path: &[String],
-    returning: &Option<Vec<SelectItem>>,
-    row: &Row,
-    schema: &TableSchema,
-) -> Result<Option<Row>> {
-    if let Some(items) = returning {
-        let mut vals = Vec::new();
-        for item in items {
-            match item {
-                SelectItem::UnnamedExpr(e) | SelectItem::ExprWithAlias { expr: e, .. } => {
-                    vals.push(if sequences::expr_needs_async_eval(e) {
-                        sequences::eval_expr_with_sequences(
-                            store,
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            e,
-                            Some(row),
-                            Some(schema),
-                        )
-                        .await?
-                    } else {
-                        let table_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-                        super::expr::bridge::eval_ast_expr_with_row(e, row, schema, table_name)?
-                    });
-                }
-                SelectItem::Wildcard(_) => vals.extend(row.values.clone()),
-                _ => {}
-            }
-        }
-        Ok(Some(Row::new(vals)))
-    } else {
-        Ok(None)
-    }
-}
-
 pub async fn execute_insert_row(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -235,7 +132,7 @@ pub async fn execute_insert_row(
     table_name: &str,
     schema: &TableSchema,
     row: Row,
-    on_conflict: &Option<OnInsert>,
+    on_conflict: ConflictBehavior,
     enum_cache: &EnumLabelCache,
 ) -> Result<InsertRowResult> {
     let mut row_values = row.values;
@@ -284,81 +181,23 @@ pub async fn execute_insert_row(
                     .await;
                 if let Err(e) = result {
                     if e.to_string().contains("Duplicate entry") {
-                        // Check if ON CONFLICT is specified
                         match on_conflict {
-                            Some(OnInsert::OnConflict(oc)) => {
-                                let pks = store
-                                    .scan_index(
-                                        txn,
-                                        db_id,
-                                        schema.table_id,
-                                        index.id,
-                                        &idx_values,
-                                        true,
-                                        &pk_types,
-                                        None,
-                                    )
+                            ConflictBehavior::DoNothing => {
+                                rollback_inserted_index_entries(
+                                    store,
+                                    txn,
+                                    db_id,
+                                    schema,
+                                    &pk_values,
+                                    &created_index_entries,
+                                )
+                                .await?;
+                                store
+                                    .delete_by_pk(txn, db_id, table_name, &pk_values)
                                     .await?;
-                                if pks.is_empty() {
-                                    return Err(anyhow!(
-                                        "Failed to find conflicting row in unique index"
-                                    ));
-                                }
-                                let existing_pk = pks.into_iter().next().unwrap();
-
-                                match &oc.action {
-                                    OnConflictAction::DoNothing => {
-                                        rollback_inserted_index_entries(
-                                            store,
-                                            txn,
-                                            db_id,
-                                            schema,
-                                            &pk_values,
-                                            &created_index_entries,
-                                        )
-                                        .await?;
-                                        store
-                                            .delete_by_pk(txn, db_id, table_name, &pk_values)
-                                            .await?;
-                                        return Ok(InsertRowResult::Skipped);
-                                    }
-                                    OnConflictAction::DoUpdate(_) => {
-                                        let existing_rows = store
-                                            .batch_get_rows(
-                                                txn,
-                                                db_id,
-                                                schema.table_id,
-                                                vec![existing_pk.clone()],
-                                                schema,
-                                            )
-                                            .await?;
-                                        let existing_row =
-                                            existing_rows.into_iter().next().ok_or_else(|| {
-                                                anyhow!("Failed to fetch existing row for upsert")
-                                            })?;
-
-                                        rollback_inserted_index_entries(
-                                            store,
-                                            txn,
-                                            db_id,
-                                            schema,
-                                            &pk_values,
-                                            &created_index_entries,
-                                        )
-                                        .await?;
-                                        store
-                                            .delete_by_pk(txn, db_id, table_name, &pk_values)
-                                            .await?;
-
-                                        return Ok(InsertRowResult::Conflicted {
-                                            existing_pk,
-                                            existing_row,
-                                            excluded_row: row,
-                                        });
-                                    }
-                                }
+                                return Ok(InsertRowResult::Skipped);
                             }
-                            Some(OnInsert::DuplicateKeyUpdate(_)) => {
+                            ConflictBehavior::DoUpdate => {
                                 let pks = store
                                     .scan_index(
                                         txn,
@@ -404,26 +243,14 @@ pub async fn execute_insert_row(
                                 store
                                     .delete_by_pk(txn, db_id, table_name, &pk_values)
                                     .await?;
+
                                 return Ok(InsertRowResult::Conflicted {
                                     existing_pk,
                                     existing_row,
                                     excluded_row: row,
                                 });
                             }
-                            None => {
-                                // No ON CONFLICT specified, return error
-                                let cols = index.columns.join(", ");
-                                let vals: Vec<String> =
-                                    idx_values.iter().map(|v| format!("{}", v)).collect();
-                                return Err(SqlError::UniqueViolation {
-                                    constraint: index.name.clone(),
-                                    message: format!(
-                                        "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
-                                        index.name, cols, vals.join(", ")
-                                    ),
-                                }.into());
-                            }
-                            _ => {
+                            ConflictBehavior::Error => {
                                 let cols = index.columns.join(", ");
                                 let vals: Vec<String> =
                                     idx_values.iter().map(|v| format!("{}", v)).collect();
@@ -470,30 +297,8 @@ pub async fn execute_insert_row(
             }
             let pk_values = schema.get_pk_values(&row);
             match on_conflict {
-                Some(OnInsert::OnConflict(oc)) => match &oc.action {
-                    OnConflictAction::DoNothing => Ok(InsertRowResult::Skipped),
-                    OnConflictAction::DoUpdate(_) => {
-                        let existing_rows = store
-                            .batch_get_rows(
-                                txn,
-                                db_id,
-                                schema.table_id,
-                                vec![pk_values.clone()],
-                                schema,
-                            )
-                            .await?;
-                        let existing_row = existing_rows
-                            .into_iter()
-                            .next()
-                            .ok_or_else(|| anyhow!("Failed to fetch existing row for upsert"))?;
-                        Ok(InsertRowResult::Conflicted {
-                            existing_pk: pk_values,
-                            existing_row,
-                            excluded_row: row,
-                        })
-                    }
-                },
-                Some(OnInsert::DuplicateKeyUpdate(_)) => {
+                ConflictBehavior::DoNothing => Ok(InsertRowResult::Skipped),
+                ConflictBehavior::DoUpdate => {
                     let existing_rows = store
                         .batch_get_rows(
                             txn,
@@ -513,8 +318,7 @@ pub async fn execute_insert_row(
                         excluded_row: row,
                     })
                 }
-                None => Err(e),
-                _ => Err(e),
+                ConflictBehavior::Error => Err(e),
             }
         }
         Err(e) => Err(e),
@@ -1176,89 +980,6 @@ pub async fn execute_update_row(
     Ok(new_row)
 }
 
-pub async fn prepare_insert_row(
-    store: &Arc<TikvStore>,
-    txn: &mut Transaction,
-    db_id: u64,
-    sequence_values: &mut HashMap<String, i64>,
-    search_path: &[String],
-    schema: &TableSchema,
-    columns: &[Ident],
-    exprs: &[Expr],
-) -> Result<(Vec<Value>, Vec<usize>)> {
-    let mut row_vals = vec![Value::Null; schema.columns.len()];
-    let mut indices = Vec::new();
-
-    if columns.is_empty() {
-        if exprs.len() != schema.columns.len() {
-            return Err(anyhow!("Column count mismatch"));
-        }
-        for (i, e) in exprs.iter().enumerate() {
-            // Check if expression is DEFAULT keyword
-            let is_default =
-                matches!(e, Expr::Identifier(ident) if ident.value.to_uppercase() == "DEFAULT");
-
-            if is_default {
-                // Don't add to indices, leave as NULL, will be filled by fill_missing_columns
-                row_vals[i] = Value::Null;
-            } else {
-                row_vals[i] = if sequences::expr_needs_async_eval(e) {
-                    sequences::eval_expr_with_sequences(
-                        store,
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        e,
-                        None,
-                        None,
-                    )
-                    .await?
-                } else {
-                    super::expr::bridge::eval_const_ast_expr(e)?
-                };
-                indices.push(i);
-            }
-        }
-    } else {
-        if columns.len() != exprs.len() {
-            return Err(anyhow!("Count mismatch"));
-        }
-        for (i, c) in columns.iter().enumerate() {
-            let idx = schema
-                .column_index(&c.value)
-                .ok_or_else(|| anyhow!("Unknown col"))?;
-
-            // Check if expression is DEFAULT keyword
-            let is_default = matches!(&exprs[i], Expr::Identifier(ident) if ident.value.to_uppercase() == "DEFAULT");
-
-            if is_default {
-                // Don't add to indices, leave as NULL, will be filled by fill_missing_columns
-                row_vals[idx] = Value::Null;
-            } else {
-                row_vals[idx] = if sequences::expr_needs_async_eval(&exprs[i]) {
-                    sequences::eval_expr_with_sequences(
-                        store,
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        &exprs[i],
-                        None,
-                        None,
-                    )
-                    .await?
-                } else {
-                    super::expr::bridge::eval_const_ast_expr(&exprs[i])?
-                };
-                indices.push(idx);
-            }
-        }
-    }
-
-    Ok((row_vals, indices))
-}
-
 async fn eval_default_expr_maybe_sequence(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -1299,6 +1020,102 @@ async fn eval_default_expr_maybe_sequence(
     Ok(Value::Text(expr_str.to_string()))
 }
 
+async fn eval_column_default_or_null_inner(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    sequence_values: &mut HashMap<String, i64>,
+    search_path: &[String],
+    schema: &TableSchema,
+    column_idx: usize,
+    sequence_defs: Option<&[crate::types::SequenceDef]>,
+) -> Result<Value> {
+    let column = schema
+        .columns
+        .get(column_idx)
+        .ok_or_else(|| anyhow!("Column index {} out of bounds", column_idx))?;
+
+    if column.is_serial {
+        let (table_schema, table_name) = schema
+            .name
+            .rsplit_once('.')
+            .unwrap_or(("public", schema.name.as_str()));
+
+        let seq_full_name = match sequence_defs {
+            Some(defs) => {
+                match sequences::find_owned_sequence_full_name(defs, &schema.name, &column.name)? {
+                    Some(full_name) => full_name,
+                    None => format!(
+                        "{}.{}",
+                        table_schema,
+                        sequences::implicit_sequence_name(table_name, &column.name)
+                    ),
+                }
+            }
+            None => {
+                let defs = store.list_sequences(txn, db_id).await?;
+                match sequences::find_owned_sequence_full_name(&defs, &schema.name, &column.name)? {
+                    Some(full_name) => full_name,
+                    None => format!(
+                        "{}.{}",
+                        table_schema,
+                        sequences::implicit_sequence_name(table_name, &column.name)
+                    ),
+                }
+            }
+        };
+
+        let seq_val = store.nextval_sequence(txn, db_id, &seq_full_name).await?;
+        sequence_values.insert(seq_full_name, seq_val);
+        return match column.data_type {
+            DataType::Int64 => Ok(Value::Int64(seq_val)),
+            _ => Ok(Value::Int32(seq_val.try_into().map_err(|_| {
+                anyhow!(
+                    "serial sequence value {} overflows INT4 for column \"{}\"",
+                    seq_val,
+                    column.name
+                )
+            })?)),
+        };
+    }
+
+    if let Some(def) = &column.default_expr {
+        return eval_default_expr_maybe_sequence(
+            store,
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            def,
+        )
+        .await;
+    }
+
+    Ok(Value::Null)
+}
+
+pub async fn eval_column_default_or_null(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    sequence_values: &mut HashMap<String, i64>,
+    search_path: &[String],
+    schema: &TableSchema,
+    column_idx: usize,
+) -> Result<Value> {
+    eval_column_default_or_null_inner(
+        store,
+        txn,
+        db_id,
+        sequence_values,
+        search_path,
+        schema,
+        column_idx,
+        None,
+    )
+    .await
+}
+
 pub async fn fill_missing_columns(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
@@ -1309,10 +1126,6 @@ pub async fn fill_missing_columns(
     row_vals: &mut Vec<Value>,
     indices: &[usize],
 ) -> Result<()> {
-    let (table_schema, table_name) = schema
-        .name
-        .rsplit_once('.')
-        .unwrap_or(("public", schema.name.as_str()));
     let sequence_defs = if schema
         .columns
         .iter()
@@ -1324,54 +1137,22 @@ pub async fn fill_missing_columns(
         None
     };
 
-    for (i, c) in schema.columns.iter().enumerate() {
+    for (i, _) in schema.columns.iter().enumerate() {
         if indices.contains(&i) {
             continue;
         }
 
-        if c.is_serial {
-            let seq_full_name = match sequence_defs.as_ref() {
-                Some(defs) => {
-                    match sequences::find_owned_sequence_full_name(defs, &schema.name, &c.name)? {
-                        Some(full_name) => full_name,
-                        None => format!(
-                            "{}.{}",
-                            table_schema,
-                            sequences::implicit_sequence_name(table_name, &c.name)
-                        ),
-                    }
-                }
-                None => format!(
-                    "{}.{}",
-                    table_schema,
-                    sequences::implicit_sequence_name(table_name, &c.name)
-                ),
-            };
-
-            let seq_val = store.nextval_sequence(txn, db_id, &seq_full_name).await?;
-            sequence_values.insert(seq_full_name, seq_val);
-
-            row_vals[i] = match c.data_type {
-                DataType::Int64 => Value::Int64(seq_val),
-                _ => Value::Int32(seq_val.try_into().map_err(|_| {
-                    anyhow!(
-                        "serial sequence value {} overflows INT4 for column \"{}\"",
-                        seq_val,
-                        c.name
-                    )
-                })?),
-            };
-        } else if let Some(def) = &c.default_expr {
-            row_vals[i] = eval_default_expr_maybe_sequence(
-                store,
-                txn,
-                db_id,
-                sequence_values,
-                search_path,
-                def,
-            )
-            .await?;
-        }
+        row_vals[i] = eval_column_default_or_null_inner(
+            store,
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            schema,
+            i,
+            sequence_defs.as_deref(),
+        )
+        .await?;
     }
     Ok(())
 }

@@ -7,7 +7,7 @@ mod cte;
 mod database;
 mod ddl;
 mod default_privileges;
-mod dml;
+mod dml_analyzed;
 mod extensions;
 mod procedure;
 mod select;

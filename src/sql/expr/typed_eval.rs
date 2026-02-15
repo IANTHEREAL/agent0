@@ -41,6 +41,7 @@ fn eval_typed_expr_inner(expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Re
     match &expr.kind {
         // ── Leaf nodes ──────────────────────────────────────
         TypedExprKind::Constant(v) => Ok(v.clone()),
+        TypedExprKind::Default => Ok(Value::Null),
 
         TypedExprKind::ColumnRef {
             column_index,

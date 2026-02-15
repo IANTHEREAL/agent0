@@ -59,7 +59,6 @@ impl Executor {
             let row = Row { values: row_values };
             dml::validate_check_constraints(&schema, &row)?;
 
-            let on_conflict = None;
             let _ = dml::execute_insert_row(
                 &self.store,
                 txn,
@@ -67,7 +66,7 @@ impl Executor {
                 table_name,
                 &schema,
                 row,
-                &on_conflict,
+                dml::ConflictBehavior::Error,
                 &enum_cache,
             )
             .await?;

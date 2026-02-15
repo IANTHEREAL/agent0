@@ -1,5 +1,106 @@
 # Worklog
 
+## 2026-02-15 — Fix CI Regressions for PR #743 (DML Analyzer)
+
+### Bug A (P0): Catalog prefetch Visitor misses INSERT target table
+
+**Root cause:** `TableNameCollector` used `pre_visit_table_factor` which only visits `TableFactor::Table` nodes. DML target tables (`INSERT INTO t`, `UPDATE t`, `DELETE FROM t`) are stored as bare `ObjectName` in sqlparser AST, not wrapped in `TableFactor::Table`. The Visitor never visited them → catalog snapshot was empty → "relation X does not exist" for all INSERT statements.
+
+**Fix:** Replaced `pre_visit_table_factor` with `pre_visit_relation` in `TableNameCollector`. The `pre_visit_relation` method (sqlparser 0.40) visits ALL relation `ObjectName` nodes uniformly — INSERT targets, UPDATE targets, DELETE targets, FROM/JOIN tables, and subquery tables.
+
+**File:** `src/sql/executor/core/catalog_prefetch.rs:212-221`
+
+**Impact:** Resolves 15 cascading regression-gate failures + SQLAlchemy smoke failure in one change.
+
+### Smell 1: ConflictBehavior enum (architectural cleanup)
+
+**Problem:** The analyzed INSERT path constructed a throwaway `sqlparser::ast::OnConflict` just to tell `execute_insert_row` whether to return `Conflicted` or `Skipped`. Abstraction inversion — typed IR executor depending on raw AST types.
+
+**Fix:** Added `ConflictBehavior` enum (`Error`, `DoNothing`, `DoUpdate`) to `src/sql/dml.rs`. Refactored `execute_insert_row` to accept `ConflictBehavior` instead of `&Option<OnInsert>`. Updated all 3 callers (dml_analyzed.rs, copy.rs, ddl.rs). Removed `OnInsert`/`OnConflictAction` imports from dml.rs. Also collapsed duplicated `DuplicateKeyUpdate` and `OnConflict(DoUpdate)` match arms.
+
+**Files:** `src/sql/dml.rs` (enum + refactored function), `src/sql/executor/dml_analyzed.rs`, `src/sql/executor/core/copy.rs`, `src/sql/ddl.rs`
+
+### Smell 3: Document UPDATE FROM multi-table limitation
+
+Added comment at `dml_analyzed.rs:176` documenting that `UPDATE ... FROM` only handles `from[0]` — multi-table FROM (e.g. `UPDATE t SET ... FROM a, b WHERE ...`) requires cross-product logic like DELETE's USING handler. Single FROM table covers the common case.
+
+### Local Unit Tests (19 new)
+
+**catalog_prefetch tests (12):** Verify `extract_dml_table_names` and `extract_table_names` correctly capture table names for:
+- INSERT target (bare + schema-qualified), INSERT...SELECT (both tables)
+- UPDATE target, UPDATE...FROM (both tables)
+- DELETE target, DELETE...USING (both tables)
+- SELECT FROM, JOIN, subquery
+- INSERT ON CONFLICT (test 119 scenario)
+- INSERT with CAST (test 155 scenario)
+
+**analyzer tests (7):** Verify DML analysis for:
+- INSERT ON CONFLICT DO UPDATE (column index + assignment count)
+- INSERT ON CONFLICT DO UPDATE with EXCLUDED + arithmetic (test 119 Case 1 pattern)
+- INSERT JSONB→INT type mismatch → `AssignmentTypeMismatch` error (test 155)
+- UPDATE JSONB→INT type mismatch → `AssignmentTypeMismatch` error (test 155)
+- ConflictBehavior derivation from AnalyzedOnConflict
+
+### Deferred
+
+- **Smell 4 (P2):** Split `dml_analyzed.rs` into focused modules — follow-up after CI green
+- **Smell 2 (P2):** Unified `TypedExpr::transform_async` — follow-up
+
+### Verification
+- `cargo check`: 0 errors, 20 pre-existing warnings
+- `cargo test`: 1209 passed (19 new), 0 failed
+- Integration tests: pending CI
+
+---
+
+## 2026-02-15 — Issue #701: Mandatory Analyzer for DML (Phases 1–3)
+
+### Goal
+Eliminate the dual-path architecture where SELECT uses `Analyzer -> Typed IR -> Operators` but DML bypasses analysis entirely. Single path: `Parser -> Analyzer -> Typed IR -> Executor` for all DML.
+
+### Phase 1: DML IR Types + Analyzer Module
+- Added `AnalyzedStatement`, `AnalyzedInsert`, `AnalyzedUpdate`, `AnalyzedDelete` IR types in `types.rs`
+- Added DML error variants: `DmlColumnNotFound`, `InsertColumnCountMismatch`, `AssignmentTypeMismatch`, `DmlWhereNotBoolean`
+- Created `src/sql/analyzer/dml.rs` with `analyze_insert`, `analyze_update`, `analyze_delete`
+- Added `analyze_statement()` entry point in `mod.rs`
+- Promoted `analyze_table_with_joins` and `analyze_projection` to `pub(super)` in `query.rs`
+
+### Phase 2: CatalogSnapshot Extension
+- Added `build_catalog_snapshot_for_statement()` in `catalog_prefetch.rs`
+- Handles INSERT (target + SELECT source), UPDATE (target + FROM), DELETE (target + USING)
+- Added `has_table()` and `merge_from()` to `CatalogSnapshot`
+
+### Phase 3: Wire DML Through Analyzer + Execute from IR
+- Created `src/sql/executor/dml_analyzed.rs` with `execute_analyzed_delete`, `execute_analyzed_update`, `execute_analyzed_insert`
+- Wired `statement.rs` dispatch: DELETE and UPDATE go fully through analyzer; INSERT with VALUES/DEFAULT VALUES through analyzer; INSERT...SELECT falls back to legacy (SELECT subquery still analyzed via execute_query)
+- All 3 executors handle: WHERE typed eval, triggers (BEFORE/AFTER), RETURNING, ON CONFLICT DO UPDATE, value coercion, check constraints
+
+### Key Decisions
+- INSERT...SELECT uses legacy path at dispatch level (pragmatic: reconstructing raw Query from AnalyzedQuery is non-trivial; the SELECT itself still goes through analyzer)
+- `table_schema` and `table_alias` fields kept in IR types for completeness but executor re-fetches from store (suppressed with `#[allow(dead_code)]`)
+
+### Verification
+- `cargo check`: clean (no errors, no warnings in our files)
+- `cargo test`: 1182 passed, 0 failed
+
+### Phase 4: Legacy Cleanup + Regression Tests
+- Removed dead `execute_delete` and `execute_update` methods from `executor/dml.rs` (~550 lines removed)
+- Removed dead helpers: `build_type_infer_schema_for_two_table_join`, `predicate_value_to_bool`, `BOOLEAN_CONTEXT_ERR_MSG`
+- Cleaned up unused imports (`Assignment`, `validate_bool_expr_in_boolean_context`)
+- Kept `execute_insert` for INSERT...SELECT fallback only
+- Added 13 DML analyzer unit tests in `src/sql/analyzer/tests.rs`:
+  - INSERT: values, default values, column not found, column count mismatch, ON CONFLICT DO NOTHING
+  - UPDATE: simple, column not found, WHERE not boolean, multiple assignments
+  - DELETE: simple, no where, WHERE not boolean
+  - DML table not found
+
+### Final Verification
+- `cargo check`: clean (no errors, no warnings in src/sql)
+- `cargo test`: 1195 passed (13 new), 0 failed
+- Integration test verification pending (requires Pantheon)
+
+---
+
 ## 2026-02-13 — Fix CI Round 8: JSONB ->> and vector CAST failures in Analyzer path
 
 ### Root Cause Analysis (deep dive)

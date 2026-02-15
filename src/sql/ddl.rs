@@ -1533,7 +1533,17 @@ pub async fn execute_refresh_materialized_view(
     let enum_cache = dml::build_enum_label_cache(store, txn, db_id, &schema).await?;
     let row_count = rows.len();
     for row in rows {
-        dml::execute_insert_row(store, txn, db_id, name, &schema, row, &None, &enum_cache).await?;
+        dml::execute_insert_row(
+            store,
+            txn,
+            db_id,
+            name,
+            &schema,
+            row,
+            dml::ConflictBehavior::Error,
+            &enum_cache,
+        )
+        .await?;
     }
     advance_implicit_sequences_for_seeded_rows(store, txn, db_id, &schema, row_count).await?;
 

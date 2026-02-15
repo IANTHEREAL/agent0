@@ -232,6 +232,7 @@ impl fmt::Display for TypedExpr {
                 let items: Vec<String> = elems.iter().map(|e| format!("{}", e)).collect();
                 write!(f, "ROW({})", items.join(", "))
             }
+            TypedExprKind::Default => write!(f, "DEFAULT"),
         }
     }
 }
@@ -422,6 +423,11 @@ pub enum TypedExprKind {
     /// Row constructor: `ROW(a, b, c)` or `(a, b, c)`.
     #[allow(dead_code)]
     Row(Vec<TypedExpr>),
+
+    // ── DML placeholder ────────────────────────────────
+    /// DEFAULT keyword in INSERT VALUES — placeholder for executor to fill
+    /// with the column's default value or serial sequence.
+    Default,
 }
 
 // ── Binary operators ────────────────────────────────────────
@@ -855,4 +861,108 @@ pub enum SetOpKind {
     Union,
     Intersect,
     Except,
+}
+
+// ── DML statements ──────────────────────────────────────────
+
+/// A fully analyzed SQL statement (DML or query).
+///
+/// This is the top-level IR node produced by `Analyzer::analyze_statement()`.
+/// Queries are analyzed via `analyze_query()` and produce `AnalyzedQuery` directly;
+/// this enum adds DML variants that share the same typed-expression infrastructure.
+#[derive(Debug, Clone)]
+pub enum AnalyzedStatement {
+    /// A SELECT / set operation.
+    #[allow(dead_code)] // Dispatched via pattern match; inner value used transitionally
+    Query(AnalyzedQuery),
+    /// An INSERT statement.
+    Insert(AnalyzedInsert),
+    /// An UPDATE statement.
+    Update(AnalyzedUpdate),
+    /// A DELETE statement.
+    Delete(AnalyzedDelete),
+}
+
+/// A fully analyzed INSERT statement.
+#[derive(Debug, Clone)]
+pub struct AnalyzedInsert {
+    /// Fully qualified table name (for storage ops).
+    pub table_name: String,
+    /// Resolved table schema (for IR completeness; executor re-fetches from store).
+    #[allow(dead_code)]
+    pub table_schema: TableRefSchema,
+    /// Column indices being inserted (maps to positions in `table_schema.columns`).
+    pub target_columns: Vec<usize>,
+    /// Row source.
+    pub source: AnalyzedInsertSource,
+    /// ON CONFLICT handling.
+    pub on_conflict: Option<AnalyzedOnConflict>,
+    /// RETURNING clause projections.
+    pub returning: Option<Vec<AnalyzedProjection>>,
+}
+
+/// Source of rows for an INSERT.
+#[derive(Debug, Clone)]
+pub enum AnalyzedInsertSource {
+    /// `VALUES (expr, ...), (expr, ...)` — each inner Vec is one row.
+    Values(Vec<Vec<TypedExpr>>),
+    /// `INSERT ... SELECT ...`
+    Query(Box<AnalyzedQuery>),
+    /// `INSERT ... DEFAULT VALUES`
+    DefaultValues,
+}
+
+/// Analyzed ON CONFLICT clause.
+#[derive(Debug, Clone)]
+pub enum AnalyzedOnConflict {
+    /// DO NOTHING — skip conflicting rows.
+    DoNothing,
+    /// DO UPDATE SET — update conflicting rows.
+    DoUpdate {
+        /// Assignments: (column_index, typed value expression).
+        /// Expressions may reference the "excluded" pseudo-table.
+        assignments: Vec<(usize, TypedExpr)>,
+        /// Optional WHERE clause on the DO UPDATE.
+        where_clause: Option<TypedExpr>,
+    },
+}
+
+/// A fully analyzed UPDATE statement.
+#[derive(Debug, Clone)]
+pub struct AnalyzedUpdate {
+    /// Fully qualified table name.
+    pub table_name: String,
+    /// Resolved table schema (for IR completeness; executor re-fetches from store).
+    #[allow(dead_code)]
+    pub table_schema: TableRefSchema,
+    /// Table alias (or bare table name).
+    #[allow(dead_code)]
+    pub table_alias: String,
+    /// SET assignments: (column_index, typed value expression).
+    pub assignments: Vec<(usize, TypedExpr)>,
+    /// FROM clause tables (for UPDATE ... FROM ... WHERE ...).
+    pub from: Vec<AnalyzedTableRef>,
+    /// WHERE predicate (type-checked to boolean).
+    pub where_clause: Option<TypedExpr>,
+    /// RETURNING clause projections.
+    pub returning: Option<Vec<AnalyzedProjection>>,
+}
+
+/// A fully analyzed DELETE statement.
+#[derive(Debug, Clone)]
+pub struct AnalyzedDelete {
+    /// Fully qualified table name.
+    pub table_name: String,
+    /// Resolved table schema (for IR completeness; executor re-fetches from store).
+    #[allow(dead_code)]
+    pub table_schema: TableRefSchema,
+    /// Table alias (or bare table name).
+    #[allow(dead_code)]
+    pub table_alias: String,
+    /// USING clause tables (for DELETE ... USING ... WHERE ...).
+    pub using: Vec<AnalyzedTableRef>,
+    /// WHERE predicate (type-checked to boolean).
+    pub where_clause: Option<TypedExpr>,
+    /// RETURNING clause projections.
+    pub returning: Option<Vec<AnalyzedProjection>>,
 }

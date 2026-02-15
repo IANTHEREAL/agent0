@@ -26,6 +26,7 @@
 //! `src/sql/expr/` — it is runtime code, not static analysis.
 
 pub mod catalog;
+pub(crate) mod dml;
 pub mod error;
 mod expr;
 mod literal;
@@ -60,6 +61,60 @@ impl<'a> Analyzer<'a> {
         Self {
             catalog,
             scopes: ScopeStack::new(),
+        }
+    }
+
+    /// Analyze a complete SQL statement (DML or query).
+    ///
+    /// Entry point for DML analysis. Queries are handled via `analyze_query()`.
+    pub fn analyze_statement(
+        &mut self,
+        stmt: &sqlparser::ast::Statement,
+    ) -> Result<AnalyzedStatement, AnalyzerError> {
+        use sqlparser::ast::Statement;
+        match stmt {
+            Statement::Query(query) => {
+                let analyzed = self.analyze_query(query)?;
+                Ok(AnalyzedStatement::Query(analyzed))
+            }
+            Statement::Insert {
+                table_name,
+                columns,
+                source,
+                returning,
+                on,
+                ..
+            } => {
+                let analyzed = self.analyze_insert(table_name, columns, source, returning, on)?;
+                Ok(AnalyzedStatement::Insert(analyzed))
+            }
+            Statement::Update {
+                table,
+                assignments,
+                from,
+                selection,
+                returning,
+                ..
+            } => {
+                let analyzed =
+                    self.analyze_update(table, assignments, from, selection, returning)?;
+                Ok(AnalyzedStatement::Update(analyzed))
+            }
+            Statement::Delete {
+                from,
+                using,
+                selection,
+                returning,
+                ..
+            } => {
+                let using_slice = using.as_deref().unwrap_or(&[]);
+                let analyzed = self.analyze_delete(from, using_slice, selection, returning)?;
+                Ok(AnalyzedStatement::Delete(analyzed))
+            }
+            _ => Err(AnalyzerError::Unsupported(format!(
+                "statement type not supported for analysis: {:?}",
+                std::mem::discriminant(stmt)
+            ))),
         }
     }
 

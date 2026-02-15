@@ -44,35 +44,6 @@ pub fn eval_ast_expr_with_row(
     eval_typed_expr(&typed, row, &qctx)
 }
 
-/// Evaluate an AST expression with ON CONFLICT context (existing + excluded rows).
-///
-/// Builds a two-table scope: the target table columns followed by an
-/// "excluded" pseudo-table with the same columns. The combined row is
-/// `[existing..., excluded...]`.
-pub fn eval_upsert_ast_expr(
-    expr: &sqlparser::ast::Expr,
-    existing_row: &Row,
-    excluded_row: &Row,
-    schema: &TableSchema,
-) -> Result<Value> {
-    let catalog = NullCatalog;
-    let mut scope = Scope::from_table_schema(&schema.name, schema);
-    // Add "excluded" as second table alias — ColumnRef indices shift by schema.columns.len()
-    let excluded_cols: Vec<(String, crate::types::DataType, bool)> = schema
-        .columns
-        .iter()
-        .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
-        .collect();
-    scope.add_table("excluded", &excluded_cols);
-    let typed =
-        Analyzer::analyze_expr_with_scope(&catalog, scope, expr).map_err(|e| anyhow!("{}", e))?;
-    // Combined row: [existing..., excluded...]
-    let mut combined = existing_row.values.clone();
-    combined.extend(excluded_row.values.clone());
-    let qctx = QueryContext::from_task_locals();
-    eval_typed_expr(&typed, &Row::new(combined), &qctx)
-}
-
 /// Evaluate an AST expression against a multi-table (join) row.
 ///
 /// `tables` is a list of `(alias, schema)` pairs. The combined row is the

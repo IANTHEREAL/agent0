@@ -1,4 +1,4 @@
-cannot cast type JSONB to INT
+is of type INT but expression is of type JSONB
 after_bad_insert_count|0
 after_bad_update_value|1
 after_bad_upsert_value|1

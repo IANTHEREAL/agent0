@@ -1,5 +1,5 @@
-NOTICE:  table "orders" does not exist, skipping
-NOTICE:  table "customers" does not exist, skipping
+psql:tests/78_update_delete_variants.sql:1: NOTICE:  table "orders" does not exist, skipping
+psql:tests/78_update_delete_variants.sql:2: NOTICE:  table "customers" does not exist, skipping
  id | customer_id | amount |   status   
 ----+-------------+--------+------------
   1 |           1 |    100 | processing
@@ -51,6 +51,16 @@ NOTICE:  table "customers" does not exist, skipping
  id 
 ----
   3
+(1 row)
+
+ id | credit 
+----+--------
+  1 |      0
+(1 row)
+
+ id | credit 
+----+--------
+  1 |      0
 (1 row)
 
                  result                 

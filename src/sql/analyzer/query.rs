@@ -300,7 +300,7 @@ impl<'a> Analyzer<'a> {
         Ok(refs)
     }
 
-    fn analyze_table_with_joins(
+    pub(super) fn analyze_table_with_joins(
         &mut self,
         twj: &TableWithJoins,
     ) -> Result<AnalyzedTableRef, AnalyzerError> {
@@ -1073,7 +1073,8 @@ impl<'a> Analyzer<'a> {
             | TypedExprKind::ColumnRef { .. }
             | TypedExprKind::ScalarSubquery(_)
             | TypedExprKind::ArraySubquery(_)
-            | TypedExprKind::Exists { .. } => false,
+            | TypedExprKind::Exists { .. }
+            | TypedExprKind::Default => false,
         }
     }
 
@@ -1373,7 +1374,8 @@ impl<'a> Analyzer<'a> {
             TypedExprKind::Constant(_)
             | TypedExprKind::ScalarSubquery(_)
             | TypedExprKind::ArraySubquery(_)
-            | TypedExprKind::Exists { .. } => None,
+            | TypedExprKind::Exists { .. }
+            | TypedExprKind::Default => None,
         }
     }
 
@@ -1395,7 +1397,7 @@ impl<'a> Analyzer<'a> {
 
     // ── SELECT projection ───────────────────────────────────
 
-    fn analyze_projection(
+    pub(super) fn analyze_projection(
         &mut self,
         items: &[SelectItem],
     ) -> Result<(Vec<AnalyzedProjection>, Vec<(String, DataType)>), AnalyzerError> {
