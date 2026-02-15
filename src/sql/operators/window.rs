@@ -4,14 +4,17 @@
 
 use std::collections::HashMap;
 
+use crate::sql::analyzer::types::{
+    TypedExpr, TypedOrderByExpr, WindowFrame, WindowFrameBound, WindowFrameUnits,
+};
 use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use sqlparser::ast::{Expr, OrderByExpr, WindowFrame, WindowFrameBound, WindowFrameUnits};
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::sql::expr::compare_order_by_values;
 use crate::sql::expr::operators::sort_by_fallible;
-use crate::sql::expr::{compare_order_by_values, eval_expr};
+use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::pg_numeric::pg_numeric_div;
 use crate::sql::query_context::QueryContext;
 use crate::sql::value_key::serialize_values_for_key;
@@ -23,19 +26,19 @@ pub struct WindowFunctionExpr {
     /// Name of the window function (e.g., "row_number", "sum", "lag")
     pub func_name: String,
     /// Argument expression (if any)
-    pub arg_expr: Option<Expr>,
+    pub arg_expr: Option<TypedExpr>,
     /// PARTITION BY expressions
-    pub partition_by: Vec<Expr>,
+    pub partition_by: Vec<TypedExpr>,
     /// ORDER BY expressions within the window
-    pub order_by: Vec<OrderByExpr>,
+    pub order_by: Vec<TypedOrderByExpr>,
     /// Offset expression for LAG/LEAD
-    pub offset_expr: Option<Expr>,
+    pub offset_expr: Option<TypedExpr>,
     /// Default value expression for LAG/LEAD
-    pub default_value_expr: Option<Expr>,
+    pub default_value_expr: Option<TypedExpr>,
     /// Window frame specification
     pub window_frame: Option<WindowFrame>,
     /// FILTER (WHERE ...) clause for window aggregate functions
-    pub filter_expr: Option<Expr>,
+    pub filter_expr: Option<TypedExpr>,
     /// Output column name
     pub output_name: String,
     /// Output data type
@@ -59,7 +62,7 @@ pub struct WindowOperator {
 fn order_by_values_are_peers(
     prev_values: &[Value],
     current_values: &[Value],
-    order_by: &[OrderByExpr],
+    order_by: &[TypedOrderByExpr],
 ) -> Result<bool> {
     debug_assert_eq!(prev_values.len(), order_by.len());
     debug_assert_eq!(current_values.len(), order_by.len());
@@ -68,8 +71,8 @@ fn order_by_values_are_peers(
         .iter()
         .zip(prev_values.iter().zip(current_values.iter()))
     {
-        let asc = order_expr.asc.unwrap_or(true);
-        let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+        let asc = order_expr.asc;
+        let nulls_first = order_expr.nulls_first;
         if !matches!(
             compare_order_by_values(prev_value, current_value, asc, nulls_first)?,
             std::cmp::Ordering::Equal
@@ -143,7 +146,6 @@ impl WindowOperator {
     fn compute_window_functions(
         &self,
         rows: &[Row],
-        schema: &TableSchema,
         query_ctx: &QueryContext,
     ) -> Result<Vec<Vec<Value>>> {
         let num_funcs = self.window_functions.len();
@@ -155,7 +157,7 @@ impl WindowOperator {
             for (row_idx, row) in rows.iter().enumerate() {
                 let mut key = Vec::new();
                 for expr in &wf.partition_by {
-                    key.push(eval_expr(expr, Some(row), Some(schema), query_ctx)?);
+                    key.push(eval_typed_expr(expr, row, query_ctx)?);
                 }
                 let key_bytes = serialize_values_for_key(&key)?;
                 partitions.entry(key_bytes).or_default().push(row_idx);
@@ -171,10 +173,9 @@ impl WindowOperator {
                     for &row_idx in &row_indices {
                         let mut keys = Vec::with_capacity(wf.order_by.len());
                         for order_expr in &wf.order_by {
-                            keys.push(eval_expr(
+                            keys.push(eval_typed_expr(
                                 &order_expr.expr,
-                                Some(&rows[row_idx]),
-                                Some(schema),
+                                &rows[row_idx],
                                 query_ctx,
                             )?);
                         }
@@ -185,8 +186,8 @@ impl WindowOperator {
                         let keys_a = &order_key_map[&a];
                         let keys_b = &order_key_map[&b];
                         for (i, order_expr) in wf.order_by.iter().enumerate() {
-                            let asc = order_expr.asc.unwrap_or(true);
-                            let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+                            let asc = order_expr.asc;
+                            let nulls_first = order_expr.nulls_first;
                             let ord =
                                 compare_order_by_values(&keys_a[i], &keys_b[i], asc, nulls_first)?;
                             if !matches!(ord, std::cmp::Ordering::Equal) {
@@ -198,8 +199,7 @@ impl WindowOperator {
                 }
 
                 // Compute peer groups for RANGE/GROUPS frame mode support
-                let peer_groups =
-                    Self::compute_peer_groups(rows, schema, wf, &row_indices, query_ctx)?;
+                let peer_groups = Self::compute_peer_groups(rows, wf, &row_indices, query_ctx)?;
 
                 // Compute function for this partition
                 match wf.func_name.as_str() {
@@ -219,7 +219,6 @@ impl WindowOperator {
                     }
                     "sum" => self.compute_sum(
                         rows,
-                        schema,
                         wf,
                         &row_indices,
                         wf_idx,
@@ -229,7 +228,6 @@ impl WindowOperator {
                     )?,
                     "count" => self.compute_count(
                         rows,
-                        schema,
                         wf,
                         &row_indices,
                         wf_idx,
@@ -239,7 +237,6 @@ impl WindowOperator {
                     )?,
                     "avg" => self.compute_avg(
                         rows,
-                        schema,
                         wf,
                         &row_indices,
                         wf_idx,
@@ -249,7 +246,6 @@ impl WindowOperator {
                     )?,
                     "min" => self.compute_min(
                         rows,
-                        schema,
                         wf,
                         &row_indices,
                         wf_idx,
@@ -259,7 +255,6 @@ impl WindowOperator {
                     )?,
                     "max" => self.compute_max(
                         rows,
-                        schema,
                         wf,
                         &row_indices,
                         wf_idx,
@@ -267,27 +262,14 @@ impl WindowOperator {
                         &peer_groups,
                         query_ctx,
                     )?,
-                    "lag" => self.compute_lag(
-                        rows,
-                        schema,
-                        wf,
-                        &row_indices,
-                        wf_idx,
-                        &mut results,
-                        query_ctx,
-                    )?,
-                    "lead" => self.compute_lead(
-                        rows,
-                        schema,
-                        wf,
-                        &row_indices,
-                        wf_idx,
-                        &mut results,
-                        query_ctx,
-                    )?,
+                    "lag" => {
+                        self.compute_lag(rows, wf, &row_indices, wf_idx, &mut results, query_ctx)?
+                    }
+                    "lead" => {
+                        self.compute_lead(rows, wf, &row_indices, wf_idx, &mut results, query_ctx)?
+                    }
                     "first_value" => self.compute_first_value(
                         rows,
-                        schema,
                         wf,
                         &row_indices,
                         wf_idx,
@@ -297,7 +279,6 @@ impl WindowOperator {
                     )?,
                     "last_value" => self.compute_last_value(
                         rows,
-                        schema,
                         wf,
                         &row_indices,
                         wf_idx,
@@ -307,7 +288,6 @@ impl WindowOperator {
                     )?,
                     "nth_value" => self.compute_nth_value(
                         rows,
-                        schema,
                         wf,
                         &row_indices,
                         wf_idx,
@@ -376,7 +356,7 @@ impl WindowOperator {
     ) -> Result<()> {
         let n = match &wf.arg_expr {
             Some(expr) => {
-                let val = eval_expr(expr, None, None, query_ctx)?;
+                let val = eval_typed_expr(expr, &Row::new(vec![]), query_ctx)?;
                 match val {
                     Value::Int32(v) if v > 0 => v as usize,
                     Value::Int64(v) if v > 0 => v as usize,
@@ -452,7 +432,6 @@ impl WindowOperator {
     /// contains rows with equal ORDER BY values.
     fn compute_peer_groups(
         rows: &[Row],
-        schema: &TableSchema,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
         query_ctx: &QueryContext,
@@ -468,7 +447,7 @@ impl WindowOperator {
             let current_values: Vec<Value> = wf
                 .order_by
                 .iter()
-                .map(|o| eval_expr(&o.expr, Some(&rows[row_idx]), Some(schema), query_ctx))
+                .map(|o| eval_typed_expr(&o.expr, &rows[row_idx], query_ctx))
                 .collect::<Result<Vec<Value>>>()?;
             if let Some(prev) = &prev_values {
                 if !order_by_values_are_peers(prev, &current_values, &wf.order_by)? {
@@ -621,8 +600,8 @@ impl WindowOperator {
             }
         };
 
-        let start = resolve_start(&frame.start_bound)?;
-        let end = match &frame.end_bound {
+        let start = resolve_start(&frame.start)?;
+        let end = match &frame.end {
             Some(bound) => resolve_end(bound)?,
             None => {
                 // Shorthand form: default end is CURRENT ROW
@@ -639,8 +618,8 @@ impl WindowOperator {
         Ok((start, end))
     }
 
-    fn eval_frame_bound_offset(&self, expr: &Expr, query_ctx: &QueryContext) -> Result<usize> {
-        let val = eval_expr(expr, None, None, query_ctx)?;
+    fn eval_frame_bound_offset(&self, expr: &TypedExpr, query_ctx: &QueryContext) -> Result<usize> {
+        let val = eval_typed_expr(expr, &Row::new(vec![]), query_ctx)?;
         match val {
             Value::Int32(n) if n >= 0 => Ok(n as usize),
             Value::Int64(n) if n >= 0 => Ok(n as usize),
@@ -653,15 +632,14 @@ impl WindowOperator {
 
     /// Check if a row passes the FILTER (WHERE ...) clause for a window aggregate.
     fn passes_filter(
-        filter_expr: &Option<Expr>,
+        filter_expr: &Option<TypedExpr>,
         row: &Row,
-        schema: &TableSchema,
         query_ctx: &QueryContext,
     ) -> Result<bool> {
         match filter_expr {
             None => Ok(true),
             Some(expr) => {
-                let val = eval_expr(expr, Some(row), Some(schema), query_ctx)?;
+                let val = eval_typed_expr(expr, row, query_ctx)?;
                 Ok(matches!(val, Value::Boolean(true)))
             }
         }
@@ -670,7 +648,6 @@ impl WindowOperator {
     fn compute_sum(
         &self,
         rows: &[Row],
-        schema: &TableSchema,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
         wf_idx: usize,
@@ -685,13 +662,11 @@ impl WindowOperator {
             let mut sum = rust_decimal::Decimal::ZERO;
             let mut has_value = false;
             for i in start..end {
-                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema, query_ctx)?
-                {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], query_ctx)? {
                     continue;
                 }
                 if let Some(expr) = &wf.arg_expr {
-                    let val =
-                        eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema), query_ctx)?;
+                    let val = eval_typed_expr(expr, &rows[row_indices[i]], query_ctx)?;
                     if let Some(n) = self.value_to_decimal(&val) {
                         sum += n;
                         has_value = true;
@@ -710,7 +685,6 @@ impl WindowOperator {
     fn compute_count(
         &self,
         rows: &[Row],
-        schema: &TableSchema,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
         wf_idx: usize,
@@ -724,13 +698,11 @@ impl WindowOperator {
                 self.get_frame_bounds(wf, pos, partition_size, peer_groups, query_ctx)?;
             let mut count = 0i64;
             for i in start..end.min(partition_size) {
-                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema, query_ctx)?
-                {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], query_ctx)? {
                     continue;
                 }
                 if let Some(expr) = &wf.arg_expr {
-                    let val =
-                        eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema), query_ctx)?;
+                    let val = eval_typed_expr(expr, &rows[row_indices[i]], query_ctx)?;
                     if !matches!(val, Value::Null) {
                         count += 1;
                     }
@@ -747,7 +719,6 @@ impl WindowOperator {
     fn compute_avg(
         &self,
         rows: &[Row],
-        schema: &TableSchema,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
         wf_idx: usize,
@@ -762,13 +733,11 @@ impl WindowOperator {
             let mut sum = rust_decimal::Decimal::ZERO;
             let mut count = 0i64;
             for i in start..end {
-                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema, query_ctx)?
-                {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], query_ctx)? {
                     continue;
                 }
                 if let Some(expr) = &wf.arg_expr {
-                    let val =
-                        eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema), query_ctx)?;
+                    let val = eval_typed_expr(expr, &rows[row_indices[i]], query_ctx)?;
                     if let Some(n) = self.value_to_decimal(&val) {
                         sum += n;
                         count += 1;
@@ -787,7 +756,6 @@ impl WindowOperator {
     fn compute_min(
         &self,
         rows: &[Row],
-        schema: &TableSchema,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
         wf_idx: usize,
@@ -801,13 +769,11 @@ impl WindowOperator {
                 self.get_frame_bounds(wf, pos, partition_size, peer_groups, query_ctx)?;
             let mut min_val: Option<Value> = None;
             for i in start..end {
-                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema, query_ctx)?
-                {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], query_ctx)? {
                     continue;
                 }
                 if let Some(expr) = &wf.arg_expr {
-                    let val =
-                        eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema), query_ctx)?;
+                    let val = eval_typed_expr(expr, &rows[row_indices[i]], query_ctx)?;
                     if !matches!(val, Value::Null) {
                         min_val = Some(match min_val {
                             None => val,
@@ -833,7 +799,6 @@ impl WindowOperator {
     fn compute_max(
         &self,
         rows: &[Row],
-        schema: &TableSchema,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
         wf_idx: usize,
@@ -847,13 +812,11 @@ impl WindowOperator {
                 self.get_frame_bounds(wf, pos, partition_size, peer_groups, query_ctx)?;
             let mut max_val: Option<Value> = None;
             for i in start..end {
-                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], schema, query_ctx)?
-                {
+                if !Self::passes_filter(&wf.filter_expr, &rows[row_indices[i]], query_ctx)? {
                     continue;
                 }
                 if let Some(expr) = &wf.arg_expr {
-                    let val =
-                        eval_expr(expr, Some(&rows[row_indices[i]]), Some(schema), query_ctx)?;
+                    let val = eval_typed_expr(expr, &rows[row_indices[i]], query_ctx)?;
                     if !matches!(val, Value::Null) {
                         max_val = Some(match max_val {
                             None => val,
@@ -879,16 +842,16 @@ impl WindowOperator {
     fn compute_lag(
         &self,
         rows: &[Row],
-        schema: &TableSchema,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
         wf_idx: usize,
         results: &mut [Vec<Value>],
         query_ctx: &QueryContext,
     ) -> Result<()> {
+        let empty_row = Row::new(vec![]);
         let offset = match wf.offset_expr.as_ref() {
             None => 1,
-            Some(expr) => match eval_expr(expr, None, None, query_ctx) {
+            Some(expr) => match eval_typed_expr(expr, &empty_row, query_ctx) {
                 Ok(Value::Int32(n)) => {
                     if n < 0 {
                         return Err(anyhow!("LAG offset must be non-negative"));
@@ -906,19 +869,14 @@ impl WindowOperator {
         };
 
         let default_value = match &wf.default_value_expr {
-            Some(e) => eval_expr(e, None, None, query_ctx)?,
+            Some(e) => eval_typed_expr(e, &empty_row, query_ctx)?,
             None => Value::Null,
         };
 
         for (pos, &row_idx) in row_indices.iter().enumerate() {
             results[row_idx][wf_idx] = if pos >= offset {
                 if let Some(expr) = &wf.arg_expr {
-                    eval_expr(
-                        expr,
-                        Some(&rows[row_indices[pos - offset]]),
-                        Some(schema),
-                        query_ctx,
-                    )?
+                    eval_typed_expr(expr, &rows[row_indices[pos - offset]], query_ctx)?
                 } else {
                     Value::Null
                 }
@@ -932,16 +890,16 @@ impl WindowOperator {
     fn compute_lead(
         &self,
         rows: &[Row],
-        schema: &TableSchema,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
         wf_idx: usize,
         results: &mut [Vec<Value>],
         query_ctx: &QueryContext,
     ) -> Result<()> {
+        let empty_row = Row::new(vec![]);
         let offset = match wf.offset_expr.as_ref() {
             None => 1,
-            Some(expr) => match eval_expr(expr, None, None, query_ctx) {
+            Some(expr) => match eval_typed_expr(expr, &empty_row, query_ctx) {
                 Ok(Value::Int32(n)) => {
                     if n < 0 {
                         return Err(anyhow!("LEAD offset must be non-negative"));
@@ -959,7 +917,7 @@ impl WindowOperator {
         };
 
         let default_value = match &wf.default_value_expr {
-            Some(e) => eval_expr(e, None, None, query_ctx)?,
+            Some(e) => eval_typed_expr(e, &empty_row, query_ctx)?,
             None => Value::Null,
         };
 
@@ -967,12 +925,7 @@ impl WindowOperator {
         for (pos, &row_idx) in row_indices.iter().enumerate() {
             results[row_idx][wf_idx] = if pos + offset < partition_size {
                 if let Some(expr) = &wf.arg_expr {
-                    eval_expr(
-                        expr,
-                        Some(&rows[row_indices[pos + offset]]),
-                        Some(schema),
-                        query_ctx,
-                    )?
+                    eval_typed_expr(expr, &rows[row_indices[pos + offset]], query_ctx)?
                 } else {
                     Value::Null
                 }
@@ -986,7 +939,6 @@ impl WindowOperator {
     fn compute_first_value(
         &self,
         rows: &[Row],
-        schema: &TableSchema,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
         wf_idx: usize,
@@ -1000,12 +952,7 @@ impl WindowOperator {
                 self.get_frame_bounds(wf, pos, partition_size, peer_groups, query_ctx)?;
             results[row_idx][wf_idx] = if start < end && start < partition_size {
                 if let Some(expr) = &wf.arg_expr {
-                    eval_expr(
-                        expr,
-                        Some(&rows[row_indices[start]]),
-                        Some(schema),
-                        query_ctx,
-                    )?
+                    eval_typed_expr(expr, &rows[row_indices[start]], query_ctx)?
                 } else {
                     Value::Null
                 }
@@ -1019,7 +966,6 @@ impl WindowOperator {
     fn compute_last_value(
         &self,
         rows: &[Row],
-        schema: &TableSchema,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
         wf_idx: usize,
@@ -1033,12 +979,7 @@ impl WindowOperator {
                 self.get_frame_bounds(wf, pos, partition_size, peer_groups, query_ctx)?;
             results[row_idx][wf_idx] = if start < end && end > 0 && end <= partition_size {
                 if let Some(expr) = &wf.arg_expr {
-                    eval_expr(
-                        expr,
-                        Some(&rows[row_indices[end - 1]]),
-                        Some(schema),
-                        query_ctx,
-                    )?
+                    eval_typed_expr(expr, &rows[row_indices[end - 1]], query_ctx)?
                 } else {
                     Value::Null
                 }
@@ -1052,7 +993,6 @@ impl WindowOperator {
     fn compute_nth_value(
         &self,
         rows: &[Row],
-        schema: &TableSchema,
         wf: &WindowFunctionExpr,
         row_indices: &[usize],
         wf_idx: usize,
@@ -1063,7 +1003,7 @@ impl WindowOperator {
         // NTH_VALUE(expr, n): the second argument is the 1-based position
         let n = match &wf.offset_expr {
             Some(expr) => {
-                let val = eval_expr(expr, None, None, query_ctx)?;
+                let val = eval_typed_expr(expr, &Row::new(vec![]), query_ctx)?;
                 match val {
                     Value::Int32(v) if v > 0 => v as usize,
                     Value::Int64(v) if v > 0 => v as usize,
@@ -1085,12 +1025,7 @@ impl WindowOperator {
             let target_pos = start + n - 1; // convert 1-based to 0-based
             results[row_idx][wf_idx] = if target_pos < end && target_pos < partition_size {
                 if let Some(expr) = &wf.arg_expr {
-                    eval_expr(
-                        expr,
-                        Some(&rows[row_indices[target_pos]]),
-                        Some(schema),
-                        query_ctx,
-                    )?
+                    eval_typed_expr(expr, &rows[row_indices[target_pos]], query_ctx)?
                 } else {
                     Value::Null
                 }
@@ -1122,11 +1057,9 @@ impl PhysicalOperator for WindowOperator {
         self.child.open(ctx).await?;
 
         let input_rows = collect_all(self.child.as_mut(), ctx).await?;
-        let input_schema = self.child.schema();
 
         // Compute window function values
-        let window_results =
-            self.compute_window_functions(&input_rows, input_schema, ctx.query_ctx)?;
+        let window_results = self.compute_window_functions(&input_rows, ctx.query_ctx)?;
 
         // Build result rows: input columns + window function results
         self.result_rows.clear();
@@ -1187,6 +1120,7 @@ impl PhysicalOperator for WindowOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analyzer::types::TypedExprKind;
     use crate::sql::operators::scan::TableScanOperator;
 
     fn test_schema() -> TableSchema {
@@ -1221,6 +1155,18 @@ mod tests {
             foreign_keys: vec![],
             owner: String::new(),
             from_alias: None,
+        }
+    }
+
+    /// Helper: creates a TypedExpr::ColumnRef for the given column index and name.
+    fn col_ref(index: usize, name: &str, data_type: DataType) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: index,
+                column_name: name.to_string(),
+            },
+            data_type,
         }
     }
 
@@ -1367,12 +1313,12 @@ mod tests {
     #[test]
     fn test_window_operator_partition_by_canonicalizes_float_keys() {
         let schema = test_schema_with_float_partition();
-        let child = Box::new(TableScanOperator::new(schema.clone()));
+        let child = Box::new(TableScanOperator::new(schema));
 
         let window_funcs = vec![WindowFunctionExpr {
             func_name: "row_number".to_string(),
             arg_expr: None,
-            partition_by: vec![Expr::Identifier(sqlparser::ast::Ident::new("grp"))],
+            partition_by: vec![col_ref(1, "grp", DataType::Float64)],
             order_by: vec![],
             offset_expr: None,
             default_value_expr: None,
@@ -1389,7 +1335,7 @@ mod tests {
             Row::new(vec![Value::Int32(2), Value::Float64(0.0)]),
         ];
         let results = op
-            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .compute_window_functions(&rows, &QueryContext::from_task_locals())
             .unwrap();
         assert_eq!(results[0][0], Value::Int64(1));
         assert_eq!(results[1][0], Value::Int64(2));
@@ -1402,7 +1348,7 @@ mod tests {
             Row::new(vec![Value::Int32(2), Value::Float64(nan2)]),
         ];
         let results = op
-            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .compute_window_functions(&rows, &QueryContext::from_task_locals())
             .unwrap();
         assert_eq!(results[0][0], Value::Int64(1));
         assert_eq!(results[1][0], Value::Int64(2));
@@ -1414,12 +1360,19 @@ mod tests {
         use std::str::FromStr;
 
         let schema = test_schema_with_numeric_partition();
-        let child = Box::new(TableScanOperator::new(schema.clone()));
+        let child = Box::new(TableScanOperator::new(schema));
 
         let window_funcs = vec![WindowFunctionExpr {
             func_name: "row_number".to_string(),
             arg_expr: None,
-            partition_by: vec![Expr::Identifier(sqlparser::ast::Ident::new("grp"))],
+            partition_by: vec![col_ref(
+                1,
+                "grp",
+                DataType::Numeric {
+                    precision: None,
+                    scale: Some(2),
+                },
+            )],
             order_by: vec![],
             offset_expr: None,
             default_value_expr: None,
@@ -1442,7 +1395,7 @@ mod tests {
             ]),
         ];
         let results = op
-            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .compute_window_functions(&rows, &QueryContext::from_task_locals())
             .unwrap();
         assert_eq!(results[0][0], Value::Int64(1));
         assert_eq!(results[1][0], Value::Int64(2));
@@ -1451,17 +1404,19 @@ mod tests {
     #[test]
     fn test_window_operator_rank_dense_rank_treat_nan_order_keys_as_peers() {
         let schema = test_schema_with_float_partition();
-        let child = Box::new(TableScanOperator::new(schema.clone()));
+        let child = Box::new(TableScanOperator::new(schema));
+
+        let grp_col = col_ref(1, "grp", DataType::Float64);
 
         let window_funcs = vec![
             WindowFunctionExpr {
                 func_name: "rank".to_string(),
                 arg_expr: None,
                 partition_by: vec![],
-                order_by: vec![OrderByExpr {
-                    expr: Expr::Identifier(sqlparser::ast::Ident::new("grp")),
-                    asc: Some(true),
-                    nulls_first: None,
+                order_by: vec![TypedOrderByExpr {
+                    expr: grp_col.clone(),
+                    asc: true,
+                    nulls_first: false,
                 }],
                 offset_expr: None,
                 default_value_expr: None,
@@ -1474,10 +1429,10 @@ mod tests {
                 func_name: "dense_rank".to_string(),
                 arg_expr: None,
                 partition_by: vec![],
-                order_by: vec![OrderByExpr {
-                    expr: Expr::Identifier(sqlparser::ast::Ident::new("grp")),
-                    asc: Some(true),
-                    nulls_first: None,
+                order_by: vec![TypedOrderByExpr {
+                    expr: grp_col.clone(),
+                    asc: true,
+                    nulls_first: false,
                 }],
                 offset_expr: None,
                 default_value_expr: None,
@@ -1502,7 +1457,7 @@ mod tests {
         ];
 
         let results = op
-            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .compute_window_functions(&rows, &QueryContext::from_task_locals())
             .unwrap();
 
         // ORDER BY grp ASC sorts NaNs last; both NaNs are peers.
@@ -1552,16 +1507,16 @@ mod tests {
             from_alias: None,
         };
 
-        let child = Box::new(TableScanOperator::new(schema.clone()));
+        let child = Box::new(TableScanOperator::new(schema));
 
         let window_funcs = vec![WindowFunctionExpr {
             func_name: "row_number".to_string(),
             arg_expr: None,
-            partition_by: vec![Expr::Identifier(sqlparser::ast::Ident::new("dept"))],
-            order_by: vec![OrderByExpr {
-                expr: Expr::Identifier(sqlparser::ast::Ident::new("id")),
-                asc: Some(true),
-                nulls_first: None,
+            partition_by: vec![col_ref(0, "dept", DataType::Text)],
+            order_by: vec![TypedOrderByExpr {
+                expr: col_ref(1, "id", DataType::Int32),
+                asc: true,
+                nulls_first: false,
             }],
             offset_expr: None,
             default_value_expr: None,
@@ -1582,7 +1537,7 @@ mod tests {
         ];
 
         let results = op
-            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .compute_window_functions(&rows, &QueryContext::from_task_locals())
             .unwrap();
 
         // Partition A: row_number 1,2; Partition B: row_number 1,2,3
@@ -1596,16 +1551,16 @@ mod tests {
     #[test]
     fn test_window_sum_aggregate() {
         let schema = test_schema();
-        let child = Box::new(TableScanOperator::new(schema.clone()));
+        let child = Box::new(TableScanOperator::new(schema));
 
         let window_funcs = vec![WindowFunctionExpr {
             func_name: "sum".to_string(),
-            arg_expr: Some(Expr::Identifier(sqlparser::ast::Ident::new("amount"))),
+            arg_expr: Some(col_ref(1, "amount", DataType::Int32)),
             partition_by: vec![],
-            order_by: vec![OrderByExpr {
-                expr: Expr::Identifier(sqlparser::ast::Ident::new("id")),
-                asc: Some(true),
-                nulls_first: None,
+            order_by: vec![TypedOrderByExpr {
+                expr: col_ref(0, "id", DataType::Int32),
+                asc: true,
+                nulls_first: false,
             }],
             offset_expr: None,
             default_value_expr: None,
@@ -1627,7 +1582,7 @@ mod tests {
         ];
 
         let results = op
-            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .compute_window_functions(&rows, &QueryContext::from_task_locals())
             .unwrap();
 
         // Running sum: 10, 30, 60
@@ -1648,7 +1603,7 @@ mod tests {
     #[test]
     fn test_window_count_no_order_by() {
         let schema = test_schema();
-        let child = Box::new(TableScanOperator::new(schema.clone()));
+        let child = Box::new(TableScanOperator::new(schema));
 
         let window_funcs = vec![WindowFunctionExpr {
             func_name: "count".to_string(),
@@ -1672,7 +1627,7 @@ mod tests {
         ];
 
         let results = op
-            .compute_window_functions(&rows, &schema, &QueryContext::from_task_locals())
+            .compute_window_functions(&rows, &QueryContext::from_task_locals())
             .unwrap();
 
         // Without ORDER BY, COUNT(*) OVER() returns total count for all rows

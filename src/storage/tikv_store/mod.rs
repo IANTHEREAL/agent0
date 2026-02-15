@@ -9,11 +9,9 @@ use crate::types::{
 use anyhow::{anyhow, Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tikv_client::{
     BoundRange, CheckLevel, Config, Key, Transaction, TransactionClient, TransactionOptions,
 };
-use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 // Submodules
@@ -34,7 +32,6 @@ mod views;
 #[cfg(test)]
 use sequences::{nextval_standalone, setval_standalone};
 
-const SCHEMA_CACHE_TTL: Duration = Duration::from_secs(60);
 const AUTOCOMMIT_MAX_RETRIES: usize = 10;
 
 /// Maximum scan limit for TiKV operations.
@@ -81,41 +78,8 @@ pub(crate) struct CommentRecord {
     pub(crate) description: String,
 }
 
-struct SchemaCache {
-    per_db: HashMap<u64, PerDatabaseSchemaCache>,
-}
-
-struct PerDatabaseSchemaCache {
-    schemas: Option<(Instant, Vec<String>)>,
-    schema_oids: Option<(Instant, HashMap<String, u32>)>,
-    tables: Option<(Instant, Vec<String>)>,
-    triggers: HashMap<String, (Instant, Vec<TriggerDef>)>,
-    functions: HashMap<String, (Instant, Option<FunctionDef>)>,
-}
-
-impl SchemaCache {
-    fn new() -> Self {
-        Self {
-            per_db: HashMap::new(),
-        }
-    }
-}
-
-impl PerDatabaseSchemaCache {
-    fn new() -> Self {
-        Self {
-            schemas: None,
-            schema_oids: None,
-            tables: None,
-            triggers: HashMap::new(),
-            functions: HashMap::new(),
-        }
-    }
-}
-
 pub struct TikvStore {
     client: Option<Arc<TransactionClient>>,
-    cache: Arc<RwLock<SchemaCache>>,
 }
 
 impl TikvStore {
@@ -155,7 +119,6 @@ impl TikvStore {
         info!("Connected to TiKV. Keyspace: {:?}", keyspace);
         let store = Self {
             client: Some(Arc::new(client)),
-            cache: Arc::new(RwLock::new(SchemaCache::new())),
         };
 
         store.check_format_version().await?;
@@ -168,13 +131,7 @@ impl TikvStore {
     pub(crate) fn new_stub() -> Arc<Self> {
         use std::sync::OnceLock;
         static STUB: OnceLock<Arc<TikvStore>> = OnceLock::new();
-        STUB.get_or_init(|| {
-            Arc::new(Self {
-                client: None,
-                cache: Arc::new(RwLock::new(SchemaCache::new())),
-            })
-        })
-        .clone()
+        STUB.get_or_init(|| Arc::new(Self { client: None })).clone()
     }
 
     fn key(&self, key: &[u8]) -> Vec<u8> {

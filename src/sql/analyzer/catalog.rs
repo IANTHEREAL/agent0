@@ -13,6 +13,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone)]
 pub enum CatalogError {
     /// Catalog data is inconsistent or corrupted.
+    #[allow(dead_code)]
     Internal(String),
 }
 
@@ -40,6 +41,7 @@ pub trait Catalog: Send + Sync {
     ) -> Result<Option<(String, TableSchema)>, CatalogError>;
 
     /// Resolve a view by name, optionally schema-qualified.
+    #[allow(dead_code)]
     fn resolve_view(
         &self,
         name: &str,
@@ -55,16 +57,26 @@ pub trait Catalog: Send + Sync {
     ) -> Result<Option<FunctionDef>, CatalogError>;
 
     /// Resolve a user-defined type by name.
+    #[allow(dead_code)]
     fn resolve_type(
         &self,
         name: &str,
         schema: Option<&str>,
     ) -> Result<Option<UserTypeDef>, CatalogError>;
 
+    /// Resolve the schema for a table-valued function call used in FROM.
+    ///
+    /// The key is a stable signature string computed from the raw sqlparser AST
+    /// (function name + argument expressions). It is populated during the async
+    /// prefetch phase so the Analyzer can stay synchronous.
+    fn resolve_table_function(&self, key: &str) -> Option<&TableSchema>;
+
     /// The current search path (ordered list of schema names).
+    #[allow(dead_code)]
     fn search_path(&self) -> &[String];
 
     /// The current database ID (for scope isolation).
+    #[allow(dead_code)]
     fn database_id(&self) -> u64;
 }
 
@@ -80,10 +92,14 @@ pub trait Catalog: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct CatalogSnapshot {
     tables: HashMap<String, (String, TableSchema)>,
+    table_functions: HashMap<String, TableSchema>,
+    #[allow(dead_code)] // FUTURE: view-aware Analyzer path
     views: HashMap<String, ViewDef>,
     functions: HashMap<String, FunctionDef>,
+    #[allow(dead_code)] // FUTURE: user-defined type resolution
     types: HashMap<String, UserTypeDef>,
     search_path: Vec<String>,
+    #[allow(dead_code)] // FUTURE: cross-database query isolation
     database_id: u64,
 }
 
@@ -92,6 +108,7 @@ impl CatalogSnapshot {
     pub fn new(search_path: Vec<String>, database_id: u64) -> Self {
         Self {
             tables: HashMap::new(),
+            table_functions: HashMap::new(),
             views: HashMap::new(),
             functions: HashMap::new(),
             types: HashMap::new(),
@@ -106,17 +123,25 @@ impl CatalogSnapshot {
             .insert(name.to_lowercase(), (qualified_name, schema));
     }
 
+    /// Add a table function schema under a stable signature key.
+    pub fn add_table_function(&mut self, key: &str, schema: TableSchema) {
+        self.table_functions.insert(key.to_string(), schema);
+    }
+
     /// Add a view to the snapshot.
+    #[allow(dead_code)] // FUTURE: view-aware Analyzer path
     pub fn add_view(&mut self, name: &str, view: ViewDef) {
         self.views.insert(name.to_lowercase(), view);
     }
 
     /// Add a user-defined function to the snapshot.
+    #[allow(dead_code)] // FUTURE: UDF prefetch
     pub fn add_function(&mut self, name: &str, func: FunctionDef) {
         self.functions.insert(name.to_lowercase(), func);
     }
 
     /// Add a user-defined type to the snapshot.
+    #[allow(dead_code)] // FUTURE: user-defined type resolution
     pub fn add_type(&mut self, name: &str, udt: UserTypeDef) {
         self.types.insert(name.to_lowercase(), udt);
     }
@@ -191,6 +216,10 @@ impl Catalog for CatalogSnapshot {
         Ok(self.resolve_name(&self.types, name, schema).cloned())
     }
 
+    fn resolve_table_function(&self, key: &str) -> Option<&TableSchema> {
+        self.table_functions.get(key)
+    }
+
     fn search_path(&self) -> &[String] {
         &self.search_path
     }
@@ -200,16 +229,75 @@ impl Catalog for CatalogSnapshot {
     }
 }
 
+// ── NullCatalog ─────────────────────────────────────────────
+
+/// A catalog that resolves nothing — for evaluating constant expressions.
+///
+/// Used by the bridge module to evaluate AST expressions that have no
+/// table/function context (literals, arithmetic, casts, etc.).
+#[derive(Debug, Clone, Copy)]
+pub struct NullCatalog;
+
+impl Catalog for NullCatalog {
+    fn resolve_table(
+        &self,
+        _name: &str,
+        _schema: Option<&str>,
+    ) -> Result<Option<(String, TableSchema)>, CatalogError> {
+        Ok(None)
+    }
+
+    fn resolve_view(
+        &self,
+        _name: &str,
+        _schema: Option<&str>,
+    ) -> Result<Option<ViewDef>, CatalogError> {
+        Ok(None)
+    }
+
+    fn resolve_function(
+        &self,
+        _name: &str,
+        _schema: Option<&str>,
+        _arg_types: &[DataType],
+    ) -> Result<Option<FunctionDef>, CatalogError> {
+        Ok(None)
+    }
+
+    fn resolve_type(
+        &self,
+        _name: &str,
+        _schema: Option<&str>,
+    ) -> Result<Option<UserTypeDef>, CatalogError> {
+        Ok(None)
+    }
+
+    fn resolve_table_function(&self, _key: &str) -> Option<&TableSchema> {
+        None
+    }
+
+    fn search_path(&self) -> &[String] {
+        &[]
+    }
+
+    fn database_id(&self) -> u64 {
+        0
+    }
+}
+
 // ── MockCatalog (for testing) ───────────────────────────────
 
 /// A simple in-memory catalog for unit testing.
 ///
 /// Build with `MockCatalog::builder()` to fluently add tables.
+// Test infrastructure -- will be wired up when analyzer tests expand.
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct MockCatalog {
     snapshot: CatalogSnapshot,
 }
 
+#[allow(dead_code)]
 impl MockCatalog {
     pub fn builder() -> MockCatalogBuilder {
         MockCatalogBuilder {
@@ -259,6 +347,10 @@ impl Catalog for MockCatalog {
         self.snapshot.resolve_type(name, schema)
     }
 
+    fn resolve_table_function(&self, key: &str) -> Option<&TableSchema> {
+        self.snapshot.resolve_table_function(key)
+    }
+
     fn search_path(&self) -> &[String] {
         self.snapshot.search_path()
     }
@@ -269,10 +361,13 @@ impl Catalog for MockCatalog {
 }
 
 /// Builder for `MockCatalog`.
+// Test infrastructure -- will be wired up when analyzer tests expand.
+#[allow(dead_code)]
 pub struct MockCatalogBuilder {
     snapshot: CatalogSnapshot,
 }
 
+#[allow(dead_code)]
 impl MockCatalogBuilder {
     /// Add a table with given columns: `(name, type, nullable)`.
     pub fn table(mut self, name: &str, columns: Vec<(&str, DataType, bool)>) -> Self {

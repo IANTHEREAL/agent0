@@ -1,22 +1,21 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use sqlparser::ast::Expr;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::{eval_expr, validate_bool_expr_in_boolean_context};
+use crate::sql::analyzer::types::TypedExpr;
+use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
-use crate::sql::types::cast::{cast, CastContext};
-use crate::types::{DataType, Row, TableSchema, Value};
+use crate::types::{Row, TableSchema, Value};
 
 #[derive(Debug)]
 pub struct FilterOperator {
     child: BoxedOperator,
-    predicate: Expr,
+    predicate: TypedExpr,
     opened: bool,
 }
 
 impl FilterOperator {
-    pub fn new(child: BoxedOperator, predicate: Expr) -> Self {
+    pub fn new(child: BoxedOperator, predicate: TypedExpr) -> Self {
         Self {
             child,
             predicate,
@@ -25,16 +24,7 @@ impl FilterOperator {
     }
 
     fn evaluate_predicate(&self, row: &Row, query_ctx: &QueryContext) -> Result<bool> {
-        let result = eval_expr(
-            &self.predicate,
-            Some(row),
-            Some(self.child.schema()),
-            query_ctx,
-        )?;
-        let result = match result {
-            Value::Text(s) => cast(Value::Text(s), &DataType::Boolean, CastContext::Implicit)?,
-            other => other,
-        };
+        let result = eval_typed_expr(&self.predicate, row, query_ctx)?;
         match result {
             Value::Boolean(b) => Ok(b),
             Value::Null => Ok(false),
@@ -50,11 +40,6 @@ impl PhysicalOperator for FilterOperator {
     }
 
     async fn open(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
-        validate_bool_expr_in_boolean_context(
-            &self.predicate,
-            self.child.schema(),
-            "Filter predicate must evaluate to boolean",
-        )?;
         self.child.open(ctx).await?;
         self.opened = true;
         Ok(())
@@ -93,15 +78,15 @@ impl PhysicalOperator for FilterOperator {
     }
 
     fn explain_info(&self) -> Option<String> {
-        Some(format!("predicate={}", self.predicate))
+        Some(format!("predicate={:?}", self.predicate))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analyzer::types::{BinaryOp, IsTestKind, TypedExprKind};
     use crate::types::{ColumnDef, DataType};
-    use sqlparser::ast::{BinaryOperator, Ident};
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -145,20 +130,34 @@ mod tests {
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
 
-        let predicate = Expr::BinaryOp {
-            left: Box::new(Expr::Identifier(Ident::new("id"))),
-            op: BinaryOperator::Gt,
-            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
-                "5".to_string(),
-                false,
-            ))),
+        let left_typed = TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: 0,
+                column_name: "id".to_string(),
+            },
+            data_type: DataType::Int32,
+        };
+        let right_typed = TypedExpr {
+            kind: TypedExprKind::Constant(Value::Int64(5)),
+            data_type: DataType::Int64,
+        };
+        let predicate = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(left_typed),
+                op: BinaryOp::Gt,
+                right: Box::new(right_typed),
+            },
+            data_type: DataType::Boolean,
         };
 
-        let filter = FilterOperator::new(child, predicate.clone());
+        let filter = FilterOperator::new(child, predicate);
 
         assert_eq!(filter.name(), "Filter");
         assert!(!filter.opened);
-        assert!(filter.explain_info().unwrap().contains("id > 5"));
+        let info = filter.explain_info().unwrap();
+        assert!(info.contains("id"));
+        assert!(info.contains("Gt"));
     }
 
     #[test]
@@ -168,7 +167,14 @@ mod tests {
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema.clone()));
 
-        let predicate = Expr::Identifier(Ident::new("active"));
+        let predicate = TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: 1,
+                column_name: "active".to_string(),
+            },
+            data_type: DataType::Boolean,
+        };
         let filter = FilterOperator::new(child, predicate);
 
         let row_true = Row::new(vec![Value::Int32(1), Value::Boolean(true)]);
@@ -183,15 +189,16 @@ mod tests {
     }
 
     #[test]
-    fn test_predicate_evaluation_text_boolean_literals() {
+    fn test_predicate_evaluation_boolean_literals() {
         use super::super::scan::TableScanOperator;
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema.clone()));
 
-        let predicate = Expr::Value(sqlparser::ast::Value::SingleQuotedString(
-            "true".to_string(),
-        ));
+        let predicate = TypedExpr {
+            kind: TypedExprKind::Constant(Value::Boolean(true)),
+            data_type: DataType::Boolean,
+        };
         let filter = FilterOperator::new(child, predicate);
 
         let row = Row::new(vec![Value::Int32(1), Value::Boolean(false)]);
@@ -200,9 +207,10 @@ mod tests {
             .unwrap());
 
         let child = Box::new(TableScanOperator::new(schema));
-        let predicate = Expr::Value(sqlparser::ast::Value::SingleQuotedString(
-            "false".to_string(),
-        ));
+        let predicate = TypedExpr {
+            kind: TypedExprKind::Constant(Value::Boolean(false)),
+            data_type: DataType::Boolean,
+        };
         let filter = FilterOperator::new(child, predicate);
         assert!(!filter
             .evaluate_predicate(&row, &QueryContext::from_task_locals())
@@ -216,8 +224,15 @@ mod tests {
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
 
-        // Predicate: active (column is NULL → should return false)
-        let predicate = Expr::Identifier(Ident::new("active"));
+        // Predicate: active (column is NULL -> should return false)
+        let predicate = TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: 1,
+                column_name: "active".to_string(),
+            },
+            data_type: DataType::Boolean,
+        };
         let filter = FilterOperator::new(child, predicate);
 
         let row_null = Row::new(vec![Value::Int32(1), Value::Null]);
@@ -234,13 +249,23 @@ mod tests {
 
         // Predicate: id > 2
         let child = Box::new(TableScanOperator::new(schema.clone()));
-        let predicate = Expr::BinaryOp {
-            left: Box::new(Expr::Identifier(Ident::new("id"))),
-            op: BinaryOperator::Gt,
-            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
-                "2".to_string(),
-                false,
-            ))),
+        let predicate = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: 0,
+                        column_name: "id".to_string(),
+                    },
+                    data_type: DataType::Int32,
+                }),
+                op: BinaryOp::Gt,
+                right: Box::new(TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Int64(2)),
+                    data_type: DataType::Int64,
+                }),
+            },
+            data_type: DataType::Boolean,
         };
         let filter = FilterOperator::new(child, predicate);
 
@@ -260,13 +285,23 @@ mod tests {
 
         // Predicate: id = 2
         let child = Box::new(TableScanOperator::new(schema));
-        let predicate = Expr::BinaryOp {
-            left: Box::new(Expr::Identifier(Ident::new("id"))),
-            op: BinaryOperator::Eq,
-            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
-                "2".to_string(),
-                false,
-            ))),
+        let predicate = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: 0,
+                        column_name: "id".to_string(),
+                    },
+                    data_type: DataType::Int32,
+                }),
+                op: BinaryOp::Eq,
+                right: Box::new(TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Int64(2)),
+                    data_type: DataType::Int64,
+                }),
+            },
+            data_type: DataType::Boolean,
         };
         let filter = FilterOperator::new(child, predicate);
 
@@ -289,7 +324,21 @@ mod tests {
 
         // Predicate: active IS NULL
         let child = Box::new(TableScanOperator::new(schema.clone()));
-        let predicate = Expr::IsNull(Box::new(Expr::Identifier(Ident::new("active"))));
+        let predicate = TypedExpr {
+            kind: TypedExprKind::IsTest {
+                expr: Box::new(TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: 1,
+                        column_name: "active".to_string(),
+                    },
+                    data_type: DataType::Boolean,
+                }),
+                test: IsTestKind::Null,
+                negated: false,
+            },
+            data_type: DataType::Boolean,
+        };
         let filter = FilterOperator::new(child, predicate);
 
         let row_null = Row::new(vec![Value::Int32(1), Value::Null]);
@@ -304,7 +353,21 @@ mod tests {
 
         // Predicate: active IS NOT NULL
         let child = Box::new(TableScanOperator::new(schema));
-        let predicate = Expr::IsNotNull(Box::new(Expr::Identifier(Ident::new("active"))));
+        let predicate = TypedExpr {
+            kind: TypedExprKind::IsTest {
+                expr: Box::new(TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: 1,
+                        column_name: "active".to_string(),
+                    },
+                    data_type: DataType::Boolean,
+                }),
+                test: IsTestKind::Null,
+                negated: true,
+            },
+            data_type: DataType::Boolean,
+        };
         let filter = FilterOperator::new(child, predicate);
 
         assert!(!filter

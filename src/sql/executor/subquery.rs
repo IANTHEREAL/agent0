@@ -1,17 +1,20 @@
-//! Subquery resolution for the SQL executor
+//! LEGACY: Subquery resolution for the SQL executor (DML paths).
+//! SELECT queries use the Analyzer → TypedExpr subquery handling in
+//! `executor/select/analyzed/subquery.rs`.
+//! Will be removed when DML is migrated to the Analyzer path.
 
-use super::super::names::{self, normalize_ident};
+use super::super::names::normalize_ident;
 use super::super::value_coercion::value_to_sql_expr;
 use super::super::ExecuteResult;
 use super::core::Executor;
-use crate::storage::TikvStore;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
-use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, Ident, Query, SelectItem, SetExpr, Value as SqlValue, With,
-};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+#[cfg(test)]
+use sqlparser::ast::With;
+use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Query, SetExpr, Value as SqlValue};
+use std::collections::HashMap;
+#[cfg(test)]
+use std::collections::HashSet;
 use tikv_client::Transaction;
 
 pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
@@ -37,6 +40,7 @@ pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
 /// Check if a query contains bare (unqualified) identifier references matching
 /// any column in the outer schema.  This is a conservative over-detection: it may
 /// flag uncorrelated subqueries as correlated (performance, not correctness).
+#[cfg(test)]
 fn query_has_bare_outer_reference(query: &Query, outer_schema: &TableSchema) -> bool {
     use core::ops::ControlFlow;
     use sqlparser::ast::{Visit, Visitor};
@@ -92,83 +96,6 @@ fn query_has_bare_outer_reference(query: &Query, outer_schema: &TableSchema) -> 
     };
     let _ = query.visit(&mut visitor);
     visitor.found
-}
-
-/// Extract table names (not aliases) from a query's top-level FROM clause
-/// for schema lookup.
-fn collect_from_table_names(query: &Query) -> Vec<(Option<String>, String)> {
-    let select = match &*query.body {
-        SetExpr::Select(s) => s,
-        _ => return Vec::new(),
-    };
-
-    fn collect_factor(
-        factor: &sqlparser::ast::TableFactor,
-        out: &mut Vec<(Option<String>, String)>,
-    ) {
-        match factor {
-            sqlparser::ast::TableFactor::Table { name, .. } => {
-                let parts: Vec<String> = name.0.iter().map(normalize_ident).collect();
-                match parts.as_slice() {
-                    [single] => out.push((None, single.clone())),
-                    [schema, obj] => out.push((Some(schema.clone()), obj.clone())),
-                    _ => {} // skip unsupported multi-part names
-                }
-            }
-            sqlparser::ast::TableFactor::NestedJoin {
-                table_with_joins, ..
-            } => {
-                collect_factor(&table_with_joins.relation, out);
-                for join in &table_with_joins.joins {
-                    collect_factor(&join.relation, out);
-                }
-            }
-            // Derived tables, functions, UNNEST, etc. — we cannot resolve their
-            // column sets without executing them; skip.
-            _ => {}
-        }
-    }
-
-    let mut names = Vec::new();
-    for twj in &select.from {
-        collect_factor(&twj.relation, &mut names);
-        for join in &twj.joins {
-            collect_factor(&join.relation, &mut names);
-        }
-    }
-    names
-}
-
-/// Return true if the FROM clause contains any entry whose columns cannot be
-/// determined by schema lookup alone (derived tables, table functions, etc.).
-fn has_unresolvable_from(from: &[sqlparser::ast::TableWithJoins]) -> bool {
-    fn is_plain_table(factor: &sqlparser::ast::TableFactor) -> bool {
-        match factor {
-            sqlparser::ast::TableFactor::Table { args: None, .. } => true,
-            sqlparser::ast::TableFactor::NestedJoin {
-                table_with_joins, ..
-            } => {
-                is_plain_table(&table_with_joins.relation)
-                    && table_with_joins
-                        .joins
-                        .iter()
-                        .all(|j| is_plain_table(&j.relation))
-            }
-            _ => false,
-        }
-    }
-
-    for twj in from {
-        if !is_plain_table(&twj.relation) {
-            return true;
-        }
-        for join in &twj.joins {
-            if !is_plain_table(&join.relation) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 /// Check whether a `TableFactor` exposes a name (alias or bare table name)
@@ -243,73 +170,13 @@ fn from_clause_shadows_alias(from: &[sqlparser::ast::TableWithJoins], outer_alia
 }
 
 /// Check whether a `Query`'s top-level SELECT FROM clause shadows `outer_alias`.
+#[cfg(test)]
 fn query_from_shadows_alias(query: &Query, outer_alias: &str) -> bool {
     if let SetExpr::Select(select) = &*query.body {
         from_clause_shadows_alias(&select.from, outer_alias)
     } else {
         false
     }
-}
-
-/// Resolve FROM-clause table names to their column name sets.
-/// Returns `None` if any FROM entry cannot be resolved (derived tables, views,
-/// unrecognised names), signalling that bare-identifier qualification should be
-/// skipped for this subquery (conservative fallback).
-pub(crate) async fn collect_inner_column_names(
-    store: &Arc<TikvStore>,
-    txn: &mut Transaction,
-    db_id: u64,
-    search_path: &[String],
-    query: &Query,
-    ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
-) -> Result<Option<HashSet<String>>> {
-    let select = match &*query.body {
-        SetExpr::Select(s) => s,
-        _ => return Ok(None),
-    };
-
-    if has_unresolvable_from(&select.from) {
-        return Ok(None);
-    }
-
-    let table_names = collect_from_table_names(query);
-    let mut columns = HashSet::new();
-
-    for (schema_opt, table_name) in &table_names {
-        // Check CTEs first.
-        let cte_key = table_name.to_lowercase();
-        if let Some((cte_schema, _)) = ctes.get(&cte_key) {
-            for col in &cte_schema.columns {
-                columns.insert(col.name.to_lowercase());
-            }
-            continue;
-        }
-
-        // Resolve via store with search_path.
-        let obj_name = match schema_opt {
-            Some(schema) => {
-                sqlparser::ast::ObjectName(vec![Ident::new(schema), Ident::new(table_name)])
-            }
-            None => sqlparser::ast::ObjectName(vec![Ident::new(table_name)]),
-        };
-
-        if let Some(resolved) =
-            names::resolve_existing_table_name(store.as_ref(), txn, db_id, &obj_name, search_path)
-                .await?
-        {
-            if let Some(table_schema) = store.get_schema(txn, db_id, &resolved.full).await? {
-                for col in &table_schema.columns {
-                    columns.insert(col.name.to_lowercase());
-                }
-                continue;
-            }
-        }
-
-        // Unresolvable (could be a view, or doesn't exist).
-        return Ok(None);
-    }
-
-    Ok(Some(columns))
 }
 
 impl Executor {
@@ -630,162 +497,6 @@ impl Executor {
                     }))
                 }
                 _ => Ok(expr.clone()),
-            }
-        })
-    }
-
-    pub(crate) async fn resolve_projection_subqueries(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
-        search_path: &[String],
-        projection: &[SelectItem],
-        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> Result<Vec<SelectItem>> {
-        let mut resolved = Vec::with_capacity(projection.len());
-        for item in projection {
-            let resolved_item = match item {
-                SelectItem::UnnamedExpr(e) => SelectItem::UnnamedExpr(
-                    self.resolve_subqueries(txn, db_id, sequence_values, search_path, e, ctes, &[])
-                        .await?,
-                ),
-                SelectItem::ExprWithAlias { expr, alias } => SelectItem::ExprWithAlias {
-                    expr: self
-                        .resolve_subqueries(
-                            txn,
-                            db_id,
-                            sequence_values,
-                            search_path,
-                            expr,
-                            ctes,
-                            &[],
-                        )
-                        .await?,
-                    alias: alias.clone(),
-                },
-                other => other.clone(),
-            };
-            resolved.push(resolved_item);
-        }
-        Ok(resolved)
-    }
-
-    pub(crate) async fn resolve_projection_subqueries_with_outer_context(
-        &self,
-        txn: &mut Transaction,
-        db_id: u64,
-        sequence_values: &mut HashMap<String, i64>,
-        search_path: &[String],
-        projection: &[SelectItem],
-        outer_alias: &str,
-        outer_schema: &TableSchema,
-        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> Result<Vec<SelectItem>> {
-        let mut resolved = Vec::with_capacity(projection.len());
-        for item in projection {
-            let resolved_item = match item {
-                SelectItem::UnnamedExpr(e) => {
-                    if self.expr_is_correlated_subquery(e, outer_alias, outer_schema) {
-                        SelectItem::UnnamedExpr(e.clone())
-                    } else {
-                        SelectItem::UnnamedExpr(
-                            self.resolve_subqueries(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                e,
-                                ctes,
-                                &[],
-                            )
-                            .await?,
-                        )
-                    }
-                }
-                SelectItem::ExprWithAlias { expr, alias } => {
-                    if self.expr_is_correlated_subquery(expr, outer_alias, outer_schema) {
-                        SelectItem::ExprWithAlias {
-                            expr: expr.clone(),
-                            alias: alias.clone(),
-                        }
-                    } else {
-                        SelectItem::ExprWithAlias {
-                            expr: self
-                                .resolve_subqueries(
-                                    txn,
-                                    db_id,
-                                    sequence_values,
-                                    search_path,
-                                    expr,
-                                    ctes,
-                                    &[],
-                                )
-                                .await?,
-                            alias: alias.clone(),
-                        }
-                    }
-                }
-                other => other.clone(),
-            };
-            resolved.push(resolved_item);
-        }
-        Ok(resolved)
-    }
-
-    pub(crate) fn expr_is_correlated_subquery(
-        &self,
-        expr: &Expr,
-        outer_alias: &str,
-        outer_schema: &TableSchema,
-    ) -> bool {
-        match expr {
-            Expr::Subquery(q) => {
-                query_has_outer_reference(q, outer_alias)
-                    || query_has_bare_outer_reference(q, outer_schema)
-            }
-            _ => false,
-        }
-    }
-
-    pub(crate) fn eval_correlated_subquery<'a>(
-        &'a self,
-        txn: &'a mut Transaction,
-        db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
-        search_path: &'a [String],
-        subquery: &'a Query,
-        outer_alias: &'a str,
-        outer_schema: &'a TableSchema,
-        outer_row: &'a Row,
-        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send + 'a>> {
-        Box::pin(async move {
-            let inner_columns =
-                collect_inner_column_names(&self.store(), txn, db_id, search_path, subquery, ctes)
-                    .await?;
-
-            let substituted_query = substitute_outer_values_in_query(
-                subquery,
-                outer_alias,
-                outer_schema,
-                outer_row,
-                inner_columns.as_ref(),
-            );
-            let result = self
-                .execute_query(txn, db_id, sequence_values, search_path, &substituted_query)
-                .await?;
-            match result {
-                ExecuteResult::Select { rows, .. } => {
-                    if rows.is_empty() {
-                        Ok(Value::Null)
-                    } else if rows.len() == 1 {
-                        Ok(rows[0].values.first().cloned().unwrap_or(Value::Null))
-                    } else {
-                        Err(anyhow!("Scalar subquery returned more than one row"))
-                    }
-                }
-                _ => Err(anyhow!("Subquery must return a SELECT result")),
             }
         })
     }
@@ -1192,10 +903,11 @@ pub fn query_has_outer_reference(query: &Query, outer_alias: &str) -> bool {
 /// Tracks alias shadowing: if a query's FROM clause defines the same name as
 /// `outer_alias`, all substitution within that query scope is skipped.
 ///
-/// Per-query CTE scoping: a query's WITH clause is logically outside that
+/// Per-query CTE scoping: a query's With clause is logically outside that
 /// query block's FROM scope, so CTEs are visited *before* FROM-shadow tracking
 /// is applied.  This ensures consistent behavior regardless of entry point
 /// (`substitute_outer_values` vs `substitute_outer_values_in_query`).
+#[cfg(test)]
 struct SubstituteVisitor<'a> {
     outer_alias: &'a str,
     outer_schema: &'a TableSchema,
@@ -1211,6 +923,7 @@ struct SubstituteVisitor<'a> {
     stashed_bodies: Vec<Option<Box<SetExpr>>>,
 }
 
+#[cfg(test)]
 impl<'a> SubstituteVisitor<'a> {
     /// Visit a SetExpr tree with per-arm FROM-shadow tracking.
     ///
@@ -1246,6 +959,7 @@ impl<'a> SubstituteVisitor<'a> {
     }
 }
 
+#[cfg(test)]
 impl<'a> sqlparser::ast::VisitorMut for SubstituteVisitor<'a> {
     type Break = ();
 
@@ -1364,6 +1078,7 @@ impl<'a> sqlparser::ast::VisitorMut for SubstituteVisitor<'a> {
 /// When `inner_columns` is `Some`, bare `Identifier` references at the immediate
 /// query level are also substituted if they match an outer-schema column and are
 /// not present in the inner-column set.
+#[cfg(test)]
 pub fn substitute_outer_values(
     expr: &Expr,
     outer_alias: &str,
@@ -1393,8 +1108,9 @@ pub fn substitute_outer_values(
 /// When `inner_columns` is `Some`, bare `Identifier` references at the
 /// immediate query level (depth 1) are also substituted.
 ///
-/// CTE scoping is handled by the visitor itself: each query's WITH clause
+/// CTE scoping is handled by the visitor itself: each query's With clause
 /// is visited before FROM-shadow tracking is applied for that query block.
+#[cfg(test)]
 pub fn substitute_outer_values_in_query(
     query: &Query,
     outer_alias: &str,

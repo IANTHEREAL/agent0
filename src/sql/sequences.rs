@@ -1,6 +1,8 @@
 use crate::sql::error::SqlError;
 use crate::storage::TikvStore;
-use crate::types::{DataType, IndexDef, SequenceBacking, SequenceDef, SequenceState, Value};
+use crate::types::{
+    DataType, IndexDef, Row, SequenceBacking, SequenceDef, SequenceState, TableSchema, Value,
+};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     Expr, Function, FunctionArg, FunctionArgExpr, MinMaxValue, ObjectName, SequenceOptions,
@@ -12,13 +14,29 @@ use std::sync::Arc;
 use tikv_client::Transaction;
 
 use super::catalog_oids;
-use super::expr::{eval_expr, eval_join_expr, JoinEvalContext};
+use super::expr::bridge::{
+    eval_ast_expr_with_join_row, eval_ast_expr_with_row, eval_const_ast_expr,
+};
 use super::names;
 use super::names::{function_name_upper, normalize_ident};
 use super::plpgsql;
 use super::value_coercion::value_to_sql_expr;
 use super::ExecuteResult;
-use crate::sql::query_context::QueryContext;
+
+/// Evaluate an expression in sequence context (optional row/schema).
+fn eval_seq_expr(
+    expr: &Expr,
+    row: Option<&crate::types::Row>,
+    schema: Option<&crate::types::TableSchema>,
+) -> Result<Value> {
+    match (row, schema) {
+        (Some(r), Some(s)) => {
+            let alias = s.name.rsplit('.').next().unwrap_or(&s.name);
+            eval_ast_expr_with_row(expr, r, s, alias)
+        }
+        _ => eval_const_ast_expr(expr),
+    }
+}
 
 pub(crate) fn expr_uses_sequence_functions(expr: &Expr) -> bool {
     use core::ops::ControlFlow;
@@ -256,8 +274,7 @@ pub(crate) fn find_owned_sequence_full_name(
 }
 
 fn eval_i64(expr: &Expr) -> Result<i64> {
-    let qc = QueryContext::from_task_locals();
-    match eval_expr(expr, None, None, &qc)? {
+    match super::expr::bridge::eval_const_ast_expr(expr)? {
         crate::types::Value::Int32(n) => Ok(n as i64),
         crate::types::Value::Int64(n) => Ok(n),
         crate::types::Value::Float64(n) => Ok(n as i64),
@@ -612,7 +629,7 @@ async fn lookup_indexdef_by_oid(
     Ok(None)
 }
 
-async fn resolve_sequence_full_name_from_value(
+pub(crate) async fn resolve_sequence_full_name_from_value(
     store: &Arc<TikvStore>,
     txn: &mut Transaction,
     db_id: u64,
@@ -657,9 +674,8 @@ pub(crate) async fn eval_expr_with_sequences(
     row: Option<&crate::types::Row>,
     schema: Option<&crate::types::TableSchema>,
 ) -> Result<crate::types::Value> {
-    let qc = QueryContext::from_task_locals();
     if !expr_needs_async_eval(expr) {
-        return eval_expr(expr, row, schema, &qc);
+        return eval_seq_expr(expr, row, schema);
     }
     let rewritten = replace_sequence_functions(
         store,
@@ -672,7 +688,7 @@ pub(crate) async fn eval_expr_with_sequences(
         schema,
     )
     .await?;
-    eval_expr(&rewritten, row, schema, &qc)
+    eval_seq_expr(&rewritten, row, schema)
 }
 
 pub(crate) async fn eval_expr_join_with_sequences(
@@ -682,10 +698,11 @@ pub(crate) async fn eval_expr_join_with_sequences(
     last_sequence_values: &mut HashMap<String, i64>,
     search_path: &[String],
     expr: &Expr,
-    join_ctx: &JoinEvalContext<'_>,
-) -> Result<crate::types::Value> {
+    combined_row: &Row,
+    tables: &[(&str, &TableSchema)],
+) -> Result<Value> {
     if !expr_needs_async_eval(expr) {
-        return eval_join_expr(join_ctx, expr);
+        return eval_ast_expr_with_join_row(expr, combined_row, tables);
     }
     let rewritten = replace_sequence_functions_join(
         store,
@@ -694,10 +711,11 @@ pub(crate) async fn eval_expr_join_with_sequences(
         last_sequence_values,
         search_path,
         expr,
-        join_ctx,
+        combined_row,
+        tables,
     )
     .await?;
-    eval_join_expr(join_ctx, &rewritten)
+    eval_ast_expr_with_join_row(&rewritten, combined_row, tables)
 }
 
 pub(crate) fn replace_sequence_functions<'a>(
@@ -711,7 +729,6 @@ pub(crate) fn replace_sequence_functions<'a>(
     schema: Option<&'a crate::types::TableSchema>,
 ) -> Pin<Box<dyn Future<Output = Result<Expr>> + Send + 'a>> {
     Box::pin(async move {
-        let qc = QueryContext::from_task_locals();
         match expr {
             Expr::Function(func) => {
                 let name = function_name_upper(func);
@@ -726,7 +743,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                             txn,
                             db_id,
                             search_path,
-                            eval_expr(arg0, row, schema, &qc)?,
+                            eval_seq_expr(arg0, row, schema)?,
                         )
                         .await?;
                         let val = store.nextval_sequence(txn, db_id, &full_name).await?;
@@ -740,7 +757,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                             txn,
                             db_id,
                             search_path,
-                            eval_expr(arg0, row, schema, &qc)?,
+                            eval_seq_expr(arg0, row, schema)?,
                         )
                         .await?;
                         if store.get_sequence(txn, db_id, &full_name).await?.is_none() {
@@ -766,10 +783,10 @@ pub(crate) fn replace_sequence_functions<'a>(
                             txn,
                             db_id,
                             search_path,
-                            eval_expr(arg0, row, schema, &qc)?,
+                            eval_seq_expr(arg0, row, schema)?,
                         )
                         .await?;
-                        let val = eval_expr(arg1, row, schema, &qc)?;
+                        let val = eval_seq_expr(arg1, row, schema)?;
                         let value_i64 = match val {
                             crate::types::Value::Int32(n) => n as i64,
                             crate::types::Value::Int64(n) => n,
@@ -784,7 +801,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                         };
                         let is_called = if func.args.len() >= 3 {
                             let arg2 = extract_arg_expr(&func.args, 2)?;
-                            match eval_expr(arg2, row, schema, &qc)? {
+                            match eval_seq_expr(arg2, row, schema)? {
                                 crate::types::Value::Boolean(b) => b,
                                 crate::types::Value::Text(s) => {
                                     matches!(
@@ -816,7 +833,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                                 )));
                             }
                         };
-                        let oid_val = eval_expr(arg0, row, schema, &qc)?;
+                        let oid_val = eval_seq_expr(arg0, row, schema)?;
                         let Some(oid) = value_to_i64(&oid_val) else {
                             return Ok(value_to_sql_expr(&Value::Text("CREATE INDEX".to_string())));
                         };
@@ -866,7 +883,7 @@ pub(crate) fn replace_sequence_functions<'a>(
                                         schema,
                                     )
                                     .await?;
-                                    if let Ok(val) = eval_expr(&resolved, row, schema, &qc) {
+                                    if let Ok(val) = eval_seq_expr(&resolved, row, schema) {
                                         arg_values.push(val);
                                     }
                                     FunctionArg::Unnamed(FunctionArgExpr::Expr(resolved))
@@ -1545,7 +1562,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
     last_sequence_values: &'a mut HashMap<String, i64>,
     search_path: &'a [String],
     expr: &'a Expr,
-    join_ctx: &'a JoinEvalContext<'a>,
+    combined_row: &'a Row,
+    tables: &'a [(&'a str, &'a TableSchema)],
 ) -> Pin<Box<dyn Future<Output = Result<Expr>> + Send + 'a>> {
     Box::pin(async move {
         match expr {
@@ -1562,7 +1580,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             txn,
                             db_id,
                             search_path,
-                            eval_join_expr(join_ctx, arg0)?,
+                            eval_ast_expr_with_join_row(arg0, combined_row, tables)?,
                         )
                         .await?;
                         let val = store.nextval_sequence(txn, db_id, &full_name).await?;
@@ -1576,7 +1594,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             txn,
                             db_id,
                             search_path,
-                            eval_join_expr(join_ctx, arg0)?,
+                            eval_ast_expr_with_join_row(arg0, combined_row, tables)?,
                         )
                         .await?;
                         if store.get_sequence(txn, db_id, &full_name).await?.is_none() {
@@ -1602,15 +1620,15 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             txn,
                             db_id,
                             search_path,
-                            eval_join_expr(join_ctx, arg0)?,
+                            eval_ast_expr_with_join_row(arg0, combined_row, tables)?,
                         )
                         .await?;
-                        let val = eval_join_expr(join_ctx, arg1)?;
+                        let val = eval_ast_expr_with_join_row(arg1, combined_row, tables)?;
                         let value_i64 = match val {
-                            crate::types::Value::Int32(n) => n as i64,
-                            crate::types::Value::Int64(n) => n,
-                            crate::types::Value::Float64(n) => n as i64,
-                            crate::types::Value::Text(s) => s
+                            Value::Int32(n) => n as i64,
+                            Value::Int64(n) => n,
+                            Value::Float64(n) => n as i64,
+                            Value::Text(s) => s
                                 .trim()
                                 .parse::<i64>()
                                 .map_err(|_| anyhow!("setval: value must be integer, got {}", s))?,
@@ -1620,7 +1638,7 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         };
                         let is_called = if func.args.len() >= 3 {
                             let arg2 = extract_arg_expr(&func.args, 2)?;
-                            match eval_join_expr(join_ctx, arg2)? {
+                            match eval_ast_expr_with_join_row(arg2, combined_row, tables)? {
                                 crate::types::Value::Boolean(b) => b,
                                 crate::types::Value::Text(s) => matches!(
                                     s.to_lowercase().as_str(),
@@ -1650,33 +1668,30 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                                 )));
                             }
                         };
-                        let oid_val = eval_join_expr(join_ctx, arg0)?;
+                        let oid_val = eval_ast_expr_with_join_row(arg0, combined_row, tables)?;
                         let Some(oid) = value_to_i64(&oid_val) else {
                             return Ok(value_to_sql_expr(&Value::Text("CREATE INDEX".to_string())));
                         };
 
                         let mut relid: Option<i64> = None;
                         let mut def: Option<&Value> = None;
-                        for (col_key, &offset) in join_ctx.column_offsets {
-                            if relid.is_none()
-                                && (col_key.ends_with(".indexrelid") || col_key == "indexrelid")
-                            {
-                                if let Some(val) = join_ctx.combined_row.values.get(offset) {
-                                    relid = value_to_i64(val);
+                        let mut col_offset = 0;
+                        for (_, tbl_schema) in tables {
+                            for (i, col) in tbl_schema.columns.iter().enumerate() {
+                                if relid.is_none() && col.name.eq_ignore_ascii_case("indexrelid") {
+                                    if let Some(val) = combined_row.values.get(col_offset + i) {
+                                        relid = value_to_i64(val);
+                                    }
                                 }
-                            }
-                            if def.is_none()
-                                && (col_key.ends_with(".indexdef") || col_key == "indexdef")
-                            {
-                                if let Some(val) = join_ctx.combined_row.values.get(offset) {
-                                    if !matches!(val, Value::Null) {
-                                        def = Some(val);
+                                if def.is_none() && col.name.eq_ignore_ascii_case("indexdef") {
+                                    if let Some(val) = combined_row.values.get(col_offset + i) {
+                                        if !matches!(val, Value::Null) {
+                                            def = Some(val);
+                                        }
                                     }
                                 }
                             }
-                            if relid.is_some() && def.is_some() {
-                                break;
-                            }
+                            col_offset += tbl_schema.columns.len();
                         }
                         if relid == Some(oid) {
                             if let Some(def) = def {
@@ -1702,7 +1717,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                                             last_sequence_values,
                                             search_path,
                                             e,
-                                            join_ctx,
+                                            combined_row,
+                                            tables,
                                         )
                                         .await?,
                                     ))
@@ -1721,7 +1737,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                                     last_sequence_values,
                                     search_path,
                                     filter,
-                                    join_ctx,
+                                    combined_row,
+                                    tables,
                                 )
                                 .await?,
                             ))
@@ -1751,7 +1768,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         left,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -1764,7 +1782,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         right,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -1779,7 +1798,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         inner,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -1792,7 +1812,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     last_sequence_values,
                     search_path,
                     inner,
-                    join_ctx,
+                    combined_row,
+                    tables,
                 )
                 .await?,
             ))),
@@ -1808,7 +1829,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     last_sequence_values,
                     search_path,
                     expr,
-                    join_ctx,
+                    combined_row,
+                    tables,
                 )
                 .await?;
                 let mut resolved_list = Vec::with_capacity(list.len());
@@ -1821,7 +1843,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             last_sequence_values,
                             search_path,
                             item,
-                            join_ctx,
+                            combined_row,
+                            tables,
                         )
                         .await?,
                     );
@@ -1846,7 +1869,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         expr,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -1859,7 +1883,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         low,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -1871,7 +1896,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         high,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -1891,7 +1917,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             last_sequence_values,
                             search_path,
                             op,
-                            join_ctx,
+                            combined_row,
+                            tables,
                         )
                         .await?,
                     ))
@@ -1908,7 +1935,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             last_sequence_values,
                             search_path,
                             cond,
-                            join_ctx,
+                            combined_row,
+                            tables,
                         )
                         .await?,
                     );
@@ -1923,7 +1951,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             last_sequence_values,
                             search_path,
                             res,
-                            join_ctx,
+                            combined_row,
+                            tables,
                         )
                         .await?,
                     );
@@ -1937,7 +1966,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             last_sequence_values,
                             search_path,
                             else_expr,
-                            join_ctx,
+                            combined_row,
+                            tables,
                         )
                         .await?,
                     ))
@@ -1964,7 +1994,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         expr,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -1985,7 +2016,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         expr,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -1998,7 +2030,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             last_sequence_values,
                             search_path,
                             e,
-                            join_ctx,
+                            combined_row,
+                            tables,
                         )
                         .await?,
                     )),
@@ -2013,7 +2046,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             last_sequence_values,
                             search_path,
                             e,
-                            join_ctx,
+                            combined_row,
+                            tables,
                         )
                         .await?,
                     )),
@@ -2035,7 +2069,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         expr,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -2049,7 +2084,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             last_sequence_values,
                             search_path,
                             e,
-                            join_ctx,
+                            combined_row,
+                            tables,
                         )
                         .await?,
                     )),
@@ -2066,7 +2102,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         expr,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -2078,7 +2115,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         r#in,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -2093,7 +2131,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         expr,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -2107,7 +2146,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         expr,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -2122,7 +2162,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         expr,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -2141,7 +2182,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         left,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -2154,7 +2196,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         right,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -2170,7 +2213,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             last_sequence_values,
                             search_path,
                             elem,
-                            join_ctx,
+                            combined_row,
+                            tables,
                         )
                         .await?,
                     );
@@ -2188,7 +2232,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                     last_sequence_values,
                     search_path,
                     obj,
-                    join_ctx,
+                    combined_row,
+                    tables,
                 )
                 .await?;
                 let mut resolved_indexes = Vec::with_capacity(indexes.len());
@@ -2201,7 +2246,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                             last_sequence_values,
                             search_path,
                             idx,
-                            join_ctx,
+                            combined_row,
+                            tables,
                         )
                         .await?,
                     );
@@ -2224,7 +2270,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         left,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -2237,7 +2284,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         right,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -2255,7 +2303,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         left,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),
@@ -2268,7 +2317,8 @@ pub(crate) fn replace_sequence_functions_join<'a>(
                         last_sequence_values,
                         search_path,
                         right,
-                        join_ctx,
+                        combined_row,
+                        tables,
                     )
                     .await?,
                 ),

@@ -1,6 +1,6 @@
 use super::helpers::{
-    bool_col, format_indexdef, int_col, int_val, null_val, split_schema_and_name, text_col,
-    text_val,
+    bool_col, format_indexdef, int2vector_col, int_col, int_val, null_val, split_schema_and_name,
+    text_col, text_val,
 };
 use super::{ScanContext, VirtualTable};
 use crate::sql::catalog_oids;
@@ -34,7 +34,7 @@ impl VirtualTable for PgIndex {
                 bool_col("indimmediate"),
                 bool_col("indisclustered"),
                 bool_col("indisvalid"),
-                text_col("indkey"),
+                int2vector_col("indkey"),
                 text_col("indpred"),
                 text_col("indexdef"),
             ],
@@ -74,13 +74,8 @@ impl VirtualTable for PgIndex {
                     for _ in &idx.expressions {
                         col_indices.push(0);
                     }
-                    let indkey = Value::Text(
-                        col_indices
-                            .iter()
-                            .map(|i| i.to_string())
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    );
+                    let indkey =
+                        Value::Array(col_indices.iter().map(|i| Value::Int64(*i)).collect());
 
                     let indexdef = format_indexdef(&table_schema, &table_name, idx);
 
@@ -136,13 +131,7 @@ impl VirtualTable for PgIndex {
                         Value::Boolean(true),
                         Value::Boolean(false),
                         Value::Boolean(true),
-                        Value::Text(
-                            indkey
-                                .iter()
-                                .map(|i| i.to_string())
-                                .collect::<Vec<_>>()
-                                .join(" "),
-                        ),
+                        Value::Array(indkey.iter().map(|i| Value::Int64(*i)).collect()),
                         null_val(),
                         text_val(&indexdef),
                     ]));

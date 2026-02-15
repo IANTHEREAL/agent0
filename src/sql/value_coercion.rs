@@ -417,16 +417,9 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
                 named: true,
             })
         }
-        Value::Vector(vec) => {
-            let vec_str = format!(
-                "[{}]",
-                vec.iter()
-                    .map(|f| f.to_string())
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            Expr::Value(SqlValue::SingleQuotedString(vec_str))
-        }
+        Value::Vector(vec) => Expr::Value(SqlValue::SingleQuotedString(
+            crate::types::format_vector_pg_text(vec),
+        )),
         Value::Json(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
         Value::Jsonb(s) => Expr::Value(SqlValue::SingleQuotedString(s.clone())),
         Value::Date(days) => match crate::types::date::format_date_days(*days) {
@@ -456,10 +449,8 @@ pub fn value_to_sql_expr(v: &Value) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::query_context::QueryContext;
     use crate::types::{ColumnDef, IntervalValue};
     use sqlparser::ast::BinaryOperator;
-    use std::sync::Arc;
 
     fn test_col(name: &str, data_type: DataType) -> ColumnDef {
         ColumnDef {
@@ -538,10 +529,9 @@ mod tests {
             .timestamp_millis();
 
         let right_expr = value_to_sql_expr(&Value::Timestamp(ts1));
-        let qc = QueryContext::new(0, Arc::from("test"), 0, 0, Arc::from("UTC"));
-        let right_val = crate::sql::expr::eval_expr(&right_expr, None, None, &qc).unwrap();
+        let right_val = crate::sql::expr::bridge::eval_const_ast_expr(&right_expr).unwrap();
 
-        let diff = crate::sql::expr::eval_binary_op_public(
+        let diff = crate::sql::expr::operators::eval_binary_op(
             Value::Timestamp(ts2),
             &BinaryOperator::Minus,
             right_val,

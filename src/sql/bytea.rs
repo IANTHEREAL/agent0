@@ -7,6 +7,7 @@ use anyhow::{anyhow, Result};
 /// Semantics match PostgreSQL `get_bit(bytea, int)`:
 /// - `bit_index` is 0-based.
 /// - Bits are addressed in big-endian order within each byte (MSB first).
+#[cfg(test)]
 pub(crate) fn get_bit(bytes: &[u8], bit_index: i64) -> Result<i32> {
     let bit_index: usize = bit_index
         .try_into()
@@ -27,6 +28,7 @@ pub(crate) fn get_bit(bytes: &[u8], bit_index: i64) -> Result<i32> {
 /// - Bits are addressed in big-endian order within each byte (MSB first).
 /// - `new_value` must be 0 or 1.
 /// - The input length is not extended; out-of-range indices raise an error.
+#[cfg(test)]
 pub(crate) fn set_bit(mut bytes: Vec<u8>, bit_index: i64, new_value: i64) -> Result<Vec<u8>> {
     if new_value != 0 && new_value != 1 {
         return Err(anyhow!("set_bit: new value must be 0 or 1"));
@@ -52,16 +54,19 @@ pub(crate) fn set_bit(mut bytes: Vec<u8>, bit_index: i64, new_value: i64) -> Res
 }
 
 /// PostgreSQL `int8send(bigint)`: encode `value` as 8 bytes, big-endian.
+#[cfg(test)]
 pub(crate) fn int8send(value: i64) -> Vec<u8> {
     Vec::from(value.to_be_bytes())
 }
 
 /// PostgreSQL `int4send(int)`: encode `value` as 4 bytes, big-endian.
+#[cfg(test)]
 pub(crate) fn int4send(value: i32) -> Vec<u8> {
     Vec::from(value.to_be_bytes())
 }
 
 /// PostgreSQL `uuid_send(uuid)`: encode UUID as 16 raw bytes.
+#[cfg(test)]
 pub(crate) fn uuid_send(value: [u8; 16]) -> Vec<u8> {
     Vec::from(value)
 }
@@ -195,6 +200,7 @@ pub(crate) fn substring(mut bytes: Vec<u8>, start: i64, count: Option<i64>) -> V
 /// When `count` is not provided, it defaults to `placing.len()`.
 ///
 /// This function mutates `base` in-place where possible to minimize allocations/copies.
+#[cfg(test)]
 pub(crate) fn overlay(
     mut base: Vec<u8>,
     placing: &[u8],

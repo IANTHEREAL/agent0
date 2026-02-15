@@ -107,6 +107,8 @@ fn analyze_expr_with_users(sql: &str) -> Result<TypedExpr, AnalyzerError> {
 }
 
 /// Like analyze_expr_with_users, but with aggregates disallowed (simulates WHERE context).
+// Test infrastructure -- will be wired up when analyzer tests expand.
+#[allow(dead_code)]
 fn analyze_expr_no_aggregates(sql: &str) -> Result<TypedExpr, AnalyzerError> {
     let catalog = test_catalog();
     let mut scope = Scope::new();
@@ -723,12 +725,15 @@ fn analyze_no_cast_when_types_match() {
     }
 }
 
-// ── Error reporting (no silent Text fallback) ───────────────
+// ── Unknown function passthrough ─────────────────────────────
 
 #[test]
-fn analyze_unknown_function_errors() {
-    let err = analyze_expr_with_users("totally_unknown_func(1)").unwrap_err();
-    assert!(matches!(err, AnalyzerError::FunctionNotFound { .. }));
+fn analyze_unknown_function_passthrough() {
+    // Unknown functions are treated as opaque calls returning Text (passthrough for
+    // pg-specific functions handled at runtime by eval_expr).
+    let result = analyze_expr_with_users("totally_unknown_func(1)").unwrap();
+    assert_eq!(result.data_type, DataType::Text);
+    assert!(matches!(result.kind, TypedExprKind::FunctionCall { .. }));
 }
 
 #[test]

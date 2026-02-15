@@ -36,6 +36,10 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("QUOTE_IDENT", quote_ident);
     map.insert("QUOTE_LITERAL", quote_literal);
     map.insert("QUOTE_NULLABLE", quote_nullable);
+    map.insert("SUBSTRING", substring);
+    map.insert("SUBSTR", substring);
+    map.insert("OVERLAY", overlay);
+    map.insert("POSITION", position);
 }
 
 pub fn upper(args: Vec<Value>) -> Result<Value> {
@@ -468,6 +472,131 @@ pub fn quote_nullable(args: Vec<Value>) -> Result<Value> {
         Some(v) => Ok(Value::Text(quoting::quote_literal(&v.to_string()))),
         None => Ok(Value::Text("NULL".to_string())),
     }
+}
+
+/// SUBSTRING(string, start[, length]) or SUBSTRING(string, pattern)
+///
+/// PostgreSQL semantics:
+/// - 2 args with text pattern: regex extraction (first capture group or full match)
+/// - 2 args with integer start: extract from position to end (1-based)
+/// - 3 args: extract from position for length characters
+/// - Also handles bytea input.
+pub fn substring(args: Vec<Value>) -> Result<Value> {
+    let mut iter = args.into_iter();
+    let val = match iter.next() {
+        Some(v) => v,
+        None => return Ok(Value::Null),
+    };
+    let from_val = iter.next();
+    let for_val = iter.next();
+
+    match val {
+        Value::Text(s) => {
+            // Regex mode: SUBSTRING(string FROM pattern) — 2 args, second is text
+            if let (Some(Value::Text(ref pattern)), None) = (&from_val, &for_val) {
+                let re = regex::Regex::new(pattern)
+                    .map_err(|e| anyhow::anyhow!("Invalid regex pattern in SUBSTRING: {}", e))?;
+                if let Some(caps) = re.captures(&s) {
+                    if caps.len() > 1 {
+                        return Ok(caps
+                            .get(1)
+                            .map(|m| Value::Text(m.as_str().to_string()))
+                            .unwrap_or(Value::Null));
+                    }
+                    return Ok(caps
+                        .get(0)
+                        .map(|m| Value::Text(m.as_str().to_string()))
+                        .unwrap_or(Value::Null));
+                }
+                return Ok(Value::Null);
+            }
+
+            // Positional mode
+            let start = match &from_val {
+                Some(Value::Int32(n)) => (n - 1).max(0) as usize,
+                Some(Value::Int64(n)) => (n - 1).max(0) as usize,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(_) => 0,
+                None => 0,
+            };
+            let len = match for_val {
+                Some(Value::Int32(n)) => Some(n.max(0) as usize),
+                Some(Value::Int64(n)) => Some(n.max(0) as usize),
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => None,
+            };
+            let chars: Vec<char> = s.chars().collect();
+            let result: String = if let Some(l) = len {
+                chars.iter().skip(start).take(l).collect()
+            } else {
+                chars.iter().skip(start).collect()
+            };
+            Ok(Value::Text(result))
+        }
+        Value::Bytes(bytes) => {
+            let start = match &from_val {
+                Some(Value::Int32(n)) => i64::from(*n),
+                Some(Value::Int64(n)) => *n,
+                Some(Value::Null) => return Ok(Value::Null),
+                Some(_) => return Ok(Value::Null),
+                None => 0,
+            };
+            let count = match for_val {
+                Some(Value::Int32(n)) => Some(i64::from(n.max(0))),
+                Some(Value::Int64(n)) => Some(n.max(0)),
+                Some(Value::Null) => return Ok(Value::Null),
+                _ => None,
+            };
+            Ok(Value::Bytes(crate::sql::bytea::substring(
+                bytes, start, count,
+            )))
+        }
+        _ => Ok(Value::Null),
+    }
+}
+
+/// OVERLAY(string PLACING replacement FROM start [FOR count])
+///
+/// Normalized by Analyzer to: OVERLAY(string, replacement, start[, count])
+/// Default count = length of replacement string.
+pub fn overlay(args: Vec<Value>) -> Result<Value> {
+    let mut iter = args.into_iter();
+    let s = match iter.next() {
+        Some(Value::Text(s)) => s,
+        _ => return Ok(Value::Null),
+    };
+    let replacement = match iter.next() {
+        Some(Value::Text(s)) => s,
+        Some(Value::Null) => return Ok(Value::Null),
+        _ => return Ok(Value::Null),
+    };
+    let start = match iter.next() {
+        Some(Value::Int32(n)) => (n - 1).max(0) as usize,
+        Some(Value::Int64(n)) => (n - 1).max(0) as usize,
+        Some(Value::Null) => return Ok(Value::Null),
+        _ => return Ok(Value::Null),
+    };
+    let rep_len = replacement.chars().count();
+    let count = match iter.next() {
+        Some(Value::Int32(n)) => n.max(0) as usize,
+        Some(Value::Int64(n)) => n.max(0) as usize,
+        _ => rep_len,
+    };
+    let chars: Vec<char> = s.chars().collect();
+    let mut result = String::new();
+    result.extend(chars.iter().take(start));
+    result.push_str(&replacement);
+    result.extend(chars.iter().skip(start + count));
+    Ok(Value::Text(result))
+}
+
+/// POSITION(substring IN string)
+///
+/// Normalized by Analyzer to: STRPOS(string, substring) — but the Analyzer
+/// actually maps POSITION to STRPOS already, so this is just an alias.
+/// Registered for completeness if anything calls it directly.
+pub fn position(args: Vec<Value>) -> Result<Value> {
+    strpos(args)
 }
 
 #[cfg(test)]

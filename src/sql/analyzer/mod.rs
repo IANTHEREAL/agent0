@@ -21,6 +21,9 @@
 //! - `catalog` — `Catalog` trait and `CatalogSnapshot` implementation
 //! - `expr` — Expression analysis (`analyze_expr`)
 //! - `query` — Query-level analysis (`analyze_query`)
+//!
+//! Note: `eval` (runtime typed expression evaluation) lives in
+//! `src/sql/expr/` — it is runtime code, not static analysis.
 
 pub mod catalog;
 pub mod error;
@@ -33,9 +36,10 @@ pub mod types;
 #[cfg(test)]
 mod tests;
 
-pub use catalog::{Catalog, CatalogSnapshot};
+pub use catalog::{Catalog, CatalogSnapshot, NullCatalog};
 pub use error::AnalyzerError;
-pub use scope::{Scope, ScopeStack};
+pub use scope::Scope;
+pub use scope::ScopeStack;
 pub use types::*;
 
 /// The Analyzer: transforms raw SQL AST into Typed IR.

@@ -1,7 +1,7 @@
 mod check_constraints;
 mod columns;
 mod constraint_column_usage;
-mod helpers;
+pub(crate) mod helpers;
 mod key_column_usage;
 mod pg_am;
 mod pg_attrdef;

@@ -17,6 +17,7 @@ describe('TypeORM Query Generation & SQL Compatibility [pg-tikv]', () => {
       await dataSource.query('DROP TABLE IF EXISTS typeorm_posts CASCADE');
       await dataSource.query('DROP TABLE IF EXISTS typeorm_tags CASCADE');
       await dataSource.query('DROP TABLE IF EXISTS typeorm_users CASCADE');
+      await dataSource.query('DROP TABLE IF EXISTS typeorm_embeddings CASCADE');
       await dataSource.destroy();
     }
   });

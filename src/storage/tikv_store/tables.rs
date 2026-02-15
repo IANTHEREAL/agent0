@@ -175,7 +175,6 @@ impl TikvStore {
             "Created table '{}' with ID {}",
             schema.name, schema.table_id
         );
-        self.invalidate_table_cache(db_id).await;
         Ok(())
     }
 
@@ -244,8 +243,6 @@ impl TikvStore {
                 .await?;
 
             info!("Dropped table '{}'", table_name);
-            self.invalidate_table_cache(db_id).await;
-            self.invalidate_trigger_cache(db_id, table_name).await;
             Ok(true)
         } else {
             Ok(false)
@@ -403,23 +400,6 @@ impl TikvStore {
     }
 
     pub async fn list_tables(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<String>> {
-        {
-            let cache = self.cache.read().await;
-            if let Some(entry) = cache.per_db.get(&db_id) {
-                if let Some((ts, tables)) = &entry.tables {
-                    if ts.elapsed() < SCHEMA_CACHE_TTL {
-                        info!(
-                            "list_tables: cache HIT ({} tables, age {}ms)",
-                            tables.len(),
-                            ts.elapsed().as_millis()
-                        );
-                        return Ok(tables.clone());
-                    }
-                }
-            }
-        }
-        info!("list_tables: cache MISS");
-
         let prefix = encode_schema_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
@@ -432,15 +412,6 @@ impl TikvStore {
                 let name = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
                 tables.push(name);
             }
-        }
-
-        {
-            let mut cache = self.cache.write().await;
-            cache
-                .per_db
-                .entry(db_id)
-                .or_insert_with(PerDatabaseSchemaCache::new)
-                .tables = Some((Instant::now(), tables.clone()));
         }
 
         Ok(tables)
@@ -528,9 +499,6 @@ impl TikvStore {
         txn_put(txn, new_key, serialize_schema(&schema)?).await?;
         txn_delete(txn, old_key).await?;
 
-        self.invalidate_table_cache(db_id).await;
-        self.invalidate_trigger_cache(db_id, old_table).await;
-        self.invalidate_trigger_cache(db_id, new_table).await;
         Ok(())
     }
 

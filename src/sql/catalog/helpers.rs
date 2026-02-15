@@ -61,6 +61,18 @@ pub fn bool_col(name: &str) -> ColumnDef {
     }
 }
 
+pub fn int2vector_col(name: &str) -> ColumnDef {
+    ColumnDef {
+        name: name.to_string(),
+        data_type: DataType::UserDefined("int2vector".to_string()),
+        nullable: true,
+        primary_key: false,
+        unique: false,
+        is_serial: false,
+        default_expr: None,
+    }
+}
+
 pub fn int_array_col(name: &str) -> ColumnDef {
     ColumnDef {
         name: name.to_string(),
@@ -188,7 +200,7 @@ pub fn data_type_to_pg_type(dt: &DataType) -> &'static str {
 pub fn data_type_to_udt_name(dt: &DataType) -> &'static str {
     match dt {
         DataType::Boolean => "bool",
-        DataType::Int32 => "integer",
+        DataType::Int32 => "int4",
         DataType::Int64 => "int8",
         DataType::Float64 => "float8",
         DataType::Text => "text",

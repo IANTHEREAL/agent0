@@ -1,7 +1,7 @@
-//! Physical query planner that builds operator trees from SQL AST
+//! Physical query planner that builds operator trees
 //!
-//! This module bridges the gap between the SQL parser and the physical operators.
-//! It takes a parsed SELECT query and produces an operator tree that can be executed.
+//! This module bridges the gap between the Analyzer's typed IR and the physical operators.
+//! It takes typed expressions and produces an operator tree that can be executed.
 //!
 //! # Supported Query Patterns
 //!
@@ -10,52 +10,43 @@
 //! - Optional WHERE clause (with index selection)
 //! - Optional ORDER BY
 //! - Optional LIMIT/OFFSET
-//!
-//! # Example
-//!
-//! ```ignore
-//! let planner = PhysicalPlanner::new(search_path);
-//! let operator = planner.plan_simple_select(db_id, schema, filter, order_by, limit, offset, 1000)?;
-//! ```
 
 use anyhow::Result;
-use sqlparser::ast::{BinaryOperator, Expr, OrderByExpr};
 use std::collections::HashMap;
+
+use crate::sql::analyzer::types::{
+    BinaryOp as TypedBinaryOp, TypedExpr, TypedExprKind, TypedOrderByExpr,
+};
 
 use super::{
     BoxedOperator, FilterOperator, InListScanOperator, IndexScanOperator, LimitOperator,
     RangeIndexScanOperator, SortOperator, TableScanOperator,
 };
-use crate::sql::expr::eval_expr;
-use crate::sql::planner::{choose_best_access_path_for_filter, ScanType};
-use crate::sql::query_context::QueryContext;
+use crate::sql::planner::{choose_best_access_path_for_typed_filter, ScanType};
 use crate::sql::value_coercion::coerce_value_for_column;
 use crate::types::{TableSchema, Value};
 
-fn extract_column_name(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Identifier(ident) => Some(ident.value.to_lowercase()),
-        Expr::CompoundIdentifier(parts) => parts.last().map(|i| i.value.to_lowercase()),
-        Expr::Nested(inner) => extract_column_name(inner),
-        _ => None,
-    }
-}
-
-fn collect_eq_predicates(expr: &Expr, out: &mut HashMap<String, Value>) -> Option<()> {
-    match expr {
-        Expr::Nested(inner) => collect_eq_predicates(inner, out),
-        Expr::BinaryOp { left, op, right } => match op {
-            BinaryOperator::And => {
+fn collect_eq_predicates(expr: &TypedExpr, out: &mut HashMap<String, Value>) -> Option<()> {
+    match &expr.kind {
+        TypedExprKind::BinaryOp { left, op, right } => match op {
+            TypedBinaryOp::And => {
                 collect_eq_predicates(left, out)?;
                 collect_eq_predicates(right, out)?;
                 Some(())
             }
-            BinaryOperator::Eq => {
-                let qc = QueryContext::from_task_locals();
-                let (col, val) = if let Some(col) = extract_column_name(left) {
-                    (col, eval_expr(right, None, None, &qc).ok()?)
-                } else if let Some(col) = extract_column_name(right) {
-                    (col, eval_expr(left, None, None, &qc).ok()?)
+            TypedBinaryOp::Eq => {
+                let (col, val) = if let TypedExprKind::ColumnRef { column_name, .. } = &left.kind {
+                    if let TypedExprKind::Constant(v) = &right.kind {
+                        (column_name.to_lowercase(), v.clone())
+                    } else {
+                        return None;
+                    }
+                } else if let TypedExprKind::ColumnRef { column_name, .. } = &right.kind {
+                    if let TypedExprKind::Constant(v) = &left.kind {
+                        (column_name.to_lowercase(), v.clone())
+                    } else {
+                        return None;
+                    }
                 } else {
                     return None;
                 };
@@ -77,7 +68,7 @@ fn collect_eq_predicates(expr: &Expr, out: &mut HashMap<String, Value>) -> Optio
 }
 
 fn filter_is_exact_index_lookup(
-    filter: &Expr,
+    filter: &TypedExpr,
     schema: &TableSchema,
     index_id: u64,
     lookup_values: &[Value],
@@ -158,31 +149,18 @@ impl PhysicalPlanner {
     /// 2. Filter operator (if WHERE clause present and not fully handled by index)
     /// 3. Sort operator (if ORDER BY present)
     /// 4. Limit operator (if LIMIT/OFFSET present)
-    ///
-    /// # Arguments
-    ///
-    /// * `schema` - Table schema
-    /// * `filter` - Optional WHERE clause expression
-    /// * `order_by` - ORDER BY expressions (can be empty)
-    /// * `limit` - Optional LIMIT value
-    /// * `offset` - OFFSET value (0 if not specified)
-    /// * `estimated_rows` - Estimated table row count for cost estimation
-    ///
-    /// # Returns
-    ///
-    /// A boxed operator that is the root of the execution tree.
     pub fn plan_simple_select(
         &self,
         db_id: u64,
         schema: TableSchema,
-        filter: Option<&Expr>,
-        order_by: Vec<OrderByExpr>,
+        filter: Option<&TypedExpr>,
+        order_by: Vec<TypedOrderByExpr>,
         limit: Option<usize>,
         offset: usize,
         estimated_rows: usize,
     ) -> Result<BoxedOperator> {
         let access_path =
-            choose_best_access_path_for_filter(db_id, &schema, filter, estimated_rows);
+            choose_best_access_path_for_typed_filter(db_id, &schema, filter, estimated_rows);
 
         let scan_upper_bound = match limit {
             Some(0) => Some(0),
@@ -293,37 +271,48 @@ impl PhysicalPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlparser::ast::{BinaryOperator, Ident};
+    use crate::sql::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExpr, TypedExprKind};
+    use crate::types::DataType;
 
-    fn make_eq_expr(col: &str, val: i32) -> Expr {
-        Expr::BinaryOp {
-            left: Box::new(Expr::Identifier(Ident::new(col))),
-            op: BinaryOperator::Eq,
-            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
-                val.to_string(),
-                false,
-            ))),
+    fn make_typed_eq_expr(col: &str, col_idx: usize, val: i32) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: col_idx,
+                        column_name: col.to_string(),
+                    },
+                    data_type: DataType::Int32,
+                }),
+                op: TypedBinaryOp::Eq,
+                right: Box::new(TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Int32(val)),
+                    data_type: DataType::Int32,
+                }),
+            },
+            data_type: DataType::Boolean,
         }
     }
 
     #[test]
     fn test_collect_eq_predicates_single() {
-        let expr = make_eq_expr("id", 42);
+        let expr = make_typed_eq_expr("id", 0, 42);
         let mut out = HashMap::new();
         assert!(super::collect_eq_predicates(&expr, &mut out).is_some());
         assert_eq!(out.len(), 1);
-        assert!(matches!(
-            out.get("id"),
-            Some(Value::Int32(42)) | Some(Value::Int64(42))
-        ));
+        assert_eq!(out.get("id"), Some(&Value::Int32(42)));
     }
 
     #[test]
     fn test_collect_eq_predicates_and_conjunction() {
-        let expr = Expr::BinaryOp {
-            left: Box::new(make_eq_expr("a", 1)),
-            op: BinaryOperator::And,
-            right: Box::new(make_eq_expr("b", 2)),
+        let expr = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(make_typed_eq_expr("a", 0, 1)),
+                op: TypedBinaryOp::And,
+                right: Box::new(make_typed_eq_expr("b", 1, 2)),
+            },
+            data_type: DataType::Boolean,
         };
         let mut out = HashMap::new();
         assert!(super::collect_eq_predicates(&expr, &mut out).is_some());
@@ -334,13 +323,23 @@ mod tests {
 
     #[test]
     fn test_collect_eq_predicates_non_eq_returns_none() {
-        let expr = Expr::BinaryOp {
-            left: Box::new(Expr::Identifier(Ident::new("id"))),
-            op: BinaryOperator::Gt,
-            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
-                "5".to_string(),
-                false,
-            ))),
+        let expr = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: 0,
+                        column_name: "id".to_string(),
+                    },
+                    data_type: DataType::Int32,
+                }),
+                op: TypedBinaryOp::Gt,
+                right: Box::new(TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Int32(5)),
+                    data_type: DataType::Int32,
+                }),
+            },
+            data_type: DataType::Boolean,
         };
         let mut out = HashMap::new();
         assert!(super::collect_eq_predicates(&expr, &mut out).is_none());
@@ -349,10 +348,13 @@ mod tests {
 
     #[test]
     fn test_collect_eq_predicates_conflicting_values() {
-        let expr = Expr::BinaryOp {
-            left: Box::new(make_eq_expr("id", 1)),
-            op: BinaryOperator::And,
-            right: Box::new(make_eq_expr("id", 2)),
+        let expr = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(make_typed_eq_expr("id", 0, 1)),
+                op: TypedBinaryOp::And,
+                right: Box::new(make_typed_eq_expr("id", 0, 2)),
+            },
+            data_type: DataType::Boolean,
         };
         let mut out = HashMap::new();
         assert!(super::collect_eq_predicates(&expr, &mut out).is_none());

@@ -19,10 +19,10 @@ use std::hash::{Hash, Hasher};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use sqlparser::ast::Expr;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::eval_expr;
+use crate::sql::analyzer::types::TypedExpr;
+use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::types::{ColumnDef, Row, TableSchema, Value};
 
 /// Compute a 64-bit hash for a slice of join-key values.
@@ -399,7 +399,7 @@ pub struct HashJoinOperator {
     probe_key_indices: Vec<usize>,
     build_outer: bool,
     probe_outer: bool,
-    filter: Option<Expr>,
+    filter: Option<TypedExpr>,
     output_schema: TableSchema,
     config: HashJoinConfig,
     state: HashJoinState,
@@ -419,7 +419,7 @@ impl HashJoinOperator {
         left_key_indices: Vec<usize>,
         right_key_indices: Vec<usize>,
         left_is_build: bool,
-        filter: Option<Expr>,
+        filter: Option<TypedExpr>,
         config: HashJoinConfig,
     ) -> Self {
         let mut columns: Vec<ColumnDef> = Vec::new();
@@ -489,94 +489,6 @@ impl HashJoinOperator {
             state: HashJoinState::Created,
         }
     }
-
-    pub fn with_output_schema(mut self, schema: TableSchema) -> Self {
-        self.output_schema = schema;
-        self
-    }
-
-    fn make_output_row(&self, probe_row: &Row, build_row: &Row) -> Row {
-        let left_len = if self.left_is_build {
-            build_row.values.len()
-        } else {
-            probe_row.values.len()
-        };
-        let right_len = if self.left_is_build {
-            probe_row.values.len()
-        } else {
-            build_row.values.len()
-        };
-
-        let mut values = Vec::with_capacity(left_len + right_len);
-        if self.left_is_build {
-            values.extend(build_row.values.iter().cloned());
-            values.extend(probe_row.values.iter().cloned());
-        } else {
-            values.extend(probe_row.values.iter().cloned());
-            values.extend(build_row.values.iter().cloned());
-        }
-        Row::new(values)
-    }
-
-    fn make_probe_only_row(&self, probe_row: &Row) -> Row {
-        let null_count = self.build_child.schema().columns.len();
-        let total_len = self.output_schema.columns.len();
-        let mut values = Vec::with_capacity(total_len);
-        if self.left_is_build {
-            values.extend(std::iter::repeat(Value::Null).take(null_count));
-            values.extend(probe_row.values.iter().cloned());
-        } else {
-            values.extend(probe_row.values.iter().cloned());
-            values.extend(std::iter::repeat(Value::Null).take(null_count));
-        }
-        Row::new(values)
-    }
-
-    fn make_build_only_row(&self, build_row: &Row) -> Row {
-        let null_count = self.probe_child.schema().columns.len();
-        let total_len = self.output_schema.columns.len();
-        let mut values = Vec::with_capacity(total_len);
-        if self.left_is_build {
-            values.extend(build_row.values.iter().cloned());
-            values.extend(std::iter::repeat(Value::Null).take(null_count));
-        } else {
-            values.extend(std::iter::repeat(Value::Null).take(null_count));
-            values.extend(build_row.values.iter().cloned());
-        }
-        Row::new(values)
-    }
-
-    fn check_filter(
-        &self,
-        row: &Row,
-        query_ctx: &crate::sql::query_context::QueryContext,
-    ) -> Result<bool> {
-        match &self.filter {
-            None => Ok(true),
-            Some(expr) => match eval_expr(expr, Some(row), Some(&self.output_schema), query_ctx)? {
-                Value::Boolean(b) => Ok(b),
-                Value::Null => Ok(false),
-                _ => Err(anyhow!("JOIN filter must be boolean")),
-            },
-        }
-    }
-
-    fn row_key_has_null(row: &Row, key_indices: &[usize]) -> bool {
-        row_key_has_null_for_join(row, key_indices)
-    }
-
-    fn hash_row_key(row: &Row, key_indices: &[usize]) -> u64 {
-        hash_row_key_for_join(row, key_indices)
-    }
-
-    fn row_keys_equal(
-        build_row: &Row,
-        build_key_indices: &[usize],
-        probe_row: &Row,
-        probe_key_indices: &[usize],
-    ) -> bool {
-        row_keys_equal_for_join(build_row, build_key_indices, probe_row, probe_key_indices)
-    }
 }
 
 #[allow(dead_code)] // hash join operator framework
@@ -634,13 +546,12 @@ impl PhysicalOperator for HashJoinOperator {
         let build_col_count = self.build_child.schema().columns.len();
         let probe_col_count = self.probe_child.schema().columns.len();
         let filter = self.filter.as_ref();
-        let output_schema = &self.output_schema;
 
         let query_ctx = ctx.query_ctx;
         let check_filter = |row: &Row| -> Result<bool> {
             match filter {
                 None => Ok(true),
-                Some(expr) => match eval_expr(expr, Some(row), Some(output_schema), query_ctx)? {
+                Some(expr) => match eval_typed_expr(expr, row, query_ctx)? {
                     Value::Boolean(b) => Ok(b),
                     Value::Null => Ok(false),
                     _ => Err(anyhow!("JOIN filter must be boolean")),

@@ -1,1 +1,4 @@
-ERROR:  Correlated subquery in JOIN context is not supported (outer refs: r)
+id
+1
+2
+(2 rows)

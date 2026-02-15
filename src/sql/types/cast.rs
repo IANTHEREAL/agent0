@@ -438,7 +438,8 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                     value: trimmed.to_string(),
                 })
             })?;
-            if vec.len() != *dim as usize {
+            // dim == 0 means "any dimension" (bare `vector` without modifier).
+            if *dim > 0 && vec.len() != *dim as usize {
                 return Err(anyhow!(
                     "vector has wrong dimensions: expected {}, got {}",
                     dim,
@@ -448,7 +449,7 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
             Ok(Value::Vector(vec))
         }
         (Value::Vector(vec), DataType::Vector(dim)) => {
-            if vec.len() != *dim as usize {
+            if *dim > 0 && vec.len() != *dim as usize {
                 return Err(anyhow!(
                     "vector has wrong dimensions: expected {}, got {}",
                     dim,
@@ -456,6 +457,13 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
                 ));
             }
             Ok(Value::Vector(vec))
+        }
+
+        // ===== regtype pseudo-type =====
+        // Implements minimal ::regtype::text — strip schema qualification and
+        // map short PostgreSQL aliases to their canonical display names.
+        (Value::Text(s), DataType::UserDefined(ref udt)) if udt.eq_ignore_ascii_case("regtype") => {
+            Ok(Value::Text(normalize_regtype(&s)))
         }
 
         // ===== Catch-all =====
@@ -579,6 +587,30 @@ pub(crate) fn coerce_text_to_numeric(v: Value) -> Result<Value> {
             cast(v, &DataType::Float64, CastContext::Implicit)
         }
         _ => Ok(v),
+    }
+}
+
+/// Normalize a PostgreSQL type name the way `::regtype::text` does:
+/// strip double-quote delimiters, drop schema qualification, and map
+/// internal short aliases to their canonical SQL display names.
+fn normalize_regtype(s: &str) -> String {
+    // 1. Remove double quotes: `"pg_catalog"."int4"` → `pg_catalog.int4`
+    let stripped = s.replace('"', "");
+    // 2. Take last dot-separated component: `pg_catalog.int4` → `int4`
+    let name = stripped.rsplit('.').next().unwrap_or(&stripped);
+    // 3. Map short aliases to display names (matches real PostgreSQL behavior)
+    match name.to_lowercase().as_str() {
+        "int2" | "smallint" => "smallint".to_string(),
+        "int4" | "integer" | "int" | "serial" => "integer".to_string(),
+        "int8" | "bigint" | "bigserial" => "bigint".to_string(),
+        "float4" | "real" => "real".to_string(),
+        "float8" => "double precision".to_string(),
+        "bool" => "boolean".to_string(),
+        "varchar" => "character varying".to_string(),
+        "timestamp" => "timestamp without time zone".to_string(),
+        "timestamptz" => "timestamp with time zone".to_string(),
+        "time" | "timetz" => "time without time zone".to_string(),
+        other => other.to_string(),
     }
 }
 

@@ -9,8 +9,8 @@
 
 use rust_decimal::Decimal;
 use sqlparser::ast::{
-    self as ast, Expr, Function, FunctionArg, FunctionArgExpr, TrimWhereField, UnaryOperator,
-    WindowType,
+    self as ast, BinaryOperator, Expr, Function, FunctionArg, FunctionArgExpr, TrimWhereField,
+    UnaryOperator, WindowType,
 };
 use std::str::FromStr;
 
@@ -240,6 +240,21 @@ impl<'a> Analyzer<'a> {
                 ))
             }
 
+            // ── Array subquery: ARRAY(SELECT ...) ─────────
+            Expr::ArraySubquery(query) => {
+                let analyzed = self.analyze_query(query)?;
+                if analyzed.output_schema.len() != 1 {
+                    return Err(AnalyzerError::ScalarSubqueryMultipleColumns {
+                        got: analyzed.output_schema.len(),
+                    });
+                }
+                let elem_type = analyzed.output_schema[0].1.clone();
+                Ok(TypedExpr::new(
+                    TypedExprKind::ArraySubquery(Box::new(analyzed)),
+                    DataType::Array(Box::new(elem_type)),
+                ))
+            }
+
             // ── Array ───────────────────────────────────────
             Expr::Array(arr) => {
                 let elems: Vec<TypedExpr> = arr
@@ -304,6 +319,48 @@ impl<'a> Analyzer<'a> {
                 operator,
                 right,
             } => {
+                // sqlparser gives JSON operators lower precedence than comparison
+                // operators, so `metadata->>'level' = 'senior'` is parsed as:
+                //   JsonAccess(metadata, LongArrow, BinaryOp('level', Eq, 'senior'))
+                // We must unwrap the nested operator: analyze the JSON access with
+                // only the key, then wrap the result in the outer comparison.
+                if let Expr::BinaryOp {
+                    left: bin_left,
+                    op: bin_op,
+                    right: bin_right,
+                } = right.as_ref()
+                {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: operator.clone(),
+                        right: bin_left.clone(),
+                    };
+                    let outer = Expr::BinaryOp {
+                        left: Box::new(json_access),
+                        op: bin_op.clone(),
+                        right: bin_right.clone(),
+                    };
+                    return self.analyze_expr(&outer);
+                }
+                if let Expr::InList {
+                    expr: in_expr,
+                    list,
+                    negated,
+                } = right.as_ref()
+                {
+                    let json_access = Expr::JsonAccess {
+                        left: left.clone(),
+                        operator: operator.clone(),
+                        right: in_expr.clone(),
+                    };
+                    let outer = Expr::InList {
+                        expr: Box::new(json_access),
+                        list: list.clone(),
+                        negated: *negated,
+                    };
+                    return self.analyze_expr(&outer);
+                }
+
                 let l = self.analyze_expr(left)?;
                 let r = self.analyze_expr(right)?;
                 match operator {
@@ -479,7 +536,7 @@ impl<'a> Analyzer<'a> {
                 };
 
                 let order_by = if let Some(ob) = &agg.order_by {
-                    self.analyze_order_by_exprs(ob)?
+                    self.analyze_order_by_exprs(ob, &[])?
                 } else {
                     vec![]
                 };
@@ -494,6 +551,155 @@ impl<'a> Analyzer<'a> {
                     },
                     return_type,
                 ))
+            }
+
+            // ── ANY / ALL ─────────────────────────────────────
+            Expr::AnyOp {
+                left,
+                compare_op,
+                right,
+            } => {
+                let left_expr = self.analyze_expr(left)?;
+                let right_expr = self.analyze_expr(right)?;
+
+                // Optimize: `x = ANY(ARRAY[a, b, c])` → `x IN (a, b, c)`
+                if matches!(compare_op, BinaryOperator::Eq) {
+                    if let TypedExprKind::ArrayLiteral(elems) = right_expr.kind {
+                        let mut in_refs: Vec<&TypedExpr> = vec![&left_expr];
+                        let elem_refs: Vec<&TypedExpr> = elems.iter().collect();
+                        in_refs.extend(elem_refs);
+                        let common = self.unify_expr_types(&in_refs, "ANY")?;
+                        let left_coerced = self.coerce_if_needed(left_expr, &common);
+                        let list = elems
+                            .into_iter()
+                            .map(|e| self.coerce_if_needed(e, &common))
+                            .collect();
+                        return Ok(TypedExpr::new(
+                            TypedExprKind::InList {
+                                expr: Box::new(left_coerced),
+                                list,
+                                negated: false,
+                            },
+                            DataType::Boolean,
+                        ));
+                    }
+                }
+
+                // Optimize: `x <> ANY(ARRAY[a, b, c])` → `x NOT IN (a, b, c)`
+                if matches!(compare_op, BinaryOperator::NotEq) {
+                    if let TypedExprKind::ArrayLiteral(elems) = right_expr.kind {
+                        let mut in_refs: Vec<&TypedExpr> = vec![&left_expr];
+                        let elem_refs: Vec<&TypedExpr> = elems.iter().collect();
+                        in_refs.extend(elem_refs);
+                        let common = self.unify_expr_types(&in_refs, "ANY")?;
+                        let left_coerced = self.coerce_if_needed(left_expr, &common);
+                        let list = elems
+                            .into_iter()
+                            .map(|e| self.coerce_if_needed(e, &common))
+                            .collect();
+                        return Ok(TypedExpr::new(
+                            TypedExprKind::InList {
+                                expr: Box::new(left_coerced),
+                                list,
+                                negated: true,
+                            },
+                            DataType::Boolean,
+                        ));
+                    }
+                }
+
+                // General case: `x = ANY(array_col)` where array_col is a column reference
+                // or other non-literal array expression.
+                // Convert to: ARRAY_POSITION(array_col, x) IS NOT NULL
+                if matches!(compare_op, BinaryOperator::Eq) {
+                    if matches!(right_expr.data_type, DataType::Array(_))
+                        || matches!(&right_expr.data_type, DataType::UserDefined(s) if s == "int2vector")
+                    {
+                        let array_pos =
+                            self.make_function_call("ARRAY_POSITION", vec![right_expr, left_expr])?;
+                        return Ok(TypedExpr::new(
+                            TypedExprKind::IsTest {
+                                expr: Box::new(array_pos),
+                                test: IsTestKind::Null,
+                                negated: true, // IS NOT NULL
+                            },
+                            DataType::Boolean,
+                        ));
+                    }
+                }
+
+                Err(AnalyzerError::Unsupported(format!(
+                    "ANY with non-array operand or non-equality operator: {:?}",
+                    compare_op,
+                )))
+            }
+
+            // ALL: `x = ALL(ARRAY[a, b, c])` → x = a AND x = b AND x = c
+            // ALL with column reference: not yet supported.
+            Expr::AllOp {
+                left,
+                compare_op,
+                right,
+            } => {
+                let left_expr = self.analyze_expr(left)?;
+                let right_expr = self.analyze_expr(right)?;
+
+                // `x = ALL(ARRAY[a, b, c])` → x = a AND x = b AND x = c
+                if let TypedExprKind::ArrayLiteral(elems) = right_expr.kind {
+                    if elems.is_empty() {
+                        // ALL of empty array is TRUE by SQL standard
+                        return Ok(TypedExpr::new(
+                            TypedExprKind::Constant(Value::Boolean(true)),
+                            DataType::Boolean,
+                        ));
+                    }
+                    let op = match compare_op {
+                        BinaryOperator::Eq => BinaryOp::Eq,
+                        BinaryOperator::NotEq => BinaryOp::NotEq,
+                        BinaryOperator::Lt => BinaryOp::Lt,
+                        BinaryOperator::LtEq => BinaryOp::LtEq,
+                        BinaryOperator::Gt => BinaryOp::Gt,
+                        BinaryOperator::GtEq => BinaryOp::GtEq,
+                        other => {
+                            return Err(AnalyzerError::Unsupported(format!(
+                                "ALL with operator: {:?}",
+                                other,
+                            )));
+                        }
+                    };
+                    // Build: (left op elem[0]) AND (left op elem[1]) AND ...
+                    let comparisons: Vec<TypedExpr> = elems
+                        .into_iter()
+                        .map(|elem| {
+                            TypedExpr::new(
+                                TypedExprKind::BinaryOp {
+                                    left: Box::new(left_expr.clone()),
+                                    op: op.clone(),
+                                    right: Box::new(elem),
+                                },
+                                DataType::Boolean,
+                            )
+                        })
+                        .collect();
+                    let mut result = comparisons.into_iter();
+                    let first = result.next().unwrap();
+                    let combined = result.fold(first, |acc, next| {
+                        TypedExpr::new(
+                            TypedExprKind::BinaryOp {
+                                left: Box::new(acc),
+                                op: BinaryOp::And,
+                                right: Box::new(next),
+                            },
+                            DataType::Boolean,
+                        )
+                    });
+                    return Ok(combined);
+                }
+
+                Err(AnalyzerError::Unsupported(format!(
+                    "ALL with non-array operand: {:?}",
+                    compare_op,
+                )))
             }
 
             // ── Catch-all for unsupported expressions ───────
@@ -948,7 +1154,7 @@ impl<'a> Analyzer<'a> {
         let order_by = if func.order_by.is_empty() {
             vec![]
         } else {
-            self.analyze_order_by_exprs(&func.order_by)?
+            self.analyze_order_by_exprs(&func.order_by, &[])?
         };
 
         // Resolve function from registry
@@ -1088,11 +1294,24 @@ impl<'a> Analyzer<'a> {
             ));
         }
 
-        // Unknown function — error rather than silently returning Text
-        Err(AnalyzerError::FunctionNotFound {
+        // Unknown function — treat as opaque call returning Text.
+        // The runtime function registry (eval_expr) handles many pg-specific functions
+        // that aren't registered in the type registry. Rather than hard-failing at
+        // analysis time, we pass through and let runtime evaluation handle dispatch.
+        let resolved = ResolvedFunction {
             name: func_name,
-            arg_types,
-        })
+            kind: FunctionKind::Builtin,
+            return_type: DataType::Text,
+        };
+        Ok(TypedExpr::new(
+            TypedExprKind::FunctionCall {
+                func: resolved,
+                args: analyzed_args,
+                order_by,
+                filter,
+            },
+            DataType::Text,
+        ))
     }
 
     /// Extract argument expressions from a function call, flattening named args.
@@ -1239,7 +1458,7 @@ impl<'a> Analyzer<'a> {
                     .map(|e| self.analyze_expr(e))
                     .collect::<Result<_, _>>()?;
 
-                let order_by = self.analyze_order_by_exprs(&spec.order_by)?;
+                let order_by = self.analyze_order_by_exprs(&spec.order_by, &[])?;
 
                 let window_frame = match &spec.window_frame {
                     Some(frame) => Some(self.convert_window_frame(frame)?),
@@ -1348,11 +1567,36 @@ impl<'a> Analyzer<'a> {
     pub(super) fn analyze_order_by_exprs(
         &mut self,
         order_by: &[ast::OrderByExpr],
+        projection: &[AnalyzedProjection],
     ) -> Result<Vec<TypedOrderByExpr>, AnalyzerError> {
         order_by
             .iter()
             .map(|ob| {
-                let expr = self.analyze_expr(&ob.expr)?;
+                // PostgreSQL: ORDER BY can reference output aliases. Check first.
+                let expr = if let Expr::Identifier(ident) = &ob.expr {
+                    let name_lower = ident.value.to_lowercase();
+                    if let Some(proj) = projection
+                        .iter()
+                        .find(|p| p.output_name.to_lowercase() == name_lower)
+                    {
+                        proj.expr.clone()
+                    } else {
+                        self.analyze_expr(&ob.expr)?
+                    }
+                } else if let Expr::Value(ast::Value::Number(n, _)) = &ob.expr {
+                    // ORDER BY <position> (1-based)
+                    if let Ok(pos) = n.parse::<usize>() {
+                        if pos >= 1 && pos <= projection.len() {
+                            projection[pos - 1].expr.clone()
+                        } else {
+                            self.analyze_expr(&ob.expr)?
+                        }
+                    } else {
+                        self.analyze_expr(&ob.expr)?
+                    }
+                } else {
+                    self.analyze_expr(&ob.expr)?
+                };
                 Ok(TypedOrderByExpr {
                     expr,
                     asc: ob.asc.unwrap_or(true),

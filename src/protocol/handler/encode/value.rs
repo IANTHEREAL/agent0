@@ -1,6 +1,7 @@
 use crate::types::{DataType, Value};
-use pgwire::api::results::DataRowEncoder;
-use pgwire::error::PgWireResult;
+use pgwire::api::results::{DataRowEncoder, FieldFormat};
+use pgwire::api::Type;
+use pgwire::error::{PgWireError, PgWireResult};
 
 pub(in crate::protocol::handler) fn encode_value(
     encoder: &mut DataRowEncoder,
@@ -103,6 +104,28 @@ pub(in crate::protocol::handler) fn encode_value(
             encoder.encode_field(&uuid.to_string())
         }
         Value::Array(elems) => {
+            // int2vector: encode as space-separated text "1 2 3"
+            if matches!(col_type, Some(DataType::UserDefined(s)) if s == "int2vector") {
+                let mut parts = Vec::with_capacity(elems.len());
+                for v in elems {
+                    match v {
+                        Value::Int64(i) => parts.push(i.to_string()),
+                        Value::Int32(i) => parts.push(i.to_string()),
+                        other => {
+                            return Err(PgWireError::ApiError(
+                                format!("int2vector element must be integer, got {:?}", other)
+                                    .into(),
+                            ))
+                        }
+                    }
+                }
+                let text = parts.join(" ");
+                return encoder.encode_field_with_type_and_format(
+                    &text,
+                    &Type::TEXT,
+                    FieldFormat::Text,
+                );
+            }
             fn value_to_option_string(v: &Value) -> Option<String> {
                 match v {
                     Value::Null => None,
@@ -191,24 +214,7 @@ pub(in crate::protocol::handler) fn encode_value(
                 Err(_) => encoder.encode_field(s),
             }
         }
-        Value::Vector(vec) => {
-            // Encode as text: [1,2,3] (compact format for integers, decimals for floats)
-            let vec_str = format!(
-                "[{}]",
-                vec.iter()
-                    .map(|f| {
-                        // Format as integer if whole number, otherwise as float
-                        if f.fract() == 0.0 && f.is_finite() {
-                            format!("{}", *f as i64)
-                        } else {
-                            f.to_string()
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
-            encoder.encode_field(&vec_str)
-        }
+        Value::Vector(vec) => encoder.encode_field(&crate::types::format_vector_pg_text(vec)),
         Value::Time(micros) => {
             let total_secs = micros / 1_000_000;
             let hours = total_secs / 3600;

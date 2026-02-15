@@ -67,20 +67,11 @@ pub enum AnalyzerError {
         parse_error: String,
     },
 
-    /// Cannot cast between types.
-    InvalidCast { from: DataType, to: DataType },
-
     /// Aggregate function used in wrong context (e.g. WHERE clause).
     AggregateNotAllowed { function: String, context: String },
 
     /// Window function used in wrong context.
     WindowNotAllowed { function: String, context: String },
-
-    /// Wildcard (*) in wrong context.
-    WildcardNotAllowed { context: String },
-
-    /// Duplicate column alias in SELECT list.
-    DuplicateAlias(String),
 
     /// Set operation (UNION/INTERSECT/EXCEPT) column count mismatch.
     SetOperationColumnMismatch { left: usize, right: usize },
@@ -178,7 +169,6 @@ impl fmt::Display for AnalyzerError {
                 "invalid input syntax for type {}: \"{}\": {}",
                 target_type, value, parse_error,
             ),
-            Self::InvalidCast { from, to } => write!(f, "cannot cast type {} to {}", from, to),
             Self::AggregateNotAllowed { function, context } => {
                 write!(
                     f,
@@ -192,10 +182,6 @@ impl fmt::Display for AnalyzerError {
                     "window function {} is not allowed in {}",
                     function, context,
                 )
-            }
-            Self::WildcardNotAllowed { context } => write!(f, "* is not allowed in {}", context),
-            Self::DuplicateAlias(alias) => {
-                write!(f, "column \"{}\" specified more than once", alias)
             }
             Self::SetOperationColumnMismatch { left, right } => write!(
                 f,

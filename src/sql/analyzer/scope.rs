@@ -23,7 +23,11 @@ pub struct ScopeColumn {
     /// Resolved data type.
     pub data_type: DataType,
     /// Whether the column is nullable.
+    #[allow(dead_code)]
     pub nullable: bool,
+    /// Whether this column is hidden from SELECT * expansion.
+    /// Used for USING join columns: the right-side duplicate is hidden.
+    pub hidden: bool,
 }
 
 /// Result of resolving a column reference.
@@ -78,6 +82,21 @@ impl Scope {
         }
     }
 
+    /// Build a scope from a `TableSchema`, using the table name (or alias) as qualifier.
+    ///
+    /// Convenience for DML contexts where the target table is already known as a
+    /// `TableSchema`. Columns are added in schema order with their catalog types.
+    pub fn from_table_schema(alias: &str, schema: &crate::types::TableSchema) -> Self {
+        let mut scope = Self::new();
+        let cols: Vec<(String, DataType, bool)> = schema
+            .columns
+            .iter()
+            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+            .collect();
+        scope.add_table(alias, &cols);
+        scope
+    }
+
     /// Add columns from a table to this scope.
     ///
     /// `alias` is the table alias (or real name if no alias). Columns are
@@ -93,6 +112,7 @@ impl Scope {
                 column_index: abs_index,
                 data_type: data_type.clone(),
                 nullable: *nullable,
+                hidden: false,
             };
 
             // Add to unqualified index (for ambiguity detection)
@@ -124,6 +144,7 @@ impl Scope {
             column_index: abs_index,
             data_type,
             nullable,
+            hidden: false,
         };
 
         self.column_index
@@ -194,14 +215,24 @@ impl Scope {
         self.columns.len()
     }
 
-    /// Get a column by its absolute index.
-    pub fn get_column(&self, index: usize) -> Option<&ScopeColumn> {
-        self.columns.get(index)
-    }
-
     /// Return all columns in this scope.
     pub fn columns(&self) -> &[ScopeColumn] {
         &self.columns
+    }
+
+    /// Mark a USING join right-side column as hidden.
+    ///
+    /// This hides the column from SELECT * expansion and removes it from
+    /// the unqualified index (so `id` resolves unambiguously to the left side).
+    pub fn hide_using_column(&mut self, index: usize) {
+        if let Some(col) = self.columns.get_mut(index) {
+            col.hidden = true;
+            // Remove from unqualified index to avoid ambiguity.
+            let lower = col.column_name.to_lowercase();
+            if let Some(positions) = self.column_index.get_mut(&lower) {
+                positions.retain(|&pos| pos != index);
+            }
+        }
     }
 }
 
@@ -308,11 +339,6 @@ impl ScopeStack {
             }
         }
         None
-    }
-
-    /// Current nesting depth (number of scopes on the stack).
-    pub fn depth(&self) -> usize {
-        self.scopes.len()
     }
 }
 

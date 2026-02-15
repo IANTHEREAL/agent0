@@ -3,21 +3,26 @@
 //! This module contains functions for handling DISTINCT operations,
 //! row deduplication, and OFFSET/LIMIT/FETCH clause processing.
 
+#[cfg(test)]
 use std::collections::HashSet;
 
+#[cfg(test)]
 use anyhow::Result;
 #[cfg(test)]
 use sqlparser::ast::Expr;
 use sqlparser::ast::Query;
 
-use super::expr::eval_expr;
+use super::expr::bridge::eval_const_ast_expr;
+#[cfg(test)]
 use super::value_key::serialize_values_for_key;
+#[cfg(test)]
 use crate::sql::query_context::QueryContext;
 #[cfg(test)]
 use crate::types::TableSchema;
 use crate::types::{Row, Value};
 
 /// Deduplicate rows based on their serialized values
+#[cfg(test)]
 pub fn dedup_rows(rows: Vec<Row>) -> Result<Vec<Row>> {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut result = Vec::new();
@@ -28,41 +33,6 @@ pub fn dedup_rows(rows: Vec<Row>) -> Result<Vec<Row>> {
         }
     }
     Ok(result)
-}
-
-#[cfg(test)]
-pub fn distinct_on_rows_join_with_indices(
-    rows: Vec<Row>,
-    on_exprs: &[Expr],
-    column_offsets: &std::collections::HashMap<String, usize>,
-    combined_schema: &TableSchema,
-    merged_column_offsets: Option<&std::collections::HashMap<String, Vec<usize>>>,
-) -> Result<(Vec<Row>, Vec<usize>)> {
-    use super::expr::{eval_join_expr, JoinEvalContext};
-    let qc = QueryContext::from_task_locals();
-    let mut seen: HashSet<Vec<u8>> = HashSet::new();
-    let mut result = Vec::new();
-    let mut indices = Vec::new();
-
-    for (idx, row) in rows.into_iter().enumerate() {
-        let ctx = JoinEvalContext::new(
-            column_offsets,
-            merged_column_offsets,
-            &row,
-            combined_schema,
-            &qc,
-        );
-        let key_values: Vec<Value> = on_exprs
-            .iter()
-            .map(|expr| eval_join_expr(&ctx, expr))
-            .collect::<Result<Vec<_>>>()?;
-        let key = serialize_values_for_key(&key_values)?;
-        if seen.insert(key) {
-            indices.push(idx);
-            result.push(row);
-        }
-    }
-    Ok((result, indices))
 }
 
 pub fn apply_offset_limit_fetch(mut rows: Vec<Row>, query: &Query) -> Vec<Row> {
@@ -78,15 +48,14 @@ pub fn apply_offset_limit_fetch(mut rows: Vec<Row>, query: &Query) -> Vec<Row> {
             _ => None,
         }
     };
-    let qc = QueryContext::from_task_locals();
     if let Some(offset) = &query.offset {
-        if let Ok(v) = eval_expr(&offset.value, None, None, &qc) {
+        if let Ok(v) = eval_const_ast_expr(&offset.value) {
             let n = value_to_usize(v).unwrap_or(0);
             rows = rows.into_iter().skip(n).collect();
         }
     }
     if let Some(limit) = &query.limit {
-        if let Ok(v) = eval_expr(limit, None, None, &qc) {
+        if let Ok(v) = eval_const_ast_expr(limit) {
             let n = value_to_usize(v).unwrap_or(usize::MAX);
             rows = rows.into_iter().take(n).collect();
         }
@@ -94,7 +63,7 @@ pub fn apply_offset_limit_fetch(mut rows: Vec<Row>, query: &Query) -> Vec<Row> {
 
     if let Some(fetch) = &query.fetch {
         if let Some(quantity) = &fetch.quantity {
-            if let Ok(v) = eval_expr(quantity, None, None, &qc) {
+            if let Ok(v) = eval_const_ast_expr(quantity) {
                 let n = value_to_usize(v).unwrap_or(1);
                 rows = rows.into_iter().take(n).collect();
             }
@@ -143,70 +112,6 @@ mod tests {
         ];
         let result = dedup_rows(rows).unwrap();
         assert_eq!(result.len(), 4);
-    }
-
-    #[test]
-    fn test_distinct_on_rows_join_with_indices() {
-        let schema = TableSchema::new(
-            "t".to_string(),
-            1,
-            vec![ColumnDef {
-                name: "a".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-            }],
-            vec![],
-        );
-        let mut offsets = HashMap::new();
-        offsets.insert("a".to_string(), 0);
-
-        let rows = vec![
-            Row::new(vec![Value::Int32(1)]),
-            Row::new(vec![Value::Int32(1)]),
-            Row::new(vec![Value::Int32(2)]),
-        ];
-        let on_exprs = vec![sqlparser::ast::Expr::Identifier(
-            sqlparser::ast::Ident::new("a"),
-        )];
-        let (result, indices) =
-            distinct_on_rows_join_with_indices(rows, &on_exprs, &offsets, &schema, None).unwrap();
-        assert_eq!(indices, vec![0, 2]);
-        assert_eq!(result.len(), 2);
-    }
-
-    #[test]
-    fn test_distinct_on_rows_join_with_indices_propagates_eval_error() {
-        let schema = TableSchema::new(
-            "t".to_string(),
-            1,
-            vec![ColumnDef {
-                name: "a".to_string(),
-                data_type: DataType::Int32,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-                is_serial: false,
-                default_expr: None,
-            }],
-            vec![],
-        );
-        let mut offsets = HashMap::new();
-        offsets.insert("a".to_string(), 0);
-
-        let rows = vec![
-            Row::new(vec![Value::Int32(1)]),
-            Row::new(vec![Value::Int32(2)]),
-        ];
-        let on_exprs = vec![sqlparser::ast::Expr::Identifier(
-            sqlparser::ast::Ident::new("missing_col"),
-        )];
-
-        let result = distinct_on_rows_join_with_indices(rows, &on_exprs, &offsets, &schema, None);
-        assert!(result.is_err());
     }
 
     #[test]

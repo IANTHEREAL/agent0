@@ -1,6 +1,7 @@
 //! SQL executor core
 
 mod alter;
+pub(crate) mod catalog_prefetch;
 mod copy;
 mod dispatch;
 mod guc;
@@ -43,8 +44,7 @@ use super::super::dml;
 use super::super::explain;
 use super::super::names;
 use super::super::names::normalize_ident;
-use super::super::projection::{fill_row_defaults, get_expr_name, infer_expr_type};
-use super::super::query;
+use super::super::projection::fill_row_defaults;
 use super::super::rbac;
 use super::super::sequences;
 use super::super::statement_time;
@@ -61,11 +61,10 @@ use crate::sql::error::SqlError;
 use crate::storage::{with_kv_read_stats, KvReadStatsSnapshot, TikvStore};
 use crate::types::{DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
-use rust_decimal::prelude::ToPrimitive;
 use sqlparser::ast::{
     AlterIndexOperation, Expr, FunctionArg, FunctionArgExpr, Query, ReferentialAction, SelectItem,
-    SetExpr, SetOperator, SetQuantifier, Statement, TableFactor, TransactionAccessMode,
-    TransactionIsolationLevel, TransactionMode, Visit, Visitor,
+    SetExpr, Statement, TableFactor, TransactionAccessMode, TransactionIsolationLevel,
+    TransactionMode, Visit, Visitor,
 };
 
 use std::collections::{HashMap, HashSet};

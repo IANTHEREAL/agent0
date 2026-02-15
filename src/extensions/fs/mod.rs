@@ -88,6 +88,89 @@ pub(crate) fn table_function_schema(func_name: &str) -> Option<TableSchema> {
     }
 }
 
+/// Infer the output schema for an `fs9(...)` table function call without decoding all rows.
+///
+/// This is used by the Analyzer prefetch phase so it can resolve column names/types
+/// for dynamic schemas (directory listing vs file vs csv headers) while keeping
+/// analysis itself synchronous.
+pub(crate) async fn infer_table_function_schema(
+    _tenant: &str,
+    mode: &Fs9Mode,
+) -> Result<TableSchema> {
+    if !context::allow_local_fs() {
+        return Err(anyhow!("permission denied for extension \"fs9\""));
+    }
+
+    use backend::FsBackend;
+
+    let backend = backend::local_backend();
+
+    match mode {
+        Fs9Mode::Directory { .. } => Ok(decoders::decode_directory(Vec::new()).schema),
+        Fs9Mode::File {
+            path,
+            format,
+            delimiter,
+            header,
+        } => {
+            let info = backend.stat(path).await?;
+            if info.is_dir {
+                return Ok(decoders::decode_directory(Vec::new()).schema);
+            }
+
+            let data = backend.read_file(path, MAX_BYTES_PER_FILE).await?;
+            let fmt = decoders::detect_format(path, format.as_deref());
+            match fmt {
+                "csv" | "tsv" => {
+                    let delim = if fmt == "tsv" && delimiter.is_none() {
+                        Some('\t')
+                    } else {
+                        *delimiter
+                    };
+                    let decoded = decoders::decode_csv(&data, path, delim, *header, 0)
+                        .map_err(|e| anyhow!("fs9: CSV decode error: {e}"))?;
+                    Ok(decoded.schema)
+                }
+                "jsonl" | "ndjson" => Ok(decoders::decode_jsonl(&data, path, 0).schema),
+                _ => Ok(decoders::decode_raw_text(&data, path, 0).schema),
+            }
+        }
+        Fs9Mode::Glob {
+            pattern,
+            format,
+            delimiter,
+            header,
+            exclude,
+        } => {
+            let matching_files =
+                glob::expand_glob(backend, pattern, MAX_FILES_PER_GLOB, exclude.as_deref()).await?;
+
+            if matching_files.is_empty() {
+                return Ok(decoders::decode_raw_text(&[], pattern, 0).schema);
+            }
+
+            let first = &matching_files[0];
+            let data = backend.read_file(first, MAX_BYTES_PER_FILE).await?;
+            let fmt = decoders::detect_format(first, format.as_deref());
+
+            match fmt {
+                "csv" | "tsv" => {
+                    let delim = if fmt == "tsv" && delimiter.is_none() {
+                        Some('\t')
+                    } else {
+                        *delimiter
+                    };
+                    let decoded = decoders::decode_csv(&data, first, delim, *header, 0)
+                        .map_err(|e| anyhow!("fs9: CSV decode error in {}: {e}", first))?;
+                    Ok(decoded.schema)
+                }
+                "jsonl" | "ndjson" => Ok(decoders::decode_jsonl(&data, first, 0).schema),
+                _ => Ok(decoders::decode_raw_text(&data, first, 0).schema),
+            }
+        }
+    }
+}
+
 pub(crate) async fn execute_table_function(
     _tenant: &str,
     mode: Fs9Mode,

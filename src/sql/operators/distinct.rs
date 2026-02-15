@@ -2,10 +2,10 @@ use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use sqlparser::ast::Expr;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::eval_expr;
+use crate::sql::analyzer::types::TypedExpr;
+use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::value_key::serialize_values_for_key;
 use crate::types::{Row, TableSchema};
 
@@ -85,13 +85,13 @@ impl PhysicalOperator for DistinctOperator {
 #[derive(Debug)]
 pub struct DistinctOnOperator {
     child: BoxedOperator,
-    on_exprs: Vec<Expr>,
+    on_exprs: Vec<TypedExpr>,
     seen: HashSet<Vec<u8>>,
     opened: bool,
 }
 
 impl DistinctOnOperator {
-    pub fn new(child: BoxedOperator, on_exprs: Vec<Expr>) -> Self {
+    pub fn new(child: BoxedOperator, on_exprs: Vec<TypedExpr>) -> Self {
         Self {
             child,
             on_exprs,
@@ -103,12 +103,11 @@ impl DistinctOnOperator {
     fn compute_key(
         &self,
         row: &Row,
-        schema: &TableSchema,
         query_ctx: &crate::sql::query_context::QueryContext,
     ) -> Result<Vec<u8>> {
         let mut key_values = Vec::new();
         for expr in &self.on_exprs {
-            key_values.push(eval_expr(expr, Some(row), Some(schema), query_ctx)?);
+            key_values.push(eval_typed_expr(expr, row, query_ctx)?);
         }
         serialize_values_for_key(&key_values)
     }
@@ -132,9 +131,8 @@ impl PhysicalOperator for DistinctOnOperator {
             return Err(anyhow!("Operator not opened"));
         }
 
-        let schema = self.child.schema().clone();
         while let Some(row) = self.child.next(ctx).await? {
-            let key = self.compute_key(&row, &schema, ctx.query_ctx)?;
+            let key = self.compute_key(&row, ctx.query_ctx)?;
             if self.seen.insert(key) {
                 return Ok(Some(row));
             }
@@ -163,7 +161,7 @@ impl PhysicalOperator for DistinctOnOperator {
     }
 
     fn explain_info(&self) -> Option<String> {
-        let exprs: Vec<String> = self.on_exprs.iter().map(|e| format!("{}", e)).collect();
+        let exprs: Vec<String> = self.on_exprs.iter().map(|e| format!("{:?}", e)).collect();
         Some(format!("on=[{}]", exprs.join(", ")))
     }
 }
@@ -171,6 +169,7 @@ impl PhysicalOperator for DistinctOnOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analyzer::types::TypedExprKind;
     use crate::sql::operators::scan::TableScanOperator;
     use crate::types::{ColumnDef, DataType, Value};
 
@@ -221,11 +220,16 @@ mod tests {
 
     #[test]
     fn test_distinct_on_operator_creation() {
-        use sqlparser::ast::Ident;
-
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
-        let on_exprs = vec![Expr::Identifier(Ident::new("name"))];
+        let on_exprs = vec![TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: 1,
+                column_name: "name".to_string(),
+            },
+            data_type: DataType::Text,
+        }];
         let op = DistinctOnOperator::new(child, on_exprs);
 
         assert_eq!(op.name(), "DistinctOn");

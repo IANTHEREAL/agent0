@@ -1,0 +1,751 @@
+//! Execution-time materialization for typed expressions.
+//!
+//! The typed evaluator (`typed_eval`) is pure and cannot execute subqueries or
+//! consult catalogs/transactions. The analyzed executor resolves those nodes
+//! before evaluation via this module.
+
+use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
+use crate::sql::executor::core::Executor;
+use crate::sql::expr::typed_eval::eval_typed_expr;
+use crate::sql::query_context::QueryContext;
+use crate::types::{DataType, Row, TableSchema, Value};
+
+use anyhow::Result;
+use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use tikv_client::Transaction;
+
+/// Return true if `expr` contains a catalog-dependent function that must be
+/// resolved at executor level (not via the pure typed evaluator).
+pub(super) fn has_catalog_dependent_function(expr: &TypedExpr) -> bool {
+    match &expr.kind {
+        TypedExprKind::FunctionCall {
+            func,
+            args,
+            order_by,
+            filter,
+        } => {
+            let name = func.name.as_str();
+            if name.eq_ignore_ascii_case("PG_GET_INDEXDEF")
+                || name.eq_ignore_ascii_case("PG_GET_CONSTRAINTDEF")
+                || name.eq_ignore_ascii_case("FORMAT_TYPE")
+            {
+                return true;
+            }
+            args.iter().any(has_catalog_dependent_function)
+                || filter
+                    .as_ref()
+                    .is_some_and(|f| has_catalog_dependent_function(f))
+                || order_by
+                    .iter()
+                    .any(|o| has_catalog_dependent_function(&o.expr))
+        }
+        TypedExprKind::AggregateCall {
+            func,
+            args,
+            order_by,
+            filter,
+            ..
+        } => {
+            let name = func.name.as_str();
+            if name.eq_ignore_ascii_case("PG_GET_INDEXDEF")
+                || name.eq_ignore_ascii_case("PG_GET_CONSTRAINTDEF")
+                || name.eq_ignore_ascii_case("FORMAT_TYPE")
+            {
+                return true;
+            }
+            args.iter().any(has_catalog_dependent_function)
+                || filter
+                    .as_ref()
+                    .is_some_and(|f| has_catalog_dependent_function(f))
+                || order_by
+                    .iter()
+                    .any(|o| has_catalog_dependent_function(&o.expr))
+        }
+        TypedExprKind::WindowCall {
+            func,
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            let name = func.name.as_str();
+            if name.eq_ignore_ascii_case("PG_GET_INDEXDEF")
+                || name.eq_ignore_ascii_case("PG_GET_CONSTRAINTDEF")
+                || name.eq_ignore_ascii_case("FORMAT_TYPE")
+            {
+                return true;
+            }
+            args.iter().any(has_catalog_dependent_function)
+                || partition_by.iter().any(has_catalog_dependent_function)
+                || order_by
+                    .iter()
+                    .any(|o| has_catalog_dependent_function(&o.expr))
+        }
+        TypedExprKind::BinaryOp { left, right, .. } => {
+            has_catalog_dependent_function(left) || has_catalog_dependent_function(right)
+        }
+        TypedExprKind::UnaryOp { operand, .. }
+        | TypedExprKind::Cast { expr: operand, .. }
+        | TypedExprKind::IsTest { expr: operand, .. } => has_catalog_dependent_function(operand),
+        TypedExprKind::Between {
+            expr, low, high, ..
+        } => {
+            has_catalog_dependent_function(expr)
+                || has_catalog_dependent_function(low)
+                || has_catalog_dependent_function(high)
+        }
+        TypedExprKind::InList { expr, list, .. } => {
+            has_catalog_dependent_function(expr) || list.iter().any(has_catalog_dependent_function)
+        }
+        TypedExprKind::Like { expr, pattern, .. }
+        | TypedExprKind::SimilarTo { expr, pattern, .. } => {
+            has_catalog_dependent_function(expr) || has_catalog_dependent_function(pattern)
+        }
+        TypedExprKind::Case {
+            operand,
+            when_clauses,
+            else_result,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|e| has_catalog_dependent_function(e))
+                || when_clauses.iter().any(|(w, t)| {
+                    has_catalog_dependent_function(w) || has_catalog_dependent_function(t)
+                })
+                || else_result
+                    .as_ref()
+                    .is_some_and(|e| has_catalog_dependent_function(e))
+        }
+        TypedExprKind::Coalesce(args)
+        | TypedExprKind::ArrayLiteral(args)
+        | TypedExprKind::Row(args) => args.iter().any(has_catalog_dependent_function),
+        TypedExprKind::NullIf(a, b) => {
+            has_catalog_dependent_function(a) || has_catalog_dependent_function(b)
+        }
+        TypedExprKind::JsonAccess { expr, path, .. } => {
+            has_catalog_dependent_function(expr) || has_catalog_dependent_function(path)
+        }
+        TypedExprKind::ArrayIndex { array, index } => {
+            has_catalog_dependent_function(array) || has_catalog_dependent_function(index)
+        }
+        _ => false,
+    }
+}
+
+impl Executor {
+    /// Materialize a typed expression for evaluation on a specific row.
+    ///
+    /// This resolves:
+    /// - correlated references via substitution (scope_depth → constants)
+    /// - uncorrelated subqueries via execution (IN/EXISTS/Scalar/Array/ANYALL)
+    /// - catalog-dependent functions (pg_get_indexdef, format_type, ...)
+    pub(super) async fn materialize_expr_for_row(
+        &self,
+        expr: &TypedExpr,
+        row: &Row,
+        schema: Option<&TableSchema>,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+        qctx: &QueryContext,
+    ) -> Result<TypedExpr> {
+        // 1) Substitute correlated outer refs (scope_depth > 0) to constants.
+        let substituted = super::subquery::substitute_outer_refs_in_expr(expr, row);
+
+        // 2) Resolve any now-uncorrelated subqueries.
+        let subqueries_materialized = self
+            .pre_materialize_async_exprs(
+                &substituted,
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                ctes,
+            )
+            .await?;
+
+        // 3) Resolve catalog-dependent functions.
+        self.materialize_catalog_functions(&subqueries_materialized, row, schema, txn, db_id, qctx)
+            .await
+    }
+
+    fn materialize_catalog_functions<'a>(
+        &'a self,
+        expr: &'a TypedExpr,
+        row: &'a Row,
+        schema: Option<&'a TableSchema>,
+        txn: &'a mut Transaction,
+        db_id: u64,
+        qctx: &'a QueryContext,
+    ) -> Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>> {
+        Box::pin(async move {
+            match &expr.kind {
+                TypedExprKind::FunctionCall {
+                    func,
+                    args,
+                    order_by,
+                    filter,
+                } => {
+                    // Recurse into args first (so we can eval constant args safely).
+                    let mut new_args = Vec::with_capacity(args.len());
+                    for a in args {
+                        new_args.push(
+                            self.materialize_catalog_functions(a, row, schema, txn, db_id, qctx)
+                                .await?,
+                        );
+                    }
+
+                    let mut new_order_by = Vec::with_capacity(order_by.len());
+                    for ob in order_by {
+                        new_order_by.push(crate::sql::analyzer::types::TypedOrderByExpr {
+                            expr: self
+                                .materialize_catalog_functions(
+                                    &ob.expr, row, schema, txn, db_id, qctx,
+                                )
+                                .await?,
+                            asc: ob.asc,
+                            nulls_first: ob.nulls_first,
+                        });
+                    }
+                    let new_filter = match filter {
+                        Some(f) => Some(Box::new(
+                            self.materialize_catalog_functions(f, row, schema, txn, db_id, qctx)
+                                .await?,
+                        )),
+                        None => None,
+                    };
+
+                    if func.name.eq_ignore_ascii_case("PG_GET_INDEXDEF") {
+                        let val = self
+                            .eval_pg_get_indexdef(&new_args, row, schema, txn, db_id, qctx)
+                            .await?;
+                        return Ok(TypedExpr::new(TypedExprKind::Constant(val), DataType::Text));
+                    }
+
+                    if func.name.eq_ignore_ascii_case("PG_GET_CONSTRAINTDEF") {
+                        // Row-level compatibility: return constraintdef if present.
+                        if let Some((_, idx)) = find_text_column(schema, "constraintdef") {
+                            if let Some(v) = row.values.get(idx) {
+                                if !matches!(v, Value::Null) {
+                                    return Ok(TypedExpr::new(
+                                        TypedExprKind::Constant(v.clone()),
+                                        DataType::Text,
+                                    ));
+                                }
+                            }
+                        }
+                        return Ok(TypedExpr::new(
+                            TypedExprKind::Constant(Value::Text(String::new())),
+                            DataType::Text,
+                        ));
+                    }
+
+                    if func.name.eq_ignore_ascii_case("FORMAT_TYPE") {
+                        let val = self
+                            .eval_format_type(&new_args, row, schema, txn, db_id, qctx)
+                            .await?;
+                        return Ok(TypedExpr::new(TypedExprKind::Constant(val), DataType::Text));
+                    }
+
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::FunctionCall {
+                            func: func.clone(),
+                            args: new_args,
+                            order_by: new_order_by,
+                            filter: new_filter,
+                        },
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+
+                // Subqueries should already be resolved by `pre_materialize_async_exprs`.
+                TypedExprKind::ScalarSubquery(_)
+                | TypedExprKind::ArraySubquery(_)
+                | TypedExprKind::Exists { .. }
+                | TypedExprKind::InSubquery { .. }
+                | TypedExprKind::AnyAll { .. } => Ok(expr.clone()),
+
+                // Recurse through composite nodes.
+                TypedExprKind::BinaryOp { left, right, op } => Ok(TypedExpr {
+                    kind: TypedExprKind::BinaryOp {
+                        left: Box::new(
+                            self.materialize_catalog_functions(left, row, schema, txn, db_id, qctx)
+                                .await?,
+                        ),
+                        op: op.clone(),
+                        right: Box::new(
+                            self.materialize_catalog_functions(
+                                right, row, schema, txn, db_id, qctx,
+                            )
+                            .await?,
+                        ),
+                    },
+                    data_type: expr.data_type.clone(),
+                }),
+                TypedExprKind::UnaryOp { op, operand } => Ok(TypedExpr {
+                    kind: TypedExprKind::UnaryOp {
+                        op: *op,
+                        operand: Box::new(
+                            self.materialize_catalog_functions(
+                                operand, row, schema, txn, db_id, qctx,
+                            )
+                            .await?,
+                        ),
+                    },
+                    data_type: expr.data_type.clone(),
+                }),
+                TypedExprKind::Cast {
+                    expr: inner,
+                    target_type,
+                    cast_context,
+                } => Ok(TypedExpr {
+                    kind: TypedExprKind::Cast {
+                        expr: Box::new(
+                            self.materialize_catalog_functions(
+                                inner, row, schema, txn, db_id, qctx,
+                            )
+                            .await?,
+                        ),
+                        target_type: target_type.clone(),
+                        cast_context: cast_context.clone(),
+                    },
+                    data_type: expr.data_type.clone(),
+                }),
+                TypedExprKind::IsTest {
+                    expr: inner,
+                    test,
+                    negated,
+                } => Ok(TypedExpr {
+                    kind: TypedExprKind::IsTest {
+                        expr: Box::new(
+                            self.materialize_catalog_functions(
+                                inner, row, schema, txn, db_id, qctx,
+                            )
+                            .await?,
+                        ),
+                        test: *test,
+                        negated: *negated,
+                    },
+                    data_type: expr.data_type.clone(),
+                }),
+                TypedExprKind::Between {
+                    expr: inner,
+                    low,
+                    high,
+                    negated,
+                } => Ok(TypedExpr {
+                    kind: TypedExprKind::Between {
+                        expr: Box::new(
+                            self.materialize_catalog_functions(
+                                inner, row, schema, txn, db_id, qctx,
+                            )
+                            .await?,
+                        ),
+                        low: Box::new(
+                            self.materialize_catalog_functions(low, row, schema, txn, db_id, qctx)
+                                .await?,
+                        ),
+                        high: Box::new(
+                            self.materialize_catalog_functions(high, row, schema, txn, db_id, qctx)
+                                .await?,
+                        ),
+                        negated: *negated,
+                    },
+                    data_type: expr.data_type.clone(),
+                }),
+                TypedExprKind::InList {
+                    expr: inner,
+                    list,
+                    negated,
+                } => {
+                    let inner = self
+                        .materialize_catalog_functions(inner, row, schema, txn, db_id, qctx)
+                        .await?;
+                    let mut new_list = Vec::with_capacity(list.len());
+                    for item in list {
+                        new_list.push(
+                            self.materialize_catalog_functions(item, row, schema, txn, db_id, qctx)
+                                .await?,
+                        );
+                    }
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::InList {
+                            expr: Box::new(inner),
+                            list: new_list,
+                            negated: *negated,
+                        },
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+                TypedExprKind::Like {
+                    expr: inner,
+                    pattern,
+                    escape,
+                    negated,
+                    case_insensitive,
+                } => Ok(TypedExpr {
+                    kind: TypedExprKind::Like {
+                        expr: Box::new(
+                            self.materialize_catalog_functions(
+                                inner, row, schema, txn, db_id, qctx,
+                            )
+                            .await?,
+                        ),
+                        pattern: Box::new(
+                            self.materialize_catalog_functions(
+                                pattern, row, schema, txn, db_id, qctx,
+                            )
+                            .await?,
+                        ),
+                        escape: match escape {
+                            Some(e) => Some(Box::new(
+                                self.materialize_catalog_functions(
+                                    e, row, schema, txn, db_id, qctx,
+                                )
+                                .await?,
+                            )),
+                            None => None,
+                        },
+                        negated: *negated,
+                        case_insensitive: *case_insensitive,
+                    },
+                    data_type: expr.data_type.clone(),
+                }),
+                TypedExprKind::SimilarTo {
+                    expr: inner,
+                    pattern,
+                    escape,
+                    negated,
+                } => Ok(TypedExpr {
+                    kind: TypedExprKind::SimilarTo {
+                        expr: Box::new(
+                            self.materialize_catalog_functions(
+                                inner, row, schema, txn, db_id, qctx,
+                            )
+                            .await?,
+                        ),
+                        pattern: Box::new(
+                            self.materialize_catalog_functions(
+                                pattern, row, schema, txn, db_id, qctx,
+                            )
+                            .await?,
+                        ),
+                        escape: match escape {
+                            Some(e) => Some(Box::new(
+                                self.materialize_catalog_functions(
+                                    e, row, schema, txn, db_id, qctx,
+                                )
+                                .await?,
+                            )),
+                            None => None,
+                        },
+                        negated: *negated,
+                    },
+                    data_type: expr.data_type.clone(),
+                }),
+                TypedExprKind::Case {
+                    operand,
+                    when_clauses,
+                    else_result,
+                } => {
+                    let operand = match operand {
+                        Some(e) => Some(Box::new(
+                            self.materialize_catalog_functions(e, row, schema, txn, db_id, qctx)
+                                .await?,
+                        )),
+                        None => None,
+                    };
+                    let mut new_when = Vec::with_capacity(when_clauses.len());
+                    for (w, t) in when_clauses {
+                        new_when.push((
+                            self.materialize_catalog_functions(w, row, schema, txn, db_id, qctx)
+                                .await?,
+                            self.materialize_catalog_functions(t, row, schema, txn, db_id, qctx)
+                                .await?,
+                        ));
+                    }
+                    let else_result = match else_result {
+                        Some(e) => Some(Box::new(
+                            self.materialize_catalog_functions(e, row, schema, txn, db_id, qctx)
+                                .await?,
+                        )),
+                        None => None,
+                    };
+                    Ok(TypedExpr {
+                        kind: TypedExprKind::Case {
+                            operand,
+                            when_clauses: new_when,
+                            else_result,
+                        },
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+                TypedExprKind::Coalesce(args)
+                | TypedExprKind::ArrayLiteral(args)
+                | TypedExprKind::Row(args) => {
+                    let mut new_args = Vec::with_capacity(args.len());
+                    for a in args {
+                        new_args.push(
+                            self.materialize_catalog_functions(a, row, schema, txn, db_id, qctx)
+                                .await?,
+                        );
+                    }
+                    Ok(TypedExpr {
+                        kind: match &expr.kind {
+                            TypedExprKind::Coalesce(_) => TypedExprKind::Coalesce(new_args),
+                            TypedExprKind::ArrayLiteral(_) => TypedExprKind::ArrayLiteral(new_args),
+                            TypedExprKind::Row(_) => TypedExprKind::Row(new_args),
+                            _ => unreachable!(),
+                        },
+                        data_type: expr.data_type.clone(),
+                    })
+                }
+                TypedExprKind::NullIf(a, b) => Ok(TypedExpr {
+                    kind: TypedExprKind::NullIf(
+                        Box::new(
+                            self.materialize_catalog_functions(a, row, schema, txn, db_id, qctx)
+                                .await?,
+                        ),
+                        Box::new(
+                            self.materialize_catalog_functions(b, row, schema, txn, db_id, qctx)
+                                .await?,
+                        ),
+                    ),
+                    data_type: expr.data_type.clone(),
+                }),
+                TypedExprKind::JsonAccess {
+                    expr: inner,
+                    path,
+                    operator,
+                } => Ok(TypedExpr {
+                    kind: TypedExprKind::JsonAccess {
+                        expr: Box::new(
+                            self.materialize_catalog_functions(
+                                inner, row, schema, txn, db_id, qctx,
+                            )
+                            .await?,
+                        ),
+                        path: Box::new(
+                            self.materialize_catalog_functions(path, row, schema, txn, db_id, qctx)
+                                .await?,
+                        ),
+                        operator: *operator,
+                    },
+                    data_type: expr.data_type.clone(),
+                }),
+                TypedExprKind::ArrayIndex { array, index } => Ok(TypedExpr {
+                    kind: TypedExprKind::ArrayIndex {
+                        array: Box::new(
+                            self.materialize_catalog_functions(
+                                array, row, schema, txn, db_id, qctx,
+                            )
+                            .await?,
+                        ),
+                        index: Box::new(
+                            self.materialize_catalog_functions(
+                                index, row, schema, txn, db_id, qctx,
+                            )
+                            .await?,
+                        ),
+                    },
+                    data_type: expr.data_type.clone(),
+                }),
+
+                // Leaf nodes.
+                _ => Ok(expr.clone()),
+            }
+        })
+    }
+
+    async fn eval_pg_get_indexdef(
+        &self,
+        args: &[TypedExpr],
+        row: &Row,
+        schema: Option<&TableSchema>,
+        txn: &mut Transaction,
+        db_id: u64,
+        qctx: &QueryContext,
+    ) -> Result<Value> {
+        let Some(arg0) = args.first() else {
+            return Ok(Value::Text("CREATE INDEX".to_string()));
+        };
+
+        let oid_val = eval_typed_expr(arg0, row, qctx)?;
+        let Some(oid) = value_to_i64(&oid_val) else {
+            return Ok(Value::Text("CREATE INDEX".to_string()));
+        };
+
+        // Prefer row-level indexdef if present and matches the OID.
+        if let Some(schema) = schema {
+            if let (Some(relid_idx), Some(def_idx)) = (
+                schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case("indexrelid")),
+                schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case("indexdef")),
+            ) {
+                if let Some(row_relid) = row.values.get(relid_idx) {
+                    if value_to_i64(row_relid) == Some(oid) {
+                        if let Some(row_def) = row.values.get(def_idx) {
+                            if !matches!(row_def, Value::Null) {
+                                return Ok(row_def.clone());
+                            }
+                        }
+                    }
+                }
+            } else if let Some(def_idx) = schema
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case("indexdef"))
+            {
+                if let Some(row_def) = row.values.get(def_idx) {
+                    if !matches!(row_def, Value::Null) {
+                        return Ok(row_def.clone());
+                    }
+                }
+            }
+        }
+
+        let store = self.store();
+        let indexdef = lookup_indexdef_by_oid(&store, txn, db_id, oid).await?;
+        Ok(Value::Text(
+            indexdef.unwrap_or_else(|| "CREATE INDEX".to_string()),
+        ))
+    }
+
+    async fn eval_format_type(
+        &self,
+        args: &[TypedExpr],
+        row: &Row,
+        schema: Option<&TableSchema>,
+        txn: &mut Transaction,
+        db_id: u64,
+        qctx: &QueryContext,
+    ) -> Result<Value> {
+        let Some(arg0) = args.first() else {
+            return Ok(Value::Null);
+        };
+
+        let oid_val = eval_typed_expr(arg0, row, qctx)?;
+        let Some(oid) = value_to_i64(&oid_val) else {
+            return Ok(Value::Text("text".to_string()));
+        };
+
+        // Row-level compatibility: if typname column is visible, return it.
+        if let Some(schema) = schema {
+            if let Some(idx) = schema
+                .columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case("typname"))
+            {
+                if let Some(v) = row.values.get(idx) {
+                    if let Value::Text(s) = v {
+                        return Ok(Value::Text(s.clone()));
+                    }
+                }
+            }
+        }
+
+        let store = self.store();
+        let typname = lookup_typname_by_oid(&store, txn, db_id, oid).await?;
+        Ok(Value::Text(typname.unwrap_or_else(|| "text".to_string())))
+    }
+}
+
+fn find_text_column<'a>(
+    schema: Option<&'a TableSchema>,
+    primary: &str,
+) -> Option<(&'a TableSchema, usize)> {
+    let schema = schema?;
+    if let Some(idx) = schema
+        .columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(primary))
+    {
+        return Some((schema, idx));
+    }
+    None
+}
+
+fn value_to_i64(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int32(n) => Some(*n as i64),
+        Value::Int64(n) => Some(*n),
+        Value::Float64(n) => Some(*n as i64),
+        Value::Text(s) => s.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+async fn lookup_indexdef_by_oid(
+    store: &Arc<crate::storage::TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    oid: i64,
+) -> Result<Option<String>> {
+    use crate::sql::catalog::helpers::{format_indexdef, split_schema_and_name};
+    use crate::sql::catalog_oids;
+
+    let user_tables = store.list_tables(txn, db_id).await?;
+
+    for full_table_name in user_tables {
+        let (table_schema, table_name) = split_schema_and_name(&full_table_name);
+        let Some(schema) = store.get_schema(txn, db_id, &full_table_name).await? else {
+            continue;
+        };
+
+        for idx in &schema.indexes {
+            let index_oid = catalog_oids::pg_class_index_oid(schema.table_id, idx.id)?;
+            if index_oid == oid {
+                return Ok(Some(format_indexdef(&table_schema, &table_name, idx)));
+            }
+        }
+
+        if !schema.pk_indices.is_empty() {
+            let pk_oid = catalog_oids::pg_class_pk_index_oid(schema.table_id)?;
+            if pk_oid == oid {
+                let pk_cols: Vec<String> = schema
+                    .pk_indices
+                    .iter()
+                    .filter_map(|idx| schema.columns.get(*idx).map(|c| c.name.clone()))
+                    .collect();
+                let indexdef = format!(
+                    "CREATE UNIQUE INDEX {}_pkey ON {}.{} USING btree ({})",
+                    table_name,
+                    table_schema,
+                    table_name,
+                    pk_cols.join(", ")
+                );
+                return Ok(Some(indexdef));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+async fn lookup_typname_by_oid(
+    store: &Arc<crate::storage::TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    oid: i64,
+) -> Result<Option<String>> {
+    if let Some(t) = crate::sql::pg_types::typname_for_oid(oid) {
+        return Ok(Some(t.to_string()));
+    }
+
+    let mut types = store.list_types(txn, db_id).await?;
+    types.sort_by_key(|t| t.oid);
+    Ok(types
+        .into_iter()
+        .find(|t| t.oid as i64 == oid)
+        .map(|t| t.name))
+}

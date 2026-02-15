@@ -1,3 +1,7 @@
+//! LEGACY: Used only by DML (INSERT/UPDATE/DELETE) WHERE-clause validation.
+//! SELECT queries use the Analyzer path which validates during analysis, not at runtime.
+//! Will be removed when DML is migrated to the Analyzer path.
+
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue};
 

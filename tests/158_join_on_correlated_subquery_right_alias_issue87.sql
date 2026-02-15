@@ -1,6 +1,6 @@
 -- Issue #87 regression:
 -- JOIN ... ON subquery references the right-side join alias.
--- Ensure correlation detection includes the right alias and fails closed with a stable error.
+-- Correlated scalar subquery in JOIN ON referencing the right table must produce correct results.
 
 DROP TABLE IF EXISTS issue87_l;
 DROP TABLE IF EXISTS issue87_r;

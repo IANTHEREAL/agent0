@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 pub mod array;
+pub mod datetime;
 pub mod encoding;
 pub mod fts;
 pub mod json;
@@ -23,6 +24,7 @@ fn init_registry() -> HashMap<&'static str, SqlFn> {
     let mut map: HashMap<&'static str, SqlFn> = HashMap::with_capacity(200);
 
     array::register(&mut map);
+    datetime::register(&mut map);
     encoding::register(&mut map);
     fts::register(&mut map);
     json::register(&mut map);

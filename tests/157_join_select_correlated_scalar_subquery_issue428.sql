@@ -1,6 +1,6 @@
 -- Issue #428 regression:
--- JOIN-context correlated scalar subqueries are explicitly unsupported.
--- Ensure we fail closed with a stable Unsupported error (no eager evaluation).
+-- Correlated scalar subquery in SELECT list with JOIN must produce correct results.
+-- The subquery correlates to the outer row (a.id) while a separate JOIN is present.
 
 DROP TABLE IF EXISTS issue428_a;
 DROP TABLE IF EXISTS issue428_b;

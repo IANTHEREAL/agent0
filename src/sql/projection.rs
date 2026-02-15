@@ -7,10 +7,10 @@ use sqlparser::parser::Parser;
 
 use crate::types::{DataType, Row, TableSchema, Value};
 
-use super::expr::eval_expr;
-use crate::sql::query_context::QueryContext;
+use super::expr::bridge::eval_const_ast_expr;
 
 /// Get the name of a SELECT item (column name or alias)
+#[cfg(test)]
 pub fn get_select_item_name(item: &sqlparser::ast::SelectItem) -> String {
     match item {
         sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
@@ -21,6 +21,7 @@ pub fn get_select_item_name(item: &sqlparser::ast::SelectItem) -> String {
 }
 
 /// Get the name of an expression for column naming
+#[cfg(test)]
 pub fn get_expr_name(expr: &Expr) -> String {
     match expr {
         Expr::Identifier(id) => id.value.clone(),
@@ -94,8 +95,7 @@ pub fn eval_default_expr(expr_str: &str) -> Result<Value> {
             if let Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) =
                 s.projection.into_iter().next()
             {
-                let qc = QueryContext::from_task_locals();
-                return eval_expr(&e, None, None, &qc);
+                return eval_const_ast_expr(&e);
             }
         }
     }

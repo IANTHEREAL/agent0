@@ -10,8 +10,7 @@ use std::collections::HashMap;
 use tikv_client::Transaction;
 
 use super::core::Executor;
-use crate::sql::expr::eval_expr;
-use crate::sql::query_context::QueryContext;
+use crate::sql::expr::bridge::eval_const_ast_expr;
 
 impl Executor {
     pub(crate) fn try_execute_user_table_function<'a>(
@@ -103,7 +102,6 @@ impl Executor {
 }
 
 fn eval_function_args(args: &[FunctionArg]) -> Result<Vec<Value>> {
-    let qc = QueryContext::from_task_locals();
     let mut values = Vec::with_capacity(args.len());
     for arg in args {
         let expr = match arg {
@@ -122,7 +120,7 @@ fn eval_function_args(args: &[FunctionArg]) -> Result<Vec<Value>> {
                 )
             }
         };
-        let val = eval_expr(expr, None, None, &qc)?;
+        let val = eval_const_ast_expr(expr)?;
         values.push(val);
     }
     Ok(values)

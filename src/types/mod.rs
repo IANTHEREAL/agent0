@@ -164,6 +164,7 @@ impl IntervalValue {
         Self { months: 0, millis }
     }
 
+    #[cfg(test)]
     pub fn from_months(months: i32) -> Self {
         Self { months, millis: 0 }
     }
@@ -234,6 +235,25 @@ impl fmt::Display for IntervalValue {
         }
         write!(f, "{}", parts.join(" "))
     }
+}
+
+/// pgvector text format: `[1,2,3]`. Integer-valued floats omit `.0`.
+pub fn format_vector_pg_text(vec: &[f64]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(2 + vec.len() * 4);
+    out.push('[');
+    for (i, v) in vec.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        if v.fract() == 0.0 && v.is_finite() {
+            write!(out, "{:.0}", v).unwrap();
+        } else {
+            write!(out, "{}", v).unwrap();
+        }
+    }
+    out.push(']');
+    out
 }
 
 /// A single value
@@ -373,16 +393,7 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
-            Value::Vector(vec) => {
-                write!(f, "[")?;
-                for (i, v) in vec.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ",")?;
-                    }
-                    write!(f, "{}", v)?;
-                }
-                write!(f, "]")
-            }
+            Value::Vector(vec) => write!(f, "{}", format_vector_pg_text(vec)),
             Value::Json(s) => write!(f, "{}", s),
             Value::Jsonb(s) => write!(f, "{}", s),
             Value::Date(days) => match date::format_date_days(*days) {
@@ -746,6 +757,21 @@ mod tests {
         let v = Value::Uuid(*uuid.as_bytes());
         assert_eq!(v.as_uuid().unwrap(), uuid);
         assert!(Value::Text("x".into()).as_uuid().is_err());
+    }
+
+    #[test]
+    fn format_vector_pg_text_integers() {
+        assert_eq!(format_vector_pg_text(&[1.0, 2.0, 3.0]), "[1,2,3]");
+    }
+
+    #[test]
+    fn format_vector_pg_text_mixed() {
+        assert_eq!(format_vector_pg_text(&[1.0, 2.5, 3.0]), "[1,2.5,3]");
+    }
+
+    #[test]
+    fn format_vector_pg_text_empty() {
+        assert_eq!(format_vector_pg_text(&[]), "[]");
     }
 
     #[test]

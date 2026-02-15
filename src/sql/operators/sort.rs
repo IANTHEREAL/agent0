@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use sqlparser::ast::OrderByExpr;
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::sql::analyzer::types::TypedOrderByExpr;
+use crate::sql::expr::compare_order_by_values;
 use crate::sql::expr::operators::sort_by_fallible;
-use crate::sql::expr::{compare_order_by_values, eval_expr};
-use crate::sql::sequences;
+use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::types::{Row, TableSchema, Value};
 
 fn estimated_value_size(value: &Value) -> usize {
@@ -66,14 +66,14 @@ fn enforce_sort_memory_limit(
 #[derive(Debug)]
 pub struct SortOperator {
     child: BoxedOperator,
-    order_by: Vec<OrderByExpr>,
+    order_by: Vec<TypedOrderByExpr>,
     sorted_rows: Vec<Row>,
     position: usize,
     opened: bool,
 }
 
 impl SortOperator {
-    pub fn new(child: BoxedOperator, order_by: Vec<OrderByExpr>) -> Self {
+    pub fn new(child: BoxedOperator, order_by: Vec<TypedOrderByExpr>) -> Self {
         Self {
             child,
             order_by,
@@ -83,29 +83,10 @@ impl SortOperator {
         }
     }
 
-    async fn compute_sort_keys(
-        &self,
-        row: &Row,
-        ctx: &mut ExecutionContext<'_>,
-    ) -> Result<Vec<Value>> {
-        let schema = self.child.schema();
+    fn compute_sort_keys(&self, row: &Row, ctx: &mut ExecutionContext<'_>) -> Result<Vec<Value>> {
         let mut keys = Vec::with_capacity(self.order_by.len());
         for order_expr in &self.order_by {
-            let value = if sequences::expr_needs_async_eval(&order_expr.expr) {
-                sequences::eval_expr_with_sequences(
-                    &ctx.store,
-                    ctx.txn,
-                    ctx.db_id,
-                    ctx.sequence_values,
-                    ctx.search_path,
-                    &order_expr.expr,
-                    Some(row),
-                    Some(schema),
-                )
-                .await?
-            } else {
-                eval_expr(&order_expr.expr, Some(row), Some(schema), ctx.query_ctx)?
-            };
+            let value = eval_typed_expr(&order_expr.expr, row, ctx.query_ctx)?;
             keys.push(value);
         }
         Ok(keys)
@@ -113,8 +94,8 @@ impl SortOperator {
 
     fn compare_keys(&self, keys_a: &[Value], keys_b: &[Value]) -> Result<std::cmp::Ordering> {
         for (i, order_expr) in self.order_by.iter().enumerate() {
-            let asc = order_expr.asc.unwrap_or(true);
-            let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+            let asc = order_expr.asc;
+            let nulls_first = order_expr.nulls_first;
 
             let ordering = compare_order_by_values(&keys_a[i], &keys_b[i], asc, nulls_first)?;
             if ordering != std::cmp::Ordering::Equal {
@@ -143,7 +124,7 @@ impl PhysicalOperator for SortOperator {
         }
         let mut keyed_rows: Vec<(Vec<Value>, Row)> = Vec::with_capacity(rows.len());
         for row in rows {
-            let keys = self.compute_sort_keys(&row, ctx).await?;
+            let keys = self.compute_sort_keys(&row, ctx)?;
             keyed_rows.push((keys, row));
         }
         sort_by_fallible(&mut keyed_rows, |(keys_a, _), (keys_b, _)| {
@@ -195,8 +176,8 @@ impl PhysicalOperator for SortOperator {
             .order_by
             .iter()
             .map(|o| {
-                let dir = if o.asc.unwrap_or(true) { "ASC" } else { "DESC" };
-                format!("{} {}", o.expr, dir)
+                let dir = if o.asc { "ASC" } else { "DESC" };
+                format!("{:?} {}", o.expr, dir)
             })
             .collect();
         Some(format!("order_by=[{}]", keys.join(", ")))
@@ -206,8 +187,8 @@ impl PhysicalOperator for SortOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
     use crate::types::{ColumnDef, DataType};
-    use sqlparser::ast::Ident;
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -244,18 +225,28 @@ mod tests {
         }
     }
 
+    fn typed_col_ref(name: &str, index: usize, data_type: DataType) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: index,
+                column_name: name.to_string(),
+            },
+            data_type,
+        }
+    }
+
     #[test]
     fn test_sort_creation() {
         use super::super::scan::TableScanOperator;
-        use sqlparser::ast::Expr;
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
 
-        let order_by = vec![OrderByExpr {
-            expr: Expr::Identifier(Ident::new("id")),
-            asc: Some(true),
-            nulls_first: None,
+        let order_by = vec![TypedOrderByExpr {
+            expr: typed_col_ref("id", 0, DataType::Int32),
+            asc: true,
+            nulls_first: false,
         }];
 
         let sort = SortOperator::new(child, order_by);
@@ -267,43 +258,41 @@ mod tests {
     #[test]
     fn test_sort_explain_info() {
         use super::super::scan::TableScanOperator;
-        use sqlparser::ast::Expr;
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
 
         let order_by = vec![
-            OrderByExpr {
-                expr: Expr::Identifier(Ident::new("id")),
-                asc: Some(true),
-                nulls_first: None,
+            TypedOrderByExpr {
+                expr: typed_col_ref("id", 0, DataType::Int32),
+                asc: true,
+                nulls_first: false,
             },
-            OrderByExpr {
-                expr: Expr::Identifier(Ident::new("name")),
-                asc: Some(false),
-                nulls_first: None,
+            TypedOrderByExpr {
+                expr: typed_col_ref("name", 1, DataType::Text),
+                asc: false,
+                nulls_first: true,
             },
         ];
 
         let sort = SortOperator::new(child, order_by);
 
         let info = sort.explain_info().unwrap();
-        assert!(info.contains("id ASC"));
-        assert!(info.contains("name DESC"));
+        assert!(info.contains("ASC"));
+        assert!(info.contains("DESC"));
     }
 
     #[test]
     fn test_compare_rows() {
         use super::super::scan::TableScanOperator;
-        use sqlparser::ast::Expr;
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
 
-        let order_by = vec![OrderByExpr {
-            expr: Expr::Identifier(Ident::new("id")),
-            asc: Some(true),
-            nulls_first: None,
+        let order_by = vec![TypedOrderByExpr {
+            expr: typed_col_ref("id", 0, DataType::Int32),
+            asc: true,
+            nulls_first: false,
         }];
 
         let sort = SortOperator::new(child, order_by);
@@ -328,15 +317,14 @@ mod tests {
     #[test]
     fn test_compare_keys_desc_ordering() {
         use super::super::scan::TableScanOperator;
-        use sqlparser::ast::Expr;
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
 
-        let order_by = vec![OrderByExpr {
-            expr: Expr::Identifier(Ident::new("id")),
-            asc: Some(false),
-            nulls_first: None,
+        let order_by = vec![TypedOrderByExpr {
+            expr: typed_col_ref("id", 0, DataType::Int32),
+            asc: false,
+            nulls_first: true,
         }];
 
         let sort = SortOperator::new(child, order_by);
@@ -357,16 +345,15 @@ mod tests {
     #[test]
     fn test_compare_keys_null_handling() {
         use super::super::scan::TableScanOperator;
-        use sqlparser::ast::Expr;
 
         let schema = test_schema();
 
         // ASC + NULLS FIRST: NULL < non-NULL
         let child = Box::new(TableScanOperator::new(schema.clone()));
-        let order_by = vec![OrderByExpr {
-            expr: Expr::Identifier(Ident::new("id")),
-            asc: Some(true),
-            nulls_first: Some(true),
+        let order_by = vec![TypedOrderByExpr {
+            expr: typed_col_ref("id", 0, DataType::Int32),
+            asc: true,
+            nulls_first: true,
         }];
         let sort = SortOperator::new(child, order_by);
 
@@ -384,10 +371,10 @@ mod tests {
 
         // ASC + NULLS LAST: NULL > non-NULL
         let child = Box::new(TableScanOperator::new(schema));
-        let order_by = vec![OrderByExpr {
-            expr: Expr::Identifier(Ident::new("id")),
-            asc: Some(true),
-            nulls_first: Some(false),
+        let order_by = vec![TypedOrderByExpr {
+            expr: typed_col_ref("id", 0, DataType::Int32),
+            asc: true,
+            nulls_first: false,
         }];
         let sort = SortOperator::new(child, order_by);
 
@@ -404,21 +391,20 @@ mod tests {
     #[test]
     fn test_compare_keys_multi_column_tiebreak() {
         use super::super::scan::TableScanOperator;
-        use sqlparser::ast::Expr;
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
 
         let order_by = vec![
-            OrderByExpr {
-                expr: Expr::Identifier(Ident::new("name")),
-                asc: Some(true),
-                nulls_first: None,
+            TypedOrderByExpr {
+                expr: typed_col_ref("name", 1, DataType::Text),
+                asc: true,
+                nulls_first: false,
             },
-            OrderByExpr {
-                expr: Expr::Identifier(Ident::new("id")),
-                asc: Some(false),
-                nulls_first: None,
+            TypedOrderByExpr {
+                expr: typed_col_ref("id", 0, DataType::Int32),
+                asc: false,
+                nulls_first: true,
             },
         ];
 

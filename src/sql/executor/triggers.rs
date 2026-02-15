@@ -657,11 +657,6 @@ impl Executor {
         if is_autocommit {
             if result.is_ok() {
                 session.commit().await?;
-                if let Ok(ExecuteResult::CreateFunction { ref func_name }) = result {
-                    self.store()
-                        .invalidate_function_cache(session.current_database_id(), func_name)
-                        .await;
-                }
             } else {
                 session.rollback().await?;
             }
@@ -800,11 +795,6 @@ impl Executor {
         if is_autocommit {
             if result.is_ok() {
                 session.commit().await?;
-                if let Ok(ExecuteResult::CreateTrigger { ref table_name, .. }) = result {
-                    self.store()
-                        .invalidate_trigger_cache(session.current_database_id(), table_name)
-                        .await;
-                }
             } else {
                 session.rollback().await?;
             }
@@ -878,11 +868,6 @@ impl Executor {
         if is_autocommit {
             if result.is_ok() {
                 session.commit().await?;
-                if let Ok(ExecuteResult::DropTrigger { ref table_name, .. }) = result {
-                    self.store()
-                        .invalidate_trigger_cache(session.current_database_id(), table_name)
-                        .await;
-                }
             } else {
                 session.rollback().await?;
             }

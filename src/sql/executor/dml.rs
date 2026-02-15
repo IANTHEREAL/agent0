@@ -1,7 +1,7 @@
 //! DML operations (INSERT, UPDATE, DELETE) for the SQL executor
 
 use super::super::dml;
-use super::super::expr::{validate_bool_expr_in_boolean_context, JoinEvalContext};
+use super::super::expr::validate_bool_expr_in_boolean_context;
 use super::super::names;
 use super::super::names::normalize_ident;
 use super::super::trigger_queue::TriggerOp;
@@ -10,7 +10,6 @@ use super::super::triggers;
 use super::super::ExecuteResult;
 use super::core::Executor;
 use crate::sql::error::SqlError;
-use crate::sql::query_context::QueryContext;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
@@ -497,7 +496,6 @@ impl Executor {
         selection: &Option<Expr>,
         returning: &Option<Vec<SelectItem>>,
     ) -> Result<ExecuteResult> {
-        let qc = QueryContext::from_task_locals();
         let ctes_ctx: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let (resolved_target, table_alias) = match &from[0].relation {
             sqlparser::ast::TableFactor::Table { name, alias, .. } => {
@@ -611,23 +609,12 @@ impl Executor {
             let should_delete = if let Some(ref e) = resolved_selection {
                 if let Some((ref using_schema, ref using_rows, ref using_alias)) = using_data {
                     let mut matched = false;
+                    let tables: &[(&str, &TableSchema)] =
+                        &[(&table_alias, &schema), (using_alias, using_schema)];
                     for using_row in using_rows {
-                        let (combined_schema, combined_row, column_offsets) =
-                            dml::build_update_join_context(
-                                &schema,
-                                &table_alias,
-                                using_schema,
-                                using_alias,
-                                &r,
-                                using_row,
-                            );
-                        let ctx = JoinEvalContext::new(
-                            &column_offsets,
-                            None,
-                            &combined_row,
-                            &combined_schema,
-                            &qc,
-                        );
+                        let mut combined_values = r.values.clone();
+                        combined_values.extend(using_row.values.clone());
+                        let combined_row = Row::new(combined_values);
                         let value = self
                             .eval_expr_join_maybe_sequence(
                                 txn,
@@ -635,7 +622,8 @@ impl Executor {
                                 sequence_values,
                                 search_path,
                                 e,
-                                &ctx,
+                                &combined_row,
+                                tables,
                             )
                             .await?;
                         if predicate_value_to_bool(e, value)? {
@@ -727,7 +715,6 @@ impl Executor {
         selection: &Option<Expr>,
         returning: &Option<Vec<SelectItem>>,
     ) -> Result<ExecuteResult> {
-        let qc = QueryContext::from_task_locals();
         let ctes_ctx: HashMap<String, (TableSchema, Vec<Row>)> = HashMap::new();
         let resolved_target = match &table.relation {
             sqlparser::ast::TableFactor::Table { name, .. } => names::resolve_existing_table_name(
@@ -855,8 +842,7 @@ impl Executor {
                 if fr.is_empty() {
                     Vec::new()
                 } else {
-                    let (combined_schema, _, column_offsets) =
-                        dml::build_update_join_context(&schema, &table_alias, fs, fa, r, &fr[0]);
+                    let tables: &[(&str, &TableSchema)] = &[(&table_alias, &schema), (fa, fs)];
 
                     let mut matches = Vec::new();
                     for from_row in fr {
@@ -864,13 +850,6 @@ impl Executor {
                             let mut combined_values = r.values.clone();
                             combined_values.extend(from_row.values.clone());
                             let combined_row = Row::new(combined_values);
-                            let ctx = JoinEvalContext::new(
-                                &column_offsets,
-                                None,
-                                &combined_row,
-                                &combined_schema,
-                                &qc,
-                            );
                             let value = self
                                 .eval_expr_join_maybe_sequence(
                                     txn,
@@ -878,7 +857,8 @@ impl Executor {
                                     sequence_values,
                                     search_path,
                                     sel,
-                                    &ctx,
+                                    &combined_row,
+                                    tables,
                                 )
                                 .await?;
                             if predicate_value_to_bool(sel, value)? {
@@ -1060,17 +1040,15 @@ mod tests {
 
     #[test]
     fn value_to_expr_roundtrips_bytes() {
-        let qc = QueryContext::from_task_locals();
         let expr = value_to_expr(Value::Bytes(vec![0, 1, 2, 255]), None).unwrap();
-        let val = crate::sql::expr::eval_expr(&expr, None, None, &qc).unwrap();
+        let val = crate::sql::expr::bridge::eval_const_ast_expr(&expr).unwrap();
         assert_eq!(val, Value::Bytes(vec![0, 1, 2, 255]));
     }
 
     #[test]
     fn value_to_expr_roundtrips_timestamp() {
-        let qc = QueryContext::from_task_locals();
         let expr = value_to_expr(Value::Timestamp(0), None).unwrap();
-        let val = crate::sql::expr::eval_expr(&expr, None, None, &qc).unwrap();
+        let val = crate::sql::expr::bridge::eval_const_ast_expr(&expr).unwrap();
         assert_eq!(val, Value::Timestamp(0));
     }
 

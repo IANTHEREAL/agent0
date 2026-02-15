@@ -17,6 +17,7 @@ describe('TypeORM Schema & Metadata Compatibility [pg-tikv]', () => {
       await dataSource.query('DROP TABLE IF EXISTS typeorm_posts CASCADE');
       await dataSource.query('DROP TABLE IF EXISTS typeorm_tags CASCADE');
       await dataSource.query('DROP TABLE IF EXISTS typeorm_users CASCADE');
+      await dataSource.query('DROP TABLE IF EXISTS typeorm_embeddings CASCADE');
       await dataSource.destroy();
     }
   });
@@ -149,7 +150,7 @@ describe('TypeORM Schema & Metadata Compatibility [pg-tikv]', () => {
 
     it('should introspect relations correctly', () => {
       const postMetadata = dataSource.getMetadata(Post);
-      
+
       const authorRelation = postMetadata.relations.find(
         (r) => r.propertyName === 'author'
       );
@@ -161,6 +162,14 @@ describe('TypeORM Schema & Metadata Compatibility [pg-tikv]', () => {
       );
       expect(tagsRelation).toBeDefined();
       expect(tagsRelation?.relationType).toBe('many-to-many');
+    });
+  });
+
+  describe('synchronize idempotency', () => {
+    it('should handle synchronize idempotently (second init succeeds)', async () => {
+      const ds2 = createDataSource({ synchronize: true });
+      await ds2.initialize(); // Must succeed — tables already exist from beforeAll
+      await ds2.destroy();
     });
   });
 });

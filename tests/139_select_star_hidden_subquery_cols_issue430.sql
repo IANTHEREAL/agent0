@@ -1,6 +1,6 @@
 -- Regression test for issue #430:
--- Correlated subqueries in JOIN-context clauses are explicitly unsupported.
--- This test asserts we fail fast with a stable Unsupported error (fail-closed).
+-- Correlated scalar subquery in JOIN ON with SELECT * must produce correct
+-- column set (no hidden __tipg_subquery_* columns) and correct results.
 
 DROP TABLE IF EXISTS ha_a;
 DROP TABLE IF EXISTS ha_b;

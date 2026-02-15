@@ -18,7 +18,6 @@ impl TikvStore {
         }
         let data = serialize_function_def(&def)?;
         txn_put(txn, key, data).await?;
-        self.invalidate_function_cache(db_id, &full_name).await;
         Ok(())
     }
 
@@ -45,7 +44,6 @@ impl TikvStore {
 
         let data = serialize_function_def(&def)?;
         txn_put(txn, key, data).await?;
-        self.invalidate_function_cache(db_id, &full_name).await;
         Ok(())
     }
 
@@ -55,21 +53,8 @@ impl TikvStore {
         db_id: u64,
         full_name: &str,
     ) -> Result<Option<FunctionDef>> {
-        // 1. Check cache
-        {
-            let cache = self.cache.read().await;
-            if let Some(db_cache) = cache.per_db.get(&db_id) {
-                if let Some((cached_at, func_opt)) = db_cache.functions.get(full_name) {
-                    if cached_at.elapsed() < SCHEMA_CACHE_TTL {
-                        return Ok(func_opt.clone());
-                    }
-                }
-            }
-        }
-
-        // 2. Cache miss - TiKV lookup
         let key = self.key(&encode_function_key_v2(db_id, full_name));
-        let result = match txn.get(key).await? {
+        match txn.get(key).await? {
             Some(data) => {
                 let mut def: FunctionDef = deserialize_function_def(&data)?;
                 if def.oid == 0 {
@@ -82,23 +67,10 @@ impl TikvStore {
                     )
                     .await?;
                 }
-                Some(def)
+                Ok(Some(def))
             }
-            None => None,
-        };
-
-        // 3. Populate cache
-        {
-            let mut cache = self.cache.write().await;
-            cache
-                .per_db
-                .entry(db_id)
-                .or_insert_with(PerDatabaseSchemaCache::new)
-                .functions
-                .insert(full_name.to_string(), (Instant::now(), result.clone()));
+            None => Ok(None),
         }
-
-        Ok(result)
     }
 
     pub async fn list_functions(
@@ -166,22 +138,16 @@ impl TikvStore {
             }
 
             if cascade {
-                let mut affected_tables = HashSet::new();
                 for trigger in &dependent_triggers {
-                    affected_tables.insert(trigger.table.as_str());
                     let _ = self
                         .drop_trigger(txn, db_id, &trigger.table, &trigger.name)
                         .await?;
-                }
-                for table in affected_tables {
-                    self.invalidate_trigger_cache(db_id, table).await;
                 }
             }
 
             txn_delete(txn, key).await?;
             let comment_key = self.key(&encode_comment_function_key_v2(db_id, full_name));
             txn_delete(txn, comment_key).await?;
-            self.invalidate_function_cache(db_id, full_name).await;
             Ok(true)
         } else {
             Ok(false)

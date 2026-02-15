@@ -5,15 +5,13 @@
 use super::super::ddl_export;
 use super::super::information_schema::VirtualTableFilter;
 use super::super::names;
-use super::super::names::normalize_ident;
 use super::super::{parse_sql, ExecuteResult};
 use super::core::Executor;
 use crate::sql::error::SqlError;
-use crate::sql::query_context::QueryContext;
 use crate::types::{ColumnDef, DataType, MigrationRecord, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Ident, Query, Statement};
+use sqlparser::ast::{Expr, FunctionArg, FunctionArgExpr, Statement};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
@@ -969,9 +967,7 @@ impl Executor {
         offset: usize,
         limit: Option<usize>,
     ) -> Result<(TableSchema, Vec<Row>)> {
-        use super::super::expr::eval_expr;
-
-        let qc = QueryContext::from_task_locals();
+        use super::super::expr::bridge::eval_const_ast_expr;
 
         fn extract_expr(arg: &FunctionArg) -> Result<&Expr> {
             match arg {
@@ -984,10 +980,10 @@ impl Executor {
             return Err(anyhow!("generate_series requires at least 2 arguments"));
         }
 
-        let start_val = eval_expr(extract_expr(&args[0])?, None, None, &qc)?;
-        let stop_val = eval_expr(extract_expr(&args[1])?, None, None, &qc)?;
+        let start_val = eval_const_ast_expr(extract_expr(&args[0])?)?;
+        let stop_val = eval_const_ast_expr(extract_expr(&args[1])?)?;
         let step_val = if args.len() >= 3 {
-            eval_expr(extract_expr(&args[2])?, None, None, &qc)?
+            eval_const_ast_expr(extract_expr(&args[2])?)?
         } else {
             Value::Null
         };
@@ -1038,8 +1034,7 @@ impl Executor {
         txn: &mut Transaction,
         args: &[FunctionArg],
     ) -> Result<(TableSchema, Vec<Row>)> {
-        use super::super::expr::eval_expr;
-        use crate::sql::query_context::QueryContext;
+        use super::super::expr::bridge::eval_const_ast_expr;
 
         fn extract_expr(arg: &FunctionArg) -> Result<&Expr> {
             match arg {
@@ -1056,15 +1051,13 @@ impl Executor {
             ));
         }
 
-        let query_ctx = QueryContext::from_task_locals();
-
-        let name = match eval_expr(extract_expr(&args[0])?, None, None, &query_ctx)? {
+        let name = match eval_const_ast_expr(extract_expr(&args[0])?)? {
             Value::Text(v) => v,
             _ => {
                 return Err(anyhow!("_pgtikv_sys_record_migration name must be TEXT"));
             }
         };
-        let checksum = match eval_expr(extract_expr(&args[1])?, None, None, &query_ctx)? {
+        let checksum = match eval_const_ast_expr(extract_expr(&args[1])?)? {
             Value::Text(v) => v,
             _ => {
                 return Err(anyhow!(
@@ -1072,7 +1065,7 @@ impl Executor {
                 ));
             }
         };
-        let sql_preview = match eval_expr(extract_expr(&args[2])?, None, None, &query_ctx)? {
+        let sql_preview = match eval_const_ast_expr(extract_expr(&args[2])?)? {
             Value::Text(v) => v,
             _ => {
                 return Err(anyhow!(
@@ -1164,86 +1157,6 @@ impl Executor {
                 .await
             } else {
                 Err(anyhow!("Invalid view query"))
-            }
-        })
-    }
-
-    pub(crate) fn execute_derived_table<'a>(
-        &'a self,
-        txn: &'a mut Transaction,
-        db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
-        search_path: &'a [String],
-        subquery: &'a Query,
-        alias: &'a str,
-        alias_columns: &'a [Ident],
-        ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<(TableSchema, Vec<Row>)>> + Send + 'a>,
-    > {
-        Box::pin(async move {
-            let result = self
-                .execute_query_with_outer_ctes(
-                    txn,
-                    db_id,
-                    sequence_values,
-                    search_path,
-                    subquery,
-                    ctes,
-                )
-                .await?;
-            match result {
-                ExecuteResult::Select {
-                    columns,
-                    column_types,
-                    rows,
-                    timezone: _,
-                } => {
-                    let column_names = if alias_columns.is_empty() {
-                        columns
-                    } else if alias_columns.len() != columns.len() {
-                        return Err(anyhow!(
-                            "Derived table alias column count mismatch: expected {}, got {}",
-                            columns.len(),
-                            alias_columns.len()
-                        ));
-                    } else {
-                        alias_columns.iter().map(normalize_ident).collect()
-                    };
-
-                    let inferred_types = column_types.unwrap_or_else(|| {
-                        crate::types::infer_column_types_from_rows(&rows, column_names.len())
-                    });
-
-                    let schema = TableSchema {
-                        table_id: 0,
-                        name: alias.to_string(),
-                        columns: column_names
-                            .iter()
-                            .enumerate()
-                            .map(|(i, n)| ColumnDef {
-                                name: n.clone(),
-                                // INTENTIONAL: index guard — unreachable when types match columns
-                                data_type: inferred_types.get(i).cloned().unwrap_or(DataType::Text),
-                                nullable: true,
-                                primary_key: false,
-                                unique: false,
-                                is_serial: false,
-                                default_expr: None,
-                            })
-                            .collect(),
-                        pk_constraint_name: None,
-                        pk_indices: vec![],
-                        indexes: vec![],
-                        version: 1,
-                        check_constraints: vec![],
-                        foreign_keys: vec![],
-                        owner: String::new(),
-                        from_alias: None,
-                    };
-                    Ok((schema, rows))
-                }
-                _ => Err(anyhow!("Derived table must return SELECT result")),
             }
         })
     }

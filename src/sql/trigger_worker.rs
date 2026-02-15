@@ -14,7 +14,6 @@ use super::trigger_rewrite::substitute_row_references;
 use crate::observability;
 use crate::pool::TikvClientPool;
 use crate::sql::error::SqlError;
-use crate::sql::query_context::QueryContext;
 use crate::storage::TikvStore;
 use crate::types::TableSchema;
 use crate::types::{Row, TriggerDef};
@@ -29,7 +28,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tikv_client::BoundRange;
 use tikv_client::Transaction;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 const MAX_CONCURRENT_KEYSPACES: usize = 4;
 
@@ -1239,7 +1238,6 @@ impl TriggerWorker {
         stmt: &str,
         search_path: &[String],
     ) -> Result<bool> {
-        let qc = QueryContext::from_task_locals();
         let stmt = stmt.trim().trim_end_matches(';').trim();
         let upper = stmt.to_uppercase();
 
@@ -1286,7 +1284,7 @@ impl TriggerWorker {
                                         )
                                         .await?
                                     } else {
-                                        super::expr::eval_expr(&expr, None, None, &qc)?
+                                        super::expr::bridge::eval_const_ast_expr(&expr)?
                                     };
 
                                     let coerced = super::value_coercion::coerce_value_for_column(

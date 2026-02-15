@@ -37,10 +37,202 @@ impl TypedExpr {
     pub fn is_null_constant(&self) -> bool {
         matches!(self.kind, TypedExprKind::Constant(Value::Null))
     }
+}
 
-    /// Returns true if this expression is a constant (non-NULL).
-    pub fn is_constant(&self) -> bool {
-        matches!(self.kind, TypedExprKind::Constant(_))
+impl fmt::Display for TypedExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            TypedExprKind::Constant(v) => write!(f, "{}", v),
+            TypedExprKind::ColumnRef { column_name, .. } => write!(f, "{}", column_name),
+            TypedExprKind::BinaryOp { left, op, right } => {
+                write!(f, "({} {} {})", left, op, right)
+            }
+            TypedExprKind::UnaryOp { op, operand } => write!(f, "({}{})", op, operand),
+            TypedExprKind::Cast {
+                expr, target_type, ..
+            } => {
+                write!(f, "CAST({} AS {:?})", expr, target_type)
+            }
+            TypedExprKind::IsTest {
+                expr,
+                test,
+                negated,
+            } => {
+                write!(
+                    f,
+                    "({} IS {}{})",
+                    expr,
+                    if *negated { "NOT " } else { "" },
+                    test
+                )
+            }
+            TypedExprKind::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
+                write!(
+                    f,
+                    "({} {}BETWEEN {} AND {})",
+                    expr,
+                    if *negated { "NOT " } else { "" },
+                    low,
+                    high
+                )
+            }
+            TypedExprKind::InList {
+                expr,
+                list,
+                negated,
+            } => {
+                let items: Vec<String> = list.iter().map(|e| format!("{}", e)).collect();
+                write!(
+                    f,
+                    "({} {}IN ({}))",
+                    expr,
+                    if *negated { "NOT " } else { "" },
+                    items.join(", ")
+                )
+            }
+            TypedExprKind::Like {
+                expr,
+                pattern,
+                negated,
+                case_insensitive,
+                ..
+            } => {
+                let kw = if *case_insensitive { "ILIKE" } else { "LIKE" };
+                write!(
+                    f,
+                    "({} {}{}  {})",
+                    expr,
+                    if *negated { "NOT " } else { "" },
+                    kw,
+                    pattern
+                )
+            }
+            TypedExprKind::SimilarTo {
+                expr,
+                pattern,
+                negated,
+                ..
+            } => {
+                write!(
+                    f,
+                    "({} {}SIMILAR TO {})",
+                    expr,
+                    if *negated { "NOT " } else { "" },
+                    pattern
+                )
+            }
+            TypedExprKind::Case {
+                operand,
+                when_clauses,
+                else_result,
+            } => {
+                write!(f, "CASE")?;
+                if let Some(op) = operand {
+                    write!(f, " {}", op)?;
+                }
+                for (when, then) in when_clauses {
+                    write!(f, " WHEN {} THEN {}", when, then)?;
+                }
+                if let Some(el) = else_result {
+                    write!(f, " ELSE {}", el)?;
+                }
+                write!(f, " END")
+            }
+            TypedExprKind::Coalesce(args) => {
+                let items: Vec<String> = args.iter().map(|e| format!("{}", e)).collect();
+                write!(f, "COALESCE({})", items.join(", "))
+            }
+            TypedExprKind::NullIf(a, b) => write!(f, "NULLIF({}, {})", a, b),
+            TypedExprKind::MinMax { args, is_greatest } => {
+                let items: Vec<String> = args.iter().map(|e| format!("{}", e)).collect();
+                let name = if *is_greatest { "GREATEST" } else { "LEAST" };
+                write!(f, "{}({})", name, items.join(", "))
+            }
+            TypedExprKind::FunctionCall { func, args, .. } => {
+                let items: Vec<String> = args.iter().map(|e| format!("{}", e)).collect();
+                write!(f, "{}({})", func.name, items.join(", "))
+            }
+            TypedExprKind::AggregateCall {
+                func,
+                args,
+                distinct,
+                ..
+            } => {
+                let items: Vec<String> = args.iter().map(|e| format!("{}", e)).collect();
+                write!(
+                    f,
+                    "{}({}{})",
+                    func.name,
+                    if *distinct { "DISTINCT " } else { "" },
+                    if items.is_empty() {
+                        "*".to_string()
+                    } else {
+                        items.join(", ")
+                    }
+                )
+            }
+            TypedExprKind::WindowCall { func, args, .. } => {
+                let items: Vec<String> = args.iter().map(|e| format!("{}", e)).collect();
+                write!(
+                    f,
+                    "{}({}) OVER (..)",
+                    func.name,
+                    if items.is_empty() {
+                        "*".to_string()
+                    } else {
+                        items.join(", ")
+                    }
+                )
+            }
+            TypedExprKind::ScalarSubquery(_) => write!(f, "(subquery)"),
+            TypedExprKind::ArraySubquery(_) => write!(f, "ARRAY(subquery)"),
+            TypedExprKind::Exists { negated, .. } => {
+                write!(f, "{}EXISTS (subquery)", if *negated { "NOT " } else { "" })
+            }
+            TypedExprKind::InSubquery { expr, negated, .. } => {
+                write!(
+                    f,
+                    "({} {}IN (subquery))",
+                    expr,
+                    if *negated { "NOT " } else { "" }
+                )
+            }
+            TypedExprKind::AnyAll {
+                expr, op, is_all, ..
+            } => {
+                let kw = if *is_all { "ALL" } else { "ANY" };
+                write!(f, "({} {} {} (subquery))", expr, op, kw)
+            }
+            TypedExprKind::ArrayLiteral(elems) => {
+                let items: Vec<String> = elems.iter().map(|e| format!("{}", e)).collect();
+                write!(f, "ARRAY[{}]", items.join(", "))
+            }
+            TypedExprKind::ArrayIndex { array, index } => {
+                write!(f, "{}[{}]", array, index)
+            }
+            TypedExprKind::JsonAccess {
+                expr,
+                path,
+                operator,
+            } => {
+                let op_str = match operator {
+                    JsonAccessOp::Arrow => "->",
+                    JsonAccessOp::LongArrow => "->>",
+                    JsonAccessOp::HashArrow => "#>",
+                    JsonAccessOp::HashLongArrow => "#>>",
+                };
+                write!(f, "({} {} {})", expr, op_str, path)
+            }
+            TypedExprKind::Row(elems) => {
+                let items: Vec<String> = elems.iter().map(|e| format!("{}", e)).collect();
+                write!(f, "ROW({})", items.join(", "))
+            }
+        }
     }
 }
 
@@ -197,6 +389,7 @@ pub enum TypedExprKind {
     },
 
     /// `expr op ANY/ALL (SELECT ...)`.
+    #[allow(dead_code)]
     AnyAll {
         expr: Box<TypedExpr>,
         op: BinaryOp,
@@ -205,6 +398,10 @@ pub enum TypedExprKind {
     },
 
     // ── Array & JSON ────────────────────────────────────
+    /// `ARRAY(SELECT ...)` — array constructor from subquery.
+    /// Each result row's first column becomes an array element.
+    ArraySubquery(Box<AnalyzedQuery>),
+
     /// Array literal: `ARRAY[a, b, c]`.
     ArrayLiteral(Vec<TypedExpr>),
 
@@ -223,6 +420,7 @@ pub enum TypedExprKind {
 
     // ── Composite ───────────────────────────────────────
     /// Row constructor: `ROW(a, b, c)` or `(a, b, c)`.
+    #[allow(dead_code)]
     Row(Vec<TypedExpr>),
 }
 
@@ -278,6 +476,7 @@ pub enum BinaryOp {
     // JSON containment & existence
     JsonContains,
     JsonContainedBy,
+    #[allow(dead_code)]
     JsonExists,
     JsonExistsAny,
     JsonExistsAll,
@@ -365,6 +564,17 @@ pub enum IsTestKind {
     Unknown,
 }
 
+impl fmt::Display for IsTestKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null => write!(f, "NULL"),
+            Self::True => write!(f, "TRUE"),
+            Self::False => write!(f, "FALSE"),
+            Self::Unknown => write!(f, "UNKNOWN"),
+        }
+    }
+}
+
 // ── JSON access operators ───────────────────────────────────
 
 /// JSON access operators.
@@ -391,8 +601,10 @@ pub struct ResolvedFunction {
     /// Canonical name (for EXPLAIN / error messages only — NOT used for dispatch).
     pub name: String,
     /// Whether builtin or user-defined.
+    #[allow(dead_code)]
     pub kind: FunctionKind,
     /// The resolved return type for this specific call (after overload resolution).
+    #[allow(dead_code)]
     pub return_type: DataType,
 }
 
@@ -403,6 +615,15 @@ pub enum FunctionKind {
     Builtin,
     /// User-defined function.
     UserDefined { oid: u32 },
+}
+
+/// A typed argument to a table-valued function (FROM ... func(...)).
+#[derive(Debug, Clone)]
+pub enum TypedFunctionArg {
+    /// Positional argument: `func(expr)`.
+    Positional(TypedExpr),
+    /// Named argument: `func(param => expr)`.
+    Named { name: String, expr: TypedExpr },
 }
 
 // ── ORDER BY ────────────────────────────────────────────────
@@ -540,6 +761,7 @@ pub enum AnalyzedTableRefKind {
     /// A base table with resolved schema.
     Table {
         name: String,
+        #[allow(dead_code)]
         schema: TableRefSchema,
     },
     /// A subquery in FROM.
@@ -550,11 +772,15 @@ pub enum AnalyzedTableRefKind {
         right: Box<AnalyzedTableRef>,
         join_type: JoinType,
         condition: JoinCondition,
+        /// Global column offset where this join's left child starts.
+        /// Used by the executor to reindex ON conditions from global to local
+        /// indices when the join is nested inside a larger join tree.
+        left_col_start: usize,
     },
     /// A table-valued function (e.g. unnest, generate_series).
     Function {
         func: ResolvedFunction,
-        args: Vec<TypedExpr>,
+        args: Vec<TypedFunctionArg>,
         output_columns: Vec<(String, DataType)>,
     },
 }
@@ -562,8 +788,10 @@ pub enum AnalyzedTableRefKind {
 /// Resolved schema information for a base table reference.
 #[derive(Debug, Clone)]
 pub struct TableRefSchema {
+    #[allow(dead_code)]
     pub table_id: u64,
     /// (column_name, data_type, nullable)
+    #[allow(dead_code)]
     pub columns: Vec<(String, DataType, bool)>,
 }
 
@@ -608,10 +836,14 @@ pub struct ResolvedUsingColumn {
 /// A resolved CTE (WITH clause entry).
 #[derive(Debug, Clone)]
 pub struct AnalyzedCte {
+    #[allow(dead_code)]
     pub name: String,
+    #[allow(dead_code)]
     pub query: AnalyzedQuery,
+    #[allow(dead_code)]
     pub columns: Vec<(String, DataType)>,
     /// Whether the CTE is materialized (`None` = unspecified / optimizer decides).
+    #[allow(dead_code)]
     pub materialized: Option<bool>,
 }
 

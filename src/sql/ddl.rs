@@ -18,8 +18,8 @@ use super::projection::fill_row_defaults;
 use super::sequences;
 use super::types::sql_datatype_to_internal_strict;
 use super::value_coercion::{coerce_value_for_column, infer_data_type};
-use super::{expr::eval_expr, ExecuteResult};
-use crate::sql::query_context::QueryContext;
+use super::ExecuteResult;
+
 use crate::storage::TikvStore;
 use crate::txn::{txn_delete, txn_put};
 use crate::types::{
@@ -1826,7 +1826,6 @@ pub async fn execute_alter_table(
     name: &ObjectName,
     operation: &AlterTableOperation,
 ) -> Result<ExecuteResult> {
-    let qc = QueryContext::from_task_locals();
     let resolved =
         names::resolve_existing_table_name(store.as_ref(), txn, db_id, name, search_path)
             .await?
@@ -2195,7 +2194,10 @@ pub async fn execute_alter_table(
                         let mut row = crate::storage::deserialize_row(pair.value())?;
                         fill_row_defaults(&mut row, &schema)?;
 
-                        let result = eval_expr(expr, Some(&row), Some(&schema), &qc)?;
+                        let table_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                        let result = super::expr::bridge::eval_ast_expr_with_row(
+                            expr, &row, &schema, table_name,
+                        )?;
                         match result {
                             Value::Boolean(true) | Value::Null => {}
                             Value::Boolean(false) => {
@@ -2670,7 +2672,11 @@ pub async fn execute_alter_table(
                             fill_row_defaults(&mut row, &schema)?;
 
                             let new_val = if let Some(using_expr) = &using {
-                                let result = eval_expr(using_expr, Some(&row), Some(&schema), &qc)?;
+                                let table_name =
+                                    schema.name.rsplit('.').next().unwrap_or(&schema.name);
+                                let result = super::expr::bridge::eval_ast_expr_with_row(
+                                    using_expr, &row, &schema, table_name,
+                                )?;
                                 coerce_value_for_column(result, &target_col)?
                             } else {
                                 let old_val =

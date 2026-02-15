@@ -197,10 +197,13 @@ fn convert_custom_type(
         "TSQUERY" => Ok(DataType::Tsquery),
         "NAME" => Ok(DataType::Name),
         "VECTOR" => {
+            // 0 means "any dimension" (bare `vector` without `(N)` modifier).
+            // DDL CREATE TABLE with bare `vector` and explicit CAST both use 0;
+            // the dimension check in cast.rs skips validation when dim == 0.
             let dim = modifiers
                 .first()
                 .and_then(|m| m.parse::<u32>().ok())
-                .unwrap_or(1536);
+                .unwrap_or(0);
             Ok(DataType::Vector(dim))
         }
         _ => match unknown_custom {

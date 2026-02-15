@@ -311,15 +311,7 @@ fn encode_value(value: &Value, buf: &mut Vec<u8>, delimiter: u8) {
             buf.push(b'}');
         }
         Value::Vector(vec) => {
-            buf.push(b'[');
-            let mut tmp = ryu::Buffer::new();
-            for (i, v) in vec.iter().enumerate() {
-                if i > 0 {
-                    buf.push(b',');
-                }
-                buf.extend_from_slice(tmp.format(*v).as_bytes());
-            }
-            buf.push(b']');
+            buf.extend_from_slice(crate::types::format_vector_pg_text(vec).as_bytes());
         }
         Value::Json(s) | Value::Jsonb(s) => {
             escape_text(s.as_bytes(), buf, delimiter);
@@ -727,5 +719,17 @@ mod tests {
         );
         // NULL emits \N, literal "\N" is escaped to \\N — no collision
         assert_eq!(buf, b"\\N\t\\\\N\n");
+    }
+
+    #[test]
+    fn test_vector_copy_uses_pgvector_format() {
+        // Integer-valued floats must omit .0 in COPY output (pgvector compat).
+        let mut buf = Vec::new();
+        encode_row(&[Value::Vector(vec![1.0, 2.0, 3.0])], &mut buf);
+        assert_eq!(buf, b"[1,2,3]\n");
+
+        buf.clear();
+        encode_row(&[Value::Vector(vec![1.0, 2.5, 3.0])], &mut buf);
+        assert_eq!(buf, b"[1,2.5,3]\n");
     }
 }

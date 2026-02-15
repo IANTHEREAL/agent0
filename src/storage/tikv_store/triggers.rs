@@ -89,19 +89,6 @@ impl TikvStore {
         db_id: u64,
         table_full_name: &str,
     ) -> Result<Vec<TriggerDef>> {
-        // 1. Check cache (read lock)
-        {
-            let cache = self.cache.read().await;
-            if let Some(db_cache) = cache.per_db.get(&db_id) {
-                if let Some((cached_at, triggers)) = db_cache.triggers.get(table_full_name) {
-                    if cached_at.elapsed() < SCHEMA_CACHE_TTL {
-                        return Ok(triggers.clone());
-                    }
-                }
-            }
-        }
-
-        // 2. Cache miss or expired — scan TiKV
         let prefix = encode_trigger_table_prefix_v2(db_id, table_full_name);
         let mut end = prefix.clone();
         end.push(0xFF);
@@ -116,20 +103,6 @@ impl TikvStore {
                 continue;
             }
             triggers.push(def);
-        }
-
-        // 3. Populate cache (write lock)
-        {
-            let mut cache = self.cache.write().await;
-            cache
-                .per_db
-                .entry(db_id)
-                .or_insert_with(PerDatabaseSchemaCache::new)
-                .triggers
-                .insert(
-                    table_full_name.to_string(),
-                    (Instant::now(), triggers.clone()),
-                );
         }
 
         Ok(triggers)

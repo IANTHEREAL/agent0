@@ -12,6 +12,7 @@ use sqlparser::ast::{
 };
 
 use crate::sql::names::split_object_name;
+use crate::sql::table_functions::table_function_key;
 use crate::sql::types::coercion::common_type;
 use crate::types::DataType;
 
@@ -92,7 +93,7 @@ impl<'a> Analyzer<'a> {
                         .add_column(None, name, dt.clone(), true);
                 }
 
-                let analyzed_order_by = self.analyze_order_by_exprs(&query.order_by)?;
+                let analyzed_order_by = self.analyze_order_by_exprs(&query.order_by, &[])?;
                 let analyzed_limit = match &query.limit {
                     Some(limit) => Some(self.analyze_expr(limit)?),
                     None => None,
@@ -210,7 +211,7 @@ impl<'a> Analyzer<'a> {
         };
 
         // 4. GROUP BY (aggregates NOT allowed)
-        let group_by = self.analyze_group_by(&select.group_by)?;
+        let group_by = self.analyze_group_by(&select.group_by, &select.projection)?;
 
         // Enable aggregates and windows for HAVING, SELECT, ORDER BY.
         {
@@ -235,8 +236,8 @@ impl<'a> Analyzer<'a> {
         // 7. DISTINCT
         let distinct = self.analyze_distinct(&select.distinct)?;
 
-        // 8. ORDER BY (within scope — can reference FROM columns)
-        let analyzed_order_by = self.analyze_order_by_exprs(order_by)?;
+        // 8. ORDER BY (can reference output aliases + FROM columns)
+        let analyzed_order_by = self.analyze_order_by_exprs(order_by, &projection)?;
 
         // 9. LIMIT
         let analyzed_limit = match limit {
@@ -249,6 +250,10 @@ impl<'a> Analyzer<'a> {
             Some(o) => Some(self.analyze_expr(&o.value)?),
             None => None,
         };
+
+        // 11. Correlated subqueries in JOIN context are handled by the executor
+        // via execute_async_nested_loop_join (per-row materialization fallback).
+        // No rejection needed here.
 
         // Pop scope
         self.scopes.pop();
@@ -297,16 +302,28 @@ impl<'a> Analyzer<'a> {
         &mut self,
         twj: &TableWithJoins,
     ) -> Result<AnalyzedTableRef, AnalyzerError> {
+        // Record where this table group's columns start (excludes preceding comma-FROM items).
+        let left_start = self.scopes.current().column_count();
         let mut result = self.analyze_table_factor(&twj.relation)?;
 
         // Process JOINs left-to-right, each one wraps the accumulated result
         for join in &twj.joins {
             // Record boundary before right table is added to scope.
-            // Columns at indices < right_start belong to left, >= to right.
+            // Columns at indices left_start..right_start belong to left, >= right_start to right.
             let right_start = self.scopes.current().column_count();
             let right = self.analyze_table_factor(&join.relation)?;
             let (join_type, condition) =
-                self.analyze_join_constraint(&join.join_operator, right_start)?;
+                self.analyze_join_constraint(&join.join_operator, left_start, right_start)?;
+
+            // USING join: hide right-side duplicate columns from SELECT * expansion.
+            // right_index is LOCAL to the right operator; convert to GLOBAL scope index for hiding.
+            if let JoinCondition::Using(ref cols) = condition {
+                for uc in cols {
+                    self.scopes
+                        .current_mut()
+                        .hide_using_column(right_start + uc.right_index);
+                }
+            }
 
             result = AnalyzedTableRef {
                 kind: AnalyzedTableRefKind::Join {
@@ -314,6 +331,7 @@ impl<'a> Analyzer<'a> {
                     right: Box::new(right),
                     join_type,
                     condition,
+                    left_col_start: left_start,
                 },
                 alias: None,
             };
@@ -327,7 +345,178 @@ impl<'a> Analyzer<'a> {
         factor: &TableFactor,
     ) -> Result<AnalyzedTableRef, AnalyzerError> {
         match factor {
-            TableFactor::Table { name, alias, .. } => {
+            TableFactor::Table {
+                name,
+                alias,
+                args: Some(func_args),
+                ..
+            } => {
+                // Table-valued function call in FROM.
+
+                let (_schema_opt, obj_name) = split_object_name(name)
+                    .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
+                let alias_str = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| obj_name.clone());
+
+                // Analyze function arguments, preserving named parameters.
+                let mut typed_args = Vec::with_capacity(func_args.len());
+                for arg in func_args {
+                    match arg {
+                        ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => {
+                            typed_args.push(TypedFunctionArg::Positional(self.analyze_expr(e)?));
+                        }
+                        ast::FunctionArg::Named {
+                            name,
+                            arg: ast::FunctionArgExpr::Expr(e),
+                            ..
+                        } => {
+                            typed_args.push(TypedFunctionArg::Named {
+                                name: crate::sql::names::normalize_ident(name),
+                                expr: self.analyze_expr(e)?,
+                            });
+                        }
+                        _ => {
+                            return Err(AnalyzerError::Unsupported(
+                                "unsupported table function argument".to_string(),
+                            ));
+                        }
+                    }
+                }
+
+                let key = table_function_key(name, func_args);
+                let mut output_cols: Vec<(String, DataType, bool)> =
+                    if let Some(schema) = self.catalog.resolve_table_function(&key) {
+                        schema
+                            .columns
+                            .iter()
+                            .map(|c| (c.name.clone(), c.data_type.clone(), c.nullable))
+                            .collect()
+                    } else if obj_name.eq_ignore_ascii_case("generate_series") {
+                        // generate_series(start, stop [, step]) returns a single column.
+                        let positional: Vec<&TypedExpr> = typed_args
+                            .iter()
+                            .filter_map(|a| match a {
+                                TypedFunctionArg::Positional(e) => Some(e),
+                                _ => None,
+                            })
+                            .collect();
+                        if positional.len() < 2 {
+                            return Err(AnalyzerError::Unsupported(
+                                "generate_series requires at least 2 arguments".to_string(),
+                            ));
+                        }
+
+                        let start_ty = &positional[0].data_type;
+                        let stop_ty = &positional[1].data_type;
+                        let out_ty = if matches!(start_ty, DataType::Date)
+                            && matches!(stop_ty, DataType::Date)
+                        {
+                            DataType::TimestampTz
+                        } else if matches!(start_ty, DataType::Timestamp)
+                            && matches!(stop_ty, DataType::Timestamp)
+                        {
+                            DataType::Timestamp
+                        } else if matches!(start_ty, DataType::Int32)
+                            && matches!(stop_ty, DataType::Int32)
+                        {
+                            DataType::Int32
+                        } else if matches!(start_ty, DataType::Int64)
+                            && matches!(stop_ty, DataType::Int64)
+                        {
+                            DataType::Int64
+                        } else if matches!(start_ty, DataType::Float64)
+                            && matches!(stop_ty, DataType::Float64)
+                        {
+                            DataType::Float64
+                        } else if matches!(start_ty, DataType::Numeric { .. })
+                            && matches!(stop_ty, DataType::Numeric { .. })
+                        {
+                            start_ty.clone()
+                        } else if let Some(common) = common_type(start_ty, stop_ty) {
+                            common
+                        } else {
+                            DataType::Text
+                        };
+
+                        // Column name semantics:
+                        // - `FROM generate_series(...) AS n` → column name "n"
+                        // - `FROM generate_series(...) AS t(col)` → column name "col"
+                        let col_name = if let Some(ta) = alias {
+                            if !ta.columns.is_empty() {
+                                crate::sql::names::normalize_ident(&ta.columns[0])
+                            } else {
+                                crate::sql::names::normalize_ident(&ta.name)
+                            }
+                        } else {
+                            "generate_series".to_string()
+                        };
+
+                        vec![(col_name, out_ty, false)]
+                    } else if obj_name.eq_ignore_ascii_case("current_schema")
+                        || obj_name.eq_ignore_ascii_case("current_database")
+                        || obj_name.eq_ignore_ascii_case("current_user")
+                        || obj_name.eq_ignore_ascii_case("session_user")
+                        || obj_name.eq_ignore_ascii_case("user")
+                    {
+                        // Scalar functions used in FROM return a single-row, single-column relation.
+                        let col_name = obj_name.to_lowercase();
+                        vec![(col_name, DataType::Text, false)]
+                    } else {
+                        return Err(AnalyzerError::Unsupported(format!(
+                            "unsupported table-valued function: {}",
+                            obj_name
+                        )));
+                    };
+
+                // Apply alias column list (renames output columns).
+                if let Some(ta) = alias {
+                    if !ta.columns.is_empty() {
+                        if ta.columns.len() != output_cols.len() {
+                            return Err(AnalyzerError::Unsupported(format!(
+                                "table function alias column count mismatch: expected {}, got {}",
+                                output_cols.len(),
+                                ta.columns.len()
+                            )));
+                        }
+                        for (i, ident) in ta.columns.iter().enumerate() {
+                            output_cols[i].0 = crate::sql::names::normalize_ident(ident);
+                        }
+                    }
+                }
+
+                self.scopes
+                    .current_mut()
+                    .add_table(&alias_str, &output_cols);
+
+                let output_columns: Vec<(String, DataType)> = output_cols
+                    .iter()
+                    .map(|(n, dt, _)| (n.clone(), dt.clone()))
+                    .collect();
+
+                let func = ResolvedFunction {
+                    name: obj_name.to_ascii_uppercase(),
+                    kind: FunctionKind::Builtin,
+                    return_type: DataType::Text,
+                };
+
+                Ok(AnalyzedTableRef {
+                    kind: AnalyzedTableRefKind::Function {
+                        func,
+                        args: typed_args,
+                        output_columns,
+                    },
+                    alias: Some(alias_str),
+                })
+            }
+
+            TableFactor::Table {
+                name,
+                alias,
+                args: None,
+                ..
+            } => {
                 // Split ObjectName into (optional schema, object name).
                 let (schema_opt, obj_name) = split_object_name(name)
                     .map_err(|e| AnalyzerError::Unsupported(e.to_string()))?;
@@ -437,23 +626,24 @@ impl<'a> Analyzer<'a> {
     fn analyze_join_constraint(
         &mut self,
         join_op: &ast::JoinOperator,
+        left_start: usize,
         right_start: usize,
     ) -> Result<(JoinType, JoinCondition), AnalyzerError> {
         match join_op {
             ast::JoinOperator::Inner(constraint) => {
-                let cond = self.analyze_join_condition(constraint, right_start)?;
+                let cond = self.analyze_join_condition(constraint, left_start, right_start)?;
                 Ok((JoinType::Inner, cond))
             }
             ast::JoinOperator::LeftOuter(constraint) => {
-                let cond = self.analyze_join_condition(constraint, right_start)?;
+                let cond = self.analyze_join_condition(constraint, left_start, right_start)?;
                 Ok((JoinType::Left, cond))
             }
             ast::JoinOperator::RightOuter(constraint) => {
-                let cond = self.analyze_join_condition(constraint, right_start)?;
+                let cond = self.analyze_join_condition(constraint, left_start, right_start)?;
                 Ok((JoinType::Right, cond))
             }
             ast::JoinOperator::FullOuter(constraint) => {
-                let cond = self.analyze_join_condition(constraint, right_start)?;
+                let cond = self.analyze_join_condition(constraint, left_start, right_start)?;
                 Ok((JoinType::Full, cond))
             }
             ast::JoinOperator::CrossJoin => Ok((JoinType::Cross, JoinCondition::None)),
@@ -467,6 +657,7 @@ impl<'a> Analyzer<'a> {
     fn analyze_join_condition(
         &mut self,
         constraint: &ast::JoinConstraint,
+        left_start: usize,
         right_start: usize,
     ) -> Result<JoinCondition, AnalyzerError> {
         match constraint {
@@ -482,9 +673,11 @@ impl<'a> Analyzer<'a> {
                     let scope = self.scopes.current();
                     let lower = col_name.to_lowercase();
 
-                    // Find matching column in left side (indices < right_start).
+                    // Find matching column in left side (indices in left_start..right_start).
                     let left_match = scope.columns().iter().find(|c| {
-                        c.column_index < right_start && c.column_name.to_lowercase() == lower
+                        c.column_index >= left_start
+                            && c.column_index < right_start
+                            && c.column_name.to_lowercase() == lower
                     });
 
                     // Find matching column in right side (indices >= right_start).
@@ -512,15 +705,54 @@ impl<'a> Analyzer<'a> {
 
                     resolved.push(ResolvedUsingColumn {
                         name: col_name.clone(),
-                        left_index: left_col.column_index,
-                        right_index: right_col.column_index,
+                        left_index: left_col.column_index - left_start,
+                        right_index: right_col.column_index - right_start,
                         data_type: unified_type,
                     });
                 }
                 Ok(JoinCondition::Using(resolved))
             }
             ast::JoinConstraint::Natural => {
-                Err(AnalyzerError::Unsupported("NATURAL JOIN".to_string()))
+                // NATURAL JOIN = USING on all columns with matching names.
+                let scope = self.scopes.current();
+                let mut resolved = Vec::new();
+                let mut seen = std::collections::HashSet::new();
+
+                // Collect left-side column names (only this join's left table).
+                let left_cols: Vec<_> = scope
+                    .columns()
+                    .iter()
+                    .filter(|c| c.column_index >= left_start && c.column_index < right_start)
+                    .collect();
+
+                // For each left column, find a matching right column.
+                for lc in &left_cols {
+                    let lower = lc.column_name.to_lowercase();
+                    if seen.contains(&lower) {
+                        continue;
+                    }
+                    if let Some(rc) = scope.columns().iter().find(|c| {
+                        c.column_index >= right_start && c.column_name.to_lowercase() == lower
+                    }) {
+                        let unified_type =
+                            common_type(&lc.data_type, &rc.data_type).ok_or_else(|| {
+                                AnalyzerError::OperatorTypeMismatch {
+                                    operator: "=".to_string(),
+                                    left: lc.data_type.clone(),
+                                    right: rc.data_type.clone(),
+                                }
+                            })?;
+                        resolved.push(ResolvedUsingColumn {
+                            name: lc.column_name.clone(),
+                            left_index: lc.column_index - left_start,
+                            right_index: rc.column_index - right_start,
+                            data_type: unified_type,
+                        });
+                        seen.insert(lower);
+                    }
+                }
+
+                Ok(JoinCondition::Using(resolved))
             }
             ast::JoinConstraint::None => Ok(JoinCondition::None),
         }
@@ -575,12 +807,41 @@ impl<'a> Analyzer<'a> {
     fn analyze_group_by(
         &mut self,
         group_by: &ast::GroupByExpr,
+        select_items: &[SelectItem],
     ) -> Result<Vec<TypedExpr>, AnalyzerError> {
         match group_by {
             ast::GroupByExpr::All => Err(AnalyzerError::Unsupported("GROUP BY ALL".to_string())),
-            ast::GroupByExpr::Expressions(exprs) => {
-                exprs.iter().map(|e| self.analyze_expr(e)).collect()
-            }
+            ast::GroupByExpr::Expressions(exprs) => exprs
+                .iter()
+                .map(|e| {
+                    // Resolve positional references: GROUP BY 1 → SELECT item at position 1.
+                    if let Expr::Value(ast::Value::Number(n, _)) = e {
+                        if let Ok(pos) = n.parse::<usize>() {
+                            if pos >= 1 && pos <= select_items.len() {
+                                let ast_expr = match &select_items[pos - 1] {
+                                    SelectItem::UnnamedExpr(expr) => expr,
+                                    SelectItem::ExprWithAlias { expr, .. } => expr,
+                                    _ => return self.analyze_expr(e),
+                                };
+                                return self.analyze_expr(ast_expr);
+                            }
+                        }
+                    }
+                    // Resolve alias references: GROUP BY alias → SELECT expr with that alias.
+                    // PostgreSQL allows GROUP BY to reference SELECT output aliases.
+                    if let Expr::Identifier(ident) = e {
+                        let name_lower = ident.value.to_lowercase();
+                        for item in select_items {
+                            if let SelectItem::ExprWithAlias { expr, alias } = item {
+                                if alias.value.to_lowercase() == name_lower {
+                                    return self.analyze_expr(expr);
+                                }
+                            }
+                        }
+                    }
+                    self.analyze_expr(e)
+                })
+                .collect(),
         }
     }
 
@@ -618,6 +879,10 @@ impl<'a> Analyzer<'a> {
                 SelectItem::Wildcard(_) => {
                     let scope = self.scopes.current();
                     for col in scope.columns() {
+                        // Skip USING join right-side duplicate columns.
+                        if col.hidden {
+                            continue;
+                        }
                         let expr = TypedExpr::new(
                             TypedExprKind::ColumnRef {
                                 scope_depth: 0,
@@ -643,10 +908,11 @@ impl<'a> Analyzer<'a> {
                         .columns()
                         .iter()
                         .filter(|c| {
-                            c.table_alias
-                                .as_ref()
-                                .map(|a| a.to_lowercase() == lower_table)
-                                .unwrap_or(false)
+                            !c.hidden
+                                && c.table_alias
+                                    .as_ref()
+                                    .map(|a| a.to_lowercase() == lower_table)
+                                    .unwrap_or(false)
                         })
                         .collect();
 

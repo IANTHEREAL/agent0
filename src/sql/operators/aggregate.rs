@@ -2,11 +2,12 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use sqlparser::ast::{Expr, OrderByExpr};
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
+use crate::sql::analyzer::types::{TypedExpr, TypedOrderByExpr};
+use crate::sql::expr::compare_order_by_values;
 use crate::sql::expr::operators::sort_by_fallible;
-use crate::sql::expr::{compare_order_by_values, eval_expr};
+use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::value_key::{serialize_value_for_key, serialize_values_for_key};
 use crate::sql::Aggregator;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
@@ -14,17 +15,17 @@ use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 #[derive(Debug, Clone)]
 pub struct AggregateExpr {
     pub func_name: String,
-    pub arg: Option<Expr>,
+    pub arg: Option<TypedExpr>,
     pub distinct: bool,
     pub delimiter: Option<String>,
-    pub filter: Option<Expr>,
-    pub order_by: Vec<OrderByExpr>,
+    pub filter: Option<TypedExpr>,
+    pub order_by: Vec<TypedOrderByExpr>,
 }
 
 #[derive(Debug)]
 pub struct HashAggregateOperator {
     child: BoxedOperator,
-    group_by_exprs: Vec<Expr>,
+    group_by_exprs: Vec<TypedExpr>,
     aggregate_exprs: Vec<AggregateExpr>,
     output_schema: TableSchema,
     result_rows: Vec<Row>,
@@ -35,7 +36,7 @@ pub struct HashAggregateOperator {
 impl HashAggregateOperator {
     pub fn new(
         child: BoxedOperator,
-        group_by_exprs: Vec<Expr>,
+        group_by_exprs: Vec<TypedExpr>,
         aggregate_exprs: Vec<AggregateExpr>,
         group_by_names: Vec<String>,
         group_by_types: Vec<DataType>,
@@ -93,12 +94,12 @@ impl HashAggregateOperator {
         }
     }
 
-    fn create_aggregator(agg_expr: &AggregateExpr) -> Result<Aggregator> {
+    fn create_aggregator(agg_expr: &AggregateExpr, return_type: &DataType) -> Result<Aggregator> {
         if agg_expr.func_name == "STRING_AGG" {
             let delim = agg_expr.delimiter.as_deref().unwrap_or(",").to_string();
             return Ok(Aggregator::new_string_agg(delim));
         }
-        Aggregator::new(&agg_expr.func_name)
+        Aggregator::new(&agg_expr.func_name, Some(return_type.clone()))
     }
 }
 
@@ -112,7 +113,6 @@ impl PhysicalOperator for HashAggregateOperator {
         self.child.open(ctx).await?;
 
         let input_rows = collect_all(self.child.as_mut(), ctx).await?;
-        let input_schema = self.child.schema();
 
         struct GroupState {
             group_values: Vec<Value>,
@@ -126,7 +126,7 @@ impl PhysicalOperator for HashAggregateOperator {
         for row in &input_rows {
             let mut group_key_values = Vec::new();
             for expr in &self.group_by_exprs {
-                let val = eval_expr(expr, Some(row), Some(input_schema), ctx.query_ctx)?;
+                let val = eval_typed_expr(expr, row, ctx.query_ctx)?;
                 group_key_values.push(val);
             }
 
@@ -137,7 +137,12 @@ impl PhysicalOperator for HashAggregateOperator {
                 let aggregators: Vec<Aggregator> = self
                     .aggregate_exprs
                     .iter()
-                    .map(|agg_expr| Self::create_aggregator(agg_expr))
+                    .enumerate()
+                    .map(|(i, agg_expr)| {
+                        let rt =
+                            &self.output_schema.columns[self.group_by_exprs.len() + i].data_type;
+                        Self::create_aggregator(agg_expr, rt)
+                    })
                     .collect::<Result<Vec<_>>>()?;
                 let seen_distinct = (0..self.aggregate_exprs.len())
                     .map(|_| HashSet::new())
@@ -170,15 +175,14 @@ impl PhysicalOperator for HashAggregateOperator {
 
             for (i, agg_expr) in self.aggregate_exprs.iter().enumerate() {
                 if let Some(ref filter_expr) = agg_expr.filter {
-                    let filter_val =
-                        eval_expr(filter_expr, Some(row), Some(input_schema), ctx.query_ctx)?;
+                    let filter_val = eval_typed_expr(filter_expr, row, ctx.query_ctx)?;
                     if !matches!(filter_val, Value::Boolean(true)) {
                         continue;
                     }
                 }
 
                 let val = if let Some(arg) = &agg_expr.arg {
-                    eval_expr(arg, Some(row), Some(input_schema), ctx.query_ctx)?
+                    eval_typed_expr(arg, row, ctx.query_ctx)?
                 } else {
                     Value::Int32(1)
                 };
@@ -194,7 +198,7 @@ impl PhysicalOperator for HashAggregateOperator {
                 if let Some(buf) = state.ordered_agg_buffers[i].as_mut() {
                     let mut keys = Vec::with_capacity(agg_expr.order_by.len());
                     for o in &agg_expr.order_by {
-                        let key = eval_expr(&o.expr, Some(row), Some(input_schema), ctx.query_ctx)?;
+                        let key = eval_typed_expr(&o.expr, row, ctx.query_ctx)?;
                         keys.push(key);
                     }
                     buf.push((keys, val));
@@ -208,8 +212,9 @@ impl PhysicalOperator for HashAggregateOperator {
 
         if groups.is_empty() && self.group_by_exprs.is_empty() {
             let mut values = Vec::new();
-            for agg_expr in &self.aggregate_exprs {
-                let agg = Self::create_aggregator(agg_expr)?;
+            for (i, agg_expr) in self.aggregate_exprs.iter().enumerate() {
+                let rt = &self.output_schema.columns[i].data_type;
+                let agg = Self::create_aggregator(agg_expr, rt)?;
                 values.push(agg.result());
             }
             self.result_rows.push(Row::new(values));
@@ -227,8 +232,8 @@ impl PhysicalOperator for HashAggregateOperator {
                         let order_by = &self.aggregate_exprs[i].order_by;
                         sort_by_fallible(&mut buf, |(keys_a, _), (keys_b, _)| {
                             for (key_idx, order_expr) in order_by.iter().enumerate() {
-                                let asc = order_expr.asc.unwrap_or(true);
-                                let nulls_first = order_expr.nulls_first.unwrap_or(!asc);
+                                let asc = order_expr.asc;
+                                let nulls_first = order_expr.nulls_first;
                                 let ord = compare_order_by_values(
                                     &keys_a[key_idx],
                                     &keys_b[key_idx],
@@ -297,7 +302,7 @@ impl PhysicalOperator for HashAggregateOperator {
         let group_cols: Vec<String> = self
             .group_by_exprs
             .iter()
-            .map(|e| format!("{}", e))
+            .map(|e| format!("{:?}", e))
             .collect();
         let agg_funcs: Vec<String> = self
             .aggregate_exprs
@@ -320,8 +325,9 @@ impl PhysicalOperator for HashAggregateOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analyzer::types::BinaryOp as TypedBinaryOp;
+    use crate::sql::analyzer::types::TypedExprKind;
     use crate::sql::operators::scan::TableScanOperator;
-    use sqlparser::ast::Ident;
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -358,15 +364,37 @@ mod tests {
         }
     }
 
+    fn category_ref() -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: 0,
+                column_name: "category".to_string(),
+            },
+            data_type: DataType::Text,
+        }
+    }
+
+    fn amount_ref() -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: 1,
+                column_name: "amount".to_string(),
+            },
+            data_type: DataType::Int32,
+        }
+    }
+
     #[test]
     fn test_hash_aggregate_creation() {
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
 
-        let group_by_exprs = vec![Expr::Identifier(Ident::new("category"))];
+        let group_by_exprs = vec![category_ref()];
         let aggregate_exprs = vec![AggregateExpr {
             func_name: "SUM".to_string(),
-            arg: Some(Expr::Identifier(Ident::new("amount"))),
+            arg: Some(amount_ref()),
             distinct: false,
             delimiter: None,
             filter: None,
@@ -394,7 +422,7 @@ mod tests {
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
 
-        let group_by_exprs = vec![Expr::Identifier(Ident::new("category"))];
+        let group_by_exprs = vec![category_ref()];
         let aggregate_exprs = vec![
             AggregateExpr {
                 func_name: "COUNT".to_string(),
@@ -406,7 +434,7 @@ mod tests {
             },
             AggregateExpr {
                 func_name: "SUM".to_string(),
-                arg: Some(Expr::Identifier(Ident::new("amount"))),
+                arg: Some(amount_ref()),
                 distinct: false,
                 delimiter: None,
                 filter: None,
@@ -465,10 +493,7 @@ mod tests {
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
 
-        let group_by_exprs = vec![
-            Expr::Identifier(Ident::new("category")),
-            Expr::Identifier(Ident::new("amount")),
-        ];
+        let group_by_exprs = vec![category_ref(), amount_ref()];
         let aggregate_exprs = vec![AggregateExpr {
             func_name: "COUNT".to_string(),
             arg: None,
@@ -502,14 +527,15 @@ mod tests {
     fn test_hash_aggregate_string_agg_delimiter() {
         let agg_expr = AggregateExpr {
             func_name: "STRING_AGG".to_string(),
-            arg: Some(Expr::Identifier(Ident::new("category"))),
+            arg: Some(category_ref()),
             distinct: false,
             delimiter: Some(", ".to_string()),
             filter: None,
             order_by: vec![],
         };
 
-        let aggregator = HashAggregateOperator::create_aggregator(&agg_expr).unwrap();
+        let aggregator =
+            HashAggregateOperator::create_aggregator(&agg_expr, &DataType::Text).unwrap();
         assert_eq!(aggregator.result(), Value::Null);
     }
 
@@ -518,19 +544,24 @@ mod tests {
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
 
+        let filter_expr = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(amount_ref()),
+                op: TypedBinaryOp::Gt,
+                right: Box::new(TypedExpr {
+                    kind: TypedExprKind::Constant(Value::Int64(100)),
+                    data_type: DataType::Int64,
+                }),
+            },
+            data_type: DataType::Boolean,
+        };
+
         let aggregate_exprs = vec![AggregateExpr {
             func_name: "SUM".to_string(),
-            arg: Some(Expr::Identifier(Ident::new("amount"))),
+            arg: Some(amount_ref()),
             distinct: false,
             delimiter: None,
-            filter: Some(Expr::BinaryOp {
-                left: Box::new(Expr::Identifier(Ident::new("amount"))),
-                op: sqlparser::ast::BinaryOperator::Gt,
-                right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
-                    "100".to_string(),
-                    false,
-                ))),
-            }),
+            filter: Some(filter_expr),
             order_by: vec![],
         }];
 

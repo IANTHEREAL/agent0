@@ -4,13 +4,16 @@ use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
+#[cfg(test)]
 use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr};
 
 use crate::sql::expr::compare_values;
+#[cfg(test)]
 use crate::sql::names::function_name_upper;
 use crate::sql::pg_numeric::pg_numeric_div;
-use crate::types::Value;
+use crate::types::{DataType, Value};
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 pub enum AggExpr {
     Function(Function),
@@ -20,7 +23,10 @@ pub enum AggExpr {
 #[derive(Debug)]
 pub enum Aggregator {
     Count(i64),
-    Sum(Value),
+    Sum {
+        value: Value,
+        return_type: DataType,
+    },
     Max(Value),
     Min(Value),
     Avg {
@@ -40,10 +46,16 @@ pub enum Aggregator {
 }
 
 impl Aggregator {
-    pub fn new(kind: &str) -> Result<Self> {
+    pub fn new(kind: &str, return_type: Option<DataType>) -> Result<Self> {
         match kind.to_uppercase().as_str() {
             "COUNT" => Ok(Aggregator::Count(0)),
-            "SUM" => Ok(Aggregator::Sum(Value::Null)),
+            "SUM" => Ok(Aggregator::Sum {
+                value: Value::Null,
+                return_type: return_type.unwrap_or(DataType::Numeric {
+                    precision: None,
+                    scale: None,
+                }),
+            }),
             "MAX" => Ok(Aggregator::Max(Value::Null)),
             "MIN" => Ok(Aggregator::Min(Value::Null)),
             "AVG" => Ok(Aggregator::Avg {
@@ -80,10 +92,13 @@ impl Aggregator {
                     }
                 }
             }
-            Aggregator::Sum(current) => {
+            Aggregator::Sum {
+                value: current,
+                return_type,
+            } => {
                 if !matches!(val, Value::Null) {
                     if matches!(current, Value::Null) {
-                        *current = val.clone();
+                        *current = widen_value(val, return_type);
                     } else {
                         *current = add_values(current, val)?;
                     }
@@ -191,7 +206,7 @@ impl Aggregator {
     pub fn result(&self) -> Value {
         match self {
             Aggregator::Count(c) => Value::Int64(*c),
-            Aggregator::Sum(v) => v.clone(),
+            Aggregator::Sum { value, .. } => value.clone(),
             Aggregator::Max(v) => v.clone(),
             Aggregator::Min(v) => v.clone(),
             Aggregator::Avg {
@@ -292,6 +307,17 @@ fn add_values(left: &Value, right: &Value) -> Result<Value> {
     }
 }
 
+/// Widen a value to the target aggregate return type (safe upcast only, no truncation).
+fn widen_value(val: &Value, target: &DataType) -> Value {
+    match (val, target) {
+        (Value::Int32(v), DataType::Int64) => Value::Int64(*v as i64),
+        (Value::Int32(v), DataType::Numeric { .. }) => Value::Numeric(Decimal::from(*v)),
+        (Value::Int64(v), DataType::Numeric { .. }) => Value::Numeric(Decimal::from(*v)),
+        _ => val.clone(),
+    }
+}
+
+#[cfg(test)]
 /// Collect aggregate functions from HAVING clause that aren't already in projection
 pub fn collect_having_agg_funcs(
     expr: &Expr,
@@ -385,6 +411,7 @@ pub fn collect_having_agg_funcs(
     }
 }
 
+#[cfg(test)]
 /// Check if two function calls match (args + relevant modifiers).
 pub fn args_match(f1: &sqlparser::ast::Function, f2: &sqlparser::ast::Function) -> bool {
     // Aggregate modifiers must be part of the match key; otherwise we can accidentally
@@ -428,7 +455,7 @@ mod tests {
 
     #[test]
     fn test_count() {
-        let mut agg = Aggregator::new("COUNT").unwrap();
+        let mut agg = Aggregator::new("COUNT", None).unwrap();
         agg.update(&Value::Int32(1)).unwrap();
         agg.update(&Value::Int32(2)).unwrap();
         agg.update(&Value::Null).unwrap();
@@ -438,37 +465,38 @@ mod tests {
 
     #[test]
     fn test_count_empty() {
-        let agg = Aggregator::new("COUNT").unwrap();
+        let agg = Aggregator::new("COUNT", None).unwrap();
         assert_eq!(agg.result(), Value::Int64(0));
     }
 
     #[test]
     fn test_sum_int32() {
-        let mut agg = Aggregator::new("SUM").unwrap();
+        // Default return type is Numeric; Int32 values are widened
+        let mut agg = Aggregator::new("SUM", None).unwrap();
         agg.update(&Value::Int32(10)).unwrap();
         agg.update(&Value::Int32(20)).unwrap();
         agg.update(&Value::Int32(30)).unwrap();
-        assert_eq!(agg.result(), Value::Int32(60));
+        assert_eq!(agg.result(), Value::Numeric(Decimal::from(60)));
     }
 
     #[test]
     fn test_sum_with_null() {
-        let mut agg = Aggregator::new("SUM").unwrap();
+        let mut agg = Aggregator::new("SUM", None).unwrap();
         agg.update(&Value::Int32(10)).unwrap();
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Int32(20)).unwrap();
-        assert_eq!(agg.result(), Value::Int32(30));
+        assert_eq!(agg.result(), Value::Numeric(Decimal::from(30)));
     }
 
     #[test]
     fn test_sum_empty() {
-        let agg = Aggregator::new("SUM").unwrap();
+        let agg = Aggregator::new("SUM", None).unwrap();
         assert_eq!(agg.result(), Value::Null);
     }
 
     #[test]
     fn test_max() {
-        let mut agg = Aggregator::new("MAX").unwrap();
+        let mut agg = Aggregator::new("MAX", None).unwrap();
         agg.update(&Value::Int32(5)).unwrap();
         agg.update(&Value::Int32(10)).unwrap();
         agg.update(&Value::Int32(3)).unwrap();
@@ -477,7 +505,7 @@ mod tests {
 
     #[test]
     fn test_max_with_null() {
-        let mut agg = Aggregator::new("MAX").unwrap();
+        let mut agg = Aggregator::new("MAX", None).unwrap();
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Int32(5)).unwrap();
         agg.update(&Value::Null).unwrap();
@@ -486,7 +514,7 @@ mod tests {
 
     #[test]
     fn test_min() {
-        let mut agg = Aggregator::new("MIN").unwrap();
+        let mut agg = Aggregator::new("MIN", None).unwrap();
         agg.update(&Value::Int32(5)).unwrap();
         agg.update(&Value::Int32(2)).unwrap();
         agg.update(&Value::Int32(8)).unwrap();
@@ -495,7 +523,7 @@ mod tests {
 
     #[test]
     fn test_avg() {
-        let mut agg = Aggregator::new("AVG").unwrap();
+        let mut agg = Aggregator::new("AVG", None).unwrap();
         agg.update(&Value::Int32(10)).unwrap();
         agg.update(&Value::Int32(20)).unwrap();
         agg.update(&Value::Int32(30)).unwrap();
@@ -505,7 +533,7 @@ mod tests {
 
     #[test]
     fn test_avg_with_null() {
-        let mut agg = Aggregator::new("AVG").unwrap();
+        let mut agg = Aggregator::new("AVG", None).unwrap();
         agg.update(&Value::Int32(10)).unwrap();
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Int32(20)).unwrap();
@@ -515,13 +543,13 @@ mod tests {
 
     #[test]
     fn test_avg_empty() {
-        let agg = Aggregator::new("AVG").unwrap();
+        let agg = Aggregator::new("AVG", None).unwrap();
         assert_eq!(agg.result(), Value::Null);
     }
 
     #[test]
     fn test_avg_float() {
-        let mut agg = Aggregator::new("AVG").unwrap();
+        let mut agg = Aggregator::new("AVG", None).unwrap();
         agg.update(&Value::Float64(1.5)).unwrap();
         agg.update(&Value::Float64(2.5)).unwrap();
         let result = agg.result();
@@ -530,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_avg_int_repeating_precision() {
-        let mut agg = Aggregator::new("AVG").unwrap();
+        let mut agg = Aggregator::new("AVG", None).unwrap();
         agg.update(&Value::Int32(300)).unwrap();
         agg.update(&Value::Int32(200)).unwrap();
         agg.update(&Value::Int32(300)).unwrap();
@@ -543,12 +571,12 @@ mod tests {
 
     #[test]
     fn test_unsupported_aggregator() {
-        assert!(Aggregator::new("UNKNOWN").is_err());
+        assert!(Aggregator::new("UNKNOWN", None).is_err());
     }
 
     #[test]
     fn test_max_text() {
-        let mut agg = Aggregator::new("MAX").unwrap();
+        let mut agg = Aggregator::new("MAX", None).unwrap();
         agg.update(&Value::Text("apple".to_string())).unwrap();
         agg.update(&Value::Text("banana".to_string())).unwrap();
         agg.update(&Value::Text("cherry".to_string())).unwrap();
@@ -557,7 +585,7 @@ mod tests {
 
     #[test]
     fn test_min_text() {
-        let mut agg = Aggregator::new("MIN").unwrap();
+        let mut agg = Aggregator::new("MIN", None).unwrap();
         agg.update(&Value::Text("banana".to_string())).unwrap();
         agg.update(&Value::Text("apple".to_string())).unwrap();
         agg.update(&Value::Text("cherry".to_string())).unwrap();
@@ -593,7 +621,7 @@ mod tests {
 
     #[test]
     fn test_array_agg() {
-        let mut agg = Aggregator::new("ARRAY_AGG").unwrap();
+        let mut agg = Aggregator::new("ARRAY_AGG", None).unwrap();
         agg.update(&Value::Int32(1)).unwrap();
         agg.update(&Value::Int32(2)).unwrap();
         agg.update(&Value::Int32(3)).unwrap();
@@ -605,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_array_agg_with_null() {
-        let mut agg = Aggregator::new("ARRAY_AGG").unwrap();
+        let mut agg = Aggregator::new("ARRAY_AGG", None).unwrap();
         agg.update(&Value::Int32(1)).unwrap();
         agg.update(&Value::Null).unwrap();
         agg.update(&Value::Int32(2)).unwrap();
@@ -617,7 +645,7 @@ mod tests {
 
     #[test]
     fn test_array_agg_empty() {
-        let agg = Aggregator::new("ARRAY_AGG").unwrap();
+        let agg = Aggregator::new("ARRAY_AGG", None).unwrap();
         assert_eq!(agg.result(), Value::Null);
     }
 
@@ -697,5 +725,29 @@ mod tests {
             parse_first_projection_expr("SELECT COUNT(*) FILTER (WHERE x > 0) > 0");
         collect_having_agg_funcs(&count_star_filter_expr, &mut agg_funcs, 1);
         assert_eq!(agg_funcs.len(), 2);
+    }
+
+    #[test]
+    fn test_sum_int32_returns_int64_with_return_type() {
+        let mut agg = Aggregator::new("SUM", Some(DataType::Int64)).unwrap();
+        agg.update(&Value::Int32(10)).unwrap();
+        agg.update(&Value::Int32(20)).unwrap();
+        agg.update(&Value::Int32(30)).unwrap();
+        assert_eq!(agg.result(), Value::Int64(60));
+    }
+
+    #[test]
+    fn test_sum_int64_returns_numeric_with_return_type() {
+        let mut agg = Aggregator::new(
+            "SUM",
+            Some(DataType::Numeric {
+                precision: None,
+                scale: None,
+            }),
+        )
+        .unwrap();
+        agg.update(&Value::Int64(100)).unwrap();
+        agg.update(&Value::Int64(200)).unwrap();
+        assert_eq!(agg.result(), Value::Numeric(Decimal::from(300)));
     }
 }

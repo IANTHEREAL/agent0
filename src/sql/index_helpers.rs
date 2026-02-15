@@ -1,6 +1,5 @@
 //! Index evaluation helpers for partial and expression indexes.
 
-use crate::sql::query_context::QueryContext;
 use crate::types::{DataType, IndexDef, Row, TableSchema, Value};
 use anyhow::Result;
 use sqlparser::ast::Expr;
@@ -62,8 +61,8 @@ pub fn eval_index_predicate(index: &IndexDef, schema: &TableSchema, row: &Row) -
         ),
     };
 
-    let qc = QueryContext::from_task_locals();
-    let value = super::expr::eval_expr(&expr, Some(row), Some(schema), &qc)?;
+    let table_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+    let value = super::expr::bridge::eval_ast_expr_with_row(&expr, row, schema, table_name)?;
     match value {
         Value::Boolean(b) => Ok(b),
         Value::Null => Ok(false),
@@ -90,7 +89,7 @@ pub fn get_index_values_with_expressions(
         }
     }
 
-    let qc = QueryContext::from_task_locals();
+    let table_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
     for expr_str in &index.expressions {
         let sql = format!("SELECT {}", expr_str);
         if let Ok(stmts) = super::parse_sql(&sql) {
@@ -99,7 +98,9 @@ pub fn get_index_values_with_expressions(
                     if let Some(sqlparser::ast::SelectItem::UnnamedExpr(expr)) =
                         select.projection.into_iter().next()
                     {
-                        let value = super::expr::eval_expr(&expr, Some(row), Some(schema), &qc)?;
+                        let value = super::expr::bridge::eval_ast_expr_with_row(
+                            &expr, row, schema, table_name,
+                        )?;
                         values.push(value);
                         continue;
                     }

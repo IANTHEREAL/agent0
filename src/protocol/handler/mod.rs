@@ -1,4 +1,4 @@
-use crate::sql::expr::eval_expr;
+use crate::sql::expr::bridge::eval_const_ast_expr;
 use crate::sql::types::{TypeContext, TypeInferrer};
 use crate::sql::{ExecuteResult, Session};
 use crate::storage::TikvStore;
@@ -889,12 +889,11 @@ fn try_parse_fs9_mode_from_args(args: &[FunctionArg]) -> Option<crate::extension
         return None;
     }
 
-    let qc = crate::sql::query_context::QueryContext::from_task_locals();
     let path_expr = match &args[0] {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
         _ => return None,
     };
-    let path = match eval_expr(path_expr, None, None, &qc).ok()? {
+    let path = match eval_const_ast_expr(path_expr).ok()? {
         Value::Text(s) => s,
         _ => return None,
     };
@@ -913,7 +912,7 @@ fn try_parse_fs9_mode_from_args(args: &[FunctionArg]) -> Option<crate::extension
                 ..
             } => {
                 let param_name = name.value.to_ascii_lowercase();
-                let val = eval_expr(e, None, None, &qc).ok()?;
+                let val = eval_const_ast_expr(e).ok()?;
                 match param_name.as_str() {
                     "format" => match val {
                         Value::Text(s) => format = Some(s),

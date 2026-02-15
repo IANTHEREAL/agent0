@@ -1,11 +1,11 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use sqlparser::ast::{Expr, JoinOperator};
+use sqlparser::ast::JoinOperator;
 
 use super::{collect_all, BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::eval_expr;
-use crate::sql::types::cast::{cast, CastContext};
-use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
+use crate::sql::analyzer::types::TypedExpr;
+use crate::sql::expr::typed_eval::eval_typed_expr;
+use crate::types::{ColumnDef, Row, TableSchema, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JoinType {
@@ -34,7 +34,7 @@ pub struct NestedLoopJoinOperator {
     left: BoxedOperator,
     right: BoxedOperator,
     join_type: JoinType,
-    condition: Option<Expr>,
+    condition: Option<TypedExpr>,
     output_schema: TableSchema,
     result_rows: Vec<Row>,
     position: usize,
@@ -47,7 +47,7 @@ impl NestedLoopJoinOperator {
         left: BoxedOperator,
         right: BoxedOperator,
         join_type: JoinType,
-        condition: Option<Expr>,
+        condition: Option<TypedExpr>,
     ) -> Self {
         let mut columns = Vec::new();
 
@@ -101,25 +101,6 @@ impl NestedLoopJoinOperator {
         }
     }
 
-    pub fn with_schema(
-        left: BoxedOperator,
-        right: BoxedOperator,
-        join_type: JoinType,
-        condition: Option<Expr>,
-        output_schema: TableSchema,
-    ) -> Self {
-        Self {
-            left,
-            right,
-            join_type,
-            condition,
-            output_schema,
-            result_rows: Vec::new(),
-            position: 0,
-            opened: false,
-        }
-    }
-
     fn make_null_row(schema: &TableSchema) -> Row {
         Row::new(vec![Value::Null; schema.columns.len()])
     }
@@ -136,21 +117,10 @@ impl NestedLoopJoinOperator {
         query_ctx: &crate::sql::query_context::QueryContext,
     ) -> Result<bool> {
         if let Some(cond) = &self.condition {
-            let result = eval_expr(
-                cond,
-                Some(combined_row),
-                Some(&self.output_schema),
-                query_ctx,
-            )?;
+            let result = eval_typed_expr(cond, combined_row, query_ctx)?;
             match result {
                 Value::Boolean(b) => Ok(b),
                 Value::Null => Ok(false),
-                Value::Text(s) => {
-                    match cast(Value::Text(s), &DataType::Boolean, CastContext::Implicit)? {
-                        Value::Boolean(b) => Ok(b),
-                        _ => unreachable!("cast to Boolean always produces Boolean"),
-                    }
-                }
                 _ => Err(anyhow!("Join condition must evaluate to boolean")),
             }
         } else {
@@ -309,7 +279,7 @@ impl PhysicalOperator for NestedLoopJoinOperator {
         };
 
         if let Some(cond) = &self.condition {
-            Some(format!("type={}, on={}", join_type_str, cond))
+            Some(format!("type={}, on={:?}", join_type_str, cond))
         } else {
             Some(format!("type={}", join_type_str))
         }
@@ -319,9 +289,9 @@ impl PhysicalOperator for NestedLoopJoinOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExprKind};
     use crate::sql::operators::scan::TableScanOperator;
     use crate::types::DataType;
-    use sqlparser::ast::{BinaryOperator, Ident};
 
     fn users_schema() -> TableSchema {
         TableSchema {
@@ -393,16 +363,39 @@ mod tests {
         }
     }
 
+    /// Build the TypedExpr equivalent of `id = user_id` for the joined schema
+    /// [id(0), name(1), order_id(2), user_id(3)].
+    fn eq_condition_id_user_id() -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: 0,
+                        column_name: "id".to_string(),
+                    },
+                    data_type: DataType::Int32,
+                }),
+                op: TypedBinaryOp::Eq,
+                right: Box::new(TypedExpr {
+                    kind: TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: 3,
+                        column_name: "user_id".to_string(),
+                    },
+                    data_type: DataType::Int32,
+                }),
+            },
+            data_type: DataType::Boolean,
+        }
+    }
+
     #[test]
     fn test_nested_loop_join_creation() {
         let left = Box::new(TableScanOperator::new(users_schema()));
         let right = Box::new(TableScanOperator::new(orders_schema()));
 
-        let condition = Expr::BinaryOp {
-            left: Box::new(Expr::Identifier(Ident::new("id"))),
-            op: BinaryOperator::Eq,
-            right: Box::new(Expr::Identifier(Ident::new("user_id"))),
-        };
+        let condition = eq_condition_id_user_id();
 
         let op = NestedLoopJoinOperator::new(left, right, JoinType::Inner, Some(condition));
 

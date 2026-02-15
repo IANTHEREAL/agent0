@@ -1,29 +1,26 @@
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
-use sqlparser::ast::{Expr, Function, FunctionArg, FunctionArgExpr};
 
 use super::{BoxedOperator, ExecutionContext, PhysicalOperator};
-use crate::sql::expr::eval_expr;
+use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
+use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::query_context::QueryContext;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 
 /// Identifies set-returning function kinds that expand one input row to many.
 #[derive(Copy, Clone, Debug)]
-enum SrfKind {
+pub(crate) enum SrfKind {
     Unnest,
     RegexpSplitToTable,
     RegexpMatches,
     EvalFunctionArray,
 }
 
-fn detect_srf(expr: &Expr) -> Option<SrfKind> {
-    let Expr::Function(f) = expr else {
+pub(crate) fn detect_srf(expr: &TypedExpr) -> Option<SrfKind> {
+    let TypedExprKind::FunctionCall { func, .. } = &expr.kind else {
         return None;
     };
-    let Some(name) = f.name.0.last() else {
-        return None;
-    };
-    match name.value.to_ascii_uppercase().as_str() {
+    match func.name.to_ascii_uppercase().as_str() {
         "UNNEST" => Some(SrfKind::Unnest),
         "REGEXP_SPLIT_TO_TABLE" => Some(SrfKind::RegexpSplitToTable),
         "REGEXP_MATCHES" => Some(SrfKind::RegexpMatches),
@@ -52,21 +49,19 @@ fn regexp_captures_to_values(caps: &regex::Captures<'_>) -> Vec<Value> {
 }
 
 /// Evaluate a set-returning function and return the expanded values.
-fn eval_srf(
+pub(crate) fn eval_srf(
     kind: SrfKind,
-    f: &Function,
+    expr: &TypedExpr,
     input: &Row,
-    schema: &TableSchema,
     query_ctx: &QueryContext,
 ) -> Result<Vec<Value>> {
+    let TypedExprKind::FunctionCall { args, .. } = &expr.kind else {
+        return Ok(Vec::new());
+    };
     match kind {
         SrfKind::Unnest => {
-            let arg_expr = f.args.first().and_then(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                _ => None,
-            });
-            if let Some(arg_expr) = arg_expr {
-                match eval_expr(arg_expr, Some(input), Some(schema), query_ctx)? {
+            if let Some(arg_expr) = args.first() {
+                match eval_typed_expr(arg_expr, input, query_ctx)? {
                     Value::Array(arr) => Ok(arr),
                     Value::Null => Ok(Vec::new()),
                     other => Ok(vec![other]),
@@ -76,32 +71,20 @@ fn eval_srf(
             }
         }
         SrfKind::RegexpSplitToTable => {
-            let arg0 = f.args.get(0).and_then(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                _ => None,
-            });
-            let arg1 = f.args.get(1).and_then(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                _ => None,
-            });
-            let arg2 = f.args.get(2).and_then(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                _ => None,
-            });
-            let (Some(arg0), Some(arg1)) = (arg0, arg1) else {
+            let (Some(arg0), Some(arg1)) = (args.get(0), args.get(1)) else {
                 return Err(anyhow!(
                     "regexp_split_to_table requires at least 2 arguments"
                 ));
             };
 
-            let source_val = eval_expr(arg0, Some(input), Some(schema), query_ctx)?;
+            let source_val = eval_typed_expr(arg0, input, query_ctx)?;
             let source = match source_val {
                 Value::Text(s) => Some(s),
                 Value::Null => None,
                 v => Some(v.to_string()),
             };
 
-            let pattern_val = eval_expr(arg1, Some(input), Some(schema), query_ctx)?;
+            let pattern_val = eval_typed_expr(arg1, input, query_ctx)?;
             let pattern = match pattern_val {
                 Value::Text(s) => Some(s),
                 Value::Null => None,
@@ -110,8 +93,8 @@ fn eval_srf(
 
             match (source, pattern) {
                 (Some(source), Some(pattern)) => {
-                    let flags = if let Some(arg2) = arg2 {
-                        match eval_expr(arg2, Some(input), Some(schema), query_ctx)? {
+                    let flags = if let Some(arg2) = args.get(2) {
+                        match eval_typed_expr(arg2, input, query_ctx)? {
                             Value::Text(s) => s,
                             Value::Null => String::new(),
                             v => v.to_string(),
@@ -141,30 +124,18 @@ fn eval_srf(
             }
         }
         SrfKind::RegexpMatches => {
-            let arg0 = f.args.get(0).and_then(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                _ => None,
-            });
-            let arg1 = f.args.get(1).and_then(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                _ => None,
-            });
-            let arg2 = f.args.get(2).and_then(|arg| match arg {
-                FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => Some(e),
-                _ => None,
-            });
-            let (Some(arg0), Some(arg1)) = (arg0, arg1) else {
+            let (Some(arg0), Some(arg1)) = (args.get(0), args.get(1)) else {
                 return Err(anyhow!("regexp_matches requires at least 2 arguments"));
             };
 
-            let source_val = eval_expr(arg0, Some(input), Some(schema), query_ctx)?;
+            let source_val = eval_typed_expr(arg0, input, query_ctx)?;
             let source = match source_val {
                 Value::Text(s) => Some(s),
                 Value::Null => None,
                 v => Some(v.to_string()),
             };
 
-            let pattern_val = eval_expr(arg1, Some(input), Some(schema), query_ctx)?;
+            let pattern_val = eval_typed_expr(arg1, input, query_ctx)?;
             let pattern = match pattern_val {
                 Value::Text(s) => Some(s),
                 Value::Null => None,
@@ -173,8 +144,8 @@ fn eval_srf(
 
             match (source, pattern) {
                 (Some(source), Some(pattern)) => {
-                    let flags = if let Some(arg2) = arg2 {
-                        match eval_expr(arg2, Some(input), Some(schema), query_ctx)? {
+                    let flags = if let Some(arg2) = args.get(2) {
+                        match eval_typed_expr(arg2, input, query_ctx)? {
                             Value::Text(s) => s,
                             Value::Null => String::new(),
                             v => v.to_string(),
@@ -206,10 +177,9 @@ fn eval_srf(
             }
         }
         SrfKind::EvalFunctionArray => {
-            // JSONB_OBJECT_KEYS, JSONB_ARRAY_ELEMENTS, etc. — eval_expr already
+            // JSONB_OBJECT_KEYS, JSONB_ARRAY_ELEMENTS, etc. — eval_typed_expr already
             // returns the array; we just need to unpack it.
-            let func_expr = Expr::Function(f.clone());
-            match eval_expr(&func_expr, Some(input), Some(schema), query_ctx)? {
+            match eval_typed_expr(expr, input, query_ctx)? {
                 Value::Array(arr) => Ok(arr),
                 Value::Null => Ok(Vec::new()),
                 other => Ok(vec![other]),
@@ -221,7 +191,7 @@ fn eval_srf(
 #[derive(Debug)]
 pub struct ProjectOperator {
     child: BoxedOperator,
-    expressions: Vec<Expr>,
+    expressions: Vec<TypedExpr>,
     #[allow(dead_code)] // preserved for EXPLAIN output
     output_names: Vec<String>,
     output_schema: TableSchema,
@@ -235,7 +205,7 @@ pub struct ProjectOperator {
 impl ProjectOperator {
     pub fn new(
         child: BoxedOperator,
-        expressions: Vec<Expr>,
+        expressions: Vec<TypedExpr>,
         output_names: Vec<String>,
         output_types: Vec<DataType>,
     ) -> Self {
@@ -283,11 +253,10 @@ impl ProjectOperator {
     }
 
     fn project_row(&self, input: &Row, query_ctx: &QueryContext) -> Result<Row> {
-        let child_schema = self.child.schema();
         let mut values = Vec::with_capacity(self.expressions.len());
 
         for expr in &self.expressions {
-            let value = eval_expr(expr, Some(input), Some(child_schema), query_ctx)?;
+            let value = eval_typed_expr(expr, input, query_ctx)?;
             values.push(value);
         }
 
@@ -296,23 +265,17 @@ impl ProjectOperator {
 
     /// Project a row that contains SRFs, returning a vector of expanded rows.
     fn project_row_with_srf(&self, input: &Row, query_ctx: &QueryContext) -> Result<Vec<Row>> {
-        let child_schema = self.child.schema();
-
         // First, evaluate all expressions and collect SRF outputs.
         let mut base_values = Vec::with_capacity(self.expressions.len());
         let mut srf_outputs: Vec<(usize, Vec<Value>)> = Vec::new();
 
         for (i, expr) in self.expressions.iter().enumerate() {
             if let Some(&(_, kind)) = self.srf_indices.iter().find(|(idx, _)| *idx == i) {
-                let Expr::Function(f) = expr else {
-                    base_values.push(Value::Null);
-                    continue;
-                };
-                let outputs = eval_srf(kind, f, input, child_schema, query_ctx)?;
+                let outputs = eval_srf(kind, expr, input, query_ctx)?;
                 srf_outputs.push((i, outputs));
                 base_values.push(Value::Null); // placeholder
             } else {
-                let value = eval_expr(expr, Some(input), Some(child_schema), query_ctx)?;
+                let value = eval_typed_expr(expr, input, query_ctx)?;
                 base_values.push(value);
             }
         }
@@ -329,7 +292,7 @@ impl ProjectOperator {
             .unwrap_or(0);
 
         if max_len == 0 {
-            // All SRFs returned empty → produce no rows (like PostgreSQL).
+            // All SRFs returned empty -> produce no rows (like PostgreSQL).
             return Ok(Vec::new());
         }
 
@@ -426,8 +389,8 @@ impl PhysicalOperator for ProjectOperator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analyzer::types::{BinaryOp as TypedBinaryOp, TypedExpr, TypedExprKind};
     use crate::types::ColumnDef;
-    use sqlparser::ast::Ident;
 
     fn test_schema() -> TableSchema {
         TableSchema {
@@ -473,6 +436,18 @@ mod tests {
         }
     }
 
+    /// Helper to create a ColumnRef TypedExpr.
+    fn col_ref(index: usize, name: &str, data_type: DataType) -> TypedExpr {
+        TypedExpr {
+            kind: TypedExprKind::ColumnRef {
+                scope_depth: 0,
+                column_index: index,
+                column_name: name.to_string(),
+            },
+            data_type,
+        }
+    }
+
     #[test]
     fn test_project_creation() {
         use super::super::scan::TableScanOperator;
@@ -481,8 +456,8 @@ mod tests {
         let child = Box::new(TableScanOperator::new(schema));
 
         let expressions = vec![
-            Expr::Identifier(Ident::new("id")),
-            Expr::Identifier(Ident::new("name")),
+            col_ref(0, "id", DataType::Int32),
+            col_ref(1, "name", DataType::Text),
         ];
         let output_names = vec!["id".to_string(), "name".to_string()];
         let output_types = vec![DataType::Int32, DataType::Text];
@@ -503,8 +478,8 @@ mod tests {
         let child = Box::new(TableScanOperator::new(schema));
 
         let expressions = vec![
-            Expr::Identifier(Ident::new("id")),
-            Expr::Identifier(Ident::new("name")),
+            col_ref(0, "id", DataType::Int32),
+            col_ref(1, "name", DataType::Text),
         ];
         let output_names = vec!["id".to_string(), "name".to_string()];
         let output_types = vec![DataType::Int32, DataType::Text];
@@ -525,7 +500,7 @@ mod tests {
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
 
-        let expressions = vec![Expr::Identifier(Ident::new("name"))];
+        let expressions = vec![col_ref(1, "name", DataType::Text)];
         let output_names = vec!["name".to_string()];
         let output_types = vec![DataType::Text];
 
@@ -548,18 +523,23 @@ mod tests {
     fn test_project_row_arithmetic_expression() {
         use super::super::scan::TableScanOperator;
         use crate::types::Value;
-        use sqlparser::ast::BinaryOperator;
 
         let schema = test_schema();
         let child = Box::new(TableScanOperator::new(schema));
 
-        let expressions = vec![Expr::BinaryOp {
-            left: Box::new(Expr::Identifier(Ident::new("id"))),
-            op: BinaryOperator::Plus,
-            right: Box::new(Expr::Value(sqlparser::ast::Value::Number(
-                "10".to_string(),
-                false,
-            ))),
+        let id_ref = col_ref(0, "id", DataType::Int32);
+        let ten = TypedExpr {
+            kind: TypedExprKind::Constant(Value::Int32(10)),
+            data_type: DataType::Int32,
+        };
+
+        let expressions = vec![TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(id_ref),
+                op: TypedBinaryOp::Add,
+                right: Box::new(ten),
+            },
+            data_type: DataType::Int32,
         }];
         let output_names = vec!["id_plus_10".to_string()];
         let output_types = vec![DataType::Int32];
@@ -588,8 +568,8 @@ mod tests {
         let child = Box::new(TableScanOperator::new(schema));
 
         let expressions = vec![
-            Expr::Identifier(Ident::new("id")),
-            Expr::Identifier(Ident::new("name")),
+            col_ref(0, "id", DataType::Int32),
+            col_ref(1, "name", DataType::Text),
         ];
         let output_names = vec!["id".to_string(), "name".to_string()];
         let output_types = vec![DataType::Int32, DataType::Text];

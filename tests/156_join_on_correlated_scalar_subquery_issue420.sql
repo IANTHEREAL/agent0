@@ -1,6 +1,6 @@
 -- Issue #420 regression:
--- Correlated subqueries in JOIN-context clauses are explicitly unsupported.
--- This test asserts we fail fast with a stable Unsupported error (fail-closed).
+-- Correlated scalar subquery in JOIN ON condition must produce correct results.
+-- The subquery correlates to the outer row (a.id) and filters the joined table.
 
 DROP TABLE IF EXISTS i420_a;
 DROP TABLE IF EXISTS i420_b;
@@ -24,7 +24,7 @@ NATURAL JOIN i420_b b
 JOIN i420_d d ON d.v = (SELECT e.v FROM i420_e e WHERE e.id = a.id)
 ORDER BY a.id;
 
--- 2) Same limitation in `SELECT *` queries.
+-- 2) Same query with `SELECT *` — verify correct column set.
 SELECT *
 FROM i420_a a
 NATURAL JOIN i420_b b

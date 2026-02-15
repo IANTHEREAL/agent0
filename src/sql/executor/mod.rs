@@ -9,7 +9,6 @@ mod ddl;
 mod default_privileges;
 mod dml;
 mod extensions;
-mod operators;
 mod procedure;
 mod select;
 pub(crate) mod subquery;

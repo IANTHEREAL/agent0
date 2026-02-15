@@ -69,28 +69,10 @@ impl TikvStore {
         }
         let oid = self.next_schema_oid(txn, db_id).await?;
         txn_put(txn, key, oid.to_be_bytes().to_vec()).await?;
-        self.invalidate_schema_cache(db_id).await;
         Ok(true)
     }
 
     pub async fn list_schemas(&self, txn: &mut Transaction, db_id: u64) -> Result<Vec<String>> {
-        {
-            let cache = self.cache.read().await;
-            if let Some(entry) = cache.per_db.get(&db_id) {
-                if let Some((ts, schemas)) = &entry.schemas {
-                    if ts.elapsed() < SCHEMA_CACHE_TTL {
-                        info!(
-                            "list_schemas: cache HIT ({} schemas, age {}ms)",
-                            schemas.len(),
-                            ts.elapsed().as_millis()
-                        );
-                        return Ok(schemas.clone());
-                    }
-                }
-            }
-        }
-        info!("list_schemas: cache MISS");
-
         let prefix = encode_schema_def_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
@@ -114,15 +96,6 @@ impl TikvStore {
         schemas.sort();
         schemas.dedup();
 
-        {
-            let mut cache = self.cache.write().await;
-            cache
-                .per_db
-                .entry(db_id)
-                .or_insert_with(PerDatabaseSchemaCache::new)
-                .schemas = Some((Instant::now(), schemas.clone()));
-        }
-
         Ok(schemas)
     }
 
@@ -131,17 +104,6 @@ impl TikvStore {
         txn: &mut Transaction,
         db_id: u64,
     ) -> Result<HashMap<String, u32>> {
-        {
-            let cache = self.cache.read().await;
-            if let Some(entry) = cache.per_db.get(&db_id) {
-                if let Some((ts, oids)) = &entry.schema_oids {
-                    if ts.elapsed() < SCHEMA_CACHE_TTL {
-                        return Ok(oids.clone());
-                    }
-                }
-            }
-        }
-
         let prefix = encode_schema_def_prefix_v2(db_id);
         let mut end = prefix.clone();
         end.push(0xFF);
@@ -183,15 +145,6 @@ impl TikvStore {
             };
 
             oids.insert(schema, oid);
-        }
-
-        {
-            let mut cache = self.cache.write().await;
-            cache
-                .per_db
-                .entry(db_id)
-                .or_insert_with(PerDatabaseSchemaCache::new)
-                .schema_oids = Some((Instant::now(), oids.clone()));
         }
 
         Ok(oids)
@@ -303,7 +256,6 @@ impl TikvStore {
         }
 
         txn_delete(txn, key).await?;
-        self.invalidate_schema_cache(db_id).await;
         Ok(true)
     }
 
@@ -333,9 +285,6 @@ impl TikvStore {
         }
 
         let schema_prefix = format!("{}.", schema);
-
-        // Avoid stale cached table lists during CASCADE cleanup.
-        self.invalidate_table_cache(db_id).await;
 
         for view in self.list_views(txn, db_id).await? {
             if view.schema == schema {
@@ -420,34 +369,5 @@ impl TikvStore {
         self.drop_schema_restrict(txn, db_id, schema, if_exists)
             .await?;
         Ok(true)
-    }
-
-    pub async fn invalidate_schema_cache(&self, db_id: u64) {
-        let mut cache = self.cache.write().await;
-        if let Some(entry) = cache.per_db.get_mut(&db_id) {
-            entry.schemas = None;
-            entry.schema_oids = None;
-        }
-    }
-
-    pub async fn invalidate_table_cache(&self, db_id: u64) {
-        let mut cache = self.cache.write().await;
-        if let Some(entry) = cache.per_db.get_mut(&db_id) {
-            entry.tables = None;
-        }
-    }
-
-    pub async fn invalidate_trigger_cache(&self, db_id: u64, table_full_name: &str) {
-        let mut cache = self.cache.write().await;
-        if let Some(entry) = cache.per_db.get_mut(&db_id) {
-            entry.triggers.remove(table_full_name);
-        }
-    }
-
-    pub async fn invalidate_function_cache(&self, db_id: u64, full_name: &str) {
-        let mut cache = self.cache.write().await;
-        if let Some(entry) = cache.per_db.get_mut(&db_id) {
-            entry.functions.remove(full_name);
-        }
     }
 }

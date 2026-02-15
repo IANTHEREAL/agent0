@@ -822,6 +822,48 @@ fn register_builtin_functions(r: &mut FunctionRegistry) {
         FunctionSignature::fixed(DataType::Boolean).with_args(2, Some(2)),
     );
 
+    // JSON set-returning functions (SRFs)
+    r.register(
+        "JSONB_OBJECT_KEYS",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+    );
+    r.register(
+        "JSON_OBJECT_KEYS",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+    );
+    r.register(
+        "JSONB_ARRAY_ELEMENTS",
+        FunctionSignature::fixed(DataType::Jsonb).with_args(1, Some(1)),
+    );
+    r.register(
+        "JSON_ARRAY_ELEMENTS",
+        FunctionSignature::fixed(DataType::Json).with_args(1, Some(1)),
+    );
+    r.register(
+        "JSONB_ARRAY_ELEMENTS_TEXT",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+    );
+    r.register(
+        "JSON_ARRAY_ELEMENTS_TEXT",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+    );
+    r.register(
+        "JSONB_EACH",
+        FunctionSignature::fixed(DataType::Jsonb).with_args(1, Some(1)),
+    );
+    r.register(
+        "JSON_EACH",
+        FunctionSignature::fixed(DataType::Json).with_args(1, Some(1)),
+    );
+    r.register(
+        "JSONB_EACH_TEXT",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+    );
+    r.register(
+        "JSON_EACH_TEXT",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+    );
+
     // Array functions
     r.register(
         "ARRAY_LENGTH",
@@ -1029,6 +1071,84 @@ fn register_builtin_functions(r: &mut FunctionRegistry) {
     r.register(
         "SHOBJ_DESCRIPTION",
         FunctionSignature::fixed(DataType::Text).with_args(2, Some(2)),
+    );
+
+    // pg_catalog introspection functions (used by ORMs for schema discovery)
+    r.register(
+        "FORMAT_TYPE",
+        FunctionSignature::fixed(DataType::Text).with_args(2, Some(2)),
+    );
+    r.register(
+        "PG_GET_INDEXDEF",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(3)),
+    );
+    r.register(
+        "PG_GET_CONSTRAINTDEF",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(2)),
+    );
+    r.register(
+        "PG_GET_EXPR",
+        FunctionSignature::fixed(DataType::Text).with_args(2, Some(3)),
+    );
+    r.register(
+        "PG_GET_USERBYID",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+    );
+    r.register(
+        "PG_GET_SERIAL_SEQUENCE",
+        FunctionSignature::fixed(DataType::Text).with_args(2, Some(2)),
+    );
+    r.register(
+        "PG_ENCODING_TO_CHAR",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+    );
+    r.register(
+        "PG_COLUMN_SIZE",
+        FunctionSignature::fixed(DataType::Int32).with_args(1, Some(1)),
+    );
+    r.register(
+        "PG_IS_IN_RECOVERY",
+        FunctionSignature::fixed(DataType::Boolean).with_args(0, Some(0)),
+    );
+    r.register(
+        "TXID_CURRENT",
+        FunctionSignature::fixed(DataType::Int64).with_args(0, Some(0)),
+    );
+
+    // Full-text search functions
+    r.register(
+        "TO_TSVECTOR",
+        FunctionSignature::fixed(DataType::Tsvector).with_args(1, Some(2)),
+    );
+    r.register(
+        "PLAINTO_TSQUERY",
+        FunctionSignature::fixed(DataType::Tsquery).with_args(1, Some(2)),
+    );
+    r.register(
+        "TO_TSQUERY",
+        FunctionSignature::fixed(DataType::Tsquery).with_args(1, Some(2)),
+    );
+    r.register(
+        "TS_RANK",
+        FunctionSignature::fixed(DataType::Float64).with_args(2, Some(4)),
+    );
+    r.register(
+        "TS_RANK_CD",
+        FunctionSignature::fixed(DataType::Float64).with_args(2, Some(4)),
+    );
+    r.register(
+        "SETWEIGHT",
+        FunctionSignature::fixed(DataType::Tsvector).with_args(2, Some(2)),
+    );
+
+    // Array functions
+    r.register(
+        "CARDINALITY",
+        FunctionSignature::fixed(DataType::Int32).with_args(1, Some(1)),
+    );
+    r.register(
+        "REGEXP_SPLIT_TO_ARRAY",
+        FunctionSignature::fixed(DataType::Array(Box::new(DataType::Text))).with_args(2, Some(3)),
     );
 
     // Bytea functions

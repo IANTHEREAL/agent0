@@ -31,6 +31,7 @@ pub(crate) fn statement_timestamp_millis_or_now() -> i64 {
 /// Read the task-local TRANSACTION_TIMESTAMP_MILLIS, falling back to
 /// statement time (which is the correct PostgreSQL semantics for implicit
 /// autocommit transactions where transaction_ts == statement_ts).
+#[cfg(test)]
 pub(super) fn transaction_timestamp_millis_or_now() -> i64 {
     transaction_timestamp_millis().unwrap_or_else(statement_timestamp_millis_or_now)
 }

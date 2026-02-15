@@ -9,10 +9,9 @@ use std::collections::HashMap;
 
 use sqlparser::ast::{BinaryOperator, Expr, JsonOperator};
 
-use super::expr::eval_expr;
+use super::expr::bridge::eval_const_ast_expr;
 use super::names::normalize_ident;
 use super::operators::HashJoinConfig;
-use crate::sql::query_context::QueryContext;
 use crate::types::{DataType, IndexDef, TableSchema, Value};
 
 /// Result of join algorithm selection.
@@ -163,6 +162,7 @@ fn extract_column_pair(
 ///
 /// Returns `(left_key_indices, right_key_indices, residual_filter)`.
 /// If no equi-join keys are found, returns `None`.
+#[cfg(test)]
 pub(crate) fn split_join_condition(
     expr: &Expr,
     left_schema: &TableSchema,
@@ -340,8 +340,156 @@ pub fn choose_best_access_path_for_filter(
     best
 }
 
+/// Choose the best access path using a typed filter expression (from the Analyzer).
+///
+/// This is the TypedExpr equivalent of [`choose_best_access_path_for_filter`].
+/// Expression-index matching and GIN are not yet supported on the typed path;
+/// those optimizations require Expr-level AST matching (a follow-up).
+pub fn choose_best_access_path_for_typed_filter(
+    _db_id: u64,
+    schema: &TableSchema,
+    filter: Option<&super::analyzer::types::TypedExpr>,
+    estimated_table_rows: usize,
+) -> AccessPath {
+    let Some(filter_expr) = filter else {
+        return AccessPath {
+            scan_type: ScanType::FullTableScan,
+            cost: estimated_table_rows as f64,
+        };
+    };
+
+    let predicates = analyze_typed_predicates(filter_expr);
+    // Pass `None` for the AST filter — expression-index matching not yet typed.
+    choose_best_access_path_with_filter(schema, &predicates, None, estimated_table_rows)
+}
+
+/// Extract [`PredicateInfo`] from a [`TypedExpr`] tree.
+///
+/// Simpler than the AST version: column names and constant values are already
+/// resolved by the Analyzer.
+pub fn analyze_typed_predicates(expr: &super::analyzer::types::TypedExpr) -> Vec<PredicateInfo> {
+    let mut predicates = Vec::new();
+    collect_typed_predicates(expr, &mut predicates);
+    predicates
+}
+
+fn collect_typed_predicates(
+    expr: &super::analyzer::types::TypedExpr,
+    predicates: &mut Vec<PredicateInfo>,
+) {
+    use super::analyzer::types::{BinaryOp as TypedBinaryOp, IsTestKind, TypedExprKind};
+
+    match &expr.kind {
+        TypedExprKind::BinaryOp { left, op, right } => match op {
+            TypedBinaryOp::And => {
+                collect_typed_predicates(left, predicates);
+                collect_typed_predicates(right, predicates);
+            }
+            TypedBinaryOp::Or => {} // can't use for index selection
+            _ => {
+                let pred_op = match op {
+                    TypedBinaryOp::Eq => Some(PredicateOp::Eq),
+                    TypedBinaryOp::NotEq => Some(PredicateOp::Ne),
+                    TypedBinaryOp::Lt => Some(PredicateOp::Lt),
+                    TypedBinaryOp::LtEq => Some(PredicateOp::Le),
+                    TypedBinaryOp::Gt => Some(PredicateOp::Gt),
+                    TypedBinaryOp::GtEq => Some(PredicateOp::Ge),
+                    _ => None,
+                };
+                if let Some(pred_op) = pred_op {
+                    // Try col OP const or const OP col
+                    if let Some(pred) = extract_typed_simple_predicate(left, right, pred_op.clone())
+                    {
+                        predicates.push(pred);
+                    } else if let Some(pred) =
+                        extract_typed_simple_predicate(right, left, flip_pred_op(pred_op))
+                    {
+                        predicates.push(pred);
+                    }
+                }
+            }
+        },
+        TypedExprKind::IsTest {
+            expr: inner,
+            test,
+            negated,
+        } => {
+            if let TypedExprKind::ColumnRef { column_name, .. } = &inner.kind {
+                let op = match (test, negated) {
+                    (IsTestKind::Null, false) => Some(PredicateOp::IsNull),
+                    (IsTestKind::Null, true) => Some(PredicateOp::IsNotNull),
+                    _ => None,
+                };
+                if let Some(op) = op {
+                    predicates.push(PredicateInfo {
+                        column: column_name.to_lowercase(),
+                        op,
+                        value: Value::Null,
+                        in_values: vec![],
+                    });
+                }
+            }
+        }
+        TypedExprKind::InList {
+            expr: inner,
+            list,
+            negated: false,
+        } => {
+            if let TypedExprKind::ColumnRef { column_name, .. } = &inner.kind {
+                let values: Vec<Value> = list
+                    .iter()
+                    .filter_map(|e| {
+                        if let TypedExprKind::Constant(v) = &e.kind {
+                            Some(v.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if values.len() == list.len() && !values.is_empty() {
+                    predicates.push(PredicateInfo {
+                        column: column_name.to_lowercase(),
+                        op: PredicateOp::In,
+                        value: values[0].clone(),
+                        in_values: values,
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_typed_simple_predicate(
+    maybe_col: &super::analyzer::types::TypedExpr,
+    maybe_val: &super::analyzer::types::TypedExpr,
+    op: PredicateOp,
+) -> Option<PredicateInfo> {
+    use super::analyzer::types::TypedExprKind;
+    if let TypedExprKind::ColumnRef { column_name, .. } = &maybe_col.kind {
+        if let TypedExprKind::Constant(val) = &maybe_val.kind {
+            return Some(PredicateInfo {
+                column: column_name.to_lowercase(),
+                op,
+                value: val.clone(),
+                in_values: vec![],
+            });
+        }
+    }
+    None
+}
+
+fn flip_pred_op(op: PredicateOp) -> PredicateOp {
+    match op {
+        PredicateOp::Lt => PredicateOp::Gt,
+        PredicateOp::Le => PredicateOp::Ge,
+        PredicateOp::Gt => PredicateOp::Lt,
+        PredicateOp::Ge => PredicateOp::Le,
+        other => other,
+    }
+}
+
 fn collect_predicates(expr: &Expr, predicates: &mut Vec<PredicateInfo>) {
-    let qc = QueryContext::from_task_locals();
     match expr {
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => {
@@ -412,10 +560,10 @@ fn collect_predicates(expr: &Expr, predicates: &mut Vec<PredicateInfo>) {
             }
             if let Expr::Identifier(ident) = &**expr {
                 let column = normalize_ident(ident);
-                let Ok(low_value) = eval_expr(low, None, None, &qc) else {
+                let Ok(low_value) = eval_const_ast_expr(low) else {
                     return;
                 };
-                let Ok(high_value) = eval_expr(high, None, None, &qc) else {
+                let Ok(high_value) = eval_const_ast_expr(high) else {
                     return;
                 };
                 predicates.push(PredicateInfo {
@@ -443,7 +591,7 @@ fn collect_predicates(expr: &Expr, predicates: &mut Vec<PredicateInfo>) {
             if let Expr::Identifier(ident) = &**expr {
                 let mut values = Vec::with_capacity(list.len());
                 for item in list {
-                    let Ok(v) = eval_expr(item, None, None, &qc) else {
+                    let Ok(v) = eval_const_ast_expr(item) else {
                         return;
                     };
                     values.push(v);
@@ -465,9 +613,8 @@ fn collect_predicates(expr: &Expr, predicates: &mut Vec<PredicateInfo>) {
 }
 
 fn extract_simple_predicate(left: &Expr, right: &Expr, op: PredicateOp) -> Option<PredicateInfo> {
-    let qc = QueryContext::from_task_locals();
     if let Expr::Identifier(ident) = left {
-        if let Ok(val) = eval_expr(right, None, None, &qc) {
+        if let Ok(val) = eval_const_ast_expr(right) {
             return Some(PredicateInfo {
                 column: normalize_ident(ident),
                 op,
@@ -477,7 +624,7 @@ fn extract_simple_predicate(left: &Expr, right: &Expr, op: PredicateOp) -> Optio
         }
     }
     if let Expr::Identifier(ident) = right {
-        if let Ok(val) = eval_expr(left, None, None, &qc) {
+        if let Ok(val) = eval_const_ast_expr(left) {
             let reversed_op = match op {
                 PredicateOp::Lt => PredicateOp::Gt,
                 PredicateOp::Le => PredicateOp::Ge,
@@ -594,7 +741,6 @@ fn match_expression_predicates(index: &IndexDef, filter: &Expr) -> Option<Vec<Va
         return None;
     }
 
-    let qc = QueryContext::from_task_locals();
     let filter_conjuncts = extract_conjuncts(filter);
     let mut values = Vec::with_capacity(index.expressions.len());
 
@@ -614,13 +760,13 @@ fn match_expression_predicates(index: &IndexDef, filter: &Expr) -> Option<Vec<Va
                 let right_norm = normalize_expr_for_match(right);
 
                 if left_norm == normalized_expr {
-                    if let Ok(value) = eval_expr(right, None, None, &qc) {
+                    if let Ok(value) = eval_const_ast_expr(right) {
                         matched_value = Some(value);
                         break;
                     }
                 }
                 if right_norm == normalized_expr {
-                    if let Ok(value) = eval_expr(left, None, None, &qc) {
+                    if let Ok(value) = eval_const_ast_expr(left) {
                         matched_value = Some(value);
                         break;
                     }
@@ -954,7 +1100,6 @@ fn extract_gin_contains_predicate(expr: &Expr) -> Option<(String, Value)> {
 }
 
 fn collect_gin_predicates(expr: &Expr) -> Vec<(String, Value)> {
-    let qc = QueryContext::from_task_locals();
     match expr {
         Expr::Nested(inner) => collect_gin_predicates(inner),
         Expr::BinaryOp { left, op, right } if matches!(op, BinaryOperator::And) => {
@@ -965,10 +1110,7 @@ fn collect_gin_predicates(expr: &Expr) -> Vec<(String, Value)> {
         Expr::BinaryOp { left, op, right }
             if is_gin_binary_operator(op, "@@") || is_gin_binary_operator(op, "@>") =>
         {
-            match (
-                extract_column_ref(left),
-                eval_expr(right, None, None, &qc).ok(),
-            ) {
+            match (extract_column_ref(left), eval_const_ast_expr(right).ok()) {
                 (Some(column), Some(pattern)) => vec![(column.name, pattern)],
                 _ => Vec::new(),
             }
@@ -996,7 +1138,6 @@ fn is_gin_binary_operator(op: &BinaryOperator, expected: &str) -> bool {
 }
 
 fn collect_json_access_gin_predicates(left: &Expr, right: &Expr) -> Vec<(String, Value)> {
-    let qc = QueryContext::from_task_locals();
     let Some(column) = extract_column_ref(left).map(|col| col.name) else {
         return Vec::new();
     };
@@ -1008,13 +1149,13 @@ fn collect_json_access_gin_predicates(left: &Expr, right: &Expr) -> Vec<(String,
             right: rhs_right,
         } if matches!(op, BinaryOperator::And) => {
             let mut predicates = Vec::new();
-            if let Ok(pattern) = eval_expr(rhs_left, None, None, &qc) {
+            if let Ok(pattern) = eval_const_ast_expr(rhs_left) {
                 predicates.push((column, pattern));
             }
             predicates.extend(collect_gin_predicates(rhs_right));
             predicates
         }
-        _ => match eval_expr(right, None, None, &qc).ok() {
+        _ => match eval_const_ast_expr(right).ok() {
             Some(pattern) => vec![(column, pattern)],
             None => Vec::new(),
         },
