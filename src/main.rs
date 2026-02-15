@@ -69,7 +69,10 @@ fn main() -> Result<()> {
         }
         Ok(cli::CliAction::Run(cli_args)) => cli_args,
         Err(msg) => {
-            eprintln!("Error: {}\nTry 'pg-tikv --help' for usage information.", msg);
+            eprintln!(
+                "Error: {}\nTry 'pg-tikv --help' for usage information.",
+                msg
+            );
             std::process::exit(1);
         }
     };
