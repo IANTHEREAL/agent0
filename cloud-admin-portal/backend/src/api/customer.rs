@@ -22,7 +22,9 @@ const SYSTEM_USER_PREFIX: &str = "_pgtikv_sys_";
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/register", post(register))
+        .route("/anonymous-register", post(anonymous_register))
         .route("/login", post(login))
+        .route("/claim", post(claim_account))
         .route("/me", get(me))
         .route("/tokens", get(list_tokens))
         .route("/tokens/:token_id", delete(revoke_token))
@@ -241,6 +243,41 @@ pub async fn register(
     ))
 }
 
+pub async fn anonymous_register(
+    State(state): State<AppState>,
+) -> Result<Json<AnonymousRegisterResponse>, AppError> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let email = format!("anon_{id}@anonymous.local");
+    let placeholder_hash = "$anon$not-a-real-hash";
+
+    db::create_anonymous_customer(&state.db, &id, &email, placeholder_hash, 5).await?;
+
+    use rand::RngCore;
+    let mut token_bytes = [0u8; 64];
+    rand::thread_rng().fill_bytes(&mut token_bytes);
+    let token = token_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    let hash_bytes = Sha256::digest(token.as_bytes());
+    let token_hash = hash_bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+
+    let expires_at = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
+    let token_id = uuid::Uuid::new_v4().to_string();
+
+    db::create_customer_token(&state.db, &token_id, &id, &token_hash, "default", &expires_at).await?;
+
+    Ok(Json(AnonymousRegisterResponse {
+        token,
+        expires_at,
+        is_anonymous: true,
+    }))
+}
+
 // ── POST /login ──────────────────────────────────────────────────
 
 pub async fn login(
@@ -286,6 +323,57 @@ pub async fn login(
     .await?;
 
     Ok(Json(LoginResponse { token, expires_at }))
+}
+
+pub async fn claim_account(
+    State(state): State<AppState>,
+    auth: CustomerAuth,
+    Json(req): Json<ClaimRequest>,
+) -> Result<Json<ClaimResponse>, AppError> {
+    if !req.email.contains('@') || req.email.len() < 3 || req.email.len() > 254 {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "Invalid email address",
+        ));
+    }
+    if req.password.len() < 8 {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "Password must be at least 8 characters",
+        ));
+    }
+
+    if db::get_customer_by_email(&state.db, &req.email).await?.is_some() {
+        return Err(AppError::conflict("Email already registered"));
+    }
+
+    use argon2::{password_hash::SaltString, Argon2, PasswordHasher};
+    use rand::rngs::OsRng;
+    let salt = SaltString::generate(&mut OsRng);
+    let password_hash = Argon2::default()
+        .hash_password(req.password.as_bytes(), &salt)
+        .map_err(|e| AppError::internal(format!("Password hashing failed: {e}")))?
+        .to_string();
+
+    let claimed = db::claim_anonymous_customer(
+        &state.db,
+        &auth.customer_id,
+        &req.email,
+        &password_hash,
+    )
+    .await?;
+    if !claimed {
+        return Err(AppError::new(
+            StatusCode::BAD_REQUEST,
+            "Account is not anonymous or already claimed",
+        ));
+    }
+
+    Ok(Json(ClaimResponse {
+        id: auth.customer_id,
+        email: req.email,
+        claimed: true,
+    }))
 }
 
 // ── GET /me ──────────────────────────────────────────────────────
@@ -348,6 +436,20 @@ pub async fn create_database(
     auth: CustomerAuth,
     Json(req): Json<CreateDatabaseRequest>,
 ) -> Result<(StatusCode, Json<DatabaseResponse>), AppError> {
+    let customer = db::get_customer_by_id(&state.db, &auth.customer_id)
+        .await?
+        .ok_or_else(|| AppError::not_found("Customer not found"))?;
+
+    if customer.is_anonymous {
+        let tenant_count = db::count_customer_tenants(&state.db, &auth.customer_id).await?;
+        let limit = customer.database_limit.unwrap_or(5) as i64;
+        if tenant_count >= limit {
+            return Err(AppError::forbidden(format!(
+                "Anonymous account database limit reached (max {limit}). Run 'db9 claim' to upgrade your account."
+            )));
+        }
+    }
+
     let tenant_id = generate_tenant_id();
     let keyspace = make_keyspace(&tenant_id);
     let admin_user = DEFAULT_ADMIN_USER.to_string();
