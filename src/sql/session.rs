@@ -70,7 +70,7 @@ pub(crate) struct SessionSettings {
 impl SessionSettings {
     pub(crate) fn new() -> Self {
         Self {
-            search_path: vec!["public".to_string()],
+            search_path: vec!["public".to_string(), "extensions".to_string()],
             max_sort_bytes: DEFAULT_MAX_SORT_BYTES,
             ..Default::default()
         }

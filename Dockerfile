@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 rust:1.85-bookworm AS builder
+FROM --platform=linux/amd64 rust:1.88-bookworm AS builder
 
 # Add arm64 architecture and install cross-compilation toolchain
 RUN dpkg --add-architecture arm64 && \

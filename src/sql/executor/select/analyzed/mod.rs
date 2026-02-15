@@ -62,7 +62,7 @@ impl Executor {
     ) -> Result<ExecuteResult> {
         // Build CatalogSnapshot (async: fetches table schemas from store).
         let catalog =
-            build_catalog_snapshot(self.store().as_ref(), txn, db_id, search_path, query, ctes)
+            build_catalog_snapshot(self.store().as_ref(), txn, db_id, search_path, self.tenant_keyspace(), query, ctes)
                 .await?;
 
         // Run the Analyzer (sync: name resolution + type checking).

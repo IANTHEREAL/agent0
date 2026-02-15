@@ -94,16 +94,16 @@ pub(crate) fn table_function_schema(func_name: &str) -> Option<TableSchema> {
 /// for dynamic schemas (directory listing vs file vs csv headers) while keeping
 /// analysis itself synchronous.
 pub(crate) async fn infer_table_function_schema(
-    _tenant: &str,
+    tenant: &str,
     mode: &Fs9Mode,
 ) -> Result<TableSchema> {
-    if !context::allow_local_fs() {
+    let use_remote = backend::is_remote_configured();
+    if !use_remote && !context::allow_local_fs() {
         return Err(anyhow!("permission denied for extension \"fs9\""));
     }
 
-    use backend::FsBackend;
-
-    let backend = backend::local_backend();
+    let backend = backend::get_backend(tenant);
+    let backend = backend.as_ref();
 
     match mode {
         Fs9Mode::Directory { .. } => Ok(decoders::decode_directory(Vec::new()).schema),
@@ -143,7 +143,8 @@ pub(crate) async fn infer_table_function_schema(
             exclude,
         } => {
             let matching_files =
-                glob::expand_glob(backend, pattern, MAX_FILES_PER_GLOB, exclude.as_deref()).await?;
+                glob::expand_glob(&*backend, pattern, MAX_FILES_PER_GLOB, exclude.as_deref())
+                    .await?;
 
             if matching_files.is_empty() {
                 return Ok(decoders::decode_raw_text(&[], pattern, 0).schema);
@@ -172,16 +173,16 @@ pub(crate) async fn infer_table_function_schema(
 }
 
 pub(crate) async fn execute_table_function(
-    _tenant: &str,
+    tenant: &str,
     mode: Fs9Mode,
 ) -> Result<(TableSchema, Vec<Row>)> {
-    if !context::allow_local_fs() {
+    let use_remote = backend::is_remote_configured();
+    if !use_remote && !context::allow_local_fs() {
         return Err(anyhow!("permission denied for extension \"fs9\""));
     }
 
-    use backend::FsBackend;
-
-    let backend = backend::local_backend();
+    let backend = backend::get_backend(tenant);
+    let backend = backend.as_ref();
 
     match mode {
         Fs9Mode::Directory {
@@ -300,18 +301,18 @@ pub(crate) async fn execute_table_function(
 }
 
 pub(crate) async fn start_file_stream(
+    tenant: &str,
     path: &str,
     format: Option<&str>,
     delimiter: Option<char>,
     header: Option<bool>,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
-    if !context::allow_local_fs() {
+    let use_remote = backend::is_remote_configured();
+    if !use_remote && !context::allow_local_fs() {
         return Err(anyhow!("permission denied for extension \"fs9\""));
     }
 
-    use backend::FsBackend;
-
-    let backend = backend::local_backend();
+    let backend = backend::get_backend(tenant);
     let info = backend.stat(path).await?;
     if info.is_dir {
         return Ok(None);
@@ -404,17 +405,27 @@ pub(crate) async fn start_file_stream(
 }
 
 pub(crate) async fn start_glob_stream(
+    tenant: &str,
     pattern: &str,
     format: Option<&str>,
     delimiter: Option<char>,
     header: Option<bool>,
     exclude: Option<&str>,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
-    start_glob_stream_with_budget(pattern, format, delimiter, header, exclude, MAX_TOTAL_BYTES)
-        .await
+    start_glob_stream_with_budget(
+        tenant,
+        pattern,
+        format,
+        delimiter,
+        header,
+        exclude,
+        MAX_TOTAL_BYTES,
+    )
+    .await
 }
 
 async fn start_glob_stream_with_budget(
+    tenant: &str,
     pattern: &str,
     format: Option<&str>,
     delimiter: Option<char>,
@@ -422,15 +433,14 @@ async fn start_glob_stream_with_budget(
     exclude: Option<&str>,
     max_total_bytes: usize,
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
-    if !context::allow_local_fs() {
+    let use_remote = backend::is_remote_configured();
+    if !use_remote && !context::allow_local_fs() {
         return Err(anyhow!("permission denied for extension \"fs9\""));
     }
 
-    use backend::FsBackend;
+    let backend = backend::get_backend(tenant);
 
-    let backend = backend::local_backend();
-
-    let first_path = match glob::find_first_match(backend, pattern, exclude).await? {
+    let first_path = match glob::find_first_match(&*backend, pattern, exclude).await? {
         Some(p) => p,
         None => return Ok(None),
     };
@@ -467,9 +477,10 @@ async fn start_glob_stream_with_budget(
     let fmt_owned = fmt.to_string();
     let pattern_owned = pattern.to_string();
     let exclude_owned = exclude.map(|s| s.to_string());
+    // Move the boxed backend into the spawned task so it can make further requests.
     tokio::spawn(async move {
         let matching_files = match glob::expand_glob(
-            backend,
+            &*backend,
             &pattern_owned,
             MAX_FILES_PER_GLOB,
             exclude_owned.as_deref(),
@@ -737,7 +748,7 @@ mod tests {
 
         let pattern = format!("{}/*.txt", dir.display());
         let (schema, mut rx) = context::with_context(true, async {
-            start_glob_stream(&pattern, None, None, None, None)
+            start_glob_stream("", &pattern, None, None, None, None)
                 .await
                 .expect("start glob stream")
                 .expect("expected streaming result")
@@ -768,7 +779,7 @@ mod tests {
         let budget = "line1\nline2\nline3\n".len();
 
         let (_schema, mut rx) = context::with_context(true, async {
-            start_glob_stream_with_budget(&pattern, None, None, None, None, budget)
+            start_glob_stream_with_budget("", &pattern, None, None, None, None, budget)
                 .await
                 .expect("start glob stream")
                 .expect("expected streaming result")
