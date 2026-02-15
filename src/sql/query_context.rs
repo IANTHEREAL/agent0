@@ -1,10 +1,16 @@
 //! Per-statement query context replacing scattered task-local variables.
 //!
-//! Replaces: `CONNECTION_ID`, `CURRENT_DATABASE_NAME` (expr/mod.rs),
+//! Replaces: `CONNECTION_ID`, `CURRENT_DATABASE_NAME`,
 //! `STATEMENT_TIMESTAMP_MILLIS` (statement_time.rs), `TIMEZONE` (session_context.rs).
-//! Legacy paths still set task-locals; eval functions fall back when QueryContext is absent.
+//! Legacy paths still read task-locals; eval functions fall back when QueryContext is absent.
 
+use std::future::Future;
 use std::sync::Arc;
+
+tokio::task_local! {
+    static CONNECTION_ID: i32;
+    static CURRENT_DATABASE_NAME: Arc<str>;
+}
 
 #[derive(Debug, Clone)]
 pub struct QueryContext {
@@ -38,6 +44,14 @@ impl QueryContext {
         }
     }
 
+    pub(crate) fn current_connection_id() -> Option<i32> {
+        CONNECTION_ID.try_with(|id| *id).ok()
+    }
+
+    pub(crate) fn current_database_name() -> Option<Arc<str>> {
+        CURRENT_DATABASE_NAME.try_with(|name| name.clone()).ok()
+    }
+
     /// Build a QueryContext from task-local storage.
     ///
     /// Use this for code paths that don't receive an explicit QueryContext
@@ -45,7 +59,6 @@ impl QueryContext {
     /// the task-locals are always populated by the session layer, so the
     /// returned context is correct.
     pub fn from_task_locals() -> Self {
-        use crate::sql::expr::{get_connection_id_value, get_current_database_name};
         use crate::sql::statement_time::{
             statement_timestamp_millis_or_now, transaction_timestamp_millis,
         };
@@ -53,12 +66,44 @@ impl QueryContext {
         let stmt_ts = statement_timestamp_millis_or_now();
         let txn_ts = transaction_timestamp_millis().unwrap_or(stmt_ts);
         Self::new(
-            get_connection_id_value(),
-            get_current_database_name().unwrap_or_else(|| Arc::from("postgres")),
+            Self::current_connection_id().unwrap_or(0),
+            Self::current_database_name().unwrap_or_else(|| Arc::from("postgres")),
             stmt_ts,
             txn_ts,
             crate::session_context::current_timezone(),
         )
+    }
+}
+
+pub(crate) async fn with_query_context<R, Fut>(
+    connection_id: i32,
+    database_name: Arc<str>,
+    fut: Fut,
+) -> R
+where
+    Fut: Future<Output = R>,
+{
+    // In debug builds, nested task-local scopes can create very large async state machines.
+    // Boxing the inner future keeps scope wrappers small and avoids stack overflows.
+    #[cfg(debug_assertions)]
+    {
+        let fut = Box::pin(fut);
+        CONNECTION_ID
+            .scope(
+                connection_id,
+                CURRENT_DATABASE_NAME.scope(database_name, fut),
+            )
+            .await
+    }
+
+    #[cfg(not(debug_assertions))]
+    {
+        CONNECTION_ID
+            .scope(
+                connection_id,
+                CURRENT_DATABASE_NAME.scope(database_name, fut),
+            )
+            .await
     }
 }
 
@@ -81,5 +126,15 @@ mod tests {
         assert_eq!(ctx2.statement_timestamp_ms, 1_700_000_000_000);
         assert_eq!(ctx2.transaction_timestamp_ms, 1_700_000_000_000);
         assert_eq!(ctx2.timezone.as_ref(), "UTC");
+    }
+
+    #[tokio::test]
+    async fn from_task_locals_reads_query_identity() {
+        let ctx = with_query_context(77, Arc::from("tenant_db"), async {
+            QueryContext::from_task_locals()
+        })
+        .await;
+        assert_eq!(ctx.connection_id, 77);
+        assert_eq!(ctx.database_name.as_ref(), "tenant_db");
     }
 }

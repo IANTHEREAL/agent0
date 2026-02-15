@@ -718,7 +718,7 @@ fn analyze_union() {
 }
 
 #[test]
-fn analyze_values_query() {
+fn analyze_values_query_body() {
     let catalog = test_catalog();
     let mut analyzer = Analyzer::new(&catalog);
     let query = parse_query("VALUES (1, 'a'), (2, 'b')");
@@ -741,6 +741,46 @@ fn analyze_values_query() {
         }
         _ => panic!("expected Values body"),
     }
+}
+
+#[test]
+fn analyze_values_query_order_by_position_resolves_to_column() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("VALUES (1), (2) ORDER BY 1");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    assert_eq!(result.order_by.len(), 1);
+    match &result.order_by[0].expr.kind {
+        TypedExprKind::ColumnRef { column_index, .. } => assert_eq!(*column_index, 0),
+        other => panic!(
+            "expected ColumnRef, got {:?}",
+            std::mem::discriminant(other)
+        ),
+    }
+}
+
+#[test]
+fn analyze_values_query_unifies_column_types_with_implicit_cast() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("VALUES (1), (9999999999)");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    assert_eq!(result.output_schema.len(), 1);
+    assert_eq!(result.output_schema[0].1, DataType::Int64);
+    let AnalyzedQueryBody::Values(rows) = &result.body else {
+        panic!("expected Values");
+    };
+    assert!(matches!(
+        rows[0][0].kind,
+        TypedExprKind::Cast {
+            cast_context: crate::sql::types::CastContext::Implicit,
+            ..
+        }
+    ));
+    assert_eq!(rows[0][0].data_type, DataType::Int64);
+    assert_eq!(rows[1][0].data_type, DataType::Int64);
 }
 
 #[test]

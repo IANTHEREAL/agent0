@@ -1,5 +1,5 @@
 use super::catalog::{global_catalog, ScanContext};
-use super::expr;
+use super::query_context::QueryContext;
 use crate::storage::TikvStore;
 use crate::types::{Row, TableSchema};
 use anyhow::{anyhow, Result};
@@ -49,7 +49,7 @@ pub async fn get_information_schema_data_filtered(
 
     let schemas = store.list_schemas(txn, db_id).await?;
     let schema_oids = store.list_schema_oids(txn, db_id).await?;
-    let database_name = match expr::get_current_database_name() {
+    let database_name = match QueryContext::current_database_name() {
         Some(name) => name,
         None => Arc::<str>::from(
             store

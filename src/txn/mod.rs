@@ -23,7 +23,7 @@ pub(crate) async fn with_savepoints<R>(
     savepoints: Arc<SavepointState>,
     future: impl Future<Output = R>,
 ) -> R {
-    // See `sql::expr::with_query_context` for rationale.
+    // See `sql::query_context::with_query_context` for rationale.
     #[cfg(debug_assertions)]
     {
         SAVEPOINTS.scope(savepoints, Box::pin(future)).await

@@ -697,7 +697,7 @@ pub struct AnalyzedQuery {
 
 /// The body of an analyzed query.
 ///
-/// Each variant produces rows with a schema matching the parent
+/// Each variant produces rows with a schema matching
 /// `AnalyzedQuery::output_schema`.
 #[derive(Debug, Clone)]
 pub enum AnalyzedQueryBody {

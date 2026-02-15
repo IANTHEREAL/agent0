@@ -1,7 +1,11 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use crate::sql::analyzer::types::TypedExpr;
+use crate::sql::analyzer::{Analyzer, CatalogSnapshot, Scope};
 use crate::sql::error::SqlError;
+use crate::sql::expr::typed_eval::eval_typed_expr;
+use crate::sql::query_context::QueryContext;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, ColumnDef as SqlColumnDef, ColumnOption,
@@ -29,6 +33,27 @@ use crate::types::{
 
 const DDL_SCAN_BATCH_SIZE: u32 = 1024;
 const DDL_BACKFILL_COMMIT_SIZE: usize = 5000;
+
+fn analyze_row_level_expr(
+    expr: &Expr,
+    schema: &TableSchema,
+    db_id: u64,
+    search_path: &[String],
+) -> Result<TypedExpr> {
+    let mut catalog = CatalogSnapshot::new(search_path.to_vec(), db_id);
+    let table_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
+    catalog.add_table(table_name, schema.name.clone(), schema.clone());
+    if let Some(alias) = &schema.from_alias {
+        catalog.add_table(alias, schema.name.clone(), schema.clone());
+    }
+
+    Analyzer::analyze_expr_with_scope(&catalog, Scope::from_table_schema(table_name, schema), expr)
+        .map_err(|e| anyhow!("{}", e))
+}
+
+fn eval_row_level_expr(typed_expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Result<Value> {
+    eval_typed_expr(typed_expr, row, qctx)
+}
 
 async fn resolve_column_data_type(
     store: &Arc<TikvStore>,
@@ -2196,6 +2221,8 @@ pub async fn execute_alter_table(
                 }
 
                 // PostgreSQL validates existing rows by default (unless NOT VALID).
+                let typed_check_expr = analyze_row_level_expr(expr, &schema, db_id, search_path)?;
+                let qctx = QueryContext::from_task_locals();
                 let (start, end) =
                     crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
                 let mut scanner = KvScanBatches::new(start, end, DDL_SCAN_BATCH_SIZE);
@@ -2204,10 +2231,7 @@ pub async fn execute_alter_table(
                         let mut row = crate::storage::deserialize_row(pair.value())?;
                         fill_row_defaults(&mut row, &schema)?;
 
-                        let table_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-                        let result = super::expr::bridge::eval_ast_expr_with_row(
-                            expr, &row, &schema, table_name,
-                        )?;
+                        let result = eval_row_level_expr(&typed_check_expr, &row, &qctx)?;
                         match result {
                             Value::Boolean(true) | Value::Null => {}
                             Value::Boolean(false) => {
@@ -2661,6 +2685,17 @@ pub async fn execute_alter_table(
 
                     let mut target_col = schema.columns[col_idx].clone();
                     target_col.data_type = new_type.clone();
+                    let typed_using_expr = if let Some(using_expr) = &using {
+                        Some(analyze_row_level_expr(
+                            using_expr,
+                            &schema,
+                            db_id,
+                            search_path,
+                        )?)
+                    } else {
+                        None
+                    };
+                    let qctx = QueryContext::from_task_locals();
 
                     let (start, end) =
                         crate::storage::encode_table_data_range_v2(db_id, schema.table_id);
@@ -2681,12 +2716,8 @@ pub async fn execute_alter_table(
                             let mut row = crate::storage::deserialize_row(&value)?;
                             fill_row_defaults(&mut row, &schema)?;
 
-                            let new_val = if let Some(using_expr) = &using {
-                                let table_name =
-                                    schema.name.rsplit('.').next().unwrap_or(&schema.name);
-                                let result = super::expr::bridge::eval_ast_expr_with_row(
-                                    using_expr, &row, &schema, table_name,
-                                )?;
+                            let new_val = if let Some(using_expr) = &typed_using_expr {
+                                let result = eval_row_level_expr(using_expr, &row, &qctx)?;
                                 coerce_value_for_column(result, &target_col)?
                             } else {
                                 let old_val =

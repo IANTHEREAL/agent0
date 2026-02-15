@@ -1,8 +1,7 @@
-use crate::sql::expr::bridge::eval_const_ast_expr;
 use crate::sql::types::{TypeContext, TypeInferrer};
 use crate::sql::{ExecuteResult, Session};
 use crate::storage::TikvStore;
-use crate::types::{ColumnDef, DataType, TableSchema, Value};
+use crate::types::{ColumnDef, DataType, TableSchema};
 use futures::{Sink, SinkExt};
 use pgwire::api::results::{FieldFormat, FieldInfo, Response};
 use pgwire::api::Type;
@@ -856,248 +855,12 @@ fn infer_system_table_function_schema(func_name: &str) -> Option<TableSchema> {
     })
 }
 
-async fn infer_extension_table_function_schema(
-    search_path: &[String],
-    schema_opt: Option<&str>,
-    func_name: &str,
-    args: &[FunctionArg],
-    is_superuser: bool,
-) -> Option<TableSchema> {
-    let in_extensions_schema = match schema_opt {
-        Some(schema) => schema.eq_ignore_ascii_case(crate::extensions::EXTENSIONS_SCHEMA),
-        None => search_path
-            .iter()
-            .any(|s| s.eq_ignore_ascii_case(crate::extensions::EXTENSIONS_SCHEMA)),
-    };
-    if !in_extensions_schema {
-        return None;
-    }
-
-    if let Some(schema) = crate::extensions::http::table_function_schema(func_name) {
-        return Some(schema);
-    }
-
-    if func_name.eq_ignore_ascii_case("fs9") {
-        return infer_fs9_table_function_schema(args, is_superuser).await;
-    }
-
-    crate::extensions::fs::table_function_schema(func_name)
-}
-
-fn try_parse_fs9_mode_from_args(args: &[FunctionArg]) -> Option<crate::extensions::fs::Fs9Mode> {
-    if args.is_empty() {
-        return None;
-    }
-
-    let path_expr = match &args[0] {
-        FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
-        _ => return None,
-    };
-    let path = match eval_const_ast_expr(path_expr).ok()? {
-        Value::Text(s) => s,
-        _ => return None,
-    };
-
-    let mut format: Option<String> = None;
-    let mut delimiter: Option<char> = None;
-    let mut header: Option<bool> = None;
-    let mut recursive: Option<bool> = None;
-    let mut exclude: Option<String> = None;
-
-    for arg in &args[1..] {
-        match arg {
-            FunctionArg::Named {
-                name,
-                arg: FunctionArgExpr::Expr(e),
-                ..
-            } => {
-                let param_name = name.value.to_ascii_lowercase();
-                let val = eval_const_ast_expr(e).ok()?;
-                match param_name.as_str() {
-                    "format" => match val {
-                        Value::Text(s) => format = Some(s),
-                        _ => return None,
-                    },
-                    "delimiter" => match val {
-                        Value::Text(s) => {
-                            if s.chars().count() != 1 {
-                                return None;
-                            }
-                            delimiter = s.chars().next();
-                        }
-                        _ => return None,
-                    },
-                    "header" => match val {
-                        Value::Boolean(b) => header = Some(b),
-                        Value::Text(s) if s.eq_ignore_ascii_case("true") => header = Some(true),
-                        Value::Text(s) if s.eq_ignore_ascii_case("false") => header = Some(false),
-                        _ => return None,
-                    },
-                    "recursive" => match val {
-                        Value::Boolean(b) => recursive = Some(b),
-                        Value::Text(s) if s.eq_ignore_ascii_case("true") => recursive = Some(true),
-                        Value::Text(s) if s.eq_ignore_ascii_case("false") => {
-                            recursive = Some(false)
-                        }
-                        _ => return None,
-                    },
-                    "exclude" => match val {
-                        Value::Text(s) => exclude = Some(s),
-                        _ => return None,
-                    },
-                    _ => return None,
-                }
-            }
-            _ => return None,
-        }
-    }
-
-    let mode = if path.ends_with('/') {
-        crate::extensions::fs::Fs9Mode::Directory {
-            path,
-            recursive: recursive.unwrap_or(false),
-            exclude,
-        }
-    } else if crate::extensions::fs::glob::is_glob_pattern(&path) {
-        crate::extensions::fs::Fs9Mode::Glob {
-            pattern: path,
-            format,
-            delimiter,
-            header,
-            exclude,
-        }
-    } else {
-        crate::extensions::fs::Fs9Mode::File {
-            path,
-            format,
-            delimiter,
-            header,
-        }
-    };
-
-    Some(mode)
-}
-
+#[cfg(test)]
 async fn infer_fs9_table_function_schema(
     args: &[FunctionArg],
     is_superuser: bool,
 ) -> Option<TableSchema> {
-    let fallback = crate::extensions::fs::table_function_schema("fs9")?;
-    if !is_superuser {
-        return Some(fallback);
-    }
-
-    let mode = match try_parse_fs9_mode_from_args(args) {
-        Some(mode) => mode,
-        None => return Some(fallback),
-    };
-
-    use crate::extensions::fs::backend::FsBackend;
-    let backend = crate::extensions::fs::backend::local_backend();
-
-    match mode {
-        crate::extensions::fs::Fs9Mode::Directory { .. } => {
-            Some(crate::extensions::fs::decoders::decode_directory(Vec::new()).schema)
-        }
-        crate::extensions::fs::Fs9Mode::File {
-            path,
-            format,
-            delimiter,
-            header,
-        } => {
-            if backend
-                .stat(&path)
-                .await
-                .ok()
-                .is_some_and(|info| info.is_dir)
-            {
-                return Some(crate::extensions::fs::decoders::decode_directory(Vec::new()).schema);
-            }
-
-            let fmt = crate::extensions::fs::decoders::detect_format(&path, format.as_deref());
-            match fmt {
-                "csv" | "tsv" => {
-                    let delim = if fmt == "tsv" && delimiter.is_none() {
-                        Some('\t')
-                    } else {
-                        delimiter
-                    };
-                    let data = match backend
-                        .read_file(&path, crate::extensions::fs::MAX_BYTES_PER_FILE)
-                        .await
-                    {
-                        Ok(data) => data,
-                        Err(_) => return Some(fallback),
-                    };
-                    let decoded =
-                        crate::extensions::fs::decoders::decode_csv(&data, &path, delim, header, 0)
-                            .ok()?;
-                    Some(decoded.schema)
-                }
-                "jsonl" | "ndjson" => {
-                    Some(crate::extensions::fs::decoders::decode_jsonl(&[], &path, 0).schema)
-                }
-                _ => Some(crate::extensions::fs::decoders::decode_raw_text(&[], &path, 0).schema),
-            }
-        }
-        crate::extensions::fs::Fs9Mode::Glob {
-            pattern,
-            format,
-            delimiter,
-            header,
-            exclude,
-        } => {
-            let files = match crate::extensions::fs::glob::expand_glob(
-                backend,
-                &pattern,
-                crate::extensions::fs::MAX_FILES_PER_GLOB,
-                exclude.as_deref(),
-            )
-            .await
-            {
-                Ok(files) => files,
-                Err(_) => return Some(fallback),
-            };
-
-            if files.is_empty() {
-                return Some(
-                    crate::extensions::fs::decoders::decode_raw_text(&[], &pattern, 0).schema,
-                );
-            }
-
-            let first = files.get(0).cloned().unwrap_or_default();
-            if first.is_empty() {
-                return Some(fallback);
-            }
-
-            let fmt = crate::extensions::fs::decoders::detect_format(&first, format.as_deref());
-            match fmt {
-                "csv" | "tsv" => {
-                    let delim = if fmt == "tsv" && delimiter.is_none() {
-                        Some('\t')
-                    } else {
-                        delimiter
-                    };
-                    let data = match backend
-                        .read_file(&first, crate::extensions::fs::MAX_BYTES_PER_FILE)
-                        .await
-                    {
-                        Ok(data) => data,
-                        Err(_) => return Some(fallback),
-                    };
-                    let decoded = crate::extensions::fs::decoders::decode_csv(
-                        &data, &first, delim, header, 0,
-                    )
-                    .ok()?;
-                    Some(decoded.schema)
-                }
-                "jsonl" | "ndjson" => {
-                    Some(crate::extensions::fs::decoders::decode_jsonl(&[], &first, 0).schema)
-                }
-                _ => Some(crate::extensions::fs::decoders::decode_raw_text(&[], &first, 0).schema),
-            }
-        }
-    }
+    crate::sql::table_functions::infer_fs9_table_function_schema(args, is_superuser).await
 }
 
 async fn infer_query_output_columns(
@@ -1419,7 +1182,7 @@ async fn collect_sources_from_table_factor(
                 {
                     sys_schema
                 } else {
-                    infer_extension_table_function_schema(
+                    crate::sql::table_functions::infer_extension_table_function_schema(
                         search_path,
                         schema_opt.as_deref(),
                         &obj_name_norm,

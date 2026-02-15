@@ -45,7 +45,7 @@ pub(crate) async fn with_context_opts<R>(
         http_requests: Cell::new(0),
     };
 
-    // See `sql::expr::with_query_context` for rationale.
+    // See `sql::query_context::with_query_context` for rationale.
     #[cfg(debug_assertions)]
     {
         CTX.scope(ctx, Box::pin(future)).await

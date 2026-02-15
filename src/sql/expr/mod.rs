@@ -17,73 +17,12 @@ use crate::sql::error::SqlError;
 use crate::types::Value;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::JsonOperator;
-use std::cell::Cell;
-use std::future::Future;
-use std::sync::Arc;
-
-// Thread-local storage for connection_id used by pg_backend_pid() as a fallback.
-thread_local! {
-    static CONNECTION_ID_FALLBACK: Cell<i32> = const { Cell::new(0) };
-}
-
-// Task-local execution context for correct behavior across async suspension points.
-tokio::task_local! {
-    static CONNECTION_ID: i32;
-    static CURRENT_DATABASE_NAME: Arc<str>;
-}
 
 pub(crate) const VERSION_STRING: &str = concat!(
     "PostgreSQL 16.0 (pg-tikv ",
     env!("CARGO_PKG_VERSION"),
     " on TiKV)"
 );
-
-/// Set the connection_id for the current thread (call before query execution)
-pub fn set_connection_id(id: i32) {
-    CONNECTION_ID_FALLBACK.with(|c| c.set(id));
-}
-
-pub(crate) fn get_connection_id_value() -> i32 {
-    CONNECTION_ID
-        .try_with(|c| *c)
-        .unwrap_or_else(|_| CONNECTION_ID_FALLBACK.with(|c| c.get()))
-}
-
-pub(crate) fn get_current_database_name() -> Option<Arc<str>> {
-    CURRENT_DATABASE_NAME.try_with(|name| name.clone()).ok()
-}
-
-pub(crate) async fn with_query_context<R, Fut>(
-    connection_id: i32,
-    database_name: Arc<str>,
-    fut: Fut,
-) -> R
-where
-    Fut: Future<Output = R>,
-{
-    // In debug builds, nested task-local scopes can create very large async state machines.
-    // Boxing the inner future keeps scope wrappers small and avoids stack overflows.
-    #[cfg(debug_assertions)]
-    {
-        let fut = Box::pin(fut);
-        CONNECTION_ID
-            .scope(
-                connection_id,
-                CURRENT_DATABASE_NAME.scope(database_name, fut),
-            )
-            .await
-    }
-
-    #[cfg(not(debug_assertions))]
-    {
-        CONNECTION_ID
-            .scope(
-                connection_id,
-                CURRENT_DATABASE_NAME.scope(database_name, fut),
-            )
-            .await
-    }
-}
 
 pub(crate) fn like_match(
     s: &str,

@@ -52,7 +52,7 @@ where
     Fut: Future<Output = R>,
 {
     // In debug builds, box the inner future to keep the state machine small.
-    // See `sql::expr::with_query_context` for rationale.
+    // See `sql::query_context::with_query_context` for rationale.
     #[cfg(debug_assertions)]
     {
         STATEMENT_TIMESTAMP_MILLIS
@@ -81,7 +81,7 @@ pub(super) async fn with_statement_timestamp_millis<R, Fut>(ts_millis: i64, fut:
 where
     Fut: Future<Output = R>,
 {
-    // See `sql::expr::with_query_context` for rationale.
+    // See `sql::query_context::with_query_context` for rationale.
     #[cfg(debug_assertions)]
     {
         STATEMENT_TIMESTAMP_MILLIS

@@ -24,7 +24,6 @@ use super::{
 use crate::auth::AuthManager;
 use crate::observability;
 use crate::pool::{TenantHandle, TikvClientPool};
-use crate::sql::expr::set_connection_id;
 use crate::sql::{ExecuteResult, Executor, Session};
 use crate::storage::TikvStore;
 use crate::types::{DataType, TableSchema, Value};
@@ -1238,8 +1237,6 @@ impl SimpleQueryHandler for DynamicPgHandler {
             )))
         })?;
 
-        set_connection_id(session.connection_id());
-
         match executor.execute(session, query).await {
             Ok(results) => {
                 let mut responses: Vec<Response<'a>> = Vec::new();
@@ -1733,8 +1730,6 @@ impl ExtendedQueryHandler for DynamicPgHandler {
                 "Session not initialized".to_string(),
             )))
         })?;
-
-        set_connection_id(session.connection_id());
 
         match executor.execute(session, &final_query).await {
             Ok(results) => Ok(send_notices_and_get_last_response(
