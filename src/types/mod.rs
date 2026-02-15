@@ -79,6 +79,7 @@ pub enum DataType {
     Tsvector,
     Tsquery,
     Name,
+    Varchar(u64),
 }
 
 impl DataType {
@@ -105,6 +106,7 @@ impl DataType {
             DataType::TimestampTz => 8,
             DataType::Tsvector => 64,
             DataType::Tsquery => 32,
+            DataType::Varchar(_) => 32,
         }
     }
 }
@@ -141,6 +143,7 @@ impl fmt::Display for DataType {
             DataType::TimestampTz => write!(f, "TIMESTAMPTZ"),
             DataType::Tsvector => write!(f, "TSVECTOR"),
             DataType::Tsquery => write!(f, "TSQUERY"),
+            DataType::Varchar(n) => write!(f, "VARCHAR({})", n),
         }
     }
 }

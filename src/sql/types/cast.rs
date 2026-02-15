@@ -61,7 +61,7 @@ fn value_is_compatible_with_column_type(value: &Value, column_type: &DataType) -
         (Value::Int32(_), DataType::Int32) => true,
         (Value::Int64(_), DataType::Int64) => true,
         (Value::Float64(_), DataType::Float64) => true,
-        (Value::Text(_), DataType::Text | DataType::Name | DataType::UserDefined(_)) => true,
+        (Value::Text(_), DataType::Text | DataType::Name | DataType::Varchar(_) | DataType::UserDefined(_)) => true,
         (Value::Bytes(_), DataType::Bytes) => true,
         (Value::Timestamp(_), DataType::Timestamp | DataType::TimestampTz) => true,
         (Value::Interval(_), DataType::Interval) => true,
@@ -96,6 +96,30 @@ pub(crate) fn cast(val: Value, target: &DataType, context: CastContext) -> Resul
     }
 
     match (val, target) {
+        // ===== To Varchar(n) =====
+        (v, DataType::Varchar(max_len)) => {
+            let s = v.to_string();
+            match context {
+                CastContext::Explicit => {
+                    let truncated: String = s.chars().take(*max_len as usize).collect();
+                    Ok(Value::Text(truncated))
+                }
+                CastContext::Assignment => {
+                    // Postgres: error if value exceeds length (unless excess is all spaces)
+                    let trimmed = s.trim_end();
+                    if trimmed.chars().count() > *max_len as usize {
+                        Err(anyhow!(
+                            "value too long for type character varying({})",
+                            max_len
+                        ))
+                    } else {
+                        Ok(Value::Text(s.chars().take(*max_len as usize).collect()))
+                    }
+                }
+                CastContext::Implicit => Ok(Value::Text(s)),
+            }
+        }
+
         // ===== To Text / Name =====
         (v, DataType::Text | DataType::Name) => Ok(Value::Text(v.to_string())),
 
@@ -900,5 +924,48 @@ mod tests {
     fn coerce_text_to_numeric_passthrough_non_text() {
         let v = coerce_text_to_numeric(Value::Int32(42)).unwrap();
         assert_eq!(v, Value::Int32(42));
+    }
+
+    // ---- VARCHAR(n) ----
+    #[test]
+    fn explicit_varchar3_truncates() {
+        let r = cast(
+            Value::Text("hello".into()),
+            &DataType::Varchar(3),
+            CastContext::Explicit,
+        )
+        .unwrap();
+        assert_eq!(r, Value::Text("hel".into()));
+    }
+
+    #[test]
+    fn assignment_varchar3_rejects_too_long() {
+        let r = cast(
+            Value::Text("hello".into()),
+            &DataType::Varchar(3),
+            CastContext::Assignment,
+        );
+        assert!(r.is_err());
+        assert!(r
+            .unwrap_err()
+            .to_string()
+            .contains("value too long for type character varying(3)"));
+    }
+
+    #[test]
+    fn assignment_varchar5_accepts_fits() {
+        let r = cast(
+            Value::Text("hello".into()),
+            &DataType::Varchar(5),
+            CastContext::Assignment,
+        )
+        .unwrap();
+        assert_eq!(r, Value::Text("hello".into()));
+    }
+
+    #[test]
+    fn null_varchar_passthrough() {
+        let r = cast(Value::Null, &DataType::Varchar(3), CastContext::Explicit).unwrap();
+        assert_eq!(r, Value::Null);
     }
 }

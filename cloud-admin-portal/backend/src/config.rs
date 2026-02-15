@@ -19,6 +19,9 @@ pub struct Config {
     pub session_ttl_hours: u64,
     pub audit_retention_days: u64,
     pub credential_key: Option<String>,
+    pub fs9_meta_url: Option<String>,
+    pub fs9_meta_key: Option<String>,
+    pub fs9_jwt_secret: Option<String>,
 }
 
 impl Config {
@@ -79,6 +82,15 @@ impl Config {
             credential_key: env::var("PGTIKV_CREDENTIAL_KEY")
                 .ok()
                 .filter(|k| !k.is_empty()),
+            fs9_meta_url: env::var("FS9_META_URL")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            fs9_meta_key: env::var("FS9_META_KEY")
+                .ok()
+                .filter(|v| !v.is_empty()),
+            fs9_jwt_secret: env::var("FS9_JWT_SECRET")
+                .ok()
+                .filter(|v| !v.is_empty()),
         }
     }
 

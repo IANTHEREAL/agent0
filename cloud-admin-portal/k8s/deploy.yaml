@@ -52,7 +52,7 @@ spec:
         - name: PGTIKV_API_PORT
           value: "8090"
         - name: PGTIKV_DATABASE_URL
-          value: "sqlite:///data/portal.db?mode=rwc"
+          value: "postgresql://db9admin:NzZybD8wmfi028xN1AGDshXd@cloud-admin-pg:5432/db9"
         - name: PGTIKV_CORS_ORIGINS
           value: "https://db9.shared.aws.tidbcloud.com"
         - name: PGTIKV_RECONCILER_ENABLED
@@ -65,14 +65,24 @@ spec:
           value: "/tls/tls.crt"
         - name: TIKV_KEY_PATH
           value: "/tls/tls.key"
+        - name: FS9_META_URL
+          value: "http://fs9-meta:9998"
+        - name: FS9_META_KEY
+          valueFrom:
+            secretKeyRef:
+              name: fs9-secret
+              key: FS9_META_KEY
+        - name: FS9_JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: fs9-secret
+              key: FS9_JWT_SECRET
         - name: RUST_LOG
           value: "info"
         volumeMounts:
         - name: tikv-tls
           mountPath: /tls
           readOnly: true
-        - name: data
-          mountPath: /data
         resources:
           requests:
             cpu: 250m
@@ -84,8 +94,6 @@ spec:
       - name: tikv-tls
         secret:
           secretName: serverless-cluster-cluster-client-secret
-      - name: data
-        emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -98,6 +106,75 @@ spec:
   ports:
   - port: 8090
     targetPort: 8090
+---
+# PostgreSQL - persistent storage for backend
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloud-admin-pg-secret
+  namespace: cloud-admin-portal
+type: Opaque
+data:
+  POSTGRES_PASSWORD: TnpaeWJEOHdtZmkwMjh4TjFBR0RzaFhk
+  POSTGRES_USER: ZGI5YWRtaW4=
+  POSTGRES_DB: ZGI5
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: cloud-admin-pg
+  namespace: cloud-admin-portal
+spec:
+  serviceName: cloud-admin-pg
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloud-admin-pg
+  template:
+    metadata:
+      labels:
+        app: cloud-admin-pg
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16-alpine
+        ports:
+        - containerPort: 5432
+        envFrom:
+        - secretRef:
+            name: cloud-admin-pg-secret
+        volumeMounts:
+        - name: pgdata
+          mountPath: /var/lib/postgresql/data
+          subPath: pgdata
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+  volumeClaimTemplates:
+  - metadata:
+      name: pgdata
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: ebs-sc
+      resources:
+        requests:
+          storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloud-admin-pg
+  namespace: cloud-admin-portal
+spec:
+  selector:
+    app: cloud-admin-pg
+  ports:
+  - port: 5432
+    targetPort: 5432
 ---
 # Frontend - React SPA served by nginx
 apiVersion: apps/v1
@@ -180,6 +257,185 @@ spec:
   ports:
   - port: 80
     targetPort: 80
+---
+# FS9 secrets
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fs9-secret
+  namespace: cloud-admin-portal
+type: Opaque
+data:
+  FS9_META_KEY: NzViYTExMDdhODNhZGNlZjYxNmNhMjQ1ZjdmZDUyNmVkYjg5MDg4Mzg3ZDMzMzE2MmExNDZmNjIyYzU1NWVhYw==
+  FS9_JWT_SECRET: ZGQ4Y2UxOWUyNjYxYmE3OTRlZTczMzg2ZWU0YWExZDZhNmZmNzg4Mzk2YTI2Y2U2MGY2NWRlM2NkYjBmZjQ4Mw==
+---
+# fs9-meta - metadata service (auth, namespaces, mounts)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fs9-meta
+  namespace: cloud-admin-portal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fs9-meta
+  template:
+    metadata:
+      labels:
+        app: fs9-meta
+    spec:
+      containers:
+      - name: fs9-meta
+        image: 093162653901.dkr.ecr.us-west-2.amazonaws.com/fs9-meta:latest
+        ports:
+        - containerPort: 9998
+        env:
+        - name: FS9_META_DSN
+          value: "postgresql://db9admin:NzZybD8wmfi028xN1AGDshXd@cloud-admin-pg:5432/fs9"
+        - name: FS9_META_HOST
+          value: "0.0.0.0"
+        - name: FS9_META_PORT
+          value: "9998"
+        - name: FS9_JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: fs9-secret
+              key: FS9_JWT_SECRET
+        - name: FS9_META_KEY
+          valueFrom:
+            secretKeyRef:
+              name: fs9-secret
+              key: FS9_META_KEY
+        - name: RUST_LOG
+          value: "info"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fs9-meta
+  namespace: cloud-admin-portal
+spec:
+  selector:
+    app: fs9-meta
+  ports:
+  - port: 9998
+    targetPort: 9998
+---
+# fs9-server - filesystem REST API server
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fs9-server
+  namespace: cloud-admin-portal
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fs9-server
+  template:
+    metadata:
+      labels:
+        app: fs9-server
+    spec:
+      containers:
+      - name: fs9-server
+        image: 093162653901.dkr.ecr.us-west-2.amazonaws.com/fs9-server:latest
+        ports:
+        - containerPort: 9999
+        env:
+        - name: FS9_HOST
+          value: "0.0.0.0"
+        - name: FS9_PORT
+          value: "9999"
+        - name: FS9_META_ENDPOINTS
+          value: "http://fs9-meta:9998"
+        - name: FS9_META_KEY
+          valueFrom:
+            secretKeyRef:
+              name: fs9-secret
+              key: FS9_META_KEY
+        - name: FS9_JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: fs9-secret
+              key: FS9_JWT_SECRET
+        - name: FS9_PLUGIN_DIR
+          value: "/app/plugins"
+        - name: FS9_DB9_API_URL
+          value: "http://cloud-admin-backend:8090/api"
+        - name: FS9_PAGEFS_PD_ENDPOINTS
+          value: "https://serverless-cluster-pd.tidb-serverless.svc.cluster.local:2379"
+        - name: FS9_PAGEFS_CA_PATH
+          value: "/tls/ca.crt"
+        - name: FS9_PAGEFS_CERT_PATH
+          value: "/tls/tls.crt"
+        - name: FS9_PAGEFS_KEY_PATH
+          value: "/tls/tls.key"
+        - name: RUST_LOG
+          value: "info"
+        volumeMounts:
+        - name: tikv-tls
+          mountPath: /tls
+          readOnly: true
+        resources:
+          requests:
+            cpu: 250m
+            memory: 256Mi
+          limits:
+            cpu: "1"
+            memory: 1Gi
+      volumes:
+      - name: tikv-tls
+        secret:
+          secretName: serverless-cluster-cluster-client-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fs9-server
+  namespace: cloud-admin-portal
+spec:
+  selector:
+    app: fs9-server
+  ports:
+  - port: 9999
+    targetPort: 9999
+---
+# Ingress for fs9 - /fs9 path with rewrite
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: cloud-admin-portal-fs9
+  namespace: cloud-admin-portal
+  annotations:
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+    nginx.ingress.kubernetes.io/proxy-body-size: "256m"
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - db9.shared.aws.tidbcloud.com
+    secretName: cloud-admin-portal-tls
+  rules:
+  - host: db9.shared.aws.tidbcloud.com
+    http:
+      paths:
+      - path: /fs9(/|$)(.*)
+        pathType: ImplementationSpecific
+        backend:
+          service:
+            name: fs9-server
+            port:
+              number: 9999
 ---
 # Ingress - HTTPS with Let's Encrypt cert
 apiVersion: networking.k8s.io/v1

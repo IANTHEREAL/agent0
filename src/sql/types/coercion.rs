@@ -10,6 +10,7 @@ pub fn type_precedence(dt: &DataType) -> i32 {
         DataType::Numeric { .. } => 40,
         DataType::Float64 => 50,
         DataType::Text => 100,
+        DataType::Varchar(_) => 100,
         DataType::Name => 100,
         DataType::Date => 60,
         DataType::Time => 61,
@@ -64,7 +65,7 @@ pub fn can_coerce(from: &DataType, to: &DataType) -> bool {
         (DataType::Timestamp, DataType::TimestampTz) => true,
 
         // Text-like types accept most types
-        (_, DataType::Text | DataType::Name) => true,
+        (_, DataType::Text | DataType::Varchar(_) | DataType::Name) => true,
 
         // JSON compatibility
         (DataType::Json, DataType::Jsonb) => true,
@@ -105,9 +106,12 @@ pub fn common_type(a: &DataType, b: &DataType) -> Option<DataType> {
         }
 
         // Text-like as universal fallback
-        (DataType::Text, _) | (_, DataType::Text) | (DataType::Name, _) | (_, DataType::Name) => {
-            Some(DataType::Text)
-        }
+        (DataType::Text, _)
+        | (_, DataType::Text)
+        | (DataType::Varchar(_), _)
+        | (_, DataType::Varchar(_))
+        | (DataType::Name, _)
+        | (_, DataType::Name) => Some(DataType::Text),
 
         _ => None,
     }

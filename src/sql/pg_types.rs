@@ -92,6 +92,6 @@ pub(crate) fn oid_and_typlen_for_datatype(dt: &DataType) -> (i64, i32) {
         DataType::Tsvector => (OID_TSVECTOR, -1),
         DataType::Tsquery => (OID_TSQUERY, -1),
         DataType::Name => (OID_NAME, 64),
-        DataType::Array(_) | DataType::UserDefined(_) => (OID_TEXT, -1),
+        DataType::Varchar(_) | DataType::Array(_) | DataType::UserDefined(_) => (OID_TEXT, -1),
     }
 }

@@ -368,7 +368,7 @@ impl Executor {
             } = &mode
             {
                 if let Some((mut schema, receiver)) =
-                    fs::start_file_stream(path, format.as_deref(), *delimiter, *header).await?
+                    fs::start_file_stream(self.tenant_keyspace(), path, format.as_deref(), *delimiter, *header).await?
                 {
                     apply_table_function_alias(&mut schema, alias)?;
                     let operator: BoxedOperator = Box::new(
@@ -389,6 +389,7 @@ impl Executor {
             } = &mode
             {
                 if let Some((mut schema, receiver)) = fs::start_glob_stream(
+                    self.tenant_keyspace(),
                     pattern,
                     format.as_deref(),
                     *delimiter,
@@ -481,6 +482,17 @@ impl Executor {
                 session.commit().await?;
             } else {
                 session.rollback().await?;
+            }
+        }
+
+        // Auto-add "extensions" to search_path so the extension's functions
+        // are immediately usable without a manual SET search_path.
+        if result.is_ok() {
+            let sp = session.search_path();
+            if !sp.iter().any(|s| s.eq_ignore_ascii_case(EXTENSIONS_SCHEMA)) {
+                let mut new_sp = sp.to_vec();
+                new_sp.push(EXTENSIONS_SCHEMA.to_string());
+                session.set_search_path(new_sp);
             }
         }
 

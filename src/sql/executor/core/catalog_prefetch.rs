@@ -23,6 +23,7 @@ pub(crate) async fn build_catalog_snapshot(
     txn: &mut Transaction,
     db_id: u64,
     search_path: &[String],
+    tenant_keyspace: &str,
     query: &Query,
     ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
 ) -> Result<CatalogSnapshot> {
@@ -32,6 +33,7 @@ pub(crate) async fn build_catalog_snapshot(
         txn,
         db_id,
         search_path,
+        tenant_keyspace,
         query,
         ctes,
         &mut expanding_views,
@@ -45,6 +47,7 @@ async fn build_catalog_snapshot_inner(
     txn: &mut Transaction,
     db_id: u64,
     search_path: &[String],
+    tenant_keyspace: &str,
     query: &Query,
     ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     expanding_views: &mut HashSet<String>,
@@ -79,6 +82,7 @@ async fn build_catalog_snapshot_inner(
             txn,
             db_id,
             search_path,
+            tenant_keyspace,
             raw_name,
             ctes,
             expanding_views,
@@ -100,7 +104,7 @@ async fn build_catalog_snapshot_inner(
     }
 
     // 4. Prefetch dynamic schemas for table-valued functions in FROM.
-    prefetch_table_function_schemas(store, txn, db_id, search_path, query, &mut snapshot).await?;
+    prefetch_table_function_schemas(store, txn, db_id, search_path, tenant_keyspace, query, &mut snapshot).await?;
 
     Ok(snapshot)
 }
@@ -182,6 +186,7 @@ async fn prefetch_table_function_schemas(
     txn: &mut Transaction,
     db_id: u64,
     search_path: &[String],
+    tenant_keyspace: &str,
     query: &Query,
     snapshot: &mut CatalogSnapshot,
 ) -> Result<()> {
@@ -333,7 +338,7 @@ async fn prefetch_table_function_schemas(
                 }
             };
 
-            let schema = fs::infer_table_function_schema("", &mode).await?;
+            let schema = fs::infer_table_function_schema(tenant_keyspace, &mode).await?;
             snapshot.add_table_function(&call.key, schema);
             continue;
         }
@@ -388,6 +393,7 @@ async fn try_resolve_view_as_table(
     txn: &mut Transaction,
     db_id: u64,
     search_path: &[String],
+    tenant_keyspace: &str,
     name: &str,
     ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     expanding_views: &mut HashSet<String>,
@@ -411,6 +417,7 @@ async fn try_resolve_view_as_table(
         txn,
         db_id,
         search_path,
+        tenant_keyspace,
         &resolved_full,
         &view_def,
         ctes,
@@ -430,6 +437,7 @@ async fn resolve_view_output_schema(
     txn: &mut Transaction,
     db_id: u64,
     search_path: &[String],
+    tenant_keyspace: &str,
     view_full_name: &str,
     view_def: &ViewDef,
     ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
@@ -460,6 +468,7 @@ async fn resolve_view_output_schema(
         txn,
         db_id,
         search_path,
+        tenant_keyspace,
         &query,
         ctes,
         expanding_views,

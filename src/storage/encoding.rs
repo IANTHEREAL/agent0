@@ -700,7 +700,7 @@ pub fn decode_value_memcomparable(data: &[u8], data_type: &DataType) -> Result<(
             let v: f64 = serde::Deserialize::deserialize(&mut deserializer)?;
             (Value::Float64(v), deserializer.position())
         }
-        DataType::Text | DataType::Name | DataType::UserDefined(_) => {
+        DataType::Text | DataType::Varchar(_) | DataType::Name | DataType::UserDefined(_) => {
             let v: String = serde::Deserialize::deserialize(&mut deserializer)?;
             (Value::Text(v), deserializer.position())
         }

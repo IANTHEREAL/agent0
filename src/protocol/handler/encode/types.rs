@@ -42,6 +42,7 @@ pub(in crate::protocol::handler) fn datatype_to_pgtype(dt: Option<&DataType>) ->
         Some(DataType::UserDefined(s)) if s == "int2vector" => Type::INT2_VECTOR,
         Some(DataType::Vector(_))
         | Some(DataType::Text)
+        | Some(DataType::Varchar(_))
         | Some(DataType::UserDefined(_))
         | None => Type::TEXT,
     }

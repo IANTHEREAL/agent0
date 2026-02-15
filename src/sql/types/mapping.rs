@@ -2,7 +2,8 @@
 
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
-    ArrayElemTypeDef, DataType as SqlDataType, ExactNumberInfo, ObjectName, TimezoneInfo,
+    ArrayElemTypeDef, CharacterLength, DataType as SqlDataType, ExactNumberInfo, ObjectName,
+    TimezoneInfo,
 };
 
 use crate::sql::error::SqlError;
@@ -78,7 +79,16 @@ fn sql_datatype_to_internal_impl(
             Ok(DataType::Numeric { precision, scale })
         }
 
-        // Text-like
+        // Text-like (with optional length → Varchar(n))
+        SqlDataType::Varchar(Some(CharacterLength::IntegerLength { length, .. }))
+        | SqlDataType::CharacterVarying(Some(CharacterLength::IntegerLength { length, .. }))
+        | SqlDataType::CharVarying(Some(CharacterLength::IntegerLength { length, .. }))
+        | SqlDataType::Character(Some(CharacterLength::IntegerLength { length, .. }))
+        | SqlDataType::Char(Some(CharacterLength::IntegerLength { length, .. })) => {
+            Ok(DataType::Varchar(*length))
+        }
+        SqlDataType::Nvarchar(Some(length)) => Ok(DataType::Varchar(*length)),
+
         SqlDataType::Text
         | SqlDataType::String(_)
         | SqlDataType::Varchar(_)

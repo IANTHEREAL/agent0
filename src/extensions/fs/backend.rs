@@ -7,6 +7,8 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use tokio::io::{AsyncBufRead, AsyncReadExt, BufReader};
 
+use serde::Deserialize;
+
 /// Metadata about a filesystem entry.
 #[derive(Debug, Clone)]
 pub(crate) struct FsFileInfo {
@@ -206,6 +208,238 @@ static BACKEND: OnceLock<LocalFsBackend> = OnceLock::new();
 
 pub(crate) fn local_backend() -> &'static LocalFsBackend {
     BACKEND.get_or_init(LocalFsBackend::new)
+}
+
+// ---------------------------------------------------------------------------
+// Remote fs9-server backend
+// ---------------------------------------------------------------------------
+
+/// JSON response from fs9-server's /api/v1/stat and /api/v1/readdir.
+#[derive(Deserialize)]
+struct FileInfoResponse {
+    path: String,
+    size: u64,
+    file_type: String,
+    mode: u32,
+    #[allow(dead_code)]
+    uid: u32,
+    #[allow(dead_code)]
+    gid: u32,
+    #[allow(dead_code)]
+    atime: u64,
+    mtime: u64,
+    #[allow(dead_code)]
+    ctime: u64,
+    #[allow(dead_code)]
+    etag: Option<String>,
+    #[allow(dead_code)]
+    symlink_target: Option<String>,
+}
+
+impl FileInfoResponse {
+    fn into_file_info(self) -> FsFileInfo {
+        FsFileInfo {
+            path: self.path,
+            is_dir: self.file_type == "directory",
+            is_file: self.file_type == "regular",
+            is_symlink: self.file_type == "symlink",
+            size: self.size,
+            mode: self.mode,
+            mtime: self.mtime,
+        }
+    }
+}
+
+/// JSON error response from fs9-server.
+#[derive(Deserialize)]
+struct Fs9ErrorResponse {
+    error: String,
+    #[allow(dead_code)]
+    code: Option<u16>,
+}
+
+pub(crate) struct Fs9HttpBackend {
+    client: reqwest::Client,
+    base_url: String,
+    token: String,
+}
+
+impl Fs9HttpBackend {
+    fn new(base_url: String, token: String) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            base_url,
+            token,
+        }
+    }
+
+    async fn check_error(&self, resp: reqwest::Response, path: &str) -> Result<reqwest::Response> {
+        if resp.status().is_success() {
+            return Ok(resp);
+        }
+        let status = resp.status().as_u16();
+        let body = resp
+            .json::<Fs9ErrorResponse>()
+            .await
+            .map(|e| e.error)
+            .unwrap_or_else(|_| format!("HTTP {status}"));
+        match status {
+            404 => Err(anyhow!("fs9: file not found: {path}")),
+            403 => Err(anyhow!("fs9: permission denied: {path}")),
+            _ => Err(anyhow!("fs9: remote error for '{path}': {body}")),
+        }
+    }
+}
+
+#[async_trait]
+impl FsBackend for Fs9HttpBackend {
+    async fn stat(&self, path: &str) -> Result<FsFileInfo> {
+        let resp = self
+            .client
+            .get(format!("{}/api/v1/stat", self.base_url))
+            .bearer_auth(&self.token)
+            .query(&[("path", path)])
+            .send()
+            .await
+            .map_err(|e| anyhow!("fs9: cannot reach fs9-server: {e}"))?;
+        let resp = self.check_error(resp, path).await?;
+        let info: FileInfoResponse = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("fs9: invalid response from fs9-server: {e}"))?;
+        Ok(info.into_file_info())
+    }
+
+    async fn readdir(&self, path: &str) -> Result<Vec<FsFileInfo>> {
+        let resp = self
+            .client
+            .get(format!("{}/api/v1/readdir", self.base_url))
+            .bearer_auth(&self.token)
+            .query(&[("path", path)])
+            .send()
+            .await
+            .map_err(|e| anyhow!("fs9: cannot reach fs9-server: {e}"))?;
+        let resp = self.check_error(resp, path).await?;
+        let entries: Vec<FileInfoResponse> = resp
+            .json()
+            .await
+            .map_err(|e| anyhow!("fs9: invalid response from fs9-server: {e}"))?;
+        let mut out: Vec<FsFileInfo> = entries.into_iter().map(|e| e.into_file_info()).collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    async fn read_file(&self, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
+        let resp = self
+            .client
+            .get(format!("{}/api/v1/download", self.base_url))
+            .bearer_auth(&self.token)
+            .query(&[("path", path)])
+            .send()
+            .await
+            .map_err(|e| anyhow!("fs9: cannot reach fs9-server: {e}"))?;
+        let resp = self.check_error(resp, path).await?;
+
+        // Check Content-Length header if present before downloading.
+        if let Some(len) = resp.content_length() {
+            if len > max_bytes as u64 {
+                return Err(anyhow!(
+                    "fs9: file too large: {path} ({len} bytes, max {max_bytes})"
+                ));
+            }
+        }
+
+        let data = resp
+            .bytes()
+            .await
+            .map_err(|e| anyhow!("fs9: cannot download '{path}': {e}"))?;
+        if data.len() > max_bytes {
+            return Err(anyhow!(
+                "fs9: file too large: {path} ({} bytes, max {max_bytes})",
+                data.len()
+            ));
+        }
+        Ok(data.to_vec())
+    }
+
+    async fn read_file_stream(
+        &self,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Box<dyn AsyncBufRead + Unpin + Send>> {
+        // Download the entire file into memory (max 10MB) and wrap in a Cursor.
+        let data = self.read_file(path, max_bytes).await?;
+        Ok(Box::new(std::io::Cursor::new(data)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Backend factory
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when the remote fs9-server backend is configured.
+pub(crate) fn is_remote_configured() -> bool {
+    std::env::var("FS9_SERVER_URL").is_ok() && std::env::var("FS9_JWT_SECRET").is_ok()
+}
+
+/// Build a backend for the given tenant keyspace.
+///
+/// When `FS9_SERVER_URL` and `FS9_JWT_SECRET` are set, returns an `Fs9HttpBackend`
+/// that calls the remote fs9-server with a minted JWT. Otherwise falls back to
+/// the local filesystem backend.
+pub(crate) fn get_backend(tenant_keyspace: &str) -> Box<dyn FsBackend> {
+    let (base_url, secret) = match (
+        std::env::var("FS9_SERVER_URL"),
+        std::env::var("FS9_JWT_SECRET"),
+    ) {
+        (Ok(url), Ok(secret)) => (url, secret),
+        _ => return Box::new(LocalFsBackend::new()),
+    };
+
+    let tenant_id = tenant_keyspace
+        .strip_prefix("tipg_tenant_")
+        .unwrap_or(tenant_keyspace);
+
+    let token = match mint_jwt(tenant_id, &secret) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!("fs9: failed to mint JWT for tenant '{}': {}", tenant_id, e);
+            return Box::new(LocalFsBackend::new());
+        }
+    };
+
+    Box::new(Fs9HttpBackend::new(base_url, token))
+}
+
+fn mint_jwt(tenant_id: &str, secret: &str) -> Result<String> {
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use serde::Serialize;
+
+    #[derive(Serialize)]
+    struct Claims<'a> {
+        sub: &'a str,
+        ns: &'a str,
+        roles: [&'a str; 1],
+        exp: u64,
+        iat: u64,
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| anyhow!("clock error: {e}"))?
+        .as_secs();
+
+    let claims = Claims {
+        sub: "pgtikv",
+        ns: tenant_id,
+        roles: ["admin"],
+        exp: now + 300, // 5 minutes
+        iat: now,
+    };
+
+    let header = Header::new(Algorithm::HS256);
+    let key = EncodingKey::from_secret(secret.as_bytes());
+    encode(&header, &claims, &key).map_err(|e| anyhow!("JWT encode error: {e}"))
 }
 
 #[cfg(test)]

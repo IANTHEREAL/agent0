@@ -194,6 +194,7 @@ pub fn data_type_to_pg_type(dt: &DataType) -> &'static str {
         DataType::Numeric { .. } => "numeric",
         DataType::Tsvector => "tsvector",
         DataType::Tsquery => "tsquery",
+        DataType::Varchar(_) => "character varying",
     }
 }
 
@@ -226,5 +227,6 @@ pub fn data_type_to_udt_name(dt: &DataType) -> &'static str {
         DataType::Numeric { .. } => "numeric",
         DataType::Tsvector => "tsvector",
         DataType::Tsquery => "tsquery",
+        DataType::Varchar(_) => "varchar",
     }
 }
