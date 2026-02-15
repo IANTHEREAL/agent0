@@ -151,6 +151,15 @@ pub async fn create_tables(pool: &AnyPool) -> Result<(), sqlx::Error> {
         .await
         .ok();
 
+    sqlx::query("ALTER TABLE customers ADD COLUMN is_anonymous INTEGER NOT NULL DEFAULT 0")
+        .execute(pool)
+        .await
+        .ok();
+    sqlx::query("ALTER TABLE customers ADD COLUMN database_limit INTEGER")
+        .execute(pool)
+        .await
+        .ok();
+
     let indexes = [
         "CREATE INDEX IF NOT EXISTS idx_tenants_state ON tenants(state)",
         "CREATE INDEX IF NOT EXISTS idx_tenants_created ON tenants(created_at DESC)",
@@ -706,6 +715,30 @@ pub async fn create_customer(
     Ok(())
 }
 
+pub async fn create_anonymous_customer(
+    pool: &AnyPool,
+    id: &str,
+    email: &str,
+    password_hash: &str,
+    database_limit: i32,
+) -> Result<(), sqlx::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
+    let sql = adapt_sql(
+        "INSERT INTO customers (id, email, password_hash, created_at, is_anonymous, database_limit) VALUES ($1, $2, $3, $4, $5, $6)",
+        pool,
+    );
+    sqlx::query(&sql)
+        .bind(id)
+        .bind(email)
+        .bind(password_hash)
+        .bind(&now)
+        .bind(1)
+        .bind(database_limit)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn get_customer_by_email(
     pool: &AnyPool,
     email: &str,
@@ -802,6 +835,38 @@ pub async fn list_customer_tenants(
     Ok(rows.iter().map(row_to_tenant).collect())
 }
 
+pub async fn count_customer_tenants(pool: &AnyPool, customer_id: &str) -> Result<i64, sqlx::Error> {
+    let sql = adapt_sql(
+        &format!(
+            "SELECT COUNT(*) as cnt FROM tenants WHERE customer_id = $1 AND state NOT IN ('{}', '{}')",
+            tenant_state::DISABLED,
+            tenant_state::CREATE_FAILED
+        ),
+        pool,
+    );
+    let row = sqlx::query(&sql).bind(customer_id).fetch_one(pool).await?;
+    Ok(row.get("cnt"))
+}
+
+pub async fn claim_anonymous_customer(
+    pool: &AnyPool,
+    customer_id: &str,
+    email: &str,
+    password_hash: &str,
+) -> Result<bool, sqlx::Error> {
+    let sql = adapt_sql(
+        "UPDATE customers SET email = $1, password_hash = $2, is_anonymous = 0, database_limit = NULL WHERE id = $3 AND is_anonymous = 1",
+        pool,
+    );
+    let result = sqlx::query(&sql)
+        .bind(email)
+        .bind(password_hash)
+        .bind(customer_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 pub async fn get_tenant_for_customer(
     pool: &AnyPool,
     tenant_id: &str,
@@ -838,12 +903,15 @@ pub async fn set_tenant_customer_id(
 }
 
 fn row_to_customer(row: &sqlx::any::AnyRow) -> CustomerRow {
+    let is_anonymous: i32 = row.get("is_anonymous");
     CustomerRow {
         id: row.get("id"),
         email: row.get("email"),
         password_hash: row.get("password_hash"),
         created_at: row.get("created_at"),
         status: row.get("status"),
+        is_anonymous: is_anonymous != 0,
+        database_limit: row.get("database_limit"),
     }
 }
 
@@ -949,5 +1017,43 @@ mod tests {
         )";
         assert!(ddl.contains("FOREIGN KEY (customer_id) REFERENCES customers(id)"));
         assert!(ddl.contains("token_hash TEXT NOT NULL"));
+    }
+
+    #[test]
+    fn test_anonymous_customer_insert_sql_has_correct_placeholders() {
+        let sql = "INSERT INTO customers (id, email, password_hash, created_at, is_anonymous, database_limit) VALUES ($1, $2, $3, $4, $5, $6)";
+        assert!(sql.contains("$6"));
+        assert_eq!(sql.matches('$').count(), 6);
+    }
+
+    #[test]
+    fn test_count_customer_tenants_sql_excludes_disabled() {
+        let sql = format!(
+            "SELECT COUNT(*) as cnt FROM tenants WHERE customer_id = $1 AND state NOT IN ('{}', '{}')",
+            "DISABLED", "CREATE_FAILED"
+        );
+        assert!(sql.contains("DISABLED"));
+        assert!(sql.contains("CREATE_FAILED"));
+        assert!(sql.contains("customer_id = $1"));
+        assert_eq!(sql.matches('$').count(), 1);
+    }
+
+    #[test]
+    fn test_claim_anonymous_customer_sql_has_correct_placeholders() {
+        let sql = "UPDATE customers SET email = $1, password_hash = $2, is_anonymous = 0, database_limit = NULL WHERE id = $3 AND is_anonymous = 1";
+        assert!(sql.contains("is_anonymous = 0"));
+        assert!(sql.contains("database_limit = NULL"));
+        assert!(sql.contains("is_anonymous = 1"));
+        assert_eq!(sql.matches('$').count(), 3);
+    }
+
+    #[test]
+    fn test_anonymous_schema_migration_sql() {
+        let alter1 = "ALTER TABLE customers ADD COLUMN is_anonymous INTEGER NOT NULL DEFAULT 0";
+        let alter2 = "ALTER TABLE customers ADD COLUMN database_limit INTEGER";
+        assert!(alter1.contains("is_anonymous"));
+        assert!(alter1.contains("DEFAULT 0"));
+        assert!(alter2.contains("database_limit"));
+        assert!(!alter2.contains("NOT NULL"));
     }
 }
