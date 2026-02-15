@@ -222,16 +222,19 @@ impl ApiClient {
             Ok(val) => val,
             Err((status, detail)) => {
                 if status == 401 && self.auto_reauth {
-                    let new_token = if let Some((anon_id, anon_secret)) =
-                        load_anonymous_credentials()
-                    {
-                        let token = self.anonymous_refresh(&anon_id, &anon_secret).await;
-                        if let Err(e) = save_credentials(&token) {
-                            eprintln!("{e}");
-                            process::exit(1);
+                    let new_token = 'reauth: {
+                        if let Some((anon_id, anon_secret)) = load_anonymous_credentials() {
+                            if let Some(token) =
+                                self.anonymous_refresh(&anon_id, &anon_secret).await
+                            {
+                                if let Err(e) = save_credentials(&token) {
+                                    eprintln!("{e}");
+                                    process::exit(1);
+                                }
+                                break 'reauth token;
+                            }
                         }
-                        token
-                    } else {
+
                         clear_credentials();
 
                         eprintln!("\nSession expired or invalid token.");
@@ -402,7 +405,7 @@ impl ApiClient {
         }
     }
 
-    async fn anonymous_refresh(&self, anonymous_id: &str, anonymous_secret: &str) -> String {
+    async fn anonymous_refresh(&self, anonymous_id: &str, anonymous_secret: &str) -> Option<String> {
         let body = serde_json::json!({
             "anonymous_id": anonymous_id,
             "anonymous_secret": anonymous_secret,
@@ -412,17 +415,8 @@ impl ApiClient {
             .send_request("POST", "/customer/anonymous-refresh", Some(&body), None)
             .await
         {
-            Ok(data) => match data["token"].as_str() {
-                Some(t) => t.to_string(),
-                None => {
-                    eprintln!("Failed to refresh anonymous session");
-                    process::exit(1);
-                }
-            },
-            Err((status, detail)) => {
-                eprintln!("Anonymous refresh failed ({}): {detail}", status);
-                process::exit(1);
-            }
+            Ok(data) => data["token"].as_str().map(|t| t.to_string()),
+            Err(_) => None,
         }
     }
 }
