@@ -1,14 +1,87 @@
 use std::collections::HashMap;
+use std::io::{self, Write};
 use std::process;
 
 use serde_json::Value;
 
+// ── Credential helpers ──────────────────────────────────────────
+
+fn credentials_path() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| h.join(".db9").join("credentials"))
+}
+
+fn ensure_config_dir() -> std::path::PathBuf {
+    let dir = dirs::home_dir()
+        .unwrap_or_else(|| {
+            eprintln!("Cannot determine home directory");
+            process::exit(1);
+        })
+        .join(".db9");
+    if !dir.exists() {
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| {
+            eprintln!("Failed to create config directory: {e}");
+            process::exit(1);
+        });
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            std::fs::set_permissions(&dir, perms).ok();
+        }
+    }
+    dir
+}
+
+fn save_credentials(token: &str) -> Result<(), String> {
+    let dir = ensure_config_dir();
+    let cred_path = dir.join("credentials");
+    let content = format!("token = \"{token}\"\n");
+    std::fs::write(&cred_path, content).map_err(|e| format!("Failed to save credentials: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(&cred_path, perms)
+            .map_err(|e| format!("Failed to set file permissions: {e}"))?;
+    }
+    Ok(())
+}
+
+fn clear_credentials() {
+    if let Some(p) = credentials_path() {
+        if p.exists() {
+            std::fs::remove_file(&p).ok();
+        }
+    }
+}
+
+fn prompt_line(label: &str) -> String {
+    eprint!("{label}");
+    io::stderr().flush().ok();
+    let mut buf = String::new();
+    io::stdin().read_line(&mut buf).unwrap_or_else(|e| {
+        eprintln!("Failed to read input: {e}");
+        process::exit(1);
+    });
+    buf.trim().to_string()
+}
+
+fn prompt_password_hidden(label: &str) -> String {
+    rpassword::prompt_password(label).unwrap_or_else(|e| {
+        eprintln!("Failed to read password: {e}");
+        process::exit(1);
+    })
+}
+
 // ── HTTP helper ──────────────────────────────────────────────────
+
+type SendResult = Result<Value, (u16, String)>;
 
 pub struct ApiClient {
     base_url: String,
     api_key: Option<String>,
     client: reqwest::Client,
+    auto_reauth: bool,
 }
 
 impl ApiClient {
@@ -32,16 +105,22 @@ impl ApiClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key: api_key.map(|s| s.to_string()),
             client,
+            auto_reauth: false,
         }
     }
 
-    pub async fn request(
+    pub fn with_auto_reauth(mut self) -> Self {
+        self.auto_reauth = true;
+        self
+    }
+
+    async fn send_request(
         &self,
         method: &str,
         path: &str,
         body: Option<&Value>,
         extra_headers: Option<&HashMap<String, String>>,
-    ) -> Value {
+    ) -> SendResult {
         let url = format!("{}{path}", self.base_url);
         let mut req = match method {
             "GET" => self.client.get(&url),
@@ -70,20 +149,147 @@ impl ApiClient {
                 let status = resp.status();
                 let text = resp.text().await.unwrap_or_default();
                 if status.is_success() {
-                    serde_json::from_str(&text).unwrap_or(Value::Null)
+                    Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
                 } else {
                     let err: Value = serde_json::from_str(&text).unwrap_or_default();
                     let detail = err
                         .get("message")
                         .or_else(|| err.get("detail"))
                         .and_then(|v| v.as_str())
-                        .unwrap_or("Unknown error");
-                    eprintln!("Error {}: {detail}", status.as_u16());
+                        .unwrap_or("Unknown error")
+                        .to_string();
+                    Err((status.as_u16(), detail))
+                }
+            }
+            Err(e) => Err((0, format!("Connection failed: {e}"))),
+        }
+    }
+
+    pub async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+        extra_headers: Option<&HashMap<String, String>>,
+    ) -> Value {
+        match self.send_request(method, path, body, extra_headers).await {
+            Ok(val) => val,
+            Err((status, detail)) => {
+                if status == 401 && self.auto_reauth {
+                    clear_credentials();
+
+                    eprintln!("\nSession expired or invalid token.");
+                    eprintln!("Please re-authenticate to continue.\n");
+
+                    let choice = prompt_line("[L] Login  [R] Register a new account: ");
+                    let new_token = match choice.to_ascii_lowercase().as_str() {
+                        "r" => self.interactive_register().await,
+                        _ => self.interactive_login().await,
+                    };
+
+                    if let Err(e) = save_credentials(&new_token) {
+                        eprintln!("{e}");
+                        process::exit(1);
+                    }
+                    eprintln!("Re-authenticated successfully. Retrying...\n");
+
+                    let mut retry_headers = extra_headers.cloned().unwrap_or_default();
+                    retry_headers
+                        .insert("Authorization".to_string(), format!("Bearer {new_token}"));
+
+                    match self
+                        .send_request(method, path, body, Some(&retry_headers))
+                        .await
+                    {
+                        Ok(val) => val,
+                        Err((retry_status, retry_detail)) => {
+                            eprintln!("Error {}: {retry_detail}", retry_status);
+                            process::exit(1);
+                        }
+                    }
+                } else {
+                    if status == 0 {
+                        eprintln!("{detail}");
+                    } else {
+                        eprintln!("Error {status}: {detail}");
+                    }
                     process::exit(1);
                 }
             }
-            Err(e) => {
-                eprintln!("Connection failed: {e}");
+        }
+    }
+
+    async fn interactive_login(&self) -> String {
+        let email = prompt_line("Email: ");
+        let password = prompt_password_hidden("Password: ");
+
+        let body = serde_json::json!({
+            "email": email,
+            "password": password,
+        });
+
+        match self
+            .send_request("POST", "/customer/login", Some(&body), None)
+            .await
+        {
+            Ok(data) => match data["token"].as_str() {
+                Some(t) => t.to_string(),
+                None => {
+                    eprintln!("Login failed: no token in response");
+                    process::exit(1);
+                }
+            },
+            Err((status, detail)) => {
+                eprintln!("Login failed ({}): {detail}", status);
+                process::exit(1);
+            }
+        }
+    }
+
+    async fn interactive_register(&self) -> String {
+        let email = prompt_line("Email: ");
+        let password = prompt_password_hidden("Password: ");
+        let confirm = prompt_password_hidden("Confirm password: ");
+
+        if password != confirm {
+            eprintln!("Passwords do not match.");
+            process::exit(1);
+        }
+
+        let body = serde_json::json!({
+            "email": email,
+            "password": password,
+        });
+
+        match self
+            .send_request("POST", "/customer/register", Some(&body), None)
+            .await
+        {
+            Ok(_) => eprintln!("Account created. Logging in..."),
+            Err((status, detail)) => {
+                eprintln!("Registration failed ({}): {detail}", status);
+                process::exit(1);
+            }
+        }
+
+        let login_body = serde_json::json!({
+            "email": email,
+            "password": password,
+        });
+
+        match self
+            .send_request("POST", "/customer/login", Some(&login_body), None)
+            .await
+        {
+            Ok(data) => match data["token"].as_str() {
+                Some(t) => t.to_string(),
+                None => {
+                    eprintln!("Login after registration failed: no token in response");
+                    process::exit(1);
+                }
+            },
+            Err((status, detail)) => {
+                eprintln!("Login after registration failed ({}): {detail}", status);
                 process::exit(1);
             }
         }

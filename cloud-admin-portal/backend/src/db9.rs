@@ -415,7 +415,7 @@ fn prompt_password(prompt: &str) -> String {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    let api = ApiClient::new_with_options(&cli.api_url, None, cli.insecure);
+    let api = ApiClient::new_with_options(&cli.api_url, None, cli.insecure).with_auto_reauth();
 
     match cli.command {
         Commands::Register => cmd_register(&api, &cli.effective_output()).await,
