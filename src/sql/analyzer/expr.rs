@@ -1107,7 +1107,7 @@ impl<'a> Analyzer<'a> {
         results: &[Expr],
         else_result: &Option<Box<Expr>>,
     ) -> Result<TypedExpr, AnalyzerError> {
-        let analyzed_operand = match operand {
+        let mut analyzed_operand = match operand {
             Some(e) => Some(Box::new(self.analyze_expr(e)?)),
             None => None,
         };
@@ -1128,6 +1128,32 @@ impl<'a> Analyzer<'a> {
             }
             let r = self.analyze_expr(result)?;
             when_clauses.push((c, r));
+        }
+
+        // Simple CASE: coerce operand and WHEN values to a single comparison target type.
+        //
+        // PostgreSQL desugars `CASE operand WHEN v THEN ...` into comparisons
+        // (`operand = v`) with coercion. The Typed IR must not rely on runtime
+        // comparison coercion; insert casts here so executor evaluation only
+        // compares type-compatible values.
+        if let Some(op) = analyzed_operand.take() {
+            let mut target = op.data_type.clone();
+            for (when_expr, _) in &when_clauses {
+                target =
+                    comparison_target_type(&target, &when_expr.data_type).ok_or_else(|| {
+                        AnalyzerError::OperatorTypeMismatch {
+                            operator: "=".to_string(),
+                            left: target.clone(),
+                            right: when_expr.data_type.clone(),
+                        }
+                    })?;
+            }
+
+            analyzed_operand = Some(Box::new(self.coerce_if_needed(*op, &target)));
+            when_clauses = when_clauses
+                .into_iter()
+                .map(|(cond, result)| (self.coerce_if_needed(cond, &target), result))
+                .collect();
         }
 
         let analyzed_else = match else_result {

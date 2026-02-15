@@ -426,6 +426,37 @@ fn analyze_case() {
     }
 }
 
+#[test]
+fn analyze_simple_case_coerces_when_values_to_operand_type() {
+    // Simple CASE: operand (Boolean) compared against WHEN values.
+    //
+    // PostgreSQL treats string literals as UNKNOWN and coerces them to the
+    // operand's type for the internal `=` comparisons.
+    let expr = analyze_expr_with_users("CASE active WHEN 't' THEN 1 ELSE 0 END").unwrap();
+    assert_eq!(expr.data_type, DataType::Int32);
+    match &expr.kind {
+        TypedExprKind::Case {
+            operand: Some(operand),
+            when_clauses,
+            ..
+        } => {
+            assert_eq!(operand.data_type, DataType::Boolean);
+            assert_eq!(when_clauses.len(), 1);
+            let (when_expr, _then_expr) = &when_clauses[0];
+            assert_eq!(when_expr.data_type, DataType::Boolean);
+            assert!(matches!(
+                when_expr.kind,
+                TypedExprKind::Cast {
+                    target_type: DataType::Boolean,
+                    cast_context: crate::sql::types::CastContext::Implicit,
+                    ..
+                }
+            ));
+        }
+        other => panic!("expected Case, got {:?}", std::mem::discriminant(other)),
+    }
+}
+
 // ── Functions ───────────────────────────────────────────────
 
 #[test]

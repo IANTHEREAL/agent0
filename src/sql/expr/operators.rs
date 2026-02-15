@@ -818,9 +818,12 @@ pub fn compare_values(left: &Value, right: &Value) -> Result<i8> {
         return compare_same_type(left, right);
     }
 
-    // Phase 4: Cross-type coercion via implicit cast, then same-type compare
-    let (cl, cr) = crate::sql::types::cast::coerce_pair(left.clone(), right.clone())?;
-    compare_same_type(&cl, &cr)
+    // Phase 4: Cross-type comparisons are rejected.
+    //
+    // The Analyzer must insert implicit casts so values are type-compatible
+    // before runtime evaluation. Keeping coercion here would be a hidden
+    // semantic fallback and a per-row overhead.
+    Err(anyhow!("Cannot compare values: {:?} vs {:?}", left, right))
 }
 
 /// ORDER BY comparator with PostgreSQL-like NULLS FIRST/LAST semantics.
@@ -990,5 +993,13 @@ mod tests {
 
         // Reverse direction
         assert_eq!(compare_values(&b, &a).unwrap(), -1); // 10.4 < 10.45
+    }
+
+    #[test]
+    fn test_compare_values_rejects_cross_type_without_analyzer_casts() {
+        let err = compare_values(&Value::Text("42".into()), &Value::Int32(10))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Cannot compare values"));
     }
 }

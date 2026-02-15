@@ -261,8 +261,8 @@ mod tests {
                 }),
                 op: BinaryOp::Gt,
                 right: Box::new(TypedExpr {
-                    kind: TypedExprKind::Constant(Value::Int64(2)),
-                    data_type: DataType::Int64,
+                    kind: TypedExprKind::Constant(Value::Int32(2)),
+                    data_type: DataType::Int32,
                 }),
             },
             data_type: DataType::Boolean,
@@ -297,8 +297,8 @@ mod tests {
                 }),
                 op: BinaryOp::Eq,
                 right: Box::new(TypedExpr {
-                    kind: TypedExprKind::Constant(Value::Int64(2)),
-                    data_type: DataType::Int64,
+                    kind: TypedExprKind::Constant(Value::Int32(2)),
+                    data_type: DataType::Int32,
                 }),
             },
             data_type: DataType::Boolean,
