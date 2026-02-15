@@ -235,6 +235,57 @@ request GET "/customer/me" "" 1
 assert_http "200" "Get me returns 200"
 assert_body_contains "$EMAIL" "Get me response contains email"
 
+echo "--- Anonymous Auth Section ---"
+
+REGISTERED_TOKEN="$TOKEN"
+REGISTERED_EMAIL="$EMAIL"
+TOKEN=""
+
+request POST "/customer/anonymous-register" "" 0
+assert_http "200" "Anonymous register returns 200"
+ANON_TOKEN="$(json_field "$LAST_BODY" "token")"
+assert_non_empty "$ANON_TOKEN" "Anonymous register returns token"
+assert_body_contains "is_anonymous" "Anonymous register response contains is_anonymous"
+
+TOKEN="$ANON_TOKEN"
+request GET "/customer/me" "" 1
+assert_http "200" "Anonymous user /me returns 200"
+assert_body_contains "anonymous.local" "Anonymous user email contains anonymous.local"
+
+request POST "/customer/databases" "{\"name\":\"anon-db-${RUN_ID}\"}" 1
+assert_http "201" "Anonymous create database returns 201"
+ANON_DB_ID="$(json_field "$LAST_BODY" "id")"
+assert_non_empty "$ANON_DB_ID" "Anonymous create database returns id"
+add_created_db "$ANON_DB_ID"
+
+request POST "/customer/claim" "{\"email\":\"claim-${RUN_ID}@example.com\",\"password\":\"short\"}" 1
+assert_http "400" "Claim with short password returns 400"
+
+request POST "/customer/claim" "{\"email\":\"not-an-email\",\"password\":\"LongEnough123!\"}" 1
+assert_http "400" "Claim with invalid email returns 400"
+
+request POST "/customer/claim" "{\"email\":\"$REGISTERED_EMAIL\",\"password\":\"LongEnough123!\"}" 1
+assert_http "409" "Claim with existing email returns 409"
+
+CLAIM_EMAIL="claimed-${RUN_ID}@example.com"
+CLAIM_PASSWORD="ClaimPass123!"
+request POST "/customer/claim" "{\"email\":\"$CLAIM_EMAIL\",\"password\":\"$CLAIM_PASSWORD\"}" 1
+assert_http "200" "Claim anonymous account returns 200"
+assert_body_contains "claimed" "Claim response contains claimed"
+assert_body_contains "$CLAIM_EMAIL" "Claim response contains new email"
+
+request POST "/customer/claim" "{\"email\":\"double-${RUN_ID}@example.com\",\"password\":\"AnotherPass123!\"}" 1
+assert_http "400" "Double claim returns 400 (no longer anonymous)"
+
+request POST "/customer/login" "{\"email\":\"$CLAIM_EMAIL\",\"password\":\"$CLAIM_PASSWORD\"}" 0
+assert_http "200" "Login with claimed credentials returns 200"
+
+request DELETE "/customer/databases/${ANON_DB_ID}" "" 1
+assert_http_one_of "200 500" "Delete anonymous database returns expected status"
+remove_created_db "$ANON_DB_ID"
+
+TOKEN="$REGISTERED_TOKEN"
+
 echo "--- Database Section ---"
 
 request POST "/customer/databases" "{\"name\":\"$DB_NAME\",\"region\":\"us-east\"}" 1

@@ -373,6 +373,26 @@ pub struct LoginResponse {
 }
 
 #[derive(Serialize)]
+pub struct AnonymousRegisterResponse {
+    pub token: String,
+    pub expires_at: String,
+    pub is_anonymous: bool,
+}
+
+#[derive(Deserialize)]
+pub struct ClaimRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Serialize)]
+pub struct ClaimResponse {
+    pub id: String,
+    pub email: String,
+    pub claimed: bool,
+}
+
+#[derive(Serialize)]
 pub struct DatabaseResponse {
     pub id: String,
     pub name: String,
@@ -456,6 +476,8 @@ pub struct CustomerRow {
     pub password_hash: String,
     pub created_at: String,
     pub status: String,
+    pub is_anonymous: bool,
+    pub database_limit: Option<i32>,
 }
 
 pub struct CustomerTokenRow {
