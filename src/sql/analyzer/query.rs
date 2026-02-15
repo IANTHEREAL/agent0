@@ -14,6 +14,7 @@ use sqlparser::ast::{
 use crate::sql::names::split_object_name;
 use crate::sql::table_functions::table_function_key;
 use crate::sql::types::coercion::common_type;
+use crate::sql::types::CastContext;
 use crate::types::DataType;
 use std::collections::HashSet;
 
@@ -56,6 +57,13 @@ impl<'a> Analyzer<'a> {
                     &query.offset,
                 )
             }
+            SetExpr::Values(values) => self.analyze_values_complete(
+                values,
+                query.with.as_ref(),
+                &query.order_by,
+                &query.limit,
+                &query.offset,
+            ),
 
             SetExpr::SetOperation {
                 op,
@@ -136,6 +144,7 @@ impl<'a> Analyzer<'a> {
     fn analyze_set_expr(&mut self, set_expr: &SetExpr) -> Result<AnalyzedQuery, AnalyzerError> {
         match set_expr {
             SetExpr::Select(select) => self.analyze_select(select),
+            SetExpr::Values(values) => self.analyze_values(values),
             SetExpr::Query(query) => self.analyze_query(query),
             SetExpr::SetOperation {
                 op,
@@ -284,6 +293,151 @@ impl<'a> Analyzer<'a> {
     /// Used by `analyze_set_expr` for each branch of a set operation.
     fn analyze_select(&mut self, select: &Select) -> Result<AnalyzedQuery, AnalyzerError> {
         self.analyze_select_complete(select, None, &[], &None, &None)
+    }
+
+    /// Analyze a VALUES query with optional WITH/ORDER BY/LIMIT/OFFSET.
+    fn analyze_values_complete(
+        &mut self,
+        values: &ast::Values,
+        with: Option<&ast::With>,
+        order_by: &[ast::OrderByExpr],
+        limit: &Option<ast::Expr>,
+        offset: &Option<ast::Offset>,
+    ) -> Result<AnalyzedQuery, AnalyzerError> {
+        self.scopes.push(Scope::new());
+
+        let ctes = self.analyze_cte_definitions(with)?;
+        let (rows, output_schema) = self.analyze_values_rows(&values.rows)?;
+
+        // Expose VALUES output columns (column1, column2, ...) for ORDER BY resolution.
+        for (name, dt) in &output_schema {
+            self.scopes
+                .current_mut()
+                .add_column(None, name, dt.clone(), true);
+        }
+
+        // Build synthetic projection so ORDER BY positional refs (ORDER BY 1) map correctly.
+        let projection: Vec<AnalyzedProjection> = output_schema
+            .iter()
+            .enumerate()
+            .map(|(idx, (name, dt))| AnalyzedProjection {
+                expr: TypedExpr::new(
+                    TypedExprKind::ColumnRef {
+                        scope_depth: 0,
+                        column_index: idx,
+                        column_name: name.clone(),
+                    },
+                    dt.clone(),
+                ),
+                output_name: name.clone(),
+            })
+            .collect();
+
+        let analyzed_order_by = self.analyze_order_by_exprs(order_by, &projection)?;
+        let analyzed_limit = match limit {
+            Some(l) => Some(self.analyze_expr(l)?),
+            None => None,
+        };
+        let analyzed_offset = match offset {
+            Some(o) => Some(self.analyze_expr(&o.value)?),
+            None => None,
+        };
+
+        self.scopes.pop();
+
+        Ok(AnalyzedQuery {
+            ctes,
+            body: AnalyzedQueryBody::Values(rows),
+            order_by: analyzed_order_by,
+            limit: analyzed_limit,
+            offset: analyzed_offset,
+            output_schema,
+        })
+    }
+
+    /// Analyze a VALUES branch (used inside set operations).
+    fn analyze_values(&mut self, values: &ast::Values) -> Result<AnalyzedQuery, AnalyzerError> {
+        self.analyze_values_complete(values, None, &[], &None, &None)
+    }
+
+    /// Analyze VALUES rows and unify each column's type across all rows.
+    fn analyze_values_rows(
+        &mut self,
+        rows: &[Vec<Expr>],
+    ) -> Result<(Vec<Vec<TypedExpr>>, Vec<(String, DataType)>), AnalyzerError> {
+        if rows.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        let expected_len = rows[0].len();
+        for row in rows {
+            if row.len() != expected_len {
+                return Err(AnalyzerError::Unsupported(
+                    "VALUES lists must all be the same length".to_string(),
+                ));
+            }
+        }
+
+        let mut analyzed_rows: Vec<Vec<TypedExpr>> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut analyzed_row = Vec::with_capacity(expected_len);
+            for expr in row {
+                analyzed_row.push(self.analyze_expr(expr)?);
+            }
+            analyzed_rows.push(analyzed_row);
+        }
+
+        let mut output_schema = Vec::with_capacity(expected_len);
+        for col_idx in 0..expected_len {
+            let col_exprs: Vec<&TypedExpr> = analyzed_rows.iter().map(|r| &r[col_idx]).collect();
+
+            let non_null_types: Vec<DataType> = col_exprs
+                .iter()
+                .filter(|e| !e.is_null_constant())
+                .map(|e| e.data_type.clone())
+                .collect();
+
+            let target_type = if non_null_types.is_empty() {
+                DataType::Text
+            } else {
+                let mut unified = non_null_types[0].clone();
+                for dt in non_null_types.iter().skip(1) {
+                    unified = common_type(&unified, dt).ok_or_else(|| {
+                        AnalyzerError::TypesCannotBeMatched {
+                            types: col_exprs.iter().map(|e| e.data_type.clone()).collect(),
+                            context: "VALUES".to_string(),
+                        }
+                    })?;
+                }
+                unified
+            };
+
+            for row in &mut analyzed_rows {
+                let expr = row[col_idx].clone();
+                row[col_idx] = Self::coerce_values_expr(expr, &target_type);
+            }
+
+            output_schema.push((format!("column{}", col_idx + 1), target_type));
+        }
+
+        Ok((analyzed_rows, output_schema))
+    }
+
+    fn coerce_values_expr(expr: TypedExpr, target: &DataType) -> TypedExpr {
+        if expr.data_type == *target {
+            expr
+        } else if expr.is_null_constant() {
+            TypedExpr::null(target.clone())
+        } else {
+            TypedExpr::new(
+                TypedExprKind::Cast {
+                    expr: Box::new(expr),
+                    target_type: target.clone(),
+                    cast_context: CastContext::Implicit,
+                },
+                target.clone(),
+            )
+        }
     }
 
     // ── FROM clause ─────────────────────────────────────────

@@ -12,7 +12,7 @@ use crate::types::{DataType, Row, Value};
 /// A correlated subquery has at least one `ColumnRef` with `scope_depth > 0`
 /// somewhere in its WHERE, projection, or other clauses.
 pub(super) fn is_correlated_query(query: &AnalyzedQuery) -> bool {
-    match &query.body {
+    let body_has_outer_ref = match &query.body {
         AnalyzedQueryBody::Select(select) => {
             // Check FROM clause (JOIN ON conditions may contain outer refs).
             if select.from.iter().any(table_ref_has_outer_ref) {
@@ -38,16 +38,15 @@ pub(super) fn is_correlated_query(query: &AnalyzedQuery) -> bool {
                     return true;
                 }
             }
-            // Check ORDER BY.
-            if query.order_by.iter().any(|o| has_outer_ref(&o.expr)) {
-                return true;
-            }
             false
         }
+        AnalyzedQueryBody::Values(rows) => rows.iter().flatten().any(has_outer_ref),
         AnalyzedQueryBody::SetOperation { left, right, .. } => {
             is_correlated_query(left) || is_correlated_query(right)
         }
-    }
+    };
+
+    body_has_outer_ref || query.order_by.iter().any(|o| has_outer_ref(&o.expr))
 }
 
 /// Check if a table reference (or its nested joins) contains outer references.
@@ -145,6 +144,15 @@ pub(super) fn substitute_outer_refs_in_query(
         AnalyzedQueryBody::Select(select) => {
             AnalyzedQueryBody::Select(substitute_outer_refs_in_select(select, outer_row))
         }
+        AnalyzedQueryBody::Values(rows) => AnalyzedQueryBody::Values(
+            rows.iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|e| substitute_outer_refs_in_expr(e, outer_row))
+                        .collect()
+                })
+                .collect(),
+        ),
         AnalyzedQueryBody::SetOperation {
             op,
             all,

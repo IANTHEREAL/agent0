@@ -177,6 +177,22 @@ impl Executor {
                     )
                     .await;
             }
+            ExecutionPath::Values => {
+                let AnalyzedQueryBody::Values(value_rows) = &analyzed.body else {
+                    return Err(anyhow!("Expected VALUES in analyzed query"));
+                };
+                return self
+                    .execute_analyzed_values(
+                        txn,
+                        db_id,
+                        sequence_values,
+                        search_path,
+                        analyzed,
+                        value_rows,
+                        ctes,
+                    )
+                    .await;
+            }
             ExecutionPath::Tableless => {
                 let AnalyzedQueryBody::Select(select) = &analyzed.body else {
                     return Err(anyhow!("Expected SELECT in analyzed query"));
@@ -597,6 +613,116 @@ impl Executor {
         Ok(ExecuteResult::Select {
             columns: columns.to_vec(),
             column_types: Some(column_types.to_vec()),
+            rows,
+            timezone: crate::session_context::current_timezone(),
+        })
+    }
+
+    // ── VALUES query path ──────────────────────────────────────
+
+    /// Execute an analyzed standalone VALUES query.
+    ///
+    /// Expressions are evaluated from typed IR with async materialization for
+    /// subqueries/catalog-dependent functions.
+    async fn execute_analyzed_values(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        sequence_values: &mut HashMap<String, i64>,
+        search_path: &[String],
+        analyzed: &AnalyzedQuery,
+        value_rows: &[Vec<TypedExpr>],
+        ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+    ) -> Result<ExecuteResult> {
+        let columns: Vec<String> = analyzed
+            .output_schema
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        let column_types: Vec<DataType> = analyzed
+            .output_schema
+            .iter()
+            .map(|(_, t)| t.clone())
+            .collect();
+
+        let schema = build_set_op_schema(&columns, &column_types);
+        let dummy_row = Row::new(vec![]);
+        let rt = ExprRuntime::new(self, db_id, search_path, ctes);
+
+        // Evaluate VALUES rows.
+        let mut rows = Vec::with_capacity(value_rows.len());
+        for expr_row in value_rows {
+            let mut pre_materialized = Vec::with_capacity(expr_row.len());
+            for expr in expr_row {
+                pre_materialized.push(rt.pre_materialize(expr, txn, sequence_values).await?);
+            }
+            let materialized = rt
+                .materialize_exprs_for_row(
+                    pre_materialized,
+                    &dummy_row,
+                    &schema,
+                    txn,
+                    sequence_values,
+                )
+                .await?;
+            let mut values = Vec::with_capacity(materialized.len());
+            for expr in &materialized {
+                values.push(rt.eval(expr, &dummy_row)?);
+            }
+            rows.push(Row::new(values));
+        }
+
+        // ORDER BY for VALUES: evaluate ORDER BY keys per row, then sort by keys.
+        if !analyzed.order_by.is_empty() {
+            let mut keyed_rows: Vec<(Row, Vec<Value>)> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let mut keys = Vec::with_capacity(analyzed.order_by.len());
+                for ob in &analyzed.order_by {
+                    keys.push(
+                        rt.resolve_and_eval(&ob.expr, &row, &schema, txn, sequence_values)
+                            .await?,
+                    );
+                }
+                keyed_rows.push((row, keys));
+            }
+
+            crate::sql::expr::operators::sort_by_fallible(&mut keyed_rows, |a, b| {
+                for (idx, ob) in analyzed.order_by.iter().enumerate() {
+                    let ord = crate::sql::expr::compare_order_by_values(
+                        &a.1[idx],
+                        &b.1[idx],
+                        ob.asc,
+                        ob.nulls_first,
+                    )?;
+                    if ord != std::cmp::Ordering::Equal {
+                        return Ok(ord);
+                    }
+                }
+                Ok(std::cmp::Ordering::Equal)
+            })?;
+
+            rows = keyed_rows.into_iter().map(|(row, _)| row).collect();
+        }
+
+        // LIMIT/OFFSET for VALUES.
+        let limit = analyzed
+            .limit
+            .as_ref()
+            .map(|e| eval_const_usize(e))
+            .transpose()?;
+        let offset = analyzed
+            .offset
+            .as_ref()
+            .map(|e| eval_const_usize(e))
+            .transpose()?
+            .unwrap_or(0);
+        let start = offset.min(rows.len());
+        let end = limit.map_or(rows.len(), |l| (start + l).min(rows.len()));
+        let rows = rows[start..end].to_vec();
+
+        Ok(ExecuteResult::Select {
+            columns,
+            column_types: Some(column_types),
             rows,
             timezone: crate::session_context::current_timezone(),
         })

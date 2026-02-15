@@ -32,6 +32,7 @@ pub(crate) struct QueryPlan {
 
 pub(crate) enum ExecutionPath {
     SetOperation { op: SetOpKind, all: bool },
+    Values,
     Tableless,
     SingleTable,
     Join,
@@ -161,6 +162,16 @@ pub(crate) fn plan_query(
                     distinct,
                 )
             }
+            AnalyzedQueryBody::Values(_) => (
+                QueryFeatures {
+                    has_aggregates: false,
+                    has_windows: false,
+                },
+                WhereStrategy::None,
+                analyze_order_by(&analyzed.order_by),
+                ProjectionStrategy::Sync,
+                DistinctStrategy::None,
+            ),
             AnalyzedQueryBody::SetOperation { .. } => (
                 QueryFeatures {
                     has_aggregates: false,
@@ -191,6 +202,7 @@ fn determine_path(analyzed: &AnalyzedQuery) -> ExecutionPath {
         AnalyzedQueryBody::SetOperation { op, all, .. } => {
             ExecutionPath::SetOperation { op: *op, all: *all }
         }
+        AnalyzedQueryBody::Values(_) => ExecutionPath::Values,
         AnalyzedQueryBody::Select(select) => {
             if select.from.is_empty() {
                 ExecutionPath::Tableless
@@ -305,6 +317,7 @@ impl QueryPlan {
                 };
                 format!("path=set_op({}{})", op_name, if *all { "_all" } else { "" })
             }
+            ExecutionPath::Values => "path=values".to_string(),
             ExecutionPath::Tableless => "path=tableless".to_string(),
             ExecutionPath::SingleTable => "path=single_table".to_string(),
             ExecutionPath::Join => "path=join".to_string(),

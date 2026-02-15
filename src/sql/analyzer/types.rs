@@ -703,6 +703,10 @@ pub struct AnalyzedQuery {
 pub enum AnalyzedQueryBody {
     /// A SELECT statement.
     Select(AnalyzedSelect),
+    /// A VALUES clause (`VALUES (..), (..)`).
+    ///
+    /// Each inner Vec is one row of typed expressions.
+    Values(Vec<Vec<TypedExpr>>),
     /// A set operation (UNION / INTERSECT / EXCEPT).
     SetOperation {
         op: SetOpKind,

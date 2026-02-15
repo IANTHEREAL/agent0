@@ -717,6 +717,41 @@ fn analyze_union() {
     }
 }
 
+#[test]
+fn analyze_values_query() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("VALUES (1, 'a'), (2, 'b')");
+    let result = analyzer.analyze_query(&query).unwrap();
+
+    assert_eq!(result.output_schema.len(), 2);
+    assert_eq!(
+        result.output_schema[0],
+        ("column1".to_string(), DataType::Int32)
+    );
+    assert_eq!(
+        result.output_schema[1],
+        ("column2".to_string(), DataType::Text)
+    );
+    match &result.body {
+        AnalyzedQueryBody::Values(rows) => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].len(), 2);
+            assert_eq!(rows[1].len(), 2);
+        }
+        _ => panic!("expected Values body"),
+    }
+}
+
+#[test]
+fn analyze_values_rejects_mismatched_row_width() {
+    let catalog = test_catalog();
+    let mut analyzer = Analyzer::new(&catalog);
+    let query = parse_query("VALUES (1), (1, 2)");
+    let err = analyzer.analyze_query(&query).unwrap_err();
+    assert!(matches!(err, AnalyzerError::Unsupported(_)));
+}
+
 // ── Implicit cast insertion ─────────────────────────────────
 
 #[test]
