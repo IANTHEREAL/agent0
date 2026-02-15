@@ -28,7 +28,7 @@ enum OutputFormat {
 #[command(
     name = "db9",
     about = "db9 — Customer CLI for pg-tikv database service",
-    version
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), ")")
 )]
 struct Cli {
     /// API base URL (env: DB9_API_URL)
