@@ -1,4 +1,19 @@
-//! Type coercion and promotion rules
+//! Type coercion and promotion rules.
+//!
+//! Two coercion functions exist with intentionally different Text-handling:
+//!
+//! - **`common_type(a, b)`** — "Text wins": used for UNION/CASE/COALESCE/etc.
+//!   where PostgreSQL resolves mixed types to a common supertype.  When one side
+//!   is Text/Varchar/Name, the result is Text because every type can be
+//!   represented as text.
+//!
+//! - **`comparison_target_type(a, b)`** — "non-Text wins": used for comparison
+//!   operators (`=`, `<`, `>`, etc.) where PostgreSQL coerces the text literal
+//!   to the typed side.  For example, `'42' = 42` coerces `'42'` to Int32, not
+//!   the integer to text.
+//!
+//! This difference matches PostgreSQL semantics (see `select_common_type` vs
+//! `select_common_typmod` in the PostgreSQL source).
 
 use crate::types::DataType;
 
@@ -249,5 +264,132 @@ pub fn binary_op_result_type(op: &str, left: &DataType, right: &DataType) -> Opt
         "&&" if matches!(left, DataType::Array(_)) => Some(DataType::Boolean),
 
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── common_type: Text wins ───────────────────────────────────
+
+    #[test]
+    fn common_type_text_vs_int32_yields_text() {
+        assert_eq!(
+            common_type(&DataType::Text, &DataType::Int32),
+            Some(DataType::Text)
+        );
+        assert_eq!(
+            common_type(&DataType::Int32, &DataType::Text),
+            Some(DataType::Text)
+        );
+    }
+
+    #[test]
+    fn common_type_numeric_promotion() {
+        assert_eq!(
+            common_type(&DataType::Int32, &DataType::Int64),
+            Some(DataType::Int64)
+        );
+        assert_eq!(
+            common_type(&DataType::Int64, &DataType::Float64),
+            Some(DataType::Float64)
+        );
+    }
+
+    #[test]
+    fn common_type_same_type() {
+        assert_eq!(
+            common_type(&DataType::Boolean, &DataType::Boolean),
+            Some(DataType::Boolean)
+        );
+    }
+
+    // ── comparison_target_type: non-Text wins ────────────────────
+
+    #[test]
+    fn comparison_text_vs_int32_yields_int32() {
+        assert_eq!(
+            comparison_target_type(&DataType::Text, &DataType::Int32),
+            Some(DataType::Int32)
+        );
+        assert_eq!(
+            comparison_target_type(&DataType::Int32, &DataType::Text),
+            Some(DataType::Int32)
+        );
+    }
+
+    #[test]
+    fn comparison_text_vs_boolean_yields_boolean() {
+        assert_eq!(
+            comparison_target_type(&DataType::Text, &DataType::Boolean),
+            Some(DataType::Boolean)
+        );
+    }
+
+    #[test]
+    fn comparison_text_vs_text_yields_text() {
+        assert_eq!(
+            comparison_target_type(&DataType::Text, &DataType::Text),
+            Some(DataType::Text)
+        );
+    }
+
+    #[test]
+    fn comparison_name_vs_int64_yields_int64() {
+        assert_eq!(
+            comparison_target_type(&DataType::Name, &DataType::Int64),
+            Some(DataType::Int64)
+        );
+    }
+
+    // ── Boundary: the difference matters ─────────────────────────
+
+    #[test]
+    fn common_vs_comparison_text_int_diverge() {
+        // common_type: Text wins (for UNION/CASE)
+        assert_eq!(
+            common_type(&DataType::Text, &DataType::Int32),
+            Some(DataType::Text)
+        );
+        // comparison_target_type: Int32 wins (for = < > operators)
+        assert_eq!(
+            comparison_target_type(&DataType::Text, &DataType::Int32),
+            Some(DataType::Int32)
+        );
+    }
+
+    // ── Temporal coercion ────────────────────────────────────────
+
+    #[test]
+    fn comparison_date_timestamp_yields_timestamp() {
+        assert_eq!(
+            comparison_target_type(&DataType::Date, &DataType::Timestamp),
+            Some(DataType::Timestamp)
+        );
+    }
+
+    // ── JSON comparisons unsupported ─────────────────────────────
+
+    #[test]
+    fn comparison_json_vs_non_text_is_none() {
+        // JSON vs non-text types are incomparable.
+        assert_eq!(
+            comparison_target_type(&DataType::Json, &DataType::Int32),
+            None
+        );
+        assert_eq!(
+            comparison_target_type(&DataType::Jsonb, &DataType::Boolean),
+            None
+        );
+    }
+
+    #[test]
+    fn comparison_jsonb_vs_text_yields_jsonb() {
+        // Text vs Jsonb: the non-text side wins (text literal cast to jsonb).
+        assert_eq!(
+            comparison_target_type(&DataType::Jsonb, &DataType::Text),
+            Some(DataType::Jsonb)
+        );
     }
 }

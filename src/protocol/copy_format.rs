@@ -46,6 +46,10 @@ impl CopyOptions {
     pub fn from_copy_options(options: &[sqlparser::ast::CopyOption]) -> Result<Self, String> {
         use sqlparser::ast::CopyOption;
         let mut opts = Self::default();
+        // Track whether the user explicitly set DELIMITER/NULL so that
+        // FORMAT CSV defaults don't override them regardless of option order.
+        let mut delimiter_set = false;
+        let mut null_string_set = false;
         for opt in options {
             match opt {
                 CopyOption::Format(ident) => {
@@ -54,13 +58,6 @@ impl CopyOptions {
                         "TEXT" => {} // default, nothing to change
                         "CSV" => {
                             opts.format = CopyFormat::Csv;
-                            // CSV defaults differ from text
-                            if opts.delimiter == TAB {
-                                opts.delimiter = b',';
-                            }
-                            if opts.null_string == "\\N" {
-                                opts.null_string = String::new();
-                            }
                         }
                         "BINARY" => {
                             return Err("COPY FORMAT binary is not supported".to_string());
@@ -78,9 +75,11 @@ impl CopyOptions {
                         ));
                     }
                     opts.delimiter = *c as u8;
+                    delimiter_set = true;
                 }
                 CopyOption::Null(s) => {
                     opts.null_string = s.clone();
+                    null_string_set = true;
                 }
                 CopyOption::Header(b) => {
                     opts.header = *b;
@@ -104,6 +103,15 @@ impl CopyOptions {
                     opts.escape = *c as u8;
                 }
                 _ => {} // Ignore FREEZE, FORCE_QUOTE, etc.
+            }
+        }
+        // Apply CSV defaults only for options not explicitly set by the user.
+        if opts.format == CopyFormat::Csv {
+            if !delimiter_set {
+                opts.delimiter = b',';
+            }
+            if !null_string_set {
+                opts.null_string = String::new();
             }
         }
         Ok(opts)
@@ -180,12 +188,16 @@ fn encode_csv_value(value: &Value, buf: &mut Vec<u8>, opts: &CopyOptions) {
         buf.push(opts.quote);
         for &c in &tmp {
             if c == opts.quote {
-                // Double the quote character for escaping.
+                // Escape the quote character.
                 if opts.escape == opts.quote {
                     buf.push(opts.quote);
                 } else {
                     buf.push(opts.escape);
                 }
+            } else if c == opts.escape && opts.escape != opts.quote {
+                // When ESCAPE differs from QUOTE, the escape character
+                // itself must also be escaped within quoted fields.
+                buf.push(opts.escape);
             }
             buf.push(c);
         }
@@ -719,6 +731,103 @@ mod tests {
         );
         // NULL emits \N, literal "\N" is escaped to \\N — no collision
         assert_eq!(buf, b"\\N\t\\\\N\n");
+    }
+
+    // --- #634: DELIMITER/NULL parsing order-independent ---
+
+    #[test]
+    fn test_delimiter_before_format_csv() {
+        // DELIMITER before FORMAT csv — must keep the explicit delimiter.
+        let opts = CopyOptions::from_copy_options(&[
+            CopyOption::Delimiter('\t'),
+            CopyOption::Format(Ident::new("csv")),
+        ])
+        .unwrap();
+        assert_eq!(opts.format, CopyFormat::Csv);
+        assert_eq!(opts.delimiter, b'\t');
+    }
+
+    #[test]
+    fn test_null_before_format_csv() {
+        // NULL before FORMAT csv — must keep the explicit null string.
+        let opts = CopyOptions::from_copy_options(&[
+            CopyOption::Null("\\N".to_string()),
+            CopyOption::Format(Ident::new("csv")),
+        ])
+        .unwrap();
+        assert_eq!(opts.format, CopyFormat::Csv);
+        assert_eq!(opts.null_string, "\\N");
+    }
+
+    #[test]
+    fn test_format_csv_before_delimiter() {
+        // FORMAT csv before DELIMITER — explicit delimiter wins.
+        let opts = CopyOptions::from_copy_options(&[
+            CopyOption::Format(Ident::new("csv")),
+            CopyOption::Delimiter('|'),
+        ])
+        .unwrap();
+        assert_eq!(opts.delimiter, b'|');
+    }
+
+    #[test]
+    fn test_csv_defaults_when_no_explicit_options() {
+        // FORMAT csv alone — defaults applied.
+        let opts =
+            CopyOptions::from_copy_options(&[CopyOption::Format(Ident::new("csv"))]).unwrap();
+        assert_eq!(opts.delimiter, b',');
+        assert!(opts.null_string.is_empty());
+    }
+
+    // --- #635: ESCAPE character escaped in CSV quoted fields ---
+
+    #[test]
+    fn test_csv_escape_backslash_in_quoted_field() {
+        let opts = CopyOptions {
+            format: CopyFormat::Csv,
+            delimiter: b',',
+            null_string: String::new(),
+            header: false,
+            quote: b'"',
+            escape: b'\\',
+        };
+        let mut buf = Vec::new();
+        // Comma triggers quoting; backslash must be escaped.
+        encode_row_with_options(&[Value::Text("a\\b,c".to_string())], &mut buf, &opts);
+        assert_eq!(buf, b"\"a\\\\b,c\"\n");
+    }
+
+    #[test]
+    fn test_csv_escape_and_quote_both_escaped() {
+        let opts = CopyOptions {
+            format: CopyFormat::Csv,
+            delimiter: b',',
+            null_string: String::new(),
+            header: false,
+            quote: b'"',
+            escape: b'\\',
+        };
+        let mut buf = Vec::new();
+        // Contains both quote and escape characters, plus delimiter for quoting.
+        encode_row_with_options(&[Value::Text("a\"b\\c,d".to_string())], &mut buf, &opts);
+        // quote escaped as \", backslash escaped as \\
+        assert_eq!(buf, b"\"a\\\"b\\\\c,d\"\n");
+    }
+
+    #[test]
+    fn test_csv_default_escape_unchanged() {
+        // When escape == quote (default), behavior unchanged: quote is doubled.
+        let opts = CopyOptions {
+            format: CopyFormat::Csv,
+            delimiter: b',',
+            null_string: String::new(),
+            header: false,
+            quote: b'"',
+            escape: b'"',
+        };
+        let mut buf = Vec::new();
+        encode_row_with_options(&[Value::Text("a\"b,c".to_string())], &mut buf, &opts);
+        assert_eq!(buf, b"\"a\"\"b,c\"\n");
     }
 
     #[test]

@@ -18,6 +18,7 @@ impl Executor {
         search_path: &[String],
         query: &Query,
         base_ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+        current_role: Option<&str>,
     ) -> Result<HashMap<String, (TableSchema, Vec<Row>)>> {
         let mut ctes: HashMap<String, (TableSchema, Vec<Row>)> = base_ctes.clone();
         if let Some(with) = &query.with {
@@ -35,6 +36,7 @@ impl Executor {
                             &cte.query,
                             &cte.alias.columns,
                             &ctes,
+                            current_role,
                         )
                         .await?;
                     ctes.insert(cte_name, (schema, rows));
@@ -47,6 +49,7 @@ impl Executor {
                             search_path,
                             &cte.query,
                             &ctes,
+                            current_role,
                         )
                         .await?;
                     match cte_result {
@@ -112,10 +115,19 @@ impl Executor {
         sequence_values: &mut HashMap<String, i64>,
         search_path: &[String],
         query: &Query,
+        current_role: Option<&str>,
     ) -> Result<HashMap<String, (TableSchema, Vec<Row>)>> {
         let base = HashMap::new();
-        self.build_cte_context_with_base(txn, db_id, sequence_values, search_path, query, &base)
-            .await
+        self.build_cte_context_with_base(
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            query,
+            &base,
+            current_role,
+        )
+        .await
     }
 
     pub(crate) async fn execute_recursive_cte(
@@ -128,6 +140,7 @@ impl Executor {
         query: &Query,
         alias_columns: &[Ident],
         existing_ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+        current_role: Option<&str>,
     ) -> Result<(TableSchema, Vec<Row>)> {
         let (base_expr, recursive_expr, is_union_all) = match &*query.body {
             SetExpr::SetOperation {
@@ -165,6 +178,7 @@ impl Executor {
                 search_path,
                 &base_query,
                 existing_ctes,
+                current_role,
             )
             .await?;
         let (columns, base_types, mut all_rows) = match base_result {
@@ -246,6 +260,7 @@ impl Executor {
                     search_path,
                     &recursive_query,
                     &temp_ctes,
+                    current_role,
                 )
                 .await?;
 

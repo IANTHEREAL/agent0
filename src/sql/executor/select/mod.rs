@@ -20,6 +20,7 @@ impl Executor {
         search_path: &'a [String],
         query: &'a Query,
         outer_ctes: &'a HashMap<String, (TableSchema, Vec<Row>)>,
+        current_role: Option<&'a str>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ExecuteResult>> + Send + 'a>>
     {
         Box::pin(async move {
@@ -32,6 +33,7 @@ impl Executor {
                         search_path,
                         query,
                         outer_ctes,
+                        current_role,
                     )
                     .await;
             }
@@ -44,6 +46,7 @@ impl Executor {
                     search_path,
                     query,
                     outer_ctes,
+                    current_role,
                 )
                 .await?;
             self.execute_query_with_ctes(
@@ -53,6 +56,7 @@ impl Executor {
                 search_path,
                 query,
                 &merged_ctes,
+                current_role,
             )
             .await
         })
@@ -66,9 +70,18 @@ impl Executor {
         search_path: &[String],
         query: &Query,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+        current_role: Option<&str>,
     ) -> Result<ExecuteResult> {
         // All SELECT / VALUES / SET operations go through the Analyzer path.
-        self.try_execute_analyzed(txn, db_id, sequence_values, search_path, query, ctes)
-            .await
+        self.try_execute_analyzed(
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            query,
+            ctes,
+            current_role,
+        )
+        .await
     }
 }

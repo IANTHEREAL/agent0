@@ -75,6 +75,7 @@ impl Executor {
         columns: &[SqlColumnDef],
         if_not_exists: bool,
         _temporary: bool,
+        current_role: Option<&str>,
     ) -> Result<ExecuteResult> {
         let resolved = names::resolve_ddl_object_name(name, search_path)?;
         if !self
@@ -87,10 +88,25 @@ impl Executor {
         let table_name = resolved.full;
 
         let ctes = self
-            .build_cte_context(txn, db_id, sequence_values, search_path, query)
+            .build_cte_context(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                query,
+                current_role,
+            )
             .await?;
         let result = self
-            .execute_query_with_ctes(txn, db_id, sequence_values, search_path, query, &ctes)
+            .execute_query_with_ctes(
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                query,
+                &ctes,
+                current_role,
+            )
             .await?;
 
         let (result_cols, result_rows) = match result {

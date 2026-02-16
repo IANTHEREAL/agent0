@@ -108,6 +108,7 @@ impl Executor {
                         columns,
                         *if_not_exists,
                         *temporary,
+                        current_role,
                     )
                     .await?
                 } else {
@@ -517,8 +518,15 @@ impl Executor {
                 }
             }
             Statement::Query(query) => {
-                self.execute_query(txn, db_id, sequence_values, search_path, query)
-                    .await
+                self.execute_query(
+                    txn,
+                    db_id,
+                    sequence_values,
+                    search_path,
+                    query,
+                    current_role,
+                )
+                .await
             }
             Statement::ShowTables { .. } => self.execute_show_tables(txn, db_id, search_path).await,
             Statement::SetVariable { .. }
@@ -639,6 +647,7 @@ impl Executor {
                         name,
                         query,
                         *or_replace,
+                        current_role,
                     )
                     .await
                 } else {
@@ -812,6 +821,7 @@ impl Executor {
                     statement,
                     *analyze,
                     *verbose,
+                    current_role,
                 )
                 .await
             }
@@ -1029,14 +1039,22 @@ impl Executor {
         statement: &Statement,
         analyze: bool,
         _verbose: bool,
+        current_role: Option<&str>,
     ) -> Result<ExecuteResult> {
         let (actual_rows, execution_time_ms, kv_stats) = if analyze {
             match statement {
                 Statement::Query(query) => {
                     let start = Instant::now();
                     let (result, kv_stats) = with_kv_read_stats(async {
-                        self.execute_query(txn, db_id, sequence_values, search_path, query)
-                            .await
+                        self.execute_query(
+                            txn,
+                            db_id,
+                            sequence_values,
+                            search_path,
+                            query,
+                            current_role,
+                        )
+                        .await
                     })
                     .await;
                     let result = result?;

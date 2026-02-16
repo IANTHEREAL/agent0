@@ -29,6 +29,11 @@ impl From<&JoinOperator> for JoinType {
     }
 }
 
+/// Streaming nested-loop join operator.
+///
+/// Materializes only the right (inner) side during `open()`.  The left
+/// (outer) side is streamed one row at a time through `next()`, which
+/// keeps memory usage at O(|right|) instead of O(|left| × |right|).
 #[derive(Debug)]
 pub struct NestedLoopJoinOperator {
     left: BoxedOperator,
@@ -36,9 +41,34 @@ pub struct NestedLoopJoinOperator {
     join_type: JoinType,
     condition: Option<TypedExpr>,
     output_schema: TableSchema,
-    result_rows: Vec<Row>,
-    position: usize,
-    opened: bool,
+
+    // ── Streaming state ─────────────────────────────────────────────
+    /// Materialized right (inner) side rows.
+    right_rows: Vec<Row>,
+    /// Column count for the left side (used for NULL padding).
+    left_col_count: usize,
+    /// Column count for the right side (used for NULL padding).
+    right_col_count: usize,
+    /// Current left row being probed against all right rows.
+    current_left_row: Option<Row>,
+    /// Position within `right_rows` for the current left row scan.
+    right_pos: usize,
+    /// Whether the current left row has matched any right row.
+    left_had_match: bool,
+    /// For RIGHT/FULL joins: tracks which right rows have been matched.
+    right_matched: Vec<bool>,
+    /// Current execution phase.
+    phase: NLJPhase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum NLJPhase {
+    NotOpened,
+    /// Streaming left side, scanning right rows for each left row.
+    Scanning,
+    /// Emitting unmatched right rows (RIGHT/FULL join only).
+    EmittingUnmatchedRight,
+    Exhausted,
 }
 
 impl NestedLoopJoinOperator {
@@ -49,6 +79,9 @@ impl NestedLoopJoinOperator {
         join_type: JoinType,
         condition: Option<TypedExpr>,
     ) -> Self {
+        let left_col_count = left.schema().columns.len();
+        let right_col_count = right.schema().columns.len();
+
         let mut columns = Vec::new();
 
         for col in &left.schema().columns {
@@ -95,14 +128,19 @@ impl NestedLoopJoinOperator {
             join_type,
             condition,
             output_schema,
-            result_rows: Vec::new(),
-            position: 0,
-            opened: false,
+            right_rows: Vec::new(),
+            left_col_count,
+            right_col_count,
+            current_left_row: None,
+            right_pos: 0,
+            left_had_match: false,
+            right_matched: Vec::new(),
+            phase: NLJPhase::NotOpened,
         }
     }
 
-    fn make_null_row(schema: &TableSchema) -> Row {
-        Row::new(vec![Value::Null; schema.columns.len()])
+    fn make_null_values(count: usize) -> Vec<Value> {
+        vec![Value::Null; count]
     }
 
     fn concat_rows(left: &Row, right: &Row) -> Row {
@@ -139,121 +177,107 @@ impl PhysicalOperator for NestedLoopJoinOperator {
         self.left.open(ctx).await?;
         self.right.open(ctx).await?;
 
-        let left_rows = collect_all(self.left.as_mut(), ctx).await?;
-        let right_rows = collect_all(self.right.as_mut(), ctx).await?;
+        // Materialize only the right (inner) side.
+        self.right_rows = collect_all(self.right.as_mut(), ctx).await?;
 
-        let left_schema = self.left.schema();
-        let right_schema = self.right.schema();
-
-        self.result_rows.clear();
-
-        match self.join_type {
-            JoinType::Cross => {
-                for left_row in &left_rows {
-                    for right_row in &right_rows {
-                        self.result_rows
-                            .push(Self::concat_rows(left_row, right_row));
-                    }
-                }
-            }
-            JoinType::Inner => {
-                for left_row in &left_rows {
-                    for right_row in &right_rows {
-                        let combined = Self::concat_rows(left_row, right_row);
-                        if self.eval_condition(&combined, ctx.query_ctx)? {
-                            self.result_rows.push(combined);
-                        }
-                    }
-                }
-            }
-            JoinType::Left => {
-                for left_row in &left_rows {
-                    let mut matched = false;
-                    for right_row in &right_rows {
-                        let combined = Self::concat_rows(left_row, right_row);
-                        if self.eval_condition(&combined, ctx.query_ctx)? {
-                            self.result_rows.push(combined);
-                            matched = true;
-                        }
-                    }
-                    if !matched {
-                        let null_right = Self::make_null_row(right_schema);
-                        self.result_rows
-                            .push(Self::concat_rows(left_row, &null_right));
-                    }
-                }
-            }
-            JoinType::Right => {
-                for right_row in &right_rows {
-                    let mut matched = false;
-                    for left_row in &left_rows {
-                        let combined = Self::concat_rows(left_row, right_row);
-                        if self.eval_condition(&combined, ctx.query_ctx)? {
-                            self.result_rows.push(combined);
-                            matched = true;
-                        }
-                    }
-                    if !matched {
-                        let null_left = Self::make_null_row(left_schema);
-                        self.result_rows
-                            .push(Self::concat_rows(&null_left, right_row));
-                    }
-                }
-            }
-            JoinType::Full => {
-                let mut right_matched = vec![false; right_rows.len()];
-
-                for left_row in &left_rows {
-                    let mut left_matched = false;
-                    for (i, right_row) in right_rows.iter().enumerate() {
-                        let combined = Self::concat_rows(left_row, right_row);
-                        if self.eval_condition(&combined, ctx.query_ctx)? {
-                            self.result_rows.push(combined);
-                            left_matched = true;
-                            right_matched[i] = true;
-                        }
-                    }
-                    if !left_matched {
-                        let null_right = Self::make_null_row(right_schema);
-                        self.result_rows
-                            .push(Self::concat_rows(left_row, &null_right));
-                    }
-                }
-
-                for (i, right_row) in right_rows.iter().enumerate() {
-                    if !right_matched[i] {
-                        let null_left = Self::make_null_row(left_schema);
-                        self.result_rows
-                            .push(Self::concat_rows(&null_left, right_row));
-                    }
-                }
-            }
+        // For RIGHT/FULL joins, track which right rows have been matched.
+        if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+            self.right_matched = vec![false; self.right_rows.len()];
         }
 
-        self.position = 0;
-        self.opened = true;
+        self.current_left_row = None;
+        self.right_pos = 0;
+        self.left_had_match = false;
+        self.phase = NLJPhase::Scanning;
         Ok(())
     }
 
-    async fn next(&mut self, _ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
-        if !self.opened {
-            return Err(anyhow!("Operator not opened"));
-        }
+    async fn next(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<Option<Row>> {
+        loop {
+            match self.phase {
+                NLJPhase::NotOpened => return Err(anyhow!("Operator not opened")),
 
-        if self.position < self.result_rows.len() {
-            let row = self.result_rows[self.position].clone();
-            self.position += 1;
-            Ok(Some(row))
-        } else {
-            Ok(None)
+                NLJPhase::Scanning => {
+                    // Ensure we have a current left row to probe.
+                    if self.current_left_row.is_none() {
+                        match self.left.next(ctx).await? {
+                            Some(row) => {
+                                self.current_left_row = Some(row);
+                                self.right_pos = 0;
+                                self.left_had_match = false;
+                            }
+                            None => {
+                                // Left side exhausted.
+                                if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+                                    self.phase = NLJPhase::EmittingUnmatchedRight;
+                                    self.right_pos = 0;
+                                    continue;
+                                } else {
+                                    self.phase = NLJPhase::Exhausted;
+                                    return Ok(None);
+                                }
+                            }
+                        }
+                    }
+
+                    let left_row = self.current_left_row.as_ref().unwrap();
+
+                    // Scan remaining right rows for the current left row.
+                    while self.right_pos < self.right_rows.len() {
+                        let right_row = &self.right_rows[self.right_pos];
+                        let combined = Self::concat_rows(left_row, right_row);
+                        let idx = self.right_pos;
+                        self.right_pos += 1;
+
+                        if self.eval_condition(&combined, ctx.query_ctx)? {
+                            self.left_had_match = true;
+                            if !self.right_matched.is_empty() {
+                                self.right_matched[idx] = true;
+                            }
+                            return Ok(Some(combined));
+                        }
+                    }
+
+                    // All right rows exhausted for this left row.
+                    if matches!(self.join_type, JoinType::Left | JoinType::Full)
+                        && !self.left_had_match
+                    {
+                        let null_right = Row::new(Self::make_null_values(self.right_col_count));
+                        let result = Self::concat_rows(left_row, &null_right);
+                        self.current_left_row = None;
+                        return Ok(Some(result));
+                    }
+
+                    // Move to the next left row.
+                    self.current_left_row = None;
+                }
+
+                NLJPhase::EmittingUnmatchedRight => {
+                    while self.right_pos < self.right_rows.len() {
+                        let idx = self.right_pos;
+                        self.right_pos += 1;
+                        if !self.right_matched[idx] {
+                            let null_left = Row::new(Self::make_null_values(self.left_col_count));
+                            let right_row = &self.right_rows[idx];
+                            return Ok(Some(Self::concat_rows(&null_left, right_row)));
+                        }
+                    }
+                    self.phase = NLJPhase::Exhausted;
+                    return Ok(None);
+                }
+
+                NLJPhase::Exhausted => return Ok(None),
+            }
         }
     }
 
     async fn close(&mut self, ctx: &mut ExecutionContext<'_>) -> Result<()> {
         self.left.close(ctx).await?;
         self.right.close(ctx).await?;
-        self.result_rows.clear();
-        self.opened = false;
+        self.right_rows.clear();
+        self.right_matched.clear();
+        self.current_left_row = None;
+        self.phase = NLJPhase::Exhausted;
         Ok(())
     }
 
@@ -286,6 +310,17 @@ impl PhysicalOperator for NestedLoopJoinOperator {
     }
 }
 
+// Note: Behavioral tests (open/next/close correctness for INNER/LEFT/RIGHT/FULL)
+// cannot be unit-tested here because `ExecutionContext` requires a live TiKV
+// `Transaction`.  Row-producing join semantics are instead covered by SQL-level
+// integration tests:
+//   - tests/61_join_comprehensive.sql      (all 5 join types + NULL padding)
+//   - tests/107_join_right_full_*.sql       (RIGHT/FULL outer join edge cases)
+//   - tests/115_join_using_outer_*.sql      (SELECT * with outer joins)
+//   - tests/116_join_using_outer_*.sql      (merged key COALESCE behavior)
+//   - tests/149_inner-join.sql              (25 INNER JOIN scenarios)
+// The unit tests below verify schema construction, type conversion, and EXPLAIN
+// output for structural correctness of the operator.
 #[cfg(test)]
 mod tests {
     use super::*;

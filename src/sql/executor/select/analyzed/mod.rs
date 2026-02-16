@@ -60,6 +60,7 @@ impl Executor {
         search_path: &[String],
         query: &Query,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
+        current_role: Option<&str>,
     ) -> Result<ExecuteResult> {
         // Pre-analysis rewrite: expand views into derived subqueries.
         //
@@ -79,6 +80,22 @@ impl Executor {
             ctes,
         )
         .await?;
+
+        // ── SELECT privilege check ──────────────────────────────────
+        // Check that the current role has SELECT privilege on every base
+        // table referenced in this query.  Virtual catalog tables
+        // (information_schema, pg_catalog) are exempt.
+        if current_role.is_some() {
+            for table_name in catalog.base_table_full_names() {
+                self.require_table_privilege(
+                    txn,
+                    current_role,
+                    crate::auth::Privilege::Select,
+                    table_name,
+                )
+                .await?;
+            }
+        }
 
         // Run the Analyzer (sync: name resolution + type checking).
         let mut analyzer = Analyzer::new(&catalog);

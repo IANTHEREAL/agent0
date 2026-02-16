@@ -216,6 +216,7 @@ impl Executor {
                             search_path,
                             subquery,
                             ctes,
+                            None,
                         )
                         .await?;
                     let values = match result {
@@ -346,6 +347,7 @@ impl Executor {
                             search_path,
                             subquery,
                             ctes,
+                            None,
                         )
                         .await?;
                     match result {
@@ -377,6 +379,7 @@ impl Executor {
                             search_path,
                             subquery,
                             ctes,
+                            None,
                         )
                         .await?;
                     let exists = match result {

@@ -5,7 +5,7 @@
 //! relations from TiKV before analysis begins (async fetch → sync analysis).
 
 use crate::types::{ColumnDef, DataType, FunctionDef, TableSchema, UserTypeDef, ViewDef};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 // ── Catalog trait ───────────────────────────────────────────
 
@@ -101,6 +101,9 @@ pub struct CatalogSnapshot {
     search_path: Vec<String>,
     #[allow(dead_code)] // FUTURE: cross-database query isolation
     database_id: u64,
+    /// Qualified names that are NOT base tables (CTEs, virtual catalog tables).
+    /// Used by `base_table_full_names()` to exclude non-privileged entries.
+    non_base_names: HashSet<String>,
 }
 
 impl CatalogSnapshot {
@@ -114,6 +117,7 @@ impl CatalogSnapshot {
             types: HashMap::new(),
             search_path,
             database_id,
+            non_base_names: HashSet::new(),
         }
     }
 
@@ -149,6 +153,36 @@ impl CatalogSnapshot {
     /// Check if a table name is already in the snapshot.
     pub fn has_table(&self, name: &str) -> bool {
         self.tables.contains_key(&name.to_lowercase())
+    }
+
+    /// Mark a qualified name as non-base (CTE alias or virtual catalog table).
+    /// These entries are visible for analysis but excluded from privilege checks.
+    pub fn mark_non_base(&mut self, qualified_name: &str) {
+        self.non_base_names.insert(qualified_name.to_string());
+    }
+
+    /// Return deduplicated fully-qualified names of all real (non-virtual) tables
+    /// in the snapshot.  Used for privilege checking — callers can iterate
+    /// the result and call `require_table_privilege()` per entry.
+    pub fn base_table_full_names(&self) -> Vec<&str> {
+        let mut seen = HashSet::new();
+        let mut result = Vec::new();
+        for (qualified_name, _schema) in self.tables.values() {
+            // Skip entries explicitly marked as non-base (CTEs, virtual tables).
+            if self.non_base_names.contains(qualified_name.as_str()) {
+                continue;
+            }
+            // Skip schema-prefixed virtual catalog tables.
+            if qualified_name.starts_with("information_schema.")
+                || qualified_name.starts_with("pg_catalog.")
+            {
+                continue;
+            }
+            if seen.insert(qualified_name.as_str()) {
+                result.push(qualified_name.as_str());
+            }
+        }
+        result
     }
 
     /// Merge tables from another snapshot into this one (for DML + subquery).

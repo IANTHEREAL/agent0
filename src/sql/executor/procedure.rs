@@ -600,6 +600,7 @@ impl Executor {
         name: &ObjectName,
         query: &Query,
         or_replace: bool,
+        current_role: Option<&str>,
     ) -> Result<ExecuteResult> {
         let result = self
             .execute_query_with_ctes(
@@ -609,6 +610,7 @@ impl Executor {
                 search_path,
                 query,
                 &HashMap::new(),
+                current_role,
             )
             .await?;
         let (columns, rows) = match result {
@@ -712,6 +714,9 @@ impl Executor {
             session.begin().await?;
         }
 
+        // Extract role before mutable borrow of session for the transaction.
+        let current_role = session.current_user().map(|u| u.to_string());
+
         let result = async {
             let db_id = session.current_database_id();
             let (txn, sequence_values, search_path) = session
@@ -750,6 +755,7 @@ impl Executor {
                     search_path,
                     &query,
                     &HashMap::new(),
+                    current_role.as_deref(),
                 )
                 .await?;
             let rows = match result {

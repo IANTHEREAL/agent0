@@ -124,8 +124,10 @@ async fn build_catalog_snapshot_inner(
     let mut snapshot = CatalogSnapshot::new(search_path.to_vec(), db_id);
 
     // 1. Add CTEs — they shadow real tables during analysis.
+    //    Mark as non-base so privilege checks don't try to validate them.
     for (cte_name, (cte_schema, _rows)) in ctes {
         snapshot.add_table(cte_name, cte_name.clone(), cte_schema.clone());
+        snapshot.mark_non_base(cte_name);
     }
 
     // 2. Extract all table names referenced in FROM/JOIN/subquery.
@@ -166,7 +168,11 @@ async fn build_catalog_snapshot_inner(
             crate::sql::information_schema::get_information_schema_schema(raw_name)
         {
             // Virtual table (pg_catalog.*, information_schema.*).
-            snapshot.add_table(raw_name, raw_name.to_string(), virtual_schema);
+            // Mark as non-base: bare names like "pg_tables" lack the pg_catalog. prefix
+            // and would otherwise leak into privilege checks.
+            let qualified = raw_name.to_string();
+            snapshot.add_table(raw_name, qualified.clone(), virtual_schema);
+            snapshot.mark_non_base(&qualified);
         }
         // If not found, we don't error here — the Analyzer will produce
         // a proper "table not found" error with context.
