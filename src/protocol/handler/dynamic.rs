@@ -21,7 +21,7 @@ use super::{
     PgServerParameterProvider, TipgQueryParser, CONNECTION_ID_COUNTER, METADATA_ACTUAL_USER,
     METADATA_AUTH_IS_SUPERUSER, METADATA_KEYSPACE,
 };
-use crate::auth::AuthManager;
+use crate::auth::{AuthManager, Privilege};
 use crate::observability;
 use crate::pool::{TenantHandle, TikvClientPool};
 use crate::sql::{ExecuteResult, Executor, Session};
@@ -1189,6 +1189,36 @@ impl SimpleQueryHandler for DynamicPgHandler {
                         }
                     }
                 };
+
+                // Authorization: COPY FROM STDIN bypasses statement execution.
+                // Require INSERT privilege before entering COPY mode.
+                let current_role = session.current_user().map(|s| s.to_string());
+                let privilege_result = {
+                    let txn = session.get_mut_txn().ok_or_else(|| {
+                        PgWireError::UserError(Box::new(ErrorInfo::new(
+                            "ERROR".to_string(),
+                            "XX000".to_string(),
+                            "No transaction".to_string(),
+                        )))
+                    })?;
+                    executor
+                        .require_table_privilege(
+                            txn,
+                            current_role.as_deref(),
+                            Privilege::Insert,
+                            &resolved_table,
+                        )
+                        .await
+                };
+
+                if let Err(e) = privilege_result {
+                    rollback_autocommit_or_mark_failed(session, started_txn).await;
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "ERROR".to_string(),
+                        sqlstate_for_executor_error(&e).to_string(),
+                        e.to_string(),
+                    ))));
+                }
 
                 let (resolved_columns, column_types) =
                     match resolve_copy_columns(&schema, &columns, &table_name) {

@@ -37,7 +37,7 @@ impl Executor {
         Ok(())
     }
 
-    async fn require_table_privilege(
+    pub(crate) async fn require_table_privilege(
         &self,
         txn: &mut Transaction,
         current_role: Option<&str>,
