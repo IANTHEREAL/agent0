@@ -32,7 +32,6 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("STRPOS", strpos);
     map.insert("SPLIT_PART", split_part);
     map.insert("TRANSLATE", translate);
-    map.insert("MD5", md5);
     map.insert("QUOTE_IDENT", quote_ident);
     map.insert("QUOTE_LITERAL", quote_literal);
     map.insert("QUOTE_NULLABLE", quote_nullable);
@@ -433,19 +432,6 @@ pub fn translate(args: Vec<Value>) -> Result<Value> {
     Ok(Value::Text(result))
 }
 
-pub fn md5(args: Vec<Value>) -> Result<Value> {
-    match args.into_iter().next() {
-        Some(Value::Null) => Ok(Value::Null),
-        Some(Value::Text(s)) => Ok(Value::Text(format!("{:x}", md5::compute(s.as_bytes())))),
-        Some(Value::Bytes(b)) => Ok(Value::Text(format!("{:x}", md5::compute(&b)))),
-        Some(v) => Ok(Value::Text(format!(
-            "{:x}",
-            md5::compute(v.to_string().as_bytes())
-        ))),
-        None => Ok(Value::Null),
-    }
-}
-
 pub fn quote_ident(args: Vec<Value>) -> Result<Value> {
     let val = match args.into_iter().next() {
         Some(Value::Text(s)) => s,
@@ -619,11 +605,6 @@ pub fn position(args: Vec<Value>) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_md5_null() {
-        assert_eq!(md5(vec![Value::Null]).unwrap(), Value::Null);
-    }
 
     #[test]
     fn test_quote_ident_non_text_arg() {

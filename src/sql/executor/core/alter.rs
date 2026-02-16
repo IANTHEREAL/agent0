@@ -1,6 +1,7 @@
 //! ALTER/COMMENT execution helpers
 
 use super::*;
+use crate::sql::error::SqlError;
 
 impl Executor {
     pub(crate) async fn execute_alter_owner_cmd(
@@ -195,11 +196,10 @@ impl Executor {
                         .ok_or_else(|| anyhow!("Table '{}' does not exist", resolved_table.full))?;
 
                     if schema.column_index(&column_name).is_none() {
-                        return Err(anyhow!(
-                            "column \"{}\" of relation \"{}\" does not exist",
-                            column_name,
-                            resolved_table.name
-                        ));
+                        return Err(SqlError::ColumnNotFound {
+                            column: column_name.clone(),
+                        }
+                        .into());
                     }
 
                     Some((resolved_table.full, column_name))
@@ -299,11 +299,10 @@ impl Executor {
                         .ok_or_else(|| anyhow!("Table '{}' does not exist", resolved_table.full))?;
 
                     if schema.column_index(&column).is_none() {
-                        return Err(anyhow!(
-                            "column \"{}\" of relation \"{}\" does not exist",
-                            column,
-                            resolved_table.name
-                        ));
+                        return Err(SqlError::ColumnNotFound {
+                            column: column.clone(),
+                        }
+                        .into());
                     }
 
                     self.store

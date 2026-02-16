@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
 use crate::extensions::context;
+use crate::sql::error::SqlError;
 use crate::types::{ColumnDef, DataType, Row, TableSchema};
 use std::collections::HashSet;
 use tracing::warn;
@@ -99,7 +100,11 @@ pub(crate) async fn infer_table_function_schema(
 ) -> Result<TableSchema> {
     let use_remote = backend::is_remote_configured();
     if !use_remote && !context::allow_local_fs() {
-        return Err(anyhow!("permission denied for extension \"fs9\""));
+        return Err(SqlError::PermissionDenied {
+            object_type: "extension".into(),
+            object_name: "fs9".into(),
+        }
+        .into());
     }
 
     let backend = backend::get_backend(tenant);
@@ -178,7 +183,11 @@ pub(crate) async fn execute_table_function(
 ) -> Result<(TableSchema, Vec<Row>)> {
     let use_remote = backend::is_remote_configured();
     if !use_remote && !context::allow_local_fs() {
-        return Err(anyhow!("permission denied for extension \"fs9\""));
+        return Err(SqlError::PermissionDenied {
+            object_type: "extension".into(),
+            object_name: "fs9".into(),
+        }
+        .into());
     }
 
     let backend = backend::get_backend(tenant);
@@ -309,7 +318,11 @@ pub(crate) async fn start_file_stream(
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
     let use_remote = backend::is_remote_configured();
     if !use_remote && !context::allow_local_fs() {
-        return Err(anyhow!("permission denied for extension \"fs9\""));
+        return Err(SqlError::PermissionDenied {
+            object_type: "extension".into(),
+            object_name: "fs9".into(),
+        }
+        .into());
     }
 
     let backend = backend::get_backend(tenant);
@@ -435,7 +448,11 @@ async fn start_glob_stream_with_budget(
 ) -> Result<Option<(TableSchema, mpsc::Receiver<Row>)>> {
     let use_remote = backend::is_remote_configured();
     if !use_remote && !context::allow_local_fs() {
-        return Err(anyhow!("permission denied for extension \"fs9\""));
+        return Err(SqlError::PermissionDenied {
+            object_type: "extension".into(),
+            object_name: "fs9".into(),
+        }
+        .into());
     }
 
     let backend = backend::get_backend(tenant);

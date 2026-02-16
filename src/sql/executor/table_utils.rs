@@ -5,6 +5,7 @@
 use super::super::ddl_export;
 use super::super::information_schema::VirtualTableFilter;
 use super::core::Executor;
+use crate::sql::catalog::virtual_tables::virtual_table_schema;
 use crate::sql::error::SqlError;
 use crate::types::{ColumnDef, DataType, MigrationRecord, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
@@ -52,101 +53,8 @@ impl Executor {
         if t_upper == "_PGTIKV_SYS_OBSERVABILITY" || t_upper.ends_with("._PGTIKV_SYS_OBSERVABILITY")
         {
             let snap = self.observability().snapshot_summary();
-            let schema = TableSchema {
-                table_id: 0,
-                name: table_name.to_string(),
-                columns: vec![
-                    ColumnDef {
-                        name: "window_seconds".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "statement_count".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "txn_commit_count".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "error_count".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "qps".to_string(),
-                        data_type: DataType::Float64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "tps".to_string(),
-                        data_type: DataType::Float64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "latency_avg_ms".to_string(),
-                        data_type: DataType::Float64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "latency_p99_ms".to_string(),
-                        data_type: DataType::Float64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "active_connections".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                ],
-                pk_constraint_name: None,
-                pk_indices: vec![],
-                indexes: vec![],
-                version: 1,
-                check_constraints: vec![],
-                foreign_keys: vec![],
-                owner: String::new(),
-                from_alias: None,
-            };
+            let mut schema = virtual_table_schema("_PGTIKV_SYS_OBSERVABILITY").unwrap();
+            schema.name = table_name.to_string();
 
             let row = Row::new(vec![
                 Value::Int64(i64::try_from(snap.window_seconds).unwrap_or(i64::MAX)),
@@ -164,83 +72,8 @@ impl Executor {
         if t_upper == "_PGTIKV_SYS_QUERY_SAMPLES" || t_upper.ends_with("._PGTIKV_SYS_QUERY_SAMPLES")
         {
             let groups = self.observability().snapshot_query_samples();
-            let schema = TableSchema {
-                table_id: 0,
-                name: table_name.to_string(),
-                columns: vec![
-                    ColumnDef {
-                        name: "query".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "sample_count".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "error_count".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "latency_avg_ms".to_string(),
-                        data_type: DataType::Float64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "latency_p99_ms".to_string(),
-                        data_type: DataType::Float64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "latency_max_ms".to_string(),
-                        data_type: DataType::Float64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "last_seen_ms_ago".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                ],
-                pk_constraint_name: None,
-                pk_indices: vec![],
-                indexes: vec![],
-                version: 1,
-                check_constraints: vec![],
-                foreign_keys: vec![],
-                owner: String::new(),
-                from_alias: None,
-            };
+            let mut schema = virtual_table_schema("_PGTIKV_SYS_QUERY_SAMPLES").unwrap();
+            schema.name = table_name.to_string();
 
             let rows = groups
                 .into_iter()
@@ -260,47 +93,8 @@ impl Executor {
         }
         if t_upper == "_PGTIKV_SYS_EXPORT_DDL" || t_upper.ends_with("._PGTIKV_SYS_EXPORT_DDL") {
             let exported = ddl_export::export_all_ddl(self.store().as_ref(), txn, db_id).await?;
-            let schema = TableSchema {
-                table_id: 0,
-                name: table_name.to_string(),
-                columns: vec![
-                    ColumnDef {
-                        name: "object_type".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "object_name".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "ddl_sql".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                ],
-                pk_constraint_name: None,
-                pk_indices: vec![],
-                indexes: vec![],
-                version: 1,
-                check_constraints: vec![],
-                foreign_keys: vec![],
-                owner: String::new(),
-                from_alias: None,
-            };
+            let mut schema = virtual_table_schema("_PGTIKV_SYS_EXPORT_DDL").unwrap();
+            schema.name = table_name.to_string();
 
             let rows = exported
                 .into_iter()
@@ -317,56 +111,8 @@ impl Executor {
 
         if t_upper == "_PGTIKV_SYS_MIGRATIONS" || t_upper.ends_with("._PGTIKV_SYS_MIGRATIONS") {
             let migrations = self.store().list_migrations(txn).await?;
-            let schema = TableSchema {
-                table_id: 0,
-                name: table_name.to_string(),
-                columns: vec![
-                    ColumnDef {
-                        name: "name".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "applied_at".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "checksum".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "sql_preview".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                ],
-                pk_constraint_name: None,
-                pk_indices: vec![],
-                indexes: vec![],
-                version: 1,
-                check_constraints: vec![],
-                foreign_keys: vec![],
-                owner: String::new(),
-                from_alias: None,
-            };
+            let mut schema = virtual_table_schema("_PGTIKV_SYS_MIGRATIONS").unwrap();
+            schema.name = table_name.to_string();
 
             let rows = migrations
                 .into_iter()
@@ -496,83 +242,8 @@ impl Executor {
                 (latency_sum_ms as f64) / (latency_cnt as f64)
             };
 
-            let schema = TableSchema {
-                table_id: 0,
-                name: table_name.to_string(),
-                columns: vec![
-                    ColumnDef {
-                        name: "keyspace".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "pending".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "processing".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "failed".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "dlq_count".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "avg_latency_ms".to_string(),
-                        data_type: DataType::Float64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "events_per_min".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                ],
-                pk_constraint_name: None,
-                pk_indices: vec![],
-                indexes: vec![],
-                version: 1,
-                check_constraints: vec![],
-                foreign_keys: vec![],
-                owner: String::new(),
-                from_alias: None,
-            };
+            let mut schema = virtual_table_schema("_PGTIKV_SYS_TRIGGER_QUEUE_STATS").unwrap();
+            schema.name = table_name.to_string();
 
             let row = Row::new(vec![
                 Value::Text(self.tenant_keyspace().to_string()),
@@ -645,83 +316,8 @@ impl Executor {
                 }
             }
 
-            let schema = TableSchema {
-                table_id: 0,
-                name: table_name.to_string(),
-                columns: vec![
-                    ColumnDef {
-                        name: "id".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "trigger_name".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "table_name".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "operation".to_string(),
-                        data_type: DataType::Text,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "error_msg".to_string(),
-                        data_type: DataType::Text,
-                        nullable: true,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "retry_count".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                    ColumnDef {
-                        name: "created_at_ms".to_string(),
-                        data_type: DataType::Int64,
-                        nullable: false,
-                        primary_key: false,
-                        unique: false,
-                        is_serial: false,
-                        default_expr: None,
-                    },
-                ],
-                pk_constraint_name: None,
-                pk_indices: vec![],
-                indexes: vec![],
-                version: 1,
-                check_constraints: vec![],
-                foreign_keys: vec![],
-                owner: String::new(),
-                from_alias: None,
-            };
+            let mut schema = virtual_table_schema("_PGTIKV_SYS_TRIGGER_DLQ").unwrap();
+            schema.name = table_name.to_string();
 
             return Ok((schema, rows));
         }

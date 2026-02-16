@@ -6,39 +6,13 @@ fn is_ident_char(b: u8) -> bool {
 }
 
 pub(super) fn sqlstate_for_executor_error(err: &anyhow::Error) -> &'static str {
-    // Try typed SqlError first (new structured error path)
     if let Some(sql_err) = err.downcast_ref::<crate::sql::error::SqlError>() {
         return sql_err.sqlstate();
     }
-    // Legacy check
     if err.is::<InFailedSqlTransaction>() {
         return "25P02";
     }
-    // String-match fallback for errors not yet migrated to SqlError
-    let msg = err.to_string();
-    if msg.starts_with("invalid input syntax for type") {
-        "22P02"
-    } else if msg.starts_with("column \"") && msg.ends_with("\" does not exist") {
-        "42703"
-    } else if msg.contains("is ambiguous") {
-        "42702"
-    } else if msg.starts_with("relation \"") && msg.contains("does not exist") {
-        "42P01"
-    } else if msg.contains("duplicate key value violates unique constraint") {
-        "23505"
-    } else if msg.contains("violates not-null constraint") {
-        "23502"
-    } else if msg.contains("violates check constraint") {
-        "23514"
-    } else if msg.contains("Division by zero") {
-        "22012"
-    } else if msg.starts_with("permission denied") {
-        "42501"
-    } else if msg.contains("does not exist") && msg.starts_with("function") {
-        "42883"
-    } else {
-        "XX000"
-    }
+    "XX000"
 }
 
 fn find_unqualified_identifier_position(query: &str, ident: &str) -> Option<usize> {

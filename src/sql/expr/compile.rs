@@ -1,15 +1,16 @@
 use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::analyzer::{Analyzer, NullCatalog, Scope};
+use crate::sql::error::SqlError;
 use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
 use crate::types::TableSchema;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 /// Compile an AST expression that must not reference row columns.
 pub fn compile_const_expr(expr: &sqlparser::ast::Expr, qctx: &QueryContext) -> Result<TypedExpr> {
     let catalog = NullCatalog;
-    let typed = Analyzer::analyze_expr_with_scope(&catalog, Scope::new(), expr)
-        .map_err(|e| anyhow!("{}", e))?;
+    let typed =
+        Analyzer::analyze_expr_with_scope(&catalog, Scope::new(), expr).map_err(SqlError::from)?;
     Ok(fold_typed_expr(&typed, qctx))
 }
 
@@ -22,8 +23,7 @@ pub fn compile_row_expr_for_table(
 ) -> Result<TypedExpr> {
     let catalog = NullCatalog;
     let scope = Scope::from_table_schema(alias, schema);
-    let typed =
-        Analyzer::analyze_expr_with_scope(&catalog, scope, expr).map_err(|e| anyhow!("{}", e))?;
+    let typed = Analyzer::analyze_expr_with_scope(&catalog, scope, expr).map_err(SqlError::from)?;
     Ok(fold_typed_expr(&typed, qctx))
 }
 
@@ -44,7 +44,6 @@ pub fn compile_join_expr(
         scope.add_table(alias, &cols);
     }
 
-    let typed =
-        Analyzer::analyze_expr_with_scope(&catalog, scope, expr).map_err(|e| anyhow!("{}", e))?;
+    let typed = Analyzer::analyze_expr_with_scope(&catalog, scope, expr).map_err(SqlError::from)?;
     Ok(fold_typed_expr(&typed, qctx))
 }

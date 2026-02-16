@@ -1,4 +1,5 @@
 use super::*;
+use crate::sql::error::SqlError;
 
 impl TikvStore {
     /// Acquire pessimistic (exclusive) locks on the given rows.
@@ -289,12 +290,17 @@ impl TikvStore {
                     other => format!("{}", other),
                 })
                 .collect();
-            return Err(anyhow!(
+            let message = format!(
                 "duplicate key value violates unique constraint \"{}\"\nDETAIL:  Key ({})=({}) already exists.",
                 constraint_name,
                 pk_col_names.join(", "),
                 pk_val_strs.join(", ")
-            ));
+            );
+            return Err(SqlError::UniqueViolation {
+                constraint: constraint_name,
+                message,
+            }
+            .into());
         }
         txn_put(txn, data_key, row_data).await?;
         debug!("Inserted row into '{}'", table_name);

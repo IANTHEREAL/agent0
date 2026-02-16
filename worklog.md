@@ -1,5 +1,59 @@
 # Worklog
 
+## 2026-02-16 — Legacy/Fallback/Misplaced Code Cleanup
+
+### Phase 0: MD5 Duplicate Removal
+- Removed duplicate `md5()` function from `src/sql/expr/functions/string.rs` (line 436-447)
+- Removed `map.insert("MD5", md5)` registration (line 35) and `test_md5_null` test
+- Kept canonical version in `src/sql/expr/functions/encoding.rs`
+
+### Phase 1: Root Typing Infrastructure
+- Added `From<AnalyzerError> for SqlError` in `src/sql/error.rs` — maps 7 variants to correct SQLSTATE codes, all others fall through to `Internal` (XX000)
+- Added `From<UnsupportedFeature> for SqlError` in `src/sql/executor/select/analyzed/query_plan.rs` — all 3 variants map to `Unsupported` (0A000)
+- Fixed 10 call sites that stripped type info via `anyhow!("{}", e)` → now use `.map_err(SqlError::from)`:
+  - `src/sql/expr/compile.rs` (3 sites)
+  - `src/sql/executor/select/analyzed/mod.rs` (3 sites)
+  - `src/sql/executor/core/statement.rs` (3 sites)
+  - `src/sql/ddl.rs` (1 site)
+- Added roundtrip test: `AnalyzerError → SqlError → anyhow → downcast → correct SQLSTATE`
+
+### Phase 2: Leaf Site Migration
+Migrated 10 `anyhow!()` sites to typed `SqlError`:
+- Unique violation: `src/storage/tikv_store/tables.rs` → `SqlError::UniqueViolation`
+- Invalid input syntax: `src/types/date.rs` → `SqlError::InvalidInputSyntax`
+- Column not found: `src/sql/executor/core/alter.rs` (2 sites) → `SqlError::ColumnNotFound`
+- Ambiguous index: `src/sql/executor/ddl.rs` → `SqlError::AmbiguousColumn`
+- Permission denied: `src/extensions/http.rs` → `SqlError::PermissionDenied`
+- Permission denied: `src/extensions/fs/mod.rs` (4 sites) → `SqlError::PermissionDenied`
+
+### Phase 3: Fallback Removal
+- Replaced `sqlstate_for_executor_error()` body: removed 10-pattern string-match fallback, now just `SqlError downcast → InFailedSqlTransaction check → XX000`
+- Rewrote `test_sqlstate_for_executor_error` to test the typed `SqlError` downcast path
+
+### Phase 4: Legacy Subquery Module Deletion
+- Verified all 5 high-risk unit test behaviors have integration test coverage:
+  - CTE scoping: `tests/20_cte.sql`, `tests/29_recursive_cte.sql`
+  - Set-op shadowing: `tests/67_set_operations.sql`
+  - CAST traversal: `tests/57_type_casting.sql` + correlated subquery tests
+  - Issue #446: `tests/155_correlated_subquery_join_on_issue446.sql`
+  - Correlated subqueries: 5+ dedicated test files (155-158, 222)
+- Confirmed zero external callers
+- Deleted `src/sql/executor/subquery.rs` (1,855 lines) and removed module declaration
+- Compiler warnings dropped from 21 to 15 (6 dead-code warnings eliminated)
+
+### Phase 5: Virtual Table Schema Unification
+- Created `src/sql/catalog/virtual_tables.rs` with single-source schema definitions for all 7 `_PGTIKV_SYS_*` tables
+- Handler gained `_PGTIKV_SYS_TRIGGER_DLQ` schema (was missing)
+- Updated `src/sql/executor/table_utils.rs` — replaced 6 inline schema blocks with `virtual_table_schema()` calls
+- Updated `src/protocol/handler/mod.rs` — `infer_system_table_function_schema()` now delegates to catalog
+
+### Verification
+- `cargo build`: 0 errors, 15 warnings (all pre-existing)
+- `cargo test`: 1232 passed, 0 failed
+- Net lines removed: ~2,200 (subquery.rs 1,855 + ~400 inline schemas)
+
+---
+
 ## 2026-02-15 — Fix CI Regressions for PR #743 (DML Analyzer)
 
 ### Bug A (P0): Catalog prefetch Visitor misses INSERT target table

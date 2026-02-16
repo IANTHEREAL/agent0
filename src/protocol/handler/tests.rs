@@ -181,54 +181,76 @@ fn encode_value_to_string(value: &Value, col_type: Option<&DataType>) -> String 
 
 #[test]
 fn test_sqlstate_for_executor_error() {
-    // Test legacy InFailedSqlTransaction
+    use crate::sql::error::SqlError;
+
+    // InFailedSqlTransaction → 25P02
     let failed = anyhow::Error::new(InFailedSqlTransaction);
     assert_eq!(sqlstate_for_executor_error(&failed), "25P02");
 
-    // Test generic error (default)
+    // Untyped anyhow → XX000
     let other = anyhow::anyhow!("boom");
     assert_eq!(sqlstate_for_executor_error(&other), "XX000");
 
-    // Test string-match fallback: invalid input syntax
-    let invalid_syntax = anyhow::anyhow!("invalid input syntax for type integer: \"abc\"");
-    assert_eq!(sqlstate_for_executor_error(&invalid_syntax), "22P02");
+    // SqlError downcast path: each variant gets correct SQLSTATE
+    let cases: Vec<(SqlError, &str)> = vec![
+        (
+            SqlError::InvalidInputSyntax {
+                type_name: "integer".into(),
+                value: "abc".into(),
+            },
+            "22P02",
+        ),
+        (
+            SqlError::ColumnNotFound {
+                column: "age".into(),
+            },
+            "42703",
+        ),
+        (SqlError::AmbiguousColumn("id".into()), "42702"),
+        (SqlError::RelationNotFound("users".into()), "42P01"),
+        (
+            SqlError::UniqueViolation {
+                constraint: "pk_users".into(),
+                message: "dup".into(),
+            },
+            "23505",
+        ),
+        (
+            SqlError::NotNullViolation {
+                column: "email".into(),
+                relation: "users".into(),
+                message: "null".into(),
+            },
+            "23502",
+        ),
+        (
+            SqlError::CheckViolation {
+                table: "t".into(),
+                constraint: "age_positive".into(),
+                detail: String::new(),
+            },
+            "23514",
+        ),
+        (SqlError::DivisionByZero, "22012"),
+        (
+            SqlError::PermissionDenied {
+                object_type: "table".into(),
+                object_name: "users".into(),
+            },
+            "42501",
+        ),
+        (SqlError::FunctionNotFound("my_func".into()), "42883"),
+    ];
 
-    // Test string-match fallback: column not found
-    let col_not_found = anyhow::anyhow!("column \"age\" does not exist");
-    assert_eq!(sqlstate_for_executor_error(&col_not_found), "42703");
-
-    // Test string-match fallback: ambiguous column
-    let ambiguous = anyhow::anyhow!("column reference \"id\" is ambiguous");
-    assert_eq!(sqlstate_for_executor_error(&ambiguous), "42702");
-
-    // Test string-match fallback: relation not found
-    let rel_not_found = anyhow::anyhow!("relation \"users\" does not exist");
-    assert_eq!(sqlstate_for_executor_error(&rel_not_found), "42P01");
-
-    // Test string-match fallback: unique constraint violation
-    let unique_violation =
-        anyhow::anyhow!("duplicate key value violates unique constraint \"pk_users\"");
-    assert_eq!(sqlstate_for_executor_error(&unique_violation), "23505");
-
-    // Test string-match fallback: not-null constraint violation
-    let not_null = anyhow::anyhow!("violates not-null constraint on column \"email\"");
-    assert_eq!(sqlstate_for_executor_error(&not_null), "23502");
-
-    // Test string-match fallback: check constraint violation
-    let check = anyhow::anyhow!("violates check constraint \"age_positive\"");
-    assert_eq!(sqlstate_for_executor_error(&check), "23514");
-
-    // Test string-match fallback: division by zero
-    let div_zero = anyhow::anyhow!("Division by zero");
-    assert_eq!(sqlstate_for_executor_error(&div_zero), "22012");
-
-    // Test string-match fallback: permission denied
-    let perm_denied = anyhow::anyhow!("permission denied for table users");
-    assert_eq!(sqlstate_for_executor_error(&perm_denied), "42501");
-
-    // Test string-match fallback: function not found
-    let func_not_found = anyhow::anyhow!("function my_func does not exist");
-    assert_eq!(sqlstate_for_executor_error(&func_not_found), "42883");
+    for (sql_err, expected_code) in cases {
+        let anyhow_err: anyhow::Error = sql_err.into();
+        assert_eq!(
+            sqlstate_for_executor_error(&anyhow_err),
+            expected_code,
+            "failed for SQLSTATE {}",
+            expected_code
+        );
+    }
 }
 
 #[test]

@@ -33,6 +33,7 @@ mod sequences;
 mod table_constraints;
 mod table_privileges;
 mod tables;
+pub(crate) mod virtual_tables;
 
 use crate::storage::TikvStore;
 use crate::types::{Row, TableSchema};

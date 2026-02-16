@@ -26,6 +26,7 @@ use crate::sql::sequences::resolve_sequence_full_name_from_value;
 use crate::sql::ExecuteResult;
 use crate::types::{DataType, Row, TableSchema, Value};
 
+use crate::sql::error::SqlError;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{FunctionArg, FunctionArgExpr, ObjectName, Query, SetExpr};
 use std::collections::HashMap;
@@ -101,11 +102,10 @@ impl Executor {
         let mut analyzer = Analyzer::new(&catalog);
         let analyzed = analyzer
             .analyze_query(&expanded_query)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            .map_err(SqlError::from)?;
 
         // Single-point routing gate: ALL capability / routing decisions are made here.
-        let plan =
-            plan_query(&analyzed, &expanded_query.locks).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let plan = plan_query(&analyzed, &expanded_query.locks).map_err(SqlError::from)?;
         tracing::debug!(target: "pipeline", "{}", plan.trace_summary());
 
         // Execute through the analyzed path, driven by the plan.
@@ -147,7 +147,7 @@ impl Executor {
         analyzed: &AnalyzedQuery,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
-        let plan = plan_query(analyzed, &[]).map_err(|e| anyhow!("{}", e))?;
+        let plan = plan_query(analyzed, &[]).map_err(SqlError::from)?;
         self.execute_analyzed_query(
             txn,
             db_id,

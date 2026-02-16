@@ -11,7 +11,6 @@ mod dml_analyzed;
 mod extensions;
 mod procedure;
 mod select;
-pub(crate) mod subquery;
 mod table_utils;
 pub(crate) mod triggers;
 mod udt;

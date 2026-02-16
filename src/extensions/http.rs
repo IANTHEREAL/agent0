@@ -1,4 +1,5 @@
 use crate::extensions::context;
+use crate::sql::error::SqlError;
 use crate::types::{ColumnDef, DataType, Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
 use reqwest::header::{CONTENT_TYPE, LOCATION};
@@ -394,7 +395,11 @@ pub(crate) async fn execute_table_function(
     call: HttpTableFunctionCall,
 ) -> Result<(TableSchema, Vec<Row>)> {
     if !context::is_superuser() {
-        return Err(anyhow!("permission denied for extension \"http\""));
+        return Err(SqlError::PermissionDenied {
+            object_type: "extension".into(),
+            object_name: "http".into(),
+        }
+        .into());
     }
 
     let (schema_name, method, url, body, content_type, follow_redirects) = match call {

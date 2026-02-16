@@ -9,6 +9,7 @@ use crate::sql::analyzer::types::{
     AnalyzedDistinct, AnalyzedQueryBody, AnalyzedSelect, SetOpKind, TypedOrderByExpr,
 };
 use crate::sql::analyzer::AnalyzedQuery;
+use crate::sql::error::SqlError;
 use sqlparser::ast::{LockClause, LockType, NonBlock};
 use std::fmt;
 
@@ -109,6 +110,12 @@ impl fmt::Display for UnsupportedFeature {
                 write!(f, "FOR UPDATE/SHARE is not allowed with JOIN queries")
             }
         }
+    }
+}
+
+impl From<UnsupportedFeature> for SqlError {
+    fn from(e: UnsupportedFeature) -> Self {
+        SqlError::Unsupported(format!("{}", e))
     }
 }
 

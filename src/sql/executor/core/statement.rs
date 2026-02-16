@@ -5,6 +5,7 @@ use super::*;
 use crate::auth::{Privilege, PrivilegeObject};
 use crate::sql::analyzer::types::AnalyzedStatement;
 use crate::sql::analyzer::Analyzer;
+use crate::sql::error::SqlError;
 
 impl Executor {
     async fn require_privilege(
@@ -429,9 +430,7 @@ impl Executor {
                 )
                 .await?;
                 let mut analyzer = Analyzer::new(&catalog);
-                let analyzed = analyzer
-                    .analyze_statement(stmt)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let analyzed = analyzer.analyze_statement(stmt).map_err(SqlError::from)?;
                 match analyzed {
                     AnalyzedStatement::Insert(ins) => {
                         self.require_table_privilege(
@@ -470,9 +469,7 @@ impl Executor {
                 )
                 .await?;
                 let mut analyzer = Analyzer::new(&catalog);
-                let analyzed = analyzer
-                    .analyze_statement(stmt)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let analyzed = analyzer.analyze_statement(stmt).map_err(SqlError::from)?;
                 match analyzed {
                     AnalyzedStatement::Delete(del) => {
                         self.require_table_privilege(
@@ -499,9 +496,7 @@ impl Executor {
                 )
                 .await?;
                 let mut analyzer = Analyzer::new(&catalog);
-                let analyzed = analyzer
-                    .analyze_statement(stmt)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                let analyzed = analyzer.analyze_statement(stmt).map_err(SqlError::from)?;
                 match analyzed {
                     AnalyzedStatement::Update(upd) => {
                         self.require_table_privilege(

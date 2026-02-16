@@ -53,7 +53,7 @@ fn analyze_row_level_expr(
         Scope::from_table_schema(table_name, schema),
         expr,
     )
-    .map_err(|e| anyhow!("{}", e))?;
+    .map_err(SqlError::from)?;
     let qctx = QueryContext::from_task_locals();
     Ok(fold_typed_expr(&typed, &qctx))
 }

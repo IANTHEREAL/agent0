@@ -4,6 +4,7 @@
 //! PostgreSQL wire protocol error responses. Uses `#[from] anyhow::Error`
 //! as a bridge so existing `anyhow!()` call sites can be migrated gradually.
 
+use crate::sql::analyzer::AnalyzerError;
 use crate::sql::types::TypeError;
 use crate::types::DataType;
 
@@ -118,6 +119,29 @@ impl SqlError {
     #[allow(dead_code)] // PG error reporting API
     pub fn severity(&self) -> &'static str {
         "ERROR"
+    }
+}
+
+impl From<AnalyzerError> for SqlError {
+    fn from(e: AnalyzerError) -> Self {
+        match e {
+            AnalyzerError::ColumnNotFound { name, .. } => SqlError::ColumnNotFound { column: name },
+            AnalyzerError::AmbiguousColumn { name, .. } => SqlError::AmbiguousColumn(name),
+            AnalyzerError::TableNotFound(name) => SqlError::RelationNotFound(name),
+            AnalyzerError::FunctionNotFound { name, arg_types } => {
+                let types: Vec<_> = arg_types.iter().map(|t| t.to_string()).collect();
+                SqlError::FunctionNotFound(format!("{}({})", name, types.join(", ")))
+            }
+            AnalyzerError::InvalidLiteral {
+                value, target_type, ..
+            } => SqlError::InvalidInputSyntax {
+                type_name: target_type.to_string(),
+                value,
+            },
+            AnalyzerError::DmlColumnNotFound { column, .. } => SqlError::ColumnNotFound { column },
+            AnalyzerError::Unsupported(msg) => SqlError::Unsupported(msg),
+            other => SqlError::Internal(anyhow::anyhow!("{}", other)),
+        }
     }
 }
 
@@ -253,5 +277,72 @@ mod tests {
         let sql_err = SqlError::from(anyhow_err);
         assert_eq!(sql_err.sqlstate(), "XX000");
         assert!(matches!(sql_err, SqlError::Internal(_)));
+    }
+
+    #[test]
+    fn test_analyzer_error_roundtrip_preserves_sqlstate() {
+        use crate::sql::analyzer::AnalyzerError;
+
+        // ColumnNotFound → 42703
+        let ae = AnalyzerError::ColumnNotFound {
+            name: "age".into(),
+            available: vec![],
+        };
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "42703");
+        let anyhow_err: anyhow::Error = sql.into();
+        let recovered = anyhow_err.downcast_ref::<SqlError>().unwrap();
+        assert_eq!(recovered.sqlstate(), "42703");
+
+        // TableNotFound → 42P01
+        let ae = AnalyzerError::TableNotFound("users".into());
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "42P01");
+        let anyhow_err: anyhow::Error = sql.into();
+        let recovered = anyhow_err.downcast_ref::<SqlError>().unwrap();
+        assert_eq!(recovered.sqlstate(), "42P01");
+
+        // AmbiguousColumn → 42702
+        let ae = AnalyzerError::AmbiguousColumn {
+            name: "id".into(),
+            tables: vec![],
+        };
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "42702");
+
+        // FunctionNotFound → 42883
+        let ae = AnalyzerError::FunctionNotFound {
+            name: "foo".into(),
+            arg_types: vec![DataType::Int32, DataType::Text],
+        };
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "42883");
+
+        // InvalidLiteral → 22P02
+        let ae = AnalyzerError::InvalidLiteral {
+            value: "abc".into(),
+            target_type: DataType::Int32,
+            parse_error: "bad".into(),
+        };
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "22P02");
+
+        // DmlColumnNotFound → 42703
+        let ae = AnalyzerError::DmlColumnNotFound {
+            column: "x".into(),
+            table: "t".into(),
+        };
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "42703");
+
+        // Unsupported → 0A000
+        let ae = AnalyzerError::Unsupported("nope".into());
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "0A000");
+
+        // Unmapped variant → XX000
+        let ae = AnalyzerError::UngroupedColumn { name: "x".into() };
+        let sql: SqlError = ae.into();
+        assert_eq!(sql.sqlstate(), "XX000");
     }
 }

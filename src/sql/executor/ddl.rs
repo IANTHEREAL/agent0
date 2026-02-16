@@ -282,7 +282,7 @@ impl Executor {
                 if if_exists {
                     continue;
                 }
-                return Err(anyhow!("Index '{}' does not exist", idx_name));
+                return Err(SqlError::RelationNotFound(idx_name.to_string()).into());
             };
 
             let mut schema = self
@@ -307,7 +307,7 @@ impl Executor {
             )
             .await?;
             let Some(dropped) = dropped else {
-                return Err(anyhow!("Index '{}' does not exist", idx_name));
+                return Err(SqlError::RelationNotFound(idx_name.to_string()).into());
             };
             last_index = dropped;
         }
