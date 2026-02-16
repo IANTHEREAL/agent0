@@ -196,6 +196,61 @@
       color: var(--text-muted);
     }
 
+    /* Agent Section */
+    .agent-section { padding: 0 0 80px; }
+
+    .agent-block {
+      max-width: 640px;
+      margin: 0 auto;
+    }
+
+    .agent-label {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      color: var(--accent);
+      margin-bottom: 12px;
+      text-align: center;
+    }
+
+    .agent-title {
+      font-size: 22px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+      margin-bottom: 20px;
+      text-align: center;
+    }
+
+    .agent-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
+    .agent-prompt {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 20px 24px;
+      gap: 16px;
+    }
+
+    .agent-prompt code {
+      font-size: 13px;
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    .agent-prompt code .url { color: var(--accent); }
+
+    .agent-subtitle {
+      padding: 0 24px 16px;
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
     /* Terminal Demo */
     .demo { padding: 40px 0 100px; }
 
@@ -460,6 +515,23 @@
           <button class="copy-btn" data-copy="curl -fsSL https://db9.shared.aws.tidbcloud.com/install | sh">Copy</button>
         </div>
         <div class="install-platforms">macOS / Linux (x86_64, arm64)</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Agent -->
+  <section class="agent-section">
+    <div class="container">
+      <div class="agent-block">
+        <div class="agent-label">AI Agents</div>
+        <h2 class="agent-title">Send this to your agent</h2>
+        <div class="agent-card">
+          <div class="agent-prompt">
+            <code>Read <span class="url">https://db9.shared.aws.tidbcloud.com/skill.md</span> and follow the instructions to use db9</code>
+            <button class="copy-btn" data-copy="Read https://db9.shared.aws.tidbcloud.com/skill.md and follow the instructions to use db9">Copy</button>
+          </div>
+          <div class="agent-subtitle">Your agent will learn how to install, authenticate, and use db9 autonomously</div>
+        </div>
       </div>
     </div>
   </section>

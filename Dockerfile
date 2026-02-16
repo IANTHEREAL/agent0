@@ -27,10 +27,16 @@ ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc \
 WORKDIR /app
 
 # Copy everything needed for build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY vendor ./vendor
 COPY crates ./crates
 COPY src ./src
+
+# Build args for version info (no .git in Docker context)
+ARG BUILD_GIT_HASH=""
+ARG BUILD_DATE=""
+ENV BUILD_GIT_HASH=${BUILD_GIT_HASH}
+ENV BUILD_DATE=${BUILD_DATE}
 
 # Cross-compile for arm64
 RUN cargo build --release --target aarch64-unknown-linux-gnu
