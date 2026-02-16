@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::{make_auth_headers, require_token, OutputFormat};
 
-use super::{exec::repl_exec, ExpandedMode, LinestyleMode, ReplState};
+use super::{exec::repl_exec, ExpandedMode, LinestyleMode, ReplState, SqlExecutor};
 
 pub enum DispatchResult {
     Continue,
@@ -111,6 +111,101 @@ fn extract_column_names(data: &Value) -> HashMap<String, Vec<String>> {
         }
     }
     columns
+}
+
+#[derive(Debug, PartialEq)]
+pub enum CopyDirection {
+    From,
+    To,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct CopyArgs {
+    pub table: String,
+    pub direction: CopyDirection,
+    pub file_path: String,
+    pub csv: bool,
+    pub header: bool,
+}
+
+pub fn parse_copy_args(arg: &str) -> Result<CopyArgs, String> {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        return Err("Usage: \\copy TABLE FROM|TO 'FILE' [CSV] [HEADER]".to_string());
+    }
+
+    let tokens = tokenize_copy_args(arg)?;
+
+    if tokens.len() < 3 {
+        return Err("Usage: \\copy TABLE FROM|TO 'FILE' [CSV] [HEADER]".to_string());
+    }
+
+    let table = tokens[0].clone();
+
+    let direction = match tokens[1].to_uppercase().as_str() {
+        "FROM" => CopyDirection::From,
+        "TO" => CopyDirection::To,
+        other => return Err(format!("Expected FROM or TO, got '{}'", other)),
+    };
+
+    let file_path = tokens[2].clone();
+
+    let mut csv = false;
+    let mut header = false;
+    for token in &tokens[3..] {
+        match token.to_uppercase().as_str() {
+            "CSV" => csv = true,
+            "HEADER" => header = true,
+            other => return Err(format!("Unknown option: '{}'", other)),
+        }
+    }
+
+    Ok(CopyArgs {
+        table,
+        direction,
+        file_path,
+        csv,
+        header,
+    })
+}
+
+fn tokenize_copy_args(input: &str) -> Result<Vec<String>, String> {
+    let mut tokens = Vec::new();
+    let mut chars = input.chars().peekable();
+
+    while chars.peek().is_some() {
+        while chars.peek().map_or(false, |c| c.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+
+        if chars.peek() == Some(&'\'') {
+            chars.next();
+            let mut token = String::new();
+            loop {
+                match chars.next() {
+                    Some('\'') => break,
+                    Some(c) => token.push(c),
+                    None => return Err("Unterminated quoted string".to_string()),
+                }
+            }
+            tokens.push(token);
+        } else {
+            let mut token = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_whitespace() {
+                    break;
+                }
+                token.push(c);
+                chars.next();
+            }
+            tokens.push(token);
+        }
+    }
+
+    Ok(tokens)
 }
 
 pub async fn dispatch(
@@ -306,6 +401,10 @@ pub async fn dispatch(
         }
         "\\watch" => handle_watch_command(arg),
         "\\!" => handle_shell_command(arg),
+        "\\copy" => {
+            handle_copy_command(repl_state, arg).await;
+            DispatchResult::Continue
+        }
         _ => {
             eprintln!("Unknown command: {cmd}. Type \\? for help.");
             DispatchResult::Continue
@@ -936,6 +1035,43 @@ fn handle_shell_command(arg: &str) -> DispatchResult {
     DispatchResult::Continue
 }
 
+// ── \copy — client-side COPY FROM/TO ────────────────────────────
+
+async fn handle_copy_command(repl_state: &ReplState, arg: &str) {
+    let args = match parse_copy_args(arg) {
+        Ok(args) => args,
+        Err(e) => {
+            eprintln!("ERROR: {}", e);
+            return;
+        }
+    };
+
+    match &repl_state.executor {
+        SqlExecutor::Api => {
+            eprintln!("\\copy is only supported in direct mode. Use --direct or --dsn flag.");
+        }
+        SqlExecutor::Direct(executor) => {
+            let result = match args.direction {
+                CopyDirection::From => {
+                    executor
+                        .copy_in(&args.table, &args.file_path, args.csv, args.header)
+                        .await
+                }
+                CopyDirection::To => {
+                    executor
+                        .copy_out(&args.table, &args.file_path, args.csv, args.header)
+                        .await
+                }
+            };
+
+            match result {
+                Ok(rows) => println!("COPY {}", rows),
+                Err(e) => eprintln!("ERROR: {}", e),
+            }
+        }
+    }
+}
+
 // ── \watch — periodic query re-execution ────────────────────────
 
 fn handle_watch_command(arg: &str) -> DispatchResult {
@@ -969,6 +1105,7 @@ fn repl_help() {
     eprintln!("  \\i <FILE>     Execute SQL from a file");
     eprintln!("  \\o [FILE]     Redirect output to file (no arg = reset to stdout)");
     eprintln!("  \\e            Edit last query in $EDITOR and execute");
+    eprintln!("  \\copy T FROM|TO 'F' [CSV] [HEADER]  Client-side COPY (direct mode only)");
     eprintln!("  \\! [COMMAND]  Execute shell command, or start interactive shell");
     eprintln!("  \\refresh      Refresh SQL completion table cache");
     eprintln!("  \\timing       Toggle query timing");
@@ -1345,5 +1482,63 @@ mod tests {
         assert!(!state.pager_enabled);
         handle_pset_command(&mut state, "pager on");
         assert!(state.pager_enabled);
+    }
+
+    #[test]
+    fn test_parse_copy_from_basic() {
+        let args = parse_copy_args("users FROM '/tmp/data.csv'").unwrap();
+        assert_eq!(args.table, "users");
+        assert_eq!(args.direction, CopyDirection::From);
+        assert_eq!(args.file_path, "/tmp/data.csv");
+        assert!(!args.csv);
+        assert!(!args.header);
+    }
+
+    #[test]
+    fn test_parse_copy_to_with_csv_header() {
+        let args = parse_copy_args("orders TO '/tmp/out.csv' CSV HEADER").unwrap();
+        assert_eq!(args.table, "orders");
+        assert_eq!(args.direction, CopyDirection::To);
+        assert_eq!(args.file_path, "/tmp/out.csv");
+        assert!(args.csv);
+        assert!(args.header);
+    }
+
+    #[test]
+    fn test_parse_copy_missing_args() {
+        assert!(parse_copy_args("").is_err());
+    }
+
+    #[test]
+    fn test_parse_copy_quoted_path_with_spaces() {
+        let args = parse_copy_args("users FROM '/tmp/my data/file.csv'").unwrap();
+        assert_eq!(args.file_path, "/tmp/my data/file.csv");
+    }
+
+    #[test]
+    fn test_parse_copy_invalid_direction() {
+        let result = parse_copy_args("users AROUND '/tmp/x'");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Expected FROM or TO"));
+    }
+
+    #[test]
+    fn test_parse_copy_unknown_option() {
+        let result = parse_copy_args("users FROM '/tmp/x' BINARY");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Unknown option"));
+    }
+
+    #[test]
+    fn test_parse_copy_unquoted_path() {
+        let args = parse_copy_args("users FROM /tmp/data.csv").unwrap();
+        assert_eq!(args.file_path, "/tmp/data.csv");
+    }
+
+    #[test]
+    fn test_parse_copy_case_insensitive_options() {
+        let args = parse_copy_args("users FROM '/tmp/x' csv header").unwrap();
+        assert!(args.csv);
+        assert!(args.header);
     }
 }

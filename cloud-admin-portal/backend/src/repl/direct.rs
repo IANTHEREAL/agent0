@@ -1,4 +1,7 @@
+use bytes::Bytes;
+use futures_util::{SinkExt, TryStreamExt};
 use serde_json::Value;
+use std::io::{BufRead, Write};
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 
 pub struct DirectExecutor {
@@ -85,9 +88,112 @@ impl DirectExecutor {
             "row_count": row_count,
         }))
     }
+    pub async fn copy_in(
+        &self,
+        table: &str,
+        file_path: &str,
+        csv: bool,
+        header: bool,
+    ) -> Result<u64, String> {
+        if !std::path::Path::new(file_path).exists() {
+            return Err(format!("\\copy: file not found: {}", file_path));
+        }
+
+        let stmt = build_copy_stmt(table, "FROM STDIN", csv, header);
+
+        let sink = self
+            .client
+            .copy_in::<_, Bytes>(stmt.as_str())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut sink = std::pin::pin!(sink);
+
+        let file =
+            std::fs::File::open(file_path).map_err(|e| format!("\\copy: {}", e))?;
+        let reader = std::io::BufReader::new(file);
+        const CHUNK_SIZE: usize = 65536;
+        let mut buf = Vec::with_capacity(CHUNK_SIZE);
+
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("\\copy: read error: {}", e))?;
+            buf.extend_from_slice(line.as_bytes());
+            buf.push(b'\n');
+            if buf.len() >= CHUNK_SIZE {
+                sink.send(Bytes::from(std::mem::take(&mut buf)))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                buf = Vec::with_capacity(CHUNK_SIZE);
+            }
+        }
+        if !buf.is_empty() {
+            sink.send(Bytes::from(buf))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        let rows = sink.finish().await.map_err(|e| e.to_string())?;
+        Ok(rows)
+    }
+
+    pub async fn copy_out(
+        &self,
+        table: &str,
+        file_path: &str,
+        csv: bool,
+        header: bool,
+    ) -> Result<u64, String> {
+        if let Some(parent) = std::path::Path::new(file_path).parent() {
+            if !parent.as_os_str().is_empty() && !parent.exists() {
+                return Err(format!(
+                    "\\copy: directory not found: {}",
+                    parent.display()
+                ));
+            }
+        }
+
+        let stmt = build_copy_stmt(table, "TO STDOUT", csv, header);
+
+        let stream = self
+            .client
+            .copy_out(stmt.as_str())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut stream = std::pin::pin!(stream);
+
+        let mut file = std::fs::File::create(file_path)
+            .map_err(|e| format!("\\copy: cannot create '{}': {}", file_path, e))?;
+
+        let mut row_count: u64 = 0;
+        while let Some(chunk) = stream.try_next().await.map_err(|e| e.to_string())? {
+            file.write_all(&chunk)
+                .map_err(|e| format!("\\copy: write error: {}", e))?;
+            row_count += chunk.iter().filter(|&&b| b == b'\n').count() as u64;
+        }
+
+        if header && row_count > 0 {
+            row_count -= 1;
+        }
+
+        Ok(row_count)
+    }
 }
 
 // ── helpers ─────────────────────────────────────────────────────
+
+fn build_copy_stmt(table: &str, direction: &str, csv: bool, header: bool) -> String {
+    let mut stmt = format!("COPY {} {}", table, direction);
+    let mut opts = Vec::new();
+    if csv {
+        opts.push("FORMAT CSV");
+    }
+    if header {
+        opts.push("HEADER");
+    }
+    if !opts.is_empty() {
+        stmt.push_str(&format!(" WITH ({})", opts.join(", ")));
+    }
+    stmt
+}
 
 // simple_query returns all values as text; infer JSON types heuristically:
 //   "t"/"f" (pg boolean text repr) → bool
