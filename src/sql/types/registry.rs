@@ -1248,4 +1248,26 @@ fn register_builtin_functions(r: &mut FunctionRegistry) {
         "HAS_TABLE_PRIVILEGE",
         FunctionSignature::fixed(DataType::Boolean).with_args(2, Some(3)),
     );
+
+    // FS9 filesystem scalar functions
+    r.register(
+        "FS9_READ",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+    );
+    r.register(
+        "FS9_WRITE",
+        FunctionSignature::fixed(DataType::Int64).with_args(2, Some(2)),
+    );
+    r.register(
+        "FS9_EXISTS",
+        FunctionSignature::fixed(DataType::Boolean).with_args(1, Some(1)),
+    );
+    r.register(
+        "FS9_SIZE",
+        FunctionSignature::fixed(DataType::Int64).with_args(1, Some(1)),
+    );
+    r.register(
+        "FS9_MTIME",
+        FunctionSignature::fixed(DataType::Text).with_args(1, Some(1)),
+    );
 }
