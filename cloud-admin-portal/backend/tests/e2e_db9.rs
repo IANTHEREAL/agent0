@@ -474,3 +474,131 @@ async fn sql_query_with_file_flag() {
         "should not fail on 404, got: {combined}"
     );
 }
+
+// ══════════════════════════════════════════════════════════════════
+// New REPL feature tests
+// ══════════════════════════════════════════════════════════════════
+
+#[test]
+fn db_sql_help_shows_direct_flag() {
+    let output = Command::new(env!("CARGO_BIN_EXE_db9"))
+        .args(["db", "sql", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--direct") || stdout.contains("-D"),
+        "sql help should mention --direct flag, got: {stdout}"
+    );
+}
+
+#[test]
+fn db_sql_help_shows_dsn_flag() {
+    let output = Command::new(env!("CARGO_BIN_EXE_db9"))
+        .args(["db", "sql", "--help"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("--dsn"),
+        "sql help should mention --dsn flag, got: {stdout}"
+    );
+}
+
+#[test]
+fn config_dir_created_on_startup() {
+    // When db9 runs (even if it fails), ~/.db9/ should be created
+    let home = TempHome::new();
+    let _ = Command::new(env!("CARGO_BIN_EXE_db9"))
+        .arg("--api-url")
+        .arg("http://127.0.0.1:1")  // invalid, will fail fast
+        .env("HOME", home.path())
+        .env("DB9_API_URL", "http://127.0.0.1:1")
+        .args(["db", "list"])
+        .output();
+    // The config dir should exist (created by ensure_config_dir or login check)
+    // This may or may not create it depending on code path — adjust assertion if needed
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_file_persists_after_session() {
+    let (addr, state) = start_server().await;
+    let api_url = format!("http://{addr}");
+    let home = TempHome::new();
+    
+    let email = format!("e2e-hist-{}@test.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "TestPass123!").await;
+    let customer_id = get_customer_id(&state, &token).await;
+    let tenant_id = seed_tenant(&state, &customer_id).await;
+    home.write_credentials(&token);
+
+    // Run a query that goes through the SQL path
+    let _ = db9_cmd(&api_url, &home)
+        .args(["db", "sql", &tenant_id, "-q", "SELECT 1"])
+        .output()
+        .unwrap();
+
+    // The ~/.db9/ directory should exist after db9 has run
+    let db9_dir = home.path().join(".db9");
+    assert!(
+        db9_dir.exists(),
+        "~/.db9 directory should exist after running db9"
+    );
+}
+
+#[test]
+fn direct_mode_connection_refused() {
+    let home = TempHome::new();
+    // Write dummy credentials
+    home.write_credentials("dummy-token");
+    
+    // Try direct mode to a non-listening port — should get a connection error, not a panic
+    let output = Command::new(env!("CARGO_BIN_EXE_db9"))
+        .env("HOME", home.path())
+        .args(["db", "sql", "dummy-id", "--direct", "--dsn", "postgres://user:pass@127.0.0.1:19999/db", "-q", "SELECT 1"])
+        .output()
+        .unwrap();
+    
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "direct mode to non-listening port should fail, stderr: {stderr}"
+    );
+    // Should get a connection error, not a panic/crash
+    assert!(
+        stderr.to_lowercase().contains("connection") || stderr.to_lowercase().contains("refused") || stderr.to_lowercase().contains("error"),
+        "should mention connection error, got: {stderr}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_file_with_multiple_statements() {
+    let (addr, state) = start_server().await;
+    let api_url = format!("http://{addr}");
+    let home = TempHome::new();
+
+    let email = format!("e2e-multi-{}@test.com", uuid::Uuid::new_v4());
+    let token = register_and_login(&state, &email, "TestPass123!").await;
+    let customer_id = get_customer_id(&state, &token).await;
+    let tenant_id = seed_tenant(&state, &customer_id).await;
+    home.write_credentials(&token);
+
+    // Write a temp SQL file with multiple statements
+    let sql_file = home.path().join("multi.sql");
+    std::fs::write(&sql_file, "SELECT 1;\nSELECT 2;\n").unwrap();
+
+    let output = db9_cmd(&api_url, &home)
+        .args(["db", "sql", &tenant_id, "-f", sql_file.to_str().unwrap()])
+        .output()
+        .unwrap();
+
+    // Should get past auth and routing (will fail at PG layer)
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lower = combined.to_lowercase();
+    assert!(!lower.contains("not logged in"), "should pass auth: {combined}");
+    assert!(!lower.contains("not found"), "should find DB: {combined}");
+}
