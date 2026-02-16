@@ -4,7 +4,8 @@
 //! sync-safe subtrees and avoids folding function/subquery nodes directly.
 
 use crate::sql::analyzer::types::{
-    TypedExpr, TypedExprKind, TypedOrderByExpr, WindowFrame, WindowFrameBound,
+    FunctionKind, ResolvedFunction, TypedExpr, TypedExprKind, TypedOrderByExpr, WindowFrame,
+    WindowFrameBound,
 };
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::expr::typed_visit::expr_any;
@@ -285,21 +286,55 @@ fn fold_subtree_if_safe(expr: TypedExpr, qctx: &QueryContext) -> TypedExpr {
 }
 
 fn is_fold_candidate(expr: &TypedExpr) -> bool {
-    !expr_any(expr, &|node| {
-        matches!(
-            &node.kind,
-            TypedExprKind::ColumnRef { .. }
-                | TypedExprKind::FunctionCall { .. }
-                | TypedExprKind::AggregateCall { .. }
-                | TypedExprKind::WindowCall { .. }
-                | TypedExprKind::ScalarSubquery(_)
-                | TypedExprKind::Exists { .. }
-                | TypedExprKind::InSubquery { .. }
-                | TypedExprKind::AnyAll { .. }
-                | TypedExprKind::ArraySubquery(_)
-                | TypedExprKind::Default
-        )
+    !expr_any(expr, &|node| match &node.kind {
+        TypedExprKind::ColumnRef { .. }
+        | TypedExprKind::AggregateCall { .. }
+        | TypedExprKind::WindowCall { .. }
+        | TypedExprKind::ScalarSubquery(_)
+        | TypedExprKind::Exists { .. }
+        | TypedExprKind::InSubquery { .. }
+        | TypedExprKind::AnyAll { .. }
+        | TypedExprKind::ArraySubquery(_)
+        | TypedExprKind::Default => true,
+        TypedExprKind::FunctionCall {
+            func,
+            order_by,
+            filter,
+            ..
+        } => !is_foldable_function_call(func, order_by, filter),
+        _ => false,
     })
+}
+
+fn is_foldable_function_call(
+    func: &ResolvedFunction,
+    order_by: &[TypedOrderByExpr],
+    filter: &Option<Box<TypedExpr>>,
+) -> bool {
+    if !matches!(func.kind, FunctionKind::Builtin) {
+        return false;
+    }
+    if !order_by.is_empty() || filter.is_some() {
+        return false;
+    }
+
+    !is_volatile_or_side_effecting_builtin(&func.name)
+}
+
+fn is_volatile_or_side_effecting_builtin(name: &str) -> bool {
+    matches!(
+        name.to_ascii_uppercase().as_str(),
+        "NEXTVAL"
+            | "CURRVAL"
+            | "SETVAL"
+            | "RANDOM"
+            | "SETSEED"
+            | "GEN_RANDOM_UUID"
+            | "UUID_GENERATE_V4"
+            | "UUIDV7"
+            | "CLOCK_TIMESTAMP"
+            | "TXID_CURRENT"
+    )
 }
 
 #[cfg(test)]
@@ -371,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_fold_function_call_node() {
+    fn folds_builtin_constant_function_call() {
         let qctx = test_qctx();
         let expr = TypedExpr::new(
             TypedExprKind::FunctionCall {
@@ -385,6 +420,51 @@ mod tests {
                 filter: None,
             },
             DataType::Text,
+        );
+
+        let folded = fold_typed_expr(&expr, &qctx);
+        match folded.kind {
+            TypedExprKind::Constant(Value::Text(v)) => assert_eq!(v, "db703"),
+            other => panic!("expected folded constant, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn does_not_fold_volatile_function_call() {
+        let qctx = test_qctx();
+        let expr = TypedExpr::new(
+            TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: "random".to_string(),
+                    kind: FunctionKind::Builtin,
+                    return_type: DataType::Float64,
+                },
+                args: vec![],
+                order_by: vec![],
+                filter: None,
+            },
+            DataType::Float64,
+        );
+
+        let folded = fold_typed_expr(&expr, &qctx);
+        assert!(matches!(folded.kind, TypedExprKind::FunctionCall { .. }));
+    }
+
+    #[test]
+    fn does_not_fold_user_defined_function_call() {
+        let qctx = test_qctx();
+        let expr = TypedExpr::new(
+            TypedExprKind::FunctionCall {
+                func: ResolvedFunction {
+                    name: "f_udf".to_string(),
+                    kind: FunctionKind::UserDefined { oid: 42 },
+                    return_type: DataType::Int32,
+                },
+                args: vec![],
+                order_by: vec![],
+                filter: None,
+            },
+            DataType::Int32,
         );
 
         let folded = fold_typed_expr(&expr, &qctx);

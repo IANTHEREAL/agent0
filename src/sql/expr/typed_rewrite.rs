@@ -19,6 +19,7 @@ use tikv_client::Transaction;
 
 type RewriteFuture<'a> = Pin<Box<dyn Future<Output = Result<TypedExpr>> + Send + 'a>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SequenceFunction {
     NextVal,
     CurrVal,
@@ -420,4 +421,40 @@ pub fn materialize_sequences_in_typed_expr<'a>(
         };
         ctx.rewrite_expr(expr).await
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sequence_function_kind_is_case_insensitive() {
+        assert_eq!(
+            sequence_function_kind("nextval"),
+            Some(SequenceFunction::NextVal)
+        );
+        assert_eq!(
+            sequence_function_kind("CURRVAL"),
+            Some(SequenceFunction::CurrVal)
+        );
+        assert_eq!(
+            sequence_function_kind("SetVal"),
+            Some(SequenceFunction::SetVal)
+        );
+        assert_eq!(sequence_function_kind("abs"), None);
+    }
+
+    #[test]
+    fn parse_setval_is_called_accepts_bool_and_text() {
+        assert!(parse_setval_is_called(Value::Boolean(true)).unwrap());
+        assert!(!parse_setval_is_called(Value::Boolean(false)).unwrap());
+        assert!(parse_setval_is_called(Value::Text("YES".to_string())).unwrap());
+        assert!(!parse_setval_is_called(Value::Text("n".to_string())).unwrap());
+    }
+
+    #[test]
+    fn parse_setval_is_called_rejects_non_bool() {
+        let err = parse_setval_is_called(Value::Int32(1)).unwrap_err();
+        assert!(err.to_string().contains("is_called must be boolean"));
+    }
 }

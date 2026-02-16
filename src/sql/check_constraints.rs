@@ -139,5 +139,26 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("x_positive"));
+
+        // CHECK treats NULL as pass (unknown).
+        validate_compiled_check_constraints(&schema, &checks, &Row::new(vec![Value::Null]), &qctx)
+            .unwrap();
+    }
+
+    #[test]
+    fn compile_check_constraints_reports_parse_error() {
+        let mut schema = check_schema();
+        schema.check_constraints[0].expr = "x >".to_string();
+
+        let qctx = QueryContext::new(
+            1,
+            Arc::from("postgres"),
+            1_700_000_000_000,
+            1_700_000_000_000,
+            Arc::from("UTC"),
+        );
+
+        let err = compile_check_constraints(&schema, &qctx).unwrap_err();
+        assert!(err.to_string().contains("Invalid CHECK expression"));
     }
 }
