@@ -20,6 +20,7 @@ mod executor;
 mod explain;
 pub mod expr;
 pub(crate) mod fts;
+pub(crate) mod fts_tokenizers;
 mod gin;
 mod index_helpers;
 mod information_schema;
