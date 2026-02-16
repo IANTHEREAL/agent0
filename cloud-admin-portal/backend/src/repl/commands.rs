@@ -766,6 +766,8 @@ fn repl_help() {
     eprintln!("  \\pager [CMD]  Control paging (on/off/CMD)");
     eprintln!("  \\x [MODE]     Toggle expanded display (on/off/auto)");
     eprintln!("  \\highlight    Toggle SQL syntax highlighting (on/off)");
+    eprintln!("  \\g            Execute query (like ;), or re-execute last query");
+    eprintln!("  \\gx           Execute query in expanded mode");
     eprintln!("  \\fs <N> [Q]   Save favorite query (Q defaults to last query)");
     eprintln!("  \\f <NAME>     Execute saved favorite query");
     eprintln!("  \\fd <NAME>    Delete saved favorite query");
@@ -773,7 +775,7 @@ fn repl_help() {
     eprintln!("  \\q            Quit");
     eprintln!("  \\?            Show this help");
     eprintln!();
-    eprintln!("Enter SQL terminated by semicolon (;) to execute.");
+    eprintln!("Enter SQL terminated by semicolon (;), \\g, or \\gx to execute.");
     eprintln!("Multi-line input is supported.");
 }
 

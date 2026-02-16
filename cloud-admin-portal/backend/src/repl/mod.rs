@@ -5,6 +5,7 @@ use crate::{make_auth_headers, require_token, OutputFormat};
 
 pub mod commands;
 pub mod completer;
+pub mod config;
 pub mod direct;
 pub mod exec;
 pub mod favorites;
@@ -23,6 +24,12 @@ pub enum ExpandedMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinestyleMode {
+    Ascii,
+    Unicode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxState {
     Idle,          // normal: "mydb> "
     InTransaction, // after BEGIN: "mydb*> "
@@ -33,6 +40,11 @@ pub struct ReplState {
     pub pager_enabled: bool,
     pub pager_command: Option<String>,
     pub expanded: ExpandedMode,
+    pub null_display: String,
+    pub border: u8,
+    pub linestyle: LinestyleMode,
+    pub format_override: Option<crate::OutputFormat>,
+    pub highlight_enabled: bool,
     pub output_file: Option<String>,
     pub last_query: Option<String>,
     pub db_id: String,
@@ -49,6 +61,48 @@ impl ReplState {
             pager_enabled: true,
             pager_command: None,
             expanded: ExpandedMode::Off,
+            null_display: "NULL".to_string(),
+            border: 1,
+            linestyle: LinestyleMode::Ascii,
+            format_override: None,
+            highlight_enabled: true,
+            output_file: None,
+            last_query: None,
+            db_id,
+            db_name,
+            api_url,
+            tx_state: TxState::Idle,
+            favorites: favorites::Favorites::load(),
+            executor,
+        }
+    }
+
+    pub fn with_config(
+        db_id: String,
+        db_name: String,
+        api_url: String,
+        executor: SqlExecutor,
+        cfg: &config::FileConfig,
+    ) -> Self {
+        let repl = cfg.repl.as_ref();
+        Self {
+            pager_enabled: repl.and_then(|r| r.pager).unwrap_or(true),
+            pager_command: repl.and_then(|r| r.pager_command.clone()),
+            expanded: match repl.and_then(|r| r.expanded.as_deref()) {
+                Some("on") => ExpandedMode::On,
+                Some("auto") => ExpandedMode::Auto,
+                _ => ExpandedMode::Off,
+            },
+            null_display: repl
+                .and_then(|r| r.null_display.clone())
+                .unwrap_or_else(|| "NULL".to_string()),
+            border: repl.and_then(|r| r.border).unwrap_or(1).min(2),
+            linestyle: match repl.and_then(|r| r.linestyle.as_deref()) {
+                Some("unicode") => LinestyleMode::Unicode,
+                _ => LinestyleMode::Ascii,
+            },
+            format_override: None,
+            highlight_enabled: repl.and_then(|r| r.highlight).unwrap_or(true),
             output_file: None,
             last_query: None,
             db_id,
@@ -114,6 +168,8 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
     let output = output.clone();
     let id = id.to_string();
 
+    let file_config = config::load_config();
+
     let repl_task = tokio::task::spawn_blocking(move || {
         let config_builder = match Config::builder().history_ignore_dups(true) {
             Ok(builder) => builder,
@@ -150,8 +206,33 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
         rl.load_history(&history_path).ok();
 
         let mut buffer = String::new();
-        let mut show_timing = true;
-        let mut repl_state = ReplState::new(id.clone(), db_name.clone(), api_url, executor);
+        let mut show_timing = file_config.repl.as_ref().and_then(|r| r.timing).unwrap_or(true);
+        let mut repl_state =
+            ReplState::with_config(id.clone(), db_name.clone(), api_url, executor, &file_config);
+
+        if !repl_state.highlight_enabled {
+            if let Some(helper) = rl.helper_mut() {
+                helper.set_highlighting(false);
+            }
+        }
+
+        if let Some(ref startup) = file_config.startup {
+            if let Some(ref cmds) = startup.commands {
+                for cmd_str in cmds {
+                    let trimmed_cmd = cmd_str.trim();
+                    if trimmed_cmd.starts_with('\\') {
+                        handle.block_on(commands::dispatch(
+                            &api,
+                            &output,
+                            &repl_state.db_id.clone(),
+                            &mut show_timing,
+                            &mut repl_state,
+                            trimmed_cmd,
+                        ));
+                    }
+                }
+            }
+        }
 
         loop {
             let prompt = if buffer.is_empty() {
@@ -190,6 +271,47 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
                     continue;
                 }
                 buffer.push('\n');
+                continue;
+            }
+
+            // Handle \g and \gx as buffer terminators (BEFORE the backslash dispatch
+            // which would clear the buffer)
+            if trimmed == "\\g" || trimmed == "\\gx" {
+                let is_expanded = trimmed == "\\gx";
+                let sql = if !buffer.is_empty() {
+                    buffer.clone()
+                } else if let Some(ref q) = repl_state.last_query {
+                    q.clone()
+                } else {
+                    eprintln!("No query to execute.");
+                    continue;
+                };
+
+                // Temporarily override expanded mode for \gx
+                let prev_expanded = repl_state.expanded;
+                if is_expanded {
+                    repl_state.expanded = ExpandedMode::On;
+                }
+
+                let new_tx_state = handle.block_on(exec::repl_exec(
+                    &api,
+                    &output,
+                    &repl_state.db_id,
+                    show_timing,
+                    &repl_state,
+                    &sql,
+                ));
+
+                // Restore expanded mode
+                if is_expanded {
+                    repl_state.expanded = prev_expanded;
+                }
+
+                repl_state.tx_state = new_tx_state;
+                (prompt_main, prompt_cont) =
+                    get_prompts(new_tx_state, &repl_state.db_name, is_direct);
+                repl_state.last_query = Some(sql);
+                buffer.clear();
                 continue;
             }
 
@@ -252,18 +374,44 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
             }
             buffer.push_str(trimmed);
 
-            if trimmed.ends_with(';') {
+            // Check for buffer terminators: ; or \g or \gx
+            let (should_execute, is_expanded_override) = if trimmed.ends_with(';') {
+                (true, false)
+            } else if buffer.ends_with("\\gx") {
+                // Strip \gx from buffer
+                buffer.truncate(buffer.len() - 3);
+                (true, true)
+            } else if buffer.ends_with("\\g") {
+                // Strip \g from buffer
+                buffer.truncate(buffer.len() - 2);
+                (true, false)
+            } else {
+                (false, false)
+            };
+
+            if should_execute {
+                let sql = buffer.trim().to_string();
+                if sql.is_empty() {
+                    buffer.clear();
+                    continue;
+                }
+
+                let prev_expanded = repl_state.expanded;
+                if is_expanded_override {
+                    repl_state.expanded = ExpandedMode::On;
+                }
+
                 let new_tx_state = handle.block_on(exec::repl_exec(
-                    &api,
-                    &output,
-                    &repl_state.db_id,
-                    show_timing,
-                    &repl_state,
-                    &buffer,
+                    &api, &output, &repl_state.db_id, show_timing, &repl_state, &sql,
                 ));
+
+                if is_expanded_override {
+                    repl_state.expanded = prev_expanded;
+                }
+
                 repl_state.tx_state = new_tx_state;
                 (prompt_main, prompt_cont) = get_prompts(new_tx_state, &repl_state.db_name, is_direct);
-                repl_state.last_query = Some(buffer.clone());
+                repl_state.last_query = Some(sql);
                 buffer.clear();
             }
         }
