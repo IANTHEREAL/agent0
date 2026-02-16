@@ -36,6 +36,13 @@ SHORT_VIEW=1
 (1 row)
 id
 (0 rows)
+ERROR:  relation "cycle_v2" does not exist
+LINE 1: CREATE VIEW cycle_v1 AS SELECT * FROM cycle_v2;
+                                              ^
+ERROR:  relation "cycle_v1" does not exist
+LINE 1: CREATE VIEW cycle_v2 AS SELECT * FROM cycle_v1;
+                                              ^
+ERROR:  view "cycle_v1" does not exist
 ?column?
 CYCLE_V1=0
 (1 row)
@@ -54,6 +61,10 @@ MULTI_V1=0
 ?column?
 MULTI_V2=0
 (1 row)
+ERROR:  relation "self_v" does not exist
+LINE 1: CREATE VIEW self_v AS SELECT * FROM self_v;
+                                            ^
+ERROR:  view "self_v" does not exist
 ?column?
 SELF_V=0
 (1 row)

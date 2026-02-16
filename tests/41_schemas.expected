@@ -19,10 +19,14 @@
 ?column?
 1
 (1 row)
+ERROR:  cannot drop schema app because other objects depend on it
+DETAIL:  table users depends on schema app
+table t1 depends on schema app
+sequence app.s depends on schema app
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
 ?column?
 1
 (1 row)
 ?column?
 1
 (1 row)
-psql:/home/dongxu/lab/pg-tikv/tests/41_schemas.sql:50: ERROR:  cannot drop schema 'app': schema is not empty

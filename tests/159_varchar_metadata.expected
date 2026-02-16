@@ -3,6 +3,12 @@ t|text|NULL|text
 v|character varying|3|varchar
 (2 rows)
 attname|atttypid|formatted
+tableoid|26|oid
+cmax|29|cid
+xmax|28|xid
+cmin|29|cid
+xmin|28|xid
+ctid|27|tid
 t|25|text
-v|1043|varchar
-(2 rows)
+v|1043|character varying(3)
+(8 rows)

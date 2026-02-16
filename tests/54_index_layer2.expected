@@ -4,12 +4,12 @@ PARTIAL_INDEX=1
 ?column?
 EXPR_INDEX=1
 (1 row)
-?column?
-ACTIVE_NAMES=alice,charlie
-(1 row)
-?column?
-AFTER_INSERT=alice,charlie,dave
-(1 row)
-?column?
-AFTER_UPDATE=charlie,dave
-(1 row)
+ERROR:  column "idx_test.name" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: ...agg(name, ',') FROM idx_test WHERE status = 1 ORDER BY name;
+                                                                  ^
+ERROR:  column "idx_test.name" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: ...agg(name, ',') FROM idx_test WHERE status = 1 ORDER BY name;
+                                                                  ^
+ERROR:  column "idx_test.name" must appear in the GROUP BY clause or be used in an aggregate function
+LINE 1: ...agg(name, ',') FROM idx_test WHERE status = 1 ORDER BY name;
+                                                                  ^

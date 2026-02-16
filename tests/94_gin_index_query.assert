@@ -1,0 +1,18 @@
+# GIN index query assertions — data correctness validated against PG 17.7
+# Note: PG 17 may choose Seq Scan for tiny tables; do not assert scan type.
+
+# EXPLAIN: JSONB @> containment query present in plan
+metadata @> '{"type": "pdf"}'::jsonb
+
+# Data query 1: JSONB @> containment (type=pdf) — ids 1 and 3
+(2 rows)
+
+# Data query 2: nested JSONB @> containment (author.name=user_1)
+(1 row)
+
+# Data query 3: COUNT with no match
+0
+
+# Data query 4: numeric canonicalization (1 == 1.0)
+4
+

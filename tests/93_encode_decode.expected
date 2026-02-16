@@ -14,7 +14,7 @@ escape_hello
 Hello
 (1 row)
 escape_mixed
-\\\000\037 \177\377
+\\\000 \377
 (1 row)
 escape_decoded
 \x5c001f207fff

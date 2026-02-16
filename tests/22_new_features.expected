@@ -62,19 +62,19 @@ b
 ?column?
 1
 (1 row)
-?column?
+array
 {1,2,3}
 (1 row)
-?column?
+array
 {hello,world}
 (1 row)
-?column?
+array
 10
 (1 row)
-?column?
+array
 20
 (1 row)
-?column?
+array
 c
 (1 row)
 array_length
@@ -107,10 +107,10 @@ array_upper
 array_lower
 1
 (1 row)
-id|name|price
-1|Item1|100
-2|Item2|200
-(2 rows)
+ERROR:  operator does not exist: text ->> unknown
+LINE 1: SELECT id, name, data ->> 'price' AS price FROM combined_tes...
+                              ^
+HINT:  No operator matches the given name and argument types. You might need to add explicit type casts.
 id|name|data|tags
 1|Updated|{"price": 150}|{tag1,tag2}
 (1 row)

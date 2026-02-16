@@ -1,0 +1,43 @@
+{
+  "pg_version": "17.7",
+  "validated_against": "PostgreSQL 17.7 (Ubuntu 17.7-0ubuntu0.25.10.1)",
+  "total_test_files": 181,
+  "total_expected_files": 178,
+  "tipg_only": {
+    "35_vector": "TIPG_EXT",
+    "36_vector_text": "TIPG_EXT",
+    "86_extensions_framework_http": "TIPG_EXT",
+    "103_create_database_edge_cases": "TIPG_MULTITENANT",
+    "114_copy_from_stdin_validation": "TIPG_BEHAVIOR",
+    "16_dvdrental_compat": "INFRA",
+    "219_gin_chinese_fts": "TIPG_EXT",
+    "222_structural_fixes_contract": "TIPG_EXT",
+    "223_migrations": "TIPG_BEHAVIOR",
+    "31_stored_procedures": "TIPG_SYNTAX",
+    "32_advanced_procedures": "TIPG_SYNTAX",
+    "dvdrental/restore": "INFRA",
+    "23_rbac": "TIPG_SYNTAX",
+    "91_timestamp_precision": "TIPG_EXT",
+    "95_alter_owner": "TIPG_CATALOG",
+    "101_server_introspection": "TIPG_VERSION",
+    "30_materialized_views": "TIPG_INTERNAL",
+    "128_hash_join_type_compat_issue426": "TIPG_BEHAVIOR",
+    "172_ordinality": "TIPG_INTERNAL",
+    "25_phase1_features": "TIPG_INTERNAL"
+  },
+  "explain_dependent": [
+    "26_explain",
+    "94_gin_index_query",
+    "131_gin_fts"
+  ],
+  "reason_codes": {
+    "TIPG_EXT": "Uses tipg-specific extensions (vector, HTTP, Chinese FTS tokenizer, now(int))",
+    "TIPG_MULTITENANT": "Uses tipg multi-tenant features (CREATE DATABASE extensions)",
+    "TIPG_BEHAVIOR": "Relies on tipg-specific behavior differences from PG",
+    "TIPG_SYNTAX": "Uses tipg-specific SQL syntax extensions (IF NOT EXISTS for roles, procedure extensions)",
+    "TIPG_CATALOG": "Uses tipg-specific catalog columns (table_owner, sequence_owner)",
+    "TIPG_VERSION": "Checks tipg-specific version string (pg-tikv)",
+    "TIPG_INTERNAL": "Contains tipg internal columns in output (_rowid, window_0)",
+    "INFRA": "Requires infrastructure not available in standard PG setup (dvdrental, Windows locale)"
+  }
+}

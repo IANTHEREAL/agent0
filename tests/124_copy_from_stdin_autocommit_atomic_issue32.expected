@@ -1,5 +1,6 @@
+ERROR:  duplicate key value violates unique constraint "t_copy_autocommit_issue32_pkey"
+DETAIL:  Key (id)=(1) already exists.
+CONTEXT:  COPY t_copy_autocommit_issue32, line 2
 count
 0
 (1 row)
-ERROR:  duplicate key value violates unique constraint "t_copy_autocommit_issue32_pkey"
-DETAIL:  Key (id)=(1) already exists.

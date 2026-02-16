@@ -17,7 +17,7 @@ a|case
 2|two
 3|other
 (3 rows)
-a|nullif|case
+a|nullif|a
 1|1|1
 2|NULL|NULL
 3|3|3
@@ -28,6 +28,4 @@ two|one|three|NULL
 case|case|case|case|case
 one|one|three|four|two
 (1 row)
-coalesce_col|coalesce_short_circuit
-1|1
-(1 row)
+ERROR:  division by zero

@@ -47,10 +47,10 @@ NOTICE:  table "set_b" does not exist, skipping
  id |  val   
 ----+--------
   1 | APPLE
-  2 | banana
   2 | BANANA
-  3 | cherry
+  2 | banana
   3 | CHERRY
+  3 | cherry
   4 | date
 (6 rows)
 

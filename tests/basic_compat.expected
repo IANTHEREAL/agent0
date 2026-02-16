@@ -98,12 +98,12 @@ test_section
 === 10. AGGREGATE FUNCTIONS ===
 (1 row)
 name|course_count|all_grades
-Anakin Skywalker|3|A-, A, B-
+Anakin Skywalker|3|A, A-, B-
 Princess Leia|2|B+, A+
 Yoda|2|A, A+
 (3 rows)
 avg_price|min_price|max_price
-9.3740|3.99|24.95
+9.374|3.99|24.95
 (1 row)
 test_section
 === 11. SUBQUERIES ===

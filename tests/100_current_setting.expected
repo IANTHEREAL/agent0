@@ -1,5 +1,5 @@
 search_path
-public
+"$user", public
 (1 row)
 statement_timeout
 0
@@ -8,13 +8,13 @@ missing_ok
 NULL
 (1 row)
 prev_timeout
-0
+200ms
 (1 row)
 statement_timeout
-200
+200ms
 (1 row)
 prev_sp
-public
+public, ss_s1
 (1 row)
 search_path
 public, ss_s1

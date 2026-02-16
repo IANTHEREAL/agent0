@@ -1,4 +1,5 @@
+ERROR:  missing data for column "b"
+CONTEXT:  COPY t_copy_row_mismatch, line 3: "5"
 count
 0
 (1 row)
-ERROR:  COPY row has 1 columns but 2 columns expected

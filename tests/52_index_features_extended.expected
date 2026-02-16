@@ -13,9 +13,13 @@ CREATE_EXPR:success
 ?column?
 CREATE_EXPR2:success
 (1 row)
+ERROR:  data type text has no default operator class for access method "gin"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
 ?column?
 CREATE_GIN:success
 (1 row)
+ERROR:  data type text has no default operator class for access method "gist"
+HINT:  You must specify an operator class for the index or define a default operator class for the data type.
 ?column?
 CREATE_GIST:success
 (1 row)
@@ -45,6 +49,8 @@ IF_NOT_EXISTS:success
 ?column?
 CREATE_COMPLEX:success
 (1 row)
+ERROR:  index "idx_ext_tags_gin" does not exist
+ERROR:  index "idx_ext_data_gist" does not exist
 ?column?
 DROP_ALL:success
 (1 row)
