@@ -15,18 +15,37 @@ pub enum ExpandedMode {
     Auto,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxState {
+    Idle,          // normal: "mydb> "
+    InTransaction, // after BEGIN: "mydb*> "
+    Failed,        // error in tx: "mydb!> "
+}
+
 pub struct ReplState {
     pub pager_enabled: bool,
     pub pager_command: Option<String>,
     pub expanded: ExpandedMode,
+    pub output_file: Option<String>,
+    pub last_query: Option<String>,
+    pub db_id: String,
+    pub db_name: String,
+    pub api_url: String,
+    pub tx_state: TxState,
 }
 
-impl Default for ReplState {
-    fn default() -> Self {
+impl ReplState {
+    pub fn new(db_id: String, db_name: String, api_url: String) -> Self {
         Self {
             pager_enabled: true,
             pager_command: None,
             expanded: ExpandedMode::Off,
+            output_file: None,
+            last_query: None,
+            db_id,
+            db_name,
+            api_url,
+            tx_state: TxState::Idle,
         }
     }
 }
@@ -42,10 +61,30 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
             Some(&headers),
         )
         .await;
-    let db_name = db_info["name"].as_str().unwrap_or(id);
+    let db_name = db_info["name"]
+        .as_str()
+        .unwrap_or(id)
+        .to_string();
+    let api_url = api.base_url().to_string();
 
-    let prompt_main = format!("{}> ", db_name);
-    let prompt_cont = format!("{}-> ", " ".repeat(db_name.len().saturating_sub(1)));
+    let get_prompts = |tx_state: TxState, db_name: &str| {
+        let suffix = match tx_state {
+            TxState::Idle => "> ",
+            TxState::InTransaction => "*> ",
+            TxState::Failed => "!> ",
+        };
+        let cont_suffix = match tx_state {
+            TxState::Idle => "-> ",
+            TxState::InTransaction => "*-> ",
+            TxState::Failed => "!-> ",
+        };
+        (
+            format!("{}{}", db_name, suffix),
+            format!("{}{}", " ".repeat(db_name.len().saturating_sub(1)), cont_suffix),
+        )
+    };
+
+    let (mut prompt_main, mut prompt_cont) = get_prompts(TxState::Idle, &db_name);
 
     eprintln!("db9 sql — connected to '{}' ({})", db_name, id);
     eprintln!("Type \\? for help, \\q to quit.\n");
@@ -92,7 +131,7 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
 
         let mut buffer = String::new();
         let mut show_timing = true;
-        let mut repl_state = ReplState::default();
+        let mut repl_state = ReplState::new(id.clone(), db_name.clone(), api_url);
 
         loop {
             let prompt = if buffer.is_empty() {
@@ -139,7 +178,7 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
                 match handle.block_on(commands::dispatch(
                     &api,
                     &output,
-                    &id,
+                    &repl_state.db_id.clone(),
                     &mut show_timing,
                     &mut repl_state,
                     trimmed,
@@ -149,6 +188,28 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
                         if let Some(helper) = rl.helper_mut() {
                             helper.set_tables(tables);
                         }
+                    }
+                    commands::DispatchResult::SwitchedDatabase { id, name, tables } => {
+                        repl_state.db_id = id;
+                        repl_state.db_name = name.clone();
+                        repl_state.tx_state = TxState::Idle;
+                        (prompt_main, prompt_cont) = get_prompts(TxState::Idle, &name);
+                        if let Some(helper) = rl.helper_mut() {
+                            helper.set_tables(tables);
+                        }
+                    }
+                    commands::DispatchResult::ExecuteQuery(sql) => {
+                        let new_tx_state = handle.block_on(exec::repl_exec(
+                            &api,
+                            &output,
+                            &repl_state.db_id,
+                            show_timing,
+                            &repl_state,
+                            &sql,
+                        ));
+                        repl_state.tx_state = new_tx_state;
+                        (prompt_main, prompt_cont) = get_prompts(new_tx_state, &repl_state.db_name);
+                        repl_state.last_query = Some(sql);
                     }
                     commands::DispatchResult::Continue => {}
                 }
@@ -167,14 +228,17 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
             buffer.push_str(trimmed);
 
             if trimmed.ends_with(';') {
-                handle.block_on(exec::repl_exec(
+                let new_tx_state = handle.block_on(exec::repl_exec(
                     &api,
                     &output,
-                    &id,
+                    &repl_state.db_id,
                     show_timing,
                     &repl_state,
                     &buffer,
                 ));
+                repl_state.tx_state = new_tx_state;
+                (prompt_main, prompt_cont) = get_prompts(new_tx_state, &repl_state.db_name);
+                repl_state.last_query = Some(buffer.clone());
                 buffer.clear();
             }
         }
