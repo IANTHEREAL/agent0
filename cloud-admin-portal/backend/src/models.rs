@@ -232,6 +232,8 @@ pub struct SqlResult {
     pub rows: Vec<Vec<serde_json::Value>>,
     pub row_count: usize,
     pub command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Serialize)]

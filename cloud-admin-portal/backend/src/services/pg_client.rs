@@ -174,6 +174,25 @@ fn text_to_json(val: Option<&str>, ty: &Type) -> Value {
     }
 }
 
+fn format_pg_error(e: &tokio_postgres::Error) -> String {
+    if let Some(db_err) = e.as_db_error() {
+        let mut parts = vec![format!("{}: {}", db_err.severity(), db_err.message())];
+        if let Some(detail) = db_err.detail() {
+            parts.push(format!("DETAIL: {detail}"));
+        }
+        if let Some(hint) = db_err.hint() {
+            parts.push(format!("HINT: {hint}"));
+        }
+        let code = db_err.code().code();
+        if !code.is_empty() {
+            parts.push(format!("SQLSTATE: {code}"));
+        }
+        parts.join("\n")
+    } else {
+        e.to_string()
+    }
+}
+
 fn query_like_statement(sql: &str) -> bool {
     let upper = sql.trim_start().to_ascii_uppercase();
     upper.starts_with("SELECT")
@@ -361,7 +380,7 @@ impl PgClient {
         sql: &str,
     ) -> Result<String, String> {
         let client = self.connect(keyspace, user, password).await?;
-        let rows = client.simple_query(sql).await.map_err(|e| e.to_string())?;
+        let rows = client.simple_query(sql).await.map_err(|e| format_pg_error(&e))?;
         let mut output = String::new();
         for msg in rows {
             if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
@@ -397,6 +416,7 @@ impl PgClient {
             rows: Vec::new(),
             row_count: 0,
             command: "UNKNOWN".to_string(),
+            error: None,
         };
 
         for statement in &statements {
@@ -409,13 +429,13 @@ impl PgClient {
                         .iter()
                         .map(|c| (c.name().to_string(), c.type_().clone()))
                         .collect::<Vec<_>>(),
-                    Err(e) => return Err(e.to_string()),
+                    Err(e) => return Err(format_pg_error(&e)),
                 };
 
                 let messages = client
                     .simple_query(statement)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| format_pg_error(&e))?;
 
                 let columns: Vec<ColumnInfo> = col_types
                     .iter()
@@ -440,12 +460,13 @@ impl PgClient {
                     columns,
                     rows: out_rows,
                     command,
+                    error: None,
                 };
             } else {
                 let messages = client
                     .simple_query(statement)
                     .await
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| format_pg_error(&e))?;
 
                 let mut affected: u64 = 0;
                 for msg in messages {
@@ -459,6 +480,7 @@ impl PgClient {
                     rows: Vec::new(),
                     row_count: affected as usize,
                     command,
+                    error: None,
                 };
             }
         }
