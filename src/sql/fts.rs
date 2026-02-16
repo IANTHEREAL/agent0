@@ -2,22 +2,36 @@ use crate::types::Value;
 use anyhow::Result;
 use std::collections::HashSet;
 
+use super::fts_tokenizers::{default_text_search_config, get_tokenizer};
+
 pub fn to_tsvector(args: Vec<Value>) -> Result<Value> {
-    let text = match args.len() {
-        1 => match &args[0] {
-            Value::Text(s) => s.clone(),
-            Value::Null => return Ok(Value::Null),
-            _ => return Err(anyhow::anyhow!("to_tsvector requires text argument")),
-        },
-        2 => match &args[1] {
-            Value::Text(s) => s.clone(),
-            Value::Null => return Ok(Value::Null),
-            _ => return Err(anyhow::anyhow!("to_tsvector requires text argument")),
-        },
+    let (config, text) = match args.len() {
+        1 => {
+            // Single argument: use default tokenizer
+            let text = extract_text(&args[0])?;
+            (default_text_search_config(), text)
+        }
+        2 => {
+            // Two arguments: (config, text)
+            let config = match &args[0] {
+                Value::Text(s) => s.as_str(),
+                _ => return Err(anyhow::anyhow!("first argument must be text search config")),
+            };
+            let text = extract_text(&args[1])?;
+            (config, text)
+        }
         _ => return Err(anyhow::anyhow!("to_tsvector takes 1 or 2 arguments")),
     };
 
-    let tokens = tokenize(&text);
+    // Get the tokenizer for the specified config
+    let tokenizer = get_tokenizer(config).ok_or_else(|| {
+        anyhow::anyhow!("unknown text search configuration: {}", config)
+    })?;
+
+    // Tokenize the text
+    let tokens = tokenizer(&text);
+
+    // Format as tsvector: 'word':position:weight
     let tsvector = tokens
         .into_iter()
         .enumerate()
@@ -28,22 +42,47 @@ pub fn to_tsvector(args: Vec<Value>) -> Result<Value> {
     Ok(Value::Tsvector(tsvector))
 }
 
+/// Extract text from a Value, handling Null gracefully.
+fn extract_text(value: &Value) -> Result<String> {
+    match value {
+        Value::Text(s) => Ok(s.clone()),
+        Value::Null => Ok(String::new()),
+        _ => Err(anyhow::anyhow!("argument must be text")),
+    }
+}
+
 pub fn plainto_tsquery(args: Vec<Value>) -> Result<Value> {
-    let text = match args.len() {
-        1 => match &args[0] {
-            Value::Text(s) => s.clone(),
-            Value::Null => return Ok(Value::Null),
-            _ => return Err(anyhow::anyhow!("plainto_tsquery requires text argument")),
-        },
-        2 => match &args[1] {
-            Value::Text(s) => s.clone(),
-            Value::Null => return Ok(Value::Null),
-            _ => return Err(anyhow::anyhow!("plainto_tsquery requires text argument")),
-        },
+    let (config, text) = match args.len() {
+        1 => {
+            // Single argument: use default tokenizer
+            let text = extract_text(&args[0])?;
+            (default_text_search_config(), text)
+        }
+        2 => {
+            // Two arguments: (config, text)
+            let config = match &args[0] {
+                Value::Text(s) => s.as_str(),
+                _ => {
+                    return Err(anyhow::anyhow!(
+                        "first argument must be text search config"
+                    ))
+                }
+            };
+            let text = extract_text(&args[1])?;
+            (config, text)
+        }
         _ => return Err(anyhow::anyhow!("plainto_tsquery takes 1 or 2 arguments")),
     };
 
-    let tokens = tokenize(&text);
+    // Get the tokenizer for the specified config
+    let tokenizer = get_tokenizer(config).ok_or_else(|| {
+        anyhow::anyhow!("unknown text search configuration: {}", config)
+    })?;
+
+    // Tokenize the text
+    let tokens = tokenizer(&text);
+
+    // Format as tsquery with AND operator
     let tsquery = tokens
         .into_iter()
         .map(|word| format!("'{}'", word))
@@ -55,16 +94,15 @@ pub fn plainto_tsquery(args: Vec<Value>) -> Result<Value> {
 
 pub fn to_tsquery(args: Vec<Value>) -> Result<Value> {
     let text = match args.len() {
-        1 => match &args[0] {
-            Value::Text(s) => s.clone(),
-            Value::Null => return Ok(Value::Null),
-            _ => return Err(anyhow::anyhow!("to_tsquery requires text argument")),
-        },
-        2 => match &args[1] {
-            Value::Text(s) => s.clone(),
-            Value::Null => return Ok(Value::Null),
-            _ => return Err(anyhow::anyhow!("to_tsquery requires text argument")),
-        },
+        1 => {
+            // Single argument: pass through as tsquery
+            extract_text(&args[0])?
+        }
+        2 => {
+            // Two arguments: (config, text) - config is for compatibility, pass through text
+            // In PostgreSQL, to_tsquery respects config but we just pass through for now
+            extract_text(&args[1])?
+        }
         _ => return Err(anyhow::anyhow!("to_tsquery takes 1 or 2 arguments")),
     };
 
@@ -113,14 +151,6 @@ pub fn ts_match(tsvector: &Value, tsquery: &Value) -> Result<Value> {
     let matches = match_tsquery(&tsvector_words, tsquery_str);
 
     Ok(Value::Boolean(matches))
-}
-
-fn tokenize(text: &str) -> Vec<String> {
-    text.to_lowercase()
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty() && s.len() > 1)
-        .map(|s| s.to_string())
-        .collect()
 }
 
 fn extract_tsvector_words(tsvector: &str) -> HashSet<String> {
