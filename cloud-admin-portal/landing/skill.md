@@ -308,6 +308,22 @@ db9 is **not just Postgres**. It ships built-in extensions that let you do thing
 | **Vector Search** | pgvector-compatible embeddings with L2, cosine, and inner product distance |
 | **Full-Text Search** | tsvector/tsquery with ranking and GIN indexing |
 
+**How to run the SQL examples below:**
+
+```bash
+# Inline
+db9 db sql <id> -q "CREATE EXTENSION http"
+
+# Multi-line / complex SQL — use a file
+echo "SELECT * FROM extensions.http_get('https://httpbin.org/ip');" > /tmp/q.sql
+db9 db sql <id> -f /tmp/q.sql
+
+# Pipe
+echo "SELECT 1" | db9 db sql <id>
+```
+
+All SQL in the sections below is executed via `db9 db sql <id> -q "..."` (or `-f` for files).
+
 ---
 
 ## JSONB — Document Store Inside Postgres
@@ -1137,76 +1153,56 @@ db9 --json db inspect <id> report
 
 ### Recipe 5: Semantic search with vector embeddings
 
-```sql
--- 1. Create table with vector column
-CREATE TABLE documents (
-    id SERIAL PRIMARY KEY,
-    content TEXT,
-    embedding vector(1536)
-);
+```bash
+# 1. Create table with vector column
+db9 db sql <id> -q "CREATE TABLE documents (id SERIAL PRIMARY KEY, content TEXT, embedding vector(1536))"
 
--- 2. Insert embeddings (from your embedding API)
-INSERT INTO documents (content, embedding) VALUES
-    ('db9 is serverless Postgres', '[0.1, 0.2, ...]');
+# 2. Insert embeddings (from your embedding API)
+db9 db sql <id> -q "INSERT INTO documents (content, embedding) VALUES ('db9 is serverless Postgres', '[0.1, 0.2, ...]')"
 
--- 3. Find 5 most similar documents
-SELECT id, content, embedding <=> '[0.1, 0.2, ...]' AS distance
-FROM documents
-ORDER BY embedding <=> '[0.1, 0.2, ...]'
-LIMIT 5;
+# 3. Find 5 most similar documents
+db9 db sql <id> -q "SELECT id, content, embedding <=> '[0.1, 0.2, ...]' AS distance FROM documents ORDER BY embedding <=> '[0.1, 0.2, ...]' LIMIT 5"
 ```
 
 ### Recipe 6: Call an external API from SQL
 
-```sql
--- Enable the HTTP extension
-CREATE EXTENSION http;
+```bash
+# Enable the HTTP extension (once per database)
+db9 db sql <id> -q "CREATE EXTENSION http"
 
--- GET request
-SELECT status, content::jsonb->>'origin' AS origin
-FROM extensions.http_get('https://httpbin.org/get');
+# GET request
+db9 db sql <id> -q "SELECT status, content::jsonb->>'origin' AS origin FROM extensions.http_get('https://httpbin.org/get')"
 
--- POST a webhook
-SELECT status
-FROM extensions.http_post(
-    'https://hooks.example.com/webhook',
-    '{"event":"deploy_complete"}',
-    'application/json'
-);
+# POST a webhook
+db9 db sql <id> -q "SELECT status FROM extensions.http_post('https://hooks.example.com/webhook', '{\"event\":\"deploy_complete\"}', 'application/json')"
 ```
 
 ### Recipe 7: Store and query JSON documents
 
-```sql
-CREATE TABLE config (
-    id SERIAL PRIMARY KEY,
-    data JSONB NOT NULL
-);
+```bash
+db9 db sql <id> -q "CREATE TABLE config (id SERIAL PRIMARY KEY, data JSONB NOT NULL)"
+db9 db sql <id> -q "INSERT INTO config (data) VALUES ('{\"env\":\"prod\",\"features\":{\"dark_mode\":true}}')"
 
-INSERT INTO config (data) VALUES ('{"env":"prod","features":{"dark_mode":true}}');
+# Query with operators
+db9 db sql <id> -q "SELECT data->>'env' AS env FROM config"
+db9 db sql <id> -q "SELECT * FROM config WHERE data @> '{\"features\":{\"dark_mode\":true}}'"
 
--- Query with operators
-SELECT data->>'env' AS env FROM config;
-SELECT * FROM config WHERE data @> '{"features":{"dark_mode":true}}';
-
--- GIN index for fast containment queries
-CREATE INDEX idx_config ON config USING GIN (data);
+# GIN index for fast containment queries
+db9 db sql <id> -q "CREATE INDEX idx_config ON config USING GIN (data)"
 ```
 
 ### Recipe 8: Query CSV/JSONL files from SQL
 
-```sql
--- Enable the fs9 extension
-CREATE EXTENSION fs9;
+```bash
+# Enable the fs9 extension (once per database)
+db9 db sql <id> -q "CREATE EXTENSION fs9"
 
--- Read a CSV file as a table
-SELECT * FROM extensions.fs9('/data/users.csv') ORDER BY name;
+# Read a CSV file as a table
+db9 db sql <id> -q "SELECT * FROM extensions.fs9('/data/users.csv') ORDER BY name"
 
--- Read JSONL logs and filter
-SELECT _line_number, line
-FROM extensions.fs9('/logs/app.jsonl')
-WHERE line->>'level' = 'error';
+# Read JSONL logs and filter errors
+db9 db sql <id> -q "SELECT _line_number, line FROM extensions.fs9('/logs/app.jsonl') WHERE line->>'level' = 'error'"
 
--- Glob multiple files
-SELECT _path, * FROM extensions.fs9('/data/*.csv');
+# Glob multiple files
+db9 db sql <id> -q "SELECT _path, * FROM extensions.fs9('/data/*.csv')"
 ```
