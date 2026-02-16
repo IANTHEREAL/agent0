@@ -39,6 +39,10 @@ pub(crate) enum RawSqlKind {
     /// sqlparser which does not support standalone `RESET`).  `RESET ROLE` is
     /// excluded: it is rewritten to `SET ROLE NONE` in the parser layer.
     Reset,
+    /// `ANALYZE [table]` — collects table statistics for the query planner.
+    /// All syntax validation (VERBOSE, quoted identifiers, trailing junk) is
+    /// handled by `parse_analyze_table_name()` in the handler, not here.
+    Analyze,
     /// Statements that we accept past Parse so the executor can return a stable
     /// "not supported" error (instead of a syntax error).
     UnsupportedExecutorSkips,
@@ -73,7 +77,7 @@ fn find_block_comment_end(s: &str) -> Option<usize> {
 ///
 /// Returns `None` for unterminated `/* */`. A line comment that reaches EOF
 /// returns `Some("")`.
-fn skip_ws_and_comments(s: &str) -> Option<&str> {
+pub(crate) fn skip_ws_and_comments(s: &str) -> Option<&str> {
     let mut rest = s;
     loop {
         rest = rest.trim_start();
@@ -219,6 +223,15 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     }
     if sql_upper.starts_with("DROP TYPE") {
         return Some(RawSqlKind::DropType);
+    }
+
+    // ANALYZE — keyword boundary only; all syntax validation lives in the handler.
+    if sql_upper == "ANALYZE"
+        || (sql_upper.len() > 7
+            && sql_upper.starts_with("ANALYZE")
+            && sql_upper.as_bytes()[7].is_ascii_whitespace())
+    {
+        return Some(RawSqlKind::Analyze);
     }
 
     // RESET <guc> / RESET ALL — but NOT RESET ROLE (which is rewritten in the parser).

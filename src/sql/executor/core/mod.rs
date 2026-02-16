@@ -1,6 +1,7 @@
 //! SQL executor core
 
 mod alter;
+mod analyze;
 pub(crate) mod catalog_prefetch;
 mod copy;
 mod dispatch;

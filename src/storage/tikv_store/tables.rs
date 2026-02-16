@@ -472,6 +472,53 @@ impl TikvStore {
         Ok(tables)
     }
 
+    /// Scan rows in batches for ANALYZE, calling `process` on each deserialized row.
+    /// Returns total row count. Does not materialize the full table in memory.
+    pub async fn scan_analyze_batch(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        table_id: u64,
+        batch_size: u32,
+        mut process: impl FnMut(&Row) -> Result<()>,
+    ) -> Result<usize> {
+        let (raw_start, raw_end) = encode_table_data_range_v2(db_id, table_id);
+        let end_key = self.key(&raw_end);
+        let mut start_key = self.key(&raw_start);
+        let mut total_rows = 0usize;
+
+        loop {
+            let range: BoundRange = (start_key.clone()..end_key.clone()).into();
+            let pairs = txn.scan(range, batch_size).await?;
+            let mut batch_count = 0u32;
+            let mut last_key: Option<Vec<u8>> = None;
+
+            for pair in pairs {
+                let row = deserialize_row(pair.value())?;
+                process(&row)?;
+                let key_ref: &[u8] = pair.key().as_ref().into();
+                last_key = Some(key_ref.to_vec());
+                total_rows += 1;
+                batch_count += 1;
+            }
+
+            if batch_count < batch_size {
+                break;
+            }
+
+            // Advance past the last key for the next batch.
+            if let Some(mut lk) = last_key {
+                lk.push(0x00);
+                start_key = lk;
+            } else {
+                break;
+            }
+        }
+
+        kv_stats::record_table_scan_pairs(total_rows);
+        Ok(total_rows)
+    }
+
     /// Truncate a table
     pub async fn truncate_table(
         &self,
