@@ -17,8 +17,12 @@ use anyhow::{anyhow, Result};
 use sqlparser::ast::JsonOperator;
 
 pub(crate) const VERSION_STRING: &str = concat!(
-    "PostgreSQL 16.0 (pg-tikv ",
+    "PostgreSQL 16.0 (db9 ",
     env!("CARGO_PKG_VERSION"),
+    "-",
+    env!("BUILD_GIT_HASH"),
+    " ",
+    env!("BUILD_DATE"),
     " on TiKV)"
 );
 

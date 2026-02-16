@@ -174,7 +174,12 @@ pub fn print_help() {
 
 /// Print version information to stdout.
 pub fn print_version() {
-    println!("pg-tikv {}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "db9 {}-{} ({})",
+        env!("CARGO_PKG_VERSION"),
+        env!("BUILD_GIT_HASH"),
+        env!("BUILD_DATE")
+    );
 }
 
 #[cfg(test)]

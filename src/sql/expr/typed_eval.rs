@@ -2185,7 +2185,7 @@ mod tests {
         );
         let result = eval_typed_expr(&func, &row, &qctx).unwrap();
         match result {
-            Value::Text(s) => assert!(s.contains("pg-tikv")),
+            Value::Text(s) => assert!(s.contains("db9")),
             _ => panic!("expected text"),
         }
     }
