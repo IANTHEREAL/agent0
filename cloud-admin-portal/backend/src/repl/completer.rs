@@ -597,4 +597,182 @@ mod tests {
         assert!(highlighted.contains(ANSI_STRING));
         assert!(!highlighted.contains(ANSI_KEYWORD));
     }
+
+    // ── table completion tests ──────────────────────────────────
+
+    #[test]
+    fn test_table_name_completion() {
+        let mut helper = SqlHelper::new();
+        helper.set_tables(vec!["users".into(), "orders".into(), "user_roles".into()]);
+        let results = complete_for(&helper, "us");
+        assert!(results.iter().any(|r| r == "users"));
+        assert!(results.iter().any(|r| r == "user_roles"));
+        assert!(!results.iter().any(|r| r == "orders"));
+    }
+
+    #[test]
+    fn test_table_and_keyword_mixed() {
+        let mut helper = SqlHelper::new();
+        helper.set_tables(vec!["settings".into()]);
+        let results = complete_for(&helper, "se");
+        assert!(results.iter().any(|r| r == "SELECT"));
+        assert!(results.iter().any(|r| r == "settings"));
+    }
+
+    #[test]
+    fn test_empty_prefix_no_completion() {
+        let helper = SqlHelper::new();
+        let results = complete_for(&helper, "");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_completion_deduplication() {
+        let mut helper = SqlHelper::new();
+        helper.set_tables(vec!["select".into()]);
+        let results = complete_for(&helper, "sel");
+        let count = results
+            .iter()
+            .filter(|r| r.to_lowercase() == "select")
+            .count();
+        assert!(count >= 1);
+    }
+
+    // ── in_string_literal tests ─────────────────────────────────
+
+    #[test]
+    fn test_in_string_literal_basic() {
+        assert!(!SqlHelper::in_string_literal("SELECT", 3));
+        assert!(SqlHelper::in_string_literal("SELECT 'hello", 10));
+        assert!(!SqlHelper::in_string_literal("SELECT 'hello'", 14));
+    }
+
+    #[test]
+    fn test_in_string_literal_escaped_quote() {
+        assert!(SqlHelper::in_string_literal("'it''s a test'", 8));
+        assert!(!SqlHelper::in_string_literal("'it''s a test'", 14));
+    }
+
+    #[test]
+    fn test_in_string_literal_empty() {
+        assert!(!SqlHelper::in_string_literal("", 0));
+    }
+
+    #[test]
+    fn test_no_completion_inside_escaped_string() {
+        let helper = SqlHelper::new();
+        let results = complete_for(&helper, "SELECT 'it''s SEL");
+        assert!(results.is_empty());
+    }
+
+    // ── word_start tests ────────────────────────────────────────
+
+    #[test]
+    fn test_word_start_beginning() {
+        assert_eq!(SqlHelper::word_start("SELECT", 3), 0);
+    }
+
+    #[test]
+    fn test_word_start_after_space() {
+        assert_eq!(SqlHelper::word_start("SELECT name", 10), 7);
+    }
+
+    #[test]
+    fn test_word_start_after_dot() {
+        assert_eq!(SqlHelper::word_start("schema.tab", 10), 7);
+    }
+
+    // ── Highlighter trait tests ─────────────────────────────────
+
+    #[test]
+    fn test_highlighter_disabled_returns_borrowed() {
+        let mut helper = SqlHelper::new();
+        helper.set_highlighting(false);
+        let result = helper.highlight("SELECT 1", 0);
+        assert_eq!(&*result, "SELECT 1");
+        assert!(!result.contains('\x1b'));
+    }
+
+    #[test]
+    fn test_highlighter_enabled_adds_ansi() {
+        let mut helper = SqlHelper::new();
+        helper.set_highlighting(true);
+        let result = helper.highlight("SELECT", 0);
+        assert!(result.contains('\x1b'));
+    }
+
+    #[test]
+    fn test_highlight_char_follows_setting() {
+        let mut helper = SqlHelper::new();
+        helper.set_highlighting(true);
+        assert!(helper.highlight_char("x", 0, false));
+        helper.set_highlighting(false);
+        assert!(!helper.highlight_char("x", 0, false));
+    }
+
+    #[test]
+    fn test_highlight_hint_adds_gray() {
+        let mut helper = SqlHelper::new();
+        helper.set_highlighting(true);
+        let result = helper.highlight_hint("suggestion");
+        assert!(result.contains("\x1b[90m"));
+    }
+
+    // ── highlight_sql edge cases ────────────────────────────────
+
+    #[test]
+    fn highlight_unterminated_string() {
+        let input = "SELECT 'unterminated";
+        let highlighted = highlight_sql(input);
+        assert_eq!(strip_ansi(&highlighted), input);
+    }
+
+    #[test]
+    fn highlight_dot_not_number() {
+        let highlighted = highlight_sql("a.b");
+        assert_eq!(strip_ansi(&highlighted), "a.b");
+        assert!(!highlighted.contains(ANSI_NUMBER));
+    }
+
+    #[test]
+    fn highlight_comment_after_code() {
+        let input = "SELECT 1 -- comment";
+        let highlighted = highlight_sql(input);
+        assert_eq!(strip_ansi(&highlighted), input);
+        assert!(highlighted.contains(ANSI_KEYWORD));
+        assert!(highlighted.contains(ANSI_NUMBER));
+        assert!(highlighted.contains(ANSI_COMMENT));
+    }
+
+    #[test]
+    fn highlight_multiple_strings() {
+        let input = "'a' || 'b'";
+        let highlighted = highlight_sql(input);
+        assert_eq!(strip_ansi(&highlighted), input);
+    }
+
+    #[test]
+    fn highlight_all_operator_pairs() {
+        for op in &["!=", "<=", ">=", "<>"] {
+            let highlighted = highlight_sql(op);
+            assert!(
+                highlighted.contains(ANSI_OPERATOR),
+                "{op} not highlighted as operator"
+            );
+            assert_eq!(strip_ansi(&highlighted), *op, "{op} text mangled");
+        }
+    }
+
+    #[test]
+    fn highlight_underscore_identifier() {
+        let highlighted = highlight_sql("_private_col");
+        assert!(!highlighted.contains(ANSI_KEYWORD));
+        assert_eq!(strip_ansi(&highlighted), "_private_col");
+    }
+
+    #[test]
+    fn highlight_whitespace_only() {
+        let highlighted = highlight_sql("   ");
+        assert_eq!(highlighted, "   ");
+    }
 }

@@ -184,4 +184,74 @@ mod tests {
     fn test_infer_float() {
         assert!(infer_typed_value("3.14").is_number());
     }
+
+    #[test]
+    fn test_infer_command_update() {
+        assert_eq!(infer_command("UPDATE users SET name = 'x'"), "UPDATE");
+    }
+
+    #[test]
+    fn test_infer_command_delete() {
+        assert_eq!(infer_command("DELETE FROM users WHERE id = 1"), "DELETE");
+    }
+
+    #[test]
+    fn test_infer_command_create_table() {
+        assert_eq!(infer_command("CREATE TABLE foo (id INT)"), "CREATE");
+    }
+
+    #[test]
+    fn test_infer_command_whitespace() {
+        assert_eq!(infer_command("  SELECT 1  "), "SELECT");
+    }
+
+    #[test]
+    fn test_infer_command_trailing_semicolons() {
+        assert_eq!(infer_command("SELECT 1;;;"), "SELECT");
+    }
+
+    #[test]
+    fn test_infer_command_case_insensitive() {
+        assert_eq!(infer_command("select 1"), "SELECT");
+        assert_eq!(infer_command("Insert INTO t VALUES (1)"), "INSERT");
+    }
+
+    #[test]
+    fn test_infer_typed_value_large_int() {
+        assert_eq!(infer_typed_value("9999999999999"), Value::Number(9999999999999i64.into()));
+    }
+
+    #[test]
+    fn test_infer_typed_value_zero() {
+        assert_eq!(infer_typed_value("0"), Value::Number(0.into()));
+    }
+
+    #[test]
+    fn test_infer_typed_value_negative_float() {
+        let val = infer_typed_value("-3.14");
+        assert!(val.is_number());
+    }
+
+    #[test]
+    fn test_infer_typed_value_uuid_string() {
+        let val = infer_typed_value("550e8400-e29b-41d4-a716-446655440000");
+        assert!(val.is_string());
+    }
+
+    #[test]
+    fn test_infer_typed_value_timestamp_string() {
+        let val = infer_typed_value("2026-02-15 12:00:00");
+        assert!(val.is_string());
+    }
+
+    #[test]
+    fn test_infer_typed_value_empty_string() {
+        assert_eq!(infer_typed_value(""), Value::String("".to_string()));
+    }
+
+    #[test]
+    fn test_infer_typed_value_json_like_string() {
+        let val = infer_typed_value("{\"key\": \"value\"}");
+        assert!(val.is_string());
+    }
 }

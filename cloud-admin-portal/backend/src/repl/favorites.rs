@@ -238,4 +238,69 @@ query1 = "SELECT \"name\" FROM users"
             Some(&"SELECT \"name\" FROM users".to_string())
         );
     }
+
+    #[test]
+    fn test_overwrite_existing_favorite() {
+        let mut fav = Favorites {
+            path: PathBuf::from("/tmp/db9_test_fav_overwrite.toml"),
+            queries: BTreeMap::new(),
+        };
+        fav.add("q", "SELECT 1").unwrap();
+        fav.add("q", "SELECT 2").unwrap();
+        assert_eq!(fav.get("q"), Some("SELECT 2".to_string()));
+        let _ = std::fs::remove_file("/tmp/db9_test_fav_overwrite.toml");
+    }
+
+    #[test]
+    fn test_list_sorted_order() {
+        let mut fav = Favorites {
+            path: PathBuf::from("/tmp/db9_test_fav_sorted.toml"),
+            queries: BTreeMap::new(),
+        };
+        fav.add("zebra", "SELECT 3").unwrap();
+        fav.add("alpha", "SELECT 1").unwrap();
+        fav.add("middle", "SELECT 2").unwrap();
+        let list = fav.list();
+        assert_eq!(list[0].0, "alpha");
+        assert_eq!(list[1].0, "middle");
+        assert_eq!(list[2].0, "zebra");
+        let _ = std::fs::remove_file("/tmp/db9_test_fav_sorted.toml");
+    }
+
+    #[test]
+    fn test_parse_toml_empty() {
+        let queries = Favorites::parse_toml("");
+        assert!(queries.is_empty());
+    }
+
+    #[test]
+    fn test_parse_toml_no_favorites_section() {
+        let content = "[other]\nkey = \"value\"\n";
+        let queries = Favorites::parse_toml(content);
+        assert!(queries.is_empty());
+    }
+
+    #[test]
+    fn test_save_and_parse_roundtrip() {
+        let tmp_path = PathBuf::from("/tmp/db9_test_fav_roundtrip.toml");
+        let mut fav = Favorites {
+            path: tmp_path.clone(),
+            queries: BTreeMap::new(),
+        };
+        fav.add("q1", "SELECT * FROM users").unwrap();
+        fav.add("q2", "INSERT INTO t VALUES (1)").unwrap();
+        // Read back the file that save() wrote
+        let content = std::fs::read_to_string(&tmp_path).unwrap();
+        let parsed = Favorites::parse_toml(&content);
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed.get("q1").map(|s| s.as_str()),
+            Some("SELECT * FROM users")
+        );
+        assert_eq!(
+            parsed.get("q2").map(|s| s.as_str()),
+            Some("INSERT INTO t VALUES (1)")
+        );
+        let _ = std::fs::remove_file(&tmp_path);
+    }
 }

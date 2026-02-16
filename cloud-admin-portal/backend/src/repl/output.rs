@@ -595,4 +595,80 @@ mod tests {
         assert!(state.pager_enabled);
         assert!(!state.is_direct());
     }
+
+    #[test]
+    fn test_format_sql_result_json_mode() {
+        let data = serde_json::json!({
+            "columns": [{"name": "id"}],
+            "rows": [[1]],
+            "command": "SELECT 1"
+        });
+        let result = format_sql_result(&data, &crate::OutputFormat::Json, ExpandedMode::Off);
+        assert!(result.contains("\"id\""));
+        assert!(result.contains("1"));
+    }
+
+    #[test]
+    fn test_format_sql_result_command_only() {
+        let data = serde_json::json!({
+            "columns": [],
+            "rows": [],
+            "command": "CREATE TABLE"
+        });
+        let result = format_sql_result(&data, &crate::OutputFormat::Table, ExpandedMode::Off);
+        assert!(result.contains("CREATE TABLE"));
+    }
+
+    #[test]
+    fn test_format_sql_result_with_nulls() {
+        let data = serde_json::json!({
+            "columns": [{"name": "a"}, {"name": "b"}],
+            "rows": [[1, null], [null, "hello"]],
+            "command": "SELECT 2"
+        });
+        let result = format_sql_result(&data, &crate::OutputFormat::Table, ExpandedMode::Off);
+        assert!(result.contains("NULL"));
+    }
+
+    #[test]
+    fn test_expanded_mode_auto_narrow_data() {
+        let data = serde_json::json!({
+            "columns": [{"name": "id"}],
+            "rows": [[1]],
+            "command": "SELECT 1"
+        });
+        print_sql_result(
+            &data,
+            &crate::OutputFormat::Table,
+            false,
+            &None,
+            ExpandedMode::Auto,
+        );
+    }
+
+    #[test]
+    fn test_print_sql_result_empty_rows() {
+        let data = serde_json::json!({
+            "columns": [{"name": "id"}, {"name": "name"}],
+            "rows": [],
+            "command": "SELECT 0"
+        });
+        print_sql_result(
+            &data,
+            &crate::OutputFormat::Table,
+            false,
+            &None,
+            ExpandedMode::Off,
+        );
+    }
+
+    #[test]
+    fn test_expanded_output_empty_rows() {
+        let data = serde_json::json!({
+            "columns": [{"name": "id"}],
+            "rows": [],
+            "command": "SELECT 0"
+        });
+        print_sql_result_expanded(&data, false, &None);
+    }
 }

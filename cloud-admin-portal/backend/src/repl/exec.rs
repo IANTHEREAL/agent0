@@ -188,4 +188,67 @@ mod tests {
         };
         assert_eq!(new_state, TxState::Idle);
     }
+
+    #[test]
+    fn test_detect_tx_state_missing_command() {
+        let data = serde_json::json!({
+            "columns": [],
+            "rows": []
+        });
+        let new_state = detect_tx_state_change(&data, TxState::InTransaction);
+        assert_eq!(new_state, TxState::InTransaction);
+    }
+
+    #[test]
+    fn test_detect_tx_state_null_command() {
+        let data = serde_json::json!({
+            "command": null,
+            "columns": [],
+            "rows": []
+        });
+        let new_state = detect_tx_state_change(&data, TxState::Idle);
+        assert_eq!(new_state, TxState::Idle);
+    }
+
+    #[test]
+    fn test_detect_tx_state_savepoint_preserves() {
+        let data = serde_json::json!({
+            "command": "SAVEPOINT",
+            "columns": [],
+            "rows": []
+        });
+        let new_state = detect_tx_state_change(&data, TxState::InTransaction);
+        assert_eq!(new_state, TxState::InTransaction);
+    }
+
+    #[test]
+    fn test_detect_tx_state_rollback_from_failed() {
+        let data = serde_json::json!({
+            "command": "ROLLBACK",
+            "columns": [],
+            "rows": []
+        });
+        let new_state = detect_tx_state_change(&data, TxState::Failed);
+        assert_eq!(new_state, TxState::Idle);
+    }
+
+    #[test]
+    fn test_print_error_relation_hint() {
+        print_error_with_hints("ERROR: relation \"foo\" does not exist");
+    }
+
+    #[test]
+    fn test_print_error_column_hint() {
+        print_error_with_hints("ERROR: column \"bar\" does not exist");
+    }
+
+    #[test]
+    fn test_print_error_syntax_hint() {
+        print_error_with_hints("ERROR: syntax error at or near \"SELEC\"");
+    }
+
+    #[test]
+    fn test_print_error_generic() {
+        print_error_with_hints("ERROR: something unexpected happened");
+    }
 }

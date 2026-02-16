@@ -742,3 +742,193 @@ fn repl_help() {
     eprintln!("Enter SQL terminated by semicolon (;) to execute.");
     eprintln!("Multi-line input is supported.");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::SqlExecutor;
+
+    #[test]
+    fn test_extract_table_names_normal() {
+        let data = serde_json::json!({
+            "columns": [{"name": "table_name"}],
+            "rows": [["users"], ["orders"], ["products"]]
+        });
+        let names = extract_table_names(&data);
+        assert_eq!(names, vec!["users", "orders", "products"]);
+    }
+
+    #[test]
+    fn test_extract_table_names_empty() {
+        let data = serde_json::json!({
+            "columns": [{"name": "table_name"}],
+            "rows": []
+        });
+        assert!(extract_table_names(&data).is_empty());
+    }
+
+    #[test]
+    fn test_extract_table_names_no_rows_key() {
+        let data = serde_json::json!({"columns": []});
+        assert!(extract_table_names(&data).is_empty());
+    }
+
+    #[test]
+    fn test_format_bool_field_true() {
+        assert_eq!(format_bool_field(Some(&Value::Bool(true))), "yes");
+    }
+
+    #[test]
+    fn test_format_bool_field_false() {
+        assert_eq!(format_bool_field(Some(&Value::Bool(false))), "no");
+    }
+
+    #[test]
+    fn test_format_bool_field_string() {
+        assert_eq!(format_bool_field(Some(&Value::String("custom".into()))), "custom");
+    }
+
+    #[test]
+    fn test_format_bool_field_none() {
+        assert_eq!(format_bool_field(None), "");
+    }
+
+    #[test]
+    fn test_handle_expanded_toggle() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        assert_eq!(state.expanded, ExpandedMode::Off);
+        handle_expanded_command(&mut state, "");
+        assert_eq!(state.expanded, ExpandedMode::On);
+        handle_expanded_command(&mut state, "");
+        assert_eq!(state.expanded, ExpandedMode::Off);
+    }
+
+    #[test]
+    fn test_handle_expanded_explicit() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        handle_expanded_command(&mut state, "on");
+        assert_eq!(state.expanded, ExpandedMode::On);
+        handle_expanded_command(&mut state, "auto");
+        assert_eq!(state.expanded, ExpandedMode::Auto);
+        handle_expanded_command(&mut state, "off");
+        assert_eq!(state.expanded, ExpandedMode::Off);
+    }
+
+    #[test]
+    fn test_handle_expanded_invalid() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        handle_expanded_command(&mut state, "invalid");
+        assert_eq!(state.expanded, ExpandedMode::Off);
+    }
+
+    #[test]
+    fn test_handle_pager_toggle() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        assert!(state.pager_enabled);
+        handle_pager_command(&mut state, "off");
+        assert!(!state.pager_enabled);
+        handle_pager_command(&mut state, "on");
+        assert!(state.pager_enabled);
+        assert!(state.pager_command.is_none());
+    }
+
+    #[test]
+    fn test_handle_pager_custom_command() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        handle_pager_command(&mut state, "more");
+        assert!(state.pager_enabled);
+        assert_eq!(state.pager_command, Some("more".to_string()));
+    }
+
+    #[test]
+    fn test_handle_highlight_command_on() {
+        match handle_highlight_command("on") {
+            DispatchResult::HighlightChanged(true) => {}
+            _ => panic!("Expected HighlightChanged(true)"),
+        }
+    }
+
+    #[test]
+    fn test_handle_highlight_command_off() {
+        match handle_highlight_command("off") {
+            DispatchResult::HighlightChanged(false) => {}
+            _ => panic!("Expected HighlightChanged(false)"),
+        }
+    }
+
+    #[test]
+    fn test_handle_highlight_command_default_on() {
+        match handle_highlight_command("") {
+            DispatchResult::HighlightChanged(true) => {}
+            _ => panic!("Expected HighlightChanged(true) for empty arg"),
+        }
+    }
+
+    #[test]
+    fn test_handle_highlight_command_invalid() {
+        match handle_highlight_command("maybe") {
+            DispatchResult::Continue => {}
+            _ => panic!("Expected Continue for invalid arg"),
+        }
+    }
+
+    #[test]
+    fn test_handle_save_favorite_with_query() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        handle_save_favorite(&mut state, "myq SELECT 1");
+        assert_eq!(state.favorites.get("myq"), Some("SELECT 1".to_string()));
+    }
+
+    #[test]
+    fn test_handle_save_favorite_from_last_query() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        state.last_query = Some("SELECT 42".to_string());
+        handle_save_favorite(&mut state, "last");
+        assert_eq!(state.favorites.get("last"), Some("SELECT 42".to_string()));
+    }
+
+    #[test]
+    fn test_handle_save_favorite_no_last_query() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        handle_save_favorite(&mut state, "name_only");
+        assert_eq!(state.favorites.get("name_only"), None);
+    }
+
+    #[test]
+    fn test_handle_execute_favorite_found() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        state.favorites.add("run_me", "SELECT 99").unwrap();
+        match handle_execute_favorite(&state, "run_me") {
+            DispatchResult::ExecuteQuery(q) => assert_eq!(q, "SELECT 99"),
+            _ => panic!("Expected ExecuteQuery"),
+        }
+    }
+
+    #[test]
+    fn test_handle_execute_favorite_not_found() {
+        let state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        match handle_execute_favorite(&state, "nonexistent") {
+            DispatchResult::Continue => {}
+            _ => panic!("Expected Continue for missing favorite"),
+        }
+    }
+
+    #[test]
+    fn test_handle_delete_favorite() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        state.favorites.add("del_me", "SELECT 1").unwrap();
+        handle_delete_favorite(&mut state, "del_me");
+        assert_eq!(state.favorites.get("del_me"), None);
+    }
+
+    #[test]
+    fn test_handle_output_redirect_set_and_reset() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        assert!(state.output_file.is_none());
+        handle_output_redirect(&mut state, "/tmp/db9_test_output.txt");
+        assert_eq!(state.output_file, Some("/tmp/db9_test_output.txt".to_string()));
+        handle_output_redirect(&mut state, "");
+        assert!(state.output_file.is_none());
+        let _ = std::fs::remove_file("/tmp/db9_test_output.txt");
+    }
+}
