@@ -13,6 +13,7 @@ mod scan;
 mod settings_tableless;
 mod statement;
 mod timeout;
+pub(crate) mod view_rewrite;
 
 #[cfg(test)]
 mod tests;

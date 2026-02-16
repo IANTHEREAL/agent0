@@ -13,6 +13,7 @@ use crate::sql::analyzer::types::{
 };
 use crate::sql::analyzer::{AnalyzedQuery, Analyzer};
 use crate::sql::executor::core::catalog_prefetch::build_catalog_snapshot;
+use crate::sql::executor::core::view_rewrite::expand_views_in_query;
 use crate::sql::executor::core::Executor;
 use crate::sql::expr::typed_eval::eval_typed_expr;
 use crate::sql::operators::{
@@ -60,6 +61,13 @@ impl Executor {
         query: &Query,
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
+        // Pre-analysis rewrite: expand views into derived subqueries.
+        //
+        // Ensures the Analyzer and planner see a single query tree, and the
+        // executor never needs runtime view expansion in table loading.
+        let expanded_query =
+            expand_views_in_query(self.store().as_ref(), txn, db_id, search_path, query).await?;
+
         // Build CatalogSnapshot (async: fetches table schemas from store).
         let catalog = build_catalog_snapshot(
             self.store().as_ref(),
@@ -67,7 +75,7 @@ impl Executor {
             db_id,
             search_path,
             self.tenant_keyspace(),
-            query,
+            &expanded_query,
             ctes,
         )
         .await?;
@@ -75,11 +83,12 @@ impl Executor {
         // Run the Analyzer (sync: name resolution + type checking).
         let mut analyzer = Analyzer::new(&catalog);
         let analyzed = analyzer
-            .analyze_query(query)
+            .analyze_query(&expanded_query)
             .map_err(|e| anyhow::anyhow!("{}", e))?;
 
         // Single-point routing gate: ALL capability / routing decisions are made here.
-        let plan = plan_query(&analyzed, &query.locks).map_err(|e| anyhow::anyhow!("{}", e))?;
+        let plan =
+            plan_query(&analyzed, &expanded_query.locks).map_err(|e| anyhow::anyhow!("{}", e))?;
         tracing::debug!(target: "pipeline", "{}", plan.trace_summary());
 
         // Execute through the analyzed path, driven by the plan.
@@ -90,14 +99,14 @@ impl Executor {
                 sequence_values,
                 search_path,
                 &analyzed,
-                &query.locks,
+                &expanded_query.locks,
                 ctes,
                 &plan,
             )
             .await?;
 
         // SELECT INTO post-processing: create table from result.
-        if let SetExpr::Select(select) = &*query.body {
+        if let SetExpr::Select(select) = &*expanded_query.body {
             if let Some(ref into) = select.into {
                 return self
                     .create_table_from_result(txn, db_id, search_path, &into.name, result)
