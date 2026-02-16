@@ -1,6 +1,5 @@
 //! Expression evaluation logic
 
-mod boolean;
 pub mod bridge;
 pub mod compile;
 pub mod functions;
@@ -10,12 +9,6 @@ pub mod static_eval;
 pub mod typed_eval;
 pub mod typed_fold;
 pub mod typed_rewrite;
-
-pub(crate) use boolean::validate_bool_expr_in_boolean_context;
-
-pub(crate) fn parse_bool_pg(s: &str) -> Option<bool> {
-    operators::parse_bool_pg(s)
-}
 
 use crate::sql::error::SqlError;
 use crate::types::Value;
