@@ -8,6 +8,8 @@ use pgtikv_admin::cli_common::{
 };
 use serde_json::Value;
 
+mod repl;
+
 const DEFAULT_API_URL: &str = "https://db9.shared.aws.tidbcloud.com/api";
 
 // ── Output format enum ──────────────────────────────────────────
@@ -354,10 +356,9 @@ fn save_token(token: &str) -> Result<(), String> {
     let existing = std::fs::read_to_string(&cred_path).unwrap_or_default();
     let mut parsed: toml::Table = existing.parse().unwrap_or_default();
     parsed.insert("token".to_string(), toml::Value::String(token.to_string()));
-    let content = toml::to_string(&parsed)
-        .map_err(|e| format!("Failed to serialize credentials: {e}"))?;
-    std::fs::write(&cred_path, &content)
-        .map_err(|e| format!("Failed to save credentials: {e}"))?;
+    let content =
+        toml::to_string(&parsed).map_err(|e| format!("Failed to serialize credentials: {e}"))?;
+    std::fs::write(&cred_path, &content).map_err(|e| format!("Failed to save credentials: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -378,8 +379,8 @@ fn save_anonymous_flag(is_anonymous: bool) -> Result<(), String> {
     } else {
         parsed.remove("is_anonymous");
     }
-    let content = toml::to_string(&parsed)
-        .map_err(|e| format!("Failed to serialize credentials: {e}"))?;
+    let content =
+        toml::to_string(&parsed).map_err(|e| format!("Failed to serialize credentials: {e}"))?;
     std::fs::write(&cred_path, content).map_err(|e| format!("Failed to save credentials: {e}"))?;
     Ok(())
 }
@@ -397,8 +398,8 @@ fn save_anonymous_credentials(anonymous_id: &str, anonymous_secret: &str) -> Res
         "anonymous_secret".to_string(),
         toml::Value::String(anonymous_secret.to_string()),
     );
-    let content = toml::to_string(&parsed)
-        .map_err(|e| format!("Failed to serialize credentials: {e}"))?;
+    let content =
+        toml::to_string(&parsed).map_err(|e| format!("Failed to serialize credentials: {e}"))?;
     std::fs::write(&cred_path, content).map_err(|e| format!("Failed to save credentials: {e}"))?;
     Ok(())
 }
@@ -413,8 +414,8 @@ fn clear_anonymous_credentials() -> Result<(), String> {
     parsed.remove("anonymous_id");
     parsed.remove("anonymous_secret");
     parsed.remove("is_anonymous");
-    let content = toml::to_string(&parsed)
-        .map_err(|e| format!("Failed to serialize credentials: {e}"))?;
+    let content =
+        toml::to_string(&parsed).map_err(|e| format!("Failed to serialize credentials: {e}"))?;
     std::fs::write(&cred_path, content).map_err(|e| format!("Failed to save credentials: {e}"))?;
     Ok(())
 }
@@ -510,9 +511,10 @@ async fn main() {
         Commands::Claim => cmd_claim(&api, &cli.effective_output()).await,
         Commands::Logout => cmd_logout(),
         Commands::Init => cmd_init(&api, &cli.effective_output()).await,
-        Commands::Sh { ref id, ref command } => {
-            cmd_sh(&api, &cli.api_url, id.as_deref(), command.as_deref()).await
-        }
+        Commands::Sh {
+            ref id,
+            ref command,
+        } => cmd_sh(&api, &cli.api_url, id.as_deref(), command.as_deref()).await,
         Commands::Completion { shell } => cmd_completion(shell),
         Commands::Db { ref action } => match action {
             DbAction::Create { name, region } => {
@@ -521,8 +523,8 @@ async fn main() {
             DbAction::List => cmd_db_list(&api, &cli.effective_output()).await,
             DbAction::Status { id } => cmd_db_status(&api, &cli.effective_output(), id).await,
             DbAction::Delete { id, yes } => {
-                    cmd_db_delete(&api, &cli.effective_output(), id, *yes).await
-                }
+                cmd_db_delete(&api, &cli.effective_output(), id, *yes).await
+            }
             DbAction::ResetPassword { id } => {
                 cmd_db_reset_password(&api, &cli.effective_output(), id).await
             }
@@ -549,8 +551,14 @@ async fn main() {
                 }
             },
             DbAction::Sql { id, query, file } => {
-                cmd_db_sql(&api, &cli.effective_output(), id, query.as_deref(), file.as_deref())
-                    .await
+                cmd_db_sql(
+                    &api,
+                    &cli.effective_output(),
+                    id,
+                    query.as_deref(),
+                    file.as_deref(),
+                )
+                .await
             }
             DbAction::Users { id, action } => match action {
                 UserAction::List => cmd_db_users_list(&api, &cli.effective_output(), id).await,
@@ -569,8 +577,14 @@ async fn main() {
                 ddl_only,
                 output_file,
             } => {
-                cmd_db_dump(&api, &cli.effective_output(), id, *ddl_only, output_file.as_deref())
-                    .await
+                cmd_db_dump(
+                    &api,
+                    &cli.effective_output(),
+                    id,
+                    *ddl_only,
+                    output_file.as_deref(),
+                )
+                .await
             }
             DbAction::Branch { action } => match action {
                 BranchAction::Create { id, name } => {
@@ -593,9 +607,7 @@ async fn main() {
             MigrationAction::New { name, dir } => {
                 cmd_migration_new(name, dir, &cli.effective_output())
             }
-            MigrationAction::List { dir } => {
-                cmd_migration_list(dir, &cli.effective_output())
-            }
+            MigrationAction::List { dir } => cmd_migration_list(dir, &cli.effective_output()),
             MigrationAction::Up { id, dir } => {
                 cmd_migration_up(&api, id, dir, &cli.effective_output()).await
             }
@@ -1299,116 +1311,6 @@ async fn execute_sql(api: &ApiClient, id: &str, sql: &str) -> Value {
     .await
 }
 
-fn print_sql_result(data: &Value, output: &OutputFormat) {
-    if matches!(output, OutputFormat::Json) {
-        print_json(data);
-        return;
-    }
-
-    let columns = match data["columns"].as_array() {
-        Some(cols) if !cols.is_empty() => cols,
-        _ => {
-            println!("{}", data["command"].as_str().unwrap_or("OK"));
-            return;
-        }
-    };
-    let rows = data["rows"].as_array().map(|r| r.as_slice()).unwrap_or(&[]);
-
-    match output {
-        OutputFormat::Csv => {
-            let header: Vec<&str> = columns
-                .iter()
-                .filter_map(|c| c["name"].as_str())
-                .collect();
-            println!("{}", header.join(","));
-            for row in rows {
-                if let Some(vals) = row.as_array() {
-                    let line: Vec<String> = vals
-                        .iter()
-                        .map(|v| match v {
-                            Value::Null => "".to_string(),
-                            Value::String(s) => {
-                                if s.contains(',') || s.contains('"') || s.contains('\n') {
-                                    format!("\"{}\"", s.replace('"', "\"\""))
-                                } else {
-                                    s.clone()
-                                }
-                            }
-                            other => other.to_string(),
-                        })
-                        .collect();
-                    println!("{}", line.join(","));
-                }
-            }
-        }
-        _ => {
-            let col_names: Vec<String> = columns
-                .iter()
-                .map(|c| c["name"].as_str().unwrap_or("?").to_string())
-                .collect();
-
-            let widths: Vec<usize> = col_names
-                .iter()
-                .enumerate()
-                .map(|(i, name)| {
-                    let max_val = rows
-                        .iter()
-                        .map(|row| {
-                            row.as_array()
-                                .and_then(|arr| arr.get(i))
-                                .map(|v| match v {
-                                    Value::Null => 4,
-                                    Value::String(s) => s.len(),
-                                    other => other.to_string().len(),
-                                })
-                                .unwrap_or(0)
-                        })
-                        .max()
-                        .unwrap_or(0);
-                    name.len().max(max_val).max(4)
-                })
-                .collect();
-
-            let header: String = col_names
-                .iter()
-                .zip(&widths)
-                .map(|(name, w)| format!("{:<width$}", name, width = w))
-                .collect::<Vec<_>>()
-                .join("  ");
-            println!("{header}");
-
-            let sep: String = widths
-                .iter()
-                .map(|w| "─".repeat(*w))
-                .collect::<Vec<_>>()
-                .join("  ");
-            println!("{sep}");
-
-            for row in rows {
-                if let Some(vals) = row.as_array() {
-                    let line: String = vals
-                        .iter()
-                        .enumerate()
-                        .map(|(i, v)| {
-                            let w = widths.get(i).copied().unwrap_or(4);
-                            let s = match v {
-                                Value::Null => "NULL".to_string(),
-                                Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            };
-                            format!("{:<width$}", s, width = w)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("  ");
-                    println!("{line}");
-                }
-            }
-            let n = rows.len();
-            println!("({} {})", n, if n == 1 { "row" } else { "rows" });
-        }
-    }
-}
-
 async fn cmd_db_inspect_schemas(api: &ApiClient, output: &OutputFormat, id: &str) {
     let data = execute_sql(
         api,
@@ -1419,7 +1321,7 @@ async fn cmd_db_inspect_schemas(api: &ApiClient, output: &OutputFormat, id: &str
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => print_sql_result(&data, output),
+        _ => repl::output::print_sql_result(&data, output),
     }
 }
 
@@ -1433,7 +1335,7 @@ async fn cmd_db_inspect_tables(api: &ApiClient, output: &OutputFormat, id: &str)
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => print_sql_result(&data, output),
+        _ => repl::output::print_sql_result(&data, output),
     }
 }
 
@@ -1447,7 +1349,7 @@ async fn cmd_db_inspect_indexes(api: &ApiClient, output: &OutputFormat, id: &str
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => print_sql_result(&data, output),
+        _ => repl::output::print_sql_result(&data, output),
     }
 }
 
@@ -1460,7 +1362,9 @@ async fn cmd_db_inspect_slow_queries(api: &ApiClient, output: &OutputFormat, id:
             samples.sort_by(|a, b| {
                 let a_p99 = a["latency_p99_ms"].as_f64().unwrap_or(0.0);
                 let b_p99 = b["latency_p99_ms"].as_f64().unwrap_or(0.0);
-                b_p99.partial_cmp(&a_p99).unwrap_or(std::cmp::Ordering::Equal)
+                b_p99
+                    .partial_cmp(&a_p99)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
             print_json(&Value::Array(samples));
         }
@@ -1469,7 +1373,9 @@ async fn cmd_db_inspect_slow_queries(api: &ApiClient, output: &OutputFormat, id:
             samples.sort_by(|a, b| {
                 let a_p99 = a["latency_p99_ms"].as_f64().unwrap_or(0.0);
                 let b_p99 = b["latency_p99_ms"].as_f64().unwrap_or(0.0);
-                b_p99.partial_cmp(&a_p99).unwrap_or(std::cmp::Ordering::Equal)
+                b_p99
+                    .partial_cmp(&a_p99)
+                    .unwrap_or(std::cmp::Ordering::Equal)
             });
 
             if samples.is_empty() {
@@ -1591,7 +1497,7 @@ async fn cmd_db_sql(
             process::exit(1);
         })
     } else if atty::is(atty::Stream::Stdin) {
-        return sql_repl(api, output, id).await;
+        return repl::run(api, output, id).await;
     } else {
         use std::io::Read;
         let mut buf = String::new();
@@ -1608,7 +1514,7 @@ async fn cmd_db_sql(
     }
 
     let data = execute_sql(api, id, &sql).await;
-    print_sql_result(&data, output);
+    repl::output::print_sql_result(&data, output);
 }
 
 async fn cmd_db_users_list(api: &ApiClient, output: &OutputFormat, id: &str) {
@@ -1712,7 +1618,7 @@ async fn cmd_db_seed(api: &ApiClient, output: &OutputFormat, id: &str, file: &st
     });
 
     let data = execute_sql(api, id, &content).await;
-    
+
     match output {
         OutputFormat::Json => print_json(&data),
         _ => {
@@ -1955,8 +1861,14 @@ fn pg_type_to_ts(pg_type: &str) -> &'static str {
         "real" | "double precision" | "float4" | "float8" | "numeric" | "decimal" => "number",
         "text" | "varchar" | "char" | "character varying" => "string",
         "boolean" | "bool" => "boolean",
-        "timestamp" | "timestamp without time zone" | "timestamp with time zone" | "timestamptz"
-        | "date" | "time" | "time without time zone" | "time with time zone" => "string",
+        "timestamp"
+        | "timestamp without time zone"
+        | "timestamp with time zone"
+        | "timestamptz"
+        | "date"
+        | "time"
+        | "time without time zone"
+        | "time with time zone" => "string",
         "json" | "jsonb" => "Record<string, unknown>",
         "uuid" => "string",
         "bytea" => "string",
@@ -1973,8 +1885,14 @@ fn pg_type_to_python(pg_type: &str) -> &'static str {
         "real" | "double precision" | "float4" | "float8" | "numeric" | "decimal" => "float",
         "text" | "varchar" | "char" | "character varying" => "str",
         "boolean" | "bool" => "bool",
-        "timestamp" | "timestamp without time zone" | "timestamp with time zone" | "timestamptz"
-        | "date" | "time" | "time without time zone" | "time with time zone" => "str",
+        "timestamp"
+        | "timestamp without time zone"
+        | "timestamp with time zone"
+        | "timestamptz"
+        | "date"
+        | "time"
+        | "time without time zone"
+        | "time with time zone" => "str",
         "json" | "jsonb" => "dict",
         "uuid" => "str",
         "bytea" => "bytes",
@@ -2384,193 +2302,6 @@ async fn cmd_migration_status(api: &ApiClient, id: &str, dir: &str, output: &Out
     }
 }
 
-// ── Interactive SQL REPL ────────────────────────────────────────
-
-async fn sql_repl(api: &ApiClient, output: &OutputFormat, id: &str) {
-    let token = require_token();
-    let headers = make_auth_headers(&token);
-    let db_info = api
-        .request(
-            "GET",
-            &format!("/customer/databases/{id}"),
-            None,
-            Some(&headers),
-        )
-        .await;
-    let db_name = db_info["name"].as_str().unwrap_or(id);
-
-    let prompt_main = format!("{}> ", db_name);
-    let prompt_cont = format!("{}-> ", " ".repeat(db_name.len().saturating_sub(1)));
-
-    eprintln!(
-        "db9 sql — connected to '{}' ({})",
-        db_name, id
-    );
-    eprintln!("Type \\? for help, \\q to quit.\n");
-
-    let stdin = io::stdin();
-    let mut buffer = String::new();
-    let mut show_timing = true;
-
-    loop {
-        if buffer.is_empty() {
-            eprint!("{}", prompt_main);
-        } else {
-            eprint!("{}", prompt_cont);
-        }
-        io::stderr().flush().ok();
-
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) => {
-                if !buffer.is_empty() {
-                    eprintln!();
-                }
-                break;
-            }
-            Err(e) => {
-                eprintln!("\nRead error: {e}");
-                break;
-            }
-            _ => {}
-        }
-
-        let trimmed = line.trim();
-
-        if trimmed.is_empty() {
-            if buffer.is_empty() {
-                continue;
-            }
-            buffer.push('\n');
-            continue;
-        }
-
-        if trimmed.starts_with('\\') {
-            buffer.clear();
-            let (cmd, arg) = match trimmed.find(char::is_whitespace) {
-                Some(pos) => (&trimmed[..pos], trimmed[pos..].trim()),
-                None => (trimmed, ""),
-            };
-            match cmd {
-                "\\q" | "\\quit" => break,
-                "\\?" | "\\help" => repl_help(),
-                "\\dt" => {
-                    repl_exec(
-                        api, output, id, show_timing,
-                        "SELECT table_schema, table_name FROM information_schema.tables \
-                         WHERE table_schema NOT IN ('pg_catalog','information_schema') \
-                         ORDER BY table_schema, table_name",
-                    ).await;
-                }
-                "\\dn" => {
-                    repl_exec(
-                        api, output, id, show_timing,
-                        "SELECT schema_name FROM information_schema.schemata \
-                         WHERE schema_name NOT IN ('pg_catalog','information_schema') \
-                         ORDER BY schema_name",
-                    ).await;
-                }
-                "\\di" => {
-                    repl_exec(
-                        api, output, id, show_timing,
-                        "SELECT schemaname, tablename, indexname FROM pg_indexes \
-                         WHERE schemaname NOT IN ('pg_catalog','information_schema') \
-                         ORDER BY schemaname, tablename, indexname",
-                    ).await;
-                }
-                "\\d" => {
-                    if arg.is_empty() {
-                        repl_exec(
-                            api, output, id, show_timing,
-                            "SELECT table_schema, table_name, table_type FROM information_schema.tables \
-                             WHERE table_schema NOT IN ('pg_catalog','information_schema') \
-                             ORDER BY table_schema, table_name",
-                        ).await;
-                    } else {
-                        let safe = arg.replace('\'', "''");
-                        repl_exec(
-                            api, output, id, show_timing,
-                            &format!(
-                                "SELECT column_name, data_type, is_nullable, column_default \
-                                 FROM information_schema.columns \
-                                 WHERE table_name = '{}' ORDER BY ordinal_position",
-                                safe
-                            ),
-                        ).await;
-                    }
-                }
-                "\\timing" => {
-                    show_timing = !show_timing;
-                    eprintln!("Timing is {}.", if show_timing { "on" } else { "off" });
-                }
-                _ => {
-                    eprintln!("Unknown command: {cmd}. Type \\? for help.");
-                }
-            }
-            continue;
-        }
-
-        if buffer.is_empty()
-            && (trimmed.eq_ignore_ascii_case("exit") || trimmed.eq_ignore_ascii_case("quit"))
-        {
-            break;
-        }
-
-        if !buffer.is_empty() {
-            buffer.push('\n');
-        }
-        buffer.push_str(trimmed);
-
-        if trimmed.ends_with(';') {
-            repl_exec(api, output, id, show_timing, &buffer).await;
-            buffer.clear();
-        }
-    }
-
-    eprintln!("Bye!");
-}
-
-async fn repl_exec(api: &ApiClient, output: &OutputFormat, id: &str, timing: bool, sql: &str) {
-    let token = require_token();
-    let headers = make_auth_headers(&token);
-    let body = serde_json::json!({ "query": sql });
-
-    let start = std::time::Instant::now();
-    match api
-        .try_request(
-            "POST",
-            &format!("/customer/databases/{id}/sql"),
-            Some(&body),
-            Some(&headers),
-        )
-        .await
-    {
-        Ok(data) => {
-            print_sql_result(&data, output);
-            if timing {
-                eprintln!("Time: {:.3}s", start.elapsed().as_secs_f64());
-            }
-        }
-        Err((_status, detail)) => {
-            eprintln!("ERROR: {detail}");
-        }
-    }
-}
-
-fn repl_help() {
-    eprintln!("Meta-commands:");
-    eprintln!("  \\d [TABLE]    Describe table columns, or list all tables");
-    eprintln!("  \\dt           List tables");
-    eprintln!("  \\dn           List schemas");
-    eprintln!("  \\di           List indexes");
-    eprintln!("  \\timing       Toggle query timing");
-    eprintln!("  \\q            Quit");
-    eprintln!("  \\?            Show this help");
-    eprintln!();
-    eprintln!("Enter SQL terminated by semicolon (;) to execute.");
-    eprintln!("Multi-line input is supported.");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2732,7 +2463,10 @@ mod tests {
 
         let read_back = std::fs::read_to_string(&cred_path).unwrap();
         let re_parsed: toml::Table = read_back.parse().unwrap();
-        assert_eq!(re_parsed.get("token").and_then(|v| v.as_str()), Some("mytoken"));
+        assert_eq!(
+            re_parsed.get("token").and_then(|v| v.as_str()),
+            Some("mytoken")
+        );
         assert_eq!(
             re_parsed.get("is_anonymous").and_then(|v| v.as_bool()),
             Some(true)
@@ -2757,7 +2491,10 @@ mod tests {
 
         let read_back = std::fs::read_to_string(&cred_path).unwrap();
         let re_parsed: toml::Table = read_back.parse().unwrap();
-        assert_eq!(re_parsed.get("token").and_then(|v| v.as_str()), Some("mytoken"));
+        assert_eq!(
+            re_parsed.get("token").and_then(|v| v.as_str()),
+            Some("mytoken")
+        );
         assert!(re_parsed.get("is_anonymous").is_none());
 
         std::fs::remove_dir_all(&temp_dir).ok();
