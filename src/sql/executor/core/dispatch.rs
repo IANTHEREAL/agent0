@@ -404,6 +404,21 @@ impl Executor {
                     });
                     return res.map(ExecuteResults::single);
                 }
+
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::Analyze)
+                ) {
+                    let start = Instant::now();
+                    let res = self.execute_analyze_cmd(session, sql_trimmed).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
+                    }
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
+                }
             }
 
                 // RESET <guc> / RESET ALL — handled directly from raw SQL, bypassing
