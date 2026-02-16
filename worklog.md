@@ -1,5 +1,155 @@
 # Worklog
 
+## 2026-02-16 — Issue #775: CREATE INDEX — enforce index name uniqueness within a schema
+
+### Problem
+tipg only checked index name uniqueness within a single table's `schema.indexes` vector, allowing two tables in the same schema to have indexes with the same name. This violates PostgreSQL's `pg_class` namespace rules.
+
+### Solution: Reservation Key (`sys_relname_`)
+
+**Storage layer** (`src/storage/encoding.rs`, `src/storage/tikv_store/tables.rs`):
+- Added `DB_SYS_RELNAME_PREFIX` (`sys_relname_`) + `encode_relname_key_v2(db_id, full_name)`
+- Added `reserve_relation_name()` — point-read check + write `b'I'` tag; TiKV write-write conflict prevents concurrent duplicates
+- Added `release_relation_name()` — delete key (no-op if missing)
+- Wired `release_relation_name` into `drop_table()` for all indexes + PK constraint
+
+**Namespace check helper** (`src/sql/ddl.rs`):
+- `check_relation_name_available()` — checks table, view, matview, sequence (point-reads), then reservation key (covers index/PK). Handles `IF NOT EXISTS` semantics.
+
+**CREATE INDEX** (`src/sql/ddl.rs`):
+- Replaced per-table `schema.indexes.any()` check with `check_relation_name_available()`
+
+**DROP INDEX** (`src/sql/ddl.rs`):
+- Added `release_relation_name()` after successful drop
+
+**ALTER INDEX RENAME** (`src/sql/executor/core/statement.rs`):
+- Replaced scan-based conflict check (iterating all tables) with `check_relation_name_available()`
+- Added `release_relation_name()` for old name after rename
+
+**Error variant** (`src/sql/error.rs`):
+- Added `DuplicateRelation(String)` → SQLSTATE `42P07`, message `relation "{0}" already exists`
+- Tests in `error.rs` and `protocol/handler/tests.rs`
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/storage/encoding.rs` | `DB_SYS_RELNAME_PREFIX` + `encode_relname_key_v2` |
+| `src/storage/tikv_store/tables.rs` | `reserve_relation_name`, `release_relation_name`, cleanup in `drop_table` |
+| `src/sql/error.rs` | `DuplicateRelation(String)` variant + SQLSTATE 42P07 |
+| `src/sql/ddl.rs` | `check_relation_name_available` helper, wire into CREATE/DROP INDEX |
+| `src/sql/executor/core/statement.rs` | ALTER INDEX RENAME → use helper |
+| `src/sql/executor/ddl.rs` | Comment on legacy Ambiguous path |
+| `src/protocol/handler/tests.rs` | DuplicateRelation downcast test |
+
+### Review fixes (v2)
+
+**Fix 1 — PK/unique constraint names now reserved at creation time:**
+- CREATE TABLE: reserve PK constraint name + all unique index names after `store.create_table()`
+- ALTER TABLE ADD PRIMARY KEY: `check_relation_name_available()` before setting `pk_constraint_name`
+- ALTER TABLE ADD UNIQUE: replaced per-table `indexes.any()` check with `check_relation_name_available()`
+- ALTER TABLE DROP CONSTRAINT (PK): release reservation key
+- ALTER TABLE DROP CONSTRAINT (unique): release reservation key
+
+**Fix 2 — Reservation key leak on failed backfill:**
+- The cleanup txn (for `has_committed_batches` failures) now also calls `release_relation_name()` alongside `delete_range()`, preventing permanent false 42P07 errors.
+
+**Fix 3 — SQL regression test added:**
+- `tests/224_index_namespace.sql` + `.expected`: cross-table duplicate rejected, IF NOT EXISTS, PK/table/view/sequence name conflicts, reuse after DROP
+
+### Review fixes (v3) — Full namespace checks for all CREATE TABLE paths
+
+**Fix 1 — CREATE TABLE: full namespace check for PK/unique names:**
+- Replaced raw `store.reserve_relation_name()` with `check_relation_name_available()` for both PK constraint and unique index names. Now checks against tables, views, matviews, sequences, and reservation keys — matching PostgreSQL's `pg_class` namespace.
+
+**Fix 2 — PK reservation in CREATE TABLE AS / SELECT INTO / CREATE MATERIALIZED VIEW:**
+- `create_table_from_query_result`: added `check_relation_name_available()` for auto-generated `{table}_pkey`
+- `create_table_from_select_into`: same
+- `execute_create_materialized_view`: same (uses `resolved.schema` directly)
+
+**Fix 3 — ALTER TABLE RENAME CONSTRAINT (UNIQUE): reservation key maintenance:**
+- Added `check_relation_name_available()` for the new name (prevents renaming to a name that conflicts with existing relations)
+- Added `release_relation_name()` for the old name (frees it for reuse)
+- Changed error from `anyhow!("Constraint '{}' already exists")` to `SqlError::DuplicateRelation` for consistent 42P07 SQLSTATE
+
+**Fix 4 — Extended regression test (`tests/224_index_namespace.sql`):**
+- Test 10: PK constraint name vs existing view conflict → ERROR 42P07
+- Test 11: CREATE TABLE AS reserves its PK name → ERROR 42P07
+- Test 12: SELECT INTO reserves its PK name → ERROR 42P07
+- Test 13: RENAME CONSTRAINT (unique) frees old name + reserves new name
+
+### Review fixes (v4) — Legacy data gap + CI lint
+
+**Fix 1 — Legacy data bypass (High):**
+- `check_relation_name_available` only checked `sys_relname_` reservation keys (written since #775). Upgraded clusters with pre-existing indexes lack these keys, so CREATE INDEX could still create cross-table duplicates.
+- Added schema-wide scan (step 5) between point-read checks and reservation-key write: iterates `list_tables` + `get_schema` per table in namespace, checking `pk_constraint_name` and `indexes[].name`.
+- Same pattern as `execute_drop_index` (`src/sql/executor/ddl.rs:258-271`). DDL is cold path — O(N) cost acceptable.
+
+**Fix 2 — CI lint failure (Medium):**
+- Merged latest master into branch. CI failure was unformatted `fs9.rs` (new file on master after branch diverged). Applied `cargo fmt`.
+
+### Verification
+- `cargo check`: compiles (0 new warnings)
+- `cargo fmt --check`: clean
+- Commit: `09edd39`
+
+### Review fixes (v5) — Extract pure scan logic + unit tests
+
+**Context:** PR #777 review found that commit `6214b69` removed the legacy scan, leaving upgraded clusters unprotected. Also, the original scan (v4) missed the default PK name case (`pk_constraint_name = None` → `{table}_pkey`).
+
+**Fix 1 — Extracted `has_legacy_name_conflict()` (pure function):**
+- New `pub(crate) fn has_legacy_name_conflict()` in `src/sql/ddl.rs` — takes an iterator of `(&str, &TableSchema)`, returns `bool`.
+- Checks both index names and PK constraint names (effective: `pk_constraint_name.unwrap_or({table}_pkey)`), matching `constraint_name_exists` logic.
+- Separates I/O (TiKV reads) from logic (name conflict detection) for testability.
+
+**Fix 2 — Restored scan in `check_relation_name_available` (step 5):**
+- Collects `Vec<(String, TableSchema)>` from `list_tables` + `get_schema`, then calls `has_legacy_name_conflict`.
+- Vec allocation is negligible — DDL is cold path.
+
+**Fix 3 — 6 unit tests:**
+- `test_legacy_scan_detects_index_conflict`: index match → true
+- `test_legacy_scan_detects_explicit_pk`: explicit pk_constraint_name match → true
+- `test_legacy_scan_detects_default_pk`: None pk_constraint_name, effective `{table}_pkey` → true
+- `test_legacy_scan_ignores_other_schema`: different schema → false
+- `test_legacy_scan_no_conflict`: different name → false
+- `test_legacy_scan_multi_table`: found on first of two tables → true
+
+### Verification (v5)
+- `cargo check`: compiles (0 new warnings)
+- `cargo fmt --check`: clean
+- `cargo test legacy_scan`: 6/6 pass
+- `cargo test`: 1274 pass, 0 fail
+
+### Review fixes (v6) — Fix CI: self-conflict in CREATE TABLE legacy scan
+
+**Root cause:** The legacy scan (step 5) in `check_relation_name_available` scans all table schemas in the namespace. CREATE TABLE stores the schema (with `pk_constraint_name` set) BEFORE calling this function to reserve the PK name. The scan finds the just-created table's own PK → false self-conflict → `relation "X_pkey" already exists`.
+
+**Fix — `exclude_table` parameter:**
+- Added `exclude_table: Option<&str>` to both `has_legacy_name_conflict` and `check_relation_name_available`.
+- CREATE TABLE paths (5 call sites) pass `Some(&table_name)` to skip the just-created table.
+- All other callers (CREATE INDEX, ALTER TABLE) pass `None` — they check BEFORE schema update, so no self-conflict.
+
+**Updated call sites:**
+- `execute_create_table` (PK + unique indexes): `Some(&table_full_name)`
+- `create_table_from_query_result`: `Some(table_name)`
+- `create_table_from_select_into`: `Some(table_name)`
+- `execute_create_materialized_view`: `Some(&view_name)`
+- `execute_create_index`: `None`
+- ALTER TABLE ADD PK/UNIQUE: `None`
+- ALTER TABLE RENAME CONSTRAINT: `None`
+- ALTER INDEX RENAME (`statement.rs`): `None`
+
+**2 new unit tests:**
+- `test_legacy_scan_excludes_owning_table`: excluded table's PK → no conflict
+- `test_legacy_scan_exclude_does_not_suppress_other_table`: excluded t1 but conflict on t2 → still detected
+
+### Verification (v6)
+- `cargo check`: compiles (0 new warnings)
+- `cargo fmt --check`: clean
+- `cargo test legacy_scan`: 8/8 pass
+- `cargo test`: 1276 pass, 0 fail
+
+---
+
 ## 2026-02-16 — Legacy/Fallback/Misplaced Code Cleanup
 
 ### Phase 0: MD5 Duplicate Removal

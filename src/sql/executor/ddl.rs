@@ -270,6 +270,8 @@ impl Executor {
                 }
             }
 
+            // Within-schema Ambiguous case should be unreachable with
+            // schema-wide relation-name reservation; keep defensive handling.
             let table_name =
                 match pick_drop_index_target(explicit_schema, search_path, &matching_tables) {
                     Ok(table_name) => table_name,

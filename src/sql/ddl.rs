@@ -818,6 +818,34 @@ pub async fn execute_create_table(
     store.create_table(txn, db_id, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
 
+    // Reserve relation names for PK constraint and unique indexes so that
+    // CREATE INDEX cannot reuse these names in the same schema.
+    // Pass exclude_table to skip the just-created table in the legacy scan.
+    if let Some(pk_name) = &schema.pk_constraint_name {
+        check_relation_name_available(
+            store,
+            txn,
+            db_id,
+            &table_schema_name,
+            pk_name,
+            false,
+            Some(&table_full_name),
+        )
+        .await?;
+    }
+    for idx in &schema.indexes {
+        check_relation_name_available(
+            store,
+            txn,
+            db_id,
+            &table_schema_name,
+            &idx.name,
+            false,
+            Some(&table_full_name),
+        )
+        .await?;
+    }
+
     Ok(ExecuteResult::CreateTable {
         table_name: table_full_name,
     })
@@ -908,6 +936,20 @@ pub async fn create_table_from_query_result(
     store.create_table(txn, db_id, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
 
+    let table_schema_name = table_name.splitn(2, '.').next().unwrap_or("public");
+    if let Some(pk_name) = &schema.pk_constraint_name {
+        check_relation_name_available(
+            store,
+            txn,
+            db_id,
+            table_schema_name,
+            pk_name,
+            false,
+            Some(table_name),
+        )
+        .await?;
+    }
+
     let row_count = result_rows.len();
     for (i, row) in result_rows.into_iter().enumerate() {
         let mut values = vec![Value::Int64((i + 1) as i64)];
@@ -985,6 +1027,20 @@ pub async fn create_table_from_select_into(
     store.create_table(txn, db_id, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
 
+    let table_schema_name = table_name.splitn(2, '.').next().unwrap_or("public");
+    if let Some(pk_name) = &schema.pk_constraint_name {
+        check_relation_name_available(
+            store,
+            txn,
+            db_id,
+            table_schema_name,
+            pk_name,
+            false,
+            Some(table_name),
+        )
+        .await?;
+    }
+
     let row_count = result_rows.len();
     for (i, row) in result_rows.into_iter().enumerate() {
         let mut values = vec![Value::Int64((i + 1) as i64)];
@@ -999,6 +1055,154 @@ pub async fn create_table_from_select_into(
     Ok(ExecuteResult::Insert {
         affected_rows: row_count as u64,
     })
+}
+
+/// Returns `true` if any table schema in the given namespace contains
+/// an index or PK constraint named `name`.
+///
+/// This is the legacy-safe fallback for clusters upgraded before
+/// `sys_relname_` reservation-key enforcement (issue #775).
+/// The effective PK name logic mirrors `constraint_name_exists`:
+/// `pk_constraint_name.unwrap_or(<table>_pkey)`.
+///
+/// `exclude_table` skips a specific table (used by CREATE TABLE to avoid
+/// matching the table that was just created in the same transaction).
+pub(crate) fn has_legacy_name_conflict<'a>(
+    table_schemas: impl Iterator<Item = (&'a str, &'a TableSchema)>,
+    schema_name: &str,
+    name: &str,
+    exclude_table: Option<&str>,
+) -> bool {
+    let schema_prefix = format!("{}.", schema_name);
+    for (table_name, tbl_schema) in table_schemas {
+        if !table_name.starts_with(&schema_prefix) {
+            continue;
+        }
+        if exclude_table.is_some_and(|t| t == table_name) {
+            continue;
+        }
+        // PK check — effective name = pk_constraint_name or {short}_pkey
+        if !tbl_schema.pk_indices.is_empty() {
+            let short = table_name.splitn(2, '.').nth(1).unwrap_or(table_name);
+            let default_pk;
+            let pk_name = match tbl_schema.pk_constraint_name.as_deref() {
+                Some(n) => n,
+                None => {
+                    default_pk = format!("{}_pkey", short);
+                    &default_pk
+                }
+            };
+            if pk_name == name {
+                return true;
+            }
+        }
+        // Index check
+        if tbl_schema.indexes.iter().any(|idx| idx.name == name) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check whether a relation name is available in the schema-wide namespace.
+///
+/// PostgreSQL requires all relation names (tables, views, matviews, sequences,
+/// indexes, PK constraints) to be unique within a schema.  This helper performs
+/// point-read checks against tables, views, matviews, and sequences, then
+/// attempts a reservation-key write for the index/PK namespace.
+///
+/// Returns `Ok(true)` if the name is available (and the reservation key was
+/// written).  Returns `Ok(false)` when `if_not_exists` is true and the name
+/// is already taken (caller should return silently).  Returns an error with
+/// `SqlError::DuplicateRelation` when the name is taken and `if_not_exists`
+/// is false.
+pub async fn check_relation_name_available(
+    store: &Arc<TikvStore>,
+    txn: &mut Transaction,
+    db_id: u64,
+    schema_name: &str,
+    name: &str,
+    if_not_exists: bool,
+    exclude_table: Option<&str>,
+) -> Result<bool> {
+    let full_name = format!("{}.{}", schema_name, name);
+
+    // 1. Table
+    if store.table_exists(txn, db_id, &full_name).await? {
+        if if_not_exists {
+            return Ok(false);
+        }
+        return Err(SqlError::DuplicateRelation(name.to_string()).into());
+    }
+
+    // 2. View
+    if store.get_view(txn, db_id, &full_name).await?.is_some() {
+        if if_not_exists {
+            return Ok(false);
+        }
+        return Err(SqlError::DuplicateRelation(name.to_string()).into());
+    }
+
+    // 3. Materialized view
+    if store
+        .get_materialized_view(txn, db_id, &full_name)
+        .await?
+        .is_some()
+    {
+        if if_not_exists {
+            return Ok(false);
+        }
+        return Err(SqlError::DuplicateRelation(name.to_string()).into());
+    }
+
+    // 4. Sequence
+    if store.get_sequence(txn, db_id, &full_name).await?.is_some() {
+        if if_not_exists {
+            return Ok(false);
+        }
+        return Err(SqlError::DuplicateRelation(name.to_string()).into());
+    }
+
+    // 5. Legacy-safe: scan all table schemas in this namespace for
+    //    indexes / PK constraints with the same name.  Covers data
+    //    created before sys_relname_ enforcement (issue #775).
+    let schema_prefix = format!("{}.", schema_name);
+    let mut table_schemas: Vec<(String, TableSchema)> = Vec::new();
+    for table_name in store.list_tables(txn, db_id).await? {
+        if !table_name.starts_with(&schema_prefix) {
+            continue;
+        }
+        if let Some(tbl_schema) = store.get_schema(txn, db_id, &table_name).await? {
+            table_schemas.push((table_name, tbl_schema));
+        }
+    }
+    if has_legacy_name_conflict(
+        table_schemas.iter().map(|(n, s)| (n.as_str(), s)),
+        schema_name,
+        name,
+        exclude_table,
+    ) {
+        if if_not_exists {
+            return Ok(false);
+        }
+        return Err(SqlError::DuplicateRelation(name.to_string()).into());
+    }
+
+    // 6. Reservation key — covers index-vs-index and index-vs-PK conflicts,
+    //    and simultaneously reserves the name via TiKV write-write detection.
+    match store.reserve_relation_name(txn, db_id, &full_name).await {
+        Ok(()) => Ok(true),
+        Err(e) => {
+            if if_not_exists
+                && e.downcast_ref::<SqlError>()
+                    .is_some_and(|se| matches!(se, SqlError::DuplicateRelation(_)))
+            {
+                Ok(false)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 pub async fn execute_create_index(
@@ -1022,13 +1226,24 @@ pub async fn execute_create_index(
         .await?
         .ok_or_else(|| SqlError::RelationNotFound(tbl_name.to_string()))?;
 
-    if schema.indexes.iter().any(|i| i.name == idx_name_str) {
-        if if_not_exists {
-            return Ok(ExecuteResult::CreateIndex {
-                index_name: idx_name_str,
-            });
-        }
-        return Err(anyhow!("Index exists"));
+    // Schema-wide namespace uniqueness check (tables, views, matviews,
+    // sequences, indexes, PK constraints). Also reserves the name via a
+    // transactional KV key for concurrency safety.
+    let owning_schema = tbl_name.splitn(2, '.').next().unwrap_or("public");
+    if !check_relation_name_available(
+        store,
+        txn,
+        db_id,
+        owning_schema,
+        &idx_name_str,
+        if_not_exists,
+        None,
+    )
+    .await?
+    {
+        return Ok(ExecuteResult::CreateIndex {
+            index_name: idx_name_str,
+        });
     }
 
     let method = using.map(|m| m.value.to_lowercase());
@@ -1266,11 +1481,16 @@ pub async fn execute_create_index(
         if has_committed_batches {
             // Backfill commits can succeed before schema update. On failure after that point,
             // remove committed entries so CREATE INDEX does not leave orphaned index KV data.
+            // Also release the reservation key to prevent permanent false 42P07.
             let _ = txn.rollback().await;
             let (start, end) = index_prefix_range(db_id, schema.table_id, index_id);
+            let idx_full_name = format!("{}.{}", owning_schema, idx_name_str);
             let cleanup_result: Result<()> = async {
                 let mut cleanup_txn = store.begin().await?;
                 delete_range(&mut cleanup_txn, start, end).await?;
+                store
+                    .release_relation_name(&mut cleanup_txn, db_id, &idx_full_name)
+                    .await?;
                 cleanup_txn.commit().await?;
                 Ok(())
             }
@@ -1466,6 +1686,18 @@ pub async fn execute_create_materialized_view(
     let row_count = rows.len();
     store.create_table(txn, db_id, schema.clone()).await?;
     create_implicit_sequences_for_schema(store, txn, db_id, &schema).await?;
+    if let Some(pk_name) = &schema.pk_constraint_name {
+        check_relation_name_available(
+            store,
+            txn,
+            db_id,
+            &resolved.schema,
+            pk_name,
+            false,
+            Some(&view_name),
+        )
+        .await?;
+    }
     for row in rows {
         store.insert(txn, db_id, &view_name, row).await?;
     }
@@ -1855,6 +2087,12 @@ pub async fn execute_drop_index(
             }
         }
         store.update_schema(txn, db_id, schema.clone()).await?;
+
+        // Release the reservation key for the dropped index name.
+        let owning_schema = _table_name.splitn(2, '.').next().unwrap_or("public");
+        let idx_full = format!("{}.{}", owning_schema, idx_name);
+        store.release_relation_name(txn, db_id, &idx_full).await?;
+
         return Ok(Some(idx_name.to_string()));
     }
     Ok(None)
@@ -1975,11 +2213,23 @@ pub async fn execute_alter_table(
                     }
                 }
                 schema.pk_indices = pk_indices;
-                schema.pk_constraint_name = Some(
-                    name.as_ref()
-                        .map(normalize_ident)
-                        .unwrap_or_else(|| format!("{}_pkey", table_object_name)),
-                );
+                let pk_constraint = name
+                    .as_ref()
+                    .map(normalize_ident)
+                    .unwrap_or_else(|| format!("{}_pkey", table_object_name));
+                // Reserve the PK constraint name in the schema-wide namespace.
+                let owning_schema = t.splitn(2, '.').next().unwrap_or("public");
+                check_relation_name_available(
+                    store,
+                    txn,
+                    db_id,
+                    owning_schema,
+                    &pk_constraint,
+                    false,
+                    None,
+                )
+                .await?;
+                schema.pk_constraint_name = Some(pk_constraint);
                 schema.version += 1;
                 store.update_schema(txn, db_id, schema).await?;
             }
@@ -2001,9 +2251,18 @@ pub async fn execute_alter_table(
                     format!("{}_{}_key", table_object_name, col_names.join("_"))
                 });
 
-                if schema.indexes.iter().any(|i| i.name == index_name) {
-                    return Err(anyhow!("Index exists"));
-                }
+                // Schema-wide namespace uniqueness check.
+                let owning_schema = t.splitn(2, '.').next().unwrap_or("public");
+                check_relation_name_available(
+                    store,
+                    txn,
+                    db_id,
+                    owning_schema,
+                    &index_name,
+                    false,
+                    None,
+                )
+                .await?;
 
                 let new_index = crate::types::IndexDef {
                     id: schema
@@ -2310,6 +2569,10 @@ pub async fn execute_alter_table(
                         }
                     }
                     schema.pk_indices.clear();
+                    // Release the PK constraint name reservation.
+                    let owning_schema = t.splitn(2, '.').next().unwrap_or("public");
+                    let pk_full = format!("{}.{}", owning_schema, constraint_name);
+                    store.release_relation_name(txn, db_id, &pk_full).await?;
                     schema.pk_constraint_name = None;
                     schema.version += 1;
                     store.update_schema(txn, db_id, schema).await?;
@@ -2361,6 +2624,11 @@ pub async fn execute_alter_table(
                 let (start, end) = index_prefix_range(db_id, schema.table_id, index.id);
                 delete_range(txn, start, end).await?;
                 schema.indexes.remove(pos);
+
+                // Release the constraint/index name reservation.
+                let owning_schema = t.splitn(2, '.').next().unwrap_or("public");
+                let idx_full = format!("{}.{}", owning_schema, constraint_name);
+                store.release_relation_name(txn, db_id, &idx_full).await?;
 
                 if index.columns.len() == 1 {
                     let col_name = &index.columns[0];
@@ -2550,7 +2818,7 @@ pub async fn execute_alter_table(
             let new = normalize_ident(new_name);
 
             if constraint_name_exists(&schema, &table_object_name, &new) {
-                return Err(anyhow!("Constraint '{}' already exists", new));
+                return Err(SqlError::DuplicateRelation(new.clone()).into());
             }
 
             if !schema.pk_indices.is_empty() {
@@ -2590,9 +2858,22 @@ pub async fn execute_alter_table(
                 .iter_mut()
                 .find(|idx| idx.name == old && idx.unique)
             {
+                let table_schema_name = t.splitn(2, '.').next().unwrap_or("public");
+                check_relation_name_available(
+                    store,
+                    txn,
+                    db_id,
+                    table_schema_name,
+                    &new,
+                    false,
+                    None,
+                )
+                .await?;
+                let old_full = format!("{}.{}", table_schema_name, old);
                 idx.name = new;
                 schema.version += 1;
                 store.update_schema(txn, db_id, schema).await?;
+                store.release_relation_name(txn, db_id, &old_full).await?;
                 return Ok(ExecuteResult::AlterTable {
                     table_name: result_table_name,
                 });
@@ -2866,5 +3147,130 @@ mod tests {
     fn rewrite_check_expr_column_respects_quote_style() {
         let out = rewrite_check_expr_column("age > 0", "age", "Years", Some('"')).unwrap();
         assert!(out.contains("\"Years\""));
+    }
+
+    // --- has_legacy_name_conflict tests ---
+
+    fn test_index(name: &str) -> IndexDef {
+        IndexDef {
+            name: name.to_string(),
+            id: 1,
+            columns: vec!["col1".to_string()],
+            unique: false,
+            method: None,
+            predicate: None,
+            expressions: vec![],
+        }
+    }
+
+    fn test_schema_with_index(table_name: &str, idx_name: &str) -> (String, TableSchema) {
+        let mut schema = TableSchema::new(table_name.to_string(), 1, vec![], vec![]);
+        schema.indexes.push(test_index(idx_name));
+        (table_name.to_string(), schema)
+    }
+
+    fn test_schema_with_pk(table_name: &str, pk_name: Option<&str>) -> (String, TableSchema) {
+        let mut schema = TableSchema::new(table_name.to_string(), 1, vec![], vec![0]);
+        schema.pk_constraint_name = pk_name.map(|n| n.to_string());
+        (table_name.to_string(), schema)
+    }
+
+    #[test]
+    fn test_legacy_scan_detects_index_conflict() {
+        let schemas = vec![test_schema_with_index("public.t1", "idx_shared")];
+        assert!(has_legacy_name_conflict(
+            schemas.iter().map(|(n, s)| (n.as_str(), s)),
+            "public",
+            "idx_shared",
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_legacy_scan_detects_explicit_pk() {
+        let schemas = vec![test_schema_with_pk("public.t1", Some("my_pk"))];
+        assert!(has_legacy_name_conflict(
+            schemas.iter().map(|(n, s)| (n.as_str(), s)),
+            "public",
+            "my_pk",
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_legacy_scan_detects_default_pk() {
+        // pk_constraint_name = None, pk_indices = [0] → effective name = "t1_pkey"
+        let schemas = vec![test_schema_with_pk("public.t1", None)];
+        assert!(has_legacy_name_conflict(
+            schemas.iter().map(|(n, s)| (n.as_str(), s)),
+            "public",
+            "t1_pkey",
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_legacy_scan_ignores_other_schema() {
+        let schemas = vec![test_schema_with_index("other.t1", "idx_shared")];
+        assert!(!has_legacy_name_conflict(
+            schemas.iter().map(|(n, s)| (n.as_str(), s)),
+            "public",
+            "idx_shared",
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_legacy_scan_no_conflict() {
+        let schemas = vec![test_schema_with_index("public.t1", "idx_a")];
+        assert!(!has_legacy_name_conflict(
+            schemas.iter().map(|(n, s)| (n.as_str(), s)),
+            "public",
+            "idx_b",
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_legacy_scan_multi_table() {
+        let schemas = vec![
+            test_schema_with_index("public.t1", "idx_shared"),
+            test_schema_with_index("public.t2", "idx_other"),
+        ];
+        assert!(has_legacy_name_conflict(
+            schemas.iter().map(|(n, s)| (n.as_str(), s)),
+            "public",
+            "idx_shared",
+            None,
+        ));
+    }
+
+    #[test]
+    fn test_legacy_scan_excludes_owning_table() {
+        // When exclude_table matches, the table's own PK should not trigger a conflict.
+        // This is the CREATE TABLE scenario: the table was just created with its PK,
+        // and the legacy scan must skip it to avoid a false self-conflict.
+        let schemas = vec![test_schema_with_pk("public.t1", Some("t1_pkey"))];
+        assert!(!has_legacy_name_conflict(
+            schemas.iter().map(|(n, s)| (n.as_str(), s)),
+            "public",
+            "t1_pkey",
+            Some("public.t1"),
+        ));
+    }
+
+    #[test]
+    fn test_legacy_scan_exclude_does_not_suppress_other_table() {
+        // Excluding t1 should NOT suppress a conflict found on t2.
+        let schemas = vec![
+            test_schema_with_index("public.t1", "idx_shared"),
+            test_schema_with_index("public.t2", "idx_shared"),
+        ];
+        assert!(has_legacy_name_conflict(
+            schemas.iter().map(|(n, s)| (n.as_str(), s)),
+            "public",
+            "idx_shared",
+            Some("public.t1"),
+        ));
     }
 }

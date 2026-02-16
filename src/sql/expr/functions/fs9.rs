@@ -57,7 +57,8 @@ pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
 }
 
 fn ensure_permissions() -> Result<()> {
-    if !crate::extensions::context::allow_local_fs() || !crate::extensions::context::is_superuser() {
+    if !crate::extensions::context::allow_local_fs() || !crate::extensions::context::is_superuser()
+    {
         return Err(anyhow!("fs9: permission denied (superuser required)"));
     }
     Ok(())
@@ -79,7 +80,11 @@ fn expect_text_arg(name: &str, arg: Value, position: usize) -> Result<Option<Str
 pub fn fs9_read(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
 
-    let path = match expect_text_arg("fs9_read", args.into_iter().next().unwrap_or(Value::Null), 1)? {
+    let path = match expect_text_arg(
+        "fs9_read",
+        args.into_iter().next().unwrap_or(Value::Null),
+        1,
+    )? {
         Some(path) => path,
         None => return Ok(Value::Null),
     };
@@ -149,7 +154,11 @@ pub fn fs9_write(args: Vec<Value>) -> Result<Value> {
 pub fn fs9_exists(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
 
-    let path = match expect_text_arg("fs9_exists", args.into_iter().next().unwrap_or(Value::Null), 1)? {
+    let path = match expect_text_arg(
+        "fs9_exists",
+        args.into_iter().next().unwrap_or(Value::Null),
+        1,
+    )? {
         Some(path) => path,
         None => return Ok(Value::Null),
     };
@@ -160,7 +169,11 @@ pub fn fs9_exists(args: Vec<Value>) -> Result<Value> {
 pub fn fs9_size(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
 
-    let path = match expect_text_arg("fs9_size", args.into_iter().next().unwrap_or(Value::Null), 1)? {
+    let path = match expect_text_arg(
+        "fs9_size",
+        args.into_iter().next().unwrap_or(Value::Null),
+        1,
+    )? {
         Some(path) => path,
         None => return Ok(Value::Null),
     };
@@ -179,7 +192,11 @@ pub fn fs9_size(args: Vec<Value>) -> Result<Value> {
 pub fn fs9_mtime(args: Vec<Value>) -> Result<Value> {
     ensure_permissions()?;
 
-    let path = match expect_text_arg("fs9_mtime", args.into_iter().next().unwrap_or(Value::Null), 1)? {
+    let path = match expect_text_arg(
+        "fs9_mtime",
+        args.into_iter().next().unwrap_or(Value::Null),
+        1,
+    )? {
         Some(path) => path,
         None => return Ok(Value::Null),
     };
@@ -192,7 +209,9 @@ pub fn fs9_mtime(args: Vec<Value>) -> Result<Value> {
         Err(err) => return Err(anyhow!("fs9_mtime: {err}")),
     };
 
-    let modified = metadata.modified().map_err(|err| anyhow!("fs9_mtime: {err}"))?;
+    let modified = metadata
+        .modified()
+        .map_err(|err| anyhow!("fs9_mtime: {err}"))?;
     let mtime = DateTime::<Utc>::from(modified).to_rfc3339_opts(SecondsFormat::Secs, true);
     Ok(Value::Text(mtime))
 }
@@ -363,7 +382,9 @@ mod tests {
             .expect_err("missing should fail")
         })
         .await;
-        assert!(missing_err.to_string().contains("fs9_mtime: file not found"));
+        assert!(missing_err
+            .to_string()
+            .contains("fs9_mtime: file not found"));
 
         cleanup(&dir);
     }

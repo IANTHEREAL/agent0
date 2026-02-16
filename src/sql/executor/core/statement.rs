@@ -949,35 +949,18 @@ impl Executor {
         let table_name =
             found_table.ok_or_else(|| anyhow!("index \"{}\" does not exist", idx_name))?;
 
-        // Check for name conflict across all tables in the same schema (PostgreSQL
-        // requires index names to be unique within a namespace, not just a table).
-        let owning_schema = table_name.splitn(2, '.').next().unwrap_or("");
-        for t in &tables {
-            let t_schema = t.splitn(2, '.').next().unwrap_or("");
-            if t_schema != owning_schema {
-                continue;
-            }
-            let s = match self.store().get_schema(txn, db_id, t).await? {
-                Some(s) => s,
-                None => continue,
-            };
-            if s.indexes.iter().any(|i| i.name == new_idx_name) {
-                return Err(anyhow!("relation \"{}\" already exists", new_idx_name));
-            }
-            if !s.pk_indices.is_empty() {
-                let pk_name = s.pk_constraint_name.as_deref().unwrap_or("");
-                let short = s.name.rsplit('.').next().unwrap_or(&s.name);
-                let default_pk = format!("{}_pkey", short);
-                let effective_pk = if pk_name.is_empty() {
-                    &default_pk
-                } else {
-                    pk_name
-                };
-                if effective_pk == new_idx_name {
-                    return Err(anyhow!("relation \"{}\" already exists", new_idx_name));
-                }
-            }
-        }
+        // Schema-wide namespace uniqueness check for the new name.
+        let owning_schema = table_name.splitn(2, '.').next().unwrap_or("public");
+        ddl::check_relation_name_available(
+            &self.store(),
+            txn,
+            db_id,
+            owning_schema,
+            &new_idx_name,
+            false,
+            None,
+        )
+        .await?;
 
         let mut schema = self
             .store()
@@ -998,6 +981,12 @@ impl Executor {
 
         schema.version += 1;
         self.store().update_schema(txn, db_id, schema).await?;
+
+        // Release the old name's reservation key.
+        let old_full = format!("{}.{}", owning_schema, idx_name);
+        self.store()
+            .release_relation_name(txn, db_id, &old_full)
+            .await?;
 
         Ok(ExecuteResult::AlterIndex {
             index_name: new_idx_name,

@@ -240,6 +240,7 @@ fn test_sqlstate_for_executor_error() {
             "42501",
         ),
         (SqlError::FunctionNotFound("my_func".into()), "42883"),
+        (SqlError::DuplicateRelation("my_idx".into()), "42P07"),
     ];
 
     for (sql_err, expected_code) in cases {

@@ -53,6 +53,7 @@ const DB_SYS_SEQUENCEDEF_PREFIX: &[u8] = b"sys_seqdef_";
 const DB_SYS_EXTENSION_PREFIX: &[u8] = b"sys_ext_";
 const DB_SYS_EXTENSIONCFG_PREFIX: &[u8] = b"sys_extcfg_";
 const DB_SYS_COMMENT_PREFIX: &[u8] = b"sys_comment_";
+const DB_SYS_RELNAME_PREFIX: &[u8] = b"sys_relname_";
 const DB_SYS_SEQ_PREFIX: &[u8] = b"sys_seq_";
 const SYS_SCHEMA_PREFIX: &[u8] = b"_sys_schema_";
 const TABLE_DATA_PREFIX: &[u8] = b"t_";
@@ -246,6 +247,18 @@ pub fn encode_table_sequence_value_key_v2(db_id: u64, table_id: u64) -> Vec<u8> 
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_SEQ_PREFIX);
     key.extend_from_slice(&table_id.to_be_bytes());
+    key
+}
+
+/// Encode a relation-name reservation key (storage format v2, database-scoped).
+///
+/// Used to enforce schema-wide index name uniqueness via TiKV write-write
+/// conflict detection. The value stored is a single-byte tag (e.g. `b'I'`
+/// for index).
+pub fn encode_relname_key_v2(db_id: u64, full_name: &str) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_RELNAME_PREFIX);
+    key.extend_from_slice(full_name.as_bytes());
     key
 }
 

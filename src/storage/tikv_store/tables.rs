@@ -147,6 +147,38 @@ impl TikvStore {
         }
     }
 
+    /// Reserve a relation name in the schema-wide namespace.
+    ///
+    /// Writes a `sys_relname_{schema}.{name}` key with a single-byte tag.
+    /// If the key already exists the name is taken — returns
+    /// `Err(SqlError::DuplicateRelation)`.
+    pub async fn reserve_relation_name(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        full_name: &str,
+    ) -> Result<()> {
+        let key = self.key(&encode_relname_key_v2(db_id, full_name));
+        if txn.get(key.clone()).await?.is_some() {
+            let short_name = full_name.rsplit('.').next().unwrap_or(full_name);
+            return Err(SqlError::DuplicateRelation(short_name.to_string()).into());
+        }
+        txn_put(txn, key, vec![b'I']).await?;
+        Ok(())
+    }
+
+    /// Release a previously reserved relation name (no-op if missing).
+    pub async fn release_relation_name(
+        &self,
+        txn: &mut Transaction,
+        db_id: u64,
+        full_name: &str,
+    ) -> Result<()> {
+        let key = self.key(&encode_relname_key_v2(db_id, full_name));
+        txn_delete(txn, key).await?;
+        Ok(())
+    }
+
     /// Check if a table exists (using txn)
     pub async fn table_exists(
         &self,
@@ -231,6 +263,20 @@ impl TikvStore {
             if !has_table_id_sequence {
                 let seq_key = self.key(&encode_table_sequence_value_key_v2(db_id, table_id));
                 txn_delete(txn, seq_key).await?;
+            }
+
+            // Release relation-name reservation keys for indexes and PK
+            // so the names become available for reuse.
+            let schema_name = table_name.splitn(2, '.').next().unwrap_or("public");
+            for idx in &schema.indexes {
+                let idx_full = format!("{}.{}", schema_name, idx.name);
+                self.release_relation_name(txn, db_id, &idx_full).await?;
+            }
+            if let Some(pk_name) = &schema.pk_constraint_name {
+                if !pk_name.is_empty() {
+                    let pk_full = format!("{}.{}", schema_name, pk_name);
+                    self.release_relation_name(txn, db_id, &pk_full).await?;
+                }
             }
 
             // Comments are stored under name-keyed keys; ensure they do not resurrect after

@@ -82,6 +82,10 @@ pub enum SqlError {
         object_name: String,
     },
 
+    // Duplicate object
+    #[error("relation \"{0}\" already exists")]
+    DuplicateRelation(String),
+
     // Unsupported features
     #[error("{0}")]
     Unsupported(String),
@@ -111,6 +115,7 @@ impl SqlError {
             Self::LockNotAvailable { .. } => "55P03",
             Self::InFailedTransaction => "25P02",
             Self::PermissionDenied { .. } => "42501",
+            Self::DuplicateRelation(_) => "42P07",
             Self::Unsupported(_) => "0A000",
             Self::Internal(_) => "XX000",
         }
@@ -230,6 +235,10 @@ mod tests {
             .sqlstate(),
             "55P03"
         );
+        assert_eq!(
+            SqlError::DuplicateRelation("idx".into()).sqlstate(),
+            "42P07"
+        );
         assert_eq!(SqlError::Unsupported("x".into()).sqlstate(), "0A000");
         let internal = SqlError::Internal(anyhow::anyhow!("boom"));
         assert_eq!(internal.sqlstate(), "XX000");
@@ -261,6 +270,10 @@ mod tests {
             "invalid input syntax for type integer: \"abc\""
         );
         assert_eq!(SqlError::DivisionByZero.to_string(), "Division by zero");
+        assert_eq!(
+            SqlError::DuplicateRelation("my_idx".into()).to_string(),
+            "relation \"my_idx\" already exists"
+        );
     }
 
     #[test]
