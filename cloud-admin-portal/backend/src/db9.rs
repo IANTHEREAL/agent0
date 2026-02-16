@@ -9,6 +9,7 @@ use pgtikv_admin::cli_common::{
 use serde_json::Value;
 
 mod repl;
+use repl::ExpandedMode;
 
 const DEFAULT_API_URL: &str = "https://db9.shared.aws.tidbcloud.com/api";
 
@@ -1321,7 +1322,7 @@ async fn cmd_db_inspect_schemas(api: &ApiClient, output: &OutputFormat, id: &str
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => repl::output::print_sql_result(&data, output, false, &None),
+        _ => repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off),
     }
 }
 
@@ -1335,7 +1336,7 @@ async fn cmd_db_inspect_tables(api: &ApiClient, output: &OutputFormat, id: &str)
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => repl::output::print_sql_result(&data, output, false, &None),
+        _ => repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off),
     }
 }
 
@@ -1349,7 +1350,7 @@ async fn cmd_db_inspect_indexes(api: &ApiClient, output: &OutputFormat, id: &str
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => repl::output::print_sql_result(&data, output, false, &None),
+        _ => repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off),
     }
 }
 
@@ -1514,7 +1515,7 @@ async fn cmd_db_sql(
     }
 
     let data = execute_sql(api, id, &sql).await;
-    repl::output::print_sql_result(&data, output, false, &None);
+    repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off);
 }
 
 async fn cmd_db_users_list(api: &ApiClient, output: &OutputFormat, id: &str) {

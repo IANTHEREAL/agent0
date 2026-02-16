@@ -32,6 +32,7 @@ pub async fn repl_exec(
                 output,
                 repl_state.pager_enabled,
                 &repl_state.pager_command,
+                repl_state.expanded,
             );
             if timing {
                 eprintln!("Time: {:.3}s", start.elapsed().as_secs_f64());

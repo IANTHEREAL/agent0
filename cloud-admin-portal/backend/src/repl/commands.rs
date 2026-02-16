@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use crate::{make_auth_headers, require_token, OutputFormat};
 
-use super::{exec::repl_exec, ReplState};
+use super::{exec::repl_exec, ReplState, ExpandedMode};
 
 pub enum DispatchResult {
     Continue,
@@ -164,6 +164,10 @@ pub async fn dispatch(
             handle_pager_command(repl_state, arg);
             DispatchResult::Continue
         }
+        "\\x" => {
+            handle_expanded_command(repl_state, arg);
+            DispatchResult::Continue
+        }
         _ => {
             eprintln!("Unknown command: {cmd}. Type \\? for help.");
             DispatchResult::Continue
@@ -194,6 +198,32 @@ fn handle_pager_command(repl_state: &mut ReplState, arg: &str) {
     }
 }
 
+fn handle_expanded_command(repl_state: &mut ReplState, arg: &str) {
+    if arg.is_empty() {
+        repl_state.expanded = match repl_state.expanded {
+            ExpandedMode::Off => ExpandedMode::On,
+            ExpandedMode::On => ExpandedMode::Off,
+            ExpandedMode::Auto => ExpandedMode::Off,
+        };
+    } else if arg.eq_ignore_ascii_case("on") {
+        repl_state.expanded = ExpandedMode::On;
+    } else if arg.eq_ignore_ascii_case("off") {
+        repl_state.expanded = ExpandedMode::Off;
+    } else if arg.eq_ignore_ascii_case("auto") {
+        repl_state.expanded = ExpandedMode::Auto;
+    } else {
+        eprintln!("Invalid expanded mode: {}. Use 'on', 'off', or 'auto'.", arg);
+        return;
+    }
+
+    let status = match repl_state.expanded {
+        ExpandedMode::Off => "off",
+        ExpandedMode::On => "on",
+        ExpandedMode::Auto => "auto",
+    };
+    eprintln!("Expanded display is {}.", status);
+}
+
 fn repl_help() {
     eprintln!("Meta-commands:");
     eprintln!("  \\d [TABLE]    Describe table columns, or list all tables");
@@ -203,6 +233,7 @@ fn repl_help() {
     eprintln!("  \\refresh      Refresh SQL completion table cache");
     eprintln!("  \\timing       Toggle query timing");
     eprintln!("  \\pager [CMD]  Control paging (on/off/CMD)");
+    eprintln!("  \\x [MODE]     Toggle expanded display (on/off/auto)");
     eprintln!("  \\q            Quit");
     eprintln!("  \\?            Show this help");
     eprintln!();

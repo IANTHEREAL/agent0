@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+use super::ExpandedMode;
 use crate::OutputFormat;
 
 /// Pipe content to a pager process
@@ -46,6 +47,75 @@ fn get_pager_command() -> String {
     "less -RFX".to_string()
 }
 
+/// Get terminal width using crossterm
+fn get_terminal_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80)
+}
+
+/// Print SQL result in expanded (vertical) format
+pub fn print_sql_result_expanded(
+    data: &Value,
+    pager_enabled: bool,
+    pager_command: &Option<String>,
+) {
+    let columns = match data["columns"].as_array() {
+        Some(cols) if !cols.is_empty() => cols,
+        _ => {
+            println!("{}", data["command"].as_str().unwrap_or("OK"));
+            return;
+        }
+    };
+    let rows = data["rows"].as_array().map(|r| r.as_slice()).unwrap_or(&[]);
+
+    let col_names: Vec<String> = columns
+        .iter()
+        .map(|c| c["name"].as_str().unwrap_or("?").to_string())
+        .collect();
+
+    // Find max column name length for alignment
+    let max_col_len = col_names.iter().map(|n| n.len()).max().unwrap_or(0);
+
+    let mut output_buf = String::new();
+
+    for (record_num, row) in rows.iter().enumerate() {
+        if let Some(vals) = row.as_array() {
+            // Record separator
+            let sep_dashes = "─".repeat(max_col_len + 3);
+            output_buf.push_str(&format!("-[ RECORD {} ]{}\n", record_num + 1, sep_dashes));
+
+            // Key-value pairs
+            for (i, col_name) in col_names.iter().enumerate() {
+                let val_str = vals
+                    .get(i)
+                    .map(|v| match v {
+                        Value::Null => "(null)".to_string(),
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_else(|| "(null)".to_string());
+
+                output_buf.push_str(&format!(
+                    "{:<width$} | {}\n",
+                    col_name,
+                    val_str,
+                    width = max_col_len
+                ));
+            }
+        }
+    }
+
+    let n = rows.len();
+    output_buf.push_str(&format!(
+        "({} {})\n",
+        n,
+        if n == 1 { "row" } else { "rows" }
+    ));
+
+    print_with_pager(&output_buf, pager_enabled, pager_command);
+}
+
 /// Print content with optional paging
 pub fn print_with_pager(content: &str, pager_enabled: bool, pager_command: &Option<String>) {
     if !pager_enabled {
@@ -78,6 +148,7 @@ pub fn print_sql_result(
     output: &OutputFormat,
     pager_enabled: bool,
     pager_command: &Option<String>,
+    expanded: ExpandedMode,
 ) {
     if matches!(output, OutputFormat::Json) {
         print_json(data);
@@ -95,7 +166,6 @@ pub fn print_sql_result(
 
     match output {
         OutputFormat::Csv => {
-            // CSV format: do not page
             let header: Vec<&str> = columns.iter().filter_map(|c| c["name"].as_str()).collect();
             println!("{}", header.join(","));
             for row in rows {
@@ -119,81 +189,191 @@ pub fn print_sql_result(
             }
         }
         _ => {
-            // Table format: collect output and page if needed
             let col_names: Vec<String> = columns
                 .iter()
                 .map(|c| c["name"].as_str().unwrap_or("?").to_string())
                 .collect();
 
-            let widths: Vec<usize> = col_names
-                .iter()
-                .enumerate()
-                .map(|(i, name)| {
-                    let max_val = rows
-                        .iter()
-                        .map(|row| {
-                            row.as_array()
-                                .and_then(|arr| arr.get(i))
-                                .map(|v| match v {
-                                    Value::Null => 4,
-                                    Value::String(s) => s.len(),
-                                    other => other.to_string().len(),
-                                })
-                                .unwrap_or(0)
-                        })
-                        .max()
-                        .unwrap_or(0);
-                    name.len().max(max_val).max(4)
-                })
-                .collect();
-
-            let mut output_buf = String::new();
-
-            let header: String = col_names
-                .iter()
-                .zip(&widths)
-                .map(|(name, w)| format!("{:<width$}", name, width = w))
-                .collect::<Vec<_>>()
-                .join("  ");
-            output_buf.push_str(&header);
-            output_buf.push('\n');
-
-            let sep: String = widths
-                .iter()
-                .map(|w| "─".repeat(*w))
-                .collect::<Vec<_>>()
-                .join("  ");
-            output_buf.push_str(&sep);
-            output_buf.push('\n');
-
-            for row in rows {
-                if let Some(vals) = row.as_array() {
-                    let line: String = vals
+            let use_expanded = match expanded {
+                ExpandedMode::On => true,
+                ExpandedMode::Off => false,
+                ExpandedMode::Auto => {
+                    let widths: Vec<usize> = col_names
                         .iter()
                         .enumerate()
-                        .map(|(i, v)| {
-                            let w = widths.get(i).copied().unwrap_or(4);
-                            let s = match v {
-                                Value::Null => "NULL".to_string(),
-                                Value::String(s) => s.clone(),
-                                other => other.to_string(),
-                            };
-                            format!("{:<width$}", s, width = w)
+                        .map(|(i, name)| {
+                            let max_val = rows
+                                .iter()
+                                .map(|row| {
+                                    row.as_array()
+                                        .and_then(|arr| arr.get(i))
+                                        .map(|v| match v {
+                                            Value::Null => 4,
+                                            Value::String(s) => s.len(),
+                                            other => other.to_string().len(),
+                                        })
+                                        .unwrap_or(0)
+                                })
+                                .max()
+                                .unwrap_or(0);
+                            name.len().max(max_val).max(4)
                         })
-                        .collect::<Vec<_>>()
-                        .join("  ");
-                    output_buf.push_str(&line);
-                    output_buf.push('\n');
+                        .collect();
+                    let total_width: usize = widths.iter().sum::<usize>() + (widths.len() - 1) * 2;
+                    total_width > get_terminal_width()
                 }
-            }
-            let n = rows.len();
-            output_buf.push_str(&format!(
-                "({} {})\n",
-                n,
-                if n == 1 { "row" } else { "rows" }
-            ));
+            };
 
-            print_with_pager(&output_buf, pager_enabled, pager_command);
+            if use_expanded {
+                print_sql_result_expanded(data, pager_enabled, pager_command);
+            } else {
+                let widths: Vec<usize> = col_names
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        let max_val = rows
+                            .iter()
+                            .map(|row| {
+                                row.as_array()
+                                    .and_then(|arr| arr.get(i))
+                                    .map(|v| match v {
+                                        Value::Null => 4,
+                                        Value::String(s) => s.len(),
+                                        other => other.to_string().len(),
+                                    })
+                                    .unwrap_or(0)
+                            })
+                            .max()
+                            .unwrap_or(0);
+                        name.len().max(max_val).max(4)
+                    })
+                    .collect();
+
+                let mut output_buf = String::new();
+
+                let header: String = col_names
+                    .iter()
+                    .zip(&widths)
+                    .map(|(name, w)| format!("{:<width$}", name, width = w))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                output_buf.push_str(&header);
+                output_buf.push('\n');
+
+                let sep: String = widths
+                    .iter()
+                    .map(|w| "─".repeat(*w))
+                    .collect::<Vec<_>>()
+                    .join("  ");
+                output_buf.push_str(&sep);
+                output_buf.push('\n');
+
+                for row in rows {
+                    if let Some(vals) = row.as_array() {
+                        let line: String = vals
+                            .iter()
+                            .enumerate()
+                            .map(|(i, v)| {
+                                let w = widths.get(i).copied().unwrap_or(4);
+                                let s = match v {
+                                    Value::Null => "NULL".to_string(),
+                                    Value::String(s) => s.clone(),
+                                    other => other.to_string(),
+                                };
+                                format!("{:<width$}", s, width = w)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("  ");
+                        output_buf.push_str(&line);
+                        output_buf.push('\n');
+                    }
+                }
+                let n = rows.len();
+                output_buf.push_str(&format!(
+                    "({} {})\n",
+                    n,
+                    if n == 1 { "row" } else { "rows" }
+                ));
+
+                print_with_pager(&output_buf, pager_enabled, pager_command);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn test_expanded_output_single_row() {
+            let data = serde_json::json!({
+                "columns": [
+                    {"name": "id"},
+                    {"name": "name"},
+                    {"name": "email"}
+                ],
+                "rows": [
+                    [1, "Alice", "alice@example.com"]
+                ]
+            });
+
+            let pager_enabled = false;
+            let pager_command = None;
+
+            print_sql_result_expanded(&data, pager_enabled, &pager_command);
+        }
+
+        #[test]
+        fn test_expanded_output_multiple_rows() {
+            let data = serde_json::json!({
+                "columns": [
+                    {"name": "id"},
+                    {"name": "name"},
+                    {"name": "email"}
+                ],
+                "rows": [
+                    [1, "Alice", "alice@example.com"],
+                    [2, "Bob", "bob@example.com"]
+                ]
+            });
+
+            print_sql_result_expanded(&data, false, &None);
+        }
+
+        #[test]
+        fn test_expanded_output_with_nulls() {
+            let data = serde_json::json!({
+                "columns": [
+                    {"name": "id"},
+                    {"name": "name"},
+                    {"name": "email"}
+                ],
+                "rows": [
+                    [1, "Alice", Value::Null],
+                    [2, Value::Null, "bob@example.com"]
+                ]
+            });
+
+            print_sql_result_expanded(&data, false, &None);
+        }
+
+        #[test]
+        fn test_expanded_mode_toggle() {
+            let mut mode = ExpandedMode::Off;
+            assert_eq!(mode, ExpandedMode::Off);
+
+            mode = ExpandedMode::On;
+            assert_eq!(mode, ExpandedMode::On);
+
+            mode = ExpandedMode::Auto;
+            assert_eq!(mode, ExpandedMode::Auto);
+        }
+
+        #[test]
+        fn test_repl_state_default() {
+            let state = super::super::ReplState::default();
+            assert_eq!(state.expanded, ExpandedMode::Off);
+            assert!(state.pager_enabled);
         }
     }
 }

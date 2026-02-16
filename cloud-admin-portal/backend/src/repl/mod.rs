@@ -8,9 +8,17 @@ pub mod completer;
 pub mod exec;
 pub mod output;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpandedMode {
+    Off,
+    On,
+    Auto,
+}
+
 pub struct ReplState {
     pub pager_enabled: bool,
     pub pager_command: Option<String>,
+    pub expanded: ExpandedMode,
 }
 
 impl Default for ReplState {
@@ -18,6 +26,7 @@ impl Default for ReplState {
         Self {
             pager_enabled: true,
             pager_command: None,
+            expanded: ExpandedMode::Off,
         }
     }
 }
