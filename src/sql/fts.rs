@@ -184,6 +184,20 @@ fn extract_tsvector_words(tsvector: &str) -> HashSet<String> {
 }
 
 fn match_tsquery(tsvector_words: &HashSet<String>, tsquery: &str) -> bool {
+    let tokens = tokenize_tsquery(tsquery);
+    if tokens.is_empty() {
+        return true;
+    }
+
+    if let Some(result) = TsQueryEvaluator::new(&tokens, tsvector_words).eval() {
+        result
+    } else {
+        // Keep legacy permissive behavior as a fallback for malformed input.
+        legacy_match_tsquery(tsvector_words, tsquery)
+    }
+}
+
+fn legacy_match_tsquery(tsvector_words: &HashSet<String>, tsquery: &str) -> bool {
     let query_terms: Vec<String> = tsquery
         .split(|c: char| matches!(c, '&' | '|' | '!'))
         .map(|s| s.trim().trim_matches('\'').to_lowercase())
@@ -198,6 +212,185 @@ fn match_tsquery(tsvector_words: &HashSet<String>, tsquery: &str) -> bool {
         query_terms.iter().any(|term| tsvector_words.contains(term))
     } else {
         query_terms.iter().all(|term| tsvector_words.contains(term))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TsQueryToken {
+    Not,
+    And,
+    Or,
+    LParen,
+    RParen,
+    Term(String),
+}
+
+fn tokenize_tsquery(tsquery: &str) -> Vec<TsQueryToken> {
+    let mut tokens = Vec::new();
+    let mut chars = tsquery.chars().peekable();
+
+    while let Some(ch) = chars.peek().copied() {
+        match ch {
+            c if c.is_whitespace() => {
+                chars.next();
+            }
+            '!' => {
+                chars.next();
+                tokens.push(TsQueryToken::Not);
+            }
+            '&' => {
+                chars.next();
+                tokens.push(TsQueryToken::And);
+            }
+            '|' => {
+                chars.next();
+                tokens.push(TsQueryToken::Or);
+            }
+            '(' => {
+                chars.next();
+                tokens.push(TsQueryToken::LParen);
+            }
+            ')' => {
+                chars.next();
+                tokens.push(TsQueryToken::RParen);
+            }
+            '\'' => {
+                chars.next(); // opening quote
+                let mut term = String::new();
+                while let Some(c) = chars.next() {
+                    if c == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            chars.next();
+                            term.push('\'');
+                        } else {
+                            break;
+                        }
+                    } else {
+                        term.push(c);
+                    }
+                }
+                if !term.is_empty() {
+                    tokens.push(TsQueryToken::Term(term.to_lowercase()));
+                }
+            }
+            _ => {
+                let mut term = String::new();
+                while let Some(c) = chars.peek().copied() {
+                    if c.is_whitespace() || matches!(c, '!' | '&' | '|' | '(' | ')') {
+                        break;
+                    }
+                    term.push(c);
+                    chars.next();
+                }
+                let normalized = term.trim().trim_matches('\'').to_lowercase();
+                if !normalized.is_empty() {
+                    tokens.push(TsQueryToken::Term(normalized));
+                }
+            }
+        }
+    }
+
+    tokens
+}
+
+struct TsQueryEvaluator<'a> {
+    tokens: &'a [TsQueryToken],
+    pos: usize,
+    words: &'a HashSet<String>,
+}
+
+impl<'a> TsQueryEvaluator<'a> {
+    fn new(tokens: &'a [TsQueryToken], words: &'a HashSet<String>) -> Self {
+        Self {
+            tokens,
+            pos: 0,
+            words,
+        }
+    }
+
+    fn eval(&mut self) -> Option<bool> {
+        let value = self.parse_or()?;
+        (self.pos == self.tokens.len()).then_some(value)
+    }
+
+    fn parse_or(&mut self) -> Option<bool> {
+        let mut value = self.parse_and()?;
+        while self.consume_or() {
+            value = value || self.parse_and()?;
+        }
+        Some(value)
+    }
+
+    fn parse_and(&mut self) -> Option<bool> {
+        let mut value = self.parse_unary()?;
+        while self.consume_and() {
+            value = value && self.parse_unary()?;
+        }
+        Some(value)
+    }
+
+    fn parse_unary(&mut self) -> Option<bool> {
+        if self.consume_not() {
+            Some(!self.parse_unary()?)
+        } else {
+            self.parse_primary()
+        }
+    }
+
+    fn parse_primary(&mut self) -> Option<bool> {
+        if self.consume_lparen() {
+            let value = self.parse_or()?;
+            if !self.consume_rparen() {
+                return None;
+            }
+            return Some(value);
+        }
+
+        self.consume_term()
+            .map(|term| self.words.contains(term.as_str()))
+    }
+
+    fn consume_and(&mut self) -> bool {
+        self.consume_if(|token| matches!(token, TsQueryToken::And))
+    }
+
+    fn consume_or(&mut self) -> bool {
+        self.consume_if(|token| matches!(token, TsQueryToken::Or))
+    }
+
+    fn consume_not(&mut self) -> bool {
+        self.consume_if(|token| matches!(token, TsQueryToken::Not))
+    }
+
+    fn consume_lparen(&mut self) -> bool {
+        self.consume_if(|token| matches!(token, TsQueryToken::LParen))
+    }
+
+    fn consume_rparen(&mut self) -> bool {
+        self.consume_if(|token| matches!(token, TsQueryToken::RParen))
+    }
+
+    fn consume_term(&mut self) -> Option<String> {
+        match self.peek_token() {
+            Some(TsQueryToken::Term(term)) => {
+                self.pos += 1;
+                Some(term.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn consume_if(&mut self, predicate: impl FnOnce(&TsQueryToken) -> bool) -> bool {
+        if self.peek_token().is_some_and(predicate) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek_token(&self) -> Option<&'a TsQueryToken> {
+        self.tokens.get(self.pos)
     }
 }
 
@@ -321,6 +514,26 @@ mod tests {
     fn test_ts_match_no_match() {
         let tsvector = Value::Tsvector("'hello':1A 'world':2A".to_string());
         let tsquery = Value::Tsquery("'foo'".to_string());
+        let result = ts_match(&tsvector, &tsquery).unwrap();
+        assert_eq!(result, Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_ts_match_not_operator() {
+        let tsvector = Value::Tsvector("'hello':1A 'rust':2A".to_string());
+        let tsquery = Value::Tsquery("'hello' & !'world'".to_string());
+        let result = ts_match(&tsvector, &tsquery).unwrap();
+        assert_eq!(result, Value::Boolean(true));
+
+        let tsvector = Value::Tsvector("'hello':1A 'world':2A".to_string());
+        let result = ts_match(&tsvector, &tsquery).unwrap();
+        assert_eq!(result, Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_ts_match_parentheses_precedence() {
+        let tsvector = Value::Tsvector("'hello':1A 'world':2A".to_string());
+        let tsquery = Value::Tsquery("('hello' | 'rust') & !'world'".to_string());
         let result = ts_match(&tsvector, &tsquery).unwrap();
         assert_eq!(result, Value::Boolean(false));
     }

@@ -21,6 +21,10 @@ use crate::types::{DataType, Row, TableSchema, Value};
 
 pub type EnumLabelCache = HashMap<String, HashSet<String>>;
 
+fn short_relation_name(name: &str) -> &str {
+    name.rsplit('.').next().unwrap_or(name)
+}
+
 /// How `execute_insert_row` should handle unique-key conflicts.
 ///
 /// Replaces the previous `&Option<OnInsert>` parameter, removing the dependency
@@ -623,15 +627,17 @@ async fn cascade_delete_recursive(
                             let cols = fk.ref_columns.join(", ");
                             let pk_val_strs: Vec<String> =
                                 pk_values.iter().map(|v| format!("{}", v)).collect();
+                            let short_table = short_relation_name(table_name);
+                            let short_other_table = short_relation_name(other_table);
                             return Err(anyhow!(
                                 "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"\n\
                                  DETAIL:  Key ({})=({}) is still referenced from table \"{}\".",
-                                table_name,
+                                short_table,
                                 fk.name,
-                                other_table,
+                                short_other_table,
                                 cols,
                                 pk_val_strs.join(", "),
-                                other_table
+                                short_other_table
                             ));
                         }
                         ForeignKeyAction::SetDefault => {
@@ -793,15 +799,17 @@ pub async fn handle_foreign_key_on_update(
                             let cols = fk.ref_columns.join(", ");
                             let pk_val_strs: Vec<String> =
                                 old_pk_values.iter().map(|v| format!("{}", v)).collect();
+                            let short_table = short_relation_name(table_name);
+                            let short_other_table = short_relation_name(other_table);
                             return Err(anyhow!(
                                 "update or delete on table \"{}\" violates foreign key constraint \"{}\" on table \"{}\"\n\
                                  DETAIL:  Key ({})=({}) is still referenced from table \"{}\".",
-                                table_name,
+                                short_table,
                                 fk.name,
-                                other_table,
+                                short_other_table,
                                 cols,
                                 pk_val_strs.join(", "),
-                                other_table
+                                short_other_table
                             ));
                         }
                     }
@@ -1245,14 +1253,16 @@ pub async fn validate_foreign_keys(
         if ref_rows.is_empty() {
             let cols = fk.columns.join(", ");
             let vals: Vec<String> = fk_values.iter().map(|v| format!("{}", v)).collect();
+            let short_table = short_relation_name(&schema.name);
+            let short_ref_table = short_relation_name(&fk.ref_table);
             return Err(anyhow!(
                 "insert or update on table \"{}\" violates foreign key constraint \"{}\"\n\
                  DETAIL:  Key ({})=({}) is not present in table \"{}\".",
-                schema.name,
+                short_table,
                 fk.name,
                 cols,
                 vals.join(", "),
-                fk.ref_table
+                short_ref_table
             ));
         }
     }
