@@ -1,5 +1,6 @@
 //! Index evaluation helpers for partial and expression indexes.
 
+use crate::sql::query_context::QueryContext;
 use crate::types::{DataType, IndexDef, Row, TableSchema, Value};
 use anyhow::Result;
 use sqlparser::ast::Expr;
@@ -18,7 +19,9 @@ pub fn is_index_materializable(index: &IndexDef) -> bool {
 /// and produces a boolean result. PostgreSQL performs this validation at DDL time.
 pub fn validate_index_predicate(predicate: &Expr, schema: &TableSchema) -> Result<()> {
     let table_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-    let typed = super::expr::compile::compile_row_expr_for_table(predicate, schema, table_name)?;
+    let qctx = QueryContext::from_task_locals();
+    let typed =
+        super::expr::compile::compile_row_expr_for_table(predicate, schema, table_name, &qctx)?;
 
     match typed.data_type {
         DataType::Boolean => Ok(()),
