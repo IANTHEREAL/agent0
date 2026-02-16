@@ -45,7 +45,7 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
     let output = output.clone();
     let id = id.to_string();
 
-    let _ = tokio::task::spawn_blocking(move || {
+    let repl_task = tokio::task::spawn_blocking(move || {
         let config_builder = match Config::builder().history_ignore_dups(true) {
             Ok(builder) => builder,
             Err(e) => {
@@ -155,8 +155,11 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
                 buffer.clear();
             }
         }
-    })
-    .await;
+    });
+
+    if let Err(e) = repl_task.await {
+        eprintln!("REPL terminated unexpectedly: {e}");
+    }
 
     eprintln!("Bye!");
 }
