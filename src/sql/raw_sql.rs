@@ -35,9 +35,112 @@ pub(crate) enum RawSqlKind {
     CreateProcedure,
     CreateTypeEnum,
     DropType,
+    /// `RESET <guc>` or `RESET ALL` — handled directly by executor (bypasses
+    /// sqlparser which does not support standalone `RESET`).  `RESET ROLE` is
+    /// excluded: it is rewritten to `SET ROLE NONE` in the parser layer.
+    Reset,
     /// Statements that we accept past Parse so the executor can return a stable
     /// "not supported" error (instead of a syntax error).
     UnsupportedExecutorSkips,
+}
+
+/// Find the end of a `/* */` block comment with PostgreSQL-style nesting.
+///
+/// `s` starts just after the opening `/*`. Returns the byte offset past the
+/// closing `*/`, or `None` if the comment is unterminated.
+fn find_block_comment_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut depth: u32 = 1;
+    let mut i = 0;
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            depth += 1;
+            i += 2;
+        } else if i + 1 < bytes.len() && bytes[i] == b'*' && bytes[i + 1] == b'/' {
+            depth -= 1;
+            i += 2;
+            if depth == 0 {
+                return Some(i);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None // unterminated
+}
+
+/// Skip whitespace and SQL comments (line and block, with nesting).
+///
+/// Returns `None` for unterminated `/* */`. A line comment that reaches EOF
+/// returns `Some("")`.
+fn skip_ws_and_comments(s: &str) -> Option<&str> {
+    let mut rest = s;
+    loop {
+        rest = rest.trim_start();
+        if rest.starts_with("--") {
+            // Line comment: skip to end of line (or end of string).
+            match rest.find('\n') {
+                Some(pos) => rest = &rest[pos + 1..],
+                None => return Some(""),
+            }
+        } else if rest.starts_with("/*") {
+            let after_open = &rest[2..];
+            match find_block_comment_end(after_open) {
+                Some(end) => rest = &after_open[end..],
+                None => return None, // unterminated
+            }
+        } else {
+            return Some(rest);
+        }
+    }
+}
+
+/// Validate the remainder after a GUC name.
+///
+/// Accepts any mix of whitespace, SQL comments (with nesting), and semicolons.
+/// Returns `false` for unexpected tokens or unterminated `/*`.
+fn is_valid_tail(tail: &str) -> bool {
+    let mut rest = tail;
+    loop {
+        match skip_ws_and_comments(rest) {
+            None => return false, // unterminated block comment
+            Some(s) => rest = s,
+        }
+        if rest.is_empty() {
+            return true;
+        }
+        if rest.starts_with(';') {
+            rest = &rest[1..];
+        } else {
+            return false; // unexpected token
+        }
+    }
+}
+
+/// Extract and validate the GUC name from the text after `RESET`.
+///
+/// Accepts a single SQL identifier (including dotted names like `tipg.use_optimizer`),
+/// optionally followed by `;`, `--` line comment, or `/* */` block comment.
+/// PostgreSQL treats comments as whitespace, so comments between `RESET` and the
+/// identifier are allowed (e.g. `RESET /*x*/ ALL`).
+/// Returns `None` if the input is empty, starts with a non-identifier character,
+/// contains unexpected trailing tokens, or has an unterminated block comment.
+pub(crate) fn extract_reset_name(after_reset: &str) -> Option<&str> {
+    // PostgreSQL treats comments as whitespace — skip them before the identifier.
+    let s = skip_ws_and_comments(after_reset)?;
+    if s.is_empty() || (!s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[0] != b'_') {
+        return None;
+    }
+    let end = s
+        .bytes()
+        .position(|b| !b.is_ascii_alphanumeric() && b != b'_' && b != b'.')
+        .unwrap_or(s.len());
+    let name = &s[..end];
+    if is_valid_tail(&s[end..]) {
+        Some(name)
+    } else {
+        None
+    }
 }
 
 pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
@@ -116,6 +219,20 @@ pub(crate) fn classify(sql_upper: &str) -> Option<RawSqlKind> {
     }
     if sql_upper.starts_with("DROP TYPE") {
         return Some(RawSqlKind::DropType);
+    }
+
+    // RESET <guc> / RESET ALL — but NOT RESET ROLE (which is rewritten in the parser).
+    // Accept any ASCII whitespace (space, tab, etc.) after "RESET", and validate
+    // that only a single identifier token follows (trailing comments/semicolons OK).
+    if sql_upper.len() > 5
+        && sql_upper[..5].eq_ignore_ascii_case("RESET")
+        && sql_upper.as_bytes()[5].is_ascii_whitespace()
+    {
+        if let Some(name) = extract_reset_name(&sql_upper[5..]) {
+            if !name.eq_ignore_ascii_case("ROLE") {
+                return Some(RawSqlKind::Reset);
+            }
+        }
     }
 
     if is_unsupported_sql_that_executor_skips(sql_upper) {
@@ -252,6 +369,93 @@ mod tests {
             Some(RawSqlKind::CreateTypeEnum)
         );
         assert_eq!(classify("SELCT 1"), None);
+        // RESET <guc> and RESET ALL are classified as Reset
+        assert_eq!(classify("RESET TIMEZONE"), Some(RawSqlKind::Reset));
+        assert_eq!(classify("RESET ALL"), Some(RawSqlKind::Reset));
+        assert_eq!(
+            classify("RESET TIPG.USE_OPTIMIZER;"),
+            Some(RawSqlKind::Reset)
+        );
+        // RESET ROLE is NOT classified as Reset (handled by parser rewrite)
+        assert_eq!(classify("RESET ROLE"), None);
+    }
+
+    #[test]
+    fn extract_reset_name_basic_and_comments() {
+        // Basic identifiers
+        assert_eq!(extract_reset_name("TIMEZONE"), Some("TIMEZONE"));
+        assert_eq!(extract_reset_name("ALL"), Some("ALL"));
+        assert_eq!(
+            extract_reset_name("TIPG.USE_OPTIMIZER"),
+            Some("TIPG.USE_OPTIMIZER")
+        );
+
+        // Trailing semicolons
+        assert_eq!(
+            extract_reset_name("TIPG.USE_OPTIMIZER;"),
+            Some("TIPG.USE_OPTIMIZER")
+        );
+
+        // Trailing line comments
+        assert_eq!(extract_reset_name("TIMEZONE -- note"), Some("TIMEZONE"));
+        assert_eq!(extract_reset_name("ALL -- note"), Some("ALL"));
+
+        // Trailing block comments
+        assert_eq!(extract_reset_name("ALL /* note */"), Some("ALL"));
+
+        // Leading whitespace (tab, spaces)
+        assert_eq!(extract_reset_name("\tTIMEZONE"), Some("TIMEZONE"));
+        assert_eq!(extract_reset_name("  TIMEZONE"), Some("TIMEZONE"));
+
+        // Issue 1: junk after comments must be rejected
+        assert_eq!(extract_reset_name("ALL /* note */ junk"), None);
+        assert_eq!(extract_reset_name("timezone -- note\njunk"), None);
+        assert_eq!(extract_reset_name("ALL /* unterminated"), None);
+
+        // Issue 2: comments before identifier (PostgreSQL treats comments as whitespace)
+        assert_eq!(extract_reset_name("/*x*/ ALL"), Some("ALL"));
+        assert_eq!(extract_reset_name("-- comment\nALL"), Some("ALL"));
+        assert_eq!(extract_reset_name("/* unterminated"), None);
+
+        // Nested block comments
+        assert_eq!(
+            extract_reset_name("/* outer /* inner */ */ ALL"),
+            Some("ALL")
+        );
+        assert_eq!(
+            extract_reset_name("ALL /* outer /* inner */ */"),
+            Some("ALL")
+        );
+        assert_eq!(extract_reset_name("ALL /* outer /* inner */"), None); // unterminated nesting
+
+        // Multiple semicolons and mixed trailing
+        assert_eq!(extract_reset_name("ALL ; -- comment"), Some("ALL"));
+        assert_eq!(extract_reset_name("ALL ; /* note */"), Some("ALL"));
+
+        // Invalid inputs
+        assert_eq!(extract_reset_name(""), None);
+        assert_eq!(extract_reset_name("123bad"), None);
+        assert_eq!(extract_reset_name("   "), None);
+    }
+
+    #[test]
+    fn classify_reset_with_comments() {
+        // Comments after GUC name
+        assert_eq!(classify("RESET TIMEZONE -- note"), Some(RawSqlKind::Reset));
+        assert_eq!(classify("RESET ALL -- note"), Some(RawSqlKind::Reset));
+        assert_eq!(classify("RESET ALL /* note */"), Some(RawSqlKind::Reset));
+
+        // RESET ROLE with trailing comment must NOT be classified as Reset
+        assert_eq!(classify("RESET ROLE -- note"), None);
+
+        // Tab whitespace between RESET and GUC name
+        assert_eq!(classify("RESET\tTIMEZONE"), Some(RawSqlKind::Reset));
+
+        // Junk after comment must NOT classify as Reset
+        assert_eq!(classify("RESET ALL /* note */ junk"), None);
+
+        // Embedded comments between RESET and GUC name
+        assert_eq!(classify("RESET /*x*/ ALL"), Some(RawSqlKind::Reset));
     }
 
     #[test]

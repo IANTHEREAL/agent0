@@ -22,8 +22,8 @@ pub fn type_precedence(dt: &DataType) -> i32 {
         DataType::Boolean => 10,
         DataType::Int32 => 20,
         DataType::Int64 => 30,
-        DataType::Numeric { .. } => 40,
-        DataType::Float64 => 50,
+        DataType::Float64 => 45,
+        DataType::Numeric { .. } => 50,
         DataType::Text => 100,
         DataType::Varchar(_) => 100,
         DataType::Name => 100,
@@ -73,7 +73,7 @@ pub fn can_coerce(from: &DataType, to: &DataType) -> bool {
         // Numeric upcast
         (DataType::Int32, DataType::Int64 | DataType::Float64 | DataType::Numeric { .. }) => true,
         (DataType::Int64, DataType::Float64 | DataType::Numeric { .. }) => true,
-        (DataType::Numeric { .. }, DataType::Float64) => true,
+        (DataType::Float64, DataType::Numeric { .. }) => true,
 
         // Temporal casts
         (DataType::Date, DataType::Timestamp | DataType::TimestampTz) => true,
@@ -294,6 +294,67 @@ mod tests {
         assert_eq!(
             common_type(&DataType::Int64, &DataType::Float64),
             Some(DataType::Float64)
+        );
+    }
+
+    #[test]
+    fn common_type_numeric_over_float64() {
+        // Numeric wins over Float64 (precision preservation, matches PostgreSQL)
+        assert_eq!(
+            common_type(
+                &DataType::Numeric {
+                    precision: None,
+                    scale: None
+                },
+                &DataType::Float64
+            ),
+            Some(DataType::Numeric {
+                precision: None,
+                scale: None
+            })
+        );
+        assert_eq!(
+            common_type(
+                &DataType::Float64,
+                &DataType::Numeric {
+                    precision: None,
+                    scale: None
+                }
+            ),
+            Some(DataType::Numeric {
+                precision: None,
+                scale: None
+            })
+        );
+    }
+
+    #[test]
+    fn comparison_numeric_vs_float64_yields_numeric() {
+        assert_eq!(
+            comparison_target_type(
+                &DataType::Numeric {
+                    precision: None,
+                    scale: None
+                },
+                &DataType::Float64
+            ),
+            Some(DataType::Numeric {
+                precision: None,
+                scale: None
+            })
+        );
+        assert_eq!(
+            comparison_target_type(
+                &DataType::Float64,
+                &DataType::Numeric {
+                    precision: None,
+                    scale: None
+                }
+            ),
+            Some(DataType::Numeric {
+                precision: None,
+                scale: None
+            })
         );
     }
 

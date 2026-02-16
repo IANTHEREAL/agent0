@@ -294,6 +294,44 @@ impl SessionSettings {
         Ok(true)
     }
 
+    /// Reset a single session setting to its default value.
+    pub(crate) fn reset_setting(&mut self, name: &str) {
+        match name {
+            "search_path" => {
+                self.search_path = vec!["public".to_string(), "extensions".to_string()]
+            }
+            "statement_timeout" => self.statement_timeout_ms = 0,
+            "lock_timeout" => self.lock_timeout_ms = 0,
+            "idle_in_transaction_session_timeout" => {
+                self.idle_in_transaction_session_timeout_ms = 0
+            }
+            "pgtikv.max_sort_bytes" | "tipg.max_sort_bytes" => {
+                self.max_sort_bytes = DEFAULT_MAX_SORT_BYTES
+            }
+            "tipg.use_optimizer" => self.use_optimizer = false,
+            "timezone" => self.timezone = None,
+            "application_name" => self.application_name = None,
+            "client_encoding" => self.client_encoding = None,
+            "standard_conforming_strings" => self.standard_conforming_strings = None,
+            "check_function_bodies" => self.check_function_bodies = None,
+            "xmloption" => self.xmloption = None,
+            "client_min_messages" => self.client_min_messages = None,
+            "row_security" => self.row_security = None,
+            "default_tablespace" => self.default_tablespace = None,
+            "default_table_access_method" => self.default_table_access_method = None,
+            "transaction_isolation" => self.transaction_isolation = None,
+            "default_transaction_read_only" => self.default_transaction_read_only = None,
+            _ => {
+                self.extra_settings.remove(name);
+            }
+        }
+    }
+
+    /// Reset all session settings to their defaults.
+    pub(crate) fn reset_all_settings(&mut self) {
+        *self = Self::new();
+    }
+
     /// Get a session setting value in a Postgres-like string form, for `SHOW`.
     pub(crate) fn show_value(&self, name: &str) -> Option<String> {
         match name {
@@ -558,6 +596,14 @@ impl Session {
 
     pub(crate) fn set_known_setting(&mut self, name: &str, value: String) -> Result<bool> {
         self.settings.set_known_setting(name, value)
+    }
+
+    pub(crate) fn reset_setting(&mut self, name: &str) {
+        self.settings.reset_setting(name);
+    }
+
+    pub(crate) fn reset_all_settings(&mut self) {
+        self.settings.reset_all_settings();
     }
 
     pub(crate) fn show_setting_value(&self, name: &str) -> Option<String> {
@@ -1060,6 +1106,89 @@ mod tests {
         assert!(settings
             .set_known_setting("default_transaction_read_only", "maybe".to_string())
             .is_err());
+    }
+
+    #[test]
+    fn test_session_settings_reset_setting() {
+        let mut settings = SessionSettings::new();
+
+        // Change a few settings
+        settings
+            .set_known_setting("statement_timeout", "5000".to_string())
+            .unwrap();
+        settings
+            .set_known_setting("timezone", "US/Eastern".to_string())
+            .unwrap();
+        settings
+            .set_known_setting("extra_float_digits", "3".to_string())
+            .unwrap();
+
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("5000")
+        );
+        assert_eq!(
+            settings.show_value("timezone").as_deref(),
+            Some("US/Eastern")
+        );
+        assert_eq!(
+            settings.show_value("extra_float_digits").as_deref(),
+            Some("3")
+        );
+
+        // Reset individual settings
+        settings.reset_setting("statement_timeout");
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("0")
+        );
+
+        settings.reset_setting("timezone");
+        assert_eq!(settings.show_value("timezone").as_deref(), Some("UTC"));
+
+        settings.reset_setting("extra_float_digits");
+        assert_eq!(settings.show_value("extra_float_digits"), None);
+    }
+
+    #[test]
+    fn test_session_settings_reset_all() {
+        let mut settings = SessionSettings::new();
+
+        settings
+            .set_known_setting("statement_timeout", "5000".to_string())
+            .unwrap();
+        settings
+            .set_known_setting("timezone", "US/Eastern".to_string())
+            .unwrap();
+        settings
+            .set_known_setting("application_name", "myapp".to_string())
+            .unwrap();
+
+        settings.reset_all_settings();
+
+        assert_eq!(
+            settings.show_value("statement_timeout").as_deref(),
+            Some("0")
+        );
+        assert_eq!(settings.show_value("timezone").as_deref(), Some("UTC"));
+        assert_eq!(settings.show_value("application_name").as_deref(), Some(""));
+        assert_eq!(
+            settings.show_value("search_path").as_deref(),
+            Some("public, extensions")
+        );
+    }
+
+    #[test]
+    fn test_session_settings_reset_preserves_set_sentinel_value() {
+        // SET application_name TO '__RESET__' must NOT trigger a reset — it's a normal SET.
+        let mut settings = SessionSettings::new();
+        settings
+            .set_known_setting("application_name", "__RESET__".to_string())
+            .unwrap();
+        assert_eq!(
+            settings.show_value("application_name").as_deref(),
+            Some("__RESET__")
+        );
     }
 
     #[test]

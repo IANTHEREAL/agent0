@@ -406,6 +406,26 @@ impl Executor {
                 }
             }
 
+                // RESET <guc> / RESET ALL — handled directly from raw SQL, bypassing
+                // sqlparser entirely. This avoids sentinel-value collisions that arise
+                // from rewriting RESET to SET.
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::Reset)
+                ) {
+                    let after_kw = sql_trimmed.get(5..).unwrap_or("");
+                    let name = crate::sql::raw_sql::extract_reset_name(after_kw)
+                        .ok_or_else(|| anyhow!("syntax error at or near \"RESET\""))?;
+                    if name.eq_ignore_ascii_case("ALL") {
+                        session.reset_all_settings();
+                    } else {
+                        session.reset_setting(&name.to_lowercase());
+                    }
+                    return Ok(ExecuteResults::single(ExecuteResult::CommandComplete {
+                        tag: "RESET",
+                    }));
+                }
+
             let statements = match parse_sql(sql) {
                 Ok(stmts) => stmts,
                 Err(e) => {
@@ -694,6 +714,7 @@ impl Executor {
                                     .collect::<Vec<_>>()
                                     .join(".")
                                     .to_lowercase();
+
                                 if var_name == "search_path" {
                                     let mut new_search_path = Vec::new();
                                     for expr in value {

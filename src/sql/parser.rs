@@ -621,7 +621,7 @@ fn preprocess_sql(sql: &str) -> String {
     result = rewrite_vector_distance_ops(&result);
 
     // sqlparser-rs doesn't support PostgreSQL's `RESET ROLE`, but it does support the equivalent
-    // `SET ROLE NONE`.
+    // `SET ROLE NONE`. Non-ROLE RESET is handled by raw_sql::Reset in the executor.
     result = rewrite_reset_role(&result);
 
     // sqlparser-rs expects a quoted string after `AT TIME ZONE`, but PostgreSQL also allows
@@ -1580,6 +1580,16 @@ mod tests {
             preprocess_sql("RESET ROLE; SELECT 'RESET ROLE';"),
             "SET ROLE NONE; SELECT 'RESET ROLE';"
         );
+    }
+
+    #[test]
+    fn test_rewrite_does_not_touch_non_role_reset() {
+        // Non-ROLE RESET is handled by the executor's raw SQL path (RawSqlKind::Reset),
+        // not by parser rewrite. The parser should leave them unchanged.
+        assert_eq!(preprocess_sql("RESET timezone"), "RESET timezone");
+        assert_eq!(preprocess_sql("RESET ALL"), "RESET ALL");
+        // RESET ROLE is still rewritten
+        assert_eq!(preprocess_sql("RESET ROLE"), "SET ROLE NONE");
     }
 
     #[test]

@@ -168,6 +168,8 @@ impl TikvStore {
             let current = txn.get(key.clone()).await?;
             let (new_value, result) = compute(current)?;
 
+            // Intentional: use raw txn.put/delete (not txn_put/txn_delete) to bypass
+            // savepoint undo tracking — matches PostgreSQL's non-transactional sequence semantics.
             match new_value {
                 Some(val) => txn.put(key.clone(), val).await.map_err(|e| anyhow!(e))?,
                 None => txn.delete(key.clone()).await.map_err(|e| anyhow!(e))?,
