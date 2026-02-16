@@ -1043,6 +1043,11 @@ fn estimate_selectivity(index: &IndexDef, matched_cols: usize, full_match: bool)
     base_selectivity.max(0.0001)
 }
 
+// NOTE: Expression-based GIN indexes (e.g. `to_tsvector('chinese', col)`)
+// are maintained on the write path but NOT yet used for query planning.
+// The planner currently only matches simple column-based GIN indexes.
+// Expression index scan support requires matching function-call predicates
+// in extract_gin_contains_predicate — tracked as a known limitation.
 fn choose_gin_access_path(
     schema: &TableSchema,
     filter_expr: &Expr,

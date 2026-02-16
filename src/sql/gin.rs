@@ -205,10 +205,16 @@ pub(crate) enum GinColumnType {
     Tsvector,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GinIndexSource {
+    Column(usize),
+    Expression,
+}
+
 pub(crate) fn supported_gin_index_column(
     schema: &TableSchema,
     index: &IndexDef,
-) -> Option<(usize, GinColumnType)> {
+) -> Option<(GinIndexSource, GinColumnType)> {
     if !index
         .method
         .as_deref()
@@ -218,35 +224,29 @@ pub(crate) fn supported_gin_index_column(
         return None;
     }
 
-    // Check for expression indexes (e.g., to_tsvector('chinese', content))
     if !index.expressions.is_empty() {
-        // For expression indexes, check if the expression is likely a tsvector
-        // We detect this by checking if the expression contains "to_tsvector"
         let expr = &index.expressions[0];
         if expr.contains("to_tsvector") {
-            // Return a special marker (col_idx=0) for expression indexes
-            // The actual column will be determined by evaluating the expression
-            return Some((0, GinColumnType::Tsvector));
+            return Some((GinIndexSource::Expression, GinColumnType::Tsvector));
         }
-        // Other expression types not supported yet
         return None;
     }
 
-    // Partial indexes not supported
     if index.predicate.is_some() {
         return None;
     }
 
-    // Simple column indexes
     if index.columns.len() != 1 {
         return None;
     }
 
     let col_idx = schema.column_index(&index.columns[0])?;
     match &schema.columns.get(col_idx)?.data_type {
-        DataType::Json | DataType::Jsonb => Some((col_idx, GinColumnType::Jsonb)),
-        DataType::Array(_) => Some((col_idx, GinColumnType::Array)),
-        DataType::Tsvector => Some((col_idx, GinColumnType::Tsvector)),
+        DataType::Json | DataType::Jsonb => {
+            Some((GinIndexSource::Column(col_idx), GinColumnType::Jsonb))
+        }
+        DataType::Array(_) => Some((GinIndexSource::Column(col_idx), GinColumnType::Array)),
+        DataType::Tsvector => Some((GinIndexSource::Column(col_idx), GinColumnType::Tsvector)),
         _ => None,
     }
 }
@@ -256,18 +256,14 @@ pub(crate) fn extract_gin_token_hashes_from_row(
     index: &IndexDef,
     row: &Row,
 ) -> Result<Vec<u64>> {
-    let Some((col_idx, col_type)) = supported_gin_index_column(schema, index) else {
+    let Some((source, col_type)) = supported_gin_index_column(schema, index) else {
         return Ok(Vec::new());
     };
 
-    // Handle expression indexes (e.g., to_tsvector('chinese', content))
-    if !index.expressions.is_empty() {
-        let values = crate::sql::index_helpers::get_index_values_with_expressions(
-            index, schema, row
-        )?;
+    if source == GinIndexSource::Expression {
+        let values =
+            crate::sql::index_helpers::get_index_values_with_expressions(index, schema, row)?;
 
-        // For expression indexes, the expression result is in values
-        // Get the last value (the expression result)
         if let Some(value) = values.last() {
             return match col_type {
                 GinColumnType::Tsvector => match value {
@@ -302,7 +298,7 @@ pub(crate) fn extract_gin_token_hashes_from_row(
                         hashes.sort_unstable();
                         hashes.dedup();
                         Ok(hashes)
-                    },
+                    }
                     other => Err(anyhow!(
                         "GIN expression index '{}' must evaluate to JSONB, got {}",
                         index.name,
@@ -314,7 +310,10 @@ pub(crate) fn extract_gin_token_hashes_from_row(
         return Ok(Vec::new());
     }
 
-    // Handle simple column indexes
+    let GinIndexSource::Column(col_idx) = source else {
+        return Ok(Vec::new());
+    };
+
     match col_type {
         GinColumnType::Array => match row.values.get(col_idx) {
             Some(Value::Null) | None => Ok(Vec::new()),
@@ -468,36 +467,6 @@ fn hash_tsvector_lexeme(word: &str) -> u64 {
     let mut h = FNV1A_OFFSET_BASIS;
     h = fnv1a_u64(h, b"T");
     fnv1a_u64(h, word.to_lowercase().as_bytes())
-}
-
-/// Extract tokenizer configuration from an index expression.
-///
-/// Parses expressions like "to_tsvector('chinese', column_name)" to extract the
-/// config parameter ('chinese' in this example).
-///
-/// Returns None if:
-/// - The index has no expressions
-/// - The expression is not a to_tsvector call
-/// - The config parameter cannot be parsed
-fn extract_tokenizer_config_from_index(index: &IndexDef) -> Option<String> {
-    if index.expressions.is_empty() {
-        return None;
-    }
-
-    let expr = &index.expressions[0];
-
-    // Simple pattern matching: to_tsvector('config', ...)
-    if let Some(start) = expr.find("to_tsvector(") {
-        let content = &expr[start + 12..]; // skip "to_tsvector("
-        if content.starts_with('\'') {
-            // Find the closing quote
-            if let Some(end) = content[1..].find('\'') {
-                return Some(content[1..=end].to_string());
-            }
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]

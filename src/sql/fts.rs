@@ -7,31 +7,31 @@ use super::fts_tokenizers::{default_text_search_config, get_tokenizer};
 pub fn to_tsvector(args: Vec<Value>) -> Result<Value> {
     let (config, text) = match args.len() {
         1 => {
-            // Single argument: use default tokenizer
-            let text = extract_text(&args[0])?;
+            let text = match extract_text(&args[0])? {
+                Some(t) => t,
+                None => return Ok(Value::Null),
+            };
             (default_text_search_config(), text)
         }
         2 => {
-            // Two arguments: (config, text)
             let config = match &args[0] {
                 Value::Text(s) => s.as_str(),
                 _ => return Err(anyhow::anyhow!("first argument must be text search config")),
             };
-            let text = extract_text(&args[1])?;
+            let text = match extract_text(&args[1])? {
+                Some(t) => t,
+                None => return Ok(Value::Null),
+            };
             (config, text)
         }
         _ => return Err(anyhow::anyhow!("to_tsvector takes 1 or 2 arguments")),
     };
 
-    // Get the tokenizer for the specified config
-    let tokenizer = get_tokenizer(config).ok_or_else(|| {
-        anyhow::anyhow!("unknown text search configuration: {}", config)
-    })?;
+    let tokenizer = get_tokenizer(config)
+        .ok_or_else(|| anyhow::anyhow!("unknown text search configuration: {}", config))?;
 
-    // Tokenize the text
     let tokens = tokenizer(&text);
 
-    // Format as tsvector: 'word':position:weight
     let tsvector = tokens
         .into_iter()
         .enumerate()
@@ -42,11 +42,12 @@ pub fn to_tsvector(args: Vec<Value>) -> Result<Value> {
     Ok(Value::Tsvector(tsvector))
 }
 
-/// Extract text from a Value, handling Null gracefully.
-fn extract_text(value: &Value) -> Result<String> {
+/// Extract text from a Value, returning `None` for SQL NULL to preserve
+/// three-valued logic (PostgreSQL: `to_tsvector(NULL)` returns NULL).
+fn extract_text(value: &Value) -> Result<Option<String>> {
     match value {
-        Value::Text(s) => Ok(s.clone()),
-        Value::Null => Ok(String::new()),
+        Value::Text(s) => Ok(Some(s.clone())),
+        Value::Null => Ok(None),
         _ => Err(anyhow::anyhow!("argument must be text")),
     }
 }
@@ -54,35 +55,31 @@ fn extract_text(value: &Value) -> Result<String> {
 pub fn plainto_tsquery(args: Vec<Value>) -> Result<Value> {
     let (config, text) = match args.len() {
         1 => {
-            // Single argument: use default tokenizer
-            let text = extract_text(&args[0])?;
+            let text = match extract_text(&args[0])? {
+                Some(t) => t,
+                None => return Ok(Value::Null),
+            };
             (default_text_search_config(), text)
         }
         2 => {
-            // Two arguments: (config, text)
             let config = match &args[0] {
                 Value::Text(s) => s.as_str(),
-                _ => {
-                    return Err(anyhow::anyhow!(
-                        "first argument must be text search config"
-                    ))
-                }
+                _ => return Err(anyhow::anyhow!("first argument must be text search config")),
             };
-            let text = extract_text(&args[1])?;
+            let text = match extract_text(&args[1])? {
+                Some(t) => t,
+                None => return Ok(Value::Null),
+            };
             (config, text)
         }
         _ => return Err(anyhow::anyhow!("plainto_tsquery takes 1 or 2 arguments")),
     };
 
-    // Get the tokenizer for the specified config
-    let tokenizer = get_tokenizer(config).ok_or_else(|| {
-        anyhow::anyhow!("unknown text search configuration: {}", config)
-    })?;
+    let tokenizer = get_tokenizer(config)
+        .ok_or_else(|| anyhow::anyhow!("unknown text search configuration: {}", config))?;
 
-    // Tokenize the text
     let tokens = tokenizer(&text);
 
-    // Format as tsquery with AND operator
     let tsquery = tokens
         .into_iter()
         .map(|word| format!("'{}'", word))
@@ -93,20 +90,40 @@ pub fn plainto_tsquery(args: Vec<Value>) -> Result<Value> {
 }
 
 pub fn to_tsquery(args: Vec<Value>) -> Result<Value> {
-    let text = match args.len() {
+    let (config, text) = match args.len() {
         1 => {
-            // Single argument: pass through as tsquery
-            extract_text(&args[0])?
+            let text = match extract_text(&args[0])? {
+                Some(t) => t,
+                None => return Ok(Value::Null),
+            };
+            (default_text_search_config(), text)
         }
         2 => {
-            // Two arguments: (config, text) - config is for compatibility, pass through text
-            // In PostgreSQL, to_tsquery respects config but we just pass through for now
-            extract_text(&args[1])?
+            let config = match &args[0] {
+                Value::Text(s) => s.as_str(),
+                _ => return Err(anyhow::anyhow!("first argument must be text search config")),
+            };
+            let text = match extract_text(&args[1])? {
+                Some(t) => t,
+                None => return Ok(Value::Null),
+            };
+            (config, text)
         }
         _ => return Err(anyhow::anyhow!("to_tsquery takes 1 or 2 arguments")),
     };
 
-    Ok(Value::Tsquery(text))
+    let tokenizer = get_tokenizer(config)
+        .ok_or_else(|| anyhow::anyhow!("unknown text search configuration: {}", config))?;
+
+    let tokens = tokenizer(&text);
+
+    let tsquery = tokens
+        .into_iter()
+        .map(|word| format!("'{}'", word))
+        .collect::<Vec<_>>()
+        .join(" & ");
+
+    Ok(Value::Tsquery(tsquery))
 }
 
 pub fn ts_rank(args: Vec<Value>) -> Result<Value> {
@@ -316,5 +333,33 @@ mod tests {
         ];
         let result = ts_rank(args).unwrap();
         assert!(matches!(result, Value::Float64(r) if r > 0.0));
+    }
+
+    #[test]
+    fn test_to_tsvector_null_returns_null() {
+        let result = to_tsvector(vec![Value::Null]).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_plainto_tsquery_null_returns_null() {
+        let result = plainto_tsquery(vec![Value::Null]).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_to_tsquery_null_returns_null() {
+        let result = to_tsquery(vec![Value::Null]).unwrap();
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_to_tsquery_with_config() {
+        let result = to_tsquery(vec![
+            Value::Text("simple".to_string()),
+            Value::Text("hello world".to_string()),
+        ])
+        .unwrap();
+        assert!(matches!(result, Value::Tsquery(_)));
     }
 }
