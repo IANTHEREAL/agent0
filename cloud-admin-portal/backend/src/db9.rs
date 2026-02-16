@@ -15,7 +15,7 @@ const DEFAULT_API_URL: &str = "https://db9.shared.aws.tidbcloud.com/api";
 
 // ── Output format enum ──────────────────────────────────────────
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Debug, PartialEq, ValueEnum)]
 enum OutputFormat {
     /// Table format (default)
     Table,
@@ -1336,7 +1336,7 @@ async fn cmd_db_inspect_schemas(api: &ApiClient, output: &OutputFormat, id: &str
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off),
+        _ => repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off, "NULL", 1, repl::LinestyleMode::Ascii),
     }
 }
 
@@ -1350,7 +1350,7 @@ async fn cmd_db_inspect_tables(api: &ApiClient, output: &OutputFormat, id: &str)
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off),
+        _ => repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off, "NULL", 1, repl::LinestyleMode::Ascii),
     }
 }
 
@@ -1364,7 +1364,7 @@ async fn cmd_db_inspect_indexes(api: &ApiClient, output: &OutputFormat, id: &str
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off),
+        _ => repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off, "NULL", 1, repl::LinestyleMode::Ascii),
     }
 }
 
@@ -1577,7 +1577,7 @@ async fn cmd_db_sql(
         if let repl::SqlExecutor::Direct(exec) = &executor {
             match exec.execute(&sql).await {
                 Ok(data) => {
-                    repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off)
+                    repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off, "NULL", 1, repl::LinestyleMode::Ascii)
                 }
                 Err(e) => {
                     eprintln!("\x1b[31mERROR:\x1b[0m {e}");
@@ -1587,7 +1587,7 @@ async fn cmd_db_sql(
         }
     } else {
         let data = execute_sql(api, id, &sql).await;
-        repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off);
+        repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off, "NULL", 1, repl::LinestyleMode::Ascii);
     }
 }
 

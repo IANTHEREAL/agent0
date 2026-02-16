@@ -5,7 +5,7 @@ use serde_json::Value;
 
 use crate::{make_auth_headers, require_token, OutputFormat};
 
-use super::{exec::repl_exec, ExpandedMode, ReplState};
+use super::{exec::repl_exec, ExpandedMode, LinestyleMode, ReplState};
 
 pub enum DispatchResult {
     Continue,
@@ -251,6 +251,10 @@ pub async fn dispatch(
             DispatchResult::Continue
         }
         "\\highlight" => handle_highlight_command(arg),
+        "\\pset" => {
+            handle_pset_command(repl_state, arg);
+            DispatchResult::Continue
+        }
         "\\!" => handle_shell_command(arg),
         _ => {
             eprintln!("Unknown command: {cmd}. Type \\? for help.");
@@ -620,6 +624,140 @@ fn handle_expanded_command(repl_state: &mut ReplState, arg: &str) {
     eprintln!("Expanded display is {}.", status);
 }
 
+fn handle_pset_command(repl_state: &mut ReplState, arg: &str) {
+    if arg.is_empty() {
+        eprintln!("border     {}", repl_state.border);
+        eprintln!("null       \"{}\"", repl_state.null_display);
+        eprintln!(
+            "format     {}",
+            match repl_state.format_override {
+                Some(OutputFormat::Json) => "json",
+                Some(OutputFormat::Csv) => "csv",
+                _ => "table",
+            }
+        );
+        eprintln!(
+            "linestyle  {}",
+            match repl_state.linestyle {
+                LinestyleMode::Ascii => "ascii",
+                LinestyleMode::Unicode => "unicode",
+            }
+        );
+        eprintln!(
+            "expanded   {}",
+            match repl_state.expanded {
+                ExpandedMode::Off => "off",
+                ExpandedMode::On => "on",
+                ExpandedMode::Auto => "auto",
+            }
+        );
+        eprintln!(
+            "pager      {}",
+            if repl_state.pager_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        );
+        return;
+    }
+
+    let parts: Vec<&str> = arg.splitn(2, char::is_whitespace).collect();
+    let option = parts[0];
+    let value = parts.get(1).map(|s| s.trim()).unwrap_or("");
+
+    match option {
+        "border" => {
+            if value.is_empty() {
+                eprintln!("border     {}", repl_state.border);
+                return;
+            }
+            match value.parse::<u8>() {
+                Ok(b) if b <= 2 => {
+                    repl_state.border = b;
+                    eprintln!("Border style is {}.", b);
+                }
+                _ => {
+                    eprintln!("Invalid border value: {}. Use 0, 1, or 2.", value);
+                }
+            }
+        }
+        "null" => {
+            repl_state.null_display = value.to_string();
+            eprintln!("Null display is \"{}\".", repl_state.null_display);
+        }
+        "format" => {
+            if value.is_empty() {
+                let label = match repl_state.format_override {
+                    Some(OutputFormat::Json) => "json",
+                    Some(OutputFormat::Csv) => "csv",
+                    _ => "table",
+                };
+                eprintln!("format     {}", label);
+                return;
+            }
+            match value.to_lowercase().as_str() {
+                "table" | "aligned" => {
+                    repl_state.format_override = Some(OutputFormat::Table);
+                    eprintln!("Output format is table.");
+                }
+                "csv" => {
+                    repl_state.format_override = Some(OutputFormat::Csv);
+                    eprintln!("Output format is csv.");
+                }
+                "json" => {
+                    repl_state.format_override = Some(OutputFormat::Json);
+                    eprintln!("Output format is json.");
+                }
+                _ => {
+                    eprintln!(
+                        "Invalid format: {}. Use table, csv, or json.",
+                        value
+                    );
+                }
+            }
+        }
+        "linestyle" => {
+            if value.is_empty() {
+                let label = match repl_state.linestyle {
+                    LinestyleMode::Ascii => "ascii",
+                    LinestyleMode::Unicode => "unicode",
+                };
+                eprintln!("linestyle  {}", label);
+                return;
+            }
+            match value.to_lowercase().as_str() {
+                "ascii" => {
+                    repl_state.linestyle = LinestyleMode::Ascii;
+                    eprintln!("Line style is ascii.");
+                }
+                "unicode" => {
+                    repl_state.linestyle = LinestyleMode::Unicode;
+                    eprintln!("Line style is unicode.");
+                }
+                _ => {
+                    eprintln!(
+                        "Invalid linestyle: {}. Use ascii or unicode.",
+                        value
+                    );
+                }
+            }
+        }
+        "expanded" => {
+            handle_expanded_command(repl_state, value);
+        }
+        "pager" => {
+            handle_pager_command(repl_state, value);
+        }
+        _ => {
+            eprintln!(
+                "Unknown pset option: {}. Valid: border, null, format, linestyle, expanded, pager",
+                option
+            );
+        }
+    }
+}
+
 // ── \fs — save favorite query ────────────────────────────────────
 
 fn handle_save_favorite(repl_state: &mut ReplState, arg: &str) {
@@ -763,6 +901,7 @@ fn repl_help() {
     eprintln!("  \\! [COMMAND]  Execute shell command, or start interactive shell");
     eprintln!("  \\refresh      Refresh SQL completion table cache");
     eprintln!("  \\timing       Toggle query timing");
+    eprintln!("  \\pset [OPT]   Set output option (border/null/format/linestyle/expanded/pager)");
     eprintln!("  \\pager [CMD]  Control paging (on/off/CMD)");
     eprintln!("  \\x [MODE]     Toggle expanded display (on/off/auto)");
     eprintln!("  \\highlight    Toggle SQL syntax highlighting (on/off)");
@@ -986,13 +1125,90 @@ mod tests {
 
     #[test]
     fn test_repl_help_includes_shell_command() {
-        // Capture stderr to verify help text includes \!
-        // Since repl_help() uses eprintln!, we can't easily capture it in a unit test.
-        // Instead, we verify the help text is present by checking the function exists
-        // and returns Continue when called.
         match handle_shell_command("true") {
             DispatchResult::Continue => {}
             _ => panic!("Expected Continue"),
         }
+    }
+
+    #[test]
+    fn test_handle_pset_border_valid() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        assert_eq!(state.border, 1);
+        handle_pset_command(&mut state, "border 0");
+        assert_eq!(state.border, 0);
+        handle_pset_command(&mut state, "border 1");
+        assert_eq!(state.border, 1);
+        handle_pset_command(&mut state, "border 2");
+        assert_eq!(state.border, 2);
+    }
+
+    #[test]
+    fn test_handle_pset_border_invalid() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        handle_pset_command(&mut state, "border 5");
+        assert_eq!(state.border, 1);
+        handle_pset_command(&mut state, "border abc");
+        assert_eq!(state.border, 1);
+    }
+
+    #[test]
+    fn test_handle_pset_null_custom() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        assert_eq!(state.null_display, "NULL");
+        handle_pset_command(&mut state, "null (empty)");
+        assert_eq!(state.null_display, "(empty)");
+        handle_pset_command(&mut state, "null ");
+        assert_eq!(state.null_display, "");
+    }
+
+    #[test]
+    fn test_handle_pset_format() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        assert!(state.format_override.is_none());
+        handle_pset_command(&mut state, "format json");
+        assert_eq!(state.format_override, Some(OutputFormat::Json));
+        handle_pset_command(&mut state, "format csv");
+        assert_eq!(state.format_override, Some(OutputFormat::Csv));
+        handle_pset_command(&mut state, "format table");
+        assert_eq!(state.format_override, Some(OutputFormat::Table));
+    }
+
+    #[test]
+    fn test_handle_pset_linestyle() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        assert_eq!(state.linestyle, LinestyleMode::Ascii);
+        handle_pset_command(&mut state, "linestyle unicode");
+        assert_eq!(state.linestyle, LinestyleMode::Unicode);
+        handle_pset_command(&mut state, "linestyle ascii");
+        assert_eq!(state.linestyle, LinestyleMode::Ascii);
+    }
+
+    #[test]
+    fn test_handle_pset_unknown_option() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        let before_border = state.border;
+        handle_pset_command(&mut state, "nosuchoption value");
+        assert_eq!(state.border, before_border);
+    }
+
+    #[test]
+    fn test_handle_pset_expanded_delegates() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        assert_eq!(state.expanded, ExpandedMode::Off);
+        handle_pset_command(&mut state, "expanded on");
+        assert_eq!(state.expanded, ExpandedMode::On);
+        handle_pset_command(&mut state, "expanded auto");
+        assert_eq!(state.expanded, ExpandedMode::Auto);
+    }
+
+    #[test]
+    fn test_handle_pset_pager_delegates() {
+        let mut state = ReplState::new("id".into(), "db".into(), "http://x".into(), SqlExecutor::Api);
+        assert!(state.pager_enabled);
+        handle_pset_command(&mut state, "pager off");
+        assert!(!state.pager_enabled);
+        handle_pset_command(&mut state, "pager on");
+        assert!(state.pager_enabled);
     }
 }

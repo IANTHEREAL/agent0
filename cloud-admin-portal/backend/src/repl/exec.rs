@@ -37,9 +37,17 @@ pub async fn repl_exec(
         Ok(data) => {
             let new_tx_state = detect_tx_state_change(&data, repl_state.tx_state);
 
+            let effective_output = repl_state.format_override.as_ref().unwrap_or(output);
+
             if let Some(ref path) = repl_state.output_file {
-                let formatted =
-                    super::output::format_sql_result(&data, output, repl_state.expanded);
+                let formatted = super::output::format_sql_result(
+                    &data,
+                    effective_output,
+                    repl_state.expanded,
+                    &repl_state.null_display,
+                    repl_state.border,
+                    repl_state.linestyle,
+                );
                 match std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -57,10 +65,13 @@ pub async fn repl_exec(
             } else {
                 print_sql_result(
                     &data,
-                    output,
+                    effective_output,
                     repl_state.pager_enabled,
                     &repl_state.pager_command,
                     repl_state.expanded,
+                    &repl_state.null_display,
+                    repl_state.border,
+                    repl_state.linestyle,
                 );
             }
             if timing {

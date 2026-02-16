@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use super::ExpandedMode;
+use super::{ExpandedMode, LinestyleMode};
 use crate::OutputFormat;
 
 /// Pipe content to a pager process
@@ -59,61 +59,12 @@ pub fn print_sql_result_expanded(
     data: &Value,
     pager_enabled: bool,
     pager_command: &Option<String>,
+    null_display: &str,
+    _border: u8,
+    linestyle: LinestyleMode,
 ) {
-    let columns = match data["columns"].as_array() {
-        Some(cols) if !cols.is_empty() => cols,
-        _ => {
-            println!("{}", data["command"].as_str().unwrap_or("OK"));
-            return;
-        }
-    };
-    let rows = data["rows"].as_array().map(|r| r.as_slice()).unwrap_or(&[]);
-
-    let col_names: Vec<String> = columns
-        .iter()
-        .map(|c| c["name"].as_str().unwrap_or("?").to_string())
-        .collect();
-
-    // Find max column name length for alignment
-    let max_col_len = col_names.iter().map(|n| n.len()).max().unwrap_or(0);
-
-    let mut output_buf = String::new();
-
-    for (record_num, row) in rows.iter().enumerate() {
-        if let Some(vals) = row.as_array() {
-            // Record separator
-            let sep_dashes = "─".repeat(max_col_len + 3);
-            output_buf.push_str(&format!("-[ RECORD {} ]{}\n", record_num + 1, sep_dashes));
-
-            // Key-value pairs
-            for (i, col_name) in col_names.iter().enumerate() {
-                let val_str = vals
-                    .get(i)
-                    .map(|v| match v {
-                        Value::Null => "(null)".to_string(),
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    })
-                    .unwrap_or_else(|| "(null)".to_string());
-
-                output_buf.push_str(&format!(
-                    "{:<width$} | {}\n",
-                    col_name,
-                    val_str,
-                    width = max_col_len
-                ));
-            }
-        }
-    }
-
-    let n = rows.len();
-    output_buf.push_str(&format!(
-        "({} {})\n",
-        n,
-        if n == 1 { "row" } else { "rows" }
-    ));
-
-    print_with_pager(&output_buf, pager_enabled, pager_command);
+    let content = format_expanded(data, null_display, linestyle);
+    print_with_pager(&content, pager_enabled, pager_command);
 }
 
 /// Print content with optional paging
@@ -149,6 +100,9 @@ pub fn print_sql_result(
     pager_enabled: bool,
     pager_command: &Option<String>,
     expanded: ExpandedMode,
+    null_display: &str,
+    border: u8,
+    linestyle: LinestyleMode,
 ) {
     if matches!(output, OutputFormat::Json) {
         print_json(data);
@@ -193,6 +147,7 @@ pub fn print_sql_result(
                 .iter()
                 .map(|c| c["name"].as_str().unwrap_or("?").to_string())
                 .collect();
+            let null_len = null_display.len().max(1);
 
             let use_expanded = match expanded {
                 ExpandedMode::On => true,
@@ -208,7 +163,7 @@ pub fn print_sql_result(
                                     row.as_array()
                                         .and_then(|arr| arr.get(i))
                                         .map(|v| match v {
-                                            Value::Null => 4,
+                                            Value::Null => null_len,
                                             Value::String(s) => s.len(),
                                             other => other.to_string().len(),
                                         })
@@ -216,92 +171,44 @@ pub fn print_sql_result(
                                 })
                                 .max()
                                 .unwrap_or(0);
-                            name.len().max(max_val).max(4)
+                            name.len().max(max_val)
                         })
                         .collect();
-                    let total_width: usize = widths.iter().sum::<usize>() + (widths.len() - 1) * 2;
+                    let n = widths.len();
+                    let total_width: usize = widths.iter().sum::<usize>()
+                        + match border {
+                            0 => n.saturating_sub(1),
+                            2 => 3 * n + 1,
+                            _ => {
+                                if n > 0 {
+                                    3 * n - 1
+                                } else {
+                                    0
+                                }
+                            }
+                        };
                     total_width > get_terminal_width()
                 }
             };
 
-            if use_expanded {
-                print_sql_result_expanded(data, pager_enabled, pager_command);
+            let content = if use_expanded {
+                format_expanded(data, null_display, linestyle)
             } else {
-                let widths: Vec<usize> = col_names
-                    .iter()
-                    .enumerate()
-                    .map(|(i, name)| {
-                        let max_val = rows
-                            .iter()
-                            .map(|row| {
-                                row.as_array()
-                                    .and_then(|arr| arr.get(i))
-                                    .map(|v| match v {
-                                        Value::Null => 4,
-                                        Value::String(s) => s.len(),
-                                        other => other.to_string().len(),
-                                    })
-                                    .unwrap_or(0)
-                            })
-                            .max()
-                            .unwrap_or(0);
-                        name.len().max(max_val).max(4)
-                    })
-                    .collect();
-
-                let mut output_buf = String::new();
-
-                let header: String = col_names
-                    .iter()
-                    .zip(&widths)
-                    .map(|(name, w)| format!("{:<width$}", name, width = w))
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                output_buf.push_str(&header);
-                output_buf.push('\n');
-
-                let sep: String = widths
-                    .iter()
-                    .map(|w| "─".repeat(*w))
-                    .collect::<Vec<_>>()
-                    .join("  ");
-                output_buf.push_str(&sep);
-                output_buf.push('\n');
-
-                for row in rows {
-                    if let Some(vals) = row.as_array() {
-                        let line: String = vals
-                            .iter()
-                            .enumerate()
-                            .map(|(i, v)| {
-                                let w = widths.get(i).copied().unwrap_or(4);
-                                let s = match v {
-                                    Value::Null => "NULL".to_string(),
-                                    Value::String(s) => s.clone(),
-                                    other => other.to_string(),
-                                };
-                                format!("{:<width$}", s, width = w)
-                            })
-                            .collect::<Vec<_>>()
-                            .join("  ");
-                        output_buf.push_str(&line);
-                        output_buf.push('\n');
-                    }
-                }
-                let n = rows.len();
-                output_buf.push_str(&format!(
-                    "({} {})\n",
-                    n,
-                    if n == 1 { "row" } else { "rows" }
-                ));
-
-                print_with_pager(&output_buf, pager_enabled, pager_command);
-            }
+                format_table(data, null_display, border, linestyle)
+            };
+            print_with_pager(&content, pager_enabled, pager_command);
         }
     }
 }
 
-pub fn format_sql_result(data: &Value, output: &OutputFormat, expanded: ExpandedMode) -> String {
+pub fn format_sql_result(
+    data: &Value,
+    output: &OutputFormat,
+    expanded: ExpandedMode,
+    null_display: &str,
+    border: u8,
+    linestyle: LinestyleMode,
+) -> String {
     if matches!(output, OutputFormat::Json) {
         return serde_json::to_string_pretty(data).unwrap_or_default() + "\n";
     }
@@ -347,6 +254,7 @@ pub fn format_sql_result(data: &Value, output: &OutputFormat, expanded: Expanded
                 .iter()
                 .map(|c| c["name"].as_str().unwrap_or("?").to_string())
                 .collect();
+            let null_len = null_display.len().max(1);
 
             let use_expanded = match expanded {
                 ExpandedMode::On => true,
@@ -362,7 +270,7 @@ pub fn format_sql_result(data: &Value, output: &OutputFormat, expanded: Expanded
                                     row.as_array()
                                         .and_then(|arr| arr.get(i))
                                         .map(|v| match v {
-                                            Value::Null => 4,
+                                            Value::Null => null_len,
                                             Value::String(s) => s.len(),
                                             other => other.to_string().len(),
                                         })
@@ -370,24 +278,36 @@ pub fn format_sql_result(data: &Value, output: &OutputFormat, expanded: Expanded
                                 })
                                 .max()
                                 .unwrap_or(0);
-                            name.len().max(max_val).max(4)
+                            name.len().max(max_val)
                         })
                         .collect();
-                    let total_width: usize = widths.iter().sum::<usize>() + (widths.len() - 1) * 2;
+                    let n = widths.len();
+                    let total_width: usize = widths.iter().sum::<usize>()
+                        + match border {
+                            0 => n.saturating_sub(1),
+                            2 => 3 * n + 1,
+                            _ => {
+                                if n > 0 {
+                                    3 * n - 1
+                                } else {
+                                    0
+                                }
+                            }
+                        };
                     total_width > get_terminal_width()
                 }
             };
 
             if use_expanded {
-                format_expanded(data)
+                format_expanded(data, null_display, linestyle)
             } else {
-                format_table(data)
+                format_table(data, null_display, border, linestyle)
             }
         }
     }
 }
 
-fn format_expanded(data: &Value) -> String {
+fn format_expanded(data: &Value, null_display: &str, linestyle: LinestyleMode) -> String {
     let columns = match data["columns"].as_array() {
         Some(cols) if !cols.is_empty() => cols,
         _ => return format!("{}\n", data["command"].as_str().unwrap_or("OK")),
@@ -400,20 +320,25 @@ fn format_expanded(data: &Value) -> String {
         .collect();
     let max_col_len = col_names.iter().map(|n| n.len()).max().unwrap_or(0);
 
+    let sep_char = match linestyle {
+        LinestyleMode::Ascii => "-",
+        LinestyleMode::Unicode => "─",
+    };
+
     let mut buf = String::new();
     for (record_num, row) in rows.iter().enumerate() {
         if let Some(vals) = row.as_array() {
-            let sep_dashes = "─".repeat(max_col_len + 3);
+            let sep_dashes = sep_char.repeat(max_col_len + 3);
             buf.push_str(&format!("-[ RECORD {} ]{}\n", record_num + 1, sep_dashes));
             for (i, col_name) in col_names.iter().enumerate() {
                 let val_str = vals
                     .get(i)
                     .map(|v| match v {
-                        Value::Null => "(null)".to_string(),
+                        Value::Null => null_display.to_string(),
                         Value::String(s) => s.clone(),
                         other => other.to_string(),
                     })
-                    .unwrap_or_else(|| "(null)".to_string());
+                    .unwrap_or_else(|| null_display.to_string());
                 buf.push_str(&format!(
                     "{:<width$} | {}\n",
                     col_name,
@@ -432,7 +357,7 @@ fn format_expanded(data: &Value) -> String {
     buf
 }
 
-fn format_table(data: &Value) -> String {
+fn format_table(data: &Value, null_display: &str, border: u8, linestyle: LinestyleMode) -> String {
     let columns = match data["columns"].as_array() {
         Some(cols) if !cols.is_empty() => cols,
         _ => return format!("{}\n", data["command"].as_str().unwrap_or("OK")),
@@ -444,6 +369,7 @@ fn format_table(data: &Value) -> String {
         .map(|c| c["name"].as_str().unwrap_or("?").to_string())
         .collect();
 
+    let null_len = null_display.len();
     let widths: Vec<usize> = col_names
         .iter()
         .enumerate()
@@ -454,7 +380,7 @@ fn format_table(data: &Value) -> String {
                     row.as_array()
                         .and_then(|arr| arr.get(i))
                         .map(|v| match v {
-                            Value::Null => 4,
+                            Value::Null => null_len,
                             Value::String(s) => s.len(),
                             other => other.to_string().len(),
                         })
@@ -462,49 +388,135 @@ fn format_table(data: &Value) -> String {
                 })
                 .max()
                 .unwrap_or(0);
-            name.len().max(max_val).max(4)
+            name.len().max(max_val)
         })
         .collect();
 
+    // Line drawing characters based on linestyle
+    let (h, v, cross, tl, tr, bl, br, td, tu, tright, tleft) = match linestyle {
+        LinestyleMode::Ascii => ("-", "|", "+", "+", "+", "+", "+", "+", "+", "+", "+"),
+        LinestyleMode::Unicode => ("─", "│", "┼", "┌", "┐", "└", "┘", "┬", "┴", "├", "┤"),
+    };
+
     let mut buf = String::new();
 
-    let header: String = col_names
-        .iter()
-        .zip(&widths)
-        .map(|(name, w)| format!("{:<width$}", name, width = w))
-        .collect::<Vec<_>>()
-        .join("  ");
-    buf.push_str(&header);
-    buf.push('\n');
-
-    let sep: String = widths
-        .iter()
-        .map(|w| "─".repeat(*w))
-        .collect::<Vec<_>>()
-        .join("  ");
-    buf.push_str(&sep);
-    buf.push('\n');
-
-    for row in rows {
-        if let Some(vals) = row.as_array() {
-            let line: String = vals
+    match border {
+        0 => {
+            // No borders, columns separated by single space
+            let header: String = col_names
                 .iter()
-                .enumerate()
-                .map(|(i, v)| {
-                    let w = widths.get(i).copied().unwrap_or(4);
-                    let s = match v {
-                        Value::Null => "NULL".to_string(),
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
-                    format!("{:<width$}", s, width = w)
-                })
+                .zip(&widths)
+                .map(|(name, w)| format!("{:<width$}", name, width = w))
                 .collect::<Vec<_>>()
-                .join("  ");
-            buf.push_str(&line);
+                .join(" ");
+            buf.push_str(&header);
             buf.push('\n');
+
+            for row in rows {
+                if let Some(vals) = row.as_array() {
+                    let line: String = vals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, vl)| {
+                            let w = widths.get(i).copied().unwrap_or(1);
+                            let s = match vl {
+                                Value::Null => null_display.to_string(),
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            format!("{:<width$}", s, width = w)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            }
+        }
+        2 => {
+            // Full box border
+            // Top: ┌──┬──┐ or +--+--+
+            let segs: Vec<String> = widths.iter().map(|w| h.repeat(w + 2)).collect();
+            buf.push_str(&format!("{}{}{}\n", tl, segs.join(td), tr));
+
+            // Header: │ col │ col │ or | col | col |
+            let hdr: Vec<String> = col_names
+                .iter()
+                .zip(&widths)
+                .map(|(name, w)| format!(" {:<width$} ", name, width = w))
+                .collect();
+            buf.push_str(&format!("{}{}{}\n", v, hdr.join(v), v));
+
+            // Header sep: ├──┼──┤ or +--+--+
+            buf.push_str(&format!("{}{}{}\n", tright, segs.join(cross), tleft));
+
+            // Data rows: │ val │ val │
+            for row in rows {
+                if let Some(vals) = row.as_array() {
+                    let cells: Vec<String> = vals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, vl)| {
+                            let w = widths.get(i).copied().unwrap_or(1);
+                            let s = match vl {
+                                Value::Null => null_display.to_string(),
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            format!(" {:<width$} ", s, width = w)
+                        })
+                        .collect();
+                    buf.push_str(&format!("{}{}{}\n", v, cells.join(v), v));
+                }
+            }
+
+            // Bottom: └──┴──┘ or +--+--+
+            buf.push_str(&format!("{}{}{}\n", bl, segs.join(tu), br));
+        }
+        _ => {
+            // border=1 (default): header separator, column separators
+            let hdr: String = col_names
+                .iter()
+                .zip(&widths)
+                .map(|(name, w)| format!(" {:<width$} ", name, width = w))
+                .collect::<Vec<_>>()
+                .join(v);
+            buf.push_str(&hdr);
+            buf.push('\n');
+
+            // Separator
+            let sep: String = widths
+                .iter()
+                .map(|w| h.repeat(w + 2))
+                .collect::<Vec<_>>()
+                .join(cross);
+            buf.push_str(&sep);
+            buf.push('\n');
+
+            // Data rows
+            for row in rows {
+                if let Some(vals) = row.as_array() {
+                    let line: String = vals
+                        .iter()
+                        .enumerate()
+                        .map(|(i, vl)| {
+                            let w = widths.get(i).copied().unwrap_or(1);
+                            let s = match vl {
+                                Value::Null => null_display.to_string(),
+                                Value::String(s) => s.clone(),
+                                other => other.to_string(),
+                            };
+                            format!(" {:<width$} ", s, width = w)
+                        })
+                        .collect::<Vec<_>>()
+                        .join(v);
+                    buf.push_str(&line);
+                    buf.push('\n');
+                }
+            }
         }
     }
+
     let n = rows.len();
     buf.push_str(&format!(
         "({} {})\n",
@@ -531,10 +543,7 @@ mod tests {
             ]
         });
 
-        let pager_enabled = false;
-        let pager_command = None;
-
-        print_sql_result_expanded(&data, pager_enabled, &pager_command);
+        print_sql_result_expanded(&data, false, &None, "NULL", 1, LinestyleMode::Ascii);
     }
 
     #[test]
@@ -551,7 +560,7 @@ mod tests {
             ]
         });
 
-        print_sql_result_expanded(&data, false, &None);
+        print_sql_result_expanded(&data, false, &None, "NULL", 1, LinestyleMode::Ascii);
     }
 
     #[test]
@@ -568,7 +577,7 @@ mod tests {
             ]
         });
 
-        print_sql_result_expanded(&data, false, &None);
+        print_sql_result_expanded(&data, false, &None, "NULL", 1, LinestyleMode::Ascii);
     }
 
     #[test]
@@ -603,7 +612,14 @@ mod tests {
             "rows": [[1]],
             "command": "SELECT 1"
         });
-        let result = format_sql_result(&data, &crate::OutputFormat::Json, ExpandedMode::Off);
+        let result = format_sql_result(
+            &data,
+            &crate::OutputFormat::Json,
+            ExpandedMode::Off,
+            "NULL",
+            1,
+            LinestyleMode::Ascii,
+        );
         assert!(result.contains("\"id\""));
         assert!(result.contains("1"));
     }
@@ -615,7 +631,14 @@ mod tests {
             "rows": [],
             "command": "CREATE TABLE"
         });
-        let result = format_sql_result(&data, &crate::OutputFormat::Table, ExpandedMode::Off);
+        let result = format_sql_result(
+            &data,
+            &crate::OutputFormat::Table,
+            ExpandedMode::Off,
+            "NULL",
+            1,
+            LinestyleMode::Ascii,
+        );
         assert!(result.contains("CREATE TABLE"));
     }
 
@@ -626,7 +649,14 @@ mod tests {
             "rows": [[1, null], [null, "hello"]],
             "command": "SELECT 2"
         });
-        let result = format_sql_result(&data, &crate::OutputFormat::Table, ExpandedMode::Off);
+        let result = format_sql_result(
+            &data,
+            &crate::OutputFormat::Table,
+            ExpandedMode::Off,
+            "NULL",
+            1,
+            LinestyleMode::Ascii,
+        );
         assert!(result.contains("NULL"));
     }
 
@@ -643,6 +673,9 @@ mod tests {
             false,
             &None,
             ExpandedMode::Auto,
+            "NULL",
+            1,
+            LinestyleMode::Ascii,
         );
     }
 
@@ -659,6 +692,9 @@ mod tests {
             false,
             &None,
             ExpandedMode::Off,
+            "NULL",
+            1,
+            LinestyleMode::Ascii,
         );
     }
 
@@ -669,6 +705,88 @@ mod tests {
             "rows": [],
             "command": "SELECT 0"
         });
-        print_sql_result_expanded(&data, false, &None);
+        print_sql_result_expanded(&data, false, &None, "NULL", 1, LinestyleMode::Ascii);
+    }
+
+    #[test]
+    fn test_format_table_border_0() {
+        let data = serde_json::json!({
+            "columns": [{"name": "id"}, {"name": "name"}],
+            "rows": [[1, "Alice"], [2, "Bob"]],
+        });
+        let result = format_table(&data, "NULL", 0, LinestyleMode::Ascii);
+        assert!(result.contains("id name"));
+        assert!(!result.contains("|"));
+        assert!(!result.contains("-"));
+        assert!(result.contains("Alice"));
+        assert!(result.contains("(2 rows)"));
+    }
+
+    #[test]
+    fn test_format_table_border_2() {
+        let data = serde_json::json!({
+            "columns": [{"name": "id"}, {"name": "name"}],
+            "rows": [[1, "Alice"]],
+        });
+        let result = format_table(&data, "NULL", 2, LinestyleMode::Ascii);
+        assert!(result.contains("+"));
+        assert!(result.contains("|"));
+        assert!(result.contains("-"));
+        let lines: Vec<&str> = result.lines().collect();
+        assert!(lines.len() >= 5);
+        assert!(lines[0].starts_with('+'));
+        assert!(lines[0].ends_with('+'));
+    }
+
+    #[test]
+    fn test_format_table_border_2_unicode() {
+        let data = serde_json::json!({
+            "columns": [{"name": "id"}, {"name": "name"}],
+            "rows": [[1, "Alice"]],
+        });
+        let result = format_table(&data, "NULL", 2, LinestyleMode::Unicode);
+        assert!(result.contains("┌"));
+        assert!(result.contains("┐"));
+        assert!(result.contains("└"));
+        assert!(result.contains("┘"));
+        assert!(result.contains("│"));
+        assert!(result.contains("─"));
+    }
+
+    #[test]
+    fn test_format_table_custom_null() {
+        let data = serde_json::json!({
+            "columns": [{"name": "a"}, {"name": "b"}],
+            "rows": [[1, null], [null, "hello"]],
+        });
+        let result = format_table(&data, "(empty)", 1, LinestyleMode::Ascii);
+        assert!(result.contains("(empty)"));
+        assert!(!result.contains("NULL"));
+    }
+
+    #[test]
+    fn test_format_table_unicode_linestyle() {
+        let data = serde_json::json!({
+            "columns": [{"name": "id"}, {"name": "name"}],
+            "rows": [[1, "Alice"], [2, "Bob"]],
+        });
+        let result = format_table(&data, "NULL", 1, LinestyleMode::Unicode);
+        assert!(result.contains("│"));
+        assert!(result.contains("─"));
+        assert!(result.contains("┼"));
+        assert!(!result.contains("|"));
+        assert!(!result.contains("+"));
+    }
+
+    #[test]
+    fn test_format_table_ascii_linestyle() {
+        let data = serde_json::json!({
+            "columns": [{"name": "id"}, {"name": "name"}],
+            "rows": [[1, "Alice"]],
+        });
+        let result = format_table(&data, "NULL", 1, LinestyleMode::Ascii);
+        assert!(result.contains("|"));
+        assert!(result.contains("-"));
+        assert!(result.contains("+"));
     }
 }
