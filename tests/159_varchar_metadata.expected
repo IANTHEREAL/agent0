@@ -1,0 +1,8 @@
+column_name|data_type|character_maximum_length|udt_name
+t|text|NULL|text
+v|character varying|3|varchar
+(2 rows)
+attname|atttypid|formatted
+t|25|text
+v|1043|varchar
+(2 rows)

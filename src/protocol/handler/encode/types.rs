@@ -24,6 +24,7 @@ pub(in crate::protocol::handler) fn datatype_to_pgtype(dt: Option<&DataType>) ->
             DataType::Int64 => Type::INT8_ARRAY,
             DataType::Float64 => Type::FLOAT8_ARRAY,
             DataType::Text => Type::TEXT_ARRAY,
+            DataType::Varchar(_) => Type::VARCHAR_ARRAY,
             DataType::Name => Type::NAME_ARRAY,
             DataType::Timestamp => Type::TIMESTAMP_ARRAY,
             DataType::TimestampTz => Type::TIMESTAMPTZ_ARRAY,
@@ -40,9 +41,9 @@ pub(in crate::protocol::handler) fn datatype_to_pgtype(dt: Option<&DataType>) ->
         Some(DataType::Tsvector) => Type::TS_VECTOR,
         Some(DataType::Tsquery) => Type::TSQUERY,
         Some(DataType::UserDefined(s)) if s == "int2vector" => Type::INT2_VECTOR,
+        Some(DataType::Varchar(_)) => Type::VARCHAR,
         Some(DataType::Vector(_))
         | Some(DataType::Text)
-        | Some(DataType::Varchar(_))
         | Some(DataType::UserDefined(_))
         | None => Type::TEXT,
     }

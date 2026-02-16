@@ -92,6 +92,26 @@ pub(crate) fn oid_and_typlen_for_datatype(dt: &DataType) -> (i64, i32) {
         DataType::Tsvector => (OID_TSVECTOR, -1),
         DataType::Tsquery => (OID_TSQUERY, -1),
         DataType::Name => (OID_NAME, 64),
-        DataType::Varchar(_) | DataType::Array(_) | DataType::UserDefined(_) => (OID_TEXT, -1),
+        DataType::Varchar(_) => (OID_VARCHAR, -1),
+        DataType::Array(_) | DataType::UserDefined(_) => (OID_TEXT, -1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oid_and_typlen_distinguishes_text_and_varchar() {
+        assert_eq!(
+            oid_and_typlen_for_datatype(&DataType::Text),
+            (OID_TEXT, -1),
+            "TEXT should map to OID_TEXT"
+        );
+        assert_eq!(
+            oid_and_typlen_for_datatype(&DataType::Varchar(3)),
+            (OID_VARCHAR, -1),
+            "VARCHAR(n) should map to OID_VARCHAR"
+        );
     }
 }
