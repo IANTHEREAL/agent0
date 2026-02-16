@@ -561,33 +561,50 @@ pub fn substring(args: Vec<Value>) -> Result<Value> {
 /// Default count = length of replacement string.
 pub fn overlay(args: Vec<Value>) -> Result<Value> {
     let mut iter = args.into_iter();
-    let s = match iter.next() {
-        Some(Value::Text(s)) => s,
-        _ => return Ok(Value::Null),
+    let base = match iter.next() {
+        Some(v) => v,
+        None => return Ok(Value::Null),
     };
-    let replacement = match iter.next() {
-        Some(Value::Text(s)) => s,
-        Some(Value::Null) => return Ok(Value::Null),
-        _ => return Ok(Value::Null),
+    let placing = match iter.next() {
+        Some(v) => v,
+        None => return Ok(Value::Null),
     };
+
     let start = match iter.next() {
-        Some(Value::Int32(n)) => (n - 1).max(0) as usize,
-        Some(Value::Int64(n)) => (n - 1).max(0) as usize,
+        Some(Value::Int32(n)) => i64::from(n),
+        Some(Value::Int64(n)) => n,
         Some(Value::Null) => return Ok(Value::Null),
         _ => return Ok(Value::Null),
     };
-    let rep_len = replacement.chars().count();
     let count = match iter.next() {
-        Some(Value::Int32(n)) => n.max(0) as usize,
-        Some(Value::Int64(n)) => n.max(0) as usize,
-        _ => rep_len,
+        Some(Value::Int32(n)) => Some(i64::from(n.max(0))),
+        Some(Value::Int64(n)) => Some(n.max(0)),
+        Some(Value::Null) => return Ok(Value::Null),
+        None => None,
+        _ => return Ok(Value::Null),
     };
-    let chars: Vec<char> = s.chars().collect();
-    let mut result = String::new();
-    result.extend(chars.iter().take(start));
-    result.push_str(&replacement);
-    result.extend(chars.iter().skip(start + count));
-    Ok(Value::Text(result))
+
+    match (base, placing) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Text(s), Value::Text(placing)) => {
+            let start = (start - 1).max(0) as usize;
+            let rep_len = placing.chars().count();
+            let count = count
+                .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
+                .unwrap_or(rep_len);
+
+            let chars: Vec<char> = s.chars().collect();
+            let mut result = String::new();
+            result.extend(chars.iter().take(start));
+            result.push_str(&placing);
+            result.extend(chars.iter().skip(start + count));
+            Ok(Value::Text(result))
+        }
+        (Value::Bytes(base), Value::Bytes(placing)) => Ok(Value::Bytes(
+            crate::sql::bytea::overlay(base, &placing, start, count),
+        )),
+        _ => Ok(Value::Null),
+    }
 }
 
 /// POSITION(substring IN string)

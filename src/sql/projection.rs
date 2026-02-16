@@ -1,11 +1,10 @@
 //! Projection helpers for SELECT items and default value handling
 
 use anyhow::{anyhow, Result};
-use sqlparser::ast::Expr;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 
-use crate::types::{DataType, Row, TableSchema, Value};
+use crate::types::{Row, TableSchema, Value};
 
 use super::expr::bridge::eval_const_ast_expr;
 
@@ -67,6 +66,11 @@ pub fn get_expr_name(expr: &Expr) -> String {
     }
 }
 
+#[cfg(test)]
+use crate::types::DataType;
+#[cfg(test)]
+use sqlparser::ast::Expr;
+
 /// Fill default values for missing columns in a row
 pub fn fill_row_defaults(row: &mut Row, schema: &TableSchema) -> Result<()> {
     if row.values.len() < schema.columns.len() {
@@ -102,22 +106,21 @@ pub fn eval_default_expr(expr_str: &str) -> Result<Value> {
     Ok(Value::Text(expr_str.to_string()))
 }
 
-/// Infer the data type of an expression
-pub fn infer_expr_type(
-    expr: &Expr,
-    schema: &TableSchema,
-) -> Result<DataType, super::types::TypeError> {
-    super::types::infer_expr_type(expr, schema)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::analyzer::{Analyzer, NullCatalog, Scope};
     use crate::types::ColumnDef;
     use sqlparser::dialect::PostgreSqlDialect;
     use sqlparser::parser::Parser;
 
-    fn infer_first_expr(sql: &str) -> DataType {
+    fn analyze_expr_type(expr: &Expr, scope: Scope) -> DataType {
+        let catalog = NullCatalog;
+        let typed = Analyzer::analyze_expr_with_scope(&catalog, scope, expr).unwrap();
+        typed.data_type
+    }
+
+    fn analyze_first_expr(sql: &str, scope: Scope) -> DataType {
         let dialect = PostgreSqlDialect {};
         let statements = Parser::parse_sql(&dialect, sql).unwrap();
         let sqlparser::ast::Statement::Query(query) = statements.into_iter().next().unwrap() else {
@@ -129,7 +132,7 @@ mod tests {
         let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
             panic!("expected unnamed expr");
         };
-        infer_expr_type(expr, &TableSchema::default()).unwrap()
+        analyze_expr_type(expr, scope)
     }
 
     #[test]
@@ -157,7 +160,7 @@ mod tests {
             name: "joined".to_string(),
             table_id: 0,
             columns: vec![ColumnDef {
-                name: "o.total".to_string(),
+                name: "total".to_string(),
                 data_type: DataType::Float64,
                 nullable: true,
                 primary_key: false,
@@ -187,7 +190,10 @@ mod tests {
             panic!("expected unnamed expr");
         };
 
-        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Float64));
+        let mut scope = Scope::from_table_schema("o", &schema);
+        scope.allow_aggregates = true;
+        scope.allow_windows = true;
+        assert_eq!(analyze_expr_type(expr, scope), DataType::Float64);
     }
 
     #[test]
@@ -196,7 +202,7 @@ mod tests {
             name: "joined".to_string(),
             table_id: 0,
             columns: vec![ColumnDef {
-                name: "o.total".to_string(),
+                name: "total".to_string(),
                 data_type: DataType::Float64,
                 nullable: true,
                 primary_key: false,
@@ -226,7 +232,10 @@ mod tests {
             panic!("expected unnamed expr");
         };
 
-        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Float64));
+        let mut scope = Scope::from_table_schema("o", &schema);
+        scope.allow_aggregates = true;
+        scope.allow_windows = true;
+        assert_eq!(analyze_expr_type(expr, scope), DataType::Float64);
     }
 
     #[test]
@@ -265,7 +274,10 @@ mod tests {
             panic!("expected unnamed expr");
         };
 
-        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Int64));
+        let mut scope = Scope::from_table_schema("t", &schema);
+        scope.allow_aggregates = true;
+        scope.allow_windows = true;
+        assert_eq!(analyze_expr_type(expr, scope), DataType::Int64);
     }
 
     #[test]
@@ -304,12 +316,15 @@ mod tests {
             panic!("expected unnamed expr");
         };
 
+        let mut scope = Scope::from_table_schema("t", &schema);
+        scope.allow_aggregates = true;
+        scope.allow_windows = true;
         assert_eq!(
-            infer_expr_type(expr, &schema),
-            Ok(DataType::Numeric {
+            analyze_expr_type(expr, scope),
+            DataType::Numeric {
                 precision: None,
                 scale: None
-            })
+            }
         );
     }
 
@@ -349,7 +364,10 @@ mod tests {
             panic!("expected unnamed expr");
         };
 
-        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Int32));
+        let mut scope = Scope::from_table_schema("t", &schema);
+        scope.allow_aggregates = true;
+        scope.allow_windows = true;
+        assert_eq!(analyze_expr_type(expr, scope), DataType::Int32);
     }
 
     #[test]
@@ -370,7 +388,10 @@ mod tests {
         let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
             panic!("expected unnamed expr");
         };
-        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::TimestampTz));
+        let mut scope = Scope::from_table_schema("t", &schema);
+        scope.allow_aggregates = true;
+        scope.allow_windows = true;
+        assert_eq!(analyze_expr_type(expr, scope), DataType::TimestampTz);
     }
 
     #[test]
@@ -391,7 +412,10 @@ mod tests {
         let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
             panic!("expected unnamed expr");
         };
-        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Timestamp));
+        let mut scope = Scope::from_table_schema("t", &schema);
+        scope.allow_aggregates = true;
+        scope.allow_windows = true;
+        assert_eq!(analyze_expr_type(expr, scope), DataType::Timestamp);
     }
 
     #[test]
@@ -409,7 +433,10 @@ mod tests {
         let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
             panic!("expected unnamed expr");
         };
-        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Timestamp));
+        let mut scope = Scope::from_table_schema("t", &schema);
+        scope.allow_aggregates = true;
+        scope.allow_windows = true;
+        assert_eq!(analyze_expr_type(expr, scope), DataType::Timestamp);
     }
 
     #[test]
@@ -427,30 +454,40 @@ mod tests {
         let sqlparser::ast::SelectItem::UnnamedExpr(expr) = &select.projection[0] else {
             panic!("expected unnamed expr");
         };
-        assert_eq!(infer_expr_type(expr, &schema), Ok(DataType::Boolean));
+        let mut scope = Scope::from_table_schema("t", &schema);
+        scope.allow_aggregates = true;
+        scope.allow_windows = true;
+        assert_eq!(analyze_expr_type(expr, scope), DataType::Boolean);
     }
 
     #[test]
     fn test_infer_expr_type_bytea_builtins() {
+        let mut scope = Scope::new();
+        scope.allow_aggregates = true;
+        scope.allow_windows = true;
         assert_eq!(
-            infer_first_expr("SELECT int8send(0::bigint)"),
+            analyze_first_expr("SELECT int8send(0::bigint)", scope.clone()),
             DataType::Bytes
         );
         assert_eq!(
-            infer_first_expr(r"SELECT get_bit(E'\\x80'::bytea, 0)"),
+            analyze_first_expr(r"SELECT get_bit(E'\\x80'::bytea, 0)", scope.clone()),
             DataType::Int32
         );
         assert_eq!(
-            infer_first_expr(r"SELECT set_bit(E'\\x00'::bytea, 0, 1)"),
+            analyze_first_expr(r"SELECT set_bit(E'\\x00'::bytea, 0, 1)", scope.clone()),
             DataType::Bytes
         );
         assert_eq!(
-            infer_first_expr(r"SELECT substring(E'\\x0102030405060708'::bytea from 3)"),
+            analyze_first_expr(
+                r"SELECT substring(E'\\x0102030405060708'::bytea from 3)",
+                scope.clone(),
+            ),
             DataType::Bytes
         );
         assert_eq!(
-            infer_first_expr(
-                r"SELECT overlay('\x00001122'::bytea placing '\xaabb'::bytea from 2 for 2)"
+            analyze_first_expr(
+                r"SELECT overlay('\x00001122'::bytea placing '\xaabb'::bytea from 2 for 2)",
+                scope,
             ),
             DataType::Bytes
         );

@@ -200,7 +200,6 @@ pub(crate) fn substring(mut bytes: Vec<u8>, start: i64, count: Option<i64>) -> V
 /// When `count` is not provided, it defaults to `placing.len()`.
 ///
 /// This function mutates `base` in-place where possible to minimize allocations/copies.
-#[cfg(test)]
 pub(crate) fn overlay(
     mut base: Vec<u8>,
     placing: &[u8],

@@ -335,7 +335,11 @@ fn register_builtin_functions(r: &mut FunctionRegistry) {
     );
     r.register(
         "OVERLAY",
-        FunctionSignature::fixed(DataType::Text).with_args(3, Some(4)),
+        FunctionSignature::custom(|args| match args.first() {
+            Some(DataType::Bytes) => DataType::Bytes,
+            _ => DataType::Text,
+        })
+        .with_args(3, Some(4)),
     );
     r.register(
         "TIMEZONE",
@@ -399,11 +403,19 @@ fn register_builtin_functions(r: &mut FunctionRegistry) {
     );
     r.register(
         "SUBSTRING",
-        FunctionSignature::fixed(DataType::Text).with_args(2, Some(3)),
+        FunctionSignature::custom(|args| match args.first() {
+            Some(DataType::Bytes) => DataType::Bytes,
+            _ => DataType::Text,
+        })
+        .with_args(2, Some(3)),
     );
     r.register(
         "SUBSTR",
-        FunctionSignature::fixed(DataType::Text).with_args(2, Some(3)),
+        FunctionSignature::custom(|args| match args.first() {
+            Some(DataType::Bytes) => DataType::Bytes,
+            _ => DataType::Text,
+        })
+        .with_args(2, Some(3)),
     );
     r.register(
         "SPLIT_PART",
