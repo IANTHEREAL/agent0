@@ -316,7 +316,8 @@ impl<'a> TsQueryEvaluator<'a> {
     fn parse_or(&mut self) -> Option<bool> {
         let mut value = self.parse_and()?;
         while self.consume_or() {
-            value = value || self.parse_and()?;
+            let rhs = self.parse_and()?;
+            value = value || rhs;
         }
         Some(value)
     }
@@ -324,7 +325,8 @@ impl<'a> TsQueryEvaluator<'a> {
     fn parse_and(&mut self) -> Option<bool> {
         let mut value = self.parse_unary()?;
         while self.consume_and() {
-            value = value && self.parse_unary()?;
+            let rhs = self.parse_unary()?;
+            value = value && rhs;
         }
         Some(value)
     }
