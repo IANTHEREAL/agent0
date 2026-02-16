@@ -35,6 +35,19 @@ pub async fn repl_exec(
 
     match result {
         Ok(data) => {
+            if let Some(err) = data.get("error").and_then(|v| v.as_str()) {
+                let new_tx_state = if repl_state.tx_state == TxState::InTransaction {
+                    TxState::Failed
+                } else {
+                    TxState::Idle
+                };
+                print_error_with_hints(err);
+                if timing {
+                    eprintln!("Time: {:.3}s", start.elapsed().as_secs_f64());
+                }
+                return new_tx_state;
+            }
+
             let new_tx_state = detect_tx_state_change(&data, repl_state.tx_state);
 
             let effective_output = repl_state.format_override.as_ref().unwrap_or(output);

@@ -1587,6 +1587,10 @@ async fn cmd_db_sql(
         }
     } else {
         let data = execute_sql(api, id, &sql).await;
+        if let Some(err) = data.get("error").and_then(|v| v.as_str()) {
+            eprintln!("\x1b[31mERROR:\x1b[0m {err}");
+            process::exit(1);
+        }
         repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off, "NULL", 1, repl::LinestyleMode::Ascii);
     }
 }

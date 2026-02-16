@@ -430,8 +430,9 @@ async fn test_sql_with_tenant_but_no_pgclient() {
 
     let app = api::router().with_state(state.clone());
     let uri = format!("/customer/databases/{tenant_id}/sql");
-    let (status, _body) = post_json_auth(app, &uri, &json!({"query": "SELECT 1"}), &token).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = post_json_auth(app, &uri, &json!({"query": "SELECT 1"}), &token).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["error"].is_string());
 }
 
 #[tokio::test]

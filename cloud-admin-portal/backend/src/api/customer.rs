@@ -1630,15 +1630,19 @@ pub async fn execute_database_sql_structured(
         })?;
 
     let pg = PgClient::new(&state.config.pg_host, state.config.pg_port);
-    let result = pg
+    let result = match pg
         .run_sql_structured(&tenant.id, &cred.username, &cred.password_plain, sql)
         .await
-        .map_err(|e| {
-            AppError::new(
-                StatusCode::BAD_REQUEST,
-                format!("SQL execution failed: {e}"),
-            )
-        })?;
+    {
+        Ok(r) => r,
+        Err(e) => SqlResult {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            row_count: 0,
+            command: "ERROR".to_string(),
+            error: Some(e),
+        },
+    };
 
     Ok(Json(result))
 }
