@@ -285,42 +285,9 @@ pub(super) fn split_sql_statements(sql: &str) -> Vec<&str> {
 }
 
 pub(super) fn get_skip_reason(sql_upper: &str) -> Option<String> {
-    if sql_upper.starts_with('\\') {
-        return Some("psql meta-command not supported".into());
-    }
-    if sql_upper.starts_with("COPY ") || sql_upper.contains(" FROM STDIN") {
-        return Some("COPY not supported".into());
-    }
-    None
+    crate::sql::raw_sql::skip_reason(sql_upper).map(|reason| reason.to_string())
 }
 
 pub(super) fn get_unsupported_reason(sql_upper: &str) -> Option<String> {
-    if sql_upper.starts_with("CREATE DOMAIN") {
-        return Some("CREATE DOMAIN not supported".into());
-    }
-    if sql_upper.starts_with("CREATE AGGREGATE") {
-        return Some("CREATE AGGREGATE not supported".into());
-    }
-    if sql_upper.starts_with("ALTER TYPE") {
-        return Some("ALTER TYPE not supported".into());
-    }
-    if sql_upper.starts_with("ALTER DOMAIN") {
-        return Some("ALTER DOMAIN not supported".into());
-    }
-    if sql_upper.starts_with("ALTER AGGREGATE") {
-        return Some("ALTER AGGREGATE not supported".into());
-    }
-    if sql_upper.starts_with("ALTER FUNCTION") {
-        if sql_upper.contains(" OWNER TO ") {
-            return None;
-        }
-        return Some("ALTER FUNCTION not supported".into());
-    }
-    if sql_upper.starts_with("ALTER SEQUENCE") {
-        if sql_upper.contains(" OWNER TO ") || sql_upper.contains(" OWNED BY ") {
-            return None;
-        }
-        return Some("ALTER SEQUENCE not supported".into());
-    }
-    None
+    crate::sql::raw_sql::unsupported_reason(sql_upper).map(|reason| reason.to_string())
 }

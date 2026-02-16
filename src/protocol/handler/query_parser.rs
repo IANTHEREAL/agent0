@@ -3,105 +3,6 @@ use async_trait::async_trait;
 use pgwire::api::Type;
 use pgwire::error::PgWireResult;
 
-fn is_refresh_materialized_view_sql(sql_upper: &str) -> bool {
-    let mut words = sql_upper.split_whitespace();
-    matches!(
-        (words.next(), words.next(), words.next()),
-        (Some("REFRESH"), Some("MATERIALIZED"), Some("VIEW"))
-    )
-}
-
-fn is_drop_materialized_view_sql(sql_upper: &str) -> bool {
-    let mut words = sql_upper.split_whitespace();
-    matches!(
-        (words.next(), words.next(), words.next()),
-        (Some("DROP"), Some("MATERIALIZED"), Some("VIEW"))
-    )
-}
-
-fn is_create_type_as_enum_sql(sql_upper: &str) -> bool {
-    if !sql_upper.starts_with("CREATE TYPE") {
-        return false;
-    }
-    let mut prev = "";
-    for token in sql_upper.split_whitespace() {
-        if prev == "AS" && token.starts_with("ENUM") {
-            return true;
-        }
-        prev = token;
-    }
-    false
-}
-
-fn is_unsupported_sql_that_executor_skips(sql_upper: &str) -> bool {
-    if sql_upper.starts_with("CREATE DOMAIN") {
-        return true;
-    }
-    if sql_upper.starts_with("CREATE AGGREGATE") {
-        return true;
-    }
-    if sql_upper.starts_with("ALTER TYPE") {
-        return true;
-    }
-    if sql_upper.starts_with("ALTER DOMAIN") {
-        return true;
-    }
-    if sql_upper.starts_with("ALTER AGGREGATE") {
-        return true;
-    }
-    if sql_upper.starts_with("ALTER FUNCTION") {
-        return !sql_upper.contains(" OWNER TO ");
-    }
-    if sql_upper.starts_with("ALTER SEQUENCE") {
-        return !sql_upper.contains(" OWNER TO ") && !sql_upper.contains(" OWNED BY ");
-    }
-    false
-}
-
-fn should_accept_sql_without_sqlparser(sql_upper: &str) -> bool {
-    // Allow statements that sqlparser cannot parse but the executor handles via raw-SQL
-    // interception or returns a clear unsupported error for.
-    if sql_upper.starts_with('\\') {
-        return true;
-    }
-    if sql_upper.starts_with("COPY ") || sql_upper.contains(" FROM STDIN") {
-        return true;
-    }
-
-    if sql_upper.starts_with("CREATE DATABASE")
-        || sql_upper.starts_with("DROP DATABASE")
-        || sql_upper.starts_with("ALTER DATABASE")
-        || sql_upper.starts_with("ALTER DEFAULT PRIVILEGES")
-        || sql_upper.starts_with("CREATE EXTENSION")
-        || sql_upper.starts_with("DROP EXTENSION")
-        || sql_upper.starts_with("COMMENT ON")
-        || sql_upper.starts_with("CREATE OR REPLACE FUNCTION")
-        || sql_upper.starts_with("CREATE FUNCTION")
-        || sql_upper.starts_with("DROP FUNCTION")
-        || sql_upper.starts_with("CREATE CONSTRAINT TRIGGER")
-        || sql_upper.starts_with("CREATE TRIGGER")
-        || sql_upper.starts_with("DROP TRIGGER")
-        || ((sql_upper.starts_with("ALTER TABLE")
-            || sql_upper.starts_with("ALTER SEQUENCE")
-            || sql_upper.starts_with("ALTER FUNCTION"))
-            && sql_upper.contains(" OWNER TO "))
-        || (sql_upper.starts_with("ALTER SEQUENCE") && sql_upper.contains("OWNED"))
-        || is_refresh_materialized_view_sql(sql_upper)
-        || is_drop_materialized_view_sql(sql_upper)
-        || sql_upper.starts_with("CALL ")
-        || sql_upper.starts_with("DROP PROCEDURE")
-        || sql_upper.starts_with("CREATE PROCEDURE")
-        || sql_upper.starts_with("CREATE OR REPLACE PROCEDURE")
-        || is_create_type_as_enum_sql(sql_upper)
-        || sql_upper.starts_with("DROP TYPE")
-        || is_unsupported_sql_that_executor_skips(sql_upper)
-    {
-        return true;
-    }
-
-    false
-}
-
 #[derive(Debug, Default)]
 pub struct TipgQueryParser;
 
@@ -131,7 +32,7 @@ impl pgwire::api::stmt::QueryParser for TipgQueryParser {
         };
 
         let sql_upper = sql_no_comments.trim_start().to_ascii_uppercase();
-        if should_accept_sql_without_sqlparser(&sql_upper) {
+        if crate::sql::raw_sql::should_accept_sql_without_sqlparser(&sql_upper) {
             return Ok(sql.to_owned());
         }
 

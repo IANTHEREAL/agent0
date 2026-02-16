@@ -33,6 +33,7 @@ mod plpgsql;
 mod projection;
 pub(crate) mod query_context;
 pub(crate) mod quoting;
+pub(crate) mod raw_sql;
 mod rbac;
 mod result;
 mod role_settings;

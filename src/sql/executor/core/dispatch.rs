@@ -85,6 +85,8 @@ impl Executor {
                 let is_observability_user =
                     session.current_user() == Some(OBSERVABILITY_USER) && !session.is_superuser();
                 let starts_with = |prefix: &str| starts_with_ignore_ascii_case(sql_trimmed, prefix);
+                let sql_upper = sql_trimmed.trim().to_ascii_uppercase();
+                let raw_kind = crate::sql::raw_sql::classify(&sql_upper);
 
                 if session.is_transaction_failed()
                     && !sql_trimmed.trim().is_empty()
@@ -103,7 +105,10 @@ impl Executor {
                 }
 
                 if !is_observability_user {
-                    if starts_with("CREATE DATABASE") {
+                    if matches!(
+                        raw_kind,
+                        Some(crate::sql::raw_sql::RawSqlKind::CreateDatabase)
+                    ) {
                         let start = Instant::now();
                         let res = self.execute_create_database_cmd(session, sql).await;
                         if res.is_err() && session.is_in_transaction() {
@@ -114,7 +119,10 @@ impl Executor {
                         });
                         return res;
                     }
-                    if starts_with("DROP DATABASE") {
+                    if matches!(
+                        raw_kind,
+                        Some(crate::sql::raw_sql::RawSqlKind::DropDatabase)
+                    ) {
                         let start = Instant::now();
                         let res = self.execute_drop_database_cmd(session, sql).await;
                         if res.is_err() && session.is_in_transaction() {
@@ -125,7 +133,10 @@ impl Executor {
                         });
                         return res;
                     }
-                    if starts_with("ALTER DATABASE") {
+                    if matches!(
+                        raw_kind,
+                        Some(crate::sql::raw_sql::RawSqlKind::AlterDatabase)
+                    ) {
                         let start = Instant::now();
                         let res = self.execute_alter_database_cmd(session, sql).await;
                         if res.is_err() && session.is_in_transaction() {
@@ -136,7 +147,10 @@ impl Executor {
                         });
                         return res;
                     }
-                    if starts_with("CREATE EXTENSION") {
+                    if matches!(
+                        raw_kind,
+                        Some(crate::sql::raw_sql::RawSqlKind::CreateExtension)
+                    ) {
                         let start = Instant::now();
                         let res = self.execute_create_extension_cmd(session, sql).await;
                         if res.is_err() && session.is_in_transaction() {
@@ -147,7 +161,10 @@ impl Executor {
                         });
                         return res.map(ExecuteResults::single);
                     }
-                if starts_with("DROP EXTENSION") {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::DropExtension)
+                ) {
                     let start = Instant::now();
                     let res = self.execute_drop_extension_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
@@ -158,7 +175,10 @@ impl Executor {
                     });
                     return res.map(ExecuteResults::single);
                 }
-                if starts_with("COMMENT ON") {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::CommentOn)
+                ) {
                     let start = Instant::now();
                     let res = self.execute_comment_on_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
@@ -169,7 +189,10 @@ impl Executor {
                     });
                     return res.map(ExecuteResults::single);
                 }
-                if starts_with("CREATE OR REPLACE FUNCTION") || starts_with("CREATE FUNCTION") {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::CreateFunction)
+                ) {
                     let start = Instant::now();
                     let res = self.execute_create_function_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
@@ -180,7 +203,10 @@ impl Executor {
                     });
                     return res.map(ExecuteResults::single);
                 }
-                if starts_with("DROP FUNCTION") {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::DropFunction)
+                ) {
                     let start = Instant::now();
                     let res = self.execute_drop_function_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
@@ -191,7 +217,10 @@ impl Executor {
                     });
                     return res.map(ExecuteResults::single);
                 }
-                if starts_with("CREATE CONSTRAINT TRIGGER") || starts_with("CREATE TRIGGER") {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::CreateTrigger)
+                ) {
                     let start = Instant::now();
                     let res = self.execute_create_trigger_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
@@ -202,7 +231,10 @@ impl Executor {
                     });
                     return res.map(ExecuteResults::single);
                 }
-                if starts_with("DROP TRIGGER") {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::DropTrigger)
+                ) {
                     let start = Instant::now();
                     let res = self.execute_drop_trigger_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
@@ -215,7 +247,6 @@ impl Executor {
                 }
             }
 
-            let sql_upper = sql_trimmed.trim().to_uppercase();
             if !is_observability_user {
                 if let Some(reason) = get_skip_reason(&sql_upper) {
                     return Err(SqlError::Unsupported(reason).into());
@@ -223,11 +254,10 @@ impl Executor {
             }
 
             if !is_observability_user {
-                if (sql_upper.starts_with("ALTER TABLE")
-                    || sql_upper.starts_with("ALTER SEQUENCE")
-                    || sql_upper.starts_with("ALTER FUNCTION"))
-                    && sql_upper.contains(" OWNER TO ")
-                {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::AlterOwnerTo)
+                ) {
                     let start = Instant::now();
                     let res = self.execute_alter_owner_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
@@ -239,7 +269,10 @@ impl Executor {
                     return res.map(ExecuteResults::single);
                 }
 
-                if sql_upper.starts_with("ALTER DEFAULT PRIVILEGES") {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::AlterDefaultPrivileges)
+                ) {
                     let start = Instant::now();
                     let res = self
                         .execute_alter_default_privileges_cmd(session, sql)
@@ -253,7 +286,10 @@ impl Executor {
                     return res.map(ExecuteResults::single);
                 }
 
-                if sql_upper.starts_with("ALTER SEQUENCE") && sql_upper.contains("OWNED") {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::AlterSequenceOwnedBy)
+                ) {
                     let start = Instant::now();
                     let res = self.execute_alter_sequence_owned_by_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
@@ -265,12 +301,10 @@ impl Executor {
                     return res.map(ExecuteResults::single);
                 }
 
-                let mut words = sql_upper.split_whitespace();
-                let is_refresh_materialized_view = matches!(
-                    (words.next(), words.next(), words.next()),
-                    (Some("REFRESH"), Some("MATERIALIZED"), Some("VIEW"))
-                );
-                if is_refresh_materialized_view {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::RefreshMaterializedView)
+                ) {
                     let start = Instant::now();
                     let res = self.execute_refresh_materialized_view_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
@@ -282,12 +316,10 @@ impl Executor {
                     return res.map(ExecuteResults::single);
                 }
 
-                let mut words = sql_upper.split_whitespace();
-                let is_drop_materialized_view = matches!(
-                    (words.next(), words.next(), words.next()),
-                    (Some("DROP"), Some("MATERIALIZED"), Some("VIEW"))
-                );
-                if is_drop_materialized_view {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::DropMaterializedView)
+                ) {
                     let start = Instant::now();
                     let res = self.execute_drop_materialized_view_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
@@ -299,7 +331,7 @@ impl Executor {
                     return res.map(ExecuteResults::single);
                 }
 
-                if sql_upper.starts_with("CALL ") {
+                if matches!(raw_kind, Some(crate::sql::raw_sql::RawSqlKind::Call)) {
                     let start = Instant::now();
                     let res = self.execute_call_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
@@ -311,7 +343,10 @@ impl Executor {
                     return res.map(ExecuteResults::single);
                 }
 
-                if sql_upper.starts_with("DROP PROCEDURE") {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::DropProcedure)
+                ) {
                     let start = Instant::now();
                     let res = self.execute_drop_procedure_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
@@ -323,7 +358,10 @@ impl Executor {
                     return res.map(ExecuteResults::single);
                 }
 
-                if sql_upper.starts_with("CREATE PROCEDURE") {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::CreateProcedure)
+                ) {
                     let start = Instant::now();
                     let res = self.execute_create_procedure_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
@@ -335,30 +373,25 @@ impl Executor {
                     return res.map(ExecuteResults::single);
                 }
 
-                if sql_upper.starts_with("CREATE TYPE") {
-                    let mut prev = "";
-                    let mut is_enum = false;
-                    for token in sql_upper.split_whitespace() {
-                        if prev == "AS" && token.starts_with("ENUM") {
-                            is_enum = true;
-                            break;
-                        }
-                        prev = token;
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::CreateTypeEnum)
+                ) {
+                    let start = Instant::now();
+                    let res = self.execute_create_type_enum_cmd(session, sql).await;
+                    if res.is_err() && session.is_in_transaction() {
+                        session.mark_transaction_failed();
                     }
-                    if is_enum {
-                        let start = Instant::now();
-                        let res = self.execute_create_type_enum_cmd(session, sql).await;
-                        if res.is_err() && session.is_in_transaction() {
-                            session.mark_transaction_failed();
-                        }
-                        self.observability.record_statement(start.elapsed(), res.is_ok(), || {
-                            sql_trimmed.to_string()
-                        });
-                        return res.map(ExecuteResults::single);
-                    }
+                    self.observability.record_statement(start.elapsed(), res.is_ok(), || {
+                        sql_trimmed.to_string()
+                    });
+                    return res.map(ExecuteResults::single);
                 }
 
-                if sql_upper.starts_with("DROP TYPE") {
+                if matches!(
+                    raw_kind,
+                    Some(crate::sql::raw_sql::RawSqlKind::DropType)
+                ) {
                     let start = Instant::now();
                     let res = self.execute_drop_type_cmd(session, sql).await;
                     if res.is_err() && session.is_in_transaction() {
