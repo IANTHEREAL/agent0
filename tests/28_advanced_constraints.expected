@@ -1,23 +1,39 @@
+ERROR:  duplicate key value violates unique constraint "unique_test_email_key"
+DETAIL:  Key (email)=(alice@example.com) already exists.
+ERROR:  duplicate key value violates unique constraint "unique_username"
+DETAIL:  Key (username)=(alice) already exists.
+ERROR:  duplicate key value violates unique constraint "unique_code"
+DETAIL:  Key (code)=(100) already exists.
 id|email|username|code
 1|alice@example.com|alice|100
 2|bob@example.com|bob|200
 6|NULL|eve|600
-(3 rows)
+7|NULL|frank|700
+(4 rows)
+ERROR:  duplicate key value violates unique constraint "unique_test_email_key"
+DETAIL:  Key (email)=(bob@example.com) already exists.
 id|email|username|code
 1|alice@example.com|alice|100
 2|bob@example.com|bob|200
 6|NULL|eve|600
-(3 rows)
+7|NULL|frank|700
+(4 rows)
 id|name|status|counter|is_active|price
 1|test1|pending|0|t|9.99
 2|test2|active|10|t|9.99
 3|test3|NULL|0|t|9.99
 (3 rows)
+ERROR:  insert or update on table "orders" violates foreign key constraint "orders_customer_id_fkey"
+DETAIL:  Key (customer_id)=(999) is not present in table "customers".
 id|customer_id|name|amount
 101|1|Alice|99.99
 102|2|Bob|149.5
 104|NULL|NULL|25
 (3 rows)
+ERROR:  update or delete on table "customers" violates foreign key constraint "orders_customer_id_fkey" on table "orders"
+DETAIL:  Key (id)=(1) is still referenced from table "orders".
+ERROR:  update or delete on table "customers" violates foreign key constraint "orders_customer_id_fkey" on table "orders"
+DETAIL:  Key (id)=(1) is still referenced from table "orders".
 id|name|email
 1|Alice|alice@example.com
 2|Bob|bob@example.com
@@ -30,25 +46,10 @@ id|order_id|product
 id|order_id|product
 103|2|Doohickey
 (1 row)
+ERROR:  duplicate key value violates unique constraint "unique_dept_empno"
+DETAIL:  Key (dept, employee_no)=(Sales, 100) already exists.
 id|dept|employee_no
 1|Sales|100
 2|Engineering|100
 3|Sales|200
 (3 rows)
-psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:14: ERROR:  duplicate key value violates unique constraint "unique_test_email_key"
-DETAIL:  Key (email)=(alice@example.com) already exists.
-psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:15: ERROR:  duplicate key value violates unique constraint "unique_username"
-DETAIL:  Key (username)=(alice) already exists.
-psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:16: ERROR:  duplicate key value violates unique constraint "unique_code"
-DETAIL:  Key (code)=(100) already exists.
-psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:18: ERROR:  duplicate key value violates unique constraint "unique_test_email_key"
-DETAIL:  Key (email)=(NULL) already exists.
-psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:22: ERROR:  Duplicate entry for unique index
-psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:68: ERROR:  insert or update on table "public.orders" violates foreign key constraint "orders_customer_id_fkey"
-DETAIL:  Key (customer_id)=(999) is not present in table "public.customers".
-psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:76: ERROR:  update or delete on table "public.customers" violates foreign key constraint "orders_customer_id_fkey" on table "public.orders"
-DETAIL:  Key (id)=(1) is still referenced from table "public.orders".
-psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:77: ERROR:  update or delete on table "public.customers" violates foreign key constraint "orders_customer_id_fkey" on table "public.orders"
-DETAIL:  Key (id)=(1) is still referenced from table "public.orders".
-psql:/home/dongxu/lab/pg-tikv/tests/28_advanced_constraints.sql:123: ERROR:  duplicate key value violates unique constraint "unique_dept_empno"
-DETAIL:  Key (dept, employee_no)=(Sales, 100) already exists.

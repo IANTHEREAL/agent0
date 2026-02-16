@@ -4,7 +4,13 @@ oid|typname
 1700|numeric
 (3 rows)
 attname|atttypid|formatted
+tableoid|26|oid
+cmax|29|cid
+xmax|28|xid
+cmin|29|cid
+xmin|28|xid
+ctid|27|tid
 n|1700|numeric
-t|1083|time
+t|1083|time without time zone
 i|1186|interval
-(3 rows)
+(9 rows)

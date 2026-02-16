@@ -1,0 +1,18 @@
+# GIN FTS assertions — data correctness validated against PG 17.7
+# Note: PG 17 uses Bitmap Heap Scan + Bitmap Index Scan for GIN, not plain Index Scan.
+
+# Test 1: Basic FTS match for 'postgresql'
+PostgreSQL Tutorial
+
+# Test 2: Multiple term search for 'database indexing'
+Database Indexing
+
+# Test 3: ts_rank ordering — rank column present
+0.06079271
+
+# Test 4: No match case
+(0 rows)
+
+# Test 5: EXPLAIN shows GIN index usage (bitmap scan path on PG 17)
+idx_fts_search
+search_vector @@ plainto_tsquery('postgresql'::text)

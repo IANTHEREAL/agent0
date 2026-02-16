@@ -44,10 +44,10 @@ ababab
 abs
 5
 (1 row)
-?column?
+ceil
 5
 (1 row)
-?column?
+floor
 4
 (1 row)
 round
@@ -110,10 +110,10 @@ int4
 btrim
 hello
 (1 row)
-btrim
+ltrim
 hello
 (1 row)
-btrim
+rtrim
 hello
 (1 row)
 position
@@ -153,8 +153,8 @@ f
 t
 (1 row)
 category|sum
-A|30
 B|40
+A|30
 (2 rows)
 category|count
 B|2

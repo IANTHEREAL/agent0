@@ -1,0 +1,40 @@
+# EXPLAIN plan assertions — structural elements validated against PG 17.7
+# Only assert elements stable across planner choices (no exact costs/rows/scan types)
+
+# Q1-Q3: constant expressions
+Result
+
+# Q4: seq scan with filter on non-indexed column (PG 17 casts to ::text)
+Seq Scan on explain_test
+
+# Q5: PK lookup
+(id = 1)
+
+# Q6: index condition on column a
+(a = 10)
+
+# Q7: unique index scan on idx_c_unique
+Index Scan using idx_c_unique on explain_test
+Index Cond: (c = 100)
+
+# Q8: composite index condition
+(b = 'one'::text)
+
+# Q13-Q14: limit operator
+Limit
+
+# Q16-Q18: aggregate operator (GROUP BY)
+Group Key: a
+
+# Q19-Q20: join operators — hash cond present
+Hash Cond: (t2.test_id = t1.id)
+
+# Q22: range scan condition
+(a >= 10) AND (a <= 20)
+
+# Q24: IS NOT NULL filter
+Filter: (b IS NOT NULL)
+
+# Q26: subquery IN — explain_join referenced
+explain_join
+

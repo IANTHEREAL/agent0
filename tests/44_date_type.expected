@@ -9,5 +9,5 @@ data_type|udt_name
 date|date
 (1 row)
 json_build_object
-{"d":"2024-01-02"}
+{"d" : "2024-01-02"}
 (1 row)

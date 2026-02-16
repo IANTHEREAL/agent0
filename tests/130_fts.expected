@@ -1,8 +1,8 @@
 to_tsvector
-'the':1A 'quick':2A 'brown':3A 'fox':4A
+'brown':3 'fox':4 'quick':2
 (1 row)
 to_tsvector
-'hello':1A 'world':2A
+'hello':1 'world':2
 (1 row)
 plainto_tsquery
 'quick' & 'fox'
@@ -11,7 +11,7 @@ plainto_tsquery
 'hello' & 'world'
 (1 row)
 to_tsquery
-hello & world
+'hello' & 'world'
 (1 row)
 ?column?
 t
@@ -23,7 +23,7 @@ f
 t
 (1 row)
 ts_rank
-0
+1e-20
 (1 row)
 setweight
 'hello':1A 'world':2A
@@ -42,8 +42,8 @@ id|title
 3|SQL Tutorial
 (2 rows)
 id|title|rank
-1|PostgreSQL Guide|1
-3|SQL Tutorial|1
+1|PostgreSQL Guide|0.06079271
+3|SQL Tutorial|0.06079271
 (2 rows)
 id|title
 (0 rows)

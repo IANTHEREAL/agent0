@@ -1,21 +1,21 @@
  current_user 
 --------------
- postgres
+ admin
 (1 row)
 
  session_user 
 --------------
- postgres
+ admin
 (1 row)
 
- u
--
- postgres
+   u   
+-------
+ admin
 (1 row)
 
- u
--
- postgres
+   u   
+-------
+ admin
 (1 row)
 
  current_database 
@@ -23,8 +23,8 @@
  postgres
 (1 row)
 
- db
--
+    db    
+----------
  postgres
 (1 row)
 
@@ -33,8 +33,8 @@
  public
 (1 row)
 
- schema_name
--
+ schema_name 
+-------------
  public
 (1 row)
 
@@ -205,3 +205,4 @@ NOTICE:  table "sys_test" does not exist, skipping
 ----------------------------------
  System functions tests completed
 (1 row)
+

@@ -4,12 +4,12 @@ idx_221_a_val_renamed
 old_gone
 0
 (1 row)
-psql:tests/221_alter_index_rename.sql:18: ERROR:  Index 'idx_221_a_val' does not exist
-psql:tests/221_alter_index_rename.sql:24: ERROR:  relation "idx_221_b_val" already exists
+ERROR:  index "idx_221_a_val" does not exist
+ERROR:  relation "idx_221_b_val" already exists
 indexname
 t221_a_pk_renamed
 (1 row)
 old_pk_gone
 0
 (1 row)
-psql:tests/221_alter_index_rename.sql:33: ERROR:  index "idx_221_nonexistent" does not exist
+ERROR:  relation "idx_221_nonexistent" does not exist

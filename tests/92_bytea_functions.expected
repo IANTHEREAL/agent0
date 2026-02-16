@@ -17,16 +17,16 @@ uuid_bytes
 \x550e8400e29b41d4a716446655440000
 (1 row)
 set_msb
-\x80
-(1 row)
-set_lsb
 \x01
 (1 row)
+set_lsb
+\x80
+(1 row)
 get_msb
-1
+0
 (1 row)
 get_lsb
-0
+1
 (1 row)
 ts_6bytes
 \x018d0c904d00

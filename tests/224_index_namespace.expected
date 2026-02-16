@@ -1,12 +1,11 @@
-psql:tests/224_index_namespace.sql:16: ERROR:  relation "idx_224_shared" already exists
-psql:tests/224_index_namespace.sql:22: ERROR:  relation "t224_a_pkey" already exists
-psql:tests/224_index_namespace.sql:25: ERROR:  relation "t224_a" already exists
-psql:tests/224_index_namespace.sql:29: ERROR:  relation "t224_v" already exists
-psql:tests/224_index_namespace.sql:33: ERROR:  relation "t224_seq" already exists
-psql:tests/224_index_namespace.sql:46: ERROR:  relation "t224_pk_view" already exists
-psql:tests/224_index_namespace.sql:50: ERROR:  relation "t224_ctas_pkey" already exists
-psql:tests/224_index_namespace.sql:54: ERROR:  relation "t224_selinto_pkey" already exists
-psql:tests/224_index_namespace.sql:62: ERROR:  relation "t224_uc_new" already exists
+ERROR:  relation "idx_224_shared" already exists
+ERROR:  relation "t224_a_pkey" already exists
+ERROR:  relation "t224_a" already exists
+ERROR:  relation "t224_v" already exists
+ERROR:  relation "t224_seq" already exists
+ERROR:  relation "t224_pk_view" already exists
+ERROR:  constraint "t224_uc_old" for table "t224_a" does not exist
+ERROR:  relation "t224_uc_old" already exists
 result
 index namespace tests completed
 (1 row)

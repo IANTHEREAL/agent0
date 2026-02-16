@@ -49,10 +49,11 @@ id|user_id|amount|tax|total
 4|2|50|5.0|55.0
 5|4|300|30.0|330.0
 (5 rows)
-id|name
-1|Alice
-2|Bob
-4|Diana
+ERROR:  cannot drop columns from view
+id|name|email|active
+1|Alice|alice@example.com|t
+2|Bob|bob@example.com|t
+4|Diana|diana@example.com|t
 (3 rows)
 id|name|email|active
 1|Alice|alice@example.com|t
@@ -83,9 +84,9 @@ count
 avg
 266.6666666666666667
 (1 row)
-id|name
-1|Alice
-2|Bob
+id|name|email|active
+1|Alice|alice@example.com|t
+2|Bob|bob@example.com|t
 (2 rows)
 name|order_count|total_amount
 Alice|2|300

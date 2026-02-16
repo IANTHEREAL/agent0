@@ -113,7 +113,7 @@ sqrt_test
 4
 (1 row)
 cbrt_test
-3
+3.0000000000000004
 (1 row)
 power_test
 8
@@ -247,9 +247,7 @@ jsonb_build_array_test
 to_json_number_test
 123
 (1 row)
-to_jsonb_string_test
-"hello"
-(1 row)
+ERROR:  could not determine polymorphic type because input has type unknown
 jsonb_extract_path_test
 1
 (1 row)
@@ -383,7 +381,7 @@ pg_typeof_bool_test
 boolean
 (1 row)
 version_test
-t
+f
 (1 row)
 current_database_test
 t
