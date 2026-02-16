@@ -36,15 +36,16 @@ PostgreSQL-compatible distributed SQL database on TiKV. Implements pgwire protoc
 ### Execution Model (single path)
 
 ```
-Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Executor/Operators -> TiKV Store -> TiKV
+Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Optimizer (CBO) -> Executor/Operators -> TiKV Store -> TiKV
 ```
 
 ### Module Boundaries
 
-- `Analyzer`: name resolution, scope checking, and type inference; outputs typed IR only.
-- `Typed IR`: explicit types, explicit function/aggregate resolution, deterministic execution contract.
-- `Executor/Operators`: physical execution (scan/filter/project/sort/aggregate/join), no hidden semantic fallback.
-- `Catalog`: `information_schema` / `pg_catalog` compatibility surface and metadata contract.
+- `Analyzer` (`src/sql/analyzer/`): name resolution, scope checking, and type inference; outputs `AnalyzedQuery` / `TypedExpr`.
+- `Optimizer` (`src/sql/optimizer/`): `AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator`. Phase 1 live for single-table SELECTs (gated by `tipg.use_optimizer` GUC, default OFF).
+- `Operators` (`src/sql/operators/`): physical operators (scan, filter, project, sort, aggregate, hash_join, NLJ, window, CTE, set_operation, table_function).
+- `Executor` (`src/sql/executor/`): DDL/DML dispatch, SELECT execution (analyzed path at `executor/select/analyzed/`).
+- `Catalog` (`src/sql/catalog/`): `information_schema` / `pg_catalog` compatibility surface (35+ virtual table implementations).
 - `Storage`: all persistent keys must remain keyspace-isolated via `TikvStore`.
 
 ### Multi-tenancy Invariant (Critical)
@@ -52,22 +53,39 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Executor/Operators
 - All persistent data must be isolated per keyspace (`_sys_*`, table rows, indexes, auth, and future stats).
 - Process-level global state is limited to in-memory caches/config/logging.
 
-## Sprint 1 Completed
+## Completed Milestones
+
+### Sprint 1 — Analyzer + Legacy Cleanup
 
 - **Task 1:** Analyzer → Typed IR pipeline (single execution path for all SELECT queries)
 - **#56** NLJ streaming — NLJ now streams outer side, materializes only build side (`src/sql/operators/join.rs`)
-- **#609** SELECT privilege enforcement — `require_table_privilege(Select)` on every base table (`mod.rs:85-99`)
-- **#634/#635** COPY CSV fixes — order-independent option parsing, ESCAPE self-escaping (`copy_format.rs`)
+- **#609** SELECT privilege enforcement — `require_table_privilege(Select)` on every base table
+- **#634/#635** COPY CSV fixes — order-independent option parsing, ESCAPE self-escaping
 - Legacy removal: `infer_expr_type`, `executor/subquery.rs`, boolean validator, comparison coercion fallback
+- All 10 legacy code items fully resolved (#772)
+
+### CBO Phase 1 — Planner Unification + Optimizer Pipeline (#778)
+
+- `AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator` pipeline implemented in `src/sql/optimizer/`.
+- **Planner dual-path resolved:** TypedExpr path has full GIN + expression-index + partial-index support. EXPLAIN uses the analyzed pipeline (view expansion → Analyzer → typed planner). AST path retained only for non-SELECT EXPLAIN and analysis error fallback.
+- Phase 1 scope: single-table SELECTs, no optimizer rules, no statistics.
+- GUC `tipg.use_optimizer` (default OFF) — opt-in with graceful fallback.
+- Handler decomposed: `view_infer.rs`, `schema_resolve.rs`, `type_infer.rs` extracted from monolithic handler.
+- Index name uniqueness enforced within schema (#777).
+
+### Other Recent
+
+- **fs9** file system functions: `fs9_read`, `fs9_write`, `fs9_exists`, `fs9_size`, `fs9_mtime` with global read budget for OOM protection.
+- **FTS** Chinese tokenizer support for GIN full-text search (#774).
+- **Admin** API: rich DbError detail extraction, 200 with error body for SQL failures.
 
 ## Current Problems (Active)
 
-### P1 — Cost-Based Optimizer (#728)
+### P1 — CBO Phases 2-4
 
-- Next major milestone: `AnalyzedQuery → LogicalPlan → PhysicalPlan → BoxedOperator`.
-- **Planner dual-path resolved:** TypedExpr path now has full GIN + expression-index + partial-index support. EXPLAIN uses the analyzed pipeline (view expansion → Analyzer → typed planner). AST path retained only for non-SELECT EXPLAIN and analysis error fallback.
-- Phase 1: LogicalPlan pipeline for single-table SELECTs (no optimizer rules, no statistics).
-- Phases 2-4: Statistics (#706), join reordering/decorrelation (#705), plan cache (#707).
+- Phase 2: Table statistics (#706) — `ANALYZE` command, row count / distinct / histogram collection.
+- Phase 3: Join reordering / decorrelation (#705) — multi-table cost-based join ordering.
+- Phase 4: Plan cache (#707) — parameterized plan reuse.
 
 ## Repository Layout (stable)
 
@@ -75,10 +93,27 @@ Client/ORM -> pgwire -> SQL Parser -> Analyzer -> Typed IR -> Executor/Operators
 pg-tikv/
 ├── src/
 │   ├── sql/
+│   │   ├── analyzer/          # Semantic analysis → AnalyzedQuery/TypedExpr
+│   │   ├── optimizer/         # CBO: LogicalPlan → PhysicalPlan → operators
+│   │   ├── operators/         # Physical operators (scan, join, sort, agg, window…)
+│   │   ├── executor/          # DDL/DML dispatch + select/analyzed/ path
+│   │   ├── expr/              # Expression system + functions/ (14 categories)
+│   │   ├── catalog/           # information_schema + pg_catalog (35+ views)
+│   │   ├── types/             # Type inference, coercion, mapping
+│   │   ├── binder/            # Legacy name binding
+│   │   ├── planner.rs         # Query planner (index selection, scan planning)
+│   │   ├── explain.rs         # EXPLAIN (uses analyzed pipeline)
+│   │   ├── triggers.rs        # BEFORE trigger body compilation + cache
+│   │   ├── trigger_worker.rs  # Background async trigger processing
+│   │   ├── stats.rs           # TableStatsCache (per-tenant)
+│   │   └── ...
 │   ├── protocol/
+│   │   └── handler/           # pgwire handler (dynamic.rs + view_infer, schema_resolve, type_infer)
 │   ├── storage/
+│   ├── extensions/            # HTTP extensions + fs9 file operations
 │   ├── auth/
 │   ├── types/
+│   ├── txn/                   # Transaction state + savepoints
 │   ├── pool.rs
 │   ├── tls.rs
 │   └── main.rs
@@ -91,13 +126,20 @@ pg-tikv/
 
 | Task | Location |
 |------|----------|
-| Add SQL function | `src/sql/expr.rs` / `src/sql/expr/functions/` |
-| Add SQL statement | `src/sql/executor.rs` + `src/sql/executor/` |
+| Add SQL function | `src/sql/expr/functions/` (14 categories: array, datetime, encoding, fs9, fts, json, math, misc, pg_compat, regex, string, uuid, vector) |
+| Add SQL statement | `src/sql/executor/` (DDL in `ddl.rs`, DML in `dml_analyzed.rs`, SELECT in `select/analyzed/`) |
 | Fix type inference | `src/sql/types/infer.rs` |
+| Fix analyzer / name resolution | `src/sql/analyzer/` (query.rs, expr.rs, scope.rs) |
+| Optimizer / query planning | `src/sql/optimizer/` (logical_planner.rs → physical_planner.rs → build.rs) |
+| Physical operators | `src/sql/operators/` (scan, join, hash_join, sort, aggregate, window, etc.) |
+| Index planning / scan strategy | `src/sql/planner.rs` |
+| EXPLAIN output | `src/sql/explain.rs` |
 | Add PostgreSQL type mapping | `src/protocol/handler/encode/types.rs` |
 | Change key encoding | `src/storage/encoding.rs` |
-| Catalog behavior | `src/sql/catalog/` + `src/sql/information_schema.rs` |
+| Catalog / pg_catalog views | `src/sql/catalog/` (35+ pg_* view implementations) |
 | Multi-tenancy | `src/pool.rs` + username parsing in handler |
+| Triggers | `src/sql/triggers.rs` (body cache) + `src/sql/executor/triggers.rs` (DDL) + `src/sql/trigger_worker.rs` (async) |
+| Transaction state | `src/txn/` (state.rs, savepoints.rs) |
 
 ## Build & Test Commands
 
