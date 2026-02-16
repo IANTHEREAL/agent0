@@ -14,7 +14,10 @@ pub struct CompiledCheckConstraint {
     pub expr: crate::sql::analyzer::types::TypedExpr,
 }
 
-pub fn compile_check_constraints(schema: &TableSchema) -> Result<Vec<CompiledCheckConstraint>> {
+pub fn compile_check_constraints(
+    schema: &TableSchema,
+    qctx: &QueryContext,
+) -> Result<Vec<CompiledCheckConstraint>> {
     let dialect = PostgreSqlDialect {};
     let table_alias = schema.name.rsplit('.').next().unwrap_or(&schema.name);
     let mut compiled = Vec::with_capacity(schema.check_constraints.len());
@@ -23,7 +26,7 @@ pub fn compile_check_constraints(schema: &TableSchema) -> Result<Vec<CompiledChe
             .try_with_sql(&check.expr)
             .and_then(|mut p| p.parse_expr())
             .map_err(|e| anyhow!("Invalid CHECK expression '{}': {}", check.expr, e))?;
-        let typed = compile_row_expr_for_table(&expr, schema, table_alias)?;
+        let typed = compile_row_expr_for_table(&expr, schema, table_alias, qctx)?;
         compiled.push(CompiledCheckConstraint {
             name: check.name.clone(),
             expr_sql: check.expr.clone(),
@@ -111,7 +114,6 @@ mod tests {
     #[test]
     fn compiled_check_constraints_validate_rows() {
         let schema = check_schema();
-        let checks = compile_check_constraints(&schema).unwrap();
         let qctx = QueryContext::new(
             1,
             Arc::from("postgres"),
@@ -119,6 +121,7 @@ mod tests {
             1_700_000_000_000,
             Arc::from("UTC"),
         );
+        let checks = compile_check_constraints(&schema, &qctx).unwrap();
 
         validate_compiled_check_constraints(
             &schema,

@@ -174,7 +174,7 @@ impl Executor {
 
         let qctx = QueryContext::from_task_locals();
         let folded_where = upd.where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx));
-        let compiled_checks = check_constraints::compile_check_constraints(&schema)?;
+        let compiled_checks = check_constraints::compile_check_constraints(&schema, &qctx)?;
         let rows = self.scan_and_fill(txn, db_id, t, &schema).await?;
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
@@ -380,7 +380,7 @@ impl Executor {
             }
             _ => None,
         };
-        let compiled_checks = check_constraints::compile_check_constraints(&schema)?;
+        let compiled_checks = check_constraints::compile_check_constraints(&schema, &qctx)?;
         let mut affected = 0;
         let mut inserted = 0usize;
         let mut ret_rows = Vec::new();

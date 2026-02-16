@@ -17,7 +17,7 @@ use anyhow::Result;
 /// Uses task-local query context for compatibility call sites.
 pub fn eval_const_ast_expr(expr: &sqlparser::ast::Expr) -> Result<Value> {
     let qctx = QueryContext::from_task_locals();
-    let typed = compile_const_expr(expr)?;
+    let typed = compile_const_expr(expr, &qctx)?;
     eval_typed_expr(&typed, &Row::new(vec![]), &qctx)
 }
 
@@ -32,7 +32,7 @@ pub fn eval_ast_expr_with_row(
     alias: &str,
 ) -> Result<Value> {
     let qctx = QueryContext::from_task_locals();
-    let typed = compile_row_expr_for_table(expr, schema, alias)?;
+    let typed = compile_row_expr_for_table(expr, schema, alias, &qctx)?;
     eval_typed_expr(&typed, row, &qctx)
 }
 
@@ -47,6 +47,6 @@ pub fn eval_ast_expr_with_join_row(
     tables: &[(&str, &TableSchema)],
 ) -> Result<Value> {
     let qctx = QueryContext::from_task_locals();
-    let typed = compile_join_expr(expr, tables)?;
+    let typed = compile_join_expr(expr, tables, &qctx)?;
     eval_typed_expr(&typed, combined_row, &qctx)
 }

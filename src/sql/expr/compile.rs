@@ -6,12 +6,11 @@ use crate::types::TableSchema;
 use anyhow::{anyhow, Result};
 
 /// Compile an AST expression that must not reference row columns.
-pub fn compile_const_expr(expr: &sqlparser::ast::Expr) -> Result<TypedExpr> {
+pub fn compile_const_expr(expr: &sqlparser::ast::Expr, qctx: &QueryContext) -> Result<TypedExpr> {
     let catalog = NullCatalog;
     let typed = Analyzer::analyze_expr_with_scope(&catalog, Scope::new(), expr)
         .map_err(|e| anyhow!("{}", e))?;
-    let qctx = QueryContext::from_task_locals();
-    Ok(fold_typed_expr(&typed, &qctx))
+    Ok(fold_typed_expr(&typed, qctx))
 }
 
 /// Compile an AST expression with table row scope.
@@ -19,19 +18,20 @@ pub fn compile_row_expr_for_table(
     expr: &sqlparser::ast::Expr,
     schema: &TableSchema,
     alias: &str,
+    qctx: &QueryContext,
 ) -> Result<TypedExpr> {
     let catalog = NullCatalog;
     let scope = Scope::from_table_schema(alias, schema);
     let typed =
         Analyzer::analyze_expr_with_scope(&catalog, scope, expr).map_err(|e| anyhow!("{}", e))?;
-    let qctx = QueryContext::from_task_locals();
-    Ok(fold_typed_expr(&typed, &qctx))
+    Ok(fold_typed_expr(&typed, qctx))
 }
 
 /// Compile an AST expression with multi-table (join) row scope.
 pub fn compile_join_expr(
     expr: &sqlparser::ast::Expr,
     tables: &[(&str, &TableSchema)],
+    qctx: &QueryContext,
 ) -> Result<TypedExpr> {
     let catalog = NullCatalog;
     let mut scope = Scope::new();
@@ -46,6 +46,5 @@ pub fn compile_join_expr(
 
     let typed =
         Analyzer::analyze_expr_with_scope(&catalog, scope, expr).map_err(|e| anyhow!("{}", e))?;
-    let qctx = QueryContext::from_task_locals();
-    Ok(fold_typed_expr(&typed, &qctx))
+    Ok(fold_typed_expr(&typed, qctx))
 }

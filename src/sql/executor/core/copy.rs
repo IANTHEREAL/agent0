@@ -31,7 +31,7 @@ impl Executor {
                 .ok_or_else(|| SqlError::RelationNotFound(table_name.to_string()))?;
             let qctx = crate::sql::query_context::QueryContext::from_task_locals();
             let compiled_checks =
-                crate::sql::check_constraints::compile_check_constraints(&schema)?;
+                crate::sql::check_constraints::compile_check_constraints(&schema, &qctx)?;
 
             let enum_cache = dml::build_enum_label_cache(&self.store, txn, db_id, &schema).await?;
 

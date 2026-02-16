@@ -1010,7 +1010,7 @@ async fn eval_default_expr_maybe_sequence(
 
     let qctx = QueryContext::from_task_locals();
     let expr = parse_default_expr(expr_str)?;
-    let typed = compile_const_expr(&expr)?;
+    let typed = compile_const_expr(&expr, &qctx)?;
     if needs_async_materialization(&typed) {
         let materialized = materialize_sequences_in_typed_expr(
             store,
