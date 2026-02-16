@@ -1824,6 +1824,7 @@ pub async fn execute_drop_table(
     names: &[ObjectName],
     if_exists: bool,
     cascade: bool,
+    stats_cache: &crate::sql::stats::TableStatsCache,
 ) -> Result<ExecuteResult> {
     let mut last = String::new();
     for name in names {
@@ -1840,6 +1841,12 @@ pub async fn execute_drop_table(
                 }
             };
 
+        // Resolve table_id for cache invalidation before the schema is deleted.
+        let table_id = store
+            .get_schema(txn, db_id, &resolved.full)
+            .await?
+            .map(|s| s.table_id);
+
         // CASCADE: drop views that depend on this table.
         if cascade {
             let _dropped = drop_dependent_views(store, txn, db_id, &resolved.full).await?;
@@ -1855,6 +1862,12 @@ pub async fn execute_drop_table(
         }
         drop_owned_sequences_for_table(store, txn, db_id, &resolved.full).await?;
         store.drop_table(txn, db_id, &resolved.full).await?;
+
+        // Invalidate the in-memory stats cache (persistent stats deleted by drop_table).
+        if let Some(tid) = table_id {
+            stats_cache.invalidate(db_id, tid);
+        }
+
         last = resolved.full;
     }
     Ok(ExecuteResult::DropTable { table_name: last })

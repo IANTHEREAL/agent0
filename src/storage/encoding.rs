@@ -55,6 +55,7 @@ const DB_SYS_EXTENSIONCFG_PREFIX: &[u8] = b"sys_extcfg_";
 const DB_SYS_COMMENT_PREFIX: &[u8] = b"sys_comment_";
 const DB_SYS_RELNAME_PREFIX: &[u8] = b"sys_relname_";
 const DB_SYS_SEQ_PREFIX: &[u8] = b"sys_seq_";
+const DB_SYS_STATS_PREFIX: &[u8] = b"sys_stats_";
 const SYS_SCHEMA_PREFIX: &[u8] = b"_sys_schema_";
 const TABLE_DATA_PREFIX: &[u8] = b"t_";
 const TABLE_INDEX_PREFIX: &[u8] = b"i_";
@@ -246,6 +247,16 @@ pub fn encode_sequence_value_key_v2(db_id: u64, sequence_oid: u32) -> Vec<u8> {
 pub fn encode_table_sequence_value_key_v2(db_id: u64, table_id: u64) -> Vec<u8> {
     let mut key = encode_database_data_prefix(db_id);
     key.extend_from_slice(DB_SYS_SEQ_PREFIX);
+    key.extend_from_slice(&table_id.to_be_bytes());
+    key
+}
+
+/// Encode the key for persisted table statistics (storage format v2, database-scoped).
+///
+/// Key format: `d_{db_id:8bytes}_sys_stats_{table_id:8bytes}`
+pub fn encode_stats_key_v2(db_id: u64, table_id: u64) -> Vec<u8> {
+    let mut key = encode_database_data_prefix(db_id);
+    key.extend_from_slice(DB_SYS_STATS_PREFIX);
     key.extend_from_slice(&table_id.to_be_bytes());
     key
 }
@@ -997,6 +1008,33 @@ mod tests {
     #[test]
     fn test_encode_migration_prefix() {
         assert_eq!(encode_migration_prefix(), b"_sys_migration_".to_vec());
+    }
+
+    #[test]
+    fn test_encode_stats_key_v2() {
+        let key = encode_stats_key_v2(1, 42);
+        let mut expected = encode_database_data_prefix(1);
+        expected.extend_from_slice(b"sys_stats_");
+        expected.extend_from_slice(&42_u64.to_be_bytes());
+        assert_eq!(key, expected);
+    }
+
+    #[test]
+    fn test_encode_stats_key_v2_different_tables() {
+        let key_a = encode_stats_key_v2(1, 10);
+        let key_b = encode_stats_key_v2(1, 20);
+        assert_ne!(key_a, key_b);
+        // Keys for same db should share the database prefix
+        let prefix = encode_database_data_prefix(1);
+        assert!(key_a.starts_with(&prefix));
+        assert!(key_b.starts_with(&prefix));
+    }
+
+    #[test]
+    fn test_encode_stats_key_v2_different_databases() {
+        let key_a = encode_stats_key_v2(1, 42);
+        let key_b = encode_stats_key_v2(2, 42);
+        assert_ne!(key_a, key_b);
     }
 
     #[test]

@@ -289,6 +289,9 @@ impl TikvStore {
             self.delete_column_comments_for_table(txn, db_id, table_name)
                 .await?;
 
+            // Remove persisted ANALYZE statistics for this table.
+            self.delete_statistics(txn, db_id, table_id).await?;
+
             info!("Dropped table '{}'", table_name);
             Ok(true)
         } else {

@@ -248,6 +248,7 @@ impl Executor {
                             names,
                             *if_exists,
                             *cascade,
+                            &self.stats_cache,
                         )
                         .await
                     }

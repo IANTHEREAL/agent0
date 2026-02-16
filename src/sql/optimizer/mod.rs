@@ -8,7 +8,9 @@ pub mod logical_plan;
 pub mod logical_planner;
 pub mod physical_plan;
 pub mod physical_planner;
+pub mod statistics;
 
 pub use build::BuildContext;
 pub use logical_planner::LogicalPlanner;
 pub use physical_planner::PhysicalPlanner;
+pub use statistics::{ColumnStatistics, TableStatistics};

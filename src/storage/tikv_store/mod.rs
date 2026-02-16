@@ -23,6 +23,7 @@ mod migrations;
 mod procedures;
 mod schemas;
 mod sequences;
+mod statistics;
 mod tables;
 mod triggers;
 mod types;

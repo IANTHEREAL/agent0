@@ -1,17 +1,23 @@
+use crate::sql::optimizer::statistics::TableStatistics;
 use dashmap::DashMap;
+use std::sync::Arc;
 
-/// Per-tenant cache for table row-count estimates used by the query planner.
+/// Per-tenant cache for table statistics used by the query planner.
 ///
 /// Owned by `TenantEntry` in the pool — when the reaper drops the entry,
 /// the cache is dropped automatically (no manual eviction needed).
 pub(crate) struct TableStatsCache {
+    /// Quick row-count estimates (populated by full scans and DML bumps).
     inner: DashMap<(u64, u64), usize>, // (db_id, table_id) → estimated row count
+    /// Full column statistics collected by ANALYZE.
+    full_stats: DashMap<(u64, u64), Arc<TableStatistics>>,
 }
 
 impl TableStatsCache {
     pub(crate) fn new() -> Self {
         Self {
             inner: DashMap::new(),
+            full_stats: DashMap::new(),
         }
     }
 
@@ -40,11 +46,38 @@ impl TableStatsCache {
     pub(crate) fn get_estimate(&self, db_id: u64, table_id: u64) -> Option<usize> {
         self.inner.get(&(db_id, table_id)).map(|r| *r)
     }
+
+    /// Cache full column statistics collected by ANALYZE.
+    ///
+    /// Also syncs the row-count estimate from `stats.row_count`.
+    pub(crate) fn update_full_stats(&self, db_id: u64, table_id: u64, stats: Arc<TableStatistics>) {
+        self.inner.insert((db_id, table_id), stats.row_count);
+        self.full_stats.insert((db_id, table_id), stats);
+    }
+
+    /// Retrieve cached full column statistics, if available.
+    pub(crate) fn get_full_stats(&self, db_id: u64, table_id: u64) -> Option<Arc<TableStatistics>> {
+        self.full_stats
+            .get(&(db_id, table_id))
+            .map(|r| Arc::clone(&r))
+    }
+
+    /// Remove all cached data for a table (row-count estimate + full stats).
+    ///
+    /// Called on DROP TABLE to prevent stale statistics from influencing
+    /// the planner. ALTER TABLE invalidation will be added in PR2 when
+    /// ANALYZE populates stats that could actually go stale.
+    pub(crate) fn invalidate(&self, db_id: u64, table_id: u64) {
+        self.inner.remove(&(db_id, table_id));
+        self.full_stats.remove(&(db_id, table_id));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql::optimizer::statistics::ColumnStatistics;
+    use std::collections::HashMap;
 
     #[test]
     fn test_stats_update_and_get() {
@@ -99,5 +132,124 @@ mod tests {
         // After drop, a new cache has no entries
         let cache2 = TableStatsCache::new();
         assert_eq!(cache2.get_estimate(1, 1), None);
+    }
+
+    #[test]
+    fn test_full_stats_update_and_get() {
+        let cache = TableStatsCache::new();
+        let stats = Arc::new(TableStatistics {
+            table_id: 42,
+            row_count: 5000,
+            last_analyzed: 1708100000000,
+            columns: HashMap::new(),
+        });
+
+        cache.update_full_stats(1, 42, stats.clone());
+
+        // Full stats should be retrievable
+        let retrieved = cache.get_full_stats(1, 42);
+        assert!(retrieved.is_some());
+        let retrieved = retrieved.unwrap();
+        assert_eq!(retrieved.table_id, 42);
+        assert_eq!(retrieved.row_count, 5000);
+
+        // Row-count estimate should be synced
+        assert_eq!(cache.get_estimate(1, 42), Some(5000));
+    }
+
+    #[test]
+    fn test_full_stats_missing_returns_none() {
+        let cache = TableStatsCache::new();
+        assert!(cache.get_full_stats(1, 999).is_none());
+    }
+
+    #[test]
+    fn test_full_stats_overwrite() {
+        let cache = TableStatsCache::new();
+        let stats1 = Arc::new(TableStatistics {
+            table_id: 10,
+            row_count: 100,
+            last_analyzed: 1000,
+            columns: HashMap::new(),
+        });
+        let stats2 = Arc::new(TableStatistics {
+            table_id: 10,
+            row_count: 200,
+            last_analyzed: 2000,
+            columns: HashMap::new(),
+        });
+
+        cache.update_full_stats(1, 10, stats1);
+        cache.update_full_stats(1, 10, stats2);
+
+        let retrieved = cache.get_full_stats(1, 10).unwrap();
+        assert_eq!(retrieved.row_count, 200);
+        assert_eq!(retrieved.last_analyzed, 2000);
+        assert_eq!(cache.get_estimate(1, 10), Some(200));
+    }
+
+    #[test]
+    fn test_invalidate_removes_both() {
+        let cache = TableStatsCache::new();
+        let stats = Arc::new(TableStatistics {
+            table_id: 42,
+            row_count: 5000,
+            last_analyzed: 1000,
+            columns: HashMap::new(),
+        });
+
+        cache.update_full_stats(1, 42, stats);
+        assert!(cache.get_estimate(1, 42).is_some());
+        assert!(cache.get_full_stats(1, 42).is_some());
+
+        cache.invalidate(1, 42);
+
+        assert!(cache.get_estimate(1, 42).is_none());
+        assert!(cache.get_full_stats(1, 42).is_none());
+    }
+
+    #[test]
+    fn test_invalidate_does_not_affect_other_tables() {
+        let cache = TableStatsCache::new();
+        cache.update_estimate(1, 10, 100);
+        cache.update_estimate(1, 20, 200);
+
+        let stats = Arc::new(TableStatistics {
+            table_id: 10,
+            row_count: 100,
+            last_analyzed: 1000,
+            columns: HashMap::new(),
+        });
+        cache.update_full_stats(1, 10, stats);
+
+        cache.invalidate(1, 10);
+
+        assert!(cache.get_estimate(1, 10).is_none());
+        assert_eq!(cache.get_estimate(1, 20), Some(200));
+    }
+
+    #[test]
+    fn test_bump_estimate_and_full_stats_independent() {
+        let cache = TableStatsCache::new();
+        let mut columns = HashMap::new();
+        columns.insert("id".to_string(), ColumnStatistics::empty());
+
+        let stats = Arc::new(TableStatistics {
+            table_id: 42,
+            row_count: 1000,
+            last_analyzed: 1000,
+            columns,
+        });
+
+        cache.update_full_stats(1, 42, stats);
+        assert_eq!(cache.get_estimate(1, 42), Some(1000));
+
+        // DML bumps modify the row-count estimate but not full stats
+        cache.bump_estimate(1, 42, 50);
+        assert_eq!(cache.get_estimate(1, 42), Some(1050));
+
+        // Full stats still reflect the ANALYZE-time value
+        let full = cache.get_full_stats(1, 42).unwrap();
+        assert_eq!(full.row_count, 1000);
     }
 }
