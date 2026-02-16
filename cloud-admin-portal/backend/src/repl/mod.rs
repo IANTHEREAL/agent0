@@ -4,6 +4,7 @@ use rustyline::{error::ReadlineError, history::DefaultHistory, Config, Editor};
 use crate::{make_auth_headers, require_token, OutputFormat};
 
 pub mod commands;
+pub mod completer;
 pub mod exec;
 pub mod output;
 
@@ -62,13 +63,20 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
             }
         };
 
-        let mut rl = match Editor::<(), DefaultHistory>::with_config(config) {
+        let mut rl = match Editor::<completer::SqlHelper, DefaultHistory>::with_config(config) {
             Ok(editor) => editor,
             Err(e) => {
                 eprintln!("Failed to initialize line editor: {e}");
                 return;
             }
         };
+        rl.set_helper(Some(completer::SqlHelper::new()));
+
+        if let Ok(tables) = handle.block_on(commands::fetch_table_names(&api, &id)) {
+            if let Some(helper) = rl.helper_mut() {
+                helper.set_tables(tables);
+            }
+        }
 
         let history_path = crate::ensure_config_dir().join("history");
         rl.load_history(&history_path).ok();
@@ -119,7 +127,7 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
 
             if trimmed.starts_with('\\') {
                 buffer.clear();
-                if handle.block_on(commands::dispatch(
+                match handle.block_on(commands::dispatch(
                     &api,
                     &output,
                     &id,
@@ -127,7 +135,13 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
                     &mut repl_state,
                     trimmed,
                 )) {
-                    break;
+                    commands::DispatchResult::Exit => break,
+                    commands::DispatchResult::RefreshedTables(tables) => {
+                        if let Some(helper) = rl.helper_mut() {
+                            helper.set_tables(tables);
+                        }
+                    }
+                    commands::DispatchResult::Continue => {}
                 }
                 continue;
             }

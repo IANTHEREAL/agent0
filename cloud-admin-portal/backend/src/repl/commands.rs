@@ -1,8 +1,56 @@
 use pgtikv_admin::cli_common::ApiClient;
+use serde_json::Value;
 
-use crate::OutputFormat;
+use crate::{make_auth_headers, require_token, OutputFormat};
 
 use super::{exec::repl_exec, ReplState};
+
+pub enum DispatchResult {
+    Continue,
+    Exit,
+    RefreshedTables(Vec<String>),
+}
+
+pub async fn fetch_table_names(api: &ApiClient, id: &str) -> Result<Vec<String>, String> {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+    let body = serde_json::json!({
+        "query": "SELECT table_name FROM information_schema.tables \
+                  WHERE table_schema NOT IN ('pg_catalog','information_schema') \
+                  ORDER BY table_name"
+    });
+
+    match api
+        .try_request(
+            "POST",
+            &format!("/customer/databases/{id}/sql"),
+            Some(&body),
+            Some(&headers),
+        )
+        .await
+    {
+        Ok(data) => Ok(extract_table_names(&data)),
+        Err((_status, detail)) => Err(detail),
+    }
+}
+
+fn extract_table_names(data: &Value) -> Vec<String> {
+    let mut tables = Vec::new();
+
+    if let Some(rows) = data["rows"].as_array() {
+        for row in rows {
+            if let Some(name) = row
+                .as_array()
+                .and_then(|vals| vals.first())
+                .and_then(|v| v.as_str())
+            {
+                tables.push(name.to_string());
+            }
+        }
+    }
+
+    tables
+}
 
 pub async fn dispatch(
     api: &ApiClient,
@@ -11,17 +59,17 @@ pub async fn dispatch(
     show_timing: &mut bool,
     repl_state: &mut ReplState,
     trimmed: &str,
-) -> bool {
+) -> DispatchResult {
     let (cmd, arg) = match trimmed.find(char::is_whitespace) {
         Some(pos) => (&trimmed[..pos], trimmed[pos..].trim()),
         None => (trimmed, ""),
     };
 
     match cmd {
-        "\\q" | "\\quit" => true,
+        "\\q" | "\\quit" => DispatchResult::Exit,
         "\\?" | "\\help" => {
             repl_help();
-            false
+            DispatchResult::Continue
         }
         "\\dt" => {
             repl_exec(
@@ -35,7 +83,7 @@ pub async fn dispatch(
                  ORDER BY table_schema, table_name",
             )
             .await;
-            false
+            DispatchResult::Continue
         }
         "\\dn" => {
             repl_exec(
@@ -49,7 +97,7 @@ pub async fn dispatch(
                  ORDER BY schema_name",
             )
             .await;
-            false
+            DispatchResult::Continue
         }
         "\\di" => {
             repl_exec(
@@ -63,7 +111,7 @@ pub async fn dispatch(
                  ORDER BY schemaname, tablename, indexname",
             )
             .await;
-            false
+            DispatchResult::Continue
         }
         "\\d" => {
             if arg.is_empty() {
@@ -95,20 +143,30 @@ pub async fn dispatch(
                 )
                 .await;
             }
-            false
+            DispatchResult::Continue
         }
+        "\\refresh" => match fetch_table_names(api, id).await {
+            Ok(tables) => {
+                eprintln!("Refreshed {} table name(s).", tables.len());
+                DispatchResult::RefreshedTables(tables)
+            }
+            Err(detail) => {
+                eprintln!("ERROR: {detail}");
+                DispatchResult::Continue
+            }
+        },
         "\\timing" => {
             *show_timing = !*show_timing;
             eprintln!("Timing is {}.", if *show_timing { "on" } else { "off" });
-            false
+            DispatchResult::Continue
         }
         "\\pager" => {
             handle_pager_command(repl_state, arg);
-            false
+            DispatchResult::Continue
         }
         _ => {
             eprintln!("Unknown command: {cmd}. Type \\? for help.");
-            false
+            DispatchResult::Continue
         }
     }
 }
@@ -142,6 +200,7 @@ fn repl_help() {
     eprintln!("  \\dt           List tables");
     eprintln!("  \\dn           List schemas");
     eprintln!("  \\di           List indexes");
+    eprintln!("  \\refresh      Refresh SQL completion table cache");
     eprintln!("  \\timing       Toggle query timing");
     eprintln!("  \\pager [CMD]  Control paging (on/off/CMD)");
     eprintln!("  \\q            Quit");
