@@ -3,7 +3,8 @@ use std::collections::HashSet;
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
-use rustyline::hint::Hinter;
+use rustyline::hint::{Hint, Hinter};
+use rustyline::history::SearchDirection;
 use rustyline::validate::Validator;
 use rustyline::{Context, Helper, Result};
 
@@ -350,10 +351,49 @@ impl Highlighter for SqlHelper {
     fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
         self.highlighting_enabled
     }
+
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        if !self.highlighting_enabled {
+            return Cow::Borrowed(hint);
+        }
+        Cow::Owned(format!("\x1b[90m{}\x1b[0m", hint))
+    }
+}
+
+pub struct SqlHint(String);
+
+impl Hint for SqlHint {
+    fn display(&self) -> &str {
+        &self.0
+    }
+
+    fn completion(&self) -> Option<&str> {
+        Some(&self.0)
+    }
 }
 
 impl Hinter for SqlHelper {
-    type Hint = String;
+    type Hint = SqlHint;
+
+    fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<Self::Hint> {
+        if line.len() < 3 || pos < line.len() {
+            return None;
+        }
+
+        let lower = line.to_lowercase();
+
+        for idx in (0..ctx.history().len()).rev() {
+            if let Ok(Some(entry)) = ctx.history().get(idx, SearchDirection::Forward) {
+                let entry_str = entry.entry.as_ref();
+                if entry_str.to_lowercase().starts_with(&lower) && entry_str.len() > line.len() {
+                    let suffix = entry_str[line.len()..].to_string();
+                    return Some(SqlHint(suffix));
+                }
+            }
+        }
+
+        None
+    }
 }
 
 impl Validator for SqlHelper {}
