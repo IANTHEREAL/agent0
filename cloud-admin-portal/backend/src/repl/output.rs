@@ -299,81 +299,298 @@ pub fn print_sql_result(
             }
         }
     }
+}
 
-    #[cfg(test)]
-    mod tests {
-        use super::*;
+pub fn format_sql_result(data: &Value, output: &OutputFormat, expanded: ExpandedMode) -> String {
+    if matches!(output, OutputFormat::Json) {
+        return serde_json::to_string_pretty(data).unwrap_or_default() + "\n";
+    }
 
-        #[test]
-        fn test_expanded_output_single_row() {
-            let data = serde_json::json!({
-                "columns": [
-                    {"name": "id"},
-                    {"name": "name"},
-                    {"name": "email"}
-                ],
-                "rows": [
-                    [1, "Alice", "alice@example.com"]
-                ]
-            });
-
-            let pager_enabled = false;
-            let pager_command = None;
-
-            print_sql_result_expanded(&data, pager_enabled, &pager_command);
+    let columns = match data["columns"].as_array() {
+        Some(cols) if !cols.is_empty() => cols,
+        _ => {
+            return format!("{}\n", data["command"].as_str().unwrap_or("OK"));
         }
+    };
+    let rows = data["rows"].as_array().map(|r| r.as_slice()).unwrap_or(&[]);
 
-        #[test]
-        fn test_expanded_output_multiple_rows() {
-            let data = serde_json::json!({
-                "columns": [
-                    {"name": "id"},
-                    {"name": "name"},
-                    {"name": "email"}
-                ],
-                "rows": [
-                    [1, "Alice", "alice@example.com"],
-                    [2, "Bob", "bob@example.com"]
-                ]
-            });
-
-            print_sql_result_expanded(&data, false, &None);
+    match output {
+        OutputFormat::Csv => {
+            let mut buf = String::new();
+            let header: Vec<&str> = columns.iter().filter_map(|c| c["name"].as_str()).collect();
+            buf.push_str(&header.join(","));
+            buf.push('\n');
+            for row in rows {
+                if let Some(vals) = row.as_array() {
+                    let line: Vec<String> = vals
+                        .iter()
+                        .map(|v| match v {
+                            Value::Null => "".to_string(),
+                            Value::String(s) => {
+                                if s.contains(',') || s.contains('"') || s.contains('\n') {
+                                    format!("\"{}\"", s.replace('"', "\"\""))
+                                } else {
+                                    s.clone()
+                                }
+                            }
+                            other => other.to_string(),
+                        })
+                        .collect();
+                    buf.push_str(&line.join(","));
+                    buf.push('\n');
+                }
+            }
+            buf
         }
+        _ => {
+            let col_names: Vec<String> = columns
+                .iter()
+                .map(|c| c["name"].as_str().unwrap_or("?").to_string())
+                .collect();
 
-        #[test]
-        fn test_expanded_output_with_nulls() {
-            let data = serde_json::json!({
-                "columns": [
-                    {"name": "id"},
-                    {"name": "name"},
-                    {"name": "email"}
-                ],
-                "rows": [
-                    [1, "Alice", Value::Null],
-                    [2, Value::Null, "bob@example.com"]
-                ]
-            });
+            let use_expanded = match expanded {
+                ExpandedMode::On => true,
+                ExpandedMode::Off => false,
+                ExpandedMode::Auto => {
+                    let widths: Vec<usize> = col_names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            let max_val = rows
+                                .iter()
+                                .map(|row| {
+                                    row.as_array()
+                                        .and_then(|arr| arr.get(i))
+                                        .map(|v| match v {
+                                            Value::Null => 4,
+                                            Value::String(s) => s.len(),
+                                            other => other.to_string().len(),
+                                        })
+                                        .unwrap_or(0)
+                                })
+                                .max()
+                                .unwrap_or(0);
+                            name.len().max(max_val).max(4)
+                        })
+                        .collect();
+                    let total_width: usize = widths.iter().sum::<usize>() + (widths.len() - 1) * 2;
+                    total_width > get_terminal_width()
+                }
+            };
 
-            print_sql_result_expanded(&data, false, &None);
+            if use_expanded {
+                format_expanded(data)
+            } else {
+                format_table(data)
+            }
         }
+    }
+}
 
-        #[test]
-        fn test_expanded_mode_toggle() {
-            let mut mode = ExpandedMode::Off;
-            assert_eq!(mode, ExpandedMode::Off);
+fn format_expanded(data: &Value) -> String {
+    let columns = match data["columns"].as_array() {
+        Some(cols) if !cols.is_empty() => cols,
+        _ => return format!("{}\n", data["command"].as_str().unwrap_or("OK")),
+    };
+    let rows = data["rows"].as_array().map(|r| r.as_slice()).unwrap_or(&[]);
 
-            mode = ExpandedMode::On;
-            assert_eq!(mode, ExpandedMode::On);
+    let col_names: Vec<String> = columns
+        .iter()
+        .map(|c| c["name"].as_str().unwrap_or("?").to_string())
+        .collect();
+    let max_col_len = col_names.iter().map(|n| n.len()).max().unwrap_or(0);
 
-            mode = ExpandedMode::Auto;
-            assert_eq!(mode, ExpandedMode::Auto);
+    let mut buf = String::new();
+    for (record_num, row) in rows.iter().enumerate() {
+        if let Some(vals) = row.as_array() {
+            let sep_dashes = "─".repeat(max_col_len + 3);
+            buf.push_str(&format!("-[ RECORD {} ]{}\n", record_num + 1, sep_dashes));
+            for (i, col_name) in col_names.iter().enumerate() {
+                let val_str = vals
+                    .get(i)
+                    .map(|v| match v {
+                        Value::Null => "(null)".to_string(),
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_else(|| "(null)".to_string());
+                buf.push_str(&format!(
+                    "{:<width$} | {}\n",
+                    col_name,
+                    val_str,
+                    width = max_col_len
+                ));
+            }
         }
+    }
+    let n = rows.len();
+    buf.push_str(&format!(
+        "({} {})\n",
+        n,
+        if n == 1 { "row" } else { "rows" }
+    ));
+    buf
+}
 
-        #[test]
-        fn test_repl_state_default() {
-            let state = super::super::ReplState::default();
-            assert_eq!(state.expanded, ExpandedMode::Off);
-            assert!(state.pager_enabled);
+fn format_table(data: &Value) -> String {
+    let columns = match data["columns"].as_array() {
+        Some(cols) if !cols.is_empty() => cols,
+        _ => return format!("{}\n", data["command"].as_str().unwrap_or("OK")),
+    };
+    let rows = data["rows"].as_array().map(|r| r.as_slice()).unwrap_or(&[]);
+
+    let col_names: Vec<String> = columns
+        .iter()
+        .map(|c| c["name"].as_str().unwrap_or("?").to_string())
+        .collect();
+
+    let widths: Vec<usize> = col_names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            let max_val = rows
+                .iter()
+                .map(|row| {
+                    row.as_array()
+                        .and_then(|arr| arr.get(i))
+                        .map(|v| match v {
+                            Value::Null => 4,
+                            Value::String(s) => s.len(),
+                            other => other.to_string().len(),
+                        })
+                        .unwrap_or(0)
+                })
+                .max()
+                .unwrap_or(0);
+            name.len().max(max_val).max(4)
+        })
+        .collect();
+
+    let mut buf = String::new();
+
+    let header: String = col_names
+        .iter()
+        .zip(&widths)
+        .map(|(name, w)| format!("{:<width$}", name, width = w))
+        .collect::<Vec<_>>()
+        .join("  ");
+    buf.push_str(&header);
+    buf.push('\n');
+
+    let sep: String = widths
+        .iter()
+        .map(|w| "─".repeat(*w))
+        .collect::<Vec<_>>()
+        .join("  ");
+    buf.push_str(&sep);
+    buf.push('\n');
+
+    for row in rows {
+        if let Some(vals) = row.as_array() {
+            let line: String = vals
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let w = widths.get(i).copied().unwrap_or(4);
+                    let s = match v {
+                        Value::Null => "NULL".to_string(),
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    format!("{:<width$}", s, width = w)
+                })
+                .collect::<Vec<_>>()
+                .join("  ");
+            buf.push_str(&line);
+            buf.push('\n');
         }
+    }
+    let n = rows.len();
+    buf.push_str(&format!(
+        "({} {})\n",
+        n,
+        if n == 1 { "row" } else { "rows" }
+    ));
+    buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_expanded_output_single_row() {
+        let data = serde_json::json!({
+            "columns": [
+                {"name": "id"},
+                {"name": "name"},
+                {"name": "email"}
+            ],
+            "rows": [
+                [1, "Alice", "alice@example.com"]
+            ]
+        });
+
+        let pager_enabled = false;
+        let pager_command = None;
+
+        print_sql_result_expanded(&data, pager_enabled, &pager_command);
+    }
+
+    #[test]
+    fn test_expanded_output_multiple_rows() {
+        let data = serde_json::json!({
+            "columns": [
+                {"name": "id"},
+                {"name": "name"},
+                {"name": "email"}
+            ],
+            "rows": [
+                [1, "Alice", "alice@example.com"],
+                [2, "Bob", "bob@example.com"]
+            ]
+        });
+
+        print_sql_result_expanded(&data, false, &None);
+    }
+
+    #[test]
+    fn test_expanded_output_with_nulls() {
+        let data = serde_json::json!({
+            "columns": [
+                {"name": "id"},
+                {"name": "name"},
+                {"name": "email"}
+            ],
+            "rows": [
+                [1, "Alice", Value::Null],
+                [2, Value::Null, "bob@example.com"]
+            ]
+        });
+
+        print_sql_result_expanded(&data, false, &None);
+    }
+
+    #[test]
+    fn test_expanded_mode_toggle() {
+        let mut mode = ExpandedMode::Off;
+        assert_eq!(mode, ExpandedMode::Off);
+
+        mode = ExpandedMode::On;
+        assert_eq!(mode, ExpandedMode::On);
+
+        mode = ExpandedMode::Auto;
+        assert_eq!(mode, ExpandedMode::Auto);
+    }
+
+    #[test]
+    fn test_repl_state_new() {
+        let state = super::super::ReplState::new(
+            "test_id".to_string(),
+            "test_db".to_string(),
+            "http://localhost".to_string(),
+        );
+        assert_eq!(state.expanded, ExpandedMode::Off);
+        assert!(state.pager_enabled);
     }
 }

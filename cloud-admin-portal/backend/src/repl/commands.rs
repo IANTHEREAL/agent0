@@ -17,6 +17,7 @@ pub enum DispatchResult {
         tables: Vec<String>,
     },
     ExecuteQuery(String),
+    HighlightChanged(bool),
 }
 
 pub async fn fetch_table_names(api: &ApiClient, id: &str) -> Result<Vec<String>, String> {
@@ -249,6 +250,7 @@ pub async fn dispatch(
             handle_expanded_command(repl_state, arg);
             DispatchResult::Continue
         }
+        "\\highlight" => handle_highlight_command(arg),
         _ => {
             eprintln!("Unknown command: {cmd}. Type \\? for help.");
             DispatchResult::Continue
@@ -690,6 +692,19 @@ fn handle_list_favorites(repl_state: &ReplState) {
     eprintln!("({} {})", favorites.len(), if favorites.len() == 1 { "favorite" } else { "favorites" });
 }
 
+fn handle_highlight_command(arg: &str) -> DispatchResult {
+    if arg.is_empty() || arg.eq_ignore_ascii_case("on") {
+        eprintln!("Syntax highlighting is on.");
+        DispatchResult::HighlightChanged(true)
+    } else if arg.eq_ignore_ascii_case("off") {
+        eprintln!("Syntax highlighting is off.");
+        DispatchResult::HighlightChanged(false)
+    } else {
+        eprintln!("Usage: \\highlight [on|off]");
+        DispatchResult::Continue
+    }
+}
+
 fn repl_help() {
     eprintln!("Meta-commands:");
     eprintln!("  \\d [TABLE]    Describe table columns, or list all tables");
@@ -708,6 +723,7 @@ fn repl_help() {
     eprintln!("  \\timing       Toggle query timing");
     eprintln!("  \\pager [CMD]  Control paging (on/off/CMD)");
     eprintln!("  \\x [MODE]     Toggle expanded display (on/off/auto)");
+    eprintln!("  \\highlight    Toggle SQL syntax highlighting (on/off)");
     eprintln!("  \\fs <N> [Q]   Save favorite query (Q defaults to last query)");
     eprintln!("  \\f <NAME>     Execute saved favorite query");
     eprintln!("  \\fd <NAME>    Delete saved favorite query");

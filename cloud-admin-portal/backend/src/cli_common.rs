@@ -159,6 +159,10 @@ impl ApiClient {
         self
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     async fn send_request(
         &self,
         method: &str,

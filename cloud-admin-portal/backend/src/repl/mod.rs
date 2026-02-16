@@ -214,6 +214,11 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
                         (prompt_main, prompt_cont) = get_prompts(new_tx_state, &repl_state.db_name);
                         repl_state.last_query = Some(sql);
                     }
+                    commands::DispatchResult::HighlightChanged(enabled) => {
+                        if let Some(helper) = rl.helper_mut() {
+                            helper.set_highlighting(enabled);
+                        }
+                    }
                     commands::DispatchResult::Continue => {}
                 }
                 continue;

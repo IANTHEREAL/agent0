@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use rustyline::completion::{Completer, Pair};
@@ -173,14 +174,21 @@ const SQL_KEYWORDS: &[&str] = &[
 pub struct SqlHelper {
     keywords: Vec<String>,
     table_names: Vec<String>,
+    highlighting_enabled: bool,
 }
 
 impl SqlHelper {
     pub fn new() -> Self {
+        let highlighting_enabled = std::env::var("NO_COLOR").is_err();
         Self {
             keywords: SQL_KEYWORDS.iter().map(|kw| (*kw).to_string()).collect(),
             table_names: Vec::new(),
+            highlighting_enabled,
         }
+    }
+
+    pub fn set_highlighting(&mut self, enabled: bool) {
+        self.highlighting_enabled = enabled;
     }
 
     pub fn set_tables(&mut self, mut tables: Vec<String>) {
@@ -223,8 +231,126 @@ impl Default for SqlHelper {
     }
 }
 
+// ── ANSI color codes ────────────────────────────────────────────
+const ANSI_RESET: &str = "\x1b[0m";
+const ANSI_KEYWORD: &str = "\x1b[1;34m"; // bold blue
+const ANSI_STRING: &str = "\x1b[32m"; // green
+const ANSI_NUMBER: &str = "\x1b[33m"; // yellow
+const ANSI_COMMENT: &str = "\x1b[90m"; // gray
+const ANSI_OPERATOR: &str = "\x1b[36m"; // cyan
+
+fn is_keyword(word: &str) -> bool {
+    let upper = word.to_ascii_uppercase();
+    SQL_KEYWORDS.iter().any(|kw| *kw == upper)
+}
+
+pub fn highlight_sql(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len + 128);
+    let mut i = 0;
+
+    while i < len {
+        let b = bytes[i];
+
+        if b == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            out.push_str(ANSI_COMMENT);
+            out.push_str(&line[i..]);
+            out.push_str(ANSI_RESET);
+            return out;
+        }
+
+        if b == b'\'' {
+            out.push_str(ANSI_STRING);
+            out.push(b as char);
+            i += 1;
+            while i < len {
+                let c = bytes[i];
+                out.push(c as char);
+                if c == b'\'' {
+                    if i + 1 < len && bytes[i + 1] == b'\'' {
+                        i += 1;
+                        out.push(bytes[i] as char);
+                    } else {
+                        break;
+                    }
+                }
+                i += 1;
+            }
+            out.push_str(ANSI_RESET);
+            i += 1;
+            continue;
+        }
+
+        if b.is_ascii_digit() || (b == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit()) {
+            out.push_str(ANSI_NUMBER);
+            while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            out.push_str(ANSI_RESET);
+            continue;
+        }
+
+        if matches!(b, b'=' | b'<' | b'>' | b'!') {
+            out.push_str(ANSI_OPERATOR);
+            if b == b'!' && i + 1 < len && bytes[i + 1] == b'=' {
+                out.push_str("!=");
+                i += 2;
+            } else if b == b'<' && i + 1 < len && bytes[i + 1] == b'>' {
+                out.push_str("<>");
+                i += 2;
+            } else if b == b'<' && i + 1 < len && bytes[i + 1] == b'=' {
+                out.push_str("<=");
+                i += 2;
+            } else if b == b'>' && i + 1 < len && bytes[i + 1] == b'=' {
+                out.push_str(">=");
+                i += 2;
+            } else {
+                out.push(b as char);
+                i += 1;
+            }
+            out.push_str(ANSI_RESET);
+            continue;
+        }
+
+        if b.is_ascii_alphabetic() || b == b'_' {
+            let start = i;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let word = &line[start..i];
+            if is_keyword(word) {
+                out.push_str(ANSI_KEYWORD);
+                out.push_str(word);
+                out.push_str(ANSI_RESET);
+            } else {
+                out.push_str(word);
+            }
+            continue;
+        }
+
+        out.push(b as char);
+        i += 1;
+    }
+
+    out
+}
+
 impl Helper for SqlHelper {}
-impl Highlighter for SqlHelper {}
+
+impl Highlighter for SqlHelper {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> Cow<'l, str> {
+        if !self.highlighting_enabled {
+            return Cow::Borrowed(line);
+        }
+        Cow::Owned(highlight_sql(line))
+    }
+
+    fn highlight_char(&self, _line: &str, _pos: usize, _forced: bool) -> bool {
+        self.highlighting_enabled
+    }
+}
 
 impl Hinter for SqlHelper {
     type Hint = String;
@@ -311,5 +437,124 @@ mod tests {
         let helper = SqlHelper::new();
         let inside = complete_for(&helper, "SELECT 'SEL");
         assert!(inside.is_empty());
+    }
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut in_escape = false;
+        for ch in s.chars() {
+            if ch == '\x1b' {
+                in_escape = true;
+            } else if in_escape {
+                if ch == 'm' {
+                    in_escape = false;
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn highlight_preserves_text_content() {
+        let input = "SELECT name FROM users WHERE id = 1";
+        let highlighted = highlight_sql(input);
+        assert_eq!(strip_ansi(&highlighted), input);
+    }
+
+    #[test]
+    fn highlight_keywords_get_colored() {
+        let highlighted = highlight_sql("SELECT");
+        assert!(highlighted.contains(ANSI_KEYWORD));
+        assert!(highlighted.contains(ANSI_RESET));
+    }
+
+    #[test]
+    fn highlight_string_literal() {
+        let highlighted = highlight_sql("'hello world'");
+        assert!(highlighted.contains(ANSI_STRING));
+        assert_eq!(strip_ansi(&highlighted), "'hello world'");
+    }
+
+    #[test]
+    fn highlight_keyword_inside_string_not_colored() {
+        let highlighted = highlight_sql("'SELECT'");
+        assert!(highlighted.contains(ANSI_STRING));
+        assert!(!highlighted.contains(ANSI_KEYWORD));
+    }
+
+    #[test]
+    fn highlight_numbers() {
+        let highlighted = highlight_sql("42");
+        assert!(highlighted.contains(ANSI_NUMBER));
+        assert_eq!(strip_ansi(&highlighted), "42");
+
+        let decimal = highlight_sql("3.14");
+        assert!(decimal.contains(ANSI_NUMBER));
+        assert_eq!(strip_ansi(&decimal), "3.14");
+    }
+
+    #[test]
+    fn highlight_operators() {
+        for op in &["=", "<", ">", "!=", "<=", ">=", "<>"] {
+            let highlighted = highlight_sql(op);
+            assert!(
+                highlighted.contains(ANSI_OPERATOR),
+                "operator {op} not highlighted"
+            );
+            assert_eq!(strip_ansi(&highlighted), *op);
+        }
+    }
+
+    #[test]
+    fn highlight_line_comment() {
+        let highlighted = highlight_sql("-- this is a comment");
+        assert!(highlighted.contains(ANSI_COMMENT));
+        assert_eq!(strip_ansi(&highlighted), "-- this is a comment");
+    }
+
+    #[test]
+    fn highlight_mixed_statement() {
+        let input = "SELECT id, name FROM users WHERE age >= 18 AND name = 'Alice' -- filter";
+        let highlighted = highlight_sql(input);
+        assert_eq!(strip_ansi(&highlighted), input);
+        assert!(highlighted.contains(ANSI_KEYWORD));
+        assert!(highlighted.contains(ANSI_STRING));
+        assert!(highlighted.contains(ANSI_NUMBER));
+        assert!(highlighted.contains(ANSI_OPERATOR));
+        assert!(highlighted.contains(ANSI_COMMENT));
+    }
+
+    #[test]
+    fn highlight_empty_input() {
+        assert_eq!(highlight_sql(""), "");
+    }
+
+    #[test]
+    fn highlight_non_keyword_identifiers() {
+        let highlighted = highlight_sql("mytable");
+        assert!(!highlighted.contains(ANSI_KEYWORD));
+        assert_eq!(highlighted, "mytable");
+    }
+
+    #[test]
+    fn highlight_case_insensitive_keywords() {
+        for kw in &["select", "Select", "SELECT", "sElEcT"] {
+            let highlighted = highlight_sql(kw);
+            assert!(
+                highlighted.contains(ANSI_KEYWORD),
+                "{kw} not recognized as keyword"
+            );
+        }
+    }
+
+    #[test]
+    fn highlight_escaped_quote_in_string() {
+        let input = "'it''s a test'";
+        let highlighted = highlight_sql(input);
+        assert_eq!(strip_ansi(&highlighted), input);
+        assert!(highlighted.contains(ANSI_STRING));
+        assert!(!highlighted.contains(ANSI_KEYWORD));
     }
 }
