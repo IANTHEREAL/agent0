@@ -201,6 +201,11 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
                 helper.set_tables(tables);
             }
         }
+        if let Ok(columns) = handle.block_on(commands::fetch_column_names(&api, &id)) {
+            if let Some(helper) = rl.helper_mut() {
+                helper.set_columns(columns);
+            }
+        }
 
         let history_path = crate::ensure_config_dir().join("history");
         rl.load_history(&history_path).ok();
@@ -326,18 +331,25 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
                     trimmed,
                 )) {
                     commands::DispatchResult::Exit => break,
-                    commands::DispatchResult::RefreshedTables(tables) => {
+                    commands::DispatchResult::RefreshedMetadata { tables, columns } => {
                         if let Some(helper) = rl.helper_mut() {
                             helper.set_tables(tables);
+                            helper.set_columns(columns);
                         }
                     }
-                    commands::DispatchResult::SwitchedDatabase { id, name, tables } => {
+                    commands::DispatchResult::SwitchedDatabase {
+                        id,
+                        name,
+                        tables,
+                        columns,
+                    } => {
                         repl_state.db_id = id;
                         repl_state.db_name = name.clone();
                         repl_state.tx_state = TxState::Idle;
                         (prompt_main, prompt_cont) = get_prompts(TxState::Idle, &name, is_direct);
                         if let Some(helper) = rl.helper_mut() {
                             helper.set_tables(tables);
+                            helper.set_columns(columns);
                         }
                     }
                     commands::DispatchResult::ExecuteQuery(sql) => {

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::process::Command;
 
 use pgtikv_admin::cli_common::ApiClient;
@@ -10,11 +11,15 @@ use super::{exec::repl_exec, ExpandedMode, LinestyleMode, ReplState};
 pub enum DispatchResult {
     Continue,
     Exit,
-    RefreshedTables(Vec<String>),
+    RefreshedMetadata {
+        tables: Vec<String>,
+        columns: HashMap<String, Vec<String>>,
+    },
     SwitchedDatabase {
         id: String,
         name: String,
         tables: Vec<String>,
+        columns: HashMap<String, Vec<String>>,
     },
     ExecuteQuery(String),
     HighlightChanged(bool),
@@ -60,6 +65,52 @@ fn extract_table_names(data: &Value) -> Vec<String> {
     }
 
     tables
+}
+
+pub async fn fetch_column_names(
+    api: &ApiClient,
+    id: &str,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+    let body = serde_json::json!({
+        "query": "SELECT table_name, column_name FROM information_schema.columns \
+                  WHERE table_schema NOT IN ('pg_catalog','information_schema') \
+                  ORDER BY table_name, ordinal_position"
+    });
+
+    match api
+        .try_request(
+            "POST",
+            &format!("/customer/databases/{id}/sql"),
+            Some(&body),
+            Some(&headers),
+        )
+        .await
+    {
+        Ok(data) => Ok(extract_column_names(&data)),
+        Err((_status, detail)) => Err(detail),
+    }
+}
+
+fn extract_column_names(data: &Value) -> HashMap<String, Vec<String>> {
+    let mut columns: HashMap<String, Vec<String>> = HashMap::new();
+    if let Some(rows) = data["rows"].as_array() {
+        for row in rows {
+            if let Some(arr) = row.as_array() {
+                if let (Some(table), Some(col)) = (
+                    arr.first().and_then(|v| v.as_str()),
+                    arr.get(1).and_then(|v| v.as_str()),
+                ) {
+                    columns
+                        .entry(table.to_lowercase())
+                        .or_default()
+                        .push(col.to_string());
+                }
+            }
+        }
+    }
+    columns
 }
 
 pub async fn dispatch(
@@ -228,16 +279,13 @@ pub async fn dispatch(
                 handle_connect(api, arg).await
             }
         }
-        "\\refresh" => match fetch_table_names(api, id).await {
-            Ok(tables) => {
-                eprintln!("Refreshed {} table name(s).", tables.len());
-                DispatchResult::RefreshedTables(tables)
-            }
-            Err(detail) => {
-                eprintln!("ERROR: {detail}");
-                DispatchResult::Continue
-            }
-        },
+        "\\refresh" => {
+            let tables = fetch_table_names(api, id).await.unwrap_or_default();
+            let columns = fetch_column_names(api, id).await.unwrap_or_default();
+            let col_count: usize = columns.values().map(|v| v.len()).sum();
+            eprintln!("Refreshed: {} tables, {} columns", tables.len(), col_count);
+            DispatchResult::RefreshedMetadata { tables, columns }
+        }
         "\\timing" => {
             *show_timing = !*show_timing;
             eprintln!("Timing is {}.", if *show_timing { "on" } else { "off" });
@@ -556,6 +604,7 @@ async fn handle_connect(api: &ApiClient, new_id: &str) -> DispatchResult {
         Ok(data) => {
             let new_name = data["name"].as_str().unwrap_or(new_id).to_string();
             let tables = fetch_table_names(api, new_id).await.unwrap_or_default();
+            let columns = fetch_column_names(api, new_id).await.unwrap_or_default();
 
             eprintln!(
                 "You are now connected to database \"{}\" ({}).",
@@ -566,6 +615,7 @@ async fn handle_connect(api: &ApiClient, new_id: &str) -> DispatchResult {
                 id: new_id.to_string(),
                 name: new_name,
                 tables,
+                columns,
             }
         }
         Err((_status, detail)) => {
@@ -968,6 +1018,29 @@ mod tests {
     fn test_extract_table_names_no_rows_key() {
         let data = serde_json::json!({"columns": []});
         assert!(extract_table_names(&data).is_empty());
+    }
+
+    #[test]
+    fn test_extract_column_names_normal() {
+        let data = serde_json::json!({
+            "columns": [{"name": "table_name"}, {"name": "column_name"}],
+            "rows": [["users", "id"], ["users", "name"], ["orders", "total"]]
+        });
+        let cols = extract_column_names(&data);
+        assert_eq!(cols.get("users").unwrap(), &vec!["id", "name"]);
+        assert_eq!(cols.get("orders").unwrap(), &vec!["total"]);
+    }
+
+    #[test]
+    fn test_extract_column_names_empty() {
+        let data = serde_json::json!({ "rows": [] });
+        assert!(extract_column_names(&data).is_empty());
+    }
+
+    #[test]
+    fn test_extract_column_names_no_rows_key() {
+        let data = serde_json::json!({"columns": []});
+        assert!(extract_column_names(&data).is_empty());
     }
 
     #[test]

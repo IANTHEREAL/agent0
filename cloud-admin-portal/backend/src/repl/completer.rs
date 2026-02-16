@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rustyline::completion::{Completer, Pair};
 use rustyline::highlight::Highlighter;
@@ -175,6 +175,7 @@ const SQL_KEYWORDS: &[&str] = &[
 pub struct SqlHelper {
     keywords: Vec<String>,
     table_names: Vec<String>,
+    columns: HashMap<String, Vec<String>>,
     highlighting_enabled: bool,
 }
 
@@ -184,6 +185,7 @@ impl SqlHelper {
         Self {
             keywords: SQL_KEYWORDS.iter().map(|kw| (*kw).to_string()).collect(),
             table_names: Vec::new(),
+            columns: HashMap::new(),
             highlighting_enabled,
         }
     }
@@ -196,6 +198,10 @@ impl SqlHelper {
         tables.sort_unstable_by_key(|name| name.to_ascii_lowercase());
         tables.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
         self.table_names = tables;
+    }
+
+    pub fn set_columns(&mut self, columns: HashMap<String, Vec<String>>) {
+        self.columns = columns;
     }
 
     fn in_string_literal(line: &str, pos: usize) -> bool {
@@ -223,6 +229,87 @@ impl SqlHelper {
             .rev()
             .find(|(_, ch)| !matches!(ch, 'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '$'))
             .map_or(0, |(idx, ch)| idx + ch.len_utf8())
+    }
+
+    fn detect_table_context(&self, line: &str, pos: usize) -> Option<(usize, Vec<Pair>)> {
+        let before_cursor = &line[..pos];
+
+        // 1. Check for dot notation: "tablename." or "tablename.prefix"
+        if let Some(dot_pos) = before_cursor.rfind('.') {
+            let before_dot = &before_cursor[..dot_pos];
+            let word_start = before_dot
+                .rfind(|c: char| !c.is_alphanumeric() && c != '_')
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            let table_name = &before_dot[word_start..];
+            if !table_name.is_empty() {
+                let table_lower = table_name.to_lowercase();
+                if let Some(cols) = self.columns.get(&table_lower) {
+                    let after_dot = &before_cursor[dot_pos + 1..];
+                    let after_dot_lower = after_dot.to_lowercase();
+                    let pairs: Vec<Pair> = cols
+                        .iter()
+                        .filter(|c| c.to_lowercase().starts_with(&after_dot_lower))
+                        .map(|c| Pair {
+                            display: c.clone(),
+                            replacement: c.clone(),
+                        })
+                        .collect();
+                    return Some((dot_pos + 1, pairs));
+                }
+            }
+        }
+
+        // 2. Scan the full line for FROM/JOIN to find table context
+        let full_lower = line.to_lowercase();
+        let before_lower = before_cursor.to_lowercase();
+        let mut table_key: Option<String> = None;
+        for keyword in &["from ", "join "] {
+            if let Some(kw_pos) = full_lower.rfind(keyword) {
+                let after_kw_start = kw_pos + keyword.len();
+                let after_kw = &full_lower[after_kw_start..];
+                let trimmed = after_kw.trim_start();
+                let table_end = trimmed
+                    .find(|c: char| !c.is_alphanumeric() && c != '_')
+                    .unwrap_or(trimmed.len());
+                let table = &trimmed[..table_end];
+                if !table.is_empty() && self.columns.contains_key(table) {
+                    table_key = Some(table.to_string());
+                    break;
+                }
+            }
+        }
+
+        let table_name = table_key?;
+        let cols = self.columns.get(&table_name)?;
+
+        // Don't suggest columns if cursor is right after FROM/JOIN (table position)
+        let cursor_word_start = before_cursor
+            .rfind(|c: char| c.is_whitespace())
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let before_word = before_lower[..cursor_word_start].trim_end();
+        if before_word.ends_with("from") || before_word.ends_with("join") {
+            return None;
+        }
+
+        let typing = &before_cursor[cursor_word_start..];
+        let typing_lower = typing.to_lowercase();
+
+        let pairs: Vec<Pair> = cols
+            .iter()
+            .filter(|c| c.to_lowercase().starts_with(&typing_lower))
+            .map(|c| Pair {
+                display: c.clone(),
+                replacement: c.clone(),
+            })
+            .collect();
+
+        if pairs.is_empty() {
+            return None;
+        }
+
+        Some((cursor_word_start, pairs))
     }
 }
 
@@ -404,6 +491,12 @@ impl Completer for SqlHelper {
     fn complete(&self, line: &str, pos: usize, _ctx: &Context<'_>) -> Result<(usize, Vec<Pair>)> {
         if pos > line.len() || Self::in_string_literal(line, pos) {
             return Ok((pos, Vec::new()));
+        }
+
+        if let Some((start_pos, pairs)) = self.detect_table_context(line, pos) {
+            if !pairs.is_empty() {
+                return Ok((start_pos, pairs));
+            }
         }
 
         let start = Self::word_start(line, pos);
@@ -774,5 +867,111 @@ mod tests {
     fn highlight_whitespace_only() {
         let highlighted = highlight_sql("   ");
         assert_eq!(highlighted, "   ");
+    }
+
+    // ── column completion tests ─────────────────────────────────
+
+    fn helper_with_columns() -> SqlHelper {
+        let mut helper = SqlHelper::new();
+        helper.set_tables(vec!["users".into(), "orders".into()]);
+        let mut columns = HashMap::new();
+        columns.insert(
+            "users".to_string(),
+            vec![
+                "id".into(),
+                "name".into(),
+                "email".into(),
+                "created_at".into(),
+            ],
+        );
+        columns.insert(
+            "orders".to_string(),
+            vec!["id".into(), "user_id".into(), "total".into()],
+        );
+        helper.set_columns(columns);
+        helper
+    }
+
+    fn complete_at(helper: &SqlHelper, line: &str, pos: usize) -> Vec<String> {
+        let history = history::DefaultHistory::new();
+        let (_start, matches) = helper
+            .complete(line, pos, &Context::new(&history))
+            .expect("completion should succeed");
+        matches.into_iter().map(|p| p.replacement).collect()
+    }
+
+    #[test]
+    fn test_column_completion_dot_notation() {
+        let helper = helper_with_columns();
+        let results = complete_for(&helper, "users.");
+        assert!(results.contains(&"id".to_string()));
+        assert!(results.contains(&"name".to_string()));
+        assert!(results.contains(&"email".to_string()));
+        assert!(results.contains(&"created_at".to_string()));
+    }
+
+    #[test]
+    fn test_column_completion_dot_with_prefix() {
+        let helper = helper_with_columns();
+        let results = complete_for(&helper, "users.na");
+        assert_eq!(results, vec!["name".to_string()]);
+    }
+
+    #[test]
+    fn test_column_completion_where_context() {
+        let helper = helper_with_columns();
+        let line = "SELECT * FROM users WHERE ";
+        let results = complete_at(&helper, line, line.len());
+        assert!(results.contains(&"id".to_string()));
+        assert!(results.contains(&"name".to_string()));
+        assert!(results.contains(&"email".to_string()));
+    }
+
+    #[test]
+    fn test_column_completion_where_with_prefix() {
+        let helper = helper_with_columns();
+        let results = complete_for(&helper, "SELECT * FROM users WHERE na");
+        assert_eq!(results, vec!["name".to_string()]);
+    }
+
+    #[test]
+    fn test_column_completion_unknown_table_dot() {
+        let helper = helper_with_columns();
+        let results = complete_for(&helper, "unknown.");
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_column_completion_no_columns_loaded() {
+        let mut helper = SqlHelper::new();
+        helper.set_tables(vec!["users".into()]);
+        let line = "SELECT * FROM users WHERE na";
+        let results = complete_at(&helper, line, line.len());
+        assert!(!results.contains(&"name".to_string()));
+        assert!(results.iter().all(|r| r.to_lowercase().starts_with("na")));
+    }
+
+    #[test]
+    fn test_column_completion_case_insensitive() {
+        let helper = helper_with_columns();
+        let results = complete_for(&helper, "USERS.");
+        assert!(results.contains(&"id".to_string()));
+        assert!(results.contains(&"name".to_string()));
+    }
+
+    #[test]
+    fn test_column_completion_from_suggests_tables() {
+        let helper = helper_with_columns();
+        let results = complete_for(&helper, "SELECT * FROM us");
+        assert!(results.contains(&"users".to_string()));
+        assert!(!results.contains(&"id".to_string()));
+    }
+
+    #[test]
+    fn test_column_completion_select_context() {
+        let helper = helper_with_columns();
+        let line = "SELECT em FROM users";
+        let results = complete_at(&helper, line, 9);
+        assert!(results.contains(&"email".to_string()));
     }
 }
