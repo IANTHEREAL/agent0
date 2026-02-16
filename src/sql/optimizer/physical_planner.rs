@@ -1,6 +1,10 @@
 //! Physical planner: `LogicalPlan → PhysicalPlan`.
 //!
-//! Phase 1 uses heuristic rules (no statistics):
+//! Two-tier estimation:
+//! - **No stats** (table never ANALYZEd): exact legacy heuristics — `rows/3` for
+//!   filter, `rows/10` for aggregate, `DEFAULT_ESTIMATED_ROWS` for scan.
+//! - **Stats available**: selectivity estimation via `selectivity.rs`, histogram-
+//!   based range estimates, and n_distinct-based GROUP BY estimates.
 //!
 //! | Logical       | Physical        | Rule                    |
 //! |---------------|-----------------|-------------------------|
@@ -11,35 +15,93 @@
 
 use super::logical_plan::{LogicalNode, LogicalPlan};
 use super::physical_plan::{PhysicalCost, PhysicalNode, PhysicalPlan};
+use super::selectivity;
+use super::statistics::TableStatistics;
 use crate::sql::analyzer::types::TypedExprKind;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 const DEFAULT_ESTIMATED_ROWS: usize = 1000;
 const TOPN_THRESHOLD: usize = 1000;
+
+/// Context for physical planning, carrying table statistics.
+///
+/// Built by the executor before calling `PhysicalPlanner::plan()`.
+/// When no statistics are available (empty context), the planner
+/// falls back to exact legacy heuristics.
+pub struct PlanningContext {
+    pub table_stats: HashMap<String, Arc<TableStatistics>>,
+}
+
+impl PlanningContext {
+    /// Create an empty context (no statistics — legacy behavior).
+    pub fn empty() -> Self {
+        Self {
+            table_stats: HashMap::new(),
+        }
+    }
+
+    /// Look up table statistics by name.
+    pub fn get_stats(&self, table_name: &str) -> Option<&TableStatistics> {
+        self.table_stats.get(table_name).map(|arc| arc.as_ref())
+    }
+}
 
 /// Converts a [`LogicalPlan`] into a [`PhysicalPlan`].
 pub struct PhysicalPlanner;
 
 impl PhysicalPlanner {
     /// Plan a logical plan into a physical plan.
-    pub fn plan(logical: &LogicalPlan) -> PhysicalPlan {
-        Self::plan_node(logical)
+    pub fn plan(logical: &LogicalPlan, ctx: &PlanningContext) -> PhysicalPlan {
+        Self::plan_node(logical, ctx)
     }
 
-    fn plan_node(logical: &LogicalPlan) -> PhysicalPlan {
+    /// Walk a logical subtree to find base-table stats.
+    ///
+    /// Returns `None` if no Scan is reachable, or if an Aggregate blocks
+    /// propagation (prevents HAVING filters from inheriting base-table stats).
+    fn resolve_stats<'a>(
+        logical: &LogicalPlan,
+        ctx: &'a PlanningContext,
+    ) -> Option<&'a TableStatistics> {
+        match &logical.node {
+            LogicalNode::Scan { table_name, .. } => ctx.get_stats(table_name),
+            // Aggregate output schema ≠ base table → block propagation.
+            LogicalNode::Aggregate { .. } => None,
+            // Transparent unary operators — recurse through.
+            LogicalNode::Filter { input, .. }
+            | LogicalNode::Project { input, .. }
+            | LogicalNode::Sort { input, .. }
+            | LogicalNode::Limit { input, .. }
+            | LogicalNode::Distinct { input }
+            | LogicalNode::DistinctOn { input, .. }
+            | LogicalNode::Window { input } => Self::resolve_stats(input, ctx),
+            // Multi-input / opaque → no stats.
+            _ => None,
+        }
+    }
+
+    fn plan_node(logical: &LogicalPlan, ctx: &PlanningContext) -> PhysicalPlan {
         match &logical.node {
             // ── Leaf nodes ──────────────────────────────
-            LogicalNode::Scan { table_name, alias } => PhysicalPlan {
-                node: PhysicalNode::SeqScan {
-                    table_name: table_name.clone(),
-                    alias: alias.clone(),
-                },
-                schema: logical.schema.clone(),
-                cost: PhysicalCost {
-                    startup: 0.0,
-                    total: DEFAULT_ESTIMATED_ROWS as f64 * 0.01 + 1.0,
-                    rows: DEFAULT_ESTIMATED_ROWS,
-                },
-            },
+            LogicalNode::Scan { table_name, alias } => {
+                let rows = ctx
+                    .get_stats(table_name)
+                    .map(|s| s.row_count)
+                    .unwrap_or(DEFAULT_ESTIMATED_ROWS);
+                PhysicalPlan {
+                    node: PhysicalNode::SeqScan {
+                        table_name: table_name.clone(),
+                        alias: alias.clone(),
+                    },
+                    schema: logical.schema.clone(),
+                    cost: PhysicalCost {
+                        startup: 0.0,
+                        total: rows as f64 * 0.01 + 1.0,
+                        rows,
+                    },
+                }
+            }
 
             LogicalNode::Empty => PhysicalPlan {
                 node: PhysicalNode::Empty,
@@ -81,8 +143,14 @@ impl PhysicalPlanner {
 
             // ── Unary operators ─────────────────────────
             LogicalNode::Filter { predicate, input } => {
-                let child = Self::plan_node(input);
-                let rows = (child.cost.rows / 3).max(1); // heuristic: 33% selectivity
+                let child = Self::plan_node(input, ctx);
+                let child_stats = Self::resolve_stats(input, ctx);
+                let rows = if let Some(stats) = child_stats {
+                    let sel = selectivity::estimate_selectivity(predicate, stats);
+                    (child.cost.rows as f64 * sel).ceil() as usize
+                } else {
+                    (child.cost.rows / 3).max(1) // exact legacy
+                };
                 let cost = PhysicalCost {
                     startup: child.cost.startup,
                     total: child.cost.total + rows as f64 * 0.01,
@@ -99,7 +167,7 @@ impl PhysicalPlanner {
             }
 
             LogicalNode::Project { projections, input } => {
-                let child = Self::plan_node(input);
+                let child = Self::plan_node(input, ctx);
                 let cost = PhysicalCost {
                     startup: child.cost.startup,
                     total: child.cost.total + child.cost.rows as f64 * 0.001,
@@ -120,11 +188,14 @@ impl PhysicalPlanner {
                 projections,
                 input,
             } => {
-                let child = Self::plan_node(input);
+                let child = Self::plan_node(input, ctx);
+                let child_stats = Self::resolve_stats(input, ctx);
                 let agg_rows = if group_by.is_empty() {
                     1
+                } else if let Some(stats) = child_stats {
+                    selectivity::estimate_group_by_rows(group_by, stats, child.cost.rows)
                 } else {
-                    (child.cost.rows / 10).max(1)
+                    (child.cost.rows / 10).max(1) // exact legacy
                 };
                 let cost = PhysicalCost {
                     startup: child.cost.total,
@@ -143,7 +214,7 @@ impl PhysicalPlanner {
             }
 
             LogicalNode::Sort { order_by, input } => {
-                let child = Self::plan_node(input);
+                let child = Self::plan_node(input, ctx);
                 let sort_cost = child.cost.total
                     + (child.cost.rows as f64 * (child.cost.rows as f64).log2().max(1.0));
                 let cost = PhysicalCost {
@@ -166,7 +237,7 @@ impl PhysicalPlanner {
                 offset,
                 input,
             } => {
-                let child = Self::plan_node(input);
+                let child = Self::plan_node(input, ctx);
 
                 // Check for TopN optimization: Sort + Limit with small limit
                 if let (
@@ -234,7 +305,7 @@ impl PhysicalPlanner {
             }
 
             LogicalNode::Distinct { input } => {
-                let child = Self::plan_node(input);
+                let child = Self::plan_node(input, ctx);
                 let cost = PhysicalCost {
                     startup: child.cost.total,
                     total: child.cost.total + child.cost.rows as f64 * 0.01,
@@ -250,7 +321,7 @@ impl PhysicalPlanner {
             }
 
             LogicalNode::DistinctOn { on_exprs, input } => {
-                let child = Self::plan_node(input);
+                let child = Self::plan_node(input, ctx);
                 let cost = PhysicalCost {
                     startup: child.cost.total,
                     total: child.cost.total + child.cost.rows as f64 * 0.01,
@@ -267,7 +338,7 @@ impl PhysicalPlanner {
             }
 
             LogicalNode::Window { input } => {
-                let child = Self::plan_node(input);
+                let child = Self::plan_node(input, ctx);
                 let cost = child.cost.clone();
                 PhysicalPlan {
                     node: PhysicalNode::Window {
@@ -285,8 +356,8 @@ impl PhysicalPlanner {
                 join_type,
                 condition,
             } => {
-                let left_phys = Self::plan_node(left);
-                let right_phys = Self::plan_node(right);
+                let left_phys = Self::plan_node(left, ctx);
+                let right_phys = Self::plan_node(right, ctx);
                 let total_rows = left_phys.cost.rows.saturating_mul(right_phys.cost.rows);
                 let total_cost =
                     left_phys.cost.total + right_phys.cost.total + total_rows as f64 * 0.01;
@@ -315,8 +386,8 @@ impl PhysicalPlanner {
                 left,
                 right,
             } => {
-                let left_phys = Self::plan_node(left);
-                let right_phys = Self::plan_node(right);
+                let left_phys = Self::plan_node(left, ctx);
+                let right_phys = Self::plan_node(right, ctx);
                 let rows = left_phys.cost.rows + right_phys.cost.rows;
                 let cost = PhysicalCost {
                     startup: 0.0,
@@ -336,7 +407,7 @@ impl PhysicalPlanner {
             }
 
             LogicalNode::Subquery { subplan, alias } => {
-                let child = Self::plan_node(subplan);
+                let child = Self::plan_node(subplan, ctx);
                 let cost = child.cost.clone();
                 PhysicalPlan {
                     node: PhysicalNode::Subquery {
@@ -364,7 +435,9 @@ fn extract_constant_usize(expr: &crate::sql::analyzer::types::TypedExpr) -> Opti
 mod tests {
     use super::*;
     use crate::sql::analyzer::types::*;
+    use crate::sql::optimizer::logical_plan::{LogicalPlan, PlanSchema};
     use crate::sql::optimizer::logical_planner::LogicalPlanner;
+    use crate::sql::optimizer::statistics::ColumnStatistics;
     use crate::types::DataType;
 
     fn simple_column(name: &str, dt: DataType) -> TypedExpr {
@@ -392,7 +465,370 @@ mod tests {
         }
     }
 
-    /// End-to-end: AnalyzedQuery → LogicalPlan → PhysicalPlan
+    fn make_table_stats(
+        row_count: usize,
+        columns: HashMap<String, ColumnStatistics>,
+    ) -> Arc<TableStatistics> {
+        Arc::new(TableStatistics {
+            table_id: 1,
+            row_count,
+            last_analyzed: 1000,
+            columns,
+        })
+    }
+
+    fn make_col_stats(null_fraction: f64, n_distinct: f64) -> ColumnStatistics {
+        ColumnStatistics {
+            null_fraction,
+            n_distinct,
+            avg_width: 4,
+            most_common_vals: vec![],
+            most_common_freqs: vec![],
+            histogram_bounds: vec![],
+            correlation: 0.0,
+        }
+    }
+
+    // ── Test 35: SeqScan with stats ──────────────────────
+
+    #[test]
+    fn test_seqscan_with_stats() {
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("users".to_string(), make_table_stats(5000, HashMap::new()));
+        let scan = LogicalPlan::scan(
+            "users".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+        );
+        let physical = PhysicalPlanner::plan(&scan, &ctx);
+        assert_eq!(physical.cost.rows, 5000);
+    }
+
+    // ── Test 36: SeqScan without stats ───────────────────
+
+    #[test]
+    fn test_seqscan_without_stats() {
+        let ctx = PlanningContext::empty();
+        let scan = LogicalPlan::scan(
+            "users".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+        );
+        let physical = PhysicalPlanner::plan(&scan, &ctx);
+        assert_eq!(physical.cost.rows, DEFAULT_ESTIMATED_ROWS);
+    }
+
+    // ── Test 37: Filter with stats ───────────────────────
+
+    #[test]
+    fn test_filter_with_stats() {
+        let mut cols = HashMap::new();
+        cols.insert(
+            "id".to_string(),
+            ColumnStatistics {
+                null_fraction: 0.0,
+                n_distinct: 10000.0,
+                avg_width: 4,
+                most_common_vals: vec![],
+                most_common_freqs: vec![],
+                histogram_bounds: vec![],
+                correlation: 0.0,
+            },
+        );
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(10000, cols));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+        );
+        let predicate = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("id", DataType::Int64)),
+                op: BinaryOp::Eq,
+                right: Box::new(simple_constant(
+                    crate::types::Value::Int32(1),
+                    DataType::Int64,
+                )),
+            },
+            data_type: DataType::Boolean,
+        };
+        let filter = scan.filter(predicate);
+        let physical = PhysicalPlanner::plan(&filter, &ctx);
+        // sel = 1/10000 = 0.0001, rows = ceil(10000 * 0.0001) = 1
+        assert_eq!(
+            physical.cost.rows, 1,
+            "filter with stats: got {}",
+            physical.cost.rows
+        );
+    }
+
+    // ── Test 38: Filter without stats ────────────────────
+
+    #[test]
+    fn test_filter_without_stats() {
+        let ctx = PlanningContext::empty();
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+        );
+        let predicate = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("id", DataType::Int64)),
+                op: BinaryOp::Eq,
+                right: Box::new(simple_constant(
+                    crate::types::Value::Int32(1),
+                    DataType::Int64,
+                )),
+            },
+            data_type: DataType::Boolean,
+        };
+        let filter = scan.filter(predicate);
+        let physical = PhysicalPlanner::plan(&filter, &ctx);
+        // Legacy: rows/3 = 1000/3 = 333
+        assert_eq!(
+            physical.cost.rows, 333,
+            "filter without stats: got {}",
+            physical.cost.rows
+        );
+    }
+
+    // ── Test 39: HAVING filter (Filter above Aggregate) ──
+
+    #[test]
+    fn test_having_filter_uses_legacy() {
+        let mut cols = HashMap::new();
+        cols.insert("id".to_string(), make_col_stats(0.0, 10000.0));
+        cols.insert("status".to_string(), make_col_stats(0.0, 50.0));
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(10000, cols));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![
+                ("id".to_string(), DataType::Int64),
+                ("status".to_string(), DataType::Text),
+            ]),
+        );
+        let agg = scan.aggregate(
+            vec![simple_column("status", DataType::Text)],
+            vec![simple_projection("status", DataType::Text)],
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        // HAVING filter sits above Aggregate
+        let having_pred = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("cnt", DataType::Int64)),
+                op: BinaryOp::Gt,
+                right: Box::new(simple_constant(
+                    crate::types::Value::Int32(5),
+                    DataType::Int64,
+                )),
+            },
+            data_type: DataType::Boolean,
+        };
+        let having = agg.filter(having_pred);
+        let physical = PhysicalPlanner::plan(&having, &ctx);
+
+        // Aggregate should use stats (50 groups), but HAVING filter should use
+        // legacy /3 because resolve_stats returns None through Aggregate.
+        // Aggregate rows = 50, HAVING rows = 50/3 = 16
+        assert_eq!(
+            physical.cost.rows,
+            (50 / 3).max(1),
+            "HAVING: got {}",
+            physical.cost.rows
+        );
+    }
+
+    // ── Test 40: Aggregate with stats ────────────────────
+
+    #[test]
+    fn test_aggregate_with_stats() {
+        let mut cols = HashMap::new();
+        cols.insert("status".to_string(), make_col_stats(0.0, 50.0));
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(10000, cols));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let agg = scan.aggregate(
+            vec![simple_column("status", DataType::Text)],
+            vec![simple_projection("status", DataType::Text)],
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let physical = PhysicalPlanner::plan(&agg, &ctx);
+        assert_eq!(
+            physical.cost.rows, 50,
+            "agg with stats: got {}",
+            physical.cost.rows
+        );
+    }
+
+    // ── Test 41: Aggregate null-group ────────────────────
+
+    #[test]
+    fn test_aggregate_null_group() {
+        let mut cols = HashMap::new();
+        cols.insert("status".to_string(), make_col_stats(0.1, 50.0));
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(10000, cols));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let agg = scan.aggregate(
+            vec![simple_column("status", DataType::Text)],
+            vec![simple_projection("status", DataType::Text)],
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let physical = PhysicalPlanner::plan(&agg, &ctx);
+        // 50 non-null groups + 1 null group = 51
+        assert_eq!(
+            physical.cost.rows, 51,
+            "agg null group: got {}",
+            physical.cost.rows
+        );
+    }
+
+    // ── Test 42: Aggregate all-NULL column ───────────────
+
+    #[test]
+    fn test_aggregate_all_null() {
+        let mut cols = HashMap::new();
+        cols.insert("status".to_string(), make_col_stats(1.0, 0.0));
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(10000, cols));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let agg = scan.aggregate(
+            vec![simple_column("status", DataType::Text)],
+            vec![simple_projection("status", DataType::Text)],
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let physical = PhysicalPlanner::plan(&agg, &ctx);
+        // n_distinct=0, null_frac=1.0 → 0 non-null groups + 1 null group = 1
+        assert_eq!(
+            physical.cost.rows, 1,
+            "agg all-null: got {}",
+            physical.cost.rows
+        );
+    }
+
+    // ── Test 43: Aggregate without stats ─────────────────
+
+    #[test]
+    fn test_aggregate_without_stats() {
+        let ctx = PlanningContext::empty();
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let agg = scan.aggregate(
+            vec![simple_column("status", DataType::Text)],
+            vec![simple_projection("status", DataType::Text)],
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let physical = PhysicalPlanner::plan(&agg, &ctx);
+        // Legacy: 1000/10 = 100
+        assert_eq!(
+            physical.cost.rows, 100,
+            "agg no stats: got {}",
+            physical.cost.rows
+        );
+    }
+
+    // ── Test 44: End-to-end with stats ───────────────────
+
+    #[test]
+    fn test_end_to_end_with_stats() {
+        let mut cols = HashMap::new();
+        cols.insert(
+            "id".to_string(),
+            ColumnStatistics {
+                null_fraction: 0.0,
+                n_distinct: 5000.0,
+                avg_width: 4,
+                most_common_vals: vec![],
+                most_common_freqs: vec![],
+                histogram_bounds: vec![],
+                correlation: 0.0,
+            },
+        );
+
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("users".to_string(), make_table_stats(5000, cols));
+
+        let query = AnalyzedQuery {
+            ctes: vec![],
+            body: AnalyzedQueryBody::Select(AnalyzedSelect {
+                projection: vec![simple_projection("id", DataType::Int64)],
+                from: vec![AnalyzedTableRef {
+                    kind: AnalyzedTableRefKind::Table {
+                        name: "users".to_string(),
+                        schema: TableRefSchema {
+                            table_id: 1,
+                            columns: vec![("id".to_string(), DataType::Int64, false)],
+                        },
+                    },
+                    alias: None,
+                }],
+                where_clause: Some(TypedExpr {
+                    kind: TypedExprKind::BinaryOp {
+                        left: Box::new(simple_column("id", DataType::Int64)),
+                        op: BinaryOp::Eq,
+                        right: Box::new(simple_constant(
+                            crate::types::Value::Int32(42),
+                            DataType::Int64,
+                        )),
+                    },
+                    data_type: DataType::Boolean,
+                }),
+                group_by: vec![],
+                having: None,
+                distinct: AnalyzedDistinct::All,
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+            output_schema: vec![("id".to_string(), DataType::Int64)],
+        };
+
+        let logical = LogicalPlanner::build(&query);
+        let physical = PhysicalPlanner::plan(&logical, &ctx);
+
+        // Scan should have 5000 rows (from stats)
+        // Filter (eq on 5000 distinct) → sel = 1/5000 → 1 row
+        // Verify the plan is sensible
+        assert!(
+            physical.cost.rows < 100,
+            "e2e: rows should be small, got {}",
+            physical.cost.rows
+        );
+    }
+
+    // ── Test 45: Existing tests still pass with empty ctx ─
+
     #[test]
     fn test_single_table_physical() {
         let query = AnalyzedQuery {
@@ -421,9 +857,8 @@ mod tests {
         };
 
         let logical = LogicalPlanner::build(&query);
-        let physical = PhysicalPlanner::plan(&logical);
+        let physical = PhysicalPlanner::plan(&logical, &PlanningContext::empty());
 
-        // Should be: Project → SeqScan
         assert!(matches!(physical.node, PhysicalNode::Project { .. }));
         if let PhysicalNode::Project { input, .. } = &physical.node {
             assert!(matches!(input.node, PhysicalNode::SeqScan { .. }));
@@ -431,7 +866,6 @@ mod tests {
         assert!(physical.cost.total > 0.0);
     }
 
-    /// TopN optimization: Sort + Limit with small limit → TopNSort
     #[test]
     fn test_topn_optimization() {
         let query = AnalyzedQuery {
@@ -467,9 +901,8 @@ mod tests {
         };
 
         let logical = LogicalPlanner::build(&query);
-        let physical = PhysicalPlanner::plan(&logical);
+        let physical = PhysicalPlanner::plan(&logical, &PlanningContext::empty());
 
-        // Should contain TopNSort
         fn has_topn(plan: &PhysicalPlan) -> bool {
             match &plan.node {
                 PhysicalNode::TopNSort { .. } => true,
@@ -483,7 +916,6 @@ mod tests {
         assert!(has_topn(&physical), "expected TopNSort for small LIMIT");
     }
 
-    /// Hash aggregate for GROUP BY
     #[test]
     fn test_hash_aggregate() {
         let count_agg = TypedExpr {
@@ -539,8 +971,304 @@ mod tests {
         };
 
         let logical = LogicalPlanner::build(&query);
-        let physical = PhysicalPlanner::plan(&logical);
+        let physical = PhysicalPlanner::plan(&logical, &PlanningContext::empty());
 
         assert!(matches!(physical.node, PhysicalNode::HashAggregate { .. }));
+    }
+
+    // ── Gate tests ───────────────────────────────────────
+
+    #[test]
+    fn test_gate1_stats_improve_estimates() {
+        let mut cols = HashMap::new();
+        cols.insert(
+            "id".to_string(),
+            ColumnStatistics {
+                null_fraction: 0.0,
+                n_distinct: 100.0,
+                avg_width: 4,
+                most_common_vals: vec![],
+                most_common_freqs: vec![],
+                histogram_bounds: vec![],
+                correlation: 0.0,
+            },
+        );
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(10000, cols));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+        );
+        let predicate = TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("id", DataType::Int64)),
+                op: BinaryOp::Eq,
+                right: Box::new(simple_constant(
+                    crate::types::Value::Int32(1),
+                    DataType::Int64,
+                )),
+            },
+            data_type: DataType::Boolean,
+        };
+        let filter = scan.filter(predicate);
+        let physical = PhysicalPlanner::plan(&filter, &ctx);
+        // sel = 1/100 = 0.01, rows = ceil(10000 * 0.01) = 100
+        assert_eq!(physical.cost.rows, 100, "gate1: got {}", physical.cost.rows);
+    }
+
+    #[test]
+    fn test_gate2_no_stats_exact_legacy() {
+        let ctx = PlanningContext::empty();
+        // Scan
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+        );
+        let scan_phys = PhysicalPlanner::plan(&scan, &ctx);
+        assert_eq!(scan_phys.cost.rows, 1000);
+
+        // Filter
+        let scan2 = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+        );
+        let filter = scan2.filter(TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("id", DataType::Int64)),
+                op: BinaryOp::Eq,
+                right: Box::new(simple_constant(
+                    crate::types::Value::Int32(1),
+                    DataType::Int64,
+                )),
+            },
+            data_type: DataType::Boolean,
+        });
+        let filter_phys = PhysicalPlanner::plan(&filter, &ctx);
+        assert_eq!(filter_phys.cost.rows, 333);
+
+        // Aggregate
+        let scan3 = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let agg = scan3.aggregate(
+            vec![simple_column("status", DataType::Text)],
+            vec![simple_projection("status", DataType::Text)],
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let agg_phys = PhysicalPlanner::plan(&agg, &ctx);
+        assert_eq!(agg_phys.cost.rows, 100);
+    }
+
+    #[test]
+    fn test_gate3_selectivity_bounds() {
+        let mut cols = HashMap::new();
+        cols.insert("id".to_string(), make_col_stats(0.0, 100.0));
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(100, cols));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+        );
+        let filter = scan.filter(TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("id", DataType::Int64)),
+                op: BinaryOp::Eq,
+                right: Box::new(simple_constant(
+                    crate::types::Value::Int32(1),
+                    DataType::Int64,
+                )),
+            },
+            data_type: DataType::Boolean,
+        });
+        let physical = PhysicalPlanner::plan(&filter, &ctx);
+        // Rows can be 0 — no forced .max(1)
+        assert!(physical.cost.rows <= 100);
+    }
+
+    #[test]
+    fn test_gate4_negative_n_distinct() {
+        let mut cols = HashMap::new();
+        cols.insert(
+            "id".to_string(),
+            ColumnStatistics {
+                null_fraction: 0.0,
+                n_distinct: -0.5,
+                avg_width: 4,
+                most_common_vals: vec![],
+                most_common_freqs: vec![],
+                histogram_bounds: vec![],
+                correlation: 0.0,
+            },
+        );
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(2000, cols));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+        );
+        let filter = scan.filter(TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("id", DataType::Int64)),
+                op: BinaryOp::Eq,
+                right: Box::new(simple_constant(
+                    crate::types::Value::Int32(1),
+                    DataType::Int64,
+                )),
+            },
+            data_type: DataType::Boolean,
+        });
+        let physical = PhysicalPlanner::plan(&filter, &ctx);
+        // eff = 0.5 * 2000 = 1000, sel = 1/1000, rows = ceil(2000 * 0.001) = 2
+        assert_eq!(physical.cost.rows, 2, "gate4: got {}", physical.cost.rows);
+    }
+
+    #[test]
+    fn test_gate5_having_isolation() {
+        let mut cols = HashMap::new();
+        cols.insert("status".to_string(), make_col_stats(0.0, 50.0));
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(10000, cols));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let agg = scan.aggregate(
+            vec![simple_column("status", DataType::Text)],
+            vec![simple_projection("status", DataType::Text)],
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let agg_phys = PhysicalPlanner::plan(&agg, &ctx);
+        assert_eq!(agg_phys.cost.rows, 50, "agg uses stats");
+
+        // HAVING filter above aggregate uses legacy
+        let having = agg.filter(TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("cnt", DataType::Int64)),
+                op: BinaryOp::Gt,
+                right: Box::new(simple_constant(
+                    crate::types::Value::Int32(5),
+                    DataType::Int64,
+                )),
+            },
+            data_type: DataType::Boolean,
+        });
+        let having_phys = PhysicalPlanner::plan(&having, &ctx);
+        assert_eq!(
+            having_phys.cost.rows,
+            (50 / 3).max(1),
+            "HAVING uses legacy /3"
+        );
+    }
+
+    #[test]
+    fn test_gate6_null_constant_zero_selectivity() {
+        let mut cols = HashMap::new();
+        cols.insert("id".to_string(), make_col_stats(0.1, 100.0));
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(1000, cols));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+        );
+        let filter = scan.filter(TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("id", DataType::Int64)),
+                op: BinaryOp::Eq,
+                right: Box::new(simple_constant(crate::types::Value::Null, DataType::Int64)),
+            },
+            data_type: DataType::Boolean,
+        });
+        let physical = PhysicalPlanner::plan(&filter, &ctx);
+        assert_eq!(physical.cost.rows, 0, "NULL eq = 0 rows");
+    }
+
+    #[test]
+    fn test_gate7_group_by_null_group() {
+        let mut cols = HashMap::new();
+        cols.insert("status".to_string(), make_col_stats(1.0, 0.0));
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(10000, cols));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let agg = scan.aggregate(
+            vec![simple_column("status", DataType::Text)],
+            vec![simple_projection("status", DataType::Text)],
+            PlanSchema::from_columns(vec![("status".to_string(), DataType::Text)]),
+        );
+        let physical = PhysicalPlanner::plan(&agg, &ctx);
+        assert_eq!(
+            physical.cost.rows, 1,
+            "null-group: got {}",
+            physical.cost.rows
+        );
+    }
+
+    #[test]
+    fn test_gate8_negated_predicates_null_safe() {
+        let mut cols = HashMap::new();
+        cols.insert(
+            "id".to_string(),
+            ColumnStatistics {
+                null_fraction: 0.2,
+                n_distinct: 100.0,
+                avg_width: 4,
+                most_common_vals: vec![crate::types::Value::Int32(1)],
+                most_common_freqs: vec![0.1],
+                histogram_bounds: vec![],
+                correlation: 0.0,
+            },
+        );
+        let mut ctx = PlanningContext::empty();
+        ctx.table_stats
+            .insert("t".to_string(), make_table_stats(1000, cols));
+
+        let scan = LogicalPlan::scan(
+            "t".to_string(),
+            None,
+            PlanSchema::from_columns(vec![("id".to_string(), DataType::Int64)]),
+        );
+        let filter = scan.filter(TypedExpr {
+            kind: TypedExprKind::BinaryOp {
+                left: Box::new(simple_column("id", DataType::Int64)),
+                op: BinaryOp::NotEq,
+                right: Box::new(simple_constant(
+                    crate::types::Value::Int32(1),
+                    DataType::Int64,
+                )),
+            },
+            data_type: DataType::Boolean,
+        });
+        let physical = PhysicalPlanner::plan(&filter, &ctx);
+        // sel ≈ (1.0 - 0.2) - 0.1 ≈ 0.7, rows ≈ 700 (ceil may round up by 1
+        // due to IEEE 754 intermediate rounding)
+        assert!(
+            (700..=701).contains(&physical.cost.rows),
+            "gate8: got {}",
+            physical.cost.rows
+        );
     }
 }

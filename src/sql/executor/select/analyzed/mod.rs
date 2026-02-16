@@ -2664,15 +2664,33 @@ impl Executor {
         ctes: &HashMap<String, (TableSchema, Vec<Row>)>,
     ) -> Result<ExecuteResult> {
         use crate::sql::operators::execute_operator_tree_with_ctes;
-        use crate::sql::optimizer::{BuildContext, LogicalPlanner, PhysicalPlanner};
+        use crate::sql::optimizer::{
+            BuildContext, LogicalPlanner, PhysicalPlanner, PlanningContext,
+        };
 
         tracing::debug!(target: "optimizer", "routing query through CBO pipeline");
 
         // Step 1: AnalyzedQuery → LogicalPlan
         let logical = LogicalPlanner::build(analyzed);
 
+        // Step 1.5: Build PlanningContext with table statistics (if available).
+        let mut planning_ctx = PlanningContext::empty();
+        if let AnalyzedQueryBody::Select(select) = &analyzed.body {
+            for table_ref in &select.from {
+                if let AnalyzedTableRefKind::Table {
+                    ref name,
+                    ref schema,
+                } = table_ref.kind
+                {
+                    if let Some(stats) = self.stats_cache().get_full_stats(db_id, schema.table_id) {
+                        planning_ctx.table_stats.insert(name.clone(), stats);
+                    }
+                }
+            }
+        }
+
         // Step 2: LogicalPlan → PhysicalPlan
-        let physical = PhysicalPlanner::plan(&logical);
+        let physical = PhysicalPlanner::plan(&logical, &planning_ctx);
 
         // Step 3: Resolve table schemas for the operator bridge.
         let mut build_ctx = BuildContext::new();
