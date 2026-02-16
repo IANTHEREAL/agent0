@@ -161,11 +161,15 @@ fn text_to_json(val: Option<&str>, ty: &Type) -> Value {
     };
     match *ty {
         Type::BOOL => Value::from(s.eq_ignore_ascii_case("t") || s.eq_ignore_ascii_case("true")),
-        Type::INT2 | Type::INT4 => s.parse::<i64>().map_or(Value::from(s.to_string()), Value::from),
-        Type::INT8 => s.parse::<i64>().map_or(Value::from(s.to_string()), Value::from),
-        Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => {
-            s.parse::<f64>().map_or(Value::from(s.to_string()), Value::from)
-        }
+        Type::INT2 | Type::INT4 => s
+            .parse::<i64>()
+            .map_or(Value::from(s.to_string()), Value::from),
+        Type::INT8 => s
+            .parse::<i64>()
+            .map_or(Value::from(s.to_string()), Value::from),
+        Type::FLOAT4 | Type::FLOAT8 | Type::NUMERIC => s
+            .parse::<f64>()
+            .map_or(Value::from(s.to_string()), Value::from),
         _ => Value::from(s.to_string()),
     }
 }

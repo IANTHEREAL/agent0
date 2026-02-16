@@ -281,8 +281,7 @@ async fn sql_query_db_not_found() {
         "should fail for nonexistent db, stderr: {stderr}"
     );
     assert!(
-        stderr.to_lowercase().contains("not found")
-            || stderr.to_lowercase().contains("404"),
+        stderr.to_lowercase().contains("not found") || stderr.to_lowercase().contains("404"),
         "should mention not found, got: {stderr}"
     );
 }
@@ -308,11 +307,7 @@ async fn sql_query_with_tenant_reaches_execution() {
     // but it should get past auth and routing. The error should NOT be
     // "not found" or "not logged in".
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        stderr
-    );
+    let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), stderr);
     let combined_lower = combined.to_lowercase();
     assert!(
         !combined_lower.contains("not logged in"),

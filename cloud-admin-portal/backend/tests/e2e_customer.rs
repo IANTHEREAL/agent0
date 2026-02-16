@@ -448,7 +448,8 @@ async fn test_users_list_db_not_found() {
     let token = register_and_login(&state, &email, "SecurePass1!").await;
 
     let app = api::router().with_state(state.clone());
-    let (status, body) = get_json_auth(app, "/customer/databases/nonexistent123/users", &token).await;
+    let (status, body) =
+        get_json_auth(app, "/customer/databases/nonexistent123/users", &token).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body["message"]
         .as_str()
@@ -471,12 +472,8 @@ async fn test_users_create_no_auth() {
 #[tokio::test]
 async fn test_users_delete_no_auth() {
     let (app, _state) = setup().await;
-    let (status, _body) = delete_json_auth(
-        app,
-        "/customer/databases/nonexistent123/users/testuser",
-        "",
-    )
-    .await;
+    let (status, _body) =
+        delete_json_auth(app, "/customer/databases/nonexistent123/users/testuser", "").await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
 
@@ -544,7 +541,8 @@ async fn test_schema_db_not_found() {
     let token = register_and_login(&state, &email, "SecurePass1!").await;
 
     let app = api::router().with_state(state.clone());
-    let (status, body) = get_json_auth(app, "/customer/databases/nonexistent123/schema", &token).await;
+    let (status, body) =
+        get_json_auth(app, "/customer/databases/nonexistent123/schema", &token).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body["message"]
         .as_str()
@@ -566,7 +564,8 @@ async fn test_migrations_list_db_not_found() {
     let token = register_and_login(&state, &email, "SecurePass1!").await;
 
     let app = api::router().with_state(state.clone());
-    let (status, body) = get_json_auth(app, "/customer/databases/nonexistent123/migrations", &token).await;
+    let (status, body) =
+        get_json_auth(app, "/customer/databases/nonexistent123/migrations", &token).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body["message"]
         .as_str()
@@ -661,6 +660,7 @@ async fn test_branch_with_tenant_but_no_pgclient() {
 
     let app = api::router().with_state(state.clone());
     let uri = format!("/customer/databases/{tenant_id}/branch");
-    let (status, _body) = post_json_auth(app, &uri, &json!({"name": "feature-branch"}), &token).await;
+    let (status, _body) =
+        post_json_auth(app, &uri, &json!({"name": "feature-branch"}), &token).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
 }

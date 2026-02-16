@@ -134,10 +134,7 @@ fn sql_result_column_index(result: &SqlResult, name: &str) -> Result<usize, AppE
         .iter()
         .position(|c| c.name == name)
         .ok_or_else(|| {
-            AppError::internal(format!(
-                "Missing expected column '{}' in SQL result",
-                name
-            ))
+            AppError::internal(format!("Missing expected column '{}' in SQL result", name))
         })
 }
 
@@ -271,7 +268,15 @@ pub async fn anonymous_register(
     let expires_at = (chrono::Utc::now() + chrono::Duration::days(90)).to_rfc3339();
     let token_id = uuid::Uuid::new_v4().to_string();
 
-    db::create_customer_token(&state.db, &token_id, &id, &token_hash, "default", &expires_at).await?;
+    db::create_customer_token(
+        &state.db,
+        &token_id,
+        &id,
+        &token_hash,
+        "default",
+        &expires_at,
+    )
+    .await?;
 
     let mut secret_bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut secret_bytes);
@@ -307,13 +312,10 @@ pub async fn anonymous_refresh(
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
 
-    let customer = db::get_anonymous_customer_by_id_and_secret(
-        &state.db,
-        &req.anonymous_id,
-        &secret_hash,
-    )
-    .await?
-    .ok_or_else(|| AppError::unauthorized("Invalid anonymous credentials"))?;
+    let customer =
+        db::get_anonymous_customer_by_id_and_secret(&state.db, &req.anonymous_id, &secret_hash)
+            .await?
+            .ok_or_else(|| AppError::unauthorized("Invalid anonymous credentials"))?;
 
     use rand::RngCore;
     let mut token_bytes = [0u8; 64];
@@ -447,7 +449,10 @@ pub async fn claim_account(
         ));
     }
 
-    if db::get_customer_by_email(&state.db, &req.email).await?.is_some() {
+    if db::get_customer_by_email(&state.db, &req.email)
+        .await?
+        .is_some()
+    {
         return Err(AppError::conflict("Email already registered"));
     }
 
@@ -459,13 +464,9 @@ pub async fn claim_account(
         .map_err(|e| AppError::internal(format!("Password hashing failed: {e}")))?
         .to_string();
 
-    let claimed = db::claim_anonymous_customer(
-        &state.db,
-        &auth.customer_id,
-        &req.email,
-        &password_hash,
-    )
-    .await?;
+    let claimed =
+        db::claim_anonymous_customer(&state.db, &auth.customer_id, &req.email, &password_hash)
+            .await?;
     if !claimed {
         return Err(AppError::new(
             StatusCode::BAD_REQUEST,
@@ -1197,7 +1198,12 @@ pub async fn dump_database(
             let select_sql = format!("SELECT * FROM {qualified_table}");
 
             let table_data = pg
-                .run_sql_structured(&tenant.id, &cred.username, &cred.password_plain, &select_sql)
+                .run_sql_structured(
+                    &tenant.id,
+                    &cred.username,
+                    &cred.password_plain,
+                    &select_sql,
+                )
                 .await
                 .map_err(|e| {
                     AppError::bad_gateway(format!(
@@ -1376,9 +1382,14 @@ pub async fn apply_database_migration(
         ));
     }
 
-    pg.run_sql_structured(&tenant.id, &cred.username, &cred.password_plain, req.sql.trim())
-        .await
-        .map_err(|e| AppError::bad_gateway(format!("Failed to apply migration SQL: {e}")))?;
+    pg.run_sql_structured(
+        &tenant.id,
+        &cred.username,
+        &cred.password_plain,
+        req.sql.trim(),
+    )
+    .await
+    .map_err(|e| AppError::bad_gateway(format!("Failed to apply migration SQL: {e}")))?;
 
     // Record the migration after successful SQL execution
     let preview = if req.sql.len() > 200 {
@@ -1392,9 +1403,14 @@ pub async fn apply_database_migration(
         req.checksum.replace('\'', "''"),
         preview.replace('\'', "''"),
     );
-    pg.run_sql_structured(&tenant.id, &cred.username, &cred.password_plain, &record_sql)
-        .await
-        .map_err(|e| AppError::bad_gateway(format!("Failed to record migration: {e}")))?;
+    pg.run_sql_structured(
+        &tenant.id,
+        &cred.username,
+        &cred.password_plain,
+        &record_sql,
+    )
+    .await
+    .map_err(|e| AppError::bad_gateway(format!("Failed to record migration: {e}")))?;
 
     Ok(Json(MigrationApplyResponse {
         status: "applied".to_string(),

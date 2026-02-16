@@ -75,10 +75,7 @@ impl Fs9Client {
         cert_path: Option<&str>,
         key_path: Option<&str>,
     ) -> Result<(), String> {
-        let url = format!(
-            "{}/api/v1/namespaces/{}/mounts",
-            self.base_url, namespace
-        );
+        let url = format!("{}/api/v1/namespaces/{}/mounts", self.base_url, namespace);
 
         let mut tikv_config = serde_json::json!({
             "type": "tikv",
@@ -127,11 +124,7 @@ impl Fs9Client {
     }
 
     /// Generate a JWT token for accessing the filesystem namespace.
-    pub async fn generate_token(
-        &self,
-        user_id: &str,
-        namespace: &str,
-    ) -> Result<String, String> {
+    pub async fn generate_token(&self, user_id: &str, namespace: &str) -> Result<String, String> {
         let url = format!("{}/api/v1/tokens/generate", self.base_url);
         let resp = self
             .client

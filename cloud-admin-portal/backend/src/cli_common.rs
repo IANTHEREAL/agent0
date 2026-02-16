@@ -40,8 +40,7 @@ fn save_credentials(token: &str) -> Result<(), String> {
     parsed.insert("token".to_string(), toml::Value::String(token.to_string()));
     let content =
         toml::to_string(&parsed).map_err(|e| format!("Failed to serialize credentials: {e}"))?;
-    std::fs::write(&cred_path, &content)
-        .map_err(|e| format!("Failed to save credentials: {e}"))?;
+    std::fs::write(&cred_path, &content).map_err(|e| format!("Failed to save credentials: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -72,8 +71,7 @@ fn save_anonymous_credentials(
     );
     let content =
         toml::to_string(&parsed).map_err(|e| format!("Failed to serialize credentials: {e}"))?;
-    std::fs::write(&cred_path, &content)
-        .map_err(|e| format!("Failed to save credentials: {e}"))?;
+    std::fs::write(&cred_path, &content).map_err(|e| format!("Failed to save credentials: {e}"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -123,6 +121,7 @@ fn prompt_password_hidden(label: &str) -> String {
 
 type SendResult = Result<Value, (u16, String)>;
 
+#[derive(Clone)]
 pub struct ApiClient {
     base_url: String,
     api_key: Option<String>,
@@ -277,7 +276,6 @@ impl ApiClient {
                         }
                     };
 
-
                     let mut retry_headers = extra_headers.cloned().unwrap_or_default();
                     retry_headers
                         .insert("Authorization".to_string(), format!("Bearer {new_token}"));
@@ -382,12 +380,7 @@ impl ApiClient {
 
     async fn interactive_anonymous(&self) -> String {
         match self
-            .send_request(
-                "POST",
-                "/customer/anonymous-register",
-                None::<&Value>,
-                None,
-            )
+            .send_request("POST", "/customer/anonymous-register", None::<&Value>, None)
             .await
         {
             Ok(data) => {
@@ -418,7 +411,11 @@ impl ApiClient {
         }
     }
 
-    async fn anonymous_refresh(&self, anonymous_id: &str, anonymous_secret: &str) -> Option<String> {
+    async fn anonymous_refresh(
+        &self,
+        anonymous_id: &str,
+        anonymous_secret: &str,
+    ) -> Option<String> {
         let body = serde_json::json!({
             "anonymous_id": anonymous_id,
             "anonymous_secret": anonymous_secret,

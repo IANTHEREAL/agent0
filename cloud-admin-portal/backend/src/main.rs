@@ -81,8 +81,8 @@ async fn main() {
             let ca = reqwest::Certificate::from_pem(&ca_pem).expect("Failed to parse CA cert");
             let mut identity_pem = cert_pem;
             identity_pem.extend_from_slice(&key_pem);
-            let identity =
-                reqwest::Identity::from_pem(&identity_pem).expect("Failed to parse client identity");
+            let identity = reqwest::Identity::from_pem(&identity_pem)
+                .expect("Failed to parse client identity");
 
             reqwest::Client::builder()
                 .add_root_certificate(ca)
@@ -98,11 +98,13 @@ async fn main() {
     let fs9_client = match (&config.fs9_meta_url, &config.fs9_meta_key) {
         (Some(url), Some(key)) => {
             tracing::info!("FS9 integration enabled: {}", url);
-            Some(Arc::new(pgtikv_admin::services::fs9_client::Fs9Client::new(
-                url.clone(),
-                key.clone(),
-                http_client.clone(),
-            )))
+            Some(Arc::new(
+                pgtikv_admin::services::fs9_client::Fs9Client::new(
+                    url.clone(),
+                    key.clone(),
+                    http_client.clone(),
+                ),
+            ))
         }
         _ => {
             tracing::info!("FS9 integration disabled (FS9_META_URL or FS9_META_KEY not set)");

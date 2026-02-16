@@ -1321,7 +1321,7 @@ async fn cmd_db_inspect_schemas(api: &ApiClient, output: &OutputFormat, id: &str
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => repl::output::print_sql_result(&data, output),
+        _ => repl::output::print_sql_result(&data, output, false, &None),
     }
 }
 
@@ -1335,7 +1335,7 @@ async fn cmd_db_inspect_tables(api: &ApiClient, output: &OutputFormat, id: &str)
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => repl::output::print_sql_result(&data, output),
+        _ => repl::output::print_sql_result(&data, output, false, &None),
     }
 }
 
@@ -1349,7 +1349,7 @@ async fn cmd_db_inspect_indexes(api: &ApiClient, output: &OutputFormat, id: &str
 
     match output {
         OutputFormat::Json => print_json(&data),
-        _ => repl::output::print_sql_result(&data, output),
+        _ => repl::output::print_sql_result(&data, output, false, &None),
     }
 }
 
@@ -1514,7 +1514,7 @@ async fn cmd_db_sql(
     }
 
     let data = execute_sql(api, id, &sql).await;
-    repl::output::print_sql_result(&data, output);
+    repl::output::print_sql_result(&data, output, false, &None);
 }
 
 async fn cmd_db_users_list(api: &ApiClient, output: &OutputFormat, id: &str) {
