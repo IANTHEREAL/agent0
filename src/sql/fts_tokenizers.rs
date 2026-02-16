@@ -95,10 +95,7 @@ mod tests {
     #[test]
     fn test_english_tokenizer() {
         let tokens = tokenize_simple("Hello, World! This is a test.");
-        assert_eq!(
-            tokens,
-            vec!["hello", "world", "this", "is", "test"]
-        );
+        assert_eq!(tokens, vec!["hello", "world", "this", "is", "test"]);
     }
 
     #[test]
