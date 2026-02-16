@@ -358,6 +358,48 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: Sql
                             helper.set_highlighting(enabled);
                         }
                     }
+                    commands::DispatchResult::Watch(secs) => {
+                        if let Some(ref query) = repl_state.last_query {
+                            let query = query.clone();
+                            let _ = crossterm::terminal::enable_raw_mode();
+                            loop {
+                                print!("\x1b[2J\x1b[H");
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| {
+                                        let secs_total = d.as_secs();
+                                        let hours = (secs_total % 86400) / 3600;
+                                        let mins = (secs_total % 3600) / 60;
+                                        let secs_r = secs_total % 60;
+                                        format!("{:02}:{:02}:{:02} UTC", hours, mins, secs_r)
+                                    })
+                                    .unwrap_or_else(|_| "??:??:??".to_string());
+                                eprintln!("\\watch every {}s  {}", secs, now);
+                                eprintln!();
+
+                                let new_tx_state = handle.block_on(exec::repl_exec(
+                                    &api, &output, &repl_state.db_id, show_timing, &repl_state, &query,
+                                ));
+                                repl_state.tx_state = new_tx_state;
+
+                                use crossterm::event::{poll, read};
+                                match poll(std::time::Duration::from_secs(secs)) {
+                                    Ok(true) => {
+                                        let _ = read();
+                                        break;
+                                    }
+                                    Ok(false) => {}
+                                    Err(_) => break,
+                                }
+                            }
+                            let _ = crossterm::terminal::disable_raw_mode();
+                            (prompt_main, prompt_cont) =
+                                get_prompts(repl_state.tx_state, &repl_state.db_name, is_direct);
+                            eprintln!("Watch stopped.");
+                        } else {
+                            eprintln!("No query to execute. Run a query first, then use \\watch.");
+                        }
+                    }
                     commands::DispatchResult::Continue => {}
                 }
                 continue;

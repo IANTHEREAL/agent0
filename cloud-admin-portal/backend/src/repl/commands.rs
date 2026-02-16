@@ -18,6 +18,7 @@ pub enum DispatchResult {
     },
     ExecuteQuery(String),
     HighlightChanged(bool),
+    Watch(u64),
 }
 
 pub async fn fetch_table_names(api: &ApiClient, id: &str) -> Result<Vec<String>, String> {
@@ -255,6 +256,7 @@ pub async fn dispatch(
             handle_pset_command(repl_state, arg);
             DispatchResult::Continue
         }
+        "\\watch" => handle_watch_command(arg),
         "\\!" => handle_shell_command(arg),
         _ => {
             eprintln!("Unknown command: {cmd}. Type \\? for help.");
@@ -884,6 +886,25 @@ fn handle_shell_command(arg: &str) -> DispatchResult {
     DispatchResult::Continue
 }
 
+// ── \watch — periodic query re-execution ────────────────────────
+
+fn handle_watch_command(arg: &str) -> DispatchResult {
+    if arg.is_empty() {
+        return DispatchResult::Watch(2); // default 2 seconds
+    }
+    match arg.parse::<u64>() {
+        Ok(0) => {
+            eprintln!("Watch interval must be at least 1 second.");
+            DispatchResult::Continue
+        }
+        Ok(secs) => DispatchResult::Watch(secs),
+        Err(_) => {
+            eprintln!("Invalid interval: '{}'. Usage: \\watch [seconds]", arg);
+            DispatchResult::Continue
+        }
+    }
+}
+
 fn repl_help() {
     eprintln!("Meta-commands:");
     eprintln!("  \\d [TABLE]    Describe table columns, or list all tables");
@@ -905,6 +926,7 @@ fn repl_help() {
     eprintln!("  \\pager [CMD]  Control paging (on/off/CMD)");
     eprintln!("  \\x [MODE]     Toggle expanded display (on/off/auto)");
     eprintln!("  \\highlight    Toggle SQL syntax highlighting (on/off)");
+    eprintln!("  \\watch [N]    Re-execute last query every N seconds (default 2)");
     eprintln!("  \\g            Execute query (like ;), or re-execute last query");
     eprintln!("  \\gx           Execute query in expanded mode");
     eprintln!("  \\fs <N> [Q]   Save favorite query (Q defaults to last query)");
@@ -1128,6 +1150,46 @@ mod tests {
         match handle_shell_command("true") {
             DispatchResult::Continue => {}
             _ => panic!("Expected Continue"),
+        }
+    }
+
+    #[test]
+    fn test_handle_watch_default_interval() {
+        match handle_watch_command("") {
+            DispatchResult::Watch(2) => {}
+            _ => panic!("Expected Watch(2) for empty arg"),
+        }
+    }
+
+    #[test]
+    fn test_handle_watch_custom_interval() {
+        match handle_watch_command("5") {
+            DispatchResult::Watch(5) => {}
+            _ => panic!("Expected Watch(5)"),
+        }
+    }
+
+    #[test]
+    fn test_handle_watch_zero_rejected() {
+        match handle_watch_command("0") {
+            DispatchResult::Continue => {}
+            _ => panic!("Expected Continue for zero interval"),
+        }
+    }
+
+    #[test]
+    fn test_handle_watch_invalid_rejected() {
+        match handle_watch_command("abc") {
+            DispatchResult::Continue => {}
+            _ => panic!("Expected Continue for non-numeric arg"),
+        }
+    }
+
+    #[test]
+    fn test_handle_watch_large_interval() {
+        match handle_watch_command("60") {
+            DispatchResult::Watch(60) => {}
+            _ => panic!("Expected Watch(60)"),
         }
     }
 
