@@ -9,6 +9,7 @@ pub mod static_eval;
 pub mod typed_eval;
 pub mod typed_fold;
 pub mod typed_rewrite;
+pub mod typed_visit;
 
 use crate::sql::error::SqlError;
 use crate::types::Value;

@@ -6,11 +6,10 @@
 use crate::sql::analyzer::types::{
     TypedExpr, TypedExprKind, TypedOrderByExpr, WindowFrame, WindowFrameBound,
 };
-use crate::sql::expr::static_eval::{
-    eval_static_typed_expr, is_row_dependent, needs_async_materialization,
-};
+use crate::sql::expr::typed_eval::eval_typed_expr;
+use crate::sql::expr::typed_visit::expr_any;
 use crate::sql::query_context::QueryContext;
-use crate::types::Value;
+use crate::types::{Row, Value};
 
 /// Fold row-independent constant subtrees inside a typed expression.
 pub fn fold_typed_expr(expr: &TypedExpr, qctx: &QueryContext) -> TypedExpr {
@@ -278,82 +277,29 @@ fn fold_subtree_if_safe(expr: TypedExpr, qctx: &QueryContext) -> TypedExpr {
     if !is_fold_candidate(&expr) {
         return expr;
     }
-    if is_row_dependent(&expr) || needs_async_materialization(&expr) {
-        return expr;
-    }
 
-    match eval_static_typed_expr(&expr, qctx) {
+    match eval_typed_expr(&expr, &Row::new(vec![]), qctx) {
         Ok(value) => TypedExpr::new(TypedExprKind::Constant(value), expr.data_type.clone()),
         Err(_) => expr,
     }
 }
 
 fn is_fold_candidate(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        TypedExprKind::Constant(_) => true,
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            is_fold_candidate(left) && is_fold_candidate(right)
-        }
-        TypedExprKind::UnaryOp { operand, .. }
-        | TypedExprKind::Cast { expr: operand, .. }
-        | TypedExprKind::IsTest { expr: operand, .. } => is_fold_candidate(operand),
-        TypedExprKind::Between {
-            expr, low, high, ..
-        } => is_fold_candidate(expr) && is_fold_candidate(low) && is_fold_candidate(high),
-        TypedExprKind::InList { expr, list, .. } => {
-            is_fold_candidate(expr) && list.iter().all(is_fold_candidate)
-        }
-        TypedExprKind::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        }
-        | TypedExprKind::SimilarTo {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            is_fold_candidate(expr)
-                && is_fold_candidate(pattern)
-                && escape.as_ref().map_or(true, |e| is_fold_candidate(e))
-        }
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            operand.as_ref().map_or(true, |e| is_fold_candidate(e))
-                && when_clauses
-                    .iter()
-                    .all(|(w, t)| is_fold_candidate(w) && is_fold_candidate(t))
-                && else_result.as_ref().map_or(true, |e| is_fold_candidate(e))
-        }
-        TypedExprKind::Coalesce(args)
-        | TypedExprKind::MinMax { args, .. }
-        | TypedExprKind::ArrayLiteral(args)
-        | TypedExprKind::Row(args) => args.iter().all(is_fold_candidate),
-        TypedExprKind::NullIf(a, b) => is_fold_candidate(a) && is_fold_candidate(b),
-        TypedExprKind::ArrayIndex { array, index } => {
-            is_fold_candidate(array) && is_fold_candidate(index)
-        }
-        TypedExprKind::JsonAccess { expr, path, .. } => {
-            is_fold_candidate(expr) && is_fold_candidate(path)
-        }
-
-        // Do not fold function/subquery/default nodes directly.
-        TypedExprKind::ColumnRef { .. }
-        | TypedExprKind::FunctionCall { .. }
-        | TypedExprKind::AggregateCall { .. }
-        | TypedExprKind::WindowCall { .. }
-        | TypedExprKind::ScalarSubquery(_)
-        | TypedExprKind::Exists { .. }
-        | TypedExprKind::InSubquery { .. }
-        | TypedExprKind::AnyAll { .. }
-        | TypedExprKind::ArraySubquery(_)
-        | TypedExprKind::Default => false,
-    }
+    !expr_any(expr, &|node| {
+        matches!(
+            &node.kind,
+            TypedExprKind::ColumnRef { .. }
+                | TypedExprKind::FunctionCall { .. }
+                | TypedExprKind::AggregateCall { .. }
+                | TypedExprKind::WindowCall { .. }
+                | TypedExprKind::ScalarSubquery(_)
+                | TypedExprKind::Exists { .. }
+                | TypedExprKind::InSubquery { .. }
+                | TypedExprKind::AnyAll { .. }
+                | TypedExprKind::ArraySubquery(_)
+                | TypedExprKind::Default
+        )
+    })
 }
 
 #[cfg(test)]

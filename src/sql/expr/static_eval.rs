@@ -6,104 +6,21 @@
 
 use crate::sql::analyzer::types::{TypedExpr, TypedExprKind};
 use crate::sql::expr::typed_eval::eval_typed_expr;
+use crate::sql::expr::typed_visit::expr_any;
 use crate::sql::query_context::QueryContext;
 use crate::types::{Row, Value};
 use anyhow::{anyhow, Result};
 
 /// Return true when an expression requires row values.
 pub fn is_row_dependent(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        TypedExprKind::ColumnRef { .. } => true,
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            is_row_dependent(left) || is_row_dependent(right)
-        }
-        TypedExprKind::UnaryOp { operand, .. }
-        | TypedExprKind::Cast { expr: operand, .. }
-        | TypedExprKind::IsTest { expr: operand, .. } => is_row_dependent(operand),
-        TypedExprKind::Between {
-            expr, low, high, ..
-        } => is_row_dependent(expr) || is_row_dependent(low) || is_row_dependent(high),
-        TypedExprKind::InList { expr, list, .. } => {
-            is_row_dependent(expr) || list.iter().any(is_row_dependent)
-        }
-        TypedExprKind::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        }
-        | TypedExprKind::SimilarTo {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            is_row_dependent(expr)
-                || is_row_dependent(pattern)
-                || escape.as_ref().is_some_and(|e| is_row_dependent(e))
-        }
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            operand.as_ref().is_some_and(|e| is_row_dependent(e))
-                || when_clauses
-                    .iter()
-                    .any(|(w, t)| is_row_dependent(w) || is_row_dependent(t))
-                || else_result.as_ref().is_some_and(|e| is_row_dependent(e))
-        }
-        TypedExprKind::Coalesce(args)
-        | TypedExprKind::MinMax { args, .. }
-        | TypedExprKind::ArrayLiteral(args)
-        | TypedExprKind::Row(args) => args.iter().any(is_row_dependent),
-        TypedExprKind::NullIf(a, b) => is_row_dependent(a) || is_row_dependent(b),
-        TypedExprKind::FunctionCall {
-            args,
-            order_by,
-            filter,
-            ..
-        }
-        | TypedExprKind::AggregateCall {
-            args,
-            order_by,
-            filter,
-            ..
-        } => {
-            args.iter().any(is_row_dependent)
-                || order_by.iter().any(|o| is_row_dependent(&o.expr))
-                || filter.as_ref().is_some_and(|f| is_row_dependent(f))
-        }
-        TypedExprKind::WindowCall {
-            args,
-            partition_by,
-            order_by,
-            ..
-        } => {
-            args.iter().any(is_row_dependent)
-                || partition_by.iter().any(is_row_dependent)
-                || order_by.iter().any(|o| is_row_dependent(&o.expr))
-        }
-        TypedExprKind::InSubquery { expr, .. } | TypedExprKind::AnyAll { expr, .. } => {
-            is_row_dependent(expr)
-        }
-        TypedExprKind::ArrayIndex { array, index } => {
-            is_row_dependent(array) || is_row_dependent(index)
-        }
-        TypedExprKind::JsonAccess { expr, path, .. } => {
-            is_row_dependent(expr) || is_row_dependent(path)
-        }
-        TypedExprKind::Constant(_)
-        | TypedExprKind::Default
-        | TypedExprKind::ScalarSubquery(_)
-        | TypedExprKind::ArraySubquery(_)
-        | TypedExprKind::Exists { .. } => false,
-    }
+    expr_any(expr, &|node| {
+        matches!(&node.kind, TypedExprKind::ColumnRef { .. })
+    })
 }
 
 /// Return true when an expression needs async executor-side materialization.
 pub fn needs_async_materialization(expr: &TypedExpr) -> bool {
-    match &expr.kind {
+    expr_any(expr, &|node| match &node.kind {
         TypedExprKind::ScalarSubquery(_)
         | TypedExprKind::ArraySubquery(_)
         | TypedExprKind::Exists { .. }
@@ -111,88 +28,12 @@ pub fn needs_async_materialization(expr: &TypedExpr) -> bool {
         | TypedExprKind::AnyAll { .. }
         | TypedExprKind::AggregateCall { .. }
         | TypedExprKind::WindowCall { .. } => true,
-        TypedExprKind::FunctionCall {
-            func,
-            args,
-            order_by,
-            filter,
-        } => {
-            let name = func.name.to_uppercase();
+        TypedExprKind::FunctionCall { func, .. } => {
+            let name = func.name.to_ascii_uppercase();
             matches!(name.as_str(), "NEXTVAL" | "CURRVAL" | "SETVAL")
-                || args.iter().any(needs_async_materialization)
-                || order_by
-                    .iter()
-                    .any(|o| needs_async_materialization(&o.expr))
-                || filter
-                    .as_ref()
-                    .is_some_and(|f| needs_async_materialization(f))
         }
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            needs_async_materialization(left) || needs_async_materialization(right)
-        }
-        TypedExprKind::UnaryOp { operand, .. }
-        | TypedExprKind::Cast { expr: operand, .. }
-        | TypedExprKind::IsTest { expr: operand, .. } => needs_async_materialization(operand),
-        TypedExprKind::Between {
-            expr, low, high, ..
-        } => {
-            needs_async_materialization(expr)
-                || needs_async_materialization(low)
-                || needs_async_materialization(high)
-        }
-        TypedExprKind::InList { expr, list, .. } => {
-            needs_async_materialization(expr) || list.iter().any(needs_async_materialization)
-        }
-        TypedExprKind::Like {
-            expr,
-            pattern,
-            escape,
-            ..
-        }
-        | TypedExprKind::SimilarTo {
-            expr,
-            pattern,
-            escape,
-            ..
-        } => {
-            needs_async_materialization(expr)
-                || needs_async_materialization(pattern)
-                || escape
-                    .as_ref()
-                    .is_some_and(|e| needs_async_materialization(e))
-        }
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            operand
-                .as_ref()
-                .is_some_and(|e| needs_async_materialization(e))
-                || when_clauses
-                    .iter()
-                    .any(|(w, t)| needs_async_materialization(w) || needs_async_materialization(t))
-                || else_result
-                    .as_ref()
-                    .is_some_and(|e| needs_async_materialization(e))
-        }
-        TypedExprKind::Coalesce(args)
-        | TypedExprKind::MinMax { args, .. }
-        | TypedExprKind::ArrayLiteral(args)
-        | TypedExprKind::Row(args) => args.iter().any(needs_async_materialization),
-        TypedExprKind::NullIf(a, b) => {
-            needs_async_materialization(a) || needs_async_materialization(b)
-        }
-        TypedExprKind::ArrayIndex { array, index } => {
-            needs_async_materialization(array) || needs_async_materialization(index)
-        }
-        TypedExprKind::JsonAccess { expr, path, .. } => {
-            needs_async_materialization(expr) || needs_async_materialization(path)
-        }
-        TypedExprKind::Constant(_) | TypedExprKind::ColumnRef { .. } | TypedExprKind::Default => {
-            false
-        }
-    }
+        _ => false,
+    })
 }
 
 /// Evaluate a row-independent typed expression.
