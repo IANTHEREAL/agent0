@@ -401,6 +401,14 @@ fn handle_conninfo(repl_state: &ReplState) {
     eprintln!("  DB ID:     {}", repl_state.db_id);
     eprintln!("  API URL:   {}", repl_state.api_url);
     eprintln!(
+        "  Mode:      {}",
+        if repl_state.is_direct() {
+            "direct (pgwire)"
+        } else {
+            "API"
+        }
+    );
+    eprintln!(
         "  Expanded:  {}",
         match repl_state.expanded {
             ExpandedMode::Off => "off",

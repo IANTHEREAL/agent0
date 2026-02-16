@@ -5,9 +5,15 @@ use crate::{make_auth_headers, require_token, OutputFormat};
 
 pub mod commands;
 pub mod completer;
+pub mod direct;
 pub mod exec;
 pub mod favorites;
 pub mod output;
+
+pub enum SqlExecutor {
+    Api,
+    Direct(direct::DirectExecutor),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpandedMode {
@@ -34,10 +40,11 @@ pub struct ReplState {
     pub api_url: String,
     pub tx_state: TxState,
     pub favorites: favorites::Favorites,
+    pub executor: SqlExecutor,
 }
 
 impl ReplState {
-    pub fn new(db_id: String, db_name: String, api_url: String) -> Self {
+    pub fn new(db_id: String, db_name: String, api_url: String, executor: SqlExecutor) -> Self {
         Self {
             pager_enabled: true,
             pager_command: None,
@@ -49,11 +56,16 @@ impl ReplState {
             api_url,
             tx_state: TxState::Idle,
             favorites: favorites::Favorites::load(),
+            executor,
         }
+    }
+
+    pub fn is_direct(&self) -> bool {
+        matches!(self.executor, SqlExecutor::Direct(_))
     }
 }
 
-pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
+pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str, executor: SqlExecutor) {
     let token = require_token();
     let headers = make_auth_headers(&token);
     let db_info = api
@@ -69,27 +81,32 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
         .unwrap_or(id)
         .to_string();
     let api_url = api.base_url().to_string();
+    let is_direct = matches!(executor, SqlExecutor::Direct(_));
 
-    let get_prompts = |tx_state: TxState, db_name: &str| {
+    let get_prompts = |tx_state: TxState, db_name: &str, direct: bool| {
+        let mode = if direct { "(direct)" } else { "" };
         let suffix = match tx_state {
-            TxState::Idle => "> ",
-            TxState::InTransaction => "*> ",
-            TxState::Failed => "!> ",
+            TxState::Idle => "=> ",
+            TxState::InTransaction => "*=> ",
+            TxState::Failed => "!=> ",
         };
         let cont_suffix = match tx_state {
             TxState::Idle => "-> ",
             TxState::InTransaction => "*-> ",
             TxState::Failed => "!-> ",
         };
+        let prefix = format!("db9:{}{}", db_name, mode);
+        let prefix_len = prefix.len();
         (
-            format!("{}{}", db_name, suffix),
-            format!("{}{}", " ".repeat(db_name.len().saturating_sub(1)), cont_suffix),
+            format!("{}{}", prefix, suffix),
+            format!("{}{}", " ".repeat(prefix_len.saturating_sub(1)), cont_suffix),
         )
     };
 
-    let (mut prompt_main, mut prompt_cont) = get_prompts(TxState::Idle, &db_name);
+    let (mut prompt_main, mut prompt_cont) = get_prompts(TxState::Idle, &db_name, is_direct);
 
-    eprintln!("db9 sql — connected to '{}' ({})", db_name, id);
+    let mode_label = if is_direct { " (direct pgwire)" } else { "" };
+    eprintln!("db9 sql — connected to '{}' ({}){}", db_name, id, mode_label);
     eprintln!("Type \\? for help, \\q to quit.\n");
 
     let handle = tokio::runtime::Handle::current();
@@ -134,7 +151,7 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
 
         let mut buffer = String::new();
         let mut show_timing = true;
-        let mut repl_state = ReplState::new(id.clone(), db_name.clone(), api_url);
+        let mut repl_state = ReplState::new(id.clone(), db_name.clone(), api_url, executor);
 
         loop {
             let prompt = if buffer.is_empty() {
@@ -196,7 +213,7 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
                         repl_state.db_id = id;
                         repl_state.db_name = name.clone();
                         repl_state.tx_state = TxState::Idle;
-                        (prompt_main, prompt_cont) = get_prompts(TxState::Idle, &name);
+                        (prompt_main, prompt_cont) = get_prompts(TxState::Idle, &name, is_direct);
                         if let Some(helper) = rl.helper_mut() {
                             helper.set_tables(tables);
                         }
@@ -211,7 +228,7 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
                             &sql,
                         ));
                         repl_state.tx_state = new_tx_state;
-                        (prompt_main, prompt_cont) = get_prompts(new_tx_state, &repl_state.db_name);
+                        (prompt_main, prompt_cont) = get_prompts(new_tx_state, &repl_state.db_name, is_direct);
                         repl_state.last_query = Some(sql);
                     }
                     commands::DispatchResult::HighlightChanged(enabled) => {
@@ -245,7 +262,7 @@ pub async fn run(api: &ApiClient, output: &OutputFormat, id: &str) {
                     &buffer,
                 ));
                 repl_state.tx_state = new_tx_state;
-                (prompt_main, prompt_cont) = get_prompts(new_tx_state, &repl_state.db_name);
+                (prompt_main, prompt_cont) = get_prompts(new_tx_state, &repl_state.db_name, is_direct);
                 repl_state.last_query = Some(buffer.clone());
                 buffer.clear();
             }

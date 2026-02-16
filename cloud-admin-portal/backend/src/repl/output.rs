@@ -589,8 +589,10 @@ mod tests {
             "test_id".to_string(),
             "test_db".to_string(),
             "http://localhost".to_string(),
+            super::super::SqlExecutor::Api,
         );
         assert_eq!(state.expanded, ExpandedMode::Off);
         assert!(state.pager_enabled);
+        assert!(!state.is_direct());
     }
 }

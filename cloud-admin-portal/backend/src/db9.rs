@@ -154,6 +154,12 @@ enum DbAction {
         /// Path to SQL file
         #[arg(long, short)]
         file: Option<String>,
+        /// Use direct pgwire connection instead of HTTP API
+        #[arg(long, short = 'D')]
+        direct: bool,
+        /// Connection string for direct mode (overrides API-provided DSN)
+        #[arg(long)]
+        dsn: Option<String>,
     },
     /// Manage database users
     Users {
@@ -551,13 +557,21 @@ async fn main() {
                     cmd_db_inspect_slow_queries(&api, &cli.effective_output(), id).await
                 }
             },
-            DbAction::Sql { id, query, file } => {
+            DbAction::Sql {
+                id,
+                query,
+                file,
+                direct,
+                dsn,
+            } => {
                 cmd_db_sql(
                     &api,
                     &cli.effective_output(),
                     id,
                     query.as_deref(),
                     file.as_deref(),
+                    *direct,
+                    dsn.as_deref(),
                 )
                 .await
             }
@@ -1483,12 +1497,55 @@ async fn cmd_token_revoke(api: &ApiClient, output: &OutputFormat, token_id: &str
     }
 }
 
+async fn build_executor(
+    api: &ApiClient,
+    id: &str,
+    direct: bool,
+    dsn: Option<&str>,
+) -> repl::SqlExecutor {
+    if !direct {
+        return repl::SqlExecutor::Api;
+    }
+
+    let connection_dsn = if let Some(d) = dsn {
+        d.to_string()
+    } else {
+        let token = require_token();
+        let headers = make_auth_headers(&token);
+        let data = api
+            .request(
+                "GET",
+                &format!("/customer/databases/{id}"),
+                None,
+                Some(&headers),
+            )
+            .await;
+        data["connection_string"]
+            .as_str()
+            .unwrap_or_else(|| {
+                eprintln!("No connection string found for database. Use --dsn to provide one.");
+                process::exit(1);
+            })
+            .to_string()
+    };
+
+    match repl::direct::DirectExecutor::connect(&connection_dsn).await {
+        Ok(exec) => repl::SqlExecutor::Direct(exec),
+        Err(e) => {
+            eprintln!("{e}");
+            process::exit(1);
+        }
+    }
+}
+
 async fn cmd_db_sql(
     api: &ApiClient,
     output: &OutputFormat,
     id: &str,
     query: Option<&str>,
     file: Option<&str>,
+    direct: bool,
+    dsn: Option<&str>,
 ) {
     let sql = if let Some(q) = query {
         q.to_string()
@@ -1498,7 +1555,8 @@ async fn cmd_db_sql(
             process::exit(1);
         })
     } else if atty::is(atty::Stream::Stdin) {
-        return repl::run(api, output, id).await;
+        let executor = build_executor(api, id, direct, dsn).await;
+        return repl::run(api, output, id, executor).await;
     } else {
         use std::io::Read;
         let mut buf = String::new();
@@ -1514,8 +1572,23 @@ async fn cmd_db_sql(
         process::exit(1);
     }
 
-    let data = execute_sql(api, id, &sql).await;
-    repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off);
+    if direct {
+        let executor = build_executor(api, id, true, dsn).await;
+        if let repl::SqlExecutor::Direct(exec) = &executor {
+            match exec.execute(&sql).await {
+                Ok(data) => {
+                    repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off)
+                }
+                Err(e) => {
+                    eprintln!("\x1b[31mERROR:\x1b[0m {e}");
+                    process::exit(1);
+                }
+            }
+        }
+    } else {
+        let data = execute_sql(api, id, &sql).await;
+        repl::output::print_sql_result(&data, output, false, &None, ExpandedMode::Off);
+    }
 }
 
 async fn cmd_db_users_list(api: &ApiClient, output: &OutputFormat, id: &str) {

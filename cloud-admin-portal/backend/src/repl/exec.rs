@@ -4,7 +4,7 @@ use pgtikv_admin::cli_common::ApiClient;
 
 use crate::{make_auth_headers, require_token, OutputFormat};
 
-use super::{output::print_sql_result, ReplState, TxState};
+use super::{output::print_sql_result, ReplState, SqlExecutor, TxState};
 
 pub async fn repl_exec(
     api: &ApiClient,
@@ -14,25 +14,32 @@ pub async fn repl_exec(
     repl_state: &ReplState,
     sql: &str,
 ) -> TxState {
-    let token = require_token();
-    let headers = make_auth_headers(&token);
-    let body = serde_json::json!({ "query": sql });
-
     let start = std::time::Instant::now();
-    match api
-        .try_request(
-            "POST",
-            &format!("/customer/databases/{id}/sql"),
-            Some(&body),
-            Some(&headers),
-        )
-        .await
-    {
+
+    let result = match &repl_state.executor {
+        SqlExecutor::Direct(executor) => executor.execute(sql).await.map_err(|e| e),
+        SqlExecutor::Api => {
+            let token = require_token();
+            let headers = make_auth_headers(&token);
+            let body = serde_json::json!({ "query": sql });
+            api.try_request(
+                "POST",
+                &format!("/customer/databases/{id}/sql"),
+                Some(&body),
+                Some(&headers),
+            )
+            .await
+            .map_err(|(_status, detail)| detail)
+        }
+    };
+
+    match result {
         Ok(data) => {
             let new_tx_state = detect_tx_state_change(&data, repl_state.tx_state);
-            
+
             if let Some(ref path) = repl_state.output_file {
-                let formatted = super::output::format_sql_result(&data, output, repl_state.expanded);
+                let formatted =
+                    super::output::format_sql_result(&data, output, repl_state.expanded);
                 match std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -61,13 +68,13 @@ pub async fn repl_exec(
             }
             new_tx_state
         }
-        Err((_status, detail)) => {
+        Err(detail) => {
             let new_tx_state = if repl_state.tx_state == TxState::InTransaction {
                 TxState::Failed
             } else {
                 TxState::Idle
             };
-            
+
             print_error_with_hints(&detail);
             if timing {
                 eprintln!("Time: {:.3}s", start.elapsed().as_secs_f64());
