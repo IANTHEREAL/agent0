@@ -5,6 +5,7 @@ pub mod analyzer;
 pub(crate) mod binder;
 pub(crate) mod bytea;
 mod catalog_oids;
+mod check_constraints;
 mod default_privileges;
 
 mod alter_sequence_owned_by;

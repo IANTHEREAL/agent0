@@ -29,6 +29,9 @@ impl Executor {
                 .get_schema(txn, db_id, table_name)
                 .await?
                 .ok_or_else(|| SqlError::RelationNotFound(table_name.to_string()))?;
+            let qctx = crate::sql::query_context::QueryContext::from_task_locals();
+            let compiled_checks =
+                crate::sql::check_constraints::compile_check_constraints(&schema)?;
 
             let enum_cache = dml::build_enum_label_cache(&self.store, txn, db_id, &schema).await?;
 
@@ -57,7 +60,12 @@ impl Executor {
             .await?;
             dml::coerce_row_values(&schema, &mut row_values)?;
             let row = Row { values: row_values };
-            dml::validate_check_constraints(&schema, &row)?;
+            crate::sql::check_constraints::validate_compiled_check_constraints(
+                &schema,
+                &compiled_checks,
+                &row,
+                &qctx,
+            )?;
 
             let _ = dml::execute_insert_row(
                 &self.store,

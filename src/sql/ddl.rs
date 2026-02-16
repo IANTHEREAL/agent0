@@ -5,6 +5,7 @@ use crate::sql::analyzer::types::TypedExpr;
 use crate::sql::analyzer::{Analyzer, CatalogSnapshot, Scope};
 use crate::sql::error::SqlError;
 use crate::sql::expr::typed_eval::eval_typed_expr;
+use crate::sql::expr::typed_fold::fold_typed_expr;
 use crate::sql::query_context::QueryContext;
 use anyhow::{anyhow, Result};
 use sqlparser::ast::{
@@ -47,8 +48,14 @@ fn analyze_row_level_expr(
         catalog.add_table(alias, schema.name.clone(), schema.clone());
     }
 
-    Analyzer::analyze_expr_with_scope(&catalog, Scope::from_table_schema(table_name, schema), expr)
-        .map_err(|e| anyhow!("{}", e))
+    let typed = Analyzer::analyze_expr_with_scope(
+        &catalog,
+        Scope::from_table_schema(table_name, schema),
+        expr,
+    )
+    .map_err(|e| anyhow!("{}", e))?;
+    let qctx = QueryContext::from_task_locals();
+    Ok(fold_typed_expr(&typed, &qctx))
 }
 
 fn eval_row_level_expr(typed_expr: &TypedExpr, row: &Row, qctx: &QueryContext) -> Result<Value> {

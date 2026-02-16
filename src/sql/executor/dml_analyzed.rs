@@ -14,8 +14,12 @@ use crate::sql::analyzer::types::{
     AnalyzedDelete, AnalyzedInsert, AnalyzedInsertSource, AnalyzedOnConflict, AnalyzedProjection,
     AnalyzedUpdate, TypedExpr, TypedExprKind,
 };
+use crate::sql::check_constraints;
 use crate::sql::dml::ConflictBehavior;
+use crate::sql::expr::static_eval::needs_async_materialization;
 use crate::sql::expr::typed_eval::eval_typed_expr;
+use crate::sql::expr::typed_fold::fold_typed_expr;
+use crate::sql::expr::typed_rewrite::materialize_sequences_in_typed_expr;
 use crate::sql::query_context::QueryContext;
 use crate::types::{Row, TableSchema, Value};
 use anyhow::{anyhow, Result};
@@ -46,6 +50,7 @@ impl Executor {
         }
 
         let qctx = QueryContext::from_task_locals();
+        let folded_where = del.where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx));
         let rows = self.scan_and_fill(txn, db_id, t, &schema).await?;
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
@@ -67,7 +72,7 @@ impl Executor {
         };
 
         for r in &rows {
-            let should_delete = if let Some(ref where_expr) = del.where_clause {
+            let should_delete = if let Some(ref where_expr) = folded_where {
                 if let Some(ref using_rows) = using_combined_rows {
                     let mut matched = false;
                     for using_row in using_rows {
@@ -168,6 +173,8 @@ impl Executor {
         }
 
         let qctx = QueryContext::from_task_locals();
+        let folded_where = upd.where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx));
+        let compiled_checks = check_constraints::compile_check_constraints(&schema)?;
         let rows = self.scan_and_fill(txn, db_id, t, &schema).await?;
         let mut cnt = 0;
         let mut ret_rows = Vec::new();
@@ -195,7 +202,7 @@ impl Executor {
             let eval_row = if let Some((_, ref _from_schema, ref from_rows)) = from_data {
                 if from_rows.is_empty() {
                     continue;
-                } else if let Some(ref where_expr) = upd.where_clause {
+                } else if let Some(ref where_expr) = folded_where {
                     let mut matched_from = None;
                     for from_row in from_rows {
                         let combined = combine_rows(r, from_row);
@@ -215,7 +222,7 @@ impl Executor {
                 }
             } else {
                 // No FROM clause — simple WHERE check.
-                if let Some(ref where_expr) = upd.where_clause {
+                if let Some(ref where_expr) = folded_where {
                     let val = eval_typed_expr(where_expr, r, &qctx)?;
                     if !typed_value_to_bool(val)? {
                         continue;
@@ -270,7 +277,12 @@ impl Executor {
             let mut final_vals = new_row.values;
             dml::coerce_row_values(&schema, &mut final_vals)?;
             let new_row = Row::new(final_vals);
-            dml::validate_check_constraints(&schema, &new_row)?;
+            check_constraints::validate_compiled_check_constraints(
+                &schema,
+                &compiled_checks,
+                &new_row,
+                &qctx,
+            )?;
 
             // Persist.
             let updated_row = dml::execute_update_row(
@@ -362,6 +374,13 @@ impl Executor {
         .await?;
 
         let qctx = QueryContext::from_task_locals();
+        let folded_on_conflict_where = match &ins.on_conflict {
+            Some(AnalyzedOnConflict::DoUpdate { where_clause, .. }) => {
+                where_clause.as_ref().map(|e| fold_typed_expr(e, &qctx))
+            }
+            _ => None,
+        };
+        let compiled_checks = check_constraints::compile_check_constraints(&schema)?;
         let mut affected = 0;
         let mut inserted = 0usize;
         let mut ret_rows = Vec::new();
@@ -382,23 +401,27 @@ impl Executor {
                     let mut vals = Vec::with_capacity(typed_row.len());
                     let mut default_positions = Vec::new();
                     for (i, typed_expr) in typed_row.iter().enumerate() {
-                        if is_default_typed_expr(typed_expr) {
+                        let folded_expr = fold_typed_expr(typed_expr, &qctx);
+                        if is_default_typed_expr(&folded_expr) {
                             // Placeholder for DEFAULT — will be filled below.
                             vals.push(Value::Null);
                             default_positions.push(i);
                         } else {
                             // Materialize sequence calls before sync eval.
-                            let materialized = if has_sequence_call(typed_expr) {
-                                self.materialize_sequences_in_expr(
+                            let materialized = if needs_async_materialization(&folded_expr) {
+                                let store = self.store();
+                                materialize_sequences_in_typed_expr(
+                                    &store,
                                     txn,
                                     db_id,
                                     sequence_values,
                                     search_path,
-                                    typed_expr,
+                                    &folded_expr,
+                                    &qctx,
                                 )
                                 .await?
                             } else {
-                                typed_expr.clone()
+                                folded_expr
                             };
                             let val = eval_typed_expr(&materialized, &empty_row, &qctx)?;
                             vals.push(val);
@@ -496,7 +519,12 @@ impl Executor {
             let mut final_vals = row.values;
             dml::coerce_row_values(&schema, &mut final_vals)?;
             let row = Row::new(final_vals);
-            dml::validate_check_constraints(&schema, &row)?;
+            check_constraints::validate_compiled_check_constraints(
+                &schema,
+                &compiled_checks,
+                &row,
+                &qctx,
+            )?;
 
             let conflict_behavior = match &ins.on_conflict {
                 Some(AnalyzedOnConflict::DoNothing) => ConflictBehavior::DoNothing,
@@ -551,13 +579,13 @@ impl Executor {
                             AnalyzedOnConflict::DoNothing => continue,
                             AnalyzedOnConflict::DoUpdate {
                                 assignments,
-                                where_clause,
+                                where_clause: _,
                             } => {
                                 // Build combined row: [existing, excluded].
                                 let combined = combine_rows(&existing_row, &excluded_row);
 
                                 // Check WHERE if present.
-                                if let Some(ref where_expr) = where_clause {
+                                if let Some(ref where_expr) = folded_on_conflict_where {
                                     let val = eval_typed_expr(where_expr, &combined, &qctx)?;
                                     if !typed_value_to_bool(val)? {
                                         continue;
@@ -612,7 +640,12 @@ impl Executor {
                                 let mut final_vals = updated_row.values;
                                 dml::coerce_row_values(&schema, &mut final_vals)?;
                                 let updated_row = Row::new(final_vals);
-                                dml::validate_check_constraints(&schema, &updated_row)?;
+                                check_constraints::validate_compiled_check_constraints(
+                                    &schema,
+                                    &compiled_checks,
+                                    &updated_row,
+                                    &qctx,
+                                )?;
 
                                 let updated_row = if schema.pk_indices.is_empty() {
                                     dml::execute_update_row_by_pk(
@@ -755,7 +788,8 @@ impl Executor {
         eval_row: &Row,
         qctx: &QueryContext,
     ) -> Result<Value> {
-        if is_default_typed_expr(typed_expr) {
+        let folded_expr = fold_typed_expr(typed_expr, qctx);
+        if is_default_typed_expr(&folded_expr) {
             return dml::eval_column_default_or_null(
                 &self.store(),
                 txn,
@@ -768,294 +802,22 @@ impl Executor {
             .await;
         }
 
-        let materialized = if has_sequence_call(typed_expr) {
-            self.materialize_sequences_in_expr(txn, db_id, sequence_values, search_path, typed_expr)
-                .await?
+        let materialized = if needs_async_materialization(&folded_expr) {
+            let store = self.store();
+            materialize_sequences_in_typed_expr(
+                &store,
+                txn,
+                db_id,
+                sequence_values,
+                search_path,
+                &folded_expr,
+                qctx,
+            )
+            .await?
         } else {
-            typed_expr.clone()
+            folded_expr
         };
         eval_typed_expr(&materialized, eval_row, qctx)
-    }
-
-    /// Pre-materialize sequence calls (NEXTVAL/CURRVAL/SETVAL) in a TypedExpr tree.
-    ///
-    /// Walks the expression tree and replaces sequence FunctionCall nodes with
-    /// Constant values. This is needed because `eval_typed_expr` is sync and
-    /// cannot call the async sequence API.
-    ///
-    /// Uses `Pin<Box<dyn Future>>` for recursive async (Rust limitation).
-    fn materialize_sequences_in_expr<'a>(
-        &'a self,
-        txn: &'a mut Transaction,
-        db_id: u64,
-        sequence_values: &'a mut HashMap<String, i64>,
-        search_path: &'a [String],
-        expr: &'a TypedExpr,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<TypedExpr>> + Send + 'a>> {
-        Box::pin(async move {
-            match &expr.kind {
-                TypedExprKind::FunctionCall {
-                    func,
-                    args,
-                    order_by,
-                    filter,
-                } => {
-                    let name_upper = func.name.to_uppercase();
-                    match name_upper.as_str() {
-                        "NEXTVAL" => {
-                            let seq_name = self
-                                .extract_sequence_name(args, txn, db_id, search_path)
-                                .await?;
-                            let val = self.store().nextval_sequence(txn, db_id, &seq_name).await?;
-                            sequence_values.insert(seq_name, val);
-                            Ok(TypedExpr::new(
-                                TypedExprKind::Constant(Value::Int64(val)),
-                                expr.data_type.clone(),
-                            ))
-                        }
-                        "CURRVAL" => {
-                            let seq_name = self
-                                .extract_sequence_name(args, txn, db_id, search_path)
-                                .await?;
-                            let val = sequence_values.get(&seq_name).copied().ok_or_else(|| {
-                                anyhow!(
-                                    "currval of sequence \"{}\" is not yet defined in this session",
-                                    seq_name
-                                )
-                            })?;
-                            Ok(TypedExpr::new(
-                                TypedExprKind::Constant(Value::Int64(val)),
-                                expr.data_type.clone(),
-                            ))
-                        }
-                        "SETVAL" => {
-                            let seq_name = self
-                                .extract_sequence_name(args, txn, db_id, search_path)
-                                .await?;
-                            let set_val = if args.len() >= 2 {
-                                let empty_row = Row::new(vec![]);
-                                let qctx = QueryContext::from_task_locals();
-                                match eval_typed_expr(&args[1], &empty_row, &qctx)? {
-                                    Value::Int32(n) => n as i64,
-                                    Value::Int64(n) => n,
-                                    other => {
-                                        return Err(anyhow!(
-                                            "setval: value must be integer, got {}",
-                                            other
-                                        ))
-                                    }
-                                }
-                            } else {
-                                return Err(anyhow!("setval requires at least 2 arguments"));
-                            };
-                            self.store()
-                                .setval_sequence(txn, db_id, &seq_name, set_val, true)
-                                .await?;
-                            sequence_values.insert(seq_name, set_val);
-                            Ok(TypedExpr::new(
-                                TypedExprKind::Constant(Value::Int64(set_val)),
-                                expr.data_type.clone(),
-                            ))
-                        }
-                        _ => {
-                            // Recurse into args for non-sequence functions.
-                            let mut new_args = Vec::with_capacity(args.len());
-                            for a in args {
-                                new_args.push(
-                                    self.materialize_sequences_in_expr(
-                                        txn,
-                                        db_id,
-                                        sequence_values,
-                                        search_path,
-                                        a,
-                                    )
-                                    .await?,
-                                );
-                            }
-                            Ok(TypedExpr {
-                                kind: TypedExprKind::FunctionCall {
-                                    func: func.clone(),
-                                    args: new_args,
-                                    order_by: order_by.clone(),
-                                    filter: filter.clone(),
-                                },
-                                data_type: expr.data_type.clone(),
-                            })
-                        }
-                    }
-                }
-                // Recurse through composite nodes.
-                TypedExprKind::BinaryOp { left, right, op } => Ok(TypedExpr {
-                    kind: TypedExprKind::BinaryOp {
-                        left: Box::new(
-                            self.materialize_sequences_in_expr(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                left,
-                            )
-                            .await?,
-                        ),
-                        op: op.clone(),
-                        right: Box::new(
-                            self.materialize_sequences_in_expr(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                right,
-                            )
-                            .await?,
-                        ),
-                    },
-                    data_type: expr.data_type.clone(),
-                }),
-                TypedExprKind::UnaryOp { op, operand } => Ok(TypedExpr {
-                    kind: TypedExprKind::UnaryOp {
-                        op: *op,
-                        operand: Box::new(
-                            self.materialize_sequences_in_expr(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                operand,
-                            )
-                            .await?,
-                        ),
-                    },
-                    data_type: expr.data_type.clone(),
-                }),
-                TypedExprKind::Cast {
-                    expr: inner,
-                    target_type,
-                    cast_context,
-                } => Ok(TypedExpr {
-                    kind: TypedExprKind::Cast {
-                        expr: Box::new(
-                            self.materialize_sequences_in_expr(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                inner,
-                            )
-                            .await?,
-                        ),
-                        target_type: target_type.clone(),
-                        cast_context: cast_context.clone(),
-                    },
-                    data_type: expr.data_type.clone(),
-                }),
-                TypedExprKind::Case {
-                    operand,
-                    when_clauses,
-                    else_result,
-                } => {
-                    let new_operand = match operand {
-                        Some(op) => Some(Box::new(
-                            self.materialize_sequences_in_expr(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                op,
-                            )
-                            .await?,
-                        )),
-                        None => None,
-                    };
-                    let mut new_whens = Vec::with_capacity(when_clauses.len());
-                    for (w, t) in when_clauses {
-                        new_whens.push((
-                            self.materialize_sequences_in_expr(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                w,
-                            )
-                            .await?,
-                            self.materialize_sequences_in_expr(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                t,
-                            )
-                            .await?,
-                        ));
-                    }
-                    let new_else = match else_result {
-                        Some(e) => Some(Box::new(
-                            self.materialize_sequences_in_expr(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                e,
-                            )
-                            .await?,
-                        )),
-                        None => None,
-                    };
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::Case {
-                            operand: new_operand,
-                            when_clauses: new_whens,
-                            else_result: new_else,
-                        },
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-                TypedExprKind::Coalesce(args) => {
-                    let mut new_args = Vec::with_capacity(args.len());
-                    for a in args {
-                        new_args.push(
-                            self.materialize_sequences_in_expr(
-                                txn,
-                                db_id,
-                                sequence_values,
-                                search_path,
-                                a,
-                            )
-                            .await?,
-                        );
-                    }
-                    Ok(TypedExpr {
-                        kind: TypedExprKind::Coalesce(new_args),
-                        data_type: expr.data_type.clone(),
-                    })
-                }
-                // Leaf nodes and nodes that can't contain sequences — return as-is.
-                _ => Ok(expr.clone()),
-            }
-        })
-    }
-
-    /// Extract the sequence name from the first argument of a sequence function call.
-    async fn extract_sequence_name(
-        &self,
-        args: &[TypedExpr],
-        txn: &mut Transaction,
-        db_id: u64,
-        search_path: &[String],
-    ) -> Result<String> {
-        if args.is_empty() {
-            return Err(anyhow!("sequence function requires at least 1 argument"));
-        }
-        let empty_row = Row::new(vec![]);
-        let qctx = QueryContext::from_task_locals();
-        let name_val = eval_typed_expr(&args[0], &empty_row, &qctx)?;
-        crate::sql::sequences::resolve_sequence_full_name_from_value(
-            &self.store(),
-            txn,
-            db_id,
-            search_path,
-            name_val,
-        )
-        .await
     }
 }
 
@@ -1138,37 +900,4 @@ fn cross_product_rows(table_rows: &[Vec<Row>]) -> Vec<Row> {
 /// Check if a TypedExpr is a DEFAULT placeholder.
 fn is_default_typed_expr(expr: &TypedExpr) -> bool {
     matches!(expr.kind, TypedExprKind::Default)
-}
-
-/// Check if a TypedExpr contains sequence function calls that need async materialization.
-fn has_sequence_call(expr: &TypedExpr) -> bool {
-    match &expr.kind {
-        TypedExprKind::FunctionCall { func, args, .. } => {
-            let name_upper = func.name.to_uppercase();
-            matches!(name_upper.as_str(), "NEXTVAL" | "CURRVAL" | "SETVAL")
-                || args.iter().any(has_sequence_call)
-        }
-        TypedExprKind::BinaryOp { left, right, .. } => {
-            has_sequence_call(left) || has_sequence_call(right)
-        }
-        TypedExprKind::UnaryOp { operand, .. }
-        | TypedExprKind::Cast { expr: operand, .. }
-        | TypedExprKind::IsTest { expr: operand, .. } => has_sequence_call(operand),
-        TypedExprKind::Case {
-            operand,
-            when_clauses,
-            else_result,
-        } => {
-            operand.as_ref().is_some_and(|e| has_sequence_call(e))
-                || when_clauses
-                    .iter()
-                    .any(|(w, t)| has_sequence_call(w) || has_sequence_call(t))
-                || else_result.as_ref().is_some_and(|e| has_sequence_call(e))
-        }
-        TypedExprKind::Coalesce(args) | TypedExprKind::ArrayLiteral(args) => {
-            args.iter().any(has_sequence_call)
-        }
-        TypedExprKind::NullIf(a, b) => has_sequence_call(a) || has_sequence_call(b),
-        _ => false,
-    }
 }

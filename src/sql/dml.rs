@@ -2,6 +2,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::sql::error::SqlError;
+use crate::sql::expr::compile::compile_const_expr;
+use crate::sql::expr::static_eval::{eval_static_typed_expr, needs_async_materialization};
+use crate::sql::expr::typed_rewrite::materialize_sequences_in_typed_expr;
+use crate::sql::query_context::QueryContext;
 use anyhow::{anyhow, Result};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -987,36 +991,40 @@ async fn eval_default_expr_maybe_sequence(
     search_path: &[String],
     expr_str: &str,
 ) -> Result<Value> {
-    let sql = format!("SELECT {}", expr_str);
-    let dialect = PostgreSqlDialect {};
-    let ast = Parser::parse_sql(&dialect, &sql)
-        .map_err(|e| anyhow!("Failed to parse default expr: {}", e))?;
-
-    if let Some(sqlparser::ast::Statement::Query(q)) = ast.into_iter().next() {
-        if let sqlparser::ast::SetExpr::Select(s) = *q.body {
-            if let Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) =
-                s.projection.into_iter().next()
-            {
-                return if sequences::expr_needs_async_eval(&e) {
-                    sequences::eval_expr_with_sequences(
-                        store,
-                        txn,
-                        db_id,
-                        sequence_values,
-                        search_path,
-                        &e,
-                        None,
-                        None,
-                    )
-                    .await
-                } else {
-                    super::expr::bridge::eval_const_ast_expr(&e)
-                };
+    fn parse_default_expr(expr_str: &str) -> Result<sqlparser::ast::Expr> {
+        let sql = format!("SELECT {}", expr_str);
+        let dialect = PostgreSqlDialect {};
+        let ast = Parser::parse_sql(&dialect, &sql)
+            .map_err(|e| anyhow!("Failed to parse default expr: {}", e))?;
+        if let Some(sqlparser::ast::Statement::Query(q)) = ast.into_iter().next() {
+            if let sqlparser::ast::SetExpr::Select(s) = *q.body {
+                if let Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) =
+                    s.projection.into_iter().next()
+                {
+                    return Ok(e);
+                }
             }
         }
+        Err(anyhow!("Failed to parse default expr: {}", expr_str))
     }
 
-    Ok(Value::Text(expr_str.to_string()))
+    let qctx = QueryContext::from_task_locals();
+    let expr = parse_default_expr(expr_str)?;
+    let typed = compile_const_expr(&expr)?;
+    if needs_async_materialization(&typed) {
+        let materialized = materialize_sequences_in_typed_expr(
+            store,
+            txn,
+            db_id,
+            sequence_values,
+            search_path,
+            &typed,
+            &qctx,
+        )
+        .await?;
+        return eval_static_typed_expr(&materialized, &qctx);
+    }
+    eval_static_typed_expr(&typed, &qctx)
 }
 
 async fn eval_column_default_or_null_inner(
@@ -1183,51 +1191,6 @@ pub fn coerce_row_values(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Res
 pub fn coerce_row_values_allow_null(schema: &TableSchema, row_vals: &mut Vec<Value>) -> Result<()> {
     for (i, c) in schema.columns.iter().enumerate() {
         row_vals[i] = coerce_value_for_column(row_vals[i].clone(), c)?;
-    }
-    Ok(())
-}
-
-pub fn validate_check_constraints(schema: &TableSchema, row: &Row) -> Result<()> {
-    let dialect = PostgreSqlDialect {};
-    let table_name = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-    for check in &schema.check_constraints {
-        let expr = Parser::new(&dialect)
-            .try_with_sql(&check.expr)
-            .and_then(|mut p| p.parse_expr())
-            .map_err(|e| anyhow!("Invalid CHECK expression '{}': {}", check.expr, e))?;
-
-        let result = super::expr::bridge::eval_ast_expr_with_row(&expr, row, schema, table_name)?;
-
-        match result {
-            Value::Boolean(true) => {}
-            Value::Boolean(false) => {
-                let name = check
-                    .name
-                    .as_ref()
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| format!("({})", check.expr));
-                let short_table = schema.name.rsplit('.').next().unwrap_or(&schema.name);
-                let row_str = row
-                    .values
-                    .iter()
-                    .map(|v| format!("{}", v))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(SqlError::CheckViolation {
-                    table: short_table.to_string(),
-                    constraint: name,
-                    detail: row_str,
-                }
-                .into());
-            }
-            Value::Null => {}
-            _ => {
-                return Err(anyhow!(
-                    "CHECK constraint must evaluate to boolean, got {:?}",
-                    result
-                ));
-            }
-        }
     }
     Ok(())
 }

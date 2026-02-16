@@ -2,10 +2,14 @@
 
 mod boolean;
 pub mod bridge;
+pub mod compile;
 pub mod functions;
 mod numeric;
 pub(crate) mod operators;
+pub mod static_eval;
 pub mod typed_eval;
+pub mod typed_fold;
+pub mod typed_rewrite;
 
 pub(crate) use boolean::validate_bool_expr_in_boolean_context;
 
