@@ -1,14 +1,22 @@
+use std::process::Command;
+
 use pgtikv_admin::cli_common::ApiClient;
 use serde_json::Value;
 
 use crate::{make_auth_headers, require_token, OutputFormat};
 
-use super::{exec::repl_exec, ReplState, ExpandedMode};
+use super::{exec::repl_exec, ExpandedMode, ReplState};
 
 pub enum DispatchResult {
     Continue,
     Exit,
     RefreshedTables(Vec<String>),
+    SwitchedDatabase {
+        id: String,
+        name: String,
+        tables: Vec<String>,
+    },
+    ExecuteQuery(String),
 }
 
 pub async fn fetch_table_names(api: &ApiClient, id: &str) -> Result<Vec<String>, String> {
@@ -66,6 +74,31 @@ pub async fn dispatch(
     };
 
     match cmd {
+        "\\fs" => {
+            handle_save_favorite(repl_state, arg);
+            DispatchResult::Continue
+        }
+        "\\f" => {
+            if arg.is_empty() {
+                eprintln!("Usage: \\f <favorite-name>");
+                DispatchResult::Continue
+            } else {
+                handle_execute_favorite(repl_state, arg)
+            }
+        }
+        "\\fd" => {
+            if arg.is_empty() {
+                eprintln!("Usage: \\fd <favorite-name>");
+                DispatchResult::Continue
+            } else {
+                handle_delete_favorite(repl_state, arg);
+                DispatchResult::Continue
+            }
+        }
+        "\\fl" => {
+            handle_list_favorites(repl_state);
+            DispatchResult::Continue
+        }
         "\\q" | "\\quit" => DispatchResult::Exit,
         "\\?" | "\\help" => {
             repl_help();
@@ -113,6 +146,21 @@ pub async fn dispatch(
             .await;
             DispatchResult::Continue
         }
+        "\\dv" => {
+            repl_exec(
+                api,
+                output,
+                id,
+                *show_timing,
+                repl_state,
+                "SELECT table_schema, table_name FROM information_schema.tables \
+                 WHERE table_type = 'VIEW' \
+                 AND table_schema NOT IN ('pg_catalog','information_schema') \
+                 ORDER BY table_schema, table_name",
+            )
+            .await;
+            DispatchResult::Continue
+        }
         "\\d" => {
             if arg.is_empty() {
                 repl_exec(
@@ -145,6 +193,39 @@ pub async fn dispatch(
             }
             DispatchResult::Continue
         }
+        "\\du" => {
+            handle_list_users(api, id).await;
+            DispatchResult::Continue
+        }
+        "\\l" => {
+            handle_list_databases(api).await;
+            DispatchResult::Continue
+        }
+        "\\conninfo" => {
+            handle_conninfo(repl_state);
+            DispatchResult::Continue
+        }
+        "\\i" => {
+            if arg.is_empty() {
+                eprintln!("Usage: \\i <filename>");
+            } else {
+                handle_include_file(api, output, id, *show_timing, repl_state, arg).await;
+            }
+            DispatchResult::Continue
+        }
+        "\\o" => {
+            handle_output_redirect(repl_state, arg);
+            DispatchResult::Continue
+        }
+        "\\e" => handle_edit(repl_state),
+        "\\c" => {
+            if arg.is_empty() {
+                eprintln!("Usage: \\c <database-id>");
+                DispatchResult::Continue
+            } else {
+                handle_connect(api, arg).await
+            }
+        }
         "\\refresh" => match fetch_table_names(api, id).await {
             Ok(tables) => {
                 eprintln!("Refreshed {} table name(s).", tables.len());
@@ -174,6 +255,310 @@ pub async fn dispatch(
         }
     }
 }
+
+// ── \du — list users ────────────────────────────────────────────
+
+async fn handle_list_users(api: &ApiClient, id: &str) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    match api
+        .try_request(
+            "GET",
+            &format!("/customer/databases/{id}/users"),
+            None,
+            Some(&headers),
+        )
+        .await
+    {
+        Ok(data) => {
+            let items = data.as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                eprintln!("No users found.");
+                return;
+            }
+
+            let mut w_name = 8usize;
+            let mut w_super = 9usize;
+            let mut w_login = 9usize;
+            for item in &items {
+                w_name = w_name.max(item["name"].as_str().unwrap_or("").len());
+                w_super = w_super.max(format_bool_field(item.get("is_superuser")).len());
+                w_login = w_login.max(format_bool_field(item.get("can_login")).len());
+            }
+
+            println!(
+                "{:<w_name$}  {:<w_super$}  {:<w_login$}",
+                "USERNAME", "SUPERUSER", "CAN_LOGIN"
+            );
+            println!(
+                "{}  {}  {}",
+                "─".repeat(w_name),
+                "─".repeat(w_super),
+                "─".repeat(w_login)
+            );
+            for item in &items {
+                println!(
+                    "{:<w_name$}  {:<w_super$}  {:<w_login$}",
+                    item["name"].as_str().unwrap_or(""),
+                    format_bool_field(item.get("is_superuser")),
+                    format_bool_field(item.get("can_login")),
+                );
+            }
+            println!(
+                "({} {})",
+                items.len(),
+                if items.len() == 1 { "row" } else { "rows" }
+            );
+        }
+        Err((_status, detail)) => {
+            eprintln!("ERROR: {detail}");
+        }
+    }
+}
+
+fn format_bool_field(v: Option<&Value>) -> String {
+    match v {
+        Some(Value::Bool(b)) => if *b { "yes" } else { "no" }.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => "".to_string(),
+    }
+}
+
+// ── \l — list databases ─────────────────────────────────────────
+
+async fn handle_list_databases(api: &ApiClient) {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    match api
+        .try_request("GET", "/customer/databases", None, Some(&headers))
+        .await
+    {
+        Ok(data) => {
+            let items = data.as_array().cloned().unwrap_or_default();
+            if items.is_empty() {
+                eprintln!("No databases found.");
+                return;
+            }
+
+            let mut w_id = 2usize;
+            let mut w_name = 4usize;
+            let mut w_state = 5usize;
+            let mut w_region = 6usize;
+
+            for item in &items {
+                w_id = w_id.max(item["id"].as_str().unwrap_or("").len());
+                w_name = w_name.max(item["name"].as_str().unwrap_or("").len());
+                w_state = w_state.max(item["state"].as_str().unwrap_or("").len());
+                w_region = w_region.max(item["region"].as_str().unwrap_or("").len());
+            }
+
+            println!(
+                "{:<w_id$}  {:<w_name$}  {:<w_state$}  {:<w_region$}",
+                "ID", "NAME", "STATE", "REGION"
+            );
+            println!(
+                "{}  {}  {}  {}",
+                "─".repeat(w_id),
+                "─".repeat(w_name),
+                "─".repeat(w_state),
+                "─".repeat(w_region)
+            );
+            for item in &items {
+                println!(
+                    "{:<w_id$}  {:<w_name$}  {:<w_state$}  {:<w_region$}",
+                    item["id"].as_str().unwrap_or(""),
+                    item["name"].as_str().unwrap_or(""),
+                    item["state"].as_str().unwrap_or(""),
+                    item["region"].as_str().unwrap_or(""),
+                );
+            }
+            println!(
+                "({} {})",
+                items.len(),
+                if items.len() == 1 {
+                    "database"
+                } else {
+                    "databases"
+                }
+            );
+        }
+        Err((_status, detail)) => {
+            eprintln!("ERROR: {detail}");
+        }
+    }
+}
+
+// ── \conninfo — show connection info ────────────────────────────
+
+fn handle_conninfo(repl_state: &ReplState) {
+    eprintln!("Connection information:");
+    eprintln!("  Database:  {}", repl_state.db_name);
+    eprintln!("  DB ID:     {}", repl_state.db_id);
+    eprintln!("  API URL:   {}", repl_state.api_url);
+    eprintln!(
+        "  Expanded:  {}",
+        match repl_state.expanded {
+            ExpandedMode::Off => "off",
+            ExpandedMode::On => "on",
+            ExpandedMode::Auto => "auto",
+        }
+    );
+    eprintln!(
+        "  Pager:     {}",
+        if repl_state.pager_enabled {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    if let Some(ref f) = repl_state.output_file {
+        eprintln!("  Output:    {}", f);
+    }
+}
+
+// ── \i — execute SQL from file ──────────────────────────────────
+
+async fn handle_include_file(
+    api: &ApiClient,
+    output: &OutputFormat,
+    id: &str,
+    timing: bool,
+    repl_state: &ReplState,
+    path: &str,
+) {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            let sql = contents.trim();
+            if sql.is_empty() {
+                eprintln!("File '{}' is empty.", path);
+                return;
+            }
+            repl_exec(api, output, id, timing, repl_state, sql).await;
+        }
+        Err(err) => {
+            eprintln!("ERROR: Failed to read '{}': {}", path, err);
+        }
+    }
+}
+
+// ── \o — redirect output ────────────────────────────────────────
+
+fn handle_output_redirect(repl_state: &mut ReplState, arg: &str) {
+    if arg.is_empty() {
+        if repl_state.output_file.is_some() {
+            repl_state.output_file = None;
+            eprintln!("Output reset to stdout.");
+        } else {
+            eprintln!("Output is stdout.");
+        }
+    } else {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(arg)
+        {
+            Ok(_) => {
+                repl_state.output_file = Some(arg.to_string());
+                eprintln!("Output redirected to '{}'.", arg);
+            }
+            Err(err) => {
+                eprintln!("ERROR: Cannot open '{}': {}", arg, err);
+            }
+        }
+    }
+}
+
+// ── \e — edit in $EDITOR ────────────────────────────────────────
+
+fn handle_edit(repl_state: &ReplState) -> DispatchResult {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+
+    let tmpdir = std::env::temp_dir();
+    let tmpfile = tmpdir.join(format!("db9_edit_{}.sql", std::process::id()));
+
+    let original = repl_state.last_query.as_deref().unwrap_or("");
+    if let Err(e) = std::fs::write(&tmpfile, original) {
+        eprintln!("ERROR: Failed to create temp file: {e}");
+        return DispatchResult::Continue;
+    }
+
+    let status = Command::new(&editor).arg(&tmpfile).status();
+
+    match status {
+        Ok(s) if s.success() => match std::fs::read_to_string(&tmpfile) {
+            Ok(contents) => {
+                let _ = std::fs::remove_file(&tmpfile);
+                let sql = contents.trim().to_string();
+                if sql.is_empty() {
+                    eprintln!("No query to execute (empty file).");
+                    return DispatchResult::Continue;
+                }
+                if sql == original.trim() {
+                    eprintln!("Query unchanged; not executed.");
+                    return DispatchResult::Continue;
+                }
+                DispatchResult::ExecuteQuery(sql)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmpfile);
+                eprintln!("ERROR: Failed to read temp file: {e}");
+                DispatchResult::Continue
+            }
+        },
+        Ok(s) => {
+            let _ = std::fs::remove_file(&tmpfile);
+            eprintln!("Editor exited with status: {}", s);
+            DispatchResult::Continue
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmpfile);
+            eprintln!("ERROR: Failed to launch editor '{}': {}", editor, e);
+            DispatchResult::Continue
+        }
+    }
+}
+
+// ── \c — switch database ────────────────────────────────────────
+
+async fn handle_connect(api: &ApiClient, new_id: &str) -> DispatchResult {
+    let token = require_token();
+    let headers = make_auth_headers(&token);
+
+    match api
+        .try_request(
+            "GET",
+            &format!("/customer/databases/{new_id}"),
+            None,
+            Some(&headers),
+        )
+        .await
+    {
+        Ok(data) => {
+            let new_name = data["name"].as_str().unwrap_or(new_id).to_string();
+            let tables = fetch_table_names(api, new_id).await.unwrap_or_default();
+
+            eprintln!(
+                "You are now connected to database \"{}\" ({}).",
+                new_name, new_id
+            );
+
+            DispatchResult::SwitchedDatabase {
+                id: new_id.to_string(),
+                name: new_name,
+                tables,
+            }
+        }
+        Err((_status, detail)) => {
+            eprintln!("ERROR: {detail}");
+            DispatchResult::Continue
+        }
+    }
+}
+
+// ── existing helpers ────────────────────────────────────────────
 
 fn handle_pager_command(repl_state: &mut ReplState, arg: &str) {
     if arg.is_empty() {
@@ -224,16 +609,109 @@ fn handle_expanded_command(repl_state: &mut ReplState, arg: &str) {
     eprintln!("Expanded display is {}.", status);
 }
 
+// ── \fs — save favorite query ────────────────────────────────────
+
+fn handle_save_favorite(repl_state: &mut ReplState, arg: &str) {
+    if arg.is_empty() {
+        eprintln!("Usage: \\fs <name> [query]");
+        eprintln!("  If no query given, saves last_query");
+        return;
+    }
+
+    let (name, query) = if let Some(space_pos) = arg.find(char::is_whitespace) {
+        let name = &arg[..space_pos];
+        let query = arg[space_pos..].trim();
+        (name, query.to_string())
+    } else {
+        let name = arg;
+        match &repl_state.last_query {
+            Some(q) => (name, q.clone()),
+            None => {
+                eprintln!("ERROR: No last query to save. Provide query explicitly: \\fs <name> <query>");
+                return;
+            }
+        }
+    };
+
+    match repl_state.favorites.add(name, &query) {
+        Ok(_) => eprintln!("Saved favorite: {}", name),
+        Err(e) => eprintln!("ERROR: {}", e),
+    }
+}
+
+// ── \f — execute favorite query ──────────────────────────────────
+
+fn handle_execute_favorite(repl_state: &ReplState, name: &str) -> DispatchResult {
+    match repl_state.favorites.get(name) {
+        Some(query) => DispatchResult::ExecuteQuery(query),
+        None => {
+            eprintln!("ERROR: Favorite '{}' not found. Use \\fl to list.", name);
+            DispatchResult::Continue
+        }
+    }
+}
+
+// ── \fd — delete favorite query ──────────────────────────────────
+
+fn handle_delete_favorite(repl_state: &mut ReplState, name: &str) {
+    match repl_state.favorites.delete(name) {
+        Ok(true) => eprintln!("Deleted favorite: {}", name),
+        Ok(false) => eprintln!("ERROR: Favorite '{}' not found.", name),
+        Err(e) => eprintln!("ERROR: {}", e),
+    }
+}
+
+// ── \fl — list all favorites ────────────────────────────────────
+
+fn handle_list_favorites(repl_state: &ReplState) {
+    let favorites = repl_state.favorites.list();
+    if favorites.is_empty() {
+        eprintln!("No saved favorites.");
+        return;
+    }
+
+    let mut w_name = 4usize;
+    for (name, _) in &favorites {
+        w_name = w_name.max(name.len());
+    }
+
+    eprintln!("{:<w_name$}  QUERY", "NAME");
+    eprintln!("{}  {}", "─".repeat(w_name), "─".repeat(40));
+
+    for (name, query) in &favorites {
+        let truncated = if query.len() > 40 {
+            format!("{}...", &query[..37])
+        } else {
+            query.clone()
+        };
+        eprintln!("{:<w_name$}  {}", name, truncated);
+    }
+
+    eprintln!("({} {})", favorites.len(), if favorites.len() == 1 { "favorite" } else { "favorites" });
+}
+
 fn repl_help() {
     eprintln!("Meta-commands:");
     eprintln!("  \\d [TABLE]    Describe table columns, or list all tables");
     eprintln!("  \\dt           List tables");
+    eprintln!("  \\dv           List views");
     eprintln!("  \\dn           List schemas");
     eprintln!("  \\di           List indexes");
+    eprintln!("  \\du           List database users");
+    eprintln!("  \\l            List all databases");
+    eprintln!("  \\c <ID>       Switch to a different database");
+    eprintln!("  \\conninfo     Show connection info");
+    eprintln!("  \\i <FILE>     Execute SQL from a file");
+    eprintln!("  \\o [FILE]     Redirect output to file (no arg = reset to stdout)");
+    eprintln!("  \\e            Edit last query in $EDITOR and execute");
     eprintln!("  \\refresh      Refresh SQL completion table cache");
     eprintln!("  \\timing       Toggle query timing");
     eprintln!("  \\pager [CMD]  Control paging (on/off/CMD)");
     eprintln!("  \\x [MODE]     Toggle expanded display (on/off/auto)");
+    eprintln!("  \\fs <N> [Q]   Save favorite query (Q defaults to last query)");
+    eprintln!("  \\f <NAME>     Execute saved favorite query");
+    eprintln!("  \\fd <NAME>    Delete saved favorite query");
+    eprintln!("  \\fl           List all saved favorite queries");
     eprintln!("  \\q            Quit");
     eprintln!("  \\?            Show this help");
     eprintln!();

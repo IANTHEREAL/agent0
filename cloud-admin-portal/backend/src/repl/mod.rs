@@ -6,6 +6,7 @@ use crate::{make_auth_headers, require_token, OutputFormat};
 pub mod commands;
 pub mod completer;
 pub mod exec;
+pub mod favorites;
 pub mod output;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub struct ReplState {
     pub db_name: String,
     pub api_url: String,
     pub tx_state: TxState,
+    pub favorites: favorites::Favorites,
 }
 
 impl ReplState {
@@ -46,6 +48,7 @@ impl ReplState {
             db_name,
             api_url,
             tx_state: TxState::Idle,
+            favorites: favorites::Favorites::load(),
         }
     }
 }
