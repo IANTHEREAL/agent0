@@ -4,8 +4,49 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::SqlFn;
+
+/// Global budget for concurrent fs9_read allocations (default 128MB).
+/// Prevents OOM when many tenants read large files simultaneously.
+/// Only covers the read window (fs::read allocation), not Value::Text lifetime.
+const FS9_READ_BUDGET: usize = 128 * 1024 * 1024;
+static FS9_READ_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII guard that releases reserved bytes on drop, ensuring budget is
+/// freed even if fs::read or UTF-8 conversion panics / errors.
+struct ReadBudgetGuard(usize);
+
+impl Drop for ReadBudgetGuard {
+    fn drop(&mut self) {
+        FS9_READ_IN_FLIGHT.fetch_sub(self.0, Ordering::Relaxed);
+    }
+}
+
+/// Try to reserve `n` bytes from the global read budget.
+/// Returns a guard that auto-releases on drop, or an error if budget exceeded.
+fn reserve_read_budget(n: usize) -> Result<ReadBudgetGuard> {
+    // CAS loop: only succeed if adding `n` stays within budget.
+    loop {
+        let current = FS9_READ_IN_FLIGHT.load(Ordering::Relaxed);
+        if current + n > FS9_READ_BUDGET {
+            return Err(anyhow!(
+                "fs9_read: concurrent read budget exceeded ({} + {} > {} bytes). \
+                 Try again later or use FROM extensions.fs9() for large files.",
+                current,
+                n,
+                FS9_READ_BUDGET
+            ));
+        }
+        if FS9_READ_IN_FLIGHT
+            .compare_exchange_weak(current, current + n, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Ok(ReadBudgetGuard(n));
+        }
+    }
+}
 
 pub fn register(map: &mut HashMap<&'static str, SqlFn>) {
     map.insert("FS9_READ", fs9_read);
@@ -55,16 +96,22 @@ pub fn fs9_read(args: Vec<Value>) -> Result<Value> {
         return Err(anyhow!("fs9_read: is a directory: {path}"));
     }
 
-    let bytes = fs::read(&path).map_err(|err| anyhow!("fs9_read: {err}"))?;
-    if bytes.len() > crate::extensions::fs::MAX_BYTES_PER_FILE {
+    let file_len = metadata.len() as usize;
+    if file_len > crate::extensions::fs::MAX_BYTES_PER_FILE {
         return Err(anyhow!(
             "fs9_read: file too large: {} bytes (max {})",
-            bytes.len(),
+            file_len,
             crate::extensions::fs::MAX_BYTES_PER_FILE
         ));
     }
 
-    Ok(Value::Text(String::from_utf8_lossy(&bytes).into_owned()))
+    let _budget = reserve_read_budget(file_len)?;
+    let bytes = fs::read(&path).map_err(|err| anyhow!("fs9_read: {err}"))?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    drop(bytes);
+    drop(_budget);
+
+    Ok(Value::Text(text))
 }
 
 pub fn fs9_write(args: Vec<Value>) -> Result<Value> {
